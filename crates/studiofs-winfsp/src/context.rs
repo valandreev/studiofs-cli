@@ -8,10 +8,9 @@ mod handle_drain;
 mod invalidation;
 mod plans;
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use buffers::{SendConstBuffer, SendMutBuffer};
@@ -118,69 +117,95 @@ const STATUS_NOT_A_REPARSE_POINT: NTSTATUS = NTSTATUS(0xC000_0275_u32 as i32);
 const STATUS_EA_TOO_LARGE: NTSTATUS = NTSTATUS(0xC000_0050_u32 as i32);
 pub(crate) const MAX_WINDOWS_COMPONENT_UTF16_UNITS: usize = 255;
 
-#[derive(Debug, Default)]
-struct AsyncCallbackState {
-    closed: bool,
-    in_flight: usize,
-}
+/// Tracker state bit that rejects new admissions; low bits count in-flight work.
+const ASYNC_CALLBACK_CLOSED: usize = 1 << (usize::BITS - 1);
 
 /// Tracks async WinFSP operations that retain an Arc<StudioVfs> after the
 /// native callback has returned STATUS_PENDING.
+///
+/// Entry and exit are lock-free. The mutex/condvar pair is touched only after
+/// `close`, so shutdown waits for exactly the callbacks admitted before it.
 pub(crate) struct WinfspAsyncCallbackTracker {
-    state: Mutex<AsyncCallbackState>,
+    state: AtomicUsize,
+    quiescent_lock: Mutex<()>,
     quiescent: Condvar,
 }
 
 impl WinfspAsyncCallbackTracker {
     fn new() -> Self {
         Self {
-            state: Mutex::new(AsyncCallbackState::default()),
+            state: AtomicUsize::new(0),
+            quiescent_lock: Mutex::new(()),
             quiescent: Condvar::new(),
         }
     }
 
     fn try_enter(self: &Arc<Self>) -> winfsp::Result<AsyncCallbackGuard> {
-        let mut state = self.state.lock();
-        if state.closed {
-            return Err(winfsp::FspError::from(STATUS_CANCELLED));
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & ASYNC_CALLBACK_CLOSED != 0 {
+                return Err(winfsp::FspError::from(STATUS_CANCELLED));
+            }
+            match self.state.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(AsyncCallbackGuard {
+                        tracker: Arc::clone(self),
+                    });
+                }
+                Err(actual) => state = actual,
+            }
         }
-        state.in_flight = state.in_flight.saturating_add(1);
-        Ok(AsyncCallbackGuard {
-            tracker: Arc::clone(self),
-        })
     }
 
+    /// Counts work even after `close`: WinFSP has already returned
+    /// STATUS_PENDING for futures queued via `spawn_task`, so they must run to
+    /// complete the request (their own `try_enter` then reports
+    /// STATUS_CANCELLED) and the shutdown drain must wait for them.
     fn enter_task(self: &Arc<Self>) -> AsyncCallbackGuard {
-        let mut state = self.state.lock();
-        state.in_flight = state.in_flight.saturating_add(1);
+        self.state.fetch_add(1, Ordering::AcqRel);
         AsyncCallbackGuard {
             tracker: Arc::clone(self),
         }
     }
 
+    fn leave(&self) {
+        let previous = self.state.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!((previous & !ASYNC_CALLBACK_CLOSED) > 0);
+        if previous == (ASYNC_CALLBACK_CLOSED | 1) {
+            // Taking the lock orders this notify after a waiter's count check.
+            let _lock = self.quiescent_lock.lock();
+            self.quiescent.notify_all();
+        }
+    }
+
     pub(crate) fn close(&self) {
-        let mut state = self.state.lock();
-        state.closed = true;
+        self.state.fetch_or(ASYNC_CALLBACK_CLOSED, Ordering::AcqRel);
+        let _lock = self.quiescent_lock.lock();
         self.quiescent.notify_all();
     }
 
+    /// Waits for admitted work to finish. Exits notify only after `close`.
     pub(crate) fn wait_for_quiescence(&self, timeout: std::time::Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        let mut state = self.state.lock();
-        while state.in_flight != 0 {
+        let mut lock = self.quiescent_lock.lock();
+        while self.in_flight() != 0 {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return false;
             };
-            if self.quiescent.wait_for(&mut state, remaining).timed_out() {
-                return state.in_flight == 0;
+            if self.quiescent.wait_for(&mut lock, remaining).timed_out() {
+                return self.in_flight() == 0;
             }
         }
         true
     }
 
-    #[cfg(test)]
     fn in_flight(&self) -> usize {
-        self.state.lock().in_flight
+        self.state.load(Ordering::Acquire) & !ASYNC_CALLBACK_CLOSED
     }
 }
 
@@ -190,12 +215,7 @@ struct AsyncCallbackGuard {
 
 impl Drop for AsyncCallbackGuard {
     fn drop(&mut self) {
-        let mut state = self.tracker.state.lock();
-        debug_assert!(state.in_flight > 0);
-        state.in_flight = state.in_flight.saturating_sub(1);
-        if state.in_flight == 0 {
-            self.tracker.quiescent.notify_all();
-        }
+        self.tracker.leave();
     }
 }
 
@@ -217,6 +237,9 @@ pub struct StudioFileHandle {
     read_callbacks: AtomicU64,
     /// Bytes served through WinFSP read callbacks for this handle.
     read_callback_bytes: AtomicU64,
+    /// EOF extension that Windows may read while closing a cached writer
+    /// handle. The newly exposed range is defined to read as zeros.
+    zero_fill_range: Mutex<Option<HandleZeroFillRange>>,
     /// WinFSP directory buffer for efficient directory enumeration.
     dir_buffer: DirBuffer,
     /// Captured text for synthetic runtime stats reads.
@@ -252,6 +275,7 @@ impl StudioFileHandle {
             disable_os_cache: false,
             read_callbacks: AtomicU64::new(0),
             read_callback_bytes: AtomicU64::new(0),
+            zero_fill_range: Mutex::new(None),
             dir_buffer: DirBuffer::new(),
             runtime_stats_snapshot: None,
         }
@@ -277,6 +301,34 @@ impl StudioFileHandle {
             self.read_callbacks.load(Ordering::Relaxed),
             self.read_callback_bytes.load(Ordering::Relaxed),
         )
+    }
+
+    fn record_zero_fill_range(&self, old_size: u64, new_size: u64) {
+        *self.zero_fill_range.lock() = (new_size > old_size).then_some(HandleZeroFillRange {
+            start: old_size,
+            end: new_size,
+        });
+    }
+
+    fn clear_zero_fill_range(&self) {
+        *self.zero_fill_range.lock() = None;
+    }
+
+    fn try_zero_fill_read(&self, buffer: &mut [u8], offset: u64) -> Option<u32> {
+        if self.is_dir || !self.open_flags.allows_write() {
+            return None;
+        }
+        let range = (*self.zero_fill_range.lock())?;
+        if offset >= range.end {
+            // At or past the extended EOF: a zero-length read, not "not my range".
+            return Some(0);
+        }
+        if offset < range.start {
+            return None;
+        }
+        let len = range.end.saturating_sub(offset).min(buffer.len() as u64) as usize;
+        buffer[..len].fill(0);
+        Some(len as u32)
     }
 }
 
@@ -1136,9 +1188,6 @@ pub struct StudioFsContext {
     /// Lifecycle barrier for async read/write/readdir futures spawned by
     /// WinFSP after their native callbacks return STATUS_PENDING.
     async_callback_tracker: Arc<WinfspAsyncCallbackTracker>,
-    /// Per-handle EOF extensions that Windows may read while closing cached
-    /// writer handles. The newly exposed range is defined to read as zeros.
-    handle_zero_fill_ranges: Mutex<HashMap<u64, HandleZeroFillRange>>,
     callback_barrier_state: CallbackBarrierState,
     directory_snapshot_cache: DirectorySnapshotCache,
     /// Upper bound for one synchronous WinFSP flush callback wait.
@@ -1220,7 +1269,6 @@ impl StudioFsContext {
             default_sd,
             invalidation_queue,
             async_callback_tracker: Arc::new(WinfspAsyncCallbackTracker::new()),
-            handle_zero_fill_ranges: Mutex::new(HashMap::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             directory_snapshot_cache: DirectorySnapshotCache::default(),
             flush_callback_timeout: winfsp_flush_callback_timeout(),
@@ -1270,7 +1318,6 @@ impl StudioFsContext {
             default_sd,
             invalidation_queue,
             async_callback_tracker: Arc::new(WinfspAsyncCallbackTracker::new()),
-            handle_zero_fill_ranges: Mutex::new(HashMap::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             directory_snapshot_cache: DirectorySnapshotCache::default(),
             flush_callback_timeout: winfsp_flush_callback_timeout(),
@@ -1310,46 +1357,6 @@ impl StudioFsContext {
             create_options,
             file_attributes,
         )
-    }
-
-    fn record_handle_zero_fill_range(&self, fh: u64, old_size: u64, new_size: u64) {
-        let mut ranges = self.handle_zero_fill_ranges.lock();
-        if new_size > old_size {
-            ranges.insert(
-                fh,
-                HandleZeroFillRange {
-                    start: old_size,
-                    end: new_size,
-                },
-            );
-        } else {
-            ranges.remove(&fh);
-        }
-    }
-
-    fn clear_handle_zero_fill_range(&self, fh: u64) {
-        self.handle_zero_fill_ranges.lock().remove(&fh);
-    }
-
-    fn try_handle_zero_fill_read(
-        &self,
-        handle: &StudioFileHandle,
-        buffer: &mut [u8],
-        offset: u64,
-    ) -> Option<u32> {
-        if handle.is_dir || !handle.open_flags.allows_write() {
-            return None;
-        }
-        let range = *self.handle_zero_fill_ranges.lock().get(&handle.fh)?;
-        if offset >= range.end {
-            return Some(0);
-        }
-        if offset < range.start {
-            return None;
-        }
-        let len = range.end.saturating_sub(offset).min(buffer.len() as u64) as usize;
-        buffer[..len].fill(0);
-        Some(len as u32)
     }
 
     #[cfg(test)]
@@ -1619,11 +1626,11 @@ impl StudioFsContext {
 
     fn execute_file_size_callback(
         &self,
-        fh: u64,
-        ino: Ino,
+        handle: &StudioFileHandle,
         action: FileSizeCallbackAction,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let (fh, ino) = (handle.fh, handle.ino);
         let attr = match action {
             FileSizeCallbackAction::KeepLogicalSize => {
                 self.vfs.getattr(ino).map_err(vfs_to_winfsp_err)?
@@ -1640,7 +1647,7 @@ impl StudioFsContext {
                     .vfs
                     .setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(new_size))
                     .map_err(vfs_to_winfsp_err)?;
-                self.record_handle_zero_fill_range(fh, old_size, attr.size);
+                handle.record_zero_fill_range(old_size, attr.size);
                 attr
             }
         };
@@ -1717,7 +1724,7 @@ impl StudioFsContext {
         T: Send + 'static,
     {
         let timeout = self.flush_callback_timeout;
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         match self.spawn_for_wait(f).recv_timeout(timeout) {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 error!(
@@ -2098,7 +2105,6 @@ impl FileSystemContext for StudioFsContext {
         }
         debug!(ino = context.ino, fh = context.fh, "close");
         self.run_close_callback(context.ino, context.fh);
-        self.clear_handle_zero_fill_range(context.fh);
         drop(context);
     }
 
@@ -2221,7 +2227,7 @@ impl FileSystemContext for StudioFsContext {
                 bytes, offset, buffer,
             ));
         }
-        if let Some(n) = self.try_handle_zero_fill_read(context, buffer, offset) {
+        if let Some(n) = context.try_zero_fill_read(buffer, offset) {
             trace!(
                 ino = context.ino,
                 fh = context.fh,
@@ -2284,7 +2290,7 @@ impl FileSystemContext for StudioFsContext {
     ) -> winfsp::Result<u32> {
         self.ensure_writable()?;
         self.vfs.note_winfsp_write_callback();
-        self.clear_handle_zero_fill_range(context.fh);
+        context.clear_zero_fill_range();
         let callback_started = Instant::now();
         // Resolve actual write offset.  Prefer the in-memory dirty attr (free)
         // and fall back to the full getattr only when there is no dirty state.
@@ -2437,8 +2443,7 @@ impl FileSystemContext for StudioFsContext {
         // flush barrier. Later reads/writes in the same open sequence depend on
         // size=0 being visible before the callback returns.
         self.execute_file_size_callback(
-            context.fh,
-            context.ino,
+            context,
             FileSizeCallbackAction::SetLogicalSize(0),
             file_info,
         )
@@ -2481,8 +2486,7 @@ impl FileSystemContext for StudioFsContext {
         // OpenOptions::create(true).truncate(true); honor that zero-EOF
         // transition so stale tail bytes are not exposed.
         self.execute_file_size_callback(
-            context.fh,
-            context.ino,
+            context,
             resolve_file_size_callback_action(new_size, set_allocation_size),
             file_info,
         )
@@ -2860,6 +2864,7 @@ mod tests {
             tracker.try_enter().is_err(),
             "closed tracker must reject new async work"
         );
+        assert_eq!(tracker.in_flight(), 1, "rejected entry must not count");
 
         drop(guard);
         assert!(tracker.wait_for_quiescence(Duration::from_secs(1)));
@@ -3880,57 +3885,62 @@ mod tests {
 
     #[test]
     fn sparse_eof_growth_zero_fills_tail_reads_on_writer_handle() {
-        let (_tmp, _vfs, ctx, _queue) = make_test_context("sparse_eof_zero_fill");
         let handle = StudioFileHandle::new(42, false, 7, OpenFlags::WRONLY);
-        ctx.record_handle_zero_fill_range(handle.fh, 1024, 4096);
+        handle.record_zero_fill_range(1024, 4096);
 
         let mut before_tail = vec![0xAA; 512];
         assert_eq!(
-            ctx.try_handle_zero_fill_read(&handle, &mut before_tail, 768),
+            handle.try_zero_fill_read(&mut before_tail, 768),
             None,
             "reads before the sparse EOF extension must use the normal VFS path"
         );
         assert!(before_tail.iter().all(|byte| *byte == 0xAA));
 
         let mut tail = vec![0xAA; 1024];
-        assert_eq!(
-            ctx.try_handle_zero_fill_read(&handle, &mut tail, 2048),
-            Some(1024)
-        );
+        assert_eq!(handle.try_zero_fill_read(&mut tail, 2048), Some(1024));
         assert!(tail.iter().all(|byte| *byte == 0));
 
         let mut crossing_eof = vec![0xAA; 1024];
         assert_eq!(
-            ctx.try_handle_zero_fill_read(&handle, &mut crossing_eof, 3584),
+            handle.try_zero_fill_read(&mut crossing_eof, 3584),
             Some(512)
         );
         assert!(crossing_eof[..512].iter().all(|byte| *byte == 0));
         assert!(crossing_eof[512..].iter().all(|byte| *byte == 0xAA));
 
-        assert_eq!(
-            ctx.try_handle_zero_fill_read(&handle, &mut crossing_eof, 4096),
-            Some(0)
-        );
+        assert_eq!(handle.try_zero_fill_read(&mut crossing_eof, 4096), Some(0));
     }
 
     #[test]
     fn sparse_eof_zero_fill_is_scoped_to_write_file_handles_and_cleared_on_shrink() {
-        let (_tmp, _vfs, ctx, _queue) = make_test_context("sparse_eof_zero_fill_scope");
         let writer = StudioFileHandle::new(42, false, 7, OpenFlags::WRONLY);
+        let sibling_writer = StudioFileHandle::new(42, false, 9, OpenFlags::WRONLY);
         let reader = StudioFileHandle::new(42, false, 7, OpenFlags::RDONLY);
         let dir_writer = StudioFileHandle::new(ROOT_INO, true, 8, OpenFlags::WRONLY);
-        ctx.record_handle_zero_fill_range(writer.fh, 1024, 4096);
+        writer.record_zero_fill_range(1024, 4096);
+        reader.record_zero_fill_range(1024, 4096);
+        dir_writer.record_zero_fill_range(1024, 4096);
 
         let mut buf = vec![0xAA; 16];
-        assert_eq!(ctx.try_handle_zero_fill_read(&reader, &mut buf, 1024), None);
+        assert_eq!(reader.try_zero_fill_read(&mut buf, 1024), None);
+        assert_eq!(dir_writer.try_zero_fill_read(&mut buf, 1024), None);
         assert_eq!(
-            ctx.try_handle_zero_fill_read(&dir_writer, &mut buf, 1024),
-            None
+            sibling_writer.try_zero_fill_read(&mut buf, 1024),
+            None,
+            "zero-fill state belongs to the handle that extended EOF"
         );
 
-        ctx.record_handle_zero_fill_range(writer.fh, 4096, 2048);
+        writer.clear_zero_fill_range();
         assert_eq!(
-            ctx.try_handle_zero_fill_read(&writer, &mut buf, 2048),
+            writer.try_zero_fill_read(&mut buf, 2048),
+            None,
+            "a write must clear the sparse EOF extension"
+        );
+
+        writer.record_zero_fill_range(1024, 4096);
+        writer.record_zero_fill_range(4096, 2048);
+        assert_eq!(
+            writer.try_zero_fill_read(&mut buf, 2048),
             None,
             "shrinks must clear stale sparse EOF extension state"
         );
