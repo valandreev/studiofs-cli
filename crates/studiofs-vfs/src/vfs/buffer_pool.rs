@@ -33,14 +33,15 @@ impl BufferPool {
         buffer
     }
 
+    // Unlike write acquisition, read-window acquisition preserves initialized
+    // bytes to avoid another full-buffer zero-fill. DataReader overwrites the
+    // returned range, including holes, before it is exposed as a cached window.
     pub(super) fn acquire_read_window(&self, len: usize) -> ReadWindowBuffer {
         let mut buffer = self
             .inner
             .lock()
             .pop()
             .unwrap_or_else(|| BytesMut::with_capacity(self.chunk_size));
-        // Keep initialized bytes on reuse; DataReader overwrites the returned
-        // range, including holes, before it is exposed as a cached window.
         if len > buffer.len() {
             buffer.resize(len, 0);
         }
@@ -55,8 +56,6 @@ impl BufferPool {
         if self.max_buffers == 0 {
             return;
         }
-        // Write acquisition clears the length; read acquisition preserves it
-        // so a warmed window does not pay another full-buffer zero-fill.
         let mut buffers = self.inner.lock();
         if buffers.len() < self.max_buffers {
             buffers.push(buffer);
