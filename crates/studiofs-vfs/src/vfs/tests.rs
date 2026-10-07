@@ -2304,6 +2304,63 @@ fn volatile_flush_does_not_wait_for_deferred_namespace_metadata() {
 }
 
 #[test]
+fn read_into_fh_reused_read_windows_overwrite_dense_holes_and_eof() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "reused-read-windows");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(ROOT_INO, b"windows.bin", 0, 0, 0o644).unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let window_len = super::FOREGROUND_READ_WINDOW_BYTES;
+        let caller_len = 128;
+        let dense = vec![0x5A; window_len * 2 + caller_len];
+        vfs.write_fh(fh, attr.ino, 0, &dense).await.unwrap();
+        let tail_offset = (window_len * 2 + caller_len + window_len / 2) as u64;
+        vfs.write_fh(fh, attr.ino, tail_offset, b"end")
+            .await
+            .unwrap();
+
+        let mut out = [0xAA; 128];
+        // Arm and fill two dense windows; replacing the first recycles it.
+        for offset in [
+            0,
+            caller_len,
+            window_len,
+            window_len + caller_len,
+            window_len * 2,
+        ] {
+            assert_eq!(
+                vfs.read_into_fh(fh, attr.ino, offset as u64, &mut out)
+                    .await
+                    .unwrap(),
+                128
+            );
+            assert_eq!(out, [0x5A; 128]);
+        }
+        let hole_offset = window_len * 2 + caller_len;
+        // The old buffer contained dense bytes. Sparse spans must overwrite them.
+        assert_eq!(
+            vfs.read_into_fh(fh, attr.ino, hole_offset as u64, &mut out)
+                .await
+                .unwrap(),
+            128
+        );
+        assert_eq!(out, [0; 128]);
+        // A short final window must expose only EOF-clamped bytes.
+        out.fill(0xAA);
+        assert_eq!(
+            vfs.read_into_fh(fh, attr.ino, tail_offset, &mut out)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(&out[..3], b"end");
+        assert_eq!(&out[3..], &[0xAA; 125]);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn read_into_fh_clamps_to_remaining_file_size() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-into-fh-clamps");

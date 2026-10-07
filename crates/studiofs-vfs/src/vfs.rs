@@ -3920,6 +3920,8 @@ pub struct StudioVfs {
     /// Reuses hot-path block buffers to reduce allocator churn on repeated
     /// materialize/stage cycles.
     write_buffer_pool: BufferPool,
+    /// Retains at most two initialized 4 MiB speculative read buffers.
+    read_window_buffer_pool: BufferPool,
     /// Maximum bytes drained by one opportunistic eager-flush attempt.
     write_eager_flush_drain_chunk_bytes: usize,
     /// Bounded local payload-put concurrency for one eager drain.

@@ -551,6 +551,7 @@ impl VfsBootstrap {
                     .saturating_mul(WRITE_BUFFER_POOL_BUFFER_MULTIPLIER),
             ),
             write_eager_flush_drain_chunk_bytes: plan.write_eager_flush_drain_chunk_bytes,
+            read_window_buffer_pool: BufferPool::new(super::FOREGROUND_READ_WINDOW_BYTES, 2),
             payload_put_concurrency: plan.payload_put_concurrency,
             local_sync_group_min_bytes: plan.local_sync_group_min_bytes,
             max_xattr_bytes: plan.max_xattr_bytes,

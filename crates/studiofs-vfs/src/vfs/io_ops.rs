@@ -215,23 +215,24 @@ impl StudioVfs {
             )
             .await?
         } else {
-            let mut window = vec![0u8; prepared.read_len];
+            let mut window = self
+                .read_window_buffer_pool
+                .acquire_read_window(prepared.read_len);
             let token = read_window_token.expect("current speculative read has an owner token");
             let written = self
                 .execute_prepared_foreground_read(
                     fh,
                     ino,
                     offset,
-                    &mut window,
+                    window.as_mut(),
                     &prepared,
                     Some((token, buffer.len())),
                 )
                 .await?;
-            window.truncate(written);
-            let read = buffer.len().min(window.len());
-            buffer[..read].copy_from_slice(&window[..read]);
+            let read = buffer.len().min(written);
+            buffer[..read].copy_from_slice(&window.as_ref()[..read]);
             if let Some(open_file) = &open_file {
-                open_file.replace_read_window(ino, offset, Bytes::from(window));
+                open_file.replace_read_window(ino, offset, window.into_bytes(written));
             }
             read
         };
