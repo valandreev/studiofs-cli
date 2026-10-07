@@ -24,7 +24,7 @@ fn test_detect_local_overlay_state_for_dentry_only_against_base() {
 }
 
 #[test]
-fn entry_names_for_inode_reads_base_and_overlay_index_candidates() {
+fn entry_bindings_for_inode_reads_base_and_overlay_index_candidates() {
     let source = temp_engine();
     let file = source
         .create_file(ROOT_INO, b"base.txt", 1000, 1000, 0o644)
@@ -35,25 +35,20 @@ fn entry_names_for_inode_reads_base_and_overlay_index_candidates() {
         .import_snapshot(&source.export_snapshot().unwrap())
         .unwrap();
     assert_eq!(
-        engine.entry_names_for_inode(ROOT_INO, file.ino).unwrap(),
-        vec![b"base.txt".to_vec()]
+        engine.entry_bindings_for_inode(file.ino).unwrap(),
+        vec![(ROOT_INO, b"base.txt".to_vec())]
     );
 
     engine
         .rename(ROOT_INO, b"base.txt", ROOT_INO, b"local.txt")
         .unwrap();
-    let names = engine.entry_names_for_inode(ROOT_INO, file.ino).unwrap();
-    assert_eq!(names.first(), Some(&b"local.txt".to_vec()));
-    // Any remaining base row is a stale candidate that lookup must reject.
-    for name in &names[1..] {
-        assert!(engine.lookup(ROOT_INO, name).is_err());
+    let bindings = engine.entry_bindings_for_inode(file.ino).unwrap();
+    assert!(bindings.contains(&(ROOT_INO, b"local.txt".to_vec())));
+    // Any other row is a stale base candidate that lookup must reject.
+    for (parent, name) in bindings.iter().filter(|(_, name)| name != b"local.txt") {
+        assert!(engine.lookup(*parent, name).is_err());
     }
-    assert!(
-        engine
-            .entry_names_for_inode(file.ino, ROOT_INO)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(engine.entry_bindings_for_inode(ROOT_INO).unwrap().is_empty());
 }
 
 #[test]

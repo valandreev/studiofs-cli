@@ -257,7 +257,8 @@ pub struct InodeAttr {
     pub ctime: i64,
     /// Access time (nanoseconds since Unix epoch).
     pub atime: i64,
-    /// Parent inode (0 for root).
+    /// Parent inode (0 for root). Authoritative for directories; for other kinds it
+    /// is a hint only, since hardlinks and cross-directory renames leave it unchanged.
     pub parent: Ino,
     /// Creation/birth time (nanoseconds since Unix epoch).
     /// Used as Windows CreationTime and macOS crtime.

@@ -1071,9 +1071,9 @@ impl<'a> NamespaceResolver<'a> {
                 break;
             }
 
-            let name = self
-                .indexed_child_name(parent, current)
-                .or_else(|| self.scanned_child_name(parent, current))?;
+            let (parent, name) = self
+                .indexed_binding(parent, current)
+                .or_else(|| Some((parent, self.scanned_child_name(parent, current)?)))?;
             components.push(name);
             current = parent;
         }
@@ -1090,12 +1090,15 @@ impl<'a> NamespaceResolver<'a> {
         Some(format!("{}{}", separator, components.join(separator)))
     }
 
-    fn indexed_child_name(&self, parent: Ino, ino: Ino) -> Option<String> {
-        let names = match self.vfs.sync_meta().entry_names_for_inode(parent, ino) {
-            Ok(names) => names,
+    /// Picks a visible binding of `ino`, preferring `hint_parent` (`attr.parent`),
+    /// then the lowest `(parent, name)`: a non-directory's `attr.parent` can be stale
+    /// after a cross-directory rename, and a hardlink has several valid parents.
+    fn indexed_binding(&self, hint_parent: Ino, ino: Ino) -> Option<(Ino, String)> {
+        let bindings = match self.vfs.sync_meta().entry_bindings_for_inode(ino) {
+            Ok(bindings) => bindings,
             Err(error) => {
                 tracing::warn!(
-                    parent,
+                    parent = hint_parent,
                     ino,
                     %error,
                     "reverse dentry index lookup failed; scanning the parent directory"
@@ -1103,13 +1106,17 @@ impl<'a> NamespaceResolver<'a> {
                 return None;
             }
         };
-        names
+        let (hinted, others): (Vec<_>, Vec<_>) = bindings
             .into_iter()
-            .find(|name| {
-                self.lookup_component(parent, name)
+            .partition(|(parent, _)| *parent == hint_parent);
+        hinted
+            .into_iter()
+            .chain(others)
+            .find(|(parent, name)| {
+                self.lookup_component(*parent, name)
                     .is_ok_and(|attr| attr.ino == ino)
             })
-            .map(name_to_string)
+            .map(|(parent, name)| (parent, name_to_string(name)))
     }
 
     fn scanned_child_name(&self, parent: Ino, ino: Ino) -> Option<String> {
@@ -1658,6 +1665,55 @@ mod tests {
 
         vfs.unlink(b.ino, b"renamed.txt").expect("unlink file");
         assert_eq!(resolver.path_for_inode(file.ino), None);
+    }
+
+    #[test]
+    fn path_for_inode_follows_files_moved_across_directories_and_hardlinks() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "path-for-inode-moved-file");
+        let a = vfs
+            .mkdir(ROOT_INO, b"a", 1000, 1000, 0o755)
+            .expect("mkdir a");
+        let b = vfs.mkdir(a.ino, b"b", 1000, 1000, 0o755).expect("mkdir b");
+        let c = vfs
+            .mkdir(ROOT_INO, b"c", 1000, 1000, 0o755)
+            .expect("mkdir c");
+        let file = vfs
+            .create(b.ino, b"file.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+        PATH_FOR_INODE_SCANS.with(|count| count.set(0));
+
+        vfs.rename(b.ino, b"file.txt", a.ino, b"moved.txt", true)
+            .expect("move file across directories");
+        assert_eq!(vfs.getattr(file.ino).expect("getattr").parent, b.ino);
+        assert_eq!(
+            resolver.path_for_inode(file.ino).as_deref(),
+            Some("/a/moved.txt")
+        );
+
+        // Hardlinks: the binding under `attr.parent` wins while it is visible,
+        // otherwise the lowest remaining `(parent, name)` binding is chosen.
+        vfs.rename(a.ino, b"moved.txt", b.ino, b"file.txt", true)
+            .expect("move file back");
+        vfs.link(file.ino, c.ino, b"z-link.txt").expect("link z");
+        vfs.link(file.ino, c.ino, b"a-link.txt").expect("link a");
+        assert_eq!(
+            resolver.path_for_inode(file.ino).as_deref(),
+            Some("/a/b/file.txt")
+        );
+        vfs.unlink(b.ino, b"file.txt")
+            .expect("unlink original name");
+        assert_eq!(
+            resolver.path_for_inode(file.ino).as_deref(),
+            Some("/c/a-link.txt")
+        );
+        vfs.unlink(c.ino, b"a-link.txt").expect("unlink a-link");
+        assert_eq!(
+            resolver.path_for_inode(file.ino).as_deref(),
+            Some("/c/z-link.txt")
+        );
+        assert_eq!(PATH_FOR_INODE_SCANS.with(std::cell::Cell::get), 0);
     }
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {

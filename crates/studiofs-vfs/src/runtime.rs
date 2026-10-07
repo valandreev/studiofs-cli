@@ -349,7 +349,7 @@ impl<M: ?Sized + MetaInodes> MetaInodes for RuntimeMetaHandle<M> {
 impl<M: ?Sized + MetaNamespace> MetaNamespace for RuntimeMetaHandle<M> {
     forward_method!(fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>);
     forward_method!(fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>>);
-    forward_method!(fn entry_names_for_inode(&self, parent: Ino, ino: Ino) -> MetaResult<Vec<Vec<u8>>>);
+    forward_method!(fn entry_bindings_for_inode(&self, ino: Ino) -> MetaResult<Vec<(Ino, Vec<u8>)>>);
     forward_method!(
         fn add_entry(
             &self,
