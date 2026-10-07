@@ -1407,6 +1407,12 @@ pub trait MetaNamespace: Send + Sync {
     /// List all entries in a directory.
     fn readdir(&self, parent: Ino) -> MetaResult<Vec<DirEntry>>;
 
+    /// Lists names under `parent` that a reverse dentry index binds to `ino`.
+    ///
+    /// The result is a candidate set, not visibility proof: it may contain stale
+    /// names, so callers must confirm each name with [`lookup`](Self::lookup).
+    fn entry_names_for_inode(&self, parent: Ino, ino: Ino) -> MetaResult<Vec<Vec<u8>>>;
+
     /// Add a directory entry. Returns error if it already exists.
     fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()>;
 

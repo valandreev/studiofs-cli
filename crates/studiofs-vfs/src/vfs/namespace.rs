@@ -1048,7 +1048,10 @@ impl<'a> NamespaceResolver<'a> {
         })
     }
 
-    /// Builds a best-effort absolute path for an inode using cached/readdir ancestry.
+    /// Builds a best-effort absolute path for an inode by walking parent links.
+    ///
+    /// Each level confirms an indexed child name with one lookup and scans the
+    /// parent with `readdir` only when no indexed name is still visible.
     ///
     /// Returns `None` when ancestry cannot be reconstructed within the lookup window.
     pub fn path_for_inode(&self, ino: Ino) -> Option<String> {
@@ -1068,11 +1071,9 @@ impl<'a> NamespaceResolver<'a> {
                 break;
             }
 
-            let entries = self.vfs.readdir(parent).ok()?;
-            let name = entries
-                .iter()
-                .find(|entry| entry.ino == current)
-                .map(|entry| String::from_utf8_lossy(&entry.name).into_owned())?;
+            let name = self
+                .indexed_child_name(parent, current)
+                .or_else(|| self.scanned_child_name(parent, current))?;
             components.push(name);
             current = parent;
         }
@@ -1088,6 +1089,45 @@ impl<'a> NamespaceResolver<'a> {
         };
         Some(format!("{}{}", separator, components.join(separator)))
     }
+
+    fn indexed_child_name(&self, parent: Ino, ino: Ino) -> Option<String> {
+        let names = match self.vfs.sync_meta().entry_names_for_inode(parent, ino) {
+            Ok(names) => names,
+            Err(error) => {
+                tracing::warn!(
+                    parent,
+                    ino,
+                    %error,
+                    "reverse dentry index lookup failed; scanning the parent directory"
+                );
+                return None;
+            }
+        };
+        names
+            .into_iter()
+            .find(|name| {
+                self.lookup_component(parent, name)
+                    .is_ok_and(|attr| attr.ino == ino)
+            })
+            .map(name_to_string)
+    }
+
+    fn scanned_child_name(&self, parent: Ino, ino: Ino) -> Option<String> {
+        #[cfg(test)]
+        tests::PATH_FOR_INODE_SCANS.with(|count| count.set(count.get() + 1));
+        self.vfs
+            .readdir(parent)
+            .ok()?
+            .into_iter()
+            .find(|entry| entry.ino == ino)
+            .map(|entry| name_to_string(entry.name))
+    }
+}
+
+/// Reuses a valid UTF-8 name buffer; only invalid names pay for lossy replacement.
+fn name_to_string(name: Vec<u8>) -> String {
+    String::from_utf8(name)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
 }
 
 /// Coordinates cache/epoch side effects for namespace mutating operations.
@@ -1552,6 +1592,73 @@ mod tests {
     use studiofs_meta::{MetaFormat, MetaInodes, MetaNamespace, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
+
+    thread_local! {
+        pub(super) static PATH_FOR_INODE_SCANS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn path_for_inode_uses_reverse_index_without_directory_scans() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "path-for-inode-reverse-index");
+        let a = vfs
+            .mkdir(ROOT_INO, b"a", 1000, 1000, 0o755)
+            .expect("mkdir a");
+        let b = vfs.mkdir(a.ino, b"b", 1000, 1000, 0o755).expect("mkdir b");
+        for index in 0..256 {
+            vfs.create(
+                b.ino,
+                format!("sibling-{index}").as_bytes(),
+                1000,
+                1000,
+                0o644,
+            )
+            .expect("create sibling");
+        }
+        let file = vfs
+            .create(b.ino, b"file.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let resolver = vfs.namespace_resolver(NamespacePathStyle::Posix);
+        PATH_FOR_INODE_SCANS.with(|count| count.set(0));
+
+        assert_eq!(
+            resolver.path_for_inode(file.ino).as_deref(),
+            Some("/a/b/file.txt")
+        );
+        vfs.rename(ROOT_INO, b"a", ROOT_INO, b"x", true)
+            .expect("rename ancestor");
+        assert_eq!(
+            resolver.path_for_inode(file.ino).as_deref(),
+            Some("/x/b/file.txt")
+        );
+        vfs.rename(b.ino, b"file.txt", b.ino, b"renamed.txt", true)
+            .expect("rename file");
+        assert_eq!(
+            resolver.path_for_inode(file.ino).as_deref(),
+            Some("/x/b/renamed.txt")
+        );
+        assert_eq!(PATH_FOR_INODE_SCANS.with(std::cell::Cell::get), 0);
+
+        // Deferred entries are not in the redb index yet, so only the scan finds them.
+        let deferred = studiofs_meta::InodeAttr::new_file(1 << 40, b.ino, 1000, 1000, 0o644);
+        {
+            let mut inner = vfs.state.namespace.deferred.inner.lock();
+            inner.entries.insert(
+                DeferredNamespaceKey::new(b.ino, b"deferred.txt"),
+                deferred.ino,
+            );
+            inner.attrs.insert(deferred.ino, deferred.clone());
+        }
+        assert_eq!(
+            resolver.path_for_inode(deferred.ino).as_deref(),
+            Some("/x/b/deferred.txt")
+        );
+        assert_eq!(PATH_FOR_INODE_SCANS.with(std::cell::Cell::get), 1);
+
+        vfs.unlink(b.ino, b"renamed.txt").expect("unlink file");
+        assert_eq!(resolver.path_for_inode(file.ino), None);
+    }
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
         let volume_name = format!("namespace-resolver-{volume_suffix}-{}", std::process::id());

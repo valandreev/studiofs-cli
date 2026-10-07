@@ -158,6 +158,10 @@ where
         self.inner.readdir(parent)
     }
 
+    fn entry_names_for_inode(&self, parent: Ino, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
+        self.inner.entry_names_for_inode(parent, ino)
+    }
+
     fn add_entry(&self, _parent: Ino, _name: &[u8], _entry: &DirEntryValue) -> MetaResult<()> {
         Err(read_only_error(ROOT_INO))
     }
