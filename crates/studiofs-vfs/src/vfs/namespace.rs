@@ -1065,15 +1065,19 @@ impl<'a> NamespaceResolver<'a> {
         let mut components: Vec<String> = Vec::new();
         let mut current = ino;
         for _ in 0..256 {
+            if current == ROOT_INO {
+                break;
+            }
             let attr = self.vfs.getattr(current).ok()?;
-            let parent = attr.parent;
-            if parent == 0 || current == ROOT_INO {
+            let hint_parent = attr.parent;
+            if hint_parent == 0 {
                 break;
             }
 
-            let (parent, name) = self.indexed_binding(parent, current).or_else(|| {
-                self.scanned_child_name(parent, current)
-                    .map(|name| (parent, name))
+            // The scan only finds deferred entries, which live under `attr.parent`.
+            let (parent, name) = self.indexed_binding(hint_parent, current).or_else(|| {
+                self.scanned_child_name(hint_parent, current)
+                    .map(|name| (hint_parent, name))
             })?;
             components.push(name);
             current = parent;
@@ -1099,10 +1103,10 @@ impl<'a> NamespaceResolver<'a> {
             Ok(bindings) => bindings,
             Err(error) => {
                 tracing::warn!(
-                    parent = hint_parent,
+                    hint_parent,
                     ino,
                     %error,
-                    "reverse dentry index lookup failed; scanning the parent directory"
+                    "reverse dentry index lookup failed; scanning the attr.parent directory"
                 );
                 return None;
             }
@@ -1708,6 +1712,12 @@ mod tests {
             Some("/c/a-link.txt")
         );
         vfs.unlink(c.ino, b"a-link.txt").expect("unlink a-link");
+        assert_eq!(
+            resolver.path_for_inode(file.ino).as_deref(),
+            Some("/c/z-link.txt")
+        );
+        // `attr.parent` may name a directory that no longer exists.
+        vfs.rmdir(a.ino, b"b").expect("rmdir hinted parent");
         assert_eq!(
             resolver.path_for_inode(file.ino).as_deref(),
             Some("/c/z-link.txt")

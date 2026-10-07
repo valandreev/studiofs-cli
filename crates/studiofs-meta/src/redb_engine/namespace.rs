@@ -51,7 +51,7 @@ impl MetaNamespace for RedbMetaEngine {
         let txn = self.begin_read_txn()?;
         let prefix = dentry_by_inode_prefix(ino);
         let range_end = prefix_successor(&prefix);
-        let mut bindings = std::collections::BTreeSet::new();
+        let mut bindings = Vec::new();
         // Base may still hold a binding the local overlay replaced; lookup rejects it.
         for index in [DENTRIES_BY_INODE_TABLE, BASE_DENTRIES_BY_INODE_TABLE] {
             let index = txn
@@ -65,10 +65,12 @@ impl MetaNamespace for RedbMetaEngine {
             for row in rows {
                 let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 let (_, parent, name) = decode_dentry_by_inode_key(key.value())?;
-                bindings.insert((parent, name.to_vec()));
+                bindings.push((parent, name.to_vec()));
             }
         }
-        Ok(bindings.into_iter().collect())
+        bindings.sort_unstable();
+        bindings.dedup();
+        Ok(bindings)
     }
 
     fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
