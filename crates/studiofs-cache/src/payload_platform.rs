@@ -10,7 +10,7 @@ use std::path::Path;
 #[cfg(windows)]
 use std::sync::LazyLock;
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 std::thread_local! {
     /// Holds clone-backed reads at the platform boundary for the concurrency regression.
     /// Per-thread storage keeps unrelated payload tests independent.
@@ -18,6 +18,22 @@ std::thread_local! {
         std::sync::mpsc::Sender<()>,
         std::sync::mpsc::Receiver<()>,
     )>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Blocks the current read at the platform boundary when a test armed the gate.
+#[cfg(all(test, any(windows, target_os = "macos")))]
+fn wait_pread_test_gate() {
+    PREAD_TEST_GATE.with(|gate| {
+        if let Some((entered, release)) = gate.borrow_mut().take() {
+            entered
+                .send(())
+                .expect("concurrent-read entry channel must remain open");
+            // Allow both 5-second entry waits to finish before the gate expires.
+            release
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("concurrent-read coordinator must release the platform read");
+        }
+    });
 }
 
 #[cfg(windows)]
@@ -86,17 +102,7 @@ pub fn open_read_only_unbuffered(path: &Path) -> io::Result<File> {
 /// Returns the number of bytes read, or `0` at EOF.
 pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     #[cfg(all(test, target_os = "macos"))]
-    PREAD_TEST_GATE.with(|gate| {
-        if let Some((entered, release)) = gate.borrow_mut().take() {
-            entered
-                .send(())
-                .expect("concurrent-read entry channel must remain open");
-            // Allow both 5-second entry waits to finish before the gate expires.
-            release
-                .recv_timeout(std::time::Duration::from_secs(15))
-                .expect("concurrent-read coordinator must release the platform read");
-        }
-    });
+    wait_pread_test_gate();
     let mut total = 0;
     while total < buf.len() {
         let total_offset = u64::try_from(total)
@@ -528,6 +534,8 @@ fn read_unbuffered_impl(
         ));
     }
 
+    #[cfg(test)]
+    wait_pread_test_gate();
     if is_windows_unbuffered_ptr_aligned(buf.as_ptr() as usize, alignment) {
         return pread_raw(file, buf, offset);
     }
@@ -556,10 +564,18 @@ impl UnbufferedWriteBuffer {
 
 #[cfg(windows)]
 impl UnbufferedReadBuffer {
+    /// Heap bytes this scratch buffer keeps alive between reads.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.backing.capacity()
+    }
+
     fn aligned_mut(&mut self, len: usize, alignment: usize) -> &mut [u8] {
         let alignment = normalized_unbuffered_write_alignment(alignment);
         let required_len = len.saturating_add(alignment - 1);
         if self.backing.len() < required_len {
+            // Exact growth keeps retained capacity at the largest request, without doubling.
+            self.backing
+                .reserve_exact(required_len - self.backing.len());
             self.backing.resize(required_len, 0);
         }
         let base = self.backing.as_ptr() as usize;
@@ -574,7 +590,7 @@ fn normalized_unbuffered_write_alignment(alignment: usize) -> usize {
 }
 
 #[cfg(windows)]
-fn is_windows_unbuffered_ptr_aligned(ptr: usize, alignment: usize) -> bool {
+pub(crate) fn is_windows_unbuffered_ptr_aligned(ptr: usize, alignment: usize) -> bool {
     ptr.is_multiple_of(normalized_unbuffered_write_alignment(alignment))
 }
 
@@ -968,6 +984,18 @@ mod tests {
 
         assert_eq!(aligned, data);
         assert!((aligned.as_ptr() as usize).is_multiple_of(8192));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unbuffered_read_scratch_grows_exactly() {
+        const MIB: usize = 1024 * 1024;
+        let mut scratch = UnbufferedReadBuffer::new();
+
+        scratch.aligned_mut(2 * MIB + 4096, 4096);
+        scratch.aligned_mut(4 * MIB, 4096);
+
+        assert_eq!(scratch.retained_bytes(), 4 * MIB + 4095);
     }
 
     #[cfg(windows)]
