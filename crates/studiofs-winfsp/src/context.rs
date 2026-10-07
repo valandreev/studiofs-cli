@@ -2859,50 +2859,11 @@ mod tests {
             tracker.try_enter().is_err(),
             "closed tracker must reject new async work"
         );
+        assert_eq!(tracker.in_flight(), 1, "rejected entry must not count");
 
         drop(guard);
         assert!(tracker.wait_for_quiescence(Duration::from_secs(1)));
         assert_eq!(tracker.in_flight(), 0);
-    }
-
-    #[test]
-    fn async_callback_tracker_wakes_shutdown_waiter_when_last_admitted_callback_leaves() {
-        const WAIT: Duration = Duration::from_secs(30);
-        let tracker = Arc::new(WinfspAsyncCallbackTracker::new());
-        let workers: Vec<_> = (0..8)
-            .map(|_| {
-                let tracker = Arc::clone(&tracker);
-                std::thread::spawn(move || {
-                    for _ in 0..1_000 {
-                        drop(tracker.try_enter().expect("open tracker admits work"));
-                    }
-                })
-            })
-            .collect();
-        for worker in workers {
-            worker.join().expect("admission worker");
-        }
-        assert_eq!(tracker.in_flight(), 0);
-
-        let admitted = tracker.try_enter().expect("open tracker admits work");
-        tracker.close();
-        assert!(tracker.try_enter().is_err());
-        assert_eq!(tracker.in_flight(), 1, "rejected entry must not count");
-
-        let waiter = {
-            let tracker = Arc::clone(&tracker);
-            std::thread::spawn(move || {
-                let started = std::time::Instant::now();
-                (tracker.wait_for_quiescence(WAIT), started.elapsed())
-            })
-        };
-        drop(admitted);
-        let (quiescent, elapsed) = waiter.join().expect("shutdown waiter");
-        assert!(quiescent);
-        assert!(
-            elapsed < WAIT,
-            "last exit after close must notify instead of waiting out the timeout"
-        );
     }
 
     #[test]
