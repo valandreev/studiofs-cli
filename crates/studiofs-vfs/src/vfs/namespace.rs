@@ -1071,9 +1071,10 @@ impl<'a> NamespaceResolver<'a> {
                 break;
             }
 
-            let (parent, name) = self
-                .indexed_binding(parent, current)
-                .or_else(|| Some((parent, self.scanned_child_name(parent, current)?)))?;
+            let (parent, name) = self.indexed_binding(parent, current).or_else(|| {
+                self.scanned_child_name(parent, current)
+                    .map(|name| (parent, name))
+            })?;
             components.push(name);
             current = parent;
         }
@@ -1094,7 +1095,7 @@ impl<'a> NamespaceResolver<'a> {
     /// then the lowest `(parent, name)`: a non-directory's `attr.parent` can be stale
     /// after a cross-directory rename, and a hardlink has several valid parents.
     fn indexed_binding(&self, hint_parent: Ino, ino: Ino) -> Option<(Ino, String)> {
-        let bindings = match self.vfs.sync_meta().entry_bindings_for_inode(ino) {
+        let mut bindings = match self.vfs.sync_meta().entry_bindings_for_inode(ino) {
             Ok(bindings) => bindings,
             Err(error) => {
                 tracing::warn!(
@@ -1106,12 +1107,10 @@ impl<'a> NamespaceResolver<'a> {
                 return None;
             }
         };
-        let (hinted, others): (Vec<_>, Vec<_>) = bindings
+        // Stable sort: hinted bindings first, the rest keep `(parent, name)` order.
+        bindings.sort_by_key(|&(parent, _)| parent != hint_parent);
+        bindings
             .into_iter()
-            .partition(|(parent, _)| *parent == hint_parent);
-        hinted
-            .into_iter()
-            .chain(others)
             .find(|(parent, name)| {
                 self.lookup_component(*parent, name)
                     .is_ok_and(|attr| attr.ino == ino)
