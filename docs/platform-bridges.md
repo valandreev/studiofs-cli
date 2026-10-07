@@ -283,6 +283,12 @@ WinFSP callback barrier semantics:
   may return before the bounded background local-dirty commit. The explicit
   `fsync` API owns local payload and redb durability barriers; neither operation
   waits for remote upload or peer publication.
+- The synchronous `flush` wait is bounded by
+  `STUDIOFS_WINFSP_FLUSH_CALLBACK_TIMEOUT_MS` (default 30000). On expiry the
+  callback fails with `STATUS_IO_TIMEOUT`, keeps any deferred cleanup hint for
+  the last-handle `close` barrier, and lets the admitted task finish in the
+  background. Synchronous `read`/`write` borrow WinFSP buffers and stay
+  unbounded; the mounted IO path uses their async callbacks.
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
 - WinFSP `FlushAndPurgeOnCleanup` is disabled at the driver layer by default so
   read-only file caching keeps WinFSP cache-manager behavior across close/reopen

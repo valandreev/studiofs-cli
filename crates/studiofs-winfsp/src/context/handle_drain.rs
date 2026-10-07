@@ -172,12 +172,18 @@ impl<'a> WinfspHandleDrainFacade<'a> {
 
     fn flush_local_dirty_state(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<bool> {
         let vfs = self.context.vfs.clone();
-        let outcome = self.context.spawn_wait(async move {
-            // WinFSP's FlushFileBuffers callback is the platform writeback
-            // boundary. Keep it volatile; the explicit fsync API remains the
-            // strict local durability boundary.
-            vfs.flush_volatile_writeback_with_outcome(ino, fh).await
-        })?;
+        // A timeout fails this flush before the caller clears the deferred
+        // cleanup hint, so the last-handle close barrier still covers the inode.
+        let outcome = self.context.spawn_wait_bounded(
+            async move {
+                // WinFSP's FlushFileBuffers callback is the platform writeback
+                // boundary. Keep it volatile; the explicit fsync API remains the
+                // strict local durability boundary.
+                vfs.flush_volatile_writeback_with_outcome(ino, fh).await
+            },
+            self.context.flush_callback_timeout,
+            "flush",
+        )?;
         Ok(outcome.flushed_local_dirty_state)
     }
 
@@ -414,6 +420,43 @@ mod tests {
             "deleted-path notification should remain queued for asynchronous delivery"
         );
         drop(in_flight);
+    }
+
+    #[test]
+    fn bounded_spawn_wait_fails_stalled_task_and_drops_late_result() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("bounded-spawn-wait");
+        let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let started = Instant::now();
+        let result: studiofs_vfs::VfsResult<u32> = ctx.spawn_wait_bounded(
+            async move {
+                let _ = release_rx.await;
+                let _ = done_tx.send(());
+                Ok(7)
+            },
+            Duration::from_millis(50),
+            "test",
+        );
+
+        let error = result.expect_err("stalled task must fail the callback");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            super::super::vfs_to_winfsp_err(error).to_ntstatus(),
+            super::super::STATUS_IO_TIMEOUT.0
+        );
+
+        // The abandoned task still owns its inputs and completes without a waiter.
+        release_tx.send(()).expect("release stalled task");
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("late task completion");
+
+        // A completed task within the bound returns its value unchanged.
+        let value = ctx
+            .spawn_wait_bounded(async { Ok(11_u32) }, Duration::from_secs(5), "test")
+            .expect("prompt task result");
+        assert_eq!(value, 11);
     }
 
     #[test]

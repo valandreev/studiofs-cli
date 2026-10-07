@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use buffers::{SendConstBuffer, SendMutBuffer};
 use directory_cache::{
@@ -1129,6 +1129,8 @@ pub struct StudioFsContext {
     handle_zero_fill_ranges: Mutex<HashMap<u64, HandleZeroFillRange>>,
     callback_barrier_state: CallbackBarrierState,
     directory_snapshot_cache: DirectorySnapshotCache,
+    /// Upper bound for one synchronous WinFSP flush callback wait.
+    flush_callback_timeout: Duration,
     #[cfg(test)]
     _test_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
@@ -1209,6 +1211,7 @@ impl StudioFsContext {
             handle_zero_fill_ranges: Mutex::new(HashMap::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             directory_snapshot_cache: DirectorySnapshotCache::default(),
+            flush_callback_timeout: winfsp_flush_callback_timeout(),
             #[cfg(test)]
             _test_runtime: None,
         })
@@ -1258,6 +1261,7 @@ impl StudioFsContext {
             handle_zero_fill_ranges: Mutex::new(HashMap::new()),
             callback_barrier_state: CallbackBarrierState::new(),
             directory_snapshot_cache: DirectorySnapshotCache::default(),
+            flush_callback_timeout: winfsp_flush_callback_timeout(),
             _test_runtime: Some(rt),
         }
     }
@@ -1685,29 +1689,90 @@ impl StudioFsContext {
         F: std::future::Future<Output = T> + Send + 'static,
         T: SpawnWaitFallback + Send + 'static,
     {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<std::thread::Result<T>>(1);
-        self.rt.spawn(async move {
-            let result = std::panic::AssertUnwindSafe(f).catch_unwind().await;
-            let _ = tx.send(result);
-        });
         // Park the WinFSP thread until the runtime worker finishes.
-        match rx.recv() {
-            Ok(Ok(result)) => result,
-            Ok(Err(payload)) => {
+        finish_spawn_wait(self.spawn_for_wait(f).recv().ok())
+    }
+
+    /// Like [`Self::spawn_wait`], but gives up after `timeout` and fails the
+    /// callback with `ErrorKind::TimedOut` (`STATUS_IO_TIMEOUT`).
+    ///
+    /// The future keeps running to completion on the runtime; its late result
+    /// is dropped because the receiver is gone. Only futures that own all their
+    /// inputs may use this: never pass a borrowed WinFSP buffer here.
+    fn spawn_wait_bounded<F, T>(
+        &self,
+        f: F,
+        timeout: Duration,
+        callback: &'static str,
+    ) -> studiofs_vfs::VfsResult<T>
+    where
+        F: std::future::Future<Output = studiofs_vfs::VfsResult<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let started = Instant::now();
+        match self.spawn_for_wait(f).recv_timeout(timeout) {
+            Ok(result) => finish_spawn_wait(Some(result)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => finish_spawn_wait(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 error!(
-                    panic = %panic_payload_message(payload.as_ref()),
-                    "WinFSP callback task panicked"
+                    callback,
+                    timeout_ms = timeout.as_millis(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "WinFSP callback task exceeded its wait bound; failing the callback while the task finishes in the background"
                 );
-                crate::request_shutdown();
-                T::task_panic_fallback()
-            }
-            Err(_) => {
-                error!("WinFSP callback task terminated before returning a result");
-                crate::request_shutdown();
-                T::task_panic_fallback()
+                Err(studiofs_vfs::VfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "WinFSP {callback} callback timed out after {} ms",
+                        timeout.as_millis()
+                    ),
+                )))
             }
         }
     }
+
+    fn spawn_for_wait<F, T>(&self, f: F) -> std::sync::mpsc::Receiver<std::thread::Result<T>>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::thread::Result<T>>(1);
+        self.rt.spawn(async move {
+            let result = std::panic::AssertUnwindSafe(f).catch_unwind().await;
+            // A bounded waiter may already be gone; the late result is dropped.
+            let _ = tx.send(result);
+        });
+        rx
+    }
+}
+
+fn finish_spawn_wait<T: SpawnWaitFallback>(result: Option<std::thread::Result<T>>) -> T {
+    match result {
+        Some(Ok(result)) => result,
+        Some(Err(payload)) => {
+            error!(
+                panic = %panic_payload_message(payload.as_ref()),
+                "WinFSP callback task panicked"
+            );
+            crate::request_shutdown();
+            T::task_panic_fallback()
+        }
+        None => {
+            error!("WinFSP callback task terminated before returning a result");
+            crate::request_shutdown();
+            T::task_panic_fallback()
+        }
+    }
+}
+
+fn winfsp_flush_callback_timeout() -> Duration {
+    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+    std::env::var("STUDIOFS_WINFSP_FLUSH_CALLBACK_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_TIMEOUT)
 }
 
 impl StudioFsContext {
