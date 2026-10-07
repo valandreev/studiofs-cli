@@ -85,6 +85,10 @@ impl MetaNamespace for PgMetaEngine {
         self.local.readdir(parent)
     }
 
+    fn entry_names_for_inode(&self, parent: Ino, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
+        self.local.entry_names_for_inode(parent, ino)
+    }
+
     fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
         self.mutate(|local| local.add_entry(parent, name, entry))
     }

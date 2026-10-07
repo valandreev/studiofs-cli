@@ -47,6 +47,31 @@ impl RedbMetaEngine {
 }
 
 impl MetaNamespace for RedbMetaEngine {
+    fn entry_names_for_inode(&self, parent: Ino, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
+        let txn = self.begin_read_txn()?;
+        let prefix = encode_dentry_by_inode_key(ino, parent, &[]);
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        // Serving rows first: base may still hold a name the local overlay replaced.
+        for index in [DENTRIES_BY_INODE_TABLE, BASE_DENTRIES_BY_INODE_TABLE] {
+            let index = txn
+                .open_table(index)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in index
+                .range(prefix.as_slice()..)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let Some(name) = key.value().strip_prefix(prefix.as_slice()) else {
+                    break;
+                };
+                if !names.iter().any(|known| known == name) {
+                    names.push(name.to_vec());
+                }
+            }
+        }
+        Ok(names)
+    }
+
     fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
         let txn = self.begin_read_txn()?;
         let current = txn
