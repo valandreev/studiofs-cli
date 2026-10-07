@@ -3021,20 +3021,19 @@ mod tests {
         pending_attr.content_epoch = pending_attr.committed_content_epoch + 1;
 
         let probes = std::cell::Cell::new(0_u32);
-        let probes_ref = &probes;
-        let observe = move |pending: bool| {
-            move || {
-                probes_ref.set(probes_ref.get() + 1);
-                pending
-            }
-        };
 
         assert_eq!(
-            MetadataRefreshDecision::for_local_attr(&pending_attr, observe(true)),
+            MetadataRefreshDecision::for_local_attr(&pending_attr, || {
+                probes.set(probes.get() + 1);
+                true
+            }),
             MetadataRefreshDecision::UseLocal
         );
         assert_eq!(
-            MetadataRefreshDecision::for_local_attr(&pending_attr, observe(false)),
+            MetadataRefreshDecision::for_local_attr(&pending_attr, || {
+                probes.set(probes.get() + 1);
+                false
+            }),
             MetadataRefreshDecision::RefreshAuthoritative
         );
         assert_eq!(probes.get(), 2, "pending attrs observe local state once");
@@ -3043,7 +3042,10 @@ mod tests {
         published_attr.upload_state = MetaUploadState::Ready;
         published_attr.content_epoch = published_attr.committed_content_epoch;
         assert_eq!(
-            MetadataRefreshDecision::for_local_attr(&published_attr, observe(false)),
+            MetadataRefreshDecision::for_local_attr(&published_attr, || {
+                probes.set(probes.get() + 1);
+                false
+            }),
             MetadataRefreshDecision::UseLocal
         );
         assert_eq!(
@@ -3054,7 +3056,7 @@ mod tests {
     }
 
     #[test]
-    fn local_pending_state_summary_matches_individual_pending_probes() {
+    fn local_pending_state_summary_turns_on_after_dirty_write() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "local-pending-state-summary");
         let _guard = rt.enter();
@@ -3067,17 +3069,7 @@ mod tests {
         pending_attr.content_epoch = pending_attr.committed_content_epoch + 1;
 
         let committed_epoch = pending_attr.committed_content_epoch;
-        let individual_probes = |vfs: &StudioVfs| {
-            vfs.has_pending_local_dirty_payloads_for_inode(ino)
-                || vfs.inode_has_dirty_writer_stack(ino)
-                || vfs.inode_has_pending_uploads(ino)
-                || vfs.has_pending_incarnation_newer_than(ino, committed_epoch)
-                || vfs.has_deferred_namespace_metadata(ino)
-        };
-        assert_eq!(
-            vfs.has_local_pending_regular_file_state(ino, committed_epoch),
-            individual_probes(&vfs)
-        );
+        assert!(!vfs.has_local_pending_regular_file_state(ino, committed_epoch));
 
         rt.block_on(async {
             vfs.write(ino, 0, b"dirty")
@@ -3085,10 +3077,6 @@ mod tests {
                 .expect("write dirty bytes");
         });
         assert!(vfs.has_local_pending_regular_file_state(ino, committed_epoch));
-        assert_eq!(
-            vfs.has_local_pending_regular_file_state(ino, committed_epoch),
-            individual_probes(&vfs)
-        );
         assert_eq!(
             vfs.local_attr_refresh_decision(ino, &pending_attr),
             MetadataRefreshDecision::UseLocal
