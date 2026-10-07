@@ -1728,10 +1728,20 @@ impl StudioFsContext {
         T: Send + 'static,
     {
         let (tx, rx) = std::sync::mpsc::sync_channel::<std::thread::Result<T>>(1);
+        // Keep an abandoned bounded wait visible to the shutdown drain.
+        let callback = self.async_callback_tracker.enter_task();
         self.rt.spawn(async move {
             let result = std::panic::AssertUnwindSafe(f).catch_unwind().await;
-            // A bounded waiter may already be gone; the late result is dropped.
-            let _ = tx.send(result);
+            // Release before replying so a returning caller observes quiescence.
+            drop(callback);
+            // A bounded waiter may already be gone; nobody else reports a late panic.
+            if let Err(std::sync::mpsc::SendError(Err(payload))) = tx.send(result) {
+                error!(
+                    panic = %panic_payload_message(payload.as_ref()),
+                    "abandoned WinFSP callback task panicked"
+                );
+                crate::request_shutdown();
+            }
         });
         rx
     }
@@ -2878,7 +2888,11 @@ mod tests {
         }
     }
 
-    fn make_test_vfs(tmp: &TempDir, volume_suffix: &str, rt: &Runtime) -> Arc<StudioVfs> {
+    pub(super) fn make_test_vfs(
+        tmp: &TempDir,
+        volume_suffix: &str,
+        rt: &Runtime,
+    ) -> Arc<StudioVfs> {
         let db_path = tmp.path().join("meta.redb");
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
         meta.init_root(0, 0).expect("init root");
