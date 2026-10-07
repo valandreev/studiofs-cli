@@ -500,6 +500,34 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_flush_task_panic_requests_shutdown() {
+        let _registry = crate::tests::ShutdownRegistryTestGuard::new();
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let _registration = crate::register_shutdown_sender("T:".to_string(), shutdown_tx)
+            .expect("register shutdown sender");
+        let (_tmp, _vfs, mut ctx, _queue) = make_test_context("late-flush-panic");
+        ctx.flush_callback_timeout = Duration::from_millis(50);
+        let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+
+        let error = ctx
+            .spawn_wait_flush::<_, ()>(async move {
+                let _ = release_rx.await;
+                panic!("late flush panic");
+            })
+            .expect_err("stalled task must time out");
+        assert_eq!(vfs_to_winfsp_err(error).to_ntstatus(), STATUS_IO_TIMEOUT.0);
+        assert!(
+            shutdown_rx.try_recv().is_err(),
+            "a timeout alone must not request shutdown"
+        );
+
+        release_tx.send(()).expect("release stalled task");
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("late panic must request shutdown");
+    }
+
+    #[test]
     fn cleanup_non_delete_on_write_committed_inode_skips_deferred_release_hint() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_defer_dirty");
         let attr = vfs

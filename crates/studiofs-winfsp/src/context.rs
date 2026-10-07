@@ -326,8 +326,10 @@ struct HandleZeroFillRange {
     end: u64,
 }
 
-trait SpawnWaitFallback {
+trait SpawnWaitFallback: Sized {
     fn task_panic_fallback() -> Self;
+    /// Reports a result nobody waited for; only bounded waits abandon tasks.
+    fn report_abandoned(self) {}
 }
 
 impl<T> SpawnWaitFallback for studiofs_vfs::VfsResult<T> {
@@ -335,6 +337,15 @@ impl<T> SpawnWaitFallback for studiofs_vfs::VfsResult<T> {
         Err(studiofs_vfs::VfsError::Other(
             "WinFSP callback task panicked".to_string(),
         ))
+    }
+
+    fn report_abandoned(self) {
+        if let Err(error) = self {
+            warn!(
+                error = %error,
+                "abandoned WinFSP callback task completed with an error"
+            );
+        }
     }
 }
 
@@ -1725,7 +1736,7 @@ impl StudioFsContext {
     fn spawn_for_wait<F, T>(&self, f: F) -> std::sync::mpsc::Receiver<std::thread::Result<T>>
     where
         F: std::future::Future<Output = T> + Send + 'static,
-        T: Send + 'static,
+        T: SpawnWaitFallback + Send + 'static,
     {
         let (tx, rx) = std::sync::mpsc::sync_channel::<std::thread::Result<T>>(1);
         // Keep an abandoned bounded wait visible to the shutdown drain.
@@ -1734,13 +1745,17 @@ impl StudioFsContext {
             let result = std::panic::AssertUnwindSafe(f).catch_unwind().await;
             // Release before replying so a returning caller observes quiescence.
             drop(callback);
-            // A bounded waiter may already be gone; nobody else reports a late panic.
-            if let Err(std::sync::mpsc::SendError(Err(payload))) = tx.send(result) {
-                error!(
-                    panic = %panic_payload_message(payload.as_ref()),
-                    "abandoned WinFSP callback task panicked"
-                );
-                crate::request_shutdown();
+            // A bounded waiter may already be gone; nobody else reports a late result.
+            match tx.send(result) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::SendError(Ok(late))) => late.report_abandoned(),
+                Err(std::sync::mpsc::SendError(Err(payload))) => {
+                    error!(
+                        panic = %panic_payload_message(payload.as_ref()),
+                        "abandoned WinFSP callback task panicked"
+                    );
+                    crate::request_shutdown();
+                }
             }
         });
         rx
@@ -1767,11 +1782,10 @@ fn finish_spawn_wait<T: SpawnWaitFallback>(result: Option<std::thread::Result<T>
 }
 
 fn winfsp_flush_callback_timeout() -> Duration {
-    std::env::var("STUDIOFS_WINFSP_FLUSH_CALLBACK_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|&m| m > 0)
-        .map_or(Duration::from_secs(30), Duration::from_millis)
+    Duration::from_millis(u64::from(crate::parse_positive_u32_env(
+        "STUDIOFS_WINFSP_FLUSH_CALLBACK_TIMEOUT_MS",
+        30_000,
+    )))
 }
 
 impl StudioFsContext {

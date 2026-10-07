@@ -1494,12 +1494,12 @@ mod tests {
         }
     }
 
-    struct ShutdownRegistryTestGuard {
+    pub(crate) struct ShutdownRegistryTestGuard {
         _guard: parking_lot::MutexGuard<'static, ()>,
     }
 
     impl ShutdownRegistryTestGuard {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             static TEST_MUTEX: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
             let guard = TEST_MUTEX.lock();
             clear_shutdown_registry_for_test();
