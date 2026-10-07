@@ -237,9 +237,6 @@ pub struct StudioFileHandle {
     read_callbacks: AtomicU64,
     /// Bytes served through WinFSP read callbacks for this handle.
     read_callback_bytes: AtomicU64,
-    /// EOF extension that Windows may read while closing a cached writer
-    /// handle. The newly exposed range is defined to read as zeros.
-    zero_fill_range: Mutex<Option<HandleZeroFillRange>>,
     /// WinFSP directory buffer for efficient directory enumeration.
     dir_buffer: DirBuffer,
     /// Captured text for synthetic runtime stats reads.
@@ -275,7 +272,6 @@ impl StudioFileHandle {
             disable_os_cache: false,
             read_callbacks: AtomicU64::new(0),
             read_callback_bytes: AtomicU64::new(0),
-            zero_fill_range: Mutex::new(None),
             dir_buffer: DirBuffer::new(),
             runtime_stats_snapshot: None,
         }
@@ -301,34 +297,6 @@ impl StudioFileHandle {
             self.read_callbacks.load(Ordering::Relaxed),
             self.read_callback_bytes.load(Ordering::Relaxed),
         )
-    }
-
-    fn record_zero_fill_range(&self, old_size: u64, new_size: u64) {
-        *self.zero_fill_range.lock() = (new_size > old_size).then_some(HandleZeroFillRange {
-            start: old_size,
-            end: new_size,
-        });
-    }
-
-    fn clear_zero_fill_range(&self) {
-        *self.zero_fill_range.lock() = None;
-    }
-
-    fn try_zero_fill_read(&self, buffer: &mut [u8], offset: u64) -> Option<u32> {
-        if self.is_dir || !self.open_flags.allows_write() {
-            return None;
-        }
-        let range = (*self.zero_fill_range.lock())?;
-        if offset >= range.end {
-            // At or past the extended EOF: a zero-length read, not "not my range".
-            return Some(0);
-        }
-        if offset < range.start {
-            return None;
-        }
-        let len = range.end.saturating_sub(offset).min(buffer.len() as u64) as usize;
-        buffer[..len].fill(0);
-        Some(len as u32)
     }
 }
 
@@ -370,12 +338,6 @@ impl Drop for PendingStudioFileHandle<'_> {
             self.context.release_unreturned_handle(handle);
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HandleZeroFillRange {
-    start: u64,
-    end: u64,
 }
 
 trait SpawnWaitFallback: Sized {
@@ -1635,21 +1597,10 @@ impl StudioFsContext {
             FileSizeCallbackAction::KeepLogicalSize => {
                 self.vfs.getattr(ino).map_err(vfs_to_winfsp_err)?
             }
-            FileSizeCallbackAction::SetLogicalSize(new_size) => {
-                let old_size = self
-                    .vfs
-                    .peek_dirty_attr(ino)
-                    .map(|attr| attr.size)
-                    .map(Ok)
-                    .unwrap_or_else(|| self.vfs.getattr(ino).map(|attr| attr.size))
-                    .map_err(vfs_to_winfsp_err)?;
-                let attr = self
-                    .vfs
-                    .setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(new_size))
-                    .map_err(vfs_to_winfsp_err)?;
-                handle.record_zero_fill_range(old_size, attr.size);
-                attr
-            }
+            FileSizeCallbackAction::SetLogicalSize(new_size) => self
+                .vfs
+                .setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(new_size))
+                .map_err(vfs_to_winfsp_err)?,
         };
         Self::write_file_info(file_info, &attr);
         Ok(())
@@ -2227,16 +2178,6 @@ impl FileSystemContext for StudioFsContext {
                 bytes, offset, buffer,
             ));
         }
-        if let Some(n) = context.try_zero_fill_read(buffer, offset) {
-            trace!(
-                ino = context.ino,
-                fh = context.fh,
-                offset,
-                n,
-                "read zero-filled sparse EOF extension"
-            );
-            return Ok(n);
-        }
 
         // Spawn the async read on a tokio worker thread so the WinFSP
         // dispatch thread doesn't participate in IO polling.
@@ -2290,7 +2231,6 @@ impl FileSystemContext for StudioFsContext {
     ) -> winfsp::Result<u32> {
         self.ensure_writable()?;
         self.vfs.note_winfsp_write_callback();
-        context.clear_zero_fill_range();
         let callback_started = Instant::now();
         // Resolve actual write offset.  Prefer the in-memory dirty attr (free)
         // and fall back to the full getattr only when there is no dirty state.
@@ -3884,69 +3824,6 @@ mod tests {
     }
 
     #[test]
-    fn sparse_eof_growth_zero_fills_tail_reads_on_writer_handle() {
-        let handle = StudioFileHandle::new(42, false, 7, OpenFlags::WRONLY);
-        handle.record_zero_fill_range(1024, 4096);
-
-        let mut before_tail = vec![0xAA; 512];
-        assert_eq!(
-            handle.try_zero_fill_read(&mut before_tail, 768),
-            None,
-            "reads before the sparse EOF extension must use the normal VFS path"
-        );
-        assert!(before_tail.iter().all(|byte| *byte == 0xAA));
-
-        let mut tail = vec![0xAA; 1024];
-        assert_eq!(handle.try_zero_fill_read(&mut tail, 2048), Some(1024));
-        assert!(tail.iter().all(|byte| *byte == 0));
-
-        let mut crossing_eof = vec![0xAA; 1024];
-        assert_eq!(
-            handle.try_zero_fill_read(&mut crossing_eof, 3584),
-            Some(512)
-        );
-        assert!(crossing_eof[..512].iter().all(|byte| *byte == 0));
-        assert!(crossing_eof[512..].iter().all(|byte| *byte == 0xAA));
-
-        assert_eq!(handle.try_zero_fill_read(&mut crossing_eof, 4096), Some(0));
-    }
-
-    #[test]
-    fn sparse_eof_zero_fill_is_scoped_to_write_file_handles_and_cleared_on_shrink() {
-        let writer = StudioFileHandle::new(42, false, 7, OpenFlags::WRONLY);
-        let sibling_writer = StudioFileHandle::new(42, false, 9, OpenFlags::WRONLY);
-        let reader = StudioFileHandle::new(42, false, 7, OpenFlags::RDONLY);
-        let dir_writer = StudioFileHandle::new(ROOT_INO, true, 8, OpenFlags::WRONLY);
-        writer.record_zero_fill_range(1024, 4096);
-        reader.record_zero_fill_range(1024, 4096);
-        dir_writer.record_zero_fill_range(1024, 4096);
-
-        let mut buf = vec![0xAA; 16];
-        assert_eq!(reader.try_zero_fill_read(&mut buf, 1024), None);
-        assert_eq!(dir_writer.try_zero_fill_read(&mut buf, 1024), None);
-        assert_eq!(
-            sibling_writer.try_zero_fill_read(&mut buf, 1024),
-            None,
-            "zero-fill state belongs to the handle that extended EOF"
-        );
-
-        writer.clear_zero_fill_range();
-        assert_eq!(
-            writer.try_zero_fill_read(&mut buf, 2048),
-            None,
-            "a write must clear the sparse EOF extension"
-        );
-
-        writer.record_zero_fill_range(1024, 4096);
-        writer.record_zero_fill_range(4096, 2048);
-        assert_eq!(
-            writer.try_zero_fill_read(&mut buf, 2048),
-            None,
-            "shrinks must clear stale sparse EOF extension state"
-        );
-    }
-
-    #[test]
     fn winfsp_create_disposition_identifies_truncate_on_existing_open() {
         assert!(should_truncate_existing_file_on_open(
             0x0400_0000,
@@ -4401,6 +4278,87 @@ mod tests {
             })
             .expect("read replacement");
         assert_eq!(readback.as_ref(), b"new");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release handle");
+    }
+
+    #[test]
+    fn async_sparse_eof_growth_reads_zeros_and_keeps_later_writes() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("async-sparse-eof-growth");
+        let attr = vfs
+            .create(ROOT_INO, b"sparse-eof.bin", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        let write = |data: &[u8], offset: u64| {
+            let mut file_info = winfsp::filesystem::FileInfo::default();
+            ctx.rt
+                .block_on(AsyncFileSystemContext::write_async(
+                    &ctx,
+                    &handle,
+                    data,
+                    offset,
+                    false,
+                    false,
+                    &mut file_info,
+                ))
+                .expect("write_async")
+        };
+        let read = |offset: u64, len: usize| {
+            let mut buf = vec![0xEE; len];
+            let n = ctx
+                .rt
+                .block_on(AsyncFileSystemContext::read_async(
+                    &ctx, &handle, &mut buf, offset,
+                ))
+                .expect("read_async");
+            buf.truncate(n as usize);
+            buf
+        };
+        let mut set_size = |size: u64| {
+            <StudioFsContext as FileSystemContext>::set_file_size(
+                &ctx,
+                &handle,
+                size,
+                false,
+                &mut file_info,
+            )
+            .expect("set_file_size");
+        };
+
+        // Shrink then grow, so stale payload bytes past the old EOF could leak.
+        assert_eq!(write(&[0xAB; 2048], 0), 2048);
+        set_size(1024);
+        set_size(2048);
+        set_size(4096);
+
+        assert_eq!(read(0, 1024), vec![0xAB; 1024]);
+        assert_eq!(
+            read(1024, 3072),
+            vec![0; 3072],
+            "extended EOF range must read as zeros"
+        );
+        assert_eq!(
+            read(3584, 1024),
+            vec![0; 512],
+            "read across the new EOF is short"
+        );
+        assert!(read(4096, 16).is_empty());
+
+        assert_eq!(write(b"fresh", 2048), 5);
+        assert_eq!(
+            read(2048, 5),
+            b"fresh",
+            "a write into the range must not be masked"
+        );
+        assert_eq!(read(1024, 1024), vec![0; 1024]);
 
         ctx.spawn_wait({
             let vfs = vfs.clone();
