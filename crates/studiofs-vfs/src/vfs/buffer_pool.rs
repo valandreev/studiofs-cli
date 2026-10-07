@@ -91,9 +91,7 @@ impl AsRef<[u8]> for ReadWindowBuffer {
 
 impl Drop for ReadWindowBuffer {
     fn drop(&mut self) {
-        if self.buffer.capacity() <= self.pool.chunk_size {
-            self.pool.release(std::mem::take(&mut self.buffer));
-        }
+        self.pool.release(std::mem::take(&mut self.buffer));
     }
 }
 
@@ -165,73 +163,12 @@ mod tests {
     }
 
     #[test]
-    fn read_window_pool_caps_count_and_rejects_oversized_buffers() {
+    fn read_window_pool_caps_count() {
         let pool = BufferPool::new(8, 1);
         let first = pool.acquire_read_window(8);
         let second = pool.acquire_read_window(8);
         drop(first);
         drop(second);
         assert_eq!(pool.inner.lock().len(), 1);
-
-        let oversized_pool = BufferPool::new(8, 1);
-        let oversized = oversized_pool.acquire_read_window(9);
-        drop(oversized);
-        assert!(oversized_pool.inner.lock().is_empty());
-    }
-
-    #[test]
-    #[ignore = "manual release microbenchmark; run with --release --ignored --exact"]
-    fn read_window_storage_microbenchmark() {
-        use std::{hint::black_box, time::Instant};
-
-        const PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
-        const ITERATIONS: usize = 256;
-        const WARMUP_LEASES: usize = 2;
-
-        let mut baseline_cache = Bytes::new();
-        for iteration in 0..WARMUP_LEASES {
-            let mut buffer = vec![0; PAYLOAD_BYTES];
-            black_box(&buffer[..]);
-            buffer.fill(iteration as u8);
-            baseline_cache = Bytes::from(buffer);
-            black_box(baseline_cache.as_ref());
-        }
-        let started = Instant::now();
-        for iteration in 0..ITERATIONS {
-            let mut buffer = vec![0; PAYLOAD_BYTES];
-            black_box(&buffer[..]);
-            buffer.fill(iteration as u8);
-            baseline_cache = Bytes::from(buffer);
-            black_box(baseline_cache.as_ref());
-        }
-        let baseline_duration_ns = started.elapsed().as_nanos();
-        drop(baseline_cache);
-
-        let pool = BufferPool::new(PAYLOAD_BYTES, 1);
-        let mut pooled_cache = None;
-        for iteration in 0..WARMUP_LEASES {
-            let mut window = pool.acquire_read_window(PAYLOAD_BYTES);
-            black_box(window.as_ref());
-            window.as_mut().fill(iteration as u8);
-            pooled_cache = Some(window.into_bytes(PAYLOAD_BYTES));
-            black_box(pooled_cache.as_ref().unwrap().as_ref());
-        }
-        let started = Instant::now();
-        for iteration in 0..ITERATIONS {
-            let mut window = pool.acquire_read_window(PAYLOAD_BYTES);
-            black_box(window.as_ref());
-            window.as_mut().fill(iteration as u8);
-            let previous = pooled_cache.replace(window.into_bytes(PAYLOAD_BYTES));
-            drop(previous);
-            black_box(pooled_cache.as_ref().unwrap().as_ref());
-        }
-        let pooled_duration_ns = started.elapsed().as_nanos();
-        drop(pooled_cache);
-
-        eprintln!(
-            "SFS-780 read-window microbenchmark: iterations={ITERATIONS} payload_bytes={PAYLOAD_BYTES} baseline_duration_ns={baseline_duration_ns} baseline_logical_bytes_written={} pooled_duration_ns={pooled_duration_ns} pooled_logical_bytes_written={} warmup_leases={WARMUP_LEASES}",
-            ITERATIONS * PAYLOAD_BYTES * 2,
-            ITERATIONS * PAYLOAD_BYTES,
-        );
     }
 }

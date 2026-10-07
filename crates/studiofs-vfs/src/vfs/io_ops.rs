@@ -230,7 +230,7 @@ impl StudioVfs {
                 )
                 .await?;
             let read = buffer.len().min(written);
-            buffer[..read].copy_from_slice(&window.as_mut()[..read]);
+            buffer[..read].copy_from_slice(&window.as_ref()[..read]);
             if let Some(open_file) = &open_file {
                 open_file.replace_read_window(ino, offset, window.into_bytes(written));
             }

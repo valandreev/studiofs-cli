@@ -7,7 +7,7 @@ last owner is dropped; errors and cancellation return the lease automatically.
 Pool misses and growth still allocate/initialize, and each Bytes owner has a
 small allocation. There is no unsafe output API or dependency change.
 
-Focused validation passed: `read_window` 10 passed / 1 ignored, `buffer_pool`
+Initial focused validation passed: `read_window` 10 passed / 1 ignored, `buffer_pool`
 6 passed / 1 ignored, and `read_into_fh_` 3 passed. Filters overlap. Crate check,
 Clippy with `--all-targets -- -D warnings`, and formatting passed. The first
 sandbox test failed during local payload persistence with PermissionDenied;
@@ -15,8 +15,8 @@ the same focused command passed outside the sandbox. No full suite ran.
 
 ## Storage microbenchmark
 
-The ignored `read_window_storage_microbenchmark` test replaces 256 cached
-4 MiB windows. The current buffer_pool.rs was compiled as an isolated test
+The initial storage microbenchmark replaced 256 cached 4 MiB windows. The
+then-current buffer_pool.rs was compiled as an isolated test
 module with `rustc --test --edition=2024 -C opt-level=3`, existing release
 bytes/parking_lot dependencies, and MiMalloc as the global allocator to match
 the product. Three runs took **47.74–60.05 ms fresh versus 24.82–27.58 ms
@@ -28,9 +28,14 @@ versus 1 GiB (overwrite after warmup). This is an estimate of eliminated writes,
 not a hardware memory-bandwidth measurement. Pointer/content regression tests
 prove that warmed storage is reused without clearing it.
 
-The committed focused test can also run with the test binary's default allocator:
+The manual benchmark was removed from the unit-test module during review;
+these historical results and raw logs remain available.
 
-    cargo test -p studiofs-vfs --lib vfs::buffer_pool::tests::read_window_storage_microbenchmark --release -- --ignored --exact --nocapture
+Review follow-up also removed the unreachable oversized-buffer Drop filter and
+test case: the sole production acquisition clamps to the fixed 4 MiB window.
+The pool-count cap test remains, and prefix copies now borrow through `as_ref()`.
+Focused follow-up validation passed: `buffer_pool` 6/6, `read_into_fh_` 3/3,
+and crate Clippy with `--all-targets -- -D warnings`.
 
 ## Mounted Windows comparison
 
