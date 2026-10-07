@@ -308,26 +308,6 @@ impl WinfspInvalidationQueue {
         state.delivery.failed_notifications = state.delivery.failed_notifications.saturating_add(1);
     }
 
-    pub(super) fn defer_for_writer(&self, vfs: &StudioVfs, path: &str) -> bool {
-        let deferred = match vfs
-            .namespace_resolver(NamespacePathStyle::Windows)
-            .resolve_path(path)
-        {
-            Ok(attr) => vfs.defer_kernel_invalidation_for_active_writer(attr.ino),
-            Err(studiofs_vfs::VfsError::Meta(
-                studiofs_meta::MetaError::EntryNotFound { .. }
-                | studiofs_meta::MetaError::InodeNotFound(_),
-            )) => false,
-            Err(_) => false,
-        };
-        if deferred {
-            let mut state = self.state.lock();
-            state.delivery.deferred_notifications =
-                state.delivery.deferred_notifications.saturating_add(1);
-        }
-        deferred
-    }
-
     fn defer_inode_writer(&self, vfs: &StudioVfs, ino: Ino) -> bool {
         if !vfs.defer_kernel_invalidation_for_active_writer(ino) {
             return false;
@@ -439,7 +419,7 @@ impl WinfspInvalidationQueue {
         }
         for (index, intent) in batch.intents.iter().enumerate() {
             let mut add = |ino, path: String, kind, action, filter| {
-                if self.defer_inode_writer(&vfs, ino) || self.defer_for_writer(&vfs, &path) {
+                if self.defer_inode_writer(&vfs, ino) {
                     writer_deferred = true;
                 }
                 if path.encode_utf16().count() >= 512 || path.contains('\0') {
@@ -860,9 +840,7 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 )
             };
 
-            if self.invalidation_queue.defer_inode_writer(&self.vfs, ino)
-                || self.invalidation_queue.defer_for_writer(&self.vfs, &path)
-            {
+            if self.invalidation_queue.defer_inode_writer(&self.vfs, ino) {
                 self.invalidation_queue
                     .push_path_preserving_deferred_age(ino, path, kind, action, filter);
                 continue;
@@ -898,9 +876,6 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
             if self
                 .invalidation_queue
                 .defer_inode_writer(&self.vfs, notification.ino)
-                || self
-                    .invalidation_queue
-                    .defer_for_writer(&self.vfs, &notification.path)
             {
                 self.invalidation_queue.push_path_preserving_deferred_age(
                     notification.ino,
