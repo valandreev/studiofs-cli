@@ -72,6 +72,9 @@ pub(super) struct ReadWindowBuffer {
 
 impl ReadWindowBuffer {
     pub(super) fn into_bytes(mut self, written: usize) -> bytes::Bytes {
+        if written == 0 {
+            return bytes::Bytes::new();
+        }
         self.visible_len = written.min(self.visible_len);
         bytes::Bytes::from_owner(self)
     }
@@ -150,6 +153,17 @@ mod tests {
         let bytes = window.into_bytes(3);
 
         assert_eq!(bytes, Bytes::from_static(b"abc"));
+    }
+
+    #[test]
+    fn zero_length_read_window_returns_buffer_to_pool_immediately() {
+        let pool = BufferPool::new(8, 1);
+        let window = pool.acquire_read_window(8);
+
+        let bytes = window.into_bytes(0);
+
+        assert!(bytes.is_empty());
+        assert_eq!(pool.inner.lock().len(), 1);
     }
 
     #[test]
