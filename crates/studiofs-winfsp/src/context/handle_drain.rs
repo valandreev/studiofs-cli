@@ -172,7 +172,13 @@ impl<'a> WinfspHandleDrainFacade<'a> {
 
     fn flush_local_dirty_state(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<bool> {
         let vfs = self.context.vfs.clone();
-        let outcome = self.context.spawn_wait(async move {
+        // A timeout fails this flush before the caller clears the deferred
+        // cleanup hint, so the last-handle close barrier still covers the inode.
+        // On that error `with_flush_gate` drops its per-inode lock, so a later
+        // flush may overlap the abandoned task. That is safe because this VFS
+        // call only waits for the release barrier and then idempotently
+        // schedules materialization.
+        let outcome = self.context.spawn_wait_flush(async move {
             // WinFSP's FlushFileBuffers callback is the platform writeback
             // boundary. Keep it volatile; the explicit fsync API remains the
             // strict local durability boundary.
@@ -371,9 +377,13 @@ mod tests {
     use winfsp::notify::NotifyingFileSystemContext;
 
     use super::super::tests::{
-        flush_barrier_calls, make_test_context, winfsp_callbacks, winfsp_foreground_flushes,
+        flush_barrier_calls, make_test_context, make_test_vfs, winfsp_callbacks,
+        winfsp_foreground_flushes,
     };
-    use super::super::{PreparedWinfspNotifications, StudioFsContext};
+    use super::super::{
+        PreparedWinfspNotifications, STATUS_IO_TIMEOUT, StudioFsContext, WinfspInvalidationQueue,
+        vfs_to_winfsp_err,
+    };
     use super::WinfspHandleDrainFacade;
 
     #[test]
@@ -414,6 +424,108 @@ mod tests {
             "deleted-path notification should remain queued for asynchronous delivery"
         );
         drop(in_flight);
+    }
+
+    #[test]
+    fn flush_timeout_keeps_deferred_hint_for_close_and_tracks_late_task() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let vfs_rt = Arc::new(tokio::runtime::Runtime::new().expect("vfs runtime"));
+        let vfs = make_test_vfs(&tmp, "flush-timeout-hint", &vfs_rt);
+        // Nothing drives this runtime until the test does, so the flush task stalls.
+        let callback_rt = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("callback runtime"),
+        );
+        let mut ctx = StudioFsContext::new_for_tests(
+            vfs.clone(),
+            callback_rt.clone(),
+            WinfspInvalidationQueue::new(&vfs),
+            false,
+        );
+        ctx.flush_callback_timeout = Duration::from_millis(50);
+        let attr = vfs
+            .create(ROOT_INO, b"flush-timeout.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        ctx.callback_barrier_state
+            .set_deferred_cleanup_hint(attr.ino);
+        let facade = WinfspHandleDrainFacade::new(&ctx);
+
+        let error = facade
+            .flush(attr.ino, fh)
+            .expect_err("stalled flush must time out");
+        assert_eq!(vfs_to_winfsp_err(error).to_ntstatus(), STATUS_IO_TIMEOUT.0);
+        assert!(
+            ctx.callback_barrier_state
+                .has_deferred_cleanup_hint(attr.ino),
+            "timed-out flush must keep the hint for the last-handle close barrier"
+        );
+        let tracker = ctx.async_callback_tracker();
+        assert_eq!(
+            tracker.in_flight(),
+            1,
+            "abandoned flush task must stay visible to the shutdown drain"
+        );
+
+        facade.close(attr.ino, fh);
+        assert!(
+            !ctx.callback_barrier_state
+                .has_deferred_cleanup_hint(attr.ino),
+            "last-handle close must consume the retained hint"
+        );
+
+        callback_rt
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while tracker.in_flight() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+            })
+            .expect("abandoned flush task drains");
+    }
+
+    #[test]
+    fn spawn_wait_flush_returns_prompt_result() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("bounded-spawn-wait");
+        let value = ctx
+            .spawn_wait_flush(async { Ok(11_u32) })
+            .expect("prompt task result");
+        assert_eq!(value, 11);
+        assert_eq!(ctx.async_callback_tracker().in_flight(), 0);
+    }
+
+    #[test]
+    fn abandoned_flush_task_panic_requests_shutdown() {
+        let _registry = crate::tests::ShutdownRegistryTestGuard::new();
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let _registration = crate::register_shutdown_sender("T:".to_string(), shutdown_tx)
+            .expect("register shutdown sender");
+        let (_tmp, _vfs, mut ctx, _queue) = make_test_context("late-flush-panic");
+        ctx.flush_callback_timeout = Duration::from_millis(50);
+        let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+
+        let error = ctx
+            .spawn_wait_flush::<_, ()>(async move {
+                let _ = release_rx.await;
+                panic!("late flush panic");
+            })
+            .expect_err("stalled task must time out");
+        assert_eq!(vfs_to_winfsp_err(error).to_ntstatus(), STATUS_IO_TIMEOUT.0);
+        assert!(
+            shutdown_rx.try_recv().is_err(),
+            "a timeout alone must not request shutdown"
+        );
+
+        release_tx.send(()).expect("release stalled task");
+        shutdown_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("late panic must request shutdown");
     }
 
     #[test]
