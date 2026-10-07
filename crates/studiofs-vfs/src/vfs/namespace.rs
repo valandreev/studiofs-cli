@@ -1091,10 +1091,19 @@ impl<'a> NamespaceResolver<'a> {
     }
 
     fn indexed_child_name(&self, parent: Ino, ino: Ino) -> Option<String> {
-        self.vfs
-            .sync_meta()
-            .entry_names_for_inode(parent, ino)
-            .ok()?
+        let names = match self.vfs.sync_meta().entry_names_for_inode(parent, ino) {
+            Ok(names) => names,
+            Err(error) => {
+                tracing::warn!(
+                    parent,
+                    ino,
+                    %error,
+                    "reverse dentry index lookup failed; scanning the parent directory"
+                );
+                return None;
+            }
+        };
+        names
             .into_iter()
             .find(|name| {
                 self.lookup_component(parent, name)
