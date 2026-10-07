@@ -162,6 +162,10 @@ impl WinfspAsyncCallbackTracker {
         }
     }
 
+    /// Counts work even after `close`: WinFSP has already returned
+    /// STATUS_PENDING for futures queued via `spawn_task`, so they must run to
+    /// complete the request (their own `try_enter` then reports
+    /// STATUS_CANCELLED) and the shutdown drain must wait for them.
     fn enter_task(self: &Arc<Self>) -> AsyncCallbackGuard {
         self.state.fetch_add(1, Ordering::AcqRel);
         AsyncCallbackGuard {
@@ -172,7 +176,7 @@ impl WinfspAsyncCallbackTracker {
     fn leave(&self) {
         let previous = self.state.fetch_sub(1, Ordering::AcqRel);
         debug_assert!((previous & !ASYNC_CALLBACK_CLOSED) > 0);
-        if previous == ASYNC_CALLBACK_CLOSED | 1 {
+        if previous == (ASYNC_CALLBACK_CLOSED | 1) {
             // Taking the lock orders this notify after a waiter's count check.
             let _lock = self.quiescent_lock.lock();
             self.quiescent.notify_all();
@@ -316,6 +320,7 @@ impl StudioFileHandle {
         }
         let range = (*self.zero_fill_range.lock())?;
         if offset >= range.end {
+            // At or past the extended EOF: a zero-length read, not "not my range".
             return Some(0);
         }
         if offset < range.start {
