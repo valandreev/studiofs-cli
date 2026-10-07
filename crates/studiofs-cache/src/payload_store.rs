@@ -41,7 +41,7 @@ const FAST_BATCH_STAGING_MAX_CONCURRENCY: usize = 4;
 /// Bounds idle unbuffered-read scratch memory to 4 x 8 MiB.
 #[cfg(windows)]
 const MAX_POOLED_UNBUFFERED_READ_BUFFERS: usize = 4;
-/// Covers a 4 MiB block plus alignment slack and `Vec` growth headroom.
+/// Covers a 4 MiB block plus alignment slack; scratch buffers grow exactly.
 #[cfg(windows)]
 const MAX_RETAINED_UNBUFFERED_READ_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
@@ -1192,20 +1192,26 @@ impl FilePayloadStore {
             .unbuffered_read_attempts
             .fetch_add(1, Ordering::Relaxed);
 
+        // Aligned destinations are read directly and leave pooled scratch for other readers.
         #[cfg(windows)]
-        let mut scratch = self
-            .shared
-            .unbuffered_read_scratch
-            .lock()
-            .pop()
-            .unwrap_or_default();
+        let pooled = !platform::is_windows_unbuffered_ptr_aligned(out.as_ptr() as usize, alignment);
+        #[cfg(windows)]
+        let mut scratch = if pooled {
+            self.shared
+                .unbuffered_read_scratch
+                .lock()
+                .pop()
+                .unwrap_or_default()
+        } else {
+            platform::UnbufferedReadBuffer::new()
+        };
         #[cfg(not(windows))]
         let mut scratch = platform::UnbufferedReadBuffer::new();
         let result =
             platform::read_unbuffered_with_buffer(file, out, start, &mut scratch, alignment);
         // Recycle only after the synchronous read returned; oversized or surplus buffers drop.
         #[cfg(windows)]
-        if scratch.retained_bytes() <= MAX_RETAINED_UNBUFFERED_READ_BUFFER_BYTES {
+        if pooled && scratch.retained_bytes() <= MAX_RETAINED_UNBUFFERED_READ_BUFFER_BYTES {
             let mut pool = self.shared.unbuffered_read_scratch.lock();
             if pool.len() < MAX_POOLED_UNBUFFERED_READ_BUFFERS {
                 pool.push(scratch);
@@ -2237,20 +2243,63 @@ mod tests {
         // Offset the destination by one byte so the read must use pooled scratch.
         let mut backing = vec![0_u8; large + 1];
 
-        assert_eq!(
-            store.read_into(4302, 0, &mut backing[1..]),
-            Some(large)
-        );
+        assert_eq!(store.read_into(4302, 0, &mut backing[1..]), Some(large));
         assert!(store.shared.unbuffered_read_scratch.lock().is_empty());
 
+        assert_eq!(store.read_into(4302, 0, &mut backing[1..4097]), Some(4096));
+        {
+            let pool = store.shared.unbuffered_read_scratch.lock();
+            assert_eq!(pool.len(), 1);
+            assert!(pool[0].retained_bytes() <= MAX_RETAINED_UNBUFFERED_READ_BUFFER_BYTES);
+        }
+        assert_eq!(store.read_mode_snapshot().unbuffered_read_successes, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn aligned_unbuffered_reads_leave_pooled_scratch_available() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open_with_modes(
+            layout,
+            LocalPayloadSyncMode::Fast,
+            LocalPayloadWriteMode::Buffered,
+            LocalPayloadReadMode::Unbuffered,
+        )
+        .unwrap();
+        store.put(4303, &[0xCD; 4096]).unwrap();
+        let mut backing = vec![0_u8; 2 * 4096 + 1];
+        let base = backing.as_ptr() as usize;
+        let aligned = base.next_multiple_of(4096) - base;
+        // Seed the pool through an unaligned destination.
+        let unaligned = if aligned == 0 { 1 } else { 0 };
         assert_eq!(
-            store.read_into(4302, 0, &mut backing[1..4097]),
+            store.read_into(4303, 0, &mut backing[unaligned..unaligned + 4096]),
             Some(4096)
         );
-        let pool = store.shared.unbuffered_read_scratch.lock();
-        assert_eq!(pool.len(), 1);
-        assert!(pool[0].retained_bytes() <= MAX_RETAINED_UNBUFFERED_READ_BUFFER_BYTES);
-        assert_eq!(store.read_mode_snapshot().unbuffered_read_successes, 2);
+        assert_eq!(store.shared.unbuffered_read_scratch.lock().len(), 1);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let store = &store;
+            let out = &mut backing[aligned..aligned + 4096];
+            let reader = scope.spawn(move || {
+                platform::PREAD_TEST_GATE.with(|gate| {
+                    *gate.borrow_mut() = Some((entered_tx, release_rx));
+                });
+                store.read_into(4303, 0, out)
+            });
+            let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+            let pooled = store.shared.unbuffered_read_scratch.lock().len();
+            let _ = release_tx.send(());
+            assert!(entered.is_ok(), "aligned read must reach the platform read");
+            assert_eq!(pooled, 1, "aligned reads must not borrow pooled scratch");
+            assert_eq!(reader.join().unwrap(), Some(4096));
+        });
     }
 
     #[test]

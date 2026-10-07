@@ -573,6 +573,9 @@ impl UnbufferedReadBuffer {
         let alignment = normalized_unbuffered_write_alignment(alignment);
         let required_len = len.saturating_add(alignment - 1);
         if self.backing.len() < required_len {
+            // Exact growth keeps retained capacity at the largest request, without doubling.
+            self.backing
+                .reserve_exact(required_len - self.backing.len());
             self.backing.resize(required_len, 0);
         }
         let base = self.backing.as_ptr() as usize;
@@ -587,7 +590,7 @@ fn normalized_unbuffered_write_alignment(alignment: usize) -> usize {
 }
 
 #[cfg(windows)]
-fn is_windows_unbuffered_ptr_aligned(ptr: usize, alignment: usize) -> bool {
+pub(crate) fn is_windows_unbuffered_ptr_aligned(ptr: usize, alignment: usize) -> bool {
     ptr.is_multiple_of(normalized_unbuffered_write_alignment(alignment))
 }
 
@@ -981,6 +984,18 @@ mod tests {
 
         assert_eq!(aligned, data);
         assert!((aligned.as_ptr() as usize).is_multiple_of(8192));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unbuffered_read_scratch_grows_exactly() {
+        const MIB: usize = 1024 * 1024;
+        let mut scratch = UnbufferedReadBuffer::new();
+
+        scratch.aligned_mut(2 * MIB + 4096, 4096);
+        scratch.aligned_mut(4 * MIB, 4096);
+
+        assert_eq!(scratch.retained_bytes(), 4 * MIB + 4095);
     }
 
     #[cfg(windows)]
