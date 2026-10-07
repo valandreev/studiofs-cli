@@ -308,7 +308,7 @@ impl WinfspInvalidationQueue {
         state.delivery.failed_notifications = state.delivery.failed_notifications.saturating_add(1);
     }
 
-    pub(super) fn defer_inode_writer(&self, vfs: &StudioVfs, ino: Ino) -> bool {
+    fn defer_inode_writer(&self, vfs: &StudioVfs, ino: Ino) -> bool {
         if !vfs.defer_kernel_invalidation_for_active_writer(ino) {
             return false;
         }
