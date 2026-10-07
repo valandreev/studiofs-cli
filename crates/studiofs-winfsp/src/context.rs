@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use buffers::{SendConstBuffer, SendMutBuffer};
+use buffers::SendConstBuffer;
 use directory_cache::{
     CachedDirInfo, DirectorySnapshot, DirectorySnapshotCache, DirectorySnapshotCacheKey,
     DirectorySnapshotChild, prepare_directory_entry,
@@ -2164,62 +2164,6 @@ impl FileSystemContext for StudioFsContext {
         Ok(())
     }
 
-    fn read(
-        &self,
-        context: &Self::FileContext,
-        buffer: &mut [u8],
-        offset: u64,
-    ) -> winfsp::Result<u32> {
-        if self.vfs.is_runtime_stats_file_ino(context.ino) {
-            let Some(bytes) = context.runtime_stats_snapshot.as_deref() else {
-                return Err(winfsp::FspError::from(STATUS_INVALID_PARAMETER));
-            };
-            return Ok(studiofs_vfs::read_runtime_stats_buffer(
-                bytes, offset, buffer,
-            ));
-        }
-
-        // Spawn the async read on a tokio worker thread so the WinFSP
-        // dispatch thread doesn't participate in IO polling.
-        let ino = context.ino;
-        let fh = context.fh;
-        let out_buf = SendMutBuffer::from_slice(buffer);
-        let vfs = self.vfs.clone();
-        let callback_start = Instant::now();
-
-        let result: Result<u32, _> = self.spawn_wait(async move {
-            // SAFETY:
-            // - `out_buf` originates from the WinFSP-provided `buffer` and remains
-            //   valid for the duration of this callback.
-            // - `spawn_wait` blocks until this task completes, so the caller cannot
-            //   observe or alias `buffer` concurrently while this mutable slice exists.
-            // - `u8` alignment is always valid (alignment = 1).
-            let out = unsafe { out_buf.into_mut_slice() };
-            vfs.read_into_fh(fh, ino, offset, out).await
-        });
-
-        match result {
-            Ok(n) => {
-                self.vfs
-                    .record_winfsp_read_callback_observability(n, callback_start.elapsed());
-                context.record_read_callback(n);
-                if !context.disable_os_cache {
-                    self.vfs.note_winfsp_os_cache_miss_read(n);
-                }
-                trace!(
-                    ino,
-                    fh,
-                    offset,
-                    n,
-                    open_flags = context.open_flags.bits(),
-                    "read"
-                );
-                Ok(n)
-            }
-            Err(e) => Err(vfs_to_winfsp_err(e)),
-        }
-    }
-
     fn write(
         &self,
         context: &Self::FileContext,
@@ -2588,16 +2532,36 @@ impl AsyncFileSystemContext for StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> impl std::future::Future<Output = winfsp::Result<u32>> + Send {
+        let callback_start = Instant::now();
+        // The mount dispatches reads only here (`new_with_timer_async`), so the
+        // synthetic runtime stats file must be served from this callback.
+        let runtime_stats_read = self.vfs.is_runtime_stats_file_ino(context.ino).then(|| {
+            match context.runtime_stats_snapshot.as_deref() {
+                Some(bytes) => Ok(studiofs_vfs::read_runtime_stats_buffer(
+                    bytes, offset, buffer,
+                )),
+                None => Err(winfsp::FspError::from(STATUS_INVALID_PARAMETER)),
+            }
+        });
         let ino = context.ino;
         let fh = context.fh;
         let open_flags = context.open_flags;
+        let disable_os_cache = context.disable_os_cache;
         let vfs = self.vfs.clone();
         let async_callback_tracker = self.async_callback_tracker.clone();
 
         async move {
+            if let Some(result) = runtime_stats_read {
+                return result;
+            }
             let _callback = async_callback_tracker.try_enter()?;
             match vfs.read_into_fh(fh, ino, offset, buffer).await {
                 Ok(n) => {
+                    vfs.record_winfsp_read_callback_observability(n, callback_start.elapsed());
+                    context.record_read_callback(n);
+                    if !disable_os_cache {
+                        vfs.note_winfsp_os_cache_miss_read(n);
+                    }
                     trace!(ino, fh, offset, n, open_flags = open_flags.bits(), "read");
                     Ok(n)
                 }
@@ -2815,7 +2779,6 @@ mod tests {
     fn callback_buffer_helpers_live_in_focused_module_and_remain_send() {
         fn assert_send<T: Send>() {}
 
-        assert_send::<super::buffers::SendMutBuffer>();
         assert_send::<super::buffers::SendConstBuffer>();
     }
 
@@ -4218,6 +4181,35 @@ mod tests {
     }
 
     #[test]
+    fn winfsp_runtime_stats_async_read_serves_open_snapshot() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-async-read");
+        let file_name = U16CString::from_str(r"\.studiofs-runtime-stats").expect("u16 path");
+        let mut file_info = empty_open_file_info();
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0,
+            FILE_GENERIC_READ_ACCESS,
+            &mut file_info,
+        )
+        .expect("runtime stats open path");
+        let snapshot = handle
+            .runtime_stats_snapshot
+            .clone()
+            .expect("open captures a snapshot");
+
+        let mut buf = vec![0; snapshot.len() + 16];
+        let n = ctx
+            .rt
+            .block_on(AsyncFileSystemContext::read_async(
+                &ctx, &handle, &mut buf, 0,
+            ))
+            .expect("runtime stats read_async");
+
+        assert_eq!(&buf[..n as usize], snapshot.as_slice());
+    }
+
+    #[test]
     fn winfsp_runtime_stats_open_accepts_windows_normalized_component() {
         let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-open-normalized");
         let file_name = U16CString::from_str(r"\.studiofs-runtime-stats.").expect("u16 path");
@@ -4296,7 +4288,6 @@ mod tests {
             .open_file(attr.ino, OpenFlags::RDWR, false)
             .expect("open_file");
         let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
-        let mut file_info = winfsp::filesystem::FileInfo::default();
         let write = |data: &[u8], offset: u64| {
             let mut file_info = winfsp::filesystem::FileInfo::default();
             ctx.rt
@@ -4311,18 +4302,20 @@ mod tests {
                 ))
                 .expect("write_async")
         };
-        let read = |offset: u64, len: usize| {
+        let read_with = |handle: &StudioFileHandle, offset: u64, len: usize| {
             let mut buf = vec![0xEE; len];
             let n = ctx
                 .rt
                 .block_on(AsyncFileSystemContext::read_async(
-                    &ctx, &handle, &mut buf, offset,
+                    &ctx, handle, &mut buf, offset,
                 ))
                 .expect("read_async");
             buf.truncate(n as usize);
             buf
         };
-        let mut set_size = |size: u64| {
+        let read = |offset: u64, len: usize| read_with(&handle, offset, len);
+        let set_size = |size: u64| {
+            let mut file_info = winfsp::filesystem::FileInfo::default();
             <StudioFsContext as FileSystemContext>::set_file_size(
                 &ctx,
                 &handle,
@@ -4352,6 +4345,13 @@ mod tests {
         );
         assert!(read(4096, 16).is_empty());
 
+        // The zeros come from the VFS, so a sibling reader sees them too.
+        let reader_fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open reader");
+        let reader = StudioFileHandle::new(attr.ino, false, reader_fh, OpenFlags::RDONLY);
+        assert_eq!(read_with(&reader, 1024, 3072), vec![0; 3072]);
+
         assert_eq!(write(b"fresh", 2048), 5);
         assert_eq!(
             read(2048, 5),
@@ -4359,6 +4359,52 @@ mod tests {
             "a write into the range must not be masked"
         );
         assert_eq!(read(1024, 1024), vec![0; 1024]);
+        assert_eq!(read_with(&reader, 2048, 5), b"fresh");
+
+        for fh in [reader_fh, fh] {
+            ctx.spawn_wait({
+                let vfs = vfs.clone();
+                async move { vfs.release_fh(fh).await }
+            })
+            .expect("release handle");
+        }
+    }
+
+    #[test]
+    fn async_read_records_callback_observability() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("async-read-observability");
+        let attr = vfs
+            .create(ROOT_INO, b"observed-read.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"observed").await }
+        })
+        .expect("seed contents");
+        let before = vfs.write_path_observability_snapshot().winfsp_callbacks;
+
+        let mut buf = [0; 16];
+        let n = ctx
+            .rt
+            .block_on(AsyncFileSystemContext::read_async(
+                &ctx, &handle, &mut buf, 0,
+            ))
+            .expect("read_async");
+
+        assert_eq!(n, 8);
+        assert_eq!(handle.read_callback_snapshot(), (1, 8));
+        let after = vfs.write_path_observability_snapshot().winfsp_callbacks;
+        assert_eq!(after.read - before.read, 1);
+        assert_eq!(after.read_bytes - before.read_bytes, 8);
+        assert_eq!(
+            after.os_cache_miss_read_callbacks - before.os_cache_miss_read_callbacks,
+            1,
+            "handles that keep the OS cache count callback reads as cache misses"
+        );
 
         ctx.spawn_wait({
             let vfs = vfs.clone();
