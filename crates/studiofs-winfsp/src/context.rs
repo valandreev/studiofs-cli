@@ -340,11 +340,12 @@ impl<T> SpawnWaitFallback for studiofs_vfs::VfsResult<T> {
     }
 
     fn report_abandoned(self) {
-        if let Err(error) = self {
-            warn!(
+        match self {
+            Ok(_) => debug!("abandoned WinFSP callback task completed in the background"),
+            Err(error) => warn!(
                 error = %error,
                 "abandoned WinFSP callback task completed with an error"
-            );
+            ),
         }
     }
 }
@@ -1743,7 +1744,9 @@ impl StudioFsContext {
         let callback = self.async_callback_tracker.enter_task();
         self.rt.spawn(async move {
             let result = std::panic::AssertUnwindSafe(f).catch_unwind().await;
-            // Release before replying so a returning caller observes quiescence.
+            // Leave the tracker before sending, so a caller that receives this
+            // result already sees the task as finished. Shutdown still waits for
+            // abandoned tasks because the guard lives until this point.
             drop(callback);
             // A bounded waiter may already be gone; nobody else reports a late result.
             match tx.send(result) {

@@ -174,9 +174,10 @@ impl<'a> WinfspHandleDrainFacade<'a> {
         let vfs = self.context.vfs.clone();
         // A timeout fails this flush before the caller clears the deferred
         // cleanup hint, so the last-handle close barrier still covers the inode.
-        // The flush gate is released on timeout; a later flush may overlap the
-        // abandoned task, which is safe because this VFS call only waits for the
-        // release barrier and then idempotently schedules materialization.
+        // On that error `with_flush_gate` drops its per-inode lock, so a later
+        // flush may overlap the abandoned task. That is safe because this VFS
+        // call only waits for the release barrier and then idempotently
+        // schedules materialization.
         let outcome = self.context.spawn_wait_flush(async move {
             // WinFSP's FlushFileBuffers callback is the platform writeback
             // boundary. Keep it volatile; the explicit fsync API remains the

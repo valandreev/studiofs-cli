@@ -284,7 +284,7 @@ WinFSP callback barrier semantics:
   `fsync` API owns local payload and redb durability barriers; neither operation
   waits for remote upload or peer publication.
 - The synchronous `flush` wait is bounded by
-  `STUDIOFS_WINFSP_FLUSH_CALLBACK_TIMEOUT_MS` (default 30000). On expiry the
+  `STUDIOFS_WINFSP_FLUSH_CALLBACK_TIMEOUT_MS` (default 30000 ms, 30 s). On expiry the
   callback fails with `STATUS_IO_TIMEOUT`, keeps any deferred cleanup hint for
   the last-handle `close` barrier, and lets the admitted task finish in the
   background. Synchronous `read`/`write` borrow WinFSP buffers and stay
