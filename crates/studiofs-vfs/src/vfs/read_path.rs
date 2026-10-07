@@ -1118,24 +1118,18 @@ enum MetadataRefreshDecision {
 }
 
 impl MetadataRefreshDecision {
-    fn for_local_attr(
-        attr: &InodeAttr,
-        has_pending_local_payloads: bool,
-        has_dirty_writer_stack: bool,
-        has_pending_uploads: bool,
-        has_pending_incarnation: bool,
-        has_pending_namespace_metadata: bool,
-    ) -> Self {
+    /// Decides whether a local attribute may serve a read without an
+    /// authoritative refresh.
+    ///
+    /// `has_local_pending_state` is the single summarized observation of
+    /// in-process pending state for the inode. It is evaluated at most once,
+    /// and only when `attr` itself still tracks unpublished regular-file
+    /// content, so fully published attributes take no shared-state locks.
+    fn for_local_attr(attr: &InodeAttr, has_local_pending_state: impl FnOnce() -> bool) -> Self {
         let tracks_pending_regular_content = attr.kind == FileType::RegularFile
             && (attr.upload_state != MetaUploadState::Ready
                 || attr.content_epoch != attr.committed_content_epoch);
-        if !tracks_pending_regular_content
-            || has_pending_local_payloads
-            || has_dirty_writer_stack
-            || has_pending_uploads
-            || has_pending_incarnation
-            || has_pending_namespace_metadata
-        {
+        if !tracks_pending_regular_content || has_local_pending_state() {
             return Self::UseLocal;
         }
         Self::RefreshAuthoritative
@@ -1233,16 +1227,8 @@ impl<'a> ReadMetadataResolver<'a> {
             .get(&self.ino)
             .cloned()?;
 
-        if MetadataRefreshDecision::for_local_attr(
-            &dirty_attr,
-            self.vfs
-                .has_pending_local_dirty_payloads_for_inode(self.ino),
-            self.vfs.inode_has_dirty_writer_stack(self.ino),
-            self.vfs.inode_has_pending_uploads(self.ino),
-            self.vfs
-                .has_pending_incarnation_newer_than(self.ino, dirty_attr.committed_content_epoch),
-            self.vfs.has_deferred_namespace_metadata(self.ino),
-        ) == MetadataRefreshDecision::UseLocal
+        if self.vfs.local_attr_refresh_decision(self.ino, &dirty_attr)
+            == MetadataRefreshDecision::UseLocal
         {
             return Some(dirty_attr);
         }
@@ -1287,16 +1273,8 @@ impl<'a> ReadMetadataResolver<'a> {
             return Ok(None);
         };
 
-        if MetadataRefreshDecision::for_local_attr(
-            &dirty_attr,
-            self.vfs
-                .has_pending_local_dirty_payloads_for_inode(self.ino),
-            self.vfs.inode_has_dirty_writer_stack(self.ino),
-            self.vfs.inode_has_pending_uploads(self.ino),
-            self.vfs
-                .has_pending_incarnation_newer_than(self.ino, dirty_attr.committed_content_epoch),
-            self.vfs.has_deferred_namespace_metadata(self.ino),
-        ) == MetadataRefreshDecision::UseLocal
+        if self.vfs.local_attr_refresh_decision(self.ino, &dirty_attr)
+            == MetadataRefreshDecision::UseLocal
         {
             return Ok(Some(dirty_attr));
         }
@@ -1343,16 +1321,8 @@ impl<'a> ReadMetadataResolver<'a> {
             return Ok(None);
         };
 
-        if MetadataRefreshDecision::for_local_attr(
-            &cached_attr,
-            self.vfs
-                .has_pending_local_dirty_payloads_for_inode(self.ino),
-            self.vfs.inode_has_dirty_writer_stack(self.ino),
-            self.vfs.inode_has_pending_uploads(self.ino),
-            self.vfs
-                .has_pending_incarnation_newer_than(self.ino, cached_attr.committed_content_epoch),
-            self.vfs.has_deferred_namespace_metadata(self.ino),
-        ) == MetadataRefreshDecision::UseLocal
+        if self.vfs.local_attr_refresh_decision(self.ino, &cached_attr)
+            == MetadataRefreshDecision::UseLocal
         {
             return Ok(Some(cached_attr));
         }
@@ -1396,16 +1366,8 @@ impl<'a> ReadMetadataResolver<'a> {
             return Ok(None);
         };
 
-        if MetadataRefreshDecision::for_local_attr(
-            &cached_attr,
-            self.vfs
-                .has_pending_local_dirty_payloads_for_inode(self.ino),
-            self.vfs.inode_has_dirty_writer_stack(self.ino),
-            self.vfs.inode_has_pending_uploads(self.ino),
-            self.vfs
-                .has_pending_incarnation_newer_than(self.ino, cached_attr.committed_content_epoch),
-            self.vfs.has_deferred_namespace_metadata(self.ino),
-        ) == MetadataRefreshDecision::UseLocal
+        if self.vfs.local_attr_refresh_decision(self.ino, &cached_attr)
+            == MetadataRefreshDecision::UseLocal
         {
             return Ok(Some(cached_attr));
         }
@@ -1779,6 +1741,27 @@ impl StudioVfs {
         Ok(Some(Bytes::from(buffer)))
     }
 
+    /// Returns whether `attr` may be served locally or needs an authoritative
+    /// refresh, probing pending local state only when `attr` requires it.
+    fn local_attr_refresh_decision(&self, ino: Ino, attr: &InodeAttr) -> MetadataRefreshDecision {
+        MetadataRefreshDecision::for_local_attr(attr, || {
+            self.has_local_pending_regular_file_state(ino, attr.committed_content_epoch)
+        })
+    }
+
+    /// Summarizes every in-process pending-state family that keeps local
+    /// regular-file metadata newer than authoritative metadata.
+    ///
+    /// Each probe takes and releases its own lock without nesting, and the
+    /// chain stops at the first pending family it observes.
+    fn has_local_pending_regular_file_state(&self, ino: Ino, committed_epoch: u64) -> bool {
+        self.has_pending_local_dirty_payloads_for_inode(ino)
+            || self.inode_has_dirty_writer_stack(ino)
+            || self.inode_has_pending_uploads(ino)
+            || self.has_pending_incarnation_newer_than(ino, committed_epoch)
+            || self.has_deferred_namespace_metadata(ino)
+    }
+
     pub(super) fn getattr_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
         trace!(
             target: "studiofs_vfs::metadata_baseline::metadata_getattr",
@@ -1827,14 +1810,8 @@ impl StudioVfs {
             return Ok(None);
         };
 
-        if MetadataRefreshDecision::for_local_attr(
-            &attr,
-            self.has_pending_local_dirty_payloads_for_inode(ino),
-            self.inode_has_dirty_writer_stack(ino),
-            self.inode_has_pending_uploads(ino),
-            self.has_pending_incarnation_newer_than(ino, attr.committed_content_epoch),
-            self.has_deferred_namespace_metadata(ino),
-        ) == MetadataRefreshDecision::RefreshAuthoritative
+        if self.local_attr_refresh_decision(ino, &attr)
+            == MetadataRefreshDecision::RefreshAuthoritative
         {
             return Ok(None);
         }
@@ -3043,37 +3020,77 @@ mod tests {
         pending_attr.upload_state = MetaUploadState::Updating;
         pending_attr.content_epoch = pending_attr.committed_content_epoch + 1;
 
+        let probes = std::cell::Cell::new(0_u32);
+        let probes_ref = &probes;
+        let observe = move |pending: bool| {
+            move || {
+                probes_ref.set(probes_ref.get() + 1);
+                pending
+            }
+        };
+
         assert_eq!(
-            MetadataRefreshDecision::for_local_attr(
-                &pending_attr,
-                true,
-                false,
-                false,
-                false,
-                false
-            ),
+            MetadataRefreshDecision::for_local_attr(&pending_attr, observe(true)),
             MetadataRefreshDecision::UseLocal
         );
         assert_eq!(
-            MetadataRefreshDecision::for_local_attr(
-                &pending_attr,
-                false,
-                false,
-                false,
-                false,
-                false
-            ),
+            MetadataRefreshDecision::for_local_attr(&pending_attr, observe(false)),
             MetadataRefreshDecision::RefreshAuthoritative
         );
+        assert_eq!(probes.get(), 2, "pending attrs observe local state once");
+
+        let mut published_attr = pending_attr.clone();
+        published_attr.upload_state = MetaUploadState::Ready;
+        published_attr.content_epoch = published_attr.committed_content_epoch;
         assert_eq!(
-            MetadataRefreshDecision::for_local_attr(
-                &pending_attr,
-                false,
-                false,
-                false,
-                false,
-                true
-            ),
+            MetadataRefreshDecision::for_local_attr(&published_attr, observe(false)),
+            MetadataRefreshDecision::UseLocal
+        );
+        assert_eq!(
+            probes.get(),
+            2,
+            "published attrs must not probe pending local state"
+        );
+    }
+
+    #[test]
+    fn local_pending_state_summary_matches_individual_pending_probes() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "local-pending-state-summary");
+        let _guard = rt.enter();
+        let created = vfs
+            .create(ROOT_INO, b"pending-summary.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let ino = created.ino;
+        let mut pending_attr = meta.get_attr(ino).expect("load attr");
+        pending_attr.upload_state = MetaUploadState::Updating;
+        pending_attr.content_epoch = pending_attr.committed_content_epoch + 1;
+
+        let committed_epoch = pending_attr.committed_content_epoch;
+        let individual_probes = |vfs: &StudioVfs| {
+            vfs.has_pending_local_dirty_payloads_for_inode(ino)
+                || vfs.inode_has_dirty_writer_stack(ino)
+                || vfs.inode_has_pending_uploads(ino)
+                || vfs.has_pending_incarnation_newer_than(ino, committed_epoch)
+                || vfs.has_deferred_namespace_metadata(ino)
+        };
+        assert_eq!(
+            vfs.has_local_pending_regular_file_state(ino, committed_epoch),
+            individual_probes(&vfs)
+        );
+
+        rt.block_on(async {
+            vfs.write(ino, 0, b"dirty")
+                .await
+                .expect("write dirty bytes");
+        });
+        assert!(vfs.has_local_pending_regular_file_state(ino, committed_epoch));
+        assert_eq!(
+            vfs.has_local_pending_regular_file_state(ino, committed_epoch),
+            individual_probes(&vfs)
+        );
+        assert_eq!(
+            vfs.local_attr_refresh_decision(ino, &pending_attr),
             MetadataRefreshDecision::UseLocal
         );
     }
