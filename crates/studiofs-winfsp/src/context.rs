@@ -6389,18 +6389,38 @@ mod tests {
     }
 
     #[test]
-    fn defer_for_writer_drops_unresolvable_path_instead_of_retrying() {
-        let (_tmp, vfs, _ctx, queue) = make_test_context("invalid-writer-path");
-        let file = vfs
-            .create(ROOT_INO, b"regular", 0, 0, 0o644)
-            .expect("create file");
-
-        assert!(
-            !queue.defer_for_writer(&vfs, r"\regular\child"),
-            "a path-resolution error must not be treated as an active writer"
+    fn writer_deferral_uses_known_inode_not_current_path_owner() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+        use studiofs_vfs::coherence::InvalidationAcceptance;
+        let (_tmp, vfs, _ctx, queue) = make_test_context("known-inode-deferral");
+        let quiet = vfs
+            .create(ROOT_INO, b"quiet", 0, 0, 0o644)
+            .expect("create quiet");
+        let busy = vfs
+            .create(ROOT_INO, b"busy", 0, 0, 0o644)
+            .expect("create busy");
+        let _fh = vfs
+            .open_file(busy.ino, OpenFlags::RDWR, false)
+            .expect("writer");
+        // The path `usy` currently resolves to the writer-owned inode, but
+        // the notification targets `quiet`; only the known inode decides.
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        assert_eq!(
+            invalidator.invalidate_batch(
+                &InvalidationBatch {
+                    generation: 1,
+                    intents: vec![InvalidationIntent::Entry {
+                        parent: ROOT_INO,
+                        name: b"busy".to_vec(),
+                        ino: Some(quiet.ino),
+                        ancestors: None,
+                    }]
+                },
+                true
+            ),
+            InvalidationAcceptance::Queued
         );
         assert_eq!(queue.delivery_snapshot().deferred_notifications, 0);
-        assert_eq!(file.kind, FileType::RegularFile);
     }
 
     #[test]
