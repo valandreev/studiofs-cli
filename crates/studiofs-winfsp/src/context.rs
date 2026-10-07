@@ -171,7 +171,7 @@ impl WinfspAsyncCallbackTracker {
 
     fn leave(&self) {
         let previous = self.state.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous & !ASYNC_CALLBACK_CLOSED > 0);
+        debug_assert!((previous & !ASYNC_CALLBACK_CLOSED) > 0);
         if previous == ASYNC_CALLBACK_CLOSED | 1 {
             // Taking the lock orders this notify after a waiter's count check.
             let _lock = self.quiescent_lock.lock();
