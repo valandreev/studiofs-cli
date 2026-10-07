@@ -47,29 +47,30 @@ impl RedbMetaEngine {
 }
 
 impl MetaNamespace for RedbMetaEngine {
-    fn entry_names_for_inode(&self, parent: Ino, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
+    fn entry_bindings_for_inode(&self, ino: Ino) -> MetaResult<Vec<(Ino, Vec<u8>)>> {
         let txn = self.begin_read_txn()?;
-        let prefix = encode_dentry_by_inode_key(ino, parent, &[]);
-        let mut names: Vec<Vec<u8>> = Vec::new();
-        // Serving rows first: base may still hold a name the local overlay replaced.
+        let prefix = dentry_by_inode_prefix(ino);
+        let range_end = prefix_successor(&prefix);
+        let mut bindings = Vec::new();
+        // Base may still hold a binding the local overlay replaced; lookup rejects it.
         for index in [DENTRIES_BY_INODE_TABLE, BASE_DENTRIES_BY_INODE_TABLE] {
             let index = txn
                 .open_table(index)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            for row in index
-                .range(prefix.as_slice()..)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
+            let rows = match range_end.as_ref() {
+                Some(end) => index.range(prefix.as_slice()..end.as_ref()),
+                None => index.range(prefix.as_slice()..),
+            }
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in rows {
                 let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                let Some(name) = key.value().strip_prefix(prefix.as_slice()) else {
-                    break;
-                };
-                if !names.iter().any(|known| known == name) {
-                    names.push(name.to_vec());
-                }
+                let (_, parent, name) = decode_dentry_by_inode_key(key.value())?;
+                bindings.push((parent, name.to_vec()));
             }
         }
-        Ok(names)
+        bindings.sort_unstable();
+        bindings.dedup();
+        Ok(bindings)
     }
 
     fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue> {
