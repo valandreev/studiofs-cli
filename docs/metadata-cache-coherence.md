@@ -168,6 +168,14 @@ changes and metadata-only mutations. VFS cache admissions retain observation
 tokens so old lookup, attribute and path-resolution results cannot repopulate a
 retired cache generation.
 
+Visible self batches mirror this client's own acknowledged events into `base_*`
+without journaling intents: the mounted kernel already observed those mutations
+through the local serving view. Re-announcing them invalidated unchanged cache
+state and, for active writers or removed inodes, failed adapter admission and
+kept the coherence gate closed. Serving-view reconciliation after a self batch
+(rename reconciliation and regular-file serving from base) still journals its
+intents.
+
 The WinFSP directory snapshot observation currently includes one mount-wide
 aggregate attribute generation. Any committed attribute invalidation therefore
 conservatively invalidates directory snapshots across the mount, including

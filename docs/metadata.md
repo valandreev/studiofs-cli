@@ -299,7 +299,8 @@ Operational note:
 2. Freeze one target `metadata_state.version` for the current sync operation.
 3. Read and apply bounded pages in `(batch_version, seq_id)` order, never past
    the frozen target.
-4. Apply self batches only to remote-visible/base reconciliation (not as local overlay writes).
+4. Apply self batches only to remote-visible/base reconciliation (not as local overlay writes),
+   without journaling cache invalidation for the already-served local state.
 5. Use self batches to acknowledge already-published local event prefixes and
    advance the local flushed watermark after restart/crash windows.
 6. Do not skip earlier foreign batches just because the client has already

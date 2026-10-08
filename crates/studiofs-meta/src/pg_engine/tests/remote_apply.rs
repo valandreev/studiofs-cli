@@ -2706,6 +2706,126 @@ fn visible_self_rename_reports_serving_reconciliation_change() {
     );
 }
 
+fn journaled_invalidation_intents(pg: &PgMetaEngine) -> Vec<crate::coherence::InvalidationIntent> {
+    use crate::engine::MetaReplication;
+    pg.local
+        .take_invalidation_batches()
+        .into_iter()
+        .flat_map(|batch| batch.intents)
+        .collect()
+}
+
+#[test]
+fn visible_self_publish_does_not_journal_invalidation_for_local_state() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"self-echo.bin", 77_041);
+    let attr = pg.get_attr(file.ino).expect("load published attr");
+    let publish = MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: vec![(
+            ChunkId(0),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(0, 64).expect("published payload range"),
+                payload: Some(PayloadRef::new_partial(77_041, 64)),
+                payload_state: PayloadRefState::Published,
+            }],
+        )],
+    };
+    journaled_invalidation_intents(&pg);
+
+    apply_visible_self_batch(
+        &pg,
+        &[
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"self-echo.bin".to_vec(),
+                entry: DirEntryValue {
+                    ino: file.ino,
+                    kind: FileType::RegularFile,
+                },
+            },
+            MetaEvent::SetAttr { attr },
+            publish,
+        ],
+    )
+    .expect("apply visible self publish");
+
+    let intents = journaled_invalidation_intents(&pg);
+    assert!(
+        intents.is_empty(),
+        "an acknowledged self publish must not invalidate the mount's own cache: {intents:?}"
+    );
+}
+
+#[test]
+fn visible_self_unlink_does_not_journal_invalidation_for_removed_inode() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"self-unlinked.bin", 77_042);
+    pg.unlink(ROOT_INO, b"self-unlinked.bin")
+        .expect("unlink published file locally");
+    journaled_invalidation_intents(&pg);
+
+    apply_visible_self_batch(
+        &pg,
+        &[
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"self-unlinked.bin".to_vec(),
+            },
+            MetaEvent::RemoveRegularFileGraph { ino: file.ino },
+            MetaEvent::RemoveAttr { ino: file.ino },
+        ],
+    )
+    .expect("apply visible self unlink");
+
+    let intents = journaled_invalidation_intents(&pg);
+    assert!(
+        intents.is_empty(),
+        "an acknowledged self unlink must not re-announce the removed inode: {intents:?}"
+    );
+}
+
+#[test]
+fn visible_self_rename_still_journals_serving_namespace_reconciliation() {
+    use crate::coherence::InvalidationIntent;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"self-from.txt", 77_043);
+    journaled_invalidation_intents(&pg);
+    let rename = MetaEvent::RenameEntry {
+        parent: ROOT_INO,
+        name: b"self-from.txt".to_vec(),
+        new_parent: ROOT_INO,
+        new_name: b"self-to.txt".to_vec(),
+        entry: DirEntryValue {
+            ino: file.ino,
+            kind: FileType::RegularFile,
+        },
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: None,
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    };
+
+    assert!(apply_visible_self_batch(&pg, &[rename]).expect("apply visible self rename"));
+
+    let intents = journaled_invalidation_intents(&pg);
+    for name in [b"self-from.txt".as_slice(), b"self-to.txt".as_slice()] {
+        assert!(
+            intents.iter().any(|intent| matches!(
+                intent,
+                InvalidationIntent::Entry { parent, name: entry_name, .. }
+                    if *parent == ROOT_INO && entry_name.as_slice() == name
+            )),
+            "serving rename reconciliation must still invalidate {:?}: {intents:?}",
+            String::from_utf8_lossy(name)
+        );
+    }
+}
+
 #[test]
 fn protected_attr_merge_preserves_larger_size_for_newer_remote_payload_publish() {
     let (_dir, pg) = temp_pg_engine_for_unit();

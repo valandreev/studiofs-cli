@@ -1709,19 +1709,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
             })
             .collect::<Vec<_>>();
         let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
-        if partial_publish_inodes.is_empty() {
-            RedbMetaEngine::apply_replica_events_to_base_in_txn(
-                txn,
-                &batch_events,
-                &HashSet::new(),
-            )?;
-        } else {
+        // These events already changed the local serving view and reached the
+        // mounted kernel through this client's own callbacks. Mirroring them into
+        // base tables must not re-announce them: the echo would purge unchanged OS
+        // cache data and, for writers or removed inodes, fail adapter admission and
+        // degrade cache coherence. Serving reconciliation below keeps its intents.
+        txn.without_invalidations(|| {
             RedbMetaEngine::apply_replica_events_to_base_in_txn(
                 txn,
                 &batch_events,
                 &partial_publish_inodes,
-            )?;
-        }
+            )
+        })?;
         let mut changed = false;
         for event in &batch_events {
             if let MetaEvent::RenameEntry {
@@ -1756,7 +1755,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
             })
             .peekable();
         if aux_events.peek().is_some() {
-            RedbMetaEngine::apply_replica_aux_state_in_txn(txn, aux_events)?;
+            txn.without_invalidations(|| {
+                RedbMetaEngine::apply_replica_aux_state_in_txn(txn, aux_events)
+            })?;
             changed = true;
         }
 
