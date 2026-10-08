@@ -1461,6 +1461,8 @@ impl<'a> ReadMetadataResolver<'a> {
 
         let remote_attr = match self.vfs.sync_meta().get_attr(self.ino) {
             Ok(remote_attr) => remote_attr,
+            // An unlinked-while-open inode has no authoritative row to refresh from.
+            Err(MetaError::InodeNotFound(_)) => return Some(dirty_attr),
             Err(error) => {
                 warn!(
                     ino = self.ino,
@@ -1510,6 +1512,8 @@ impl<'a> ReadMetadataResolver<'a> {
         let remote_attr =
             match run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino)).await {
                 Ok(remote_attr) => remote_attr,
+                // An unlinked-while-open inode has no authoritative row to refresh from.
+                Err(VfsError::Meta(MetaError::InodeNotFound(_))) => return Ok(Some(dirty_attr)),
                 Err(error) => {
                     warn!(
                         ino = self.ino,

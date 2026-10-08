@@ -3836,6 +3836,9 @@ fn catch_startup_panic(startup: impl FnOnce() -> VfsResult<()>) -> VfsResult<()>
 struct PendingCoherenceInvalidation {
     batch: studiofs_meta::coherence::InvalidationBatch,
     attempts: u8,
+    /// Retained because a local writer still protects part of the batch, not
+    /// because delivery failed.
+    deferred: bool,
 }
 
 /// The core VFS - satisfies filesystem operations using metadata + data + cache.
