@@ -7,7 +7,7 @@ use super::{
     VfsError, VfsResult,
 };
 use crate::VfsMeta;
-use crate::runtime::run_meta;
+use crate::runtime::{run_local_cache_io, run_meta};
 use crate::utils::{IntervalRange, subtract_claimed_range};
 use bytes::Bytes;
 use futures::{StreamExt, stream};
@@ -46,6 +46,35 @@ struct ReadSegment {
 type ReadRangeList = SmallVec<[ReadRange; 8]>;
 type ReadBlockList = SmallVec<[u32; 16]>;
 const MAX_FOREGROUND_COLD_READ_FETCH_IN_FLIGHT: usize = 64;
+/// A read fans out across committed local payload objects only when it spans at
+/// least this many runs and bytes; smaller reads stay on the serial path.
+const PARALLEL_LOCAL_READ_MIN_RUNS: usize = 2;
+const PARALLEL_LOCAL_READ_MIN_BYTES: usize = 2 * 1024 * 1024;
+const PARALLEL_LOCAL_READ_MAX_THREADS: usize = 8;
+
+/// A run of adjacent segments backed by one local object, planned for the
+/// concurrent pre-pass.
+struct PlannedLocalRun {
+    segments: std::ops::Range<usize>,
+    /// Committed (`Base`/`Overlay`) run, as opposed to a local-dirty or
+    /// pending-extent run.
+    committed: bool,
+    object_id: u64,
+    block_offset: usize,
+    dst_start: usize,
+    dst_end: usize,
+}
+
+/// One local run read straight into its disjoint slice of the output.
+struct LocalRunRead<'a> {
+    segments: std::ops::Range<usize>,
+    committed: bool,
+    object_id: u64,
+    block_offset: usize,
+    dst: &'a mut [u8],
+    read: Option<usize>,
+    io_ns: u64,
+}
 
 struct ReadClaimBuffers {
     claimed: ReadRangeList,
@@ -857,6 +886,8 @@ impl<'a> DataReader<'a> {
     ) -> VfsResult<usize> {
         let mut written = 0usize;
         let mut index = 0usize;
+        let prefetched_runs =
+            Self::read_committed_local_runs_concurrently(vfs, offset, segments, buffer);
         while index < segments.len() {
             let segment = &segments[index];
             let dst_start = segment.range.start().saturating_sub(offset) as usize;
@@ -889,9 +920,13 @@ impl<'a> DataReader<'a> {
                             object_id, block_offset
                         ))
                     })?;
-                    let read = vfs
-                        .payload_store_read_into_async(*object_id, block_offset, dst)
-                        .await?;
+                    // Extents served by the concurrent pre-pass are already in `buffer`.
+                    let read = if prefetched_runs.binary_search(&index).is_ok() {
+                        Some(dst.len())
+                    } else {
+                        vfs.payload_store_read_into_async(*object_id, block_offset, dst)
+                            .await?
+                    };
                     match read {
                         Some(read) if read == dst.len() => {}
                         Some(read) => {
@@ -929,14 +964,18 @@ impl<'a> DataReader<'a> {
                                 run_dst_end.saturating_sub(dst_start)
                             ))
                         })?;
-                    let dst = &mut buffer[dst_start..run_dst_end];
-                    Self::assemble_committed_payload_into(
-                        vfs,
-                        &run_payload,
-                        segment.range.start(),
-                        dst,
-                    )
-                    .await?;
+                    // Runs served by the concurrent pre-pass are already in `buffer`;
+                    // unresolved runs take the serial path with all its fallbacks.
+                    if prefetched_runs.binary_search(&index).is_err() {
+                        let dst = &mut buffer[dst_start..run_dst_end];
+                        Self::assemble_committed_payload_into(
+                            vfs,
+                            &run_payload,
+                            segment.range.start(),
+                            dst,
+                        )
+                        .await?;
+                    }
                     written = written.max(run_dst_end);
                     index = run_end;
                     continue;
@@ -950,6 +989,215 @@ impl<'a> DataReader<'a> {
             index += 1;
         }
         Ok(written)
+    }
+
+    /// Local-dirty / pending-extent segments read through the same
+    /// `payload_store_read_into_async` call as the serial branch.
+    fn local_extent_source(segment: &ReadSegment) -> Option<(u64, u32)> {
+        match &segment.source {
+            ReadSegmentSource::LocalPayload {
+                object_id,
+                data_offset,
+            } => Some((*object_id, *data_offset)),
+            ReadSegmentSource::PendingExtent {
+                object_id,
+                block_offset,
+            } => Some((*object_id, *block_offset)),
+            _ => None,
+        }
+    }
+
+    /// Extends a local-extent run over following segments of the same object
+    /// with contiguous file, payload and destination ranges.
+    fn local_extent_read_run(
+        segments: &[ReadSegment],
+        start_index: usize,
+        read_offset: u64,
+        buffer_len: usize,
+    ) -> (usize, usize) {
+        let first = &segments[start_index];
+        let (object_id, first_offset) = Self::local_extent_source(first).unwrap_or_default();
+        let mut run_end = start_index + 1;
+        let mut file_end = first.range.end();
+        let mut dst_end = file_end.saturating_sub(read_offset) as usize;
+        let mut next_offset = u64::from(first_offset)
+            .saturating_add(first.range.end().saturating_sub(first.range.start()));
+        while let Some(next) = segments.get(run_end) {
+            let Some((next_object, next_block_offset)) = Self::local_extent_source(next) else {
+                break;
+            };
+            let next_dst_start = next.range.start().saturating_sub(read_offset) as usize;
+            let next_dst_end = next.range.end().saturating_sub(read_offset) as usize;
+            if next_object != object_id
+                || next.range.start() != file_end
+                || u64::from(next_block_offset) != next_offset
+                || next_dst_start != dst_end
+                || next_dst_end > buffer_len
+                || next_dst_start >= next_dst_end
+            {
+                break;
+            }
+            run_end += 1;
+            file_end = next.range.end();
+            dst_end = next_dst_end;
+            next_offset =
+                next_offset.saturating_add(next.range.end().saturating_sub(next.range.start()));
+        }
+        (run_end, dst_end)
+    }
+
+    /// Reads distinct local runs concurrently, each directly into its own
+    /// disjoint slice of `buffer`, inside one blocking section. Covers committed
+    /// (`Base`/`Overlay`) runs and local-dirty / pending-extent (`LocalPayload`,
+    /// `PendingExtent`) runs in one wave. Returns the segment indices of every
+    /// run that was fully served (the first index for a committed run, every
+    /// index for an extent run); failed, short, or upload-hot runs are left for
+    /// the serial path so all fallbacks are unchanged.
+    fn read_committed_local_runs_concurrently(
+        vfs: &StudioVfs,
+        offset: u64,
+        segments: &[ReadSegment],
+        buffer: &mut [u8],
+    ) -> Vec<usize> {
+        let mut runs: Vec<PlannedLocalRun> = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut index = 0usize;
+        while index < segments.len() {
+            let segment = &segments[index];
+            let dst_start = segment.range.start().saturating_sub(offset) as usize;
+            let dst_end = segment.range.end().saturating_sub(offset) as usize;
+            let committed = Self::committed_segment_payload(segment);
+            let extent = Self::local_extent_source(segment);
+            if committed.is_none() && extent.is_none() {
+                index += 1;
+                continue;
+            }
+            if dst_start >= buffer.len() || dst_end > buffer.len() || dst_start >= dst_end {
+                index += 1;
+                continue;
+            }
+            let (object_id, payload_offset, run_end, run_dst_end) = match (committed, extent) {
+                (Some(payload), _) => {
+                    let (run_end, run_dst_end) =
+                        Self::committed_local_read_run(segments, index, offset, buffer.len());
+                    (payload.object_id, payload.offset, run_end, run_dst_end)
+                }
+                (None, Some((object_id, extent_offset))) => {
+                    let (run_end, run_dst_end) =
+                        Self::local_extent_read_run(segments, index, offset, buffer.len());
+                    (object_id, extent_offset, run_end, run_dst_end)
+                }
+                (None, None) => unreachable!("filtered above"),
+            };
+            let first_index = index;
+            index = run_end;
+            if runs.last().is_some_and(|last| dst_start < last.dst_end) {
+                // Overlapping destinations cannot be split into disjoint slices.
+                return Vec::new();
+            }
+            let Ok(block_offset) = usize::try_from(payload_offset) else {
+                continue;
+            };
+            if vfs.upload_hot_get(object_id).is_some() {
+                continue;
+            }
+            total_bytes += run_dst_end - dst_start;
+            runs.push(PlannedLocalRun {
+                segments: first_index..run_end,
+                committed: committed.is_some(),
+                object_id,
+                block_offset,
+                dst_start,
+                dst_end: run_dst_end,
+            });
+        }
+        if runs.len() < PARALLEL_LOCAL_READ_MIN_RUNS || total_bytes < PARALLEL_LOCAL_READ_MIN_BYTES
+        {
+            return Vec::new();
+        }
+
+        let mut jobs = Vec::with_capacity(runs.len());
+        let mut rest = &mut *buffer;
+        let mut consumed = 0usize;
+        for run in runs {
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(run.dst_start - consumed);
+            let (dst, tail) = tail.split_at_mut(run.dst_end - run.dst_start);
+            rest = tail;
+            consumed = run.dst_end;
+            jobs.push(LocalRunRead {
+                segments: run.segments,
+                committed: run.committed,
+                object_id: run.object_id,
+                block_offset: run.block_offset,
+                dst,
+                read: None,
+                io_ns: 0,
+            });
+        }
+
+        let backend = &vfs.local_payload_backend;
+        let read_job = |job: &mut LocalRunRead<'_>| {
+            let started = Instant::now();
+            job.read = backend.read_into(job.object_id, job.block_offset, job.dst);
+            job.io_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        };
+        // One blocking section for the whole fan-out; the calling thread reads the
+        // first run of each wave itself.
+        let ((), timing) = run_local_cache_io(|| {
+            for wave in jobs.chunks_mut(PARALLEL_LOCAL_READ_MAX_THREADS) {
+                std::thread::scope(|scope| {
+                    let Some((first, others)) = wave.split_first_mut() else {
+                        return;
+                    };
+                    for job in others {
+                        scope.spawn(|| read_job(job));
+                    }
+                    read_job(first);
+                });
+            }
+        });
+        // One cache-io sample for the whole fan-out (wall time), not one per run.
+        vfs.record_local_cache_io_timing(timing);
+
+        let mut resolved = Vec::with_capacity(jobs.len());
+        for job in &jobs {
+            // Short, oversized, or missing reads are re-run by the serial path.
+            if job.read != Some(job.dst.len()) {
+                continue;
+            }
+            vfs.record_foreground_local_payload_read(job.dst.len() as u64, job.io_ns);
+            if job.committed {
+                Self::note_prefetched_object_read(vfs, job.object_id, job.dst.len());
+                resolved.push(job.segments.start);
+            } else {
+                resolved.extend(job.segments.clone());
+            }
+        }
+        resolved
+    }
+
+    fn note_prefetched_object_read(vfs: &StudioVfs, object_id: u64, read: usize) {
+        let prefetched = &vfs.state.metrics.prefetched_object_ids;
+        if prefetched.contains(&object_id) {
+            let mut remaining_bytes = vfs.state.metrics.prefetched_object_remaining_bytes.lock();
+            let remove = if let Some(remaining) = remaining_bytes.get_mut(&object_id) {
+                let read_bytes = u32::try_from(read).unwrap_or(u32::MAX);
+                let useful = (*remaining).min(read_bytes);
+                *remaining = (*remaining).saturating_sub(useful);
+                vfs.state
+                    .metrics
+                    .readahead_used_bytes
+                    .fetch_add(u64::from(useful), Ordering::Relaxed);
+                *remaining == 0
+            } else {
+                true
+            };
+            if remove {
+                remaining_bytes.pop(&object_id);
+                drop(remaining_bytes);
+                prefetched.remove(&object_id);
+            }
+        }
     }
 
     fn committed_segment_payload(segment: &ReadSegment) -> Option<&PayloadRef> {
@@ -1028,29 +1276,7 @@ impl<'a> DataReader<'a> {
         {
             if read == dst.len() {
                 span_resolved = true;
-                let prefetched = &vfs.state.metrics.prefetched_object_ids;
-                if prefetched.contains(&payload.object_id) {
-                    let mut remaining_bytes =
-                        vfs.state.metrics.prefetched_object_remaining_bytes.lock();
-                    let remove =
-                        if let Some(remaining) = remaining_bytes.get_mut(&payload.object_id) {
-                            let read_bytes = u32::try_from(read).unwrap_or(u32::MAX);
-                            let useful = (*remaining).min(read_bytes);
-                            *remaining = (*remaining).saturating_sub(useful);
-                            vfs.state
-                                .metrics
-                                .readahead_used_bytes
-                                .fetch_add(u64::from(useful), Ordering::Relaxed);
-                            *remaining == 0
-                        } else {
-                            true
-                        };
-                    if remove {
-                        remaining_bytes.pop(&payload.object_id);
-                        drop(remaining_bytes);
-                        prefetched.remove(&payload.object_id);
-                    }
-                }
+                Self::note_prefetched_object_read(vfs, payload.object_id, read);
             }
             if !span_resolved {
                 error!(
@@ -2368,6 +2594,7 @@ mod tests {
         read_into_calls: AtomicU64,
         advise_will_need_calls: AtomicU64,
         force_short_read: AtomicBool,
+        read_threads: std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
     }
 
     impl CountingLocalPayloadBackend {
@@ -2378,7 +2605,12 @@ mod tests {
                 read_into_calls: AtomicU64::new(0),
                 advise_will_need_calls: AtomicU64::new(0),
                 force_short_read: AtomicBool::new(false),
+                read_threads: std::sync::Mutex::new(std::collections::HashSet::new()),
             }
+        }
+
+        fn read_thread_count(&self) -> usize {
+            self.read_threads.lock().expect("read thread set").len()
         }
 
         fn reset_counters(&self) {
@@ -2417,6 +2649,10 @@ mod tests {
 
         fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
             self.read_into_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.read_threads
+                .lock()
+                .expect("read thread set")
+                .insert(std::thread::current().id());
             let read = self.inner.read_into(object_id, data_offset, out);
             if self.force_short_read.load(AtomicOrdering::Relaxed) {
                 read.map(|read| read.min(1))
@@ -4368,6 +4604,269 @@ mod tests {
                 counting_backend.read_into_calls(),
                 1,
                 "adjacent committed local hits for the same object should coalesce into one backend read"
+            );
+        });
+    }
+
+    #[test]
+    fn multi_object_committed_read_fans_out_and_keeps_fallback() {
+        const OBJECT_LEN: usize = 1024 * 1024;
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "assemble-concurrent-runs");
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_payload_backend = counting_backend.clone();
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let object_ids = [0xD001_u64, 0xD002, 0xD003];
+            let fixtures: Vec<Vec<u8>> = object_ids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    (0..OBJECT_LEN + 16)
+                        .map(|byte| ((byte + i * 37) % 251) as u8)
+                        .collect()
+                })
+                .collect();
+            for (object_id, data) in object_ids.iter().zip(&fixtures) {
+                vfs.local_payload_backend()
+                    .put(*object_id, data, false)
+                    .expect("persist local payload");
+            }
+            // The middle object is only in the upload stage, so its run must fall
+            // back to the serial path after the concurrent pass misses it.
+            vfs.cached_store()
+                .link_upload_stage_batch(&[object_ids[1]])
+                .expect("link payload into upload stage");
+            vfs.payload_store_remove_async(object_ids[1])
+                .await
+                .expect("evict primary local payload");
+
+            let segments: Vec<ReadSegment> = object_ids
+                .iter()
+                .enumerate()
+                .map(|(i, object_id)| {
+                    let mut payload = PayloadRef::new_full(*object_id, OBJECT_LEN as u32);
+                    payload.offset = 16;
+                    payload.length = OBJECT_LEN as u32;
+                    ReadSegment {
+                        range: read_range((i * OBJECT_LEN) as u64, ((i + 1) * OBJECT_LEN) as u64),
+                        source: ReadSegmentSource::Base { payload },
+                    }
+                })
+                .collect();
+            let mut buffer = vec![0_u8; OBJECT_LEN * 3];
+            counting_backend.reset_counters();
+            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer)
+                .await
+                .expect("assemble data reader output");
+
+            assert_eq!(written, buffer.len());
+            for (i, data) in fixtures.iter().enumerate() {
+                assert!(
+                    buffer[i * OBJECT_LEN..(i + 1) * OBJECT_LEN] == data[16..],
+                    "object {i} bytes must land in order"
+                );
+            }
+            // Serial would issue 3 backend reads; the concurrent pass issues 3 and
+            // the missed middle run is re-read serially before the stage fallback.
+            assert_eq!(counting_backend.read_into_calls(), 4);
+            assert_eq!(
+                counting_backend.read_thread_count(),
+                3,
+                "each run must be read on its own thread"
+            );
+        });
+    }
+
+    #[test]
+    fn published_resident_file_read_fans_out_across_block_objects() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, mut vfs, meta) = make_unstarted_test_vfs(&tmp, "published-resident-fan-out");
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_payload_backend = counting_backend.clone();
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let block_len = DEFAULT_BLOCK_SIZE as usize;
+            let created = vfs
+                .create(ROOT_INO, b"published-resident-fan-out.bin", 0, 0, 0o644)
+                .expect("create test file");
+            let ino = created.ino;
+            let object_ids = [0xE001_u64, 0xE002];
+            let fixtures: Vec<Vec<u8>> = (0..object_ids.len())
+                .map(|i| {
+                    (0..block_len)
+                        .map(|byte| ((byte + i * 53) % 241) as u8)
+                        .collect()
+                })
+                .collect();
+
+            let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
+            staged_attr.size = (block_len * 2) as u64;
+            staged_attr.committed_size = staged_attr.size;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            for (i, (object_id, data)) in object_ids.iter().zip(&fixtures).enumerate() {
+                vfs.local_payload_backend()
+                    .put(*object_id, data, false)
+                    .expect("persist resident payload");
+                meta.stage_payload_slice(
+                    ino,
+                    i as u32,
+                    &PayloadRef::new_full(*object_id, DEFAULT_BLOCK_SIZE),
+                )
+                .expect("stage published payload");
+            }
+
+            let cache_io_before = vfs
+                .state
+                .metrics
+                .local_cache_io_calls
+                .load(AtomicOrdering::Relaxed);
+            counting_backend.reset_counters();
+            let read = vfs
+                .read(ino, 0, (block_len * 2) as u32)
+                .await
+                .expect("read resident file");
+
+            assert_eq!(read.len(), block_len * 2);
+            assert!(read[..block_len] == fixtures[0][..]);
+            assert!(read[block_len..] == fixtures[1][..]);
+            assert_eq!(counting_backend.read_into_calls(), 2);
+            assert_eq!(
+                vfs.state
+                    .metrics
+                    .local_cache_io_calls
+                    .load(AtomicOrdering::Relaxed)
+                    - cache_io_before,
+                1,
+                "one fan-out is one local cache io section"
+            );
+            assert_eq!(
+                counting_backend.read_thread_count(),
+                2,
+                "published Base runs of one request must be read concurrently"
+            );
+        });
+    }
+
+    #[test]
+    fn unpublished_local_file_read_fans_out_across_pending_extents_and_base() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, mut vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-extent-fan-out");
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_payload_backend = counting_backend.clone();
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let block_len = DEFAULT_BLOCK_SIZE as usize;
+            let created = vfs
+                .create(ROOT_INO, b"pending-extent-fan-out.bin", 0, 0, 0o644)
+                .expect("create test file");
+            let ino = created.ino;
+            // Blocks 0 and 1 are unpublished pending extents; block 1 only has an
+            // upload-stage copy, so it must fall back. Block 2 is a committed run.
+            let object_ids = [0xF001_u64, 0xF002, 0xF003];
+            let fixtures: Vec<Vec<u8>> = (0..object_ids.len())
+                .map(|i| {
+                    (0..block_len)
+                        .map(|byte| ((byte + i * 71) % 239) as u8)
+                        .collect()
+                })
+                .collect();
+            for (object_id, data) in object_ids.iter().zip(&fixtures) {
+                vfs.local_payload_backend()
+                    .put(*object_id, data, false)
+                    .expect("persist local payload");
+            }
+            vfs.cached_store()
+                .link_upload_stage_batch(&[object_ids[1]])
+                .expect("link payload into upload stage");
+            vfs.payload_store_remove_async(object_ids[1])
+                .await
+                .expect("evict primary local payload");
+
+            let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
+            staged_attr.size = (block_len * 3) as u64;
+            staged_attr.committed_size = staged_attr.size;
+            staged_attr.upload_state = MetaUploadState::Updating;
+            staged_attr.committed_content_epoch = 1;
+            staged_attr.content_epoch = 2;
+            meta.set_attr(&staged_attr).expect("persist staged attr");
+            for (i, object_id) in object_ids.iter().enumerate() {
+                meta.stage_payload_slice(
+                    ino,
+                    i as u32,
+                    &PayloadRef::new_full(*object_id, DEFAULT_BLOCK_SIZE),
+                )
+                .expect("persist payload slice");
+            }
+            for (i, object_id) in object_ids.iter().take(2).enumerate() {
+                vfs.state.incarnation.live_extent_records.lock().insert(
+                    (ino, i as u32),
+                    crate::vfs::overlay::ExtentRecordId {
+                        object_id: *object_id,
+                        content_epoch: staged_attr.content_epoch,
+                    },
+                );
+            }
+            let resolved_slices = meta
+                .lookup_regular_file_slices(ino, 0, (block_len * 3) as u64)
+                .expect("resolve slice snapshot");
+            let reader = DataReader::new(
+                &vfs,
+                ino,
+                0,
+                (block_len * 3) as u64,
+                Some(staged_attr.content_epoch),
+                Some(resolved_slices.as_slice()),
+            );
+            let segments = reader.build_segments().await.expect("build segments");
+            assert_eq!(
+                segments
+                    .iter()
+                    .filter(|segment| matches!(
+                        segment.source,
+                        ReadSegmentSource::PendingExtent { .. }
+                    ))
+                    .count(),
+                2,
+                "setup must produce pending-extent segments: {segments:?}"
+            );
+            assert!(
+                segments
+                    .iter()
+                    .any(|segment| matches!(segment.source, ReadSegmentSource::Base { .. })),
+                "setup must keep one committed segment: {segments:?}"
+            );
+
+            counting_backend.reset_counters();
+            let mut buffer = vec![0_u8; block_len * 3];
+            let written = reader
+                .read_into(&mut buffer)
+                .await
+                .expect("read unpublished file");
+
+            assert_eq!(written, buffer.len());
+            for (i, data) in fixtures.iter().enumerate() {
+                assert!(
+                    buffer[i * block_len..(i + 1) * block_len] == data[..],
+                    "block {i} bytes must land in order"
+                );
+            }
+            // 3 concurrent reads plus the serial retry of the staged-only extent.
+            assert_eq!(counting_backend.read_into_calls(), 4);
+            assert_eq!(
+                counting_backend.read_thread_count(),
+                3,
+                "pending extents and committed runs must share one fan-out"
             );
         });
     }
