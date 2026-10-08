@@ -7,7 +7,7 @@ mod tests {
 
     #[cfg(test)]
     fn assign_reserved_object_ids(
-        pending: &mut std::collections::HashMap<(Ino, u32), PendingPayload>,
+        pending: &mut std::collections::BTreeMap<(Ino, u32), PendingPayload>,
         ino: Ino,
         blocks: &mut [PersistedPayloadEntry],
         fresh_object_ids: &[u64],
@@ -364,11 +364,11 @@ mod tests {
         data: &'static [u8],
         reserved_object_id: Option<u64>,
     ) -> (
-        std::collections::HashMap<(Ino, u32), PendingPayload>,
+        std::collections::BTreeMap<(Ino, u32), PendingPayload>,
         Vec<DirtyWriteSnapshot>,
     ) {
         (
-            std::collections::HashMap::from([(
+            std::collections::BTreeMap::from([(
                 (ino, block_index),
                 PendingPayload::buffered(BytesMut::from(data), reserved_object_id),
             )]),
@@ -1436,7 +1436,7 @@ mod tests {
     #[test]
     fn assign_reserved_object_ids_reuses_existing_ids_and_stores_new_ones() {
         let ino = 42;
-        let mut pending = std::collections::HashMap::from([
+        let mut pending = std::collections::BTreeMap::from([
             (
                 (ino, 0),
                 PendingPayload::buffered(BytesMut::from(&b"alpha"[..]), Some(111)),
@@ -1468,7 +1468,7 @@ mod tests {
     #[test]
     fn commit_persisted_payload_state_clears_reserved_id_without_dropping_newer_bytes() {
         let ino = 7;
-        let mut pending = std::collections::HashMap::from([(
+        let mut pending = std::collections::BTreeMap::from([(
             (ino, 3),
             PendingPayload::buffered(BytesMut::from(&b"newer"[..]), Some(333)),
         )]);
@@ -1493,7 +1493,7 @@ mod tests {
     fn commit_persisted_payload_state_removes_matching_local_extent_after_metadata_commit() {
         let ino = 8;
         let mut pending =
-            std::collections::HashMap::from([((ino, 4), PendingPayload::local_extent(444, 4096))]);
+            std::collections::BTreeMap::from([((ino, 4), PendingPayload::local_extent(444, 4096))]);
         let blocks = vec![PersistedPayloadEntry::from_local_extent(4, 444, 4096)];
 
         let (removed_bytes, removed_block_indexes, removed_buffers) =

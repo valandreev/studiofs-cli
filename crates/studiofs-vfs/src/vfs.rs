@@ -1876,7 +1876,7 @@ impl UploadState {
 
 struct IncarnationState {
     inode_incarnations: OrderedMutex<std::collections::HashMap<Ino, InodeIncarnationState>>,
-    live_extent_records: OrderedMutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
+    live_extent_records: OrderedMutex<std::collections::BTreeMap<(Ino, u32), ExtentRecordId>>,
 }
 
 impl IncarnationState {
@@ -1887,7 +1887,7 @@ impl IncarnationState {
                 LockTier::Incarnation,
             ),
             live_extent_records: OrderedMutex::new(
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 LockTier::Incarnation,
             ),
         }
@@ -3836,6 +3836,9 @@ fn catch_startup_panic(startup: impl FnOnce() -> VfsResult<()>) -> VfsResult<()>
 struct PendingCoherenceInvalidation {
     batch: studiofs_meta::coherence::InvalidationBatch,
     attempts: u8,
+    /// Retained because a local writer still protects part of the batch, not
+    /// because delivery failed.
+    deferred: bool,
 }
 
 /// The core VFS - satisfies filesystem operations using metadata + data + cache.
@@ -5553,14 +5556,15 @@ impl StudioVfs {
 
         let has_pending_uploads = self.inode_has_pending_uploads(ino);
         let has_local_overlay = self.inode_has_local_overlay(ino);
-        let has_live_extents = !self.live_extent_records_for_inode(ino).is_empty();
+        let has_live_extents = self.inode_has_live_extents(ino);
         let has_pending_epoch_finalization = self
             .state
             .upload
             .pending_epoch_finalizations
             .lock()
-            .iter()
-            .any(|pending| pending.0 == ino);
+            .range((ino, 0)..=(ino, u64::MAX))
+            .next()
+            .is_some();
         if Self::is_fully_published_regular_file(attr)
             && !has_pending_uploads
             && !has_local_overlay
@@ -5709,19 +5713,31 @@ impl StudioVfs {
         if has_newer_pending_upload {
             return false;
         }
-        let live_extents = self.live_extent_records_for_inode(ino);
-        let has_newer_live_extent = live_extents
-            .iter()
-            .any(|(_, _, content_epoch)| *content_epoch > committed_epoch);
+        let (has_live_extents, has_newer_live_extent) = {
+            let live_extents = self.state.incarnation.live_extent_records.lock();
+            let mut records = live_extents.range((ino, 0)..=(ino, u32::MAX));
+            match records.next() {
+                None => (false, false),
+                Some((_, first)) => (
+                    true,
+                    first.content_epoch > committed_epoch
+                        || records.any(|(_, extent)| extent.content_epoch > committed_epoch),
+                ),
+            }
+        };
         let (has_pending_epoch_finalization, has_newer_pending_epoch_finalization) = {
             let pending_epoch_finalizations = self.state.upload.pending_epoch_finalizations.lock();
             (
                 pending_epoch_finalizations
-                    .iter()
-                    .any(|pending| pending.0 == ino),
-                pending_epoch_finalizations
-                    .iter()
-                    .any(|pending| pending.0 == ino && pending.1 > committed_epoch),
+                    .range((ino, 0)..=(ino, u64::MAX))
+                    .next()
+                    .is_some(),
+                committed_epoch.checked_add(1).is_some_and(|first_newer| {
+                    pending_epoch_finalizations
+                        .range((ino, first_newer)..=(ino, u64::MAX))
+                        .next()
+                        .is_some()
+                }),
             )
         };
         if has_newer_pending_epoch_finalization {
@@ -5758,7 +5774,7 @@ impl StudioVfs {
             || dirty_attr_present
             || has_dirty_writers
             || has_pending_uploads
-            || !live_extents.is_empty()
+            || has_live_extents
             || has_pending_epoch_finalization
     }
 
@@ -5997,6 +6013,12 @@ impl StudioVfs {
             .pending_epoch_finalizations
             .lock()
             .insert(key);
+        tracing::debug!(
+            ino,
+            content_epoch,
+            newly_queued = inserted,
+            "epoch finalization queued"
+        );
         if inserted {
             self.state.file_session.note_background_transition(
                 ino,
@@ -6013,9 +6035,11 @@ impl StudioVfs {
 
     fn remove_pending_epoch_finalizations_for_inode(&self, ino: Ino) {
         let mut pending = self.state.upload.pending_epoch_finalizations.lock();
-        let before = pending.len();
-        pending.retain(|(candidate, _)| *candidate != ino);
-        let removed = before.saturating_sub(pending.len());
+        let keys: Vec<_> = pending.range((ino, 0)..=(ino, u64::MAX)).copied().collect();
+        let removed = keys.len();
+        for key in &keys {
+            pending.remove(key);
+        }
         drop(pending);
         if removed > 0 {
             self.debug_pending_inode_state(ino, "epoch_finalization_cleared");
@@ -6086,7 +6110,8 @@ impl StudioVfs {
         let mut pending = self.state.upload.pending_epoch_finalizations.lock();
         let next = pending.pop_first();
         drop(pending);
-        if let Some((ino, _)) = next {
+        if let Some((ino, content_epoch)) = next {
+            tracing::debug!(ino, content_epoch, "epoch finalization dequeued");
             self.state.file_session.note_background_transition(
                 ino,
                 FileSessionOperation::Finalize,
@@ -6175,21 +6200,26 @@ impl StudioVfs {
     }
 
     fn remove_live_extents_for_inode(&self, ino: Ino) {
-        self.state
-            .incarnation
-            .live_extent_records
-            .lock()
-            .retain(|(candidate, _), _| *candidate != ino);
+        let mut live_extents = self.state.incarnation.live_extent_records.lock();
+        let keys: Vec<_> = live_extents
+            .range((ino, 0)..=(ino, u32::MAX))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in &keys {
+            live_extents.remove(key);
+        }
     }
 
     fn remove_live_extents_for_inode_epoch(&self, ino: Ino, content_epoch: u64) {
-        self.state
-            .incarnation
-            .live_extent_records
-            .lock()
-            .retain(|(candidate, _), extent| {
-                *candidate != ino || extent.content_epoch != content_epoch
-            });
+        let mut live_extents = self.state.incarnation.live_extent_records.lock();
+        let keys: Vec<_> = live_extents
+            .range((ino, 0)..=(ino, u32::MAX))
+            .filter(|(_, extent)| extent.content_epoch == content_epoch)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in &keys {
+            live_extents.remove(key);
+        }
     }
 
     fn remote_upload_placeholder_visible(&self, _ino: Ino, _attr: &InodeAttr) -> bool {
@@ -6198,19 +6228,27 @@ impl StudioVfs {
 
     /// Return live extent records for an inode as `(block_index, object_id, content_epoch)`.
     pub fn live_extent_records_for_inode(&self, ino: Ino) -> Vec<(u32, u64, u64)> {
-        let mut out: Vec<_> = self
-            .state
+        // The map is keyed by `(ino, block_index)`, so the range is already
+        // ordered by block index.
+        self.state
             .incarnation
             .live_extent_records
             .lock()
-            .iter()
-            .filter(|((candidate, _), _)| *candidate == ino)
+            .range((ino, 0)..=(ino, u32::MAX))
             .map(|((_, block_index), extent)| {
                 (*block_index, extent.object_id, extent.content_epoch)
             })
-            .collect();
-        out.sort_by_key(|(block_index, _, _)| *block_index);
-        out
+            .collect()
+    }
+
+    pub(super) fn inode_has_live_extents(&self, ino: Ino) -> bool {
+        self.state
+            .incarnation
+            .live_extent_records
+            .lock()
+            .range((ino, 0)..=(ino, u32::MAX))
+            .next()
+            .is_some()
     }
 
     fn live_extent_epoch_for_object(&self, ino: Ino, object_id: u64) -> Option<u64> {
@@ -6218,10 +6256,9 @@ impl StudioVfs {
             .incarnation
             .live_extent_records
             .lock()
-            .iter()
-            .filter_map(|((candidate_ino, _), extent)| {
-                (*candidate_ino == ino && extent.object_id == object_id)
-                    .then_some(extent.content_epoch)
+            .range((ino, 0)..=(ino, u32::MAX))
+            .filter_map(|(_, extent)| {
+                (extent.object_id == object_id).then_some(extent.content_epoch)
             })
             .max()
     }

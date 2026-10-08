@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,8 @@ use crate::local::{
 };
 
 const PAYLOAD_MUTATION_STRIPES: usize = 64;
+/// Upper bound on payloads removed under one set of mutation stripes.
+const PAYLOAD_REMOVAL_CHUNK_OBJECTS: usize = 32;
 
 /// Cache index (redb) backing store for the local payload runtime.
 #[path = "payload_index.rs"]
@@ -62,6 +65,8 @@ const ACCESS_TOUCH_BATCH_SIZE: usize = 128;
 const ACCESS_TOUCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const ACCESS_TOUCH_FLUSH_INTERVAL: Duration = Duration::ZERO;
+/// Wake-up cadence of the background access-touch flusher.
+const ACCESS_TOUCH_FLUSHER_TICK: Duration = Duration::from_millis(250);
 const ACCESS_TOUCH_RETRY_BASE_BACKOFF_MS: u64 = 10;
 const ACCESS_TOUCH_RETRY_MAX_EXPONENT: u8 = 8;
 const DIRTY_ORPHAN_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
@@ -211,9 +216,11 @@ pub enum LocalPayloadReadMode {
 impl LocalPayloadReadMode {
     /// Default read mode for mounted filesystem paths.
     pub const fn default_for_mount_path() -> Self {
-        // The mounted vnode already has a kernel page cache. On macOS, caching
-        // backing payload files too duplicates pages and competes with UBC.
-        if cfg!(target_os = "macos") {
+        // The mounted file already has a kernel page cache. Caching backing
+        // payload files too duplicates every read in memory; on Windows the
+        // duplicate payload pages evict the mounted file's cached pages, so
+        // repeat reads of large files fall back to callbacks.
+        if cfg!(any(target_os = "macos", windows)) {
             Self::Unbuffered
         } else {
             Self::Buffered
@@ -277,14 +284,14 @@ impl LocalPayloadBackendOpenError {
 pub struct LocalPayloadBackendRuntime {
     layout: LocalPayloadLayout,
     volume_uuid: [u8; 16],
-    index: CacheIndex,
+    index: Arc<CacheIndex>,
     payload_store: FilePayloadStore,
     budget_governor: CacheBudgetGovernor,
     eviction_pass_lock: Mutex<()>,
     payload_mutation_gates: [Mutex<()>; PAYLOAD_MUTATION_STRIPES],
     runtime_pinned: Mutex<HashMap<u64, usize>>,
     eviction_scan_skipped_non_evictable: AtomicU64,
-    pending_access_touches: Mutex<PendingAccessTouches>,
+    access_touch: AccessTouchFlusher,
     last_dirty_orphan_prune_at: Mutex<Instant>,
     dirty_validation_in_progress: AtomicBool,
     storage_state_epoch: Mutex<u64>,
@@ -306,6 +313,13 @@ pub struct LocalPayloadBackendRuntime {
     >,
     #[cfg(test)]
     payload_gate_probe: Mutex<Option<std::sync::mpsc::SyncSender<bool>>>,
+    #[cfg(test)]
+    pause_after_removal_chunk: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
 }
 
 struct DirtyValidationGuard<'a> {
@@ -322,6 +336,9 @@ impl Drop for DirtyValidationGuard<'_> {
 
 impl Drop for LocalPayloadBackendRuntime {
     fn drop(&mut self) {
+        // Join the flusher before the final flush so no background commit can
+        // outlive this backend or race the redb database being reopened.
+        self.access_touch.stop_and_join();
         self.flush_access_touches(true, "drop");
     }
 }
@@ -433,9 +450,11 @@ impl LocalPayloadBackendRuntime {
             );
         }
 
+        let index = Arc::new(index);
         Ok(Self {
             layout,
             volume_uuid: config.volume_uuid,
+            access_touch: AccessTouchFlusher::start(Arc::clone(&index)),
             index,
             payload_store,
             budget_governor: cache_budget_bytes
@@ -445,7 +464,6 @@ impl LocalPayloadBackendRuntime {
             payload_mutation_gates: std::array::from_fn(|_| Mutex::new(())),
             runtime_pinned: Mutex::new(HashMap::new()),
             eviction_scan_skipped_non_evictable: AtomicU64::new(0),
-            pending_access_touches: Mutex::new(PendingAccessTouches::new()),
             last_dirty_orphan_prune_at: Mutex::new(
                 Instant::now()
                     .checked_sub(DIRTY_ORPHAN_PRUNE_MIN_INTERVAL)
@@ -466,6 +484,8 @@ impl LocalPayloadBackendRuntime {
             rollback_after_absence: Mutex::new(None),
             #[cfg(test)]
             payload_gate_probe: Mutex::new(None),
+            #[cfg(test)]
+            pause_after_removal_chunk: Mutex::new(None),
         })
     }
 
@@ -529,17 +549,28 @@ impl LocalPayloadBackendRuntime {
         }
     }
 
+    /// Enqueues an access touch. Foreground reads never flush: the commit runs
+    /// on the owned flusher thread (or, if that thread could not be spawned,
+    /// inline as a degraded fallback).
     fn touch_access_if_read(&self, object_id: u64, read_len: usize, op: &'static str) {
         if read_len == 0 {
             return;
         }
-        let pending_ids = {
-            let mut pending = self.pending_access_touches.lock();
+        let shared = &self.access_touch.shared;
+        let flush_inline = {
+            let mut pending = shared.pending.lock();
             pending.enqueue(object_id);
-            pending.take_ready_for_flush(false, Instant::now())
+            if shared.flusher_running.load(Ordering::Acquire) {
+                if pending.request_flush_if_due(Instant::now()) {
+                    shared.wake.notify_one();
+                }
+                None
+            } else {
+                pending.take_ready_for_flush(false, Instant::now())
+            }
         };
-        if let Some(pending_ids) = pending_ids {
-            self.flush_access_touch_ids(pending_ids, op);
+        if let Some(pending_ids) = flush_inline {
+            shared.flush_ids(pending_ids, op);
         }
     }
 
@@ -624,6 +655,24 @@ impl LocalPayloadBackendRuntime {
         } else {
             self.forget_access_touches(&still_orphaned);
         }
+    }
+
+    fn remove_payload_chunk(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
+        let _mutations = self.lock_payload_mutations(object_ids);
+        if self.index.any_present(object_ids)? {
+            return self.remove_payloads_locked(object_ids);
+        }
+        for &object_id in object_ids {
+            if self.payload_store.payload_path_exists(object_id)? {
+                return self.remove_payloads_locked(object_ids);
+            }
+        }
+        // No persistent ownership remains, but stale runtime state must still be cleared.
+        self.forget_runtime_pins(object_ids);
+        self.forget_access_touches(object_ids);
+        self.payload_store.invalidate_runtime_state(object_ids);
+        self.note_storage_state_change();
+        Ok(())
     }
 
     fn remove_payloads_locked(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
@@ -801,38 +850,20 @@ impl LocalPayloadBackendRuntime {
 
     fn flush_access_touches(&self, force: bool, operation: &'static str) {
         let pending_ids = {
-            let mut pending = self.pending_access_touches.lock();
+            let mut pending = self.access_touch.shared.pending.lock();
             let Some(pending_ids) = pending.take_ready_for_flush(force, Instant::now()) else {
                 return;
             };
             pending_ids
         };
-        self.flush_access_touch_ids(pending_ids, operation);
-    }
-
-    fn flush_access_touch_ids(&self, pending_ids: Vec<u64>, operation: &'static str) {
-        if let Err(error) = self
-            .index
-            .touch_access_many_unique(&pending_ids, ACCESS_TOUCH_MIN_INTERVAL)
-        {
-            warn!(
-                operation,
-                count = pending_ids.len(),
-                error = ?error,
-                "local payload runtime batched access touch failed"
-            );
-            let mut pending = self.pending_access_touches.lock();
-            pending.requeue_after_failure(pending_ids);
-        } else {
-            self.pending_access_touches.lock().record_flush_success();
-        }
+        self.access_touch.shared.flush_ids(pending_ids, operation);
     }
 
     fn forget_access_touches(&self, object_ids: &[u64]) {
         if object_ids.is_empty() {
             return;
         }
-        let mut pending = self.pending_access_touches.lock();
+        let mut pending = self.access_touch.shared.pending.lock();
         pending.forget_many(object_ids);
     }
 
@@ -1408,23 +1439,17 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     }
 
     fn remove_batch(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
-        if object_ids.is_empty() {
-            return Ok(());
-        }
-        let _mutations = self.lock_payload_mutations(object_ids);
-        if self.index.any_present(object_ids)? {
-            return self.remove_payloads_locked(object_ids);
-        }
-        for &object_id in object_ids {
-            if self.payload_store.payload_path_exists(object_id)? {
-                return self.remove_payloads_locked(object_ids);
+        // Removing a multi-gigabyte file covers every mutation stripe. Release
+        // them between bounded chunks so concurrent materialization of new
+        // payloads is not stalled for the whole removal.
+        for chunk in object_ids.chunks(PAYLOAD_REMOVAL_CHUNK_OBJECTS) {
+            self.remove_payload_chunk(chunk)?;
+            #[cfg(test)]
+            if let Some((removed, resume)) = self.pause_after_removal_chunk.lock().take() {
+                let _ = removed.send(());
+                let _ = resume.recv_timeout(Duration::from_secs(5));
             }
         }
-        // No persistent ownership remains, but stale runtime state must still be cleared.
-        self.forget_runtime_pins(object_ids);
-        self.forget_access_touches(object_ids);
-        self.payload_store.invalidate_runtime_state(object_ids);
-        self.note_storage_state_change();
         Ok(())
     }
 
@@ -1573,6 +1598,113 @@ struct PendingAccessTouches {
     last_flush_at: Instant,
     failed_flushes: u8,
     next_retry_at: Option<Instant>,
+    /// A foreground enqueue already asked the flusher thread to run.
+    flush_requested: bool,
+}
+
+/// State shared between the backend and its access-touch flusher thread.
+#[derive(Debug)]
+struct AccessTouchShared {
+    index: Arc<CacheIndex>,
+    pending: Mutex<PendingAccessTouches>,
+    wake: Condvar,
+    stop: AtomicBool,
+    /// False when the flusher thread could not be spawned; reads then flush inline.
+    flusher_running: AtomicBool,
+}
+
+impl AccessTouchShared {
+    fn flush_ids(&self, pending_ids: Vec<u64>, operation: &'static str) {
+        if let Err(error) = self
+            .index
+            .touch_access_many_unique(&pending_ids, ACCESS_TOUCH_MIN_INTERVAL)
+        {
+            warn!(
+                operation,
+                count = pending_ids.len(),
+                error = ?error,
+                "local payload runtime batched access touch failed"
+            );
+            self.pending.lock().requeue_after_failure(pending_ids);
+        } else {
+            self.pending.lock().record_flush_success();
+        }
+    }
+
+    /// Flusher thread body: commits due access-touch batches off the read path.
+    fn run_flusher(&self) {
+        loop {
+            let pending_ids = {
+                let mut pending = self.pending.lock();
+                if !self.stop.load(Ordering::Acquire) && !pending.flush_requested {
+                    self.wake.wait_for(&mut pending, ACCESS_TOUCH_FLUSHER_TICK);
+                }
+                if self.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                pending.take_ready_for_flush(false, Instant::now())
+            };
+            if let Some(pending_ids) = pending_ids {
+                self.flush_ids(pending_ids, "background");
+            }
+        }
+    }
+}
+
+/// Owns the access-touch flusher thread; joined when the backend is dropped so
+/// the redb index is not retained past the backend lifecycle.
+#[derive(Debug)]
+struct AccessTouchFlusher {
+    shared: Arc<AccessTouchShared>,
+    handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl AccessTouchFlusher {
+    fn start(index: Arc<CacheIndex>) -> Self {
+        let shared = Arc::new(AccessTouchShared {
+            index,
+            pending: Mutex::new(PendingAccessTouches::new()),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+            flusher_running: AtomicBool::new(false),
+        });
+        let worker = Arc::clone(&shared);
+        let handle = match std::thread::Builder::new()
+            .name("studiofs-access-touch".to_owned())
+            .spawn(move || worker.run_flusher())
+        {
+            Ok(handle) => {
+                shared.flusher_running.store(true, Ordering::Release);
+                Some(handle)
+            }
+            Err(error) => {
+                warn!(
+                    error = ?error,
+                    "failed to spawn access-touch flusher; falling back to inline flush on reads"
+                );
+                None
+            }
+        };
+        Self {
+            shared,
+            handle: Mutex::new(handle),
+        }
+    }
+
+    fn stop_and_join(&self) {
+        {
+            // Set under the pending lock so a flusher about to wait cannot miss it.
+            let _pending = self.shared.pending.lock();
+            self.shared.stop.store(true, Ordering::Release);
+        }
+        self.shared.wake.notify_all();
+        if let Some(handle) = self.handle.lock().take()
+            && handle.join().is_err()
+        {
+            warn!("access-touch flusher thread panicked");
+        }
+        self.shared.flusher_running.store(false, Ordering::Release);
+    }
 }
 
 impl PendingAccessTouches {
@@ -1583,6 +1715,7 @@ impl PendingAccessTouches {
             last_flush_at: Instant::now(),
             failed_flushes: 0,
             next_retry_at: None,
+            flush_requested: false,
         };
         pending.debug_assert_consistent();
         pending
@@ -1615,7 +1748,25 @@ impl PendingAccessTouches {
         drained
     }
 
+    /// Marks a flush as requested when a batch is due and none is already
+    /// requested; returns whether the flusher thread should be woken.
+    fn request_flush_if_due(&mut self, now: Instant) -> bool {
+        if self.flush_requested || self.object_ids.is_empty() {
+            return false;
+        }
+        if let Some(next_retry) = self.next_retry_at
+            && now < next_retry
+        {
+            return false;
+        }
+        let due = self.object_ids.len() >= ACCESS_TOUCH_BATCH_SIZE
+            || now.duration_since(self.last_flush_at) >= ACCESS_TOUCH_FLUSH_INTERVAL;
+        self.flush_requested |= due;
+        due
+    }
+
     fn take_ready_for_flush(&mut self, force: bool, now: Instant) -> Option<Vec<u64>> {
+        self.flush_requested = false;
         if self.object_ids.is_empty() {
             return None;
         }
@@ -1770,7 +1921,7 @@ mod tests {
             assert_eq!(backend.payload_store.read_into(99, 0, &mut out), Some(5));
             std::fs::remove_file(layout.payload_object_path(99)).unwrap();
             backend.pin(99);
-            backend.pending_access_touches.lock().enqueue(99);
+            backend.access_touch.shared.pending.lock().enqueue(99);
             let before = backend.payload_store.sync_barrier_snapshot();
             backend.fail_next_index_write_for_test();
             backend.payload_store.fail_next_remove_for_test(99);
@@ -1778,7 +1929,15 @@ mod tests {
             backend.remove(99).unwrap();
             backend.remove_batch(&[99, 100]).unwrap();
             assert!(!backend.is_runtime_pinned(99));
-            assert!(backend.pending_access_touches.lock().object_ids.is_empty());
+            assert!(
+                backend
+                    .access_touch
+                    .shared
+                    .pending
+                    .lock()
+                    .object_ids
+                    .is_empty()
+            );
             assert_eq!(backend.payload_store.read_into(99, 0, &mut out), None);
             let after = backend.payload_store.sync_barrier_snapshot();
             assert_eq!(
@@ -2410,6 +2569,72 @@ mod tests {
     }
 
     #[test]
+    fn foreground_read_enqueues_access_touch_without_flushing() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x24; 16],
+        })
+        .unwrap();
+        // Stop the real flusher but keep the foreground in "flusher running"
+        // mode, so any commit performed by the read itself would be visible.
+        backend.access_touch.stop_and_join();
+        backend
+            .access_touch
+            .shared
+            .flusher_running
+            .store(true, Ordering::Release);
+        backend.put(10, b"ten", true).unwrap();
+        backend.put(11, b"eleven", true).unwrap();
+        let mut out = [0_u8; 2];
+        assert_eq!(backend.read_into(10, 0, &mut out), Some(2));
+
+        assert_eq!(
+            backend.access_touch.shared.pending.lock().object_ids,
+            vec![10],
+            "the read must only enqueue the touch"
+        );
+        assert_eq!(
+            backend.index.access_order_object_ids().unwrap(),
+            vec![10, 11]
+        );
+        backend.flush_access_touches(true, "test");
+        assert_eq!(
+            backend.index.access_order_object_ids().unwrap(),
+            vec![11, 10]
+        );
+    }
+
+    #[test]
+    fn background_flusher_commits_access_touch_after_read() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x25; 16],
+        })
+        .unwrap();
+        backend.put(10, b"ten", true).unwrap();
+        backend.put(11, b"eleven", true).unwrap();
+        let mut out = [0_u8; 2];
+        assert_eq!(backend.read_into(10, 0, &mut out), Some(2));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while backend.index.access_order_object_ids().unwrap() != vec![11, 10] {
+            assert!(
+                Instant::now() < deadline,
+                "background flusher did not commit the access touch"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
     fn local_backend_read_into_refreshes_access_order() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
@@ -2701,6 +2926,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bulk_removal_releases_mutation_stripes_for_concurrent_puts() {
+        use std::sync::Arc;
+        use std::sync::mpsc::sync_channel;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = Arc::new(
+            LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                LocalPayloadBackendConfig {
+                    cache_root: temp.path().to_path_buf(),
+                    volume_uuid: [0x7c; 16],
+                },
+                None,
+                LocalPayloadSyncMode::Fast,
+            )
+            .unwrap(),
+        );
+        // Every stripe is covered, as when a multi-gigabyte file is deleted.
+        let removed_ids = (0..(PAYLOAD_MUTATION_STRIPES * 2) as u64).collect::<Vec<_>>();
+        let puts = removed_ids
+            .iter()
+            .map(|&object_id| LocalPayloadPut {
+                object_id,
+                data: Bytes::from_static(b"old"),
+                evictable: false,
+            })
+            .collect::<Vec<_>>();
+        backend.put_batch(&puts).unwrap();
+
+        let (removed_tx, removed_rx) = sync_channel(1);
+        let (resume_tx, resume_rx) = sync_channel(1);
+        *backend.pause_after_removal_chunk.lock() = Some((removed_tx, resume_rx));
+        let remover = {
+            let backend = Arc::clone(&backend);
+            let removed_ids = removed_ids.clone();
+            std::thread::spawn(move || backend.remove_batch(&removed_ids))
+        };
+        removed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bulk removal must release its stripes between bounded chunks");
+        assert!(
+            backend
+                .index
+                .get_entry(*removed_ids.last().unwrap())
+                .unwrap()
+                .is_some(),
+            "the pause must happen before the bulk removal finishes"
+        );
+
+        // A new payload whose stripe belongs to a not-yet-removed chunk.
+        let new_id = (PAYLOAD_MUTATION_STRIPES * 4 - 1) as u64;
+        let (put_tx, put_rx) = sync_channel(1);
+        let writer = {
+            let backend = Arc::clone(&backend);
+            std::thread::spawn(move || {
+                let _ = put_tx.send(backend.put_batch(&[LocalPayloadPut {
+                    object_id: new_id,
+                    data: Bytes::from_static(b"new"),
+                    evictable: false,
+                }]));
+            })
+        };
+        let put_result = put_rx.recv_timeout(Duration::from_secs(5));
+        let _ = resume_tx.send(());
+        put_result
+            .expect("materialization put must not wait for the whole bulk removal")
+            .unwrap();
+        writer.join().expect("writer thread panicked");
+        remover
+            .join()
+            .expect("remover thread panicked")
+            .expect("bulk removal succeeds");
+
+        for &object_id in &removed_ids {
+            assert!(backend.index.get_entry(object_id).unwrap().is_none());
+            assert!(!layout.payload_object_path(object_id).exists());
+        }
+        assert_eq!(backend.get_for_upload(new_id).unwrap().as_ref(), b"new");
     }
 
     #[test]

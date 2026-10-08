@@ -64,21 +64,7 @@ impl PendingInvalidations {
         if self.seen.contains(&intent) {
             return;
         }
-        let bytes = std::mem::size_of::<InvalidationIntent>()
-            + match &intent {
-                InvalidationIntent::Entry {
-                    name, ancestors, ..
-                } => {
-                    name.len()
-                        + ancestors.as_ref().map_or(0, |parts| {
-                            parts
-                                .iter()
-                                .map(|part| part.len() + std::mem::size_of::<Vec<u8>>())
-                                .sum::<usize>()
-                        })
-                }
-                _ => 0,
-            };
+        let bytes = Self::intent_bytes(&intent);
         if intent == InvalidationIntent::Reset
             || self.intents.len() >= MAX_INVALIDATION_INTENTS
             || bytes > MAX_INVALIDATION_BYTES.saturating_sub(self.bytes)
@@ -92,6 +78,31 @@ impl PendingInvalidations {
             self.bytes += bytes;
             self.seen.insert(intent.clone());
             self.intents.push(intent);
+        }
+    }
+
+    fn intent_bytes(intent: &InvalidationIntent) -> usize {
+        std::mem::size_of::<InvalidationIntent>()
+            + match intent {
+                InvalidationIntent::Entry {
+                    name, ancestors, ..
+                } => {
+                    name.len()
+                        + ancestors.as_ref().map_or(0, |parts| {
+                            parts
+                                .iter()
+                                .map(|part| part.len() + std::mem::size_of::<Vec<u8>>())
+                                .sum::<usize>()
+                        })
+                }
+                _ => 0,
+            }
+    }
+
+    /// Appends every intent of `scoped`, as if each had been pushed here.
+    pub(crate) fn absorb(&mut self, scoped: Self) {
+        for intent in scoped.intents {
+            self.push(intent);
         }
     }
 }

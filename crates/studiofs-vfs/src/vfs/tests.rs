@@ -1588,6 +1588,7 @@ fn failed_semantic_generation_falls_back_to_reset_after_bounded_retries() {
                 intents: vec![InvalidationIntent::Attributes { ino: ROOT_INO }],
             },
             attempts: 0,
+            deferred: false,
         });
 
     vfs.drain_semantic_invalidations();
@@ -1644,6 +1645,7 @@ fn semantic_writer_deferral_does_not_consume_retry_attempts() {
                     ],
                 },
                 attempts: 0,
+                deferred: false,
             });
 
         assert_eq!(vfs.drain_semantic_invalidations(), Some(false));
@@ -1654,6 +1656,245 @@ fn semantic_writer_deferral_does_not_consume_retry_attempts() {
         }
 
         vfs.release_fh(fh).await.expect("release");
+    });
+}
+
+fn healthy_coherence_progress() -> studiofs_meta::engine::MetadataCoherenceProgress {
+    studiofs_meta::engine::MetadataCoherenceProgress {
+        applied_version: Some(4),
+        remote_head_version: Some(4),
+        source_connected: true,
+        remote_authoritative: true,
+    }
+}
+
+#[test]
+fn writer_deferred_generation_completes_and_health_recovers_after_release() {
+    use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "semantic-deferred-recovery");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"deferred-recovery", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        vfs.set_kernel_invalidator(Arc::new(AlwaysQueueKernelInvalidator));
+        vfs.note_coherence_sync_started();
+        vfs.note_coherence_sync_success(healthy_coherence_progress(), true, 1);
+        assert!(vfs.coherence_allows_os_cache());
+        vfs.coherence_pending_invalidations
+            .lock()
+            .push_back(PendingCoherenceInvalidation {
+                batch: InvalidationBatch {
+                    generation: 2,
+                    intents: vec![InvalidationIntent::Attributes { ino: attr.ino }],
+                },
+                attempts: 0,
+                deferred: false,
+            });
+
+        // A wake while the writer is open: the generation stays incomplete.
+        vfs.note_coherence_sync_started();
+        let before = vfs.drain_semantic_invalidations();
+        let after = vfs.drain_semantic_invalidations();
+        assert_eq!((before, after), (Some(false), Some(false)));
+        assert!(
+            vfs.note_metadata_invalidation_pass(
+                before,
+                after,
+                false,
+                false,
+                healthy_coherence_progress()
+            )
+            .is_none()
+        );
+        assert!(!vfs.coherence_allows_os_cache());
+        assert!(vfs.has_deferred_coherence_retry());
+        assert!(vfs.deferred_coherence_retry_blocked());
+
+        vfs.release_fh(fh).await.expect("release writer");
+        assert!(
+            !vfs.deferred_coherence_retry_blocked(),
+            "the retry gate must open once the writer state is gone"
+        );
+
+        // The retry wake needs no new batch and no metadata change to recover.
+        vfs.note_coherence_sync_started();
+        let before = vfs.drain_semantic_invalidations();
+        let after = vfs.drain_semantic_invalidations();
+        assert_eq!((before, after), (Some(true), None));
+        assert!(
+            vfs.note_metadata_invalidation_pass(
+                before,
+                after,
+                false,
+                false,
+                healthy_coherence_progress()
+            )
+            .is_none()
+        );
+        assert!(!vfs.has_deferred_coherence_retry());
+        assert!(
+            vfs.coherence_allows_os_cache(),
+            "coverage of a completed deferred generation must reopen the cache gate"
+        );
+    });
+}
+
+#[test]
+fn invalidation_worker_retries_writer_deferred_generation_without_new_metadata() {
+    use studiofs_meta::MetaEvent;
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "semantic-deferred-worker");
+    let _guard = rt.enter();
+    // Bounded observable-state wait; the worker's own fallback poll is an hour away.
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"deferred-worker", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        vfs.set_kernel_invalidator(Arc::new(AlwaysQueueKernelInvalidator));
+        let worker = tokio::spawn(
+            vfs.clone()
+                .background_metadata_invalidation(Duration::from_secs(3600)),
+        );
+        wait_until("startup coverage", || vfs.coherence_allows_os_cache()).await;
+
+        // A committed metadata change for a file that still has a writer.
+        let mut changed = meta.get_attr(attr.ino).expect("attr");
+        changed.mtime += 1;
+        meta.apply_replica_serving_state(&[MetaEvent::SetAttr { attr: changed }])
+            .expect("commit metadata change");
+        wait_until("deferral", || vfs.has_deferred_coherence_retry()).await;
+        assert!(!vfs.coherence_allows_os_cache());
+
+        // Nothing else is committed or published: only the writer going away.
+        vfs.release_fh(fh).await.expect("release writer");
+        wait_until("recovery after release", || {
+            vfs.coherence_allows_os_cache() && !vfs.has_deferred_coherence_retry()
+        })
+        .await;
+        worker.abort();
+    });
+}
+
+#[test]
+fn upload_dirty_state_without_an_open_writer_does_not_defer_invalidation() {
+    use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "semantic-upload-dirty");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"upload-pending", 0, 0, 0o644)
+            .expect("create");
+        // Closed writer whose data is still draining to the upload pipeline.
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(attr.ino, attr.clone());
+        assert!(vfs.inode_has_local_dirty_state(attr.ino));
+        assert!(!vfs.defer_kernel_invalidation_for_active_writer(attr.ino));
+
+        vfs.set_kernel_invalidator(Arc::new(AlwaysQueueKernelInvalidator));
+        vfs.note_coherence_sync_started();
+        vfs.note_coherence_sync_success(healthy_coherence_progress(), true, 1);
+        assert!(vfs.coherence_allows_os_cache());
+        vfs.coherence_pending_invalidations
+            .lock()
+            .push_back(PendingCoherenceInvalidation {
+                batch: InvalidationBatch {
+                    generation: 2,
+                    intents: vec![
+                        InvalidationIntent::Attributes { ino: attr.ino },
+                        InvalidationIntent::Content { ino: attr.ino },
+                    ],
+                },
+                attempts: 0,
+                deferred: false,
+            });
+        assert_eq!(vfs.drain_semantic_invalidations(), Some(true));
+        assert!(!vfs.has_deferred_coherence_retry());
+        assert!(vfs.coherence_allows_os_cache());
+
+        // An open write-capable handle still protects the inode.
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        assert!(vfs.defer_kernel_invalidation_for_active_writer(attr.ino));
+        vfs.release_fh(fh).await.expect("release writer");
+    });
+}
+
+#[test]
+fn adapter_writer_deferral_does_not_consume_retry_attempts() {
+    use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "semantic-adapter-deferral");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"adapter-deferral", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        // The adapter reports its own dirty-writer protection as Failed.
+        vfs.set_kernel_invalidator(Arc::new(AlwaysFailKernelInvalidator));
+        vfs.coherence_pending_invalidations
+            .lock()
+            .push_back(PendingCoherenceInvalidation {
+                batch: InvalidationBatch {
+                    generation: 3,
+                    intents: vec![InvalidationIntent::Entry {
+                        parent: ROOT_INO,
+                        name: b"adapter-deferral".to_vec(),
+                        ancestors: None,
+                        ino: Some(attr.ino),
+                    }],
+                },
+                attempts: 0,
+                deferred: false,
+            });
+
+        for _ in 0..4 {
+            assert_eq!(vfs.drain_semantic_invalidations(), Some(false));
+        }
+        {
+            let pending = vfs.coherence_pending_invalidations.lock();
+            let retained = pending.front().expect("deferred batch retained");
+            assert_eq!(pending.len(), 1);
+            assert_eq!(retained.attempts, 0);
+            assert!(retained.deferred);
+            assert!(matches!(
+                retained.batch.intents.as_slice(),
+                [InvalidationIntent::Entry { .. }]
+            ));
+        }
+
+        // Once the writer state is gone a genuine failure counts again.
+        vfs.release_fh(fh).await.expect("release writer");
+        vfs.drain_semantic_invalidations();
+        let pending = vfs.coherence_pending_invalidations.lock();
+        assert_eq!(pending.front().expect("failed batch").attempts, 1);
+        assert!(!pending.front().expect("failed batch").deferred);
     });
 }
 
@@ -1683,6 +1924,7 @@ fn semantic_reset_covers_writer_deferred_scopes() {
                     ],
                 },
                 attempts: 0,
+                deferred: false,
             });
 
         assert_eq!(vfs.drain_semantic_invalidations(), Some(true));
@@ -1709,6 +1951,7 @@ fn semantic_queue_overflow_reset_replaces_old_unresolved_generations() {
                     intents: vec![InvalidationIntent::Attributes { ino: ROOT_INO }],
                 },
                 attempts: 0,
+                deferred: false,
             });
     }
 

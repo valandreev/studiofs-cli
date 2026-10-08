@@ -15,6 +15,9 @@ use crate::{JanitorMeta, VfsMeta};
 const JANITOR_RECONCILIATION_CONCURRENCY: usize = 32;
 const COHERENCE_PENDING_INVALIDATION_CAPACITY: usize = 128;
 const COHERENCE_INVALIDATION_RETRY_LIMIT: u8 = 3;
+/// Bounded local re-check of writer-deferred generations; nothing else wakes the
+/// invalidation worker when a writer releases or its dirty state drains.
+const COHERENCE_DEFERRED_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const LOCAL_REDB_COMPACTION_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const LOCAL_REDB_COMPACTION_IDLE_WINDOW: Duration = Duration::from_secs(15 * 60);
 const LOCAL_REDB_COMPACTION_DIAGNOSTIC_RECHECK: Duration = Duration::from_secs(60 * 60);
@@ -141,6 +144,8 @@ struct MetadataTraversalSnapshot {
 enum MetadataInvalidationWakeReason {
     BackendNotify,
     FallbackPoll,
+    /// A writer-deferred invalidation generation may have become deliverable.
+    DeferredRetry,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -268,6 +273,7 @@ fn should_run_invalidation_poll_sync(
                 && last_metadata_token == current_metadata_token
         }
         MetadataInvalidationWakeReason::FallbackPoll => true,
+        MetadataInvalidationWakeReason::DeferredRetry => false,
     }
 }
 
@@ -435,6 +441,7 @@ impl StudioVfs {
     pub(super) async fn background_epoch_finalizer(self: Arc<Self>) {
         const MAX_FINALIZATIONS_IN_FLIGHT: usize = 32;
         let publisher = Arc::new(commit::EpochPublicationBatcher::default());
+        tracing::debug!("epoch finalizer worker started");
 
         'finalizer: loop {
             let Some((ino, content_epoch)) = self.pop_epoch_finalization() else {
@@ -481,6 +488,18 @@ impl StudioVfs {
                 let Some(finalize_result) = finalize_result else {
                     break 'finalizer;
                 };
+                tracing::debug!(
+                    ino,
+                    content_epoch,
+                    status = match &finalize_result {
+                        Ok(commit::EpochFinalizeStatus::Published) => "published",
+                        Ok(commit::EpochFinalizeStatus::WaitingForUploads) => "waiting_for_uploads",
+                        Ok(commit::EpochFinalizeStatus::Deferred) => "deferred",
+                        Ok(commit::EpochFinalizeStatus::Skipped) => "skipped",
+                        Err(_) => "error",
+                    },
+                    "epoch finalization result"
+                );
                 match finalize_result {
                     Ok(commit::EpochFinalizeStatus::Published) => {
                         self.state.file_session.note_background_transition(
@@ -625,7 +644,12 @@ impl StudioVfs {
     ) -> (InvalidationAcceptance, bool) {
         use studiofs_meta::coherence::InvalidationIntent;
 
+        let original_inodes = Self::semantic_batch_inodes(&batch);
+        let intent_summary = tracing::enabled!(tracing::Level::DEBUG)
+            .then(|| Self::semantic_intent_summary(&batch))
+            .unwrap_or_default();
         let mut deferred = false;
+        let mut deferred_inodes = Vec::new();
         let mut attr_inodes = HashSet::new();
         let mut full_content_inodes = HashSet::new();
         let mut namespace_parents = HashSet::new();
@@ -640,6 +664,7 @@ impl StudioVfs {
                     }
                     if self.should_skip_kernel_invalidation_for_active_open(*ino, full) {
                         deferred = true;
+                        deferred_inodes.push(*ino);
                         return false;
                     }
                 }
@@ -677,12 +702,13 @@ impl StudioVfs {
         if deferred {
             debug!(
                 generation = batch.generation,
+                ?deferred_inodes,
                 "semantic invalidation deferred for active writer; generation coverage incomplete"
             );
         }
         // A global reset covers every semantic scope, including scopes whose
         // ordinary writer protection would otherwise defer native purges.
-        let generation_complete = !deferred || reset;
+        let mut generation_complete = !deferred || reset;
         let invalidator = self.kernel_invalidator();
         let has_invalidator = invalidator.is_some();
         let acceptance = match invalidator {
@@ -690,11 +716,22 @@ impl StudioVfs {
             Some(_invalidator) if batch.intents.is_empty() => InvalidationAcceptance::Failed,
             Some(invalidator) => invalidator.invalidate_batch(&batch, generation_complete),
         };
+        // Adapters also protect open writers and report that deferral as Failed.
+        // It clears when the writer closes; it is not a delivery failure, so it
+        // must neither consume retry attempts nor escalate to a reset.
+        if acceptance == InvalidationAcceptance::Failed
+            && generation_complete
+            && !reset
+            && self.semantic_batch_has_active_writer(&original_inodes)
+        {
+            generation_complete = false;
+        }
         if acceptance != InvalidationAcceptance::Queued || !generation_complete {
             debug!(
                 generation = batch.generation,
                 ?acceptance,
                 generation_complete,
+                intents = %intent_summary,
                 "semantic invalidation not fully admitted"
             );
         }
@@ -732,18 +769,82 @@ impl StudioVfs {
                     && generation_complete,
             );
             if !generation_complete {
-                self.retain_failed_coherence_invalidation(retry, attempts);
+                self.retain_failed_coherence_invalidation(retry, attempts, true);
             } else if acceptance == InvalidationAcceptance::Failed {
-                self.retain_failed_coherence_invalidation(retry, attempts.saturating_add(1));
+                self.retain_failed_coherence_invalidation(retry, attempts.saturating_add(1), false);
             }
         }
         outcome
+    }
+
+    fn semantic_batch_inodes(batch: &studiofs_meta::coherence::InvalidationBatch) -> Vec<Ino> {
+        use studiofs_meta::coherence::InvalidationIntent;
+        batch
+            .intents
+            .iter()
+            .filter_map(|intent| match intent {
+                InvalidationIntent::Attributes { ino }
+                | InvalidationIntent::Content { ino }
+                | InvalidationIntent::Directory { ino } => Some(*ino),
+                InvalidationIntent::Entry { ino, .. } => *ino,
+                InvalidationIntent::Reset => None,
+            })
+            .collect()
+    }
+
+    /// Intent kinds and inode identities only, for diagnostics.
+    fn semantic_intent_summary(batch: &studiofs_meta::coherence::InvalidationBatch) -> String {
+        use studiofs_meta::coherence::InvalidationIntent;
+        let (mut attrs, mut content, mut dirs, mut entries, mut reset) =
+            (Vec::new(), Vec::new(), Vec::new(), 0usize, false);
+        for intent in &batch.intents {
+            match intent {
+                InvalidationIntent::Attributes { ino } => attrs.push(*ino),
+                InvalidationIntent::Content { ino } => content.push(*ino),
+                InvalidationIntent::Directory { ino } => dirs.push(*ino),
+                InvalidationIntent::Entry { .. } => entries += 1,
+                InvalidationIntent::Reset => reset = true,
+            }
+        }
+        format!(
+            "attributes={attrs:?} content={content:?} directories={dirs:?} entries={entries} reset={reset}"
+        )
+    }
+
+    fn semantic_batch_has_active_writer(&self, inodes: &[Ino]) -> bool {
+        inodes
+            .iter()
+            .any(|ino| self.handle_table.has_active_open_overlay(*ino))
+    }
+
+    /// True while some writer-deferred generation is retained.
+    pub(super) fn has_deferred_coherence_retry(&self) -> bool {
+        self.coherence_pending_invalidations
+            .lock()
+            .iter()
+            .any(|pending| pending.deferred)
+    }
+
+    /// True while every writer-deferred generation is still protected by local
+    /// writer state, so retrying now could only defer again.
+    pub(super) fn deferred_coherence_retry_blocked(&self) -> bool {
+        let deferred = self
+            .coherence_pending_invalidations
+            .lock()
+            .iter()
+            .filter(|pending| pending.deferred)
+            .map(|pending| Self::semantic_batch_inodes(&pending.batch))
+            .collect::<Vec<_>>();
+        deferred
+            .iter()
+            .all(|inodes| self.semantic_batch_has_active_writer(inodes))
     }
 
     fn retain_failed_coherence_invalidation(
         &self,
         batch: studiofs_meta::coherence::InvalidationBatch,
         attempts: u8,
+        deferred: bool,
     ) {
         let is_reset = matches!(
             batch.intents.as_slice(),
@@ -783,9 +884,14 @@ impl StudioVfs {
                     intents: vec![studiofs_meta::coherence::InvalidationIntent::Reset],
                 },
                 attempts: 0,
+                deferred: false,
             });
         } else {
-            pending.push_back(PendingCoherenceInvalidation { batch, attempts });
+            pending.push_back(PendingCoherenceInvalidation {
+                batch,
+                attempts,
+                deferred,
+            });
         }
     }
 
@@ -1113,18 +1219,15 @@ impl StudioVfs {
         }
     }
 
-    /// Protect accepted local state when a native bridge can only invalidate
-    /// attributes together with content. A true result requires the bridge to
-    /// defer delivery and leaves the ordinary handle-release retry armed.
+    /// Protect an open write-capable handle when a native bridge can only invalidate
+    /// attributes together with content. A true result requires the bridge to defer
+    /// delivery and leaves the ordinary handle-release retry armed.
+    ///
+    /// Pending uploads and unflushed VFS state are deliberately not a reason: the
+    /// VFS owns that data, the kernel holds none of it for a write-capable handle,
+    /// and a purge only makes the kernel ask the VFS again.
     pub fn defer_kernel_invalidation_for_active_writer(&self, ino: Ino) -> bool {
-        if self.should_skip_kernel_invalidation_for_active_open(ino, true) {
-            return true;
-        }
-        if self.inode_has_local_dirty_state(ino) {
-            self.deferred_kernel_invalidations.insert(ino);
-            return true;
-        }
-        false
+        self.should_skip_kernel_invalidation_for_active_open(ino, true)
     }
 
     pub(super) fn flush_deferred_kernel_invalidations(&self, ino: Ino) {
@@ -1235,6 +1338,47 @@ impl StudioVfs {
         }
     }
 
+    async fn wait_for_deferred_coherence_retry(&self) {
+        if self.has_deferred_coherence_retry() {
+            tokio::time::sleep(COHERENCE_DEFERRED_RETRY_INTERVAL).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Health bookkeeping for one invalidation pass after its metadata sync.
+    ///
+    /// Returns `None` when the pass found nothing to reconcile. Otherwise returns
+    /// whether semantic coverage is complete and the applied boundary, for the
+    /// reconciliation that follows.
+    pub(super) fn note_metadata_invalidation_pass(
+        &self,
+        before_sync_coverage: Option<bool>,
+        after_sync_coverage: Option<bool>,
+        token_namespace_changed: bool,
+        metadata_changed: bool,
+        progress: MetadataCoherenceProgress,
+    ) -> Option<(bool, Option<u64>)> {
+        let semantic_coverage_ready =
+            semantic_coverage_complete(before_sync_coverage, after_sync_coverage);
+        let reconciliation_complete = !token_namespace_changed && !metadata_changed;
+        let health_coverage_complete = invalidation_coverage_complete(
+            before_sync_coverage,
+            after_sync_coverage,
+            token_namespace_changed,
+            metadata_changed,
+        );
+        let applied_boundary = progress.applied_version;
+
+        self.note_coherence_sync_success(progress, health_coverage_complete, now_unix_millis());
+        self.note_coherence_delivery_state(now_unix_millis());
+
+        if reconciliation_complete {
+            return None;
+        }
+        Some((semantic_coverage_ready, applied_boundary))
+    }
+
     pub(super) async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {
         let meta = self.meta.sync_view();
         let metadata_notifier = meta.metadata_invalidation_notifier();
@@ -1255,9 +1399,17 @@ impl StudioVfs {
                     MetadataInvalidationWakeReason::BackendNotify
                 },
                 _ = fallback_timer.tick() => MetadataInvalidationWakeReason::FallbackPoll,
+                _ = Self::wait_for_deferred_coherence_retry(&self) => {
+                    MetadataInvalidationWakeReason::DeferredRetry
+                },
             };
             if self.shutdown_requested() {
                 break;
+            }
+            if wake_reason == MetadataInvalidationWakeReason::DeferredRetry
+                && self.deferred_coherence_retry_blocked()
+            {
+                continue;
             }
             self.note_coherence_sync_started();
             // Local commits must not wait for a remote poll to finish before
@@ -1310,23 +1462,17 @@ impl StudioVfs {
                 &after_namespace_token,
                 &after_metadata_token,
             );
-            let semantic_coverage_ready =
-                semantic_coverage_complete(before_sync_coverage, after_sync_coverage);
-            let reconciliation_complete = !token_namespace_changed && !metadata_changed;
-            let health_coverage_complete = invalidation_coverage_complete(
-                before_sync_coverage,
-                after_sync_coverage,
-                token_namespace_changed,
-                metadata_changed,
-            );
-            let applied_boundary = progress.applied_version;
-
-            self.note_coherence_sync_success(progress, health_coverage_complete, now_unix_millis());
-            self.note_coherence_delivery_state(now_unix_millis());
-
-            if reconciliation_complete {
+            let Some((semantic_coverage_ready, applied_boundary)) = self
+                .note_metadata_invalidation_pass(
+                    before_sync_coverage,
+                    after_sync_coverage,
+                    token_namespace_changed,
+                    metadata_changed,
+                    progress,
+                )
+            else {
                 continue;
-            }
+            };
 
             let meta = self.meta.clone();
             let current_snapshot =

@@ -12,7 +12,7 @@ use redb::{
     TableDefinition, WriteTransaction,
 };
 use std::borrow::{Borrow, Cow};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::ErrorKind;
 use std::ops::Deref;
@@ -431,6 +431,7 @@ pub(crate) struct RedbWriteTransaction<'a> {
     invalidation_journal: &'a Mutex<InvalidationJournal>,
     invalidation_notify: &'a tokio::sync::Notify,
     invalidations: RefCell<PendingInvalidations>,
+    invalidations_suppressed: Cell<bool>,
 }
 
 fn begin_redb_write_txn(
@@ -659,9 +660,62 @@ impl Deref for RedbWriteTransaction<'_> {
     }
 }
 
+/// Guard returned by [`RedbWriteTransaction::invalidation_scope`].
+pub(crate) struct InvalidationScope<'t, 'db> {
+    txn: &'t RedbWriteTransaction<'db>,
+    outer: Option<PendingInvalidations>,
+}
+
+impl InvalidationScope<'_, '_> {
+    /// Drops every scope journaled since the guard was created.
+    pub(crate) fn discard(mut self) {
+        if let Some(outer) = self.outer.take() {
+            *self.txn.invalidations.borrow_mut() = outer;
+        }
+    }
+}
+
+impl Drop for InvalidationScope<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(mut outer) = self.outer.take() {
+            let mut current = self.txn.invalidations.borrow_mut();
+            outer.absorb(std::mem::take(&mut *current));
+            *current = outer;
+        }
+    }
+}
+
 impl RedbWriteTransaction<'_> {
     pub(crate) fn invalidate(&self, intent: InvalidationIntent) {
+        if self.invalidations_suppressed.get() {
+            return;
+        }
         self.invalidations.borrow_mut().push(intent);
+    }
+
+    /// Journals the following scopes separately until the returned guard is
+    /// resolved. [`InvalidationScope::discard`] drops them, for a write that
+    /// left the serving view exactly as it was; dropping the guard otherwise
+    /// keeps them. Isolation means an overflow to `Reset` inside the scope
+    /// cannot destroy the intents journaled before it.
+    pub(crate) fn invalidation_scope(&self) -> InvalidationScope<'_, '_> {
+        let outer = std::mem::take(&mut *self.invalidations.borrow_mut());
+        InvalidationScope {
+            txn: self,
+            outer: Some(outer),
+        }
+    }
+
+    /// Runs `apply` without journaling the invalidation scopes it records.
+    ///
+    /// Only for writes that cannot change what the local serving view already
+    /// exposed, such as mirroring this client's own acknowledged events into
+    /// the remote-visible base tables.
+    pub(crate) fn without_invalidations<T>(&self, apply: impl FnOnce() -> T) -> T {
+        let previous = self.invalidations_suppressed.replace(true);
+        let result = apply();
+        self.invalidations_suppressed.set(previous);
+        result
     }
 
     pub(crate) fn commit(self) -> Result<(), redb::CommitError> {
@@ -675,6 +729,7 @@ impl RedbWriteTransaction<'_> {
             invalidation_journal,
             invalidation_notify,
             invalidations,
+            invalidations_suppressed: _,
         } = self;
         let commit_started = Instant::now();
         MetadataWriteMetrics::observe(&write_metrics.mutation, commit_started - mutation_started);
@@ -843,6 +898,7 @@ impl RedbMetaEngine {
             invalidation_journal: &self.invalidation_journal,
             invalidation_notify: &self.invalidation_notify,
             invalidations: RefCell::default(),
+            invalidations_suppressed: Cell::new(false),
         })
     }
 
@@ -874,6 +930,7 @@ impl RedbMetaEngine {
             invalidation_journal: &self.invalidation_journal,
             invalidation_notify: &self.invalidation_notify,
             invalidations: RefCell::default(),
+            invalidations_suppressed: Cell::new(false),
         })
     }
 

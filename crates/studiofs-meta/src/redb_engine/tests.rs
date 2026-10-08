@@ -1563,3 +1563,62 @@ fn contract_core_harness_accepts_open_unlink_pending_overlay_cleanup() {
         .assert_invariants("open-unlink pending overlay cleanup")
         .expect("open-unlink cleanup state should satisfy contract invariants");
 }
+
+#[test]
+fn coherence_journal_discards_only_scoped_intents() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 1 });
+    let scope = txn.invalidation_scope();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 1 });
+    txn.invalidate(InvalidationIntent::Attributes { ino: 2 });
+    scope.discard();
+    // A dropped (not discarded) scope keeps what it journaled.
+    let scope = txn.invalidation_scope();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 3 });
+    drop(scope);
+    txn.commit().unwrap();
+    let batches = engine.take_invalidation_batches();
+    assert_eq!(
+        batches[0].intents,
+        vec![
+            InvalidationIntent::Attributes { ino: 1 },
+            InvalidationIntent::Attributes { ino: 3 }
+        ]
+    );
+}
+
+#[test]
+fn coherence_journal_discarded_overflow_keeps_earlier_intents() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 1 });
+    let scope = txn.invalidation_scope();
+    // Overflows the scoped journal into a reset.
+    for ino in 10..10_000 {
+        txn.invalidate(InvalidationIntent::Attributes { ino });
+    }
+    scope.discard();
+    txn.commit().unwrap();
+    let batches = engine.take_invalidation_batches();
+    assert_eq!(
+        batches[0].intents,
+        vec![InvalidationIntent::Attributes { ino: 1 }]
+    );
+}
+
+#[test]
+fn coherence_journal_kept_scope_reset_subsumes_earlier_intents() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 1 });
+    let scope = txn.invalidation_scope();
+    txn.invalidate(InvalidationIntent::Reset);
+    drop(scope);
+    txn.commit().unwrap();
+    let batches = engine.take_invalidation_batches();
+    assert_eq!(batches[0].intents, vec![InvalidationIntent::Reset]);
+}

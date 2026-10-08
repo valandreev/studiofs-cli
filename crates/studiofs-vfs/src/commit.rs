@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use studiofs_meta::InodeLifecycleState;
 
 use crate::runtime::{
@@ -27,6 +28,9 @@ struct FinalizeMetaSnapshot {
 }
 
 const EPOCH_PUBLICATION_BATCH_MAX_OPERATIONS: usize = 64;
+const PUBLISH_VISIBILITY_PROBE_CONCURRENCY: usize = 64;
+/// Visibility budgets one finalization may spend in total while progressing.
+const PUBLISH_VISIBILITY_MAX_BUDGETS: u32 = 10;
 
 type EpochPublicationCompletion = tokio::sync::oneshot::Sender<Result<bool, Arc<VfsError>>>;
 
@@ -188,6 +192,7 @@ impl CommitCoordinator {
         content_epoch: u64,
         publisher: Option<Arc<EpochPublicationBatcher>>,
     ) -> VfsResult<EpochFinalizeStatus> {
+        tracing::debug!(ino, content_epoch, "epoch finalization started");
         let _commit_qos = vfs
             .qos
             .acquire_commit()
@@ -202,6 +207,12 @@ impl CommitCoordinator {
             Ok(attr) => attr,
             Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
                 vfs.clear_inode_incarnation(ino);
+                tracing::debug!(
+                    ino,
+                    content_epoch,
+                    reason = "inode_not_found",
+                    "epoch finalization skipped"
+                );
                 return Ok(EpochFinalizeStatus::Skipped);
             }
             Err(err) => return Err(err),
@@ -210,9 +221,26 @@ impl CommitCoordinator {
             || attr.upload_state == MetaUploadState::Ready
             || !StudioVfs::needs_epoch_finalization(&attr)
         {
+            tracing::debug!(
+                ino,
+                content_epoch,
+                attr_content_epoch = attr.content_epoch,
+                committed_content_epoch = attr.committed_content_epoch,
+                upload_state = ?attr.upload_state,
+                size = attr.size,
+                committed_size = attr.committed_size,
+                reason = "attr_epoch_mismatch_or_ready_or_no_finalization_needed",
+                "epoch finalization skipped"
+            );
             return Ok(EpochFinalizeStatus::Skipped);
         }
         if attr.size == 0 && attr.committed_size > 0 && vfs.handle_table.open_count(ino) > 0 {
+            tracing::debug!(
+                ino,
+                content_epoch,
+                reason = "zero_size_truncate_with_open_handles",
+                "epoch finalization deferred"
+            );
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
@@ -225,6 +253,12 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::WaitingForUploads);
         }
         if vfs.inode_has_unmaterialized_overlay_for_finalize(ino) {
+            tracing::debug!(
+                ino,
+                content_epoch,
+                reason = "unmaterialized_overlay",
+                "epoch finalization deferred"
+            );
             return Ok(EpochFinalizeStatus::Deferred);
         }
         let meta = run_meta_maintenance(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
@@ -295,6 +329,12 @@ impl CommitCoordinator {
                     vfs.clear_inode_incarnation(ino);
                     drop(finalize_session);
                     vfs.state.file_session.gc_if_idle(ino);
+                    tracing::debug!(
+                        ino,
+                        content_epoch,
+                        reason = "inode_not_found_at_finalize_gate",
+                        "epoch finalization skipped"
+                    );
                     return Ok(EpochFinalizeStatus::Skipped);
                 }
                 Err(err) => {
@@ -324,6 +364,12 @@ impl CommitCoordinator {
         {
             drop(finalize_session);
             vfs.state.file_session.gc_if_idle(ino);
+            tracing::debug!(
+                ino,
+                content_epoch,
+                reason = "zero_size_truncate_with_open_handles_at_finalize_gate",
+                "epoch finalization deferred"
+            );
             return Ok(EpochFinalizeStatus::Deferred);
         }
         if vfs.inode_has_pending_uploads(ino) {
@@ -339,6 +385,12 @@ impl CommitCoordinator {
         if vfs.inode_has_unmaterialized_overlay_for_finalize(ino) {
             drop(finalize_session);
             vfs.state.file_session.gc_if_idle(ino);
+            tracing::debug!(
+                ino,
+                content_epoch,
+                reason = "unmaterialized_overlay_at_finalize_gate",
+                "epoch finalization deferred"
+            );
             return Ok(EpochFinalizeStatus::Deferred);
         }
         let publication_changes_visible_size = latest_attr.committed_size != latest_attr.size;
@@ -371,6 +423,12 @@ impl CommitCoordinator {
                     Ok(attr) => attr,
                     Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
                         vfs.clear_inode_incarnation(ino);
+                        tracing::debug!(
+                            ino,
+                            content_epoch,
+                            reason = "inode_not_found_after_unpublished",
+                            "epoch finalization skipped"
+                        );
                         return Ok(EpochFinalizeStatus::Skipped);
                     }
                     Err(err) => return Err(err),
@@ -388,6 +446,12 @@ impl CommitCoordinator {
                 );
                 return Ok(EpochFinalizeStatus::Skipped);
             }
+            tracing::debug!(
+                ino,
+                content_epoch,
+                reason = "overlay_not_publish_ready_in_redb",
+                "epoch finalization deferred: publish_regular_file_overlay_to_base_if_matches returned false"
+            );
             return Ok(EpochFinalizeStatus::Deferred);
         }
         if let Err(error) = vfs.upload_stage_remove_batch_async(&meta.object_ids).await {
@@ -485,6 +549,7 @@ impl CommitCoordinator {
             vfs.invalidate_kernel_inode_attrs([ino]);
         }
 
+        tracing::debug!(ino, content_epoch, "epoch finalization published");
         Ok(EpochFinalizeStatus::Published)
     }
 
@@ -516,58 +581,89 @@ impl CommitCoordinator {
         vfs: &StudioVfs,
         object_ids: &[u64],
     ) -> VfsResult<()> {
-        if object_ids.is_empty() {
+        let store = vfs.fetch_scheduler.data_store();
+        wait_until_objects_visible(
+            object_ids,
+            &vfs.data_prefix,
+            vfs.publish_visibility_timeout,
+            &vfs.state.shutdown.background_shutdown_token,
+            |key: String| async move { store.exists(&key).await },
+        )
+        .await
+    }
+}
+
+async fn wait_until_objects_visible<E, F, Fut>(
+    object_ids: &[u64],
+    data_prefix: &str,
+    visibility_timeout: Duration,
+    shutdown_token: &CancellationToken,
+    exists: F,
+) -> VfsResult<()>
+where
+    E: std::fmt::Display,
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, E>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut deadline = started + visibility_timeout;
+    // Progress extends `deadline`; this caps the whole walk so a trickle of
+    // newly visible objects cannot keep one finalization waiting indefinitely.
+    let hard_deadline = started + visibility_timeout.saturating_mul(PUBLISH_VISIBILITY_MAX_BUDGETS);
+    let target = object_ids.iter().collect::<HashSet<_>>().len();
+    let mut visible: HashSet<u64> = HashSet::new();
+    loop {
+        let pending: Vec<u64> = object_ids
+            .iter()
+            .copied()
+            .filter(|object_id| !visible.contains(object_id))
+            .collect();
+        if pending.is_empty() {
             return Ok(());
         }
-        let visibility_timeout = vfs.publish_visibility_timeout;
-        let deadline = tokio::time::Instant::now() + visibility_timeout;
-        let shutdown_token = vfs.state.shutdown.background_shutdown_token.clone();
-        loop {
-            let mut all_visible = true;
-            for object_id in object_ids {
+        let visible_before = visible.len();
+        let exists = &exists;
+        // Probe objects concurrently: a multi-GiB file has thousands of objects and a
+        // sequential HEAD walk cannot finish inside the visibility budget.
+        let mut probes = futures::stream::iter(pending)
+            .map(|object_id| async move {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    all_visible = false;
-                    break;
+                    return Ok((object_id, false));
                 }
                 let probe_timeout = crate::vfs::REMOTE_OBJECT_IO_TIMEOUT.min(remaining);
-                let checks = format_object_fragment_keys(&vfs.data_prefix, *object_id)
+                let checks = format_object_fragment_keys(data_prefix, object_id)
                     .into_iter()
-                    .map(|key| async {
+                    .map(|key| async move {
                         let result = remote_object_exists_with_timeout(
-                            &shutdown_token,
+                            shutdown_token,
                             probe_timeout,
-                            vfs.fetch_scheduler.data_store().exists(&key),
+                            exists(key.clone()),
                         )
                         .await;
                         (key, result)
                     });
-                let results = futures::future::join_all(checks).await;
-                for (key, result) in results {
+                let mut object_visible = true;
+                for (key, result) in futures::future::join_all(checks).await {
                     match result {
                         TimeoutOrCancel::Completed(Ok(true)) => {}
-                        TimeoutOrCancel::Completed(Ok(false)) => {
-                            all_visible = false;
-                            break;
-                        }
+                        TimeoutOrCancel::Completed(Ok(false)) => object_visible = false,
                         TimeoutOrCancel::Completed(Err(err)) => {
-                            all_visible = false;
+                            object_visible = false;
                             tracing::debug!(
-                                object_id = *object_id,
+                                object_id,
                                 key,
                                 error = %err,
                                 "publish visibility check failed, will retry"
                             );
-                            break;
                         }
                         TimeoutOrCancel::TimedOut => {
-                            all_visible = false;
+                            object_visible = false;
                             tracing::debug!(
-                                object_id = *object_id,
+                                object_id,
                                 key,
                                 "publish visibility check timed out, will retry"
                             );
-                            break;
                         }
                         TimeoutOrCancel::Cancelled => {
                             return Err(VfsError::Other(
@@ -576,23 +672,31 @@ impl CommitCoordinator {
                         }
                     }
                 }
-                if !all_visible {
-                    break;
-                }
+                Ok((object_id, object_visible))
+            })
+            .buffer_unordered(PUBLISH_VISIBILITY_PROBE_CONCURRENCY);
+        while let Some(probe) = probes.next().await {
+            let (object_id, object_visible) = probe?;
+            if object_visible {
+                visible.insert(object_id);
             }
-
-            if all_visible {
-                return Ok(());
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(VfsError::Other(format!(
-                    "timed out after {:?} waiting for uploaded extents to become remotely visible",
-                    visibility_timeout
-                )));
-            }
-
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        drop(probes);
+
+        if visible.len() == target {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if visible.len() > visible_before && now < hard_deadline {
+            // The budget bounds a stall, not the total walk over a large object set.
+            deadline = (now + visibility_timeout).min(hard_deadline);
+        } else if now >= deadline {
+            return Err(VfsError::Other(format!(
+                "timed out after {:?} waiting for uploaded extents to become remotely visible",
+                visibility_timeout
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -628,5 +732,70 @@ mod tests {
         .await;
 
         assert!(matches!(result, TimeoutOrCancel::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn visibility_wait_covers_thousands_of_objects_within_one_budget() {
+        let shutdown = CancellationToken::new();
+        let object_ids: Vec<u64> = (1..=400).collect();
+        // 400 sequential 5 ms probes need ~2 s; the budget is 500 ms.
+        let result = wait_until_objects_visible(
+            &object_ids,
+            "data",
+            Duration::from_millis(500),
+            &shutdown,
+            |_key: String| async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Ok::<_, std::convert::Infallible>(true)
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "large object set must become visible: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn visibility_wait_times_out_when_no_object_becomes_visible() {
+        let shutdown = CancellationToken::new();
+        let result = wait_until_objects_visible(
+            &[1, 2],
+            "data",
+            Duration::from_millis(100),
+            &shutdown,
+            |_key: String| async { Ok::<_, std::convert::Infallible>(false) },
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+    #[tokio::test]
+    async fn visibility_wait_stops_at_hard_ceiling_despite_progress() {
+        let shutdown = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let object_ids: Vec<u64> = (0..100_000).collect();
+        // One more object becomes visible every 5 ms, so progress never stalls
+        // for the 50 ms budget but the walk could never finish.
+        let result = wait_until_objects_visible(
+            &object_ids,
+            "data",
+            Duration::from_millis(50),
+            &shutdown,
+            |key: String| async move {
+                let object_id = key
+                    .split('/')
+                    .find(|part| part.len() == 16)
+                    .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                    .unwrap_or(u64::MAX);
+                let released = started.elapsed().as_millis() as u64 / 5;
+                Ok::<_, std::convert::Infallible>(object_id <= released)
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

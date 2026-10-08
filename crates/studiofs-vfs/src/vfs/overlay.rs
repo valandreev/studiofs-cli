@@ -286,22 +286,13 @@ impl StudioVfs {
             .local_dirty
             .pending_payloads
             .lock()
-            .keys()
-            .any(|(candidate, _)| *candidate == ino)
+            .range((ino, 0)..=(ino, u32::MAX))
+            .next()
+            .is_some()
         {
             return true;
         }
-        if self
-            .state
-            .incarnation
-            .live_extent_records
-            .lock()
-            .keys()
-            .any(|(candidate, _)| *candidate == ino)
-        {
-            return true;
-        }
-        false
+        self.inode_has_live_extents(ino)
     }
 }
 

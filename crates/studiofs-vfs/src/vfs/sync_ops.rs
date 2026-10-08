@@ -1066,7 +1066,9 @@ impl StudioVfs {
                 .await;
             drop(session);
             vfs.state.file_session.gc_if_idle(ino);
-            if let Err(error) = result {
+            if let Err(error) = result
+                && !vfs.suppress_deleted_inode_materialization_error(ino, &error)
+            {
                 warn!(
                     ino,
                     error = %error,

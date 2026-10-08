@@ -76,7 +76,7 @@ pub(super) struct DrainOutcome {
 }
 
 pub(super) fn commit_persisted_payload_state(
-    pending: &mut std::collections::HashMap<(Ino, u32), PendingPayload>,
+    pending: &mut std::collections::BTreeMap<(Ino, u32), PendingPayload>,
     ino: Ino,
     blocks: &[PersistedPayloadEntry],
 ) -> (usize, Vec<u32>, Vec<BytesMut>) {
@@ -128,7 +128,7 @@ where
     }
 
     fn additional_object_id_count_needed(
-        pending: &std::collections::HashMap<(Ino, u32), PendingPayload>,
+        pending: &std::collections::BTreeMap<(Ino, u32), PendingPayload>,
         ino: Ino,
         blocks: &[DirtyWriteSnapshot],
     ) -> usize {
@@ -150,7 +150,7 @@ where
 
     pub(super) fn try_prepare_persisted_blocks(
         &self,
-        pending: &mut std::collections::HashMap<(Ino, u32), PendingPayload>,
+        pending: &mut std::collections::BTreeMap<(Ino, u32), PendingPayload>,
         ino: Ino,
         blocks: Vec<DirtyWriteSnapshot>,
         fresh_object_ids: &mut std::collections::VecDeque<u64>,
