@@ -149,6 +149,13 @@ covers every gate; holding them for the whole removal stalled concurrent
 materialization of new writes for more than a second. Earlier chunks stay
 removed after a failure, and a retry of the whole batch is idempotent.
 Presence-check errors propagate rather than being treated as absence.
+
+Reads only enqueue access touches. An owned `studiofs-access-touch` thread
+commits them to the index in batches (128 IDs or 250 ms) and is joined before
+the final forced flush on drop. Committing on the read path put a redb write
+on whichever read crossed the threshold and stalled it for tens of
+milliseconds. Eviction and `sync_data` still force a synchronous flush.
+
 Outstanding markers are
 replayed only before startup begins serving operations; a successful live retry
 can leave an older marker until the next startup.
