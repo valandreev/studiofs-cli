@@ -371,7 +371,7 @@ pub(super) struct OverlayBatchState {
 
 pub(super) struct LocalDirtyState {
     pub(super) pending_payloads:
-        OrderedMutex<std::collections::HashMap<(Ino, u32), PendingPayload>>,
+        OrderedMutex<std::collections::BTreeMap<(Ino, u32), PendingPayload>>,
     pub(super) pending_payload_indexes:
         OrderedMutex<std::collections::HashMap<Ino, std::collections::BTreeSet<u32>>>,
     pending_chunk_slices: OrderedMutex<
@@ -399,7 +399,7 @@ impl LocalDirtyState {
     pub(super) fn new() -> Self {
         Self {
             pending_payloads: OrderedMutex::new(
-                std::collections::HashMap::new(),
+                std::collections::BTreeMap::new(),
                 LockTier::LocalDirty,
             ),
             pending_payload_indexes: OrderedMutex::new(
@@ -3099,8 +3099,20 @@ impl StudioVfs {
             let Some(chunks) = pending_chunk_slices.get(&ino) else {
                 return Vec::new();
             };
+            // Slice ranges are chunk-relative, so only chunks overlapping the
+            // request can intersect it.
+            let first_chunk = studiofs_meta::schema::chunk_id_from_offset(
+                offset,
+                studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+            )
+            .0;
+            let last_chunk = studiofs_meta::schema::chunk_id_from_offset(
+                end - 1,
+                studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+            )
+            .0;
             chunks
-                .iter()
+                .range(first_chunk..=last_chunk)
                 .flat_map(|(chunk_id, slices)| {
                     slices.iter().copied().map(|slice| (*chunk_id, slice))
                 })
