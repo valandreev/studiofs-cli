@@ -1150,7 +1150,10 @@ impl<'a> DataReader<'a> {
                         return;
                     };
                     for job in others {
-                        scope.spawn(|| read_job(job));
+                        // `scope.spawn` panics when the OS refuses a thread. A run
+                        // that could not be spawned keeps `read: None` and is read
+                        // by the serial path like any other unresolved run.
+                        let _ = std::thread::Builder::new().spawn_scoped(scope, || read_job(job));
                     }
                     read_job(first);
                 });

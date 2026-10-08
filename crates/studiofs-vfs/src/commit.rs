@@ -29,6 +29,8 @@ struct FinalizeMetaSnapshot {
 
 const EPOCH_PUBLICATION_BATCH_MAX_OPERATIONS: usize = 64;
 const PUBLISH_VISIBILITY_PROBE_CONCURRENCY: usize = 64;
+/// Visibility budgets one finalization may spend in total while progressing.
+const PUBLISH_VISIBILITY_MAX_BUDGETS: u32 = 10;
 
 type EpochPublicationCompletion = tokio::sync::oneshot::Sender<Result<bool, Arc<VfsError>>>;
 
@@ -603,7 +605,12 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<bool, E>>,
 {
-    let mut deadline = tokio::time::Instant::now() + visibility_timeout;
+    let started = tokio::time::Instant::now();
+    let mut deadline = started + visibility_timeout;
+    // Progress extends `deadline`; this caps the whole walk so a trickle of
+    // newly visible objects cannot keep one finalization waiting indefinitely.
+    let hard_deadline = started + visibility_timeout.saturating_mul(PUBLISH_VISIBILITY_MAX_BUDGETS);
+    let target = object_ids.iter().collect::<HashSet<_>>().len();
     let mut visible: HashSet<u64> = HashSet::new();
     loop {
         let pending: Vec<u64> = object_ids
@@ -676,13 +683,13 @@ where
         }
         drop(probes);
 
-        if visible.len() == object_ids.iter().collect::<HashSet<_>>().len() {
+        if visible.len() == target {
             return Ok(());
         }
         let now = tokio::time::Instant::now();
-        if visible.len() > visible_before {
+        if visible.len() > visible_before && now < hard_deadline {
             // The budget bounds a stall, not the total walk over a large object set.
-            deadline = now + visibility_timeout;
+            deadline = (now + visibility_timeout).min(hard_deadline);
         } else if now >= deadline {
             return Err(VfsError::Other(format!(
                 "timed out after {:?} waiting for uploaded extents to become remotely visible",
@@ -763,5 +770,32 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+    #[tokio::test]
+    async fn visibility_wait_stops_at_hard_ceiling_despite_progress() {
+        let shutdown = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let object_ids: Vec<u64> = (0..100_000).collect();
+        // One more object becomes visible every 5 ms, so progress never stalls
+        // for the 50 ms budget but the walk could never finish.
+        let result = wait_until_objects_visible(
+            &object_ids,
+            "data",
+            Duration::from_millis(50),
+            &shutdown,
+            |key: String| async move {
+                let object_id = key
+                    .split('/')
+                    .find(|part| part.len() == 16)
+                    .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                    .unwrap_or(u64::MAX);
+                let released = started.elapsed().as_millis() as u64 / 5;
+                Ok::<_, std::convert::Infallible>(object_id <= released)
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
