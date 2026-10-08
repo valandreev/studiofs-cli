@@ -216,9 +216,11 @@ pub enum LocalPayloadReadMode {
 impl LocalPayloadReadMode {
     /// Default read mode for mounted filesystem paths.
     pub const fn default_for_mount_path() -> Self {
-        // The mounted vnode already has a kernel page cache. On macOS, caching
-        // backing payload files too duplicates pages and competes with UBC.
-        if cfg!(target_os = "macos") {
+        // The mounted file already has a kernel page cache. Caching backing
+        // payload files too duplicates every read in memory; on Windows the
+        // duplicate payload pages evict the mounted file's cached pages, so
+        // repeat reads of large files fall back to callbacks.
+        if cfg!(any(target_os = "macos", windows)) {
             Self::Unbuffered
         } else {
             Self::Buffered
