@@ -461,10 +461,6 @@ impl WinfspInvalidationQueue {
                     InvalidationIntent::Attributes { ino }
                     | InvalidationIntent::Content { ino }
                     | InvalidationIntent::Directory { ino } => {
-                        let attr = vfs
-                            .meta()
-                            .get_attr(*ino)
-                            .map_err(|_| InvalidationAcceptance::Failed)?;
                         let filter = match intent {
                             InvalidationIntent::Content { .. } => {
                                 FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE
@@ -476,14 +472,24 @@ impl WinfspInvalidationQueue {
                         };
                         let paths = if let Some(paths) = entry_paths_by_ino.get(ino) {
                             paths.clone()
-                        } else if attr.kind == FileType::Directory || attr.nlink <= 1 {
-                            vec![(
-                                ino_to_windows_path(&vfs, *ino)
-                                    .ok_or(InvalidationAcceptance::Failed)?,
-                                attr.kind,
-                            )]
                         } else {
-                            return Err(InvalidationAcceptance::Failed);
+                            match vfs.meta().get_attr(*ino) {
+                                Ok(attr) if attr.kind == FileType::Directory || attr.nlink <= 1 => {
+                                    vec![(
+                                        ino_to_windows_path(&vfs, *ino)
+                                            .ok_or(InvalidationAcceptance::Failed)?,
+                                        attr.kind,
+                                    )]
+                                }
+                                Ok(_) => return Err(InvalidationAcceptance::Failed),
+                                // WinFSP caches by path. A removed inode has no
+                                // current path left to purge; its old names are
+                                // covered by entry intents with historical paths.
+                                Err(studiofs_meta::MetaError::InodeNotFound(_)) => {
+                                    return Ok(());
+                                }
+                                Err(_) => return Err(InvalidationAcceptance::Failed),
+                            }
                         };
                         for (path, kind) in paths {
                             add(*ino, path, kind, FILE_ACTION_MODIFIED, filter)?;
@@ -824,6 +830,15 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 )
             } else {
                 let Some(path) = ino_to_windows_path(&self.vfs, ino) else {
+                    if matches!(
+                        meta.get_attr(ino),
+                        Err(studiofs_meta::MetaError::InodeNotFound(_))
+                    ) {
+                        // Removed inodes have no current path to purge; their
+                        // old names are delivered as explicit path notifications.
+                        trace!(ino, "skipping notify - inode removed");
+                        continue;
+                    }
                     trace!(ino, "skipping notify - inode no longer resolvable");
                     self.invalidation_queue.record_failed_notification();
                     continue;

@@ -190,6 +190,11 @@ keeps old paths during retry. Semantic enqueue and retry cannot block at capacit
 unsupported work, and writer deferral. A partially deferred generation cannot
 advance the fully accepted generation. Local writable handles and dirty state
 defer native purges, retaining exact historical targets for a later timer pass.
+WinFSP caches by path, so attribute, content or directory scopes for an inode
+that no longer exists add no target and do not fail the generation; the old
+names are purged by their entry intents. Queued inode notifications for removed
+inodes are likewise skipped without counting as delivery failures. Existing
+inodes whose current path cannot be resolved still fail admission.
 
 Native WinFSP invalidates more than its notification filter names suggest:
 [`FspFileNodeInvalidateCachesAndNotifyChangeByName`](https://github.com/winfsp/winfsp/blob/master/src/sys/file.c)

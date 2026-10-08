@@ -6909,17 +6909,20 @@ mod tests {
     }
 
     #[test]
-    fn semantic_deleted_inode_still_notifies_old_name_with_partial_coverage() {
+    fn semantic_deleted_inode_notifies_old_name_with_complete_coverage() {
         use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
         use studiofs_vfs::coherence::InvalidationAcceptance;
         let (_tmp, _vfs, ctx, queue) = make_test_context("semantic-deleted-inode");
         let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        // WinFSP caches by path: a removed inode has no current path left, and
+        // its old name is purged by the entry notification below.
         assert_eq!(
             invalidator.invalidate_batch(
                 &InvalidationBatch {
                     generation: 3,
                     intents: vec![
                         InvalidationIntent::Attributes { ino: u64::MAX },
+                        InvalidationIntent::Content { ino: u64::MAX },
                         InvalidationIntent::Entry {
                             parent: ROOT_INO,
                             name: b"old".to_vec(),
@@ -6930,7 +6933,7 @@ mod tests {
                 },
                 true
             ),
-            InvalidationAcceptance::Failed
+            InvalidationAcceptance::Queued
         );
         let prepared = ctx
             .should_notify()
@@ -6938,7 +6941,34 @@ mod tests {
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared[0].path, r"\old");
         assert_eq!(prepared[0].info.action, FILE_ACTION_REMOVED);
-        assert_eq!(queue.delivery_snapshot().queued_generation, None);
+        let status = queue.delivery_snapshot();
+        assert_eq!(status.queued_generation, Some(3));
+        assert_eq!(status.failed_batches, 0);
+    }
+
+    #[test]
+    fn removed_inode_notification_is_not_a_delivery_failure() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("notify-removed-inode");
+        let kept = vfs
+            .create(ROOT_INO, b"kept.txt", 0, 0, 0o644)
+            .expect("create kept");
+        let removed = vfs
+            .create(ROOT_INO, b"removed.txt", 0, 0, 0o644)
+            .expect("create removed");
+        vfs.unlink(ROOT_INO, b"removed.txt")
+            .expect("unlink removed");
+        queue.extend([removed.ino, kept.ino]);
+
+        let prepared = ctx.should_notify().expect("existing inode is notified");
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|notification| notification.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![r"\kept.txt"]
+        );
+        drop(prepared);
+        assert_eq!(queue.delivery_snapshot().failed_notifications, 0);
     }
 
     #[test]
