@@ -441,6 +441,7 @@ impl StudioVfs {
     pub(super) async fn background_epoch_finalizer(self: Arc<Self>) {
         const MAX_FINALIZATIONS_IN_FLIGHT: usize = 32;
         let publisher = Arc::new(commit::EpochPublicationBatcher::default());
+        tracing::debug!("epoch finalizer worker started");
 
         'finalizer: loop {
             let Some((ino, content_epoch)) = self.pop_epoch_finalization() else {
@@ -487,6 +488,18 @@ impl StudioVfs {
                 let Some(finalize_result) = finalize_result else {
                     break 'finalizer;
                 };
+                tracing::debug!(
+                    ino,
+                    content_epoch,
+                    status = match &finalize_result {
+                        Ok(commit::EpochFinalizeStatus::Published) => "published",
+                        Ok(commit::EpochFinalizeStatus::WaitingForUploads) => "waiting_for_uploads",
+                        Ok(commit::EpochFinalizeStatus::Deferred) => "deferred",
+                        Ok(commit::EpochFinalizeStatus::Skipped) => "skipped",
+                        Err(_) => "error",
+                    },
+                    "epoch finalization result"
+                );
                 match finalize_result {
                     Ok(commit::EpochFinalizeStatus::Published) => {
                         self.state.file_session.note_background_transition(

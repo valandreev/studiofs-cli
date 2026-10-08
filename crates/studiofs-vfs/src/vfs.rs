@@ -6013,6 +6013,12 @@ impl StudioVfs {
             .pending_epoch_finalizations
             .lock()
             .insert(key);
+        tracing::debug!(
+            ino,
+            content_epoch,
+            newly_queued = inserted,
+            "epoch finalization queued"
+        );
         if inserted {
             self.state.file_session.note_background_transition(
                 ino,
@@ -6104,7 +6110,8 @@ impl StudioVfs {
         let mut pending = self.state.upload.pending_epoch_finalizations.lock();
         let next = pending.pop_first();
         drop(pending);
-        if let Some((ino, _)) = next {
+        if let Some((ino, content_epoch)) = next {
+            tracing::debug!(ino, content_epoch, "epoch finalization dequeued");
             self.state.file_session.note_background_transition(
                 ino,
                 FileSessionOperation::Finalize,
