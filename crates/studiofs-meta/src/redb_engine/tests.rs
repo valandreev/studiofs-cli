@@ -1563,3 +1563,45 @@ fn contract_core_harness_accepts_open_unlink_pending_overlay_cleanup() {
         .assert_invariants("open-unlink pending overlay cleanup")
         .expect("open-unlink cleanup state should satisfy contract invariants");
 }
+
+#[test]
+fn coherence_journal_discards_only_scopes_after_mark_and_keeps_reset() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 1 });
+    let mark = txn.invalidation_mark();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 1 });
+    txn.invalidate(InvalidationIntent::Attributes { ino: 2 });
+    txn.discard_invalidations_since(mark);
+    // A discarded scope can be journaled again; an older duplicate stays.
+    txn.invalidate(InvalidationIntent::Attributes { ino: 2 });
+    let reset_mark = txn.invalidation_mark();
+    txn.invalidate(InvalidationIntent::Reset);
+    txn.discard_invalidations_since(reset_mark);
+    txn.commit().unwrap();
+    let batches = engine.take_invalidation_batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].intents, vec![InvalidationIntent::Reset]);
+}
+
+#[test]
+fn coherence_journal_discard_restores_unchanged_scopes() {
+    use crate::coherence::InvalidationIntent;
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 1 });
+    let mark = txn.invalidation_mark();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 2 });
+    txn.discard_invalidations_since(mark);
+    txn.invalidate(InvalidationIntent::Attributes { ino: 2 });
+    txn.commit().unwrap();
+    let batches = engine.take_invalidation_batches();
+    assert_eq!(
+        batches[0].intents,
+        vec![
+            InvalidationIntent::Attributes { ino: 1 },
+            InvalidationIntent::Attributes { ino: 2 }
+        ]
+    );
+}

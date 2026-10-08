@@ -668,6 +668,17 @@ impl RedbWriteTransaction<'_> {
         self.invalidations.borrow_mut().push(intent);
     }
 
+    /// Journal position for [`Self::discard_invalidations_since`].
+    pub(crate) fn invalidation_mark(&self) -> usize {
+        self.invalidations.borrow().mark()
+    }
+
+    /// Drops the scopes journaled since `mark`, for a write that left the
+    /// serving view exactly as it was.
+    pub(crate) fn discard_invalidations_since(&self, mark: usize) {
+        self.invalidations.borrow_mut().truncate(mark);
+    }
+
     /// Runs `apply` without journaling the invalidation scopes it records.
     ///
     /// Only for writes that cannot change what the local serving view already

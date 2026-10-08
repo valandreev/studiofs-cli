@@ -179,6 +179,22 @@ impl LocalDentryMutationReducer {
     }
 }
 
+/// An inode's merged attributes plus the dentries bound to it, keyed by dentry key.
+type ServingInodeView = (Option<InodeAttr>, BTreeMap<Vec<u8>, DirEntryValue>);
+
+/// Inodes and dentry keys a set of replayed events can touch.
+#[derive(Default)]
+struct ReplayScope {
+    inodes: BTreeSet<Ino>,
+    dentry_keys: BTreeSet<Vec<u8>>,
+}
+
+#[derive(PartialEq)]
+struct ReplayScopeView {
+    inodes: Vec<(ServingInodeView, Vec<Vec<u8>>)>,
+    dentries: Vec<Option<DirEntryValue>>,
+}
+
 #[cfg(test)]
 use std::cell::Cell;
 
@@ -1388,29 +1404,64 @@ impl RedbMetaEngine {
         &self,
         events: &[crate::events::MetaEvent],
     ) -> MetaResult<()> {
-        self.apply_replica_serving_state_inner(events, false)
+        self.apply_replica_serving_state_inner(events, false, false)
     }
 
     pub(crate) fn apply_replica_serving_state_for_pending_replay(
         &self,
         events: &[crate::events::MetaEvent],
     ) -> MetaResult<()> {
-        self.apply_replica_serving_state_inner(events, true)
+        self.apply_replica_serving_state_inner(events, true, true)
     }
 
     fn apply_replica_serving_state_inner(
         &self,
         events: &[crate::events::MetaEvent],
         reject_stale_ready_growth: bool,
+        discard_unchanged: bool,
     ) -> MetaResult<()> {
         if events.is_empty() {
             return Ok(());
         }
 
         let txn = self.begin_write_txn()?;
-        Self::apply_replica_serving_state_in_txn(&txn, events, reject_stale_ready_growth)?;
+        Self::apply_replica_serving_state_in_txn_with(
+            &txn,
+            events,
+            reject_stale_ready_growth,
+            discard_unchanged,
+        )?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// `discard_unchanged` drops the scopes journaled for `events` when, as a whole, they
+    /// left the touched inodes, dentries and file rows exactly as they were. Replaying
+    /// this client's own pending events does that in steady state; the kernel already
+    /// saw them, and the transaction is atomic, so intermediate states are unobservable.
+    pub(crate) fn apply_replica_serving_state_in_txn_with<E: Borrow<crate::events::MetaEvent>>(
+        txn: &RedbWriteTransaction<'_>,
+        events: &[E],
+        reject_stale_ready_growth: bool,
+        discard_unchanged: bool,
+    ) -> MetaResult<()> {
+        let scope = if discard_unchanged {
+            Self::replay_events_scope(txn, events.iter().map(Borrow::borrow))?
+        } else {
+            None
+        };
+        let invalidation_mark = txn.invalidation_mark();
+        let view_before = scope
+            .as_ref()
+            .map(|scope| Self::replay_scope_view(txn, scope))
+            .transpose()?;
+        Self::apply_replica_serving_state_in_txn(txn, events, reject_stale_ready_growth)?;
+        if let (Some(scope), Some(before)) = (scope.as_ref(), view_before.as_ref())
+            && Self::replay_scope_view(txn, scope)? == *before
+        {
+            txn.discard_invalidations_since(invalidation_mark);
+        }
         Ok(())
     }
 
@@ -1733,6 +1784,8 @@ impl RedbMetaEngine {
         };
 
         for ino in inodes {
+            let invalidation_mark = txn.invalidation_mark();
+            let view_before = Self::serving_view_of_inode(txn, *ino)?;
             Self::invalidate_replica_inode(txn, *ino, false)?;
             let base_attr = base_attrs.get(ino).and_then(|attr| attr.as_ref());
 
@@ -1773,9 +1826,131 @@ impl RedbMetaEngine {
                     changed = true;
                 }
             }
+            // Reconciling toward base is routinely a no-op for this client's own
+            // acknowledged writes; only a real change to what the mount serves
+            // can leave cached kernel state stale.
+            if Self::serving_view_of_inode(txn, *ino)? == view_before {
+                txn.discard_invalidations_since(invalidation_mark);
+            }
         }
 
         Ok(changed)
+    }
+
+    /// What replaying `events` can touch, when every event is a plain one whose
+    /// effect is fully captured by inode, dentry and file-row state. Any other
+    /// event returns `None`, which keeps the intents.
+    fn replay_events_scope<'event>(
+        txn: &RedbWriteTransaction<'_>,
+        events: impl IntoIterator<Item = &'event crate::events::MetaEvent>,
+    ) -> MetaResult<Option<ReplayScope>> {
+        use crate::events::MetaEvent;
+        let mut scope = ReplayScope::default();
+        for event in events {
+            match event {
+                MetaEvent::SetAttr { attr } => {
+                    scope.inodes.insert(attr.ino);
+                }
+                MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+                | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                | MetaEvent::RemoveRegularFileGraph { ino } => {
+                    scope.inodes.insert(*ino);
+                }
+                MetaEvent::AddEntry {
+                    parent,
+                    name,
+                    entry,
+                } => {
+                    scope.inodes.extend([*parent, entry.ino]);
+                    scope.dentry_keys.insert(encode_dentry_key(*parent, name));
+                }
+                MetaEvent::RemoveEntry { parent, name } => {
+                    scope.inodes.insert(*parent);
+                    scope.dentry_keys.insert(encode_dentry_key(*parent, name));
+                }
+                // A removed directory takes its descendants' names with it.
+                MetaEvent::RemoveAttr { ino } => {
+                    match Self::get_attr_merged_in_write_txn(txn, *ino) {
+                        Ok(attr) if attr.kind == FileType::Directory => return Ok(None),
+                        Ok(_) | Err(MetaError::InodeNotFound(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                    scope.inodes.insert(*ino);
+                }
+                MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(scope))
+    }
+
+    fn replay_scope_view(
+        txn: &RedbWriteTransaction<'_>,
+        scope: &ReplayScope,
+    ) -> MetaResult<ReplayScopeView> {
+        let mut inodes = Vec::with_capacity(scope.inodes.len());
+        for ino in &scope.inodes {
+            inodes.push((
+                Self::serving_view_of_inode(txn, *ino)?,
+                Self::regular_file_rows_snapshot(txn, *ino)?,
+            ));
+        }
+        let mut dentries = Vec::with_capacity(scope.dentry_keys.len());
+        for key in &scope.dentry_keys {
+            dentries.push(Self::invalidation_binding(txn, key)?);
+        }
+        Ok(ReplayScopeView { inodes, dentries })
+    }
+
+    /// Raw overlay and base chunk rows of `ino`, so content changes show up.
+    fn regular_file_rows_snapshot(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<Vec<Vec<u8>>> {
+        let prefix = regular_file_chunk_prefix(ino);
+        let mut rows = Vec::new();
+        for definition in [REGULAR_FILE_OVERLAY_TABLE, REGULAR_FILE_BASE_TABLE] {
+            let table = txn
+                .open_table(definition)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            for row in table
+                .range(prefix.as_ref()..)
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+            {
+                let (key, value) = row.map_err(|error| MetaError::Storage(error.to_string()))?;
+                if !key.value().starts_with(prefix.as_ref()) {
+                    break;
+                }
+                let mut bytes = key.value().to_vec();
+                bytes.extend_from_slice(value.value());
+                rows.push(bytes);
+            }
+            rows.push(Vec::new());
+        }
+        Ok(rows)
+    }
+
+    /// The merged attributes and dentries the foreground view exposes for `ino`.
+    fn serving_view_of_inode(
+        txn: &RedbWriteTransaction<'_>,
+        ino: Ino,
+    ) -> MetaResult<ServingInodeView> {
+        let attr = match Self::get_attr_merged_in_write_txn(txn, ino) {
+            Ok(attr) => Some(attr),
+            Err(MetaError::InodeNotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let mut dentries = BTreeMap::new();
+        for index in [DENTRIES_BY_INODE_TABLE, BASE_DENTRIES_BY_INODE_TABLE] {
+            for key in Self::dentry_keys_for_inode_in_write_index(txn, index, ino)? {
+                if let Some(entry) = Self::invalidation_binding(txn, &key)?
+                    && entry.ino == ino
+                {
+                    dentries.insert(key, entry);
+                }
+            }
+        }
+        Ok((attr, dentries))
     }
 
     #[cfg(test)]
@@ -1834,6 +2009,8 @@ impl RedbMetaEngine {
                 continue;
             }
             let (parent, name) = decode_dentry_key(key)?;
+            let invalidation_mark = txn.invalidation_mark();
+            let binding_before = Self::invalidation_binding(txn, key)?;
             Self::invalidate_replica_entry(txn, parent, name, None)?;
             let base_entry = base_entries
                 .get(key.as_slice())
@@ -1843,6 +2020,9 @@ impl RedbMetaEngine {
                 Self::invalidate_replica_inode(txn, entry.ino, false)?;
             } else {
                 Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
+            }
+            if Self::invalidation_binding(txn, key)? == binding_before {
+                txn.discard_invalidations_since(invalidation_mark);
             }
             changed = true;
         }

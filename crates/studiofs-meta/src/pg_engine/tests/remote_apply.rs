@@ -7553,3 +7553,155 @@ fn unit_remote_projection_converges_nested_rename_overwrite_to_source_inode() {
         vec![new_block0.object_id, new_block1.object_id]
     );
 }
+
+fn apply_self_replay(
+    pg: &PgMetaEngine,
+    events: Vec<MetaEvent>,
+    flushed_event_seq: u64,
+    next_event_seq: u64,
+    initial_overlay: OverlayConflictSets,
+) {
+    RemoteApplyCoordinator::new(&pg.local)
+        .apply_decoded_batches(
+            vec![DecodedReplayBatch {
+                batch_version: 1,
+                events,
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq,
+                next_event_seq,
+                initial_overlay,
+            },
+        )
+        .expect("apply self replay");
+}
+
+#[test]
+fn self_replay_of_replaced_file_does_not_journal_unchanged_serving_state() {
+    // Delete an uploaded file, write a same-named replacement, then see both
+    // acknowledged back: the serving view already holds exactly that state.
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    create_published_small_file(&pg, ROOT_INO, b"replaced.dat", 77_201);
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
+    pg.persist_flushed_event_seq(start).expect("ack setup");
+
+    pg.unlink(ROOT_INO, b"replaced.dat").expect("unlink old");
+    create_published_small_file(&pg, ROOT_INO, b"replaced.dat", 77_202);
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+    let events = pg.local.read_events_range(start, end).expect("read events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    let initial_overlay = pg.local_overlay_conflicts().expect("overlay");
+    journaled_invalidation_intents(&pg);
+
+    apply_self_replay(&pg, projected.events, start, end, initial_overlay);
+
+    let intents = journaled_invalidation_intents(&pg);
+    assert!(
+        intents.is_empty(),
+        "an acknowledged self replacement must not invalidate the mount's own cache: {intents:?}"
+    );
+}
+
+#[test]
+fn self_replay_still_journals_when_serving_dentry_diverged_from_base() {
+    use crate::coherence::InvalidationIntent;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let entry = pg
+        .create_dir(ROOT_INO, b"diverged-dir", 0, 0, 0o755)
+        .expect("create local dir");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+    let events = pg.local.read_events_range(start, end).expect("read events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    pg.local
+        .apply_replica_serving_state(&[MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"diverged-dir".to_vec(),
+            entry: DirEntryValue {
+                ino: ROOT_INO,
+                kind: FileType::Directory,
+            },
+        }])
+        .expect("simulate stale serving dentry before self replay");
+    let initial_overlay = pg.local_overlay_conflicts().expect("overlay");
+    journaled_invalidation_intents(&pg);
+
+    apply_self_replay(&pg, projected.events, start, end, initial_overlay);
+
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"diverged-dir").expect("lookup").ino,
+        entry.ino
+    );
+    let intents = journaled_invalidation_intents(&pg);
+    assert!(
+        intents.iter().any(|intent| matches!(
+            intent,
+            InvalidationIntent::Entry { parent, name, .. }
+                if *parent == ROOT_INO && name.as_slice() == b"diverged-dir"
+        )),
+        "a real serving correction must still be announced: {intents:?}"
+    );
+}
+
+#[test]
+fn restoring_pending_local_state_does_not_journal_the_mounts_own_writes() {
+    // A new file written through this mount: the pending suffix of the local event
+    // log is replayed into serving after every flush and acknowledgement. The
+    // serving view already holds those events, and the kernel saw them directly.
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"written-locally.dat", 0, 0, 0o644)
+        .expect("create file");
+    set_file_state(&pg, file.ino, 3 * 64, 1);
+    for (index, object_id) in [77_501u64, 77_502, 77_503].into_iter().enumerate() {
+        pg.stage_payload_slice(
+            file.ino,
+            index as u32,
+            &PayloadRef::new_partial(object_id, 64),
+        )
+        .expect("stage block");
+    }
+    journaled_invalidation_intents(&pg);
+
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending state");
+
+    let intents = journaled_invalidation_intents(&pg);
+    assert!(
+        intents.is_empty(),
+        "replaying the mount's own pending events must not invalidate its cache: {intents:?}"
+    );
+}
+
+#[test]
+fn restoring_pending_local_state_still_journals_a_real_serving_correction() {
+    use crate::coherence::InvalidationIntent;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"corrected.dat", 0, 0, 0o644)
+        .expect("create file");
+    set_file_state(&pg, file.ino, 64, 1);
+    // Serving lost the local size, e.g. a foreign apply rewrote the inode.
+    let mut stale = pg.get_attr(file.ino).expect("attr");
+    stale.size = 0;
+    pg.local
+        .apply_replica_serving_state(&[MetaEvent::SetAttr { attr: stale }])
+        .expect("regress serving attr");
+    journaled_invalidation_intents(&pg);
+
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending state");
+
+    assert_eq!(pg.get_attr(file.ino).expect("attr").size, 64);
+    let intents = journaled_invalidation_intents(&pg);
+    assert!(
+        intents.contains(&InvalidationIntent::Attributes { ino: file.ino }),
+        "restoring newer local state must still be announced: {intents:?}"
+    );
+}
