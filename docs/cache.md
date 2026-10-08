@@ -138,9 +138,16 @@ it; Fast mode adds no sync barriers. Failed directory barriers also retain the
 intent. Callers can retry removal immediately, and lightweight startup retires
 outstanding markers while preserving any payload that has since been reindexed.
 Removal of IDs absent from both the index and disk skips intent persistence,
-index writes, unlink and directory barriers under the mutation gates. The batch
-shares one index read snapshot and still clears runtime pins, access touches
-and cached read handles. Dangling symlink paths continue through normal deletion.
+index writes, unlink and directory barriers under the mutation gates. Each
+removal chunk shares one index read snapshot and still clears runtime pins,
+access touches and cached read handles. Dangling symlink paths continue through
+normal deletion.
+
+Batch removal runs in chunks of at most 32 IDs, each with its own gates and
+intent, and stops at the first failed chunk. Deleting a multi-gigabyte file
+covers every gate; holding them for the whole removal stalled concurrent
+materialization of new writes for more than a second. Earlier chunks stay
+removed after a failure, and a retry of the whole batch is idempotent.
 Presence-check errors propagate rather than being treated as absence.
 Outstanding markers are
 replayed only before startup begins serving operations; a successful live retry

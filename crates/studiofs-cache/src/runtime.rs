@@ -23,6 +23,8 @@ use crate::local::{
 };
 
 const PAYLOAD_MUTATION_STRIPES: usize = 64;
+/// Upper bound on payloads removed under one set of mutation stripes.
+const PAYLOAD_REMOVAL_CHUNK_OBJECTS: usize = 32;
 
 /// Cache index (redb) backing store for the local payload runtime.
 #[path = "payload_index.rs"]
@@ -306,6 +308,13 @@ pub struct LocalPayloadBackendRuntime {
     >,
     #[cfg(test)]
     payload_gate_probe: Mutex<Option<std::sync::mpsc::SyncSender<bool>>>,
+    #[cfg(test)]
+    pause_after_removal_chunk: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
 }
 
 struct DirtyValidationGuard<'a> {
@@ -466,6 +475,8 @@ impl LocalPayloadBackendRuntime {
             rollback_after_absence: Mutex::new(None),
             #[cfg(test)]
             payload_gate_probe: Mutex::new(None),
+            #[cfg(test)]
+            pause_after_removal_chunk: Mutex::new(None),
         })
     }
 
@@ -624,6 +635,24 @@ impl LocalPayloadBackendRuntime {
         } else {
             self.forget_access_touches(&still_orphaned);
         }
+    }
+
+    fn remove_payload_chunk(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
+        let _mutations = self.lock_payload_mutations(object_ids);
+        if self.index.any_present(object_ids)? {
+            return self.remove_payloads_locked(object_ids);
+        }
+        for &object_id in object_ids {
+            if self.payload_store.payload_path_exists(object_id)? {
+                return self.remove_payloads_locked(object_ids);
+            }
+        }
+        // No persistent ownership remains, but stale runtime state must still be cleared.
+        self.forget_runtime_pins(object_ids);
+        self.forget_access_touches(object_ids);
+        self.payload_store.invalidate_runtime_state(object_ids);
+        self.note_storage_state_change();
+        Ok(())
     }
 
     fn remove_payloads_locked(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
@@ -1408,23 +1437,17 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     }
 
     fn remove_batch(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
-        if object_ids.is_empty() {
-            return Ok(());
-        }
-        let _mutations = self.lock_payload_mutations(object_ids);
-        if self.index.any_present(object_ids)? {
-            return self.remove_payloads_locked(object_ids);
-        }
-        for &object_id in object_ids {
-            if self.payload_store.payload_path_exists(object_id)? {
-                return self.remove_payloads_locked(object_ids);
+        // Removing a multi-gigabyte file covers every mutation stripe. Release
+        // them between bounded chunks so concurrent materialization of new
+        // payloads is not stalled for the whole removal.
+        for chunk in object_ids.chunks(PAYLOAD_REMOVAL_CHUNK_OBJECTS) {
+            self.remove_payload_chunk(chunk)?;
+            #[cfg(test)]
+            if let Some((removed, resume)) = self.pause_after_removal_chunk.lock().take() {
+                let _ = removed.send(());
+                let _ = resume.recv_timeout(Duration::from_secs(5));
             }
         }
-        // No persistent ownership remains, but stale runtime state must still be cleared.
-        self.forget_runtime_pins(object_ids);
-        self.forget_access_touches(object_ids);
-        self.payload_store.invalidate_runtime_state(object_ids);
-        self.note_storage_state_change();
         Ok(())
     }
 
@@ -2701,6 +2724,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bulk_removal_releases_mutation_stripes_for_concurrent_puts() {
+        use std::sync::Arc;
+        use std::sync::mpsc::sync_channel;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = Arc::new(
+            LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+                LocalPayloadBackendConfig {
+                    cache_root: temp.path().to_path_buf(),
+                    volume_uuid: [0x7c; 16],
+                },
+                None,
+                LocalPayloadSyncMode::Fast,
+            )
+            .unwrap(),
+        );
+        // Every stripe is covered, as when a multi-gigabyte file is deleted.
+        let removed_ids = (0..(PAYLOAD_MUTATION_STRIPES * 2) as u64).collect::<Vec<_>>();
+        let puts = removed_ids
+            .iter()
+            .map(|&object_id| LocalPayloadPut {
+                object_id,
+                data: Bytes::from_static(b"old"),
+                evictable: false,
+            })
+            .collect::<Vec<_>>();
+        backend.put_batch(&puts).unwrap();
+
+        let (removed_tx, removed_rx) = sync_channel(1);
+        let (resume_tx, resume_rx) = sync_channel(1);
+        *backend.pause_after_removal_chunk.lock() = Some((removed_tx, resume_rx));
+        let remover = {
+            let backend = Arc::clone(&backend);
+            let removed_ids = removed_ids.clone();
+            std::thread::spawn(move || backend.remove_batch(&removed_ids))
+        };
+        removed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bulk removal must release its stripes between bounded chunks");
+        assert!(
+            backend
+                .index
+                .get_entry(*removed_ids.last().unwrap())
+                .unwrap()
+                .is_some(),
+            "the pause must happen before the bulk removal finishes"
+        );
+
+        // A new payload whose stripe belongs to a not-yet-removed chunk.
+        let new_id = (PAYLOAD_MUTATION_STRIPES * 4 - 1) as u64;
+        let (put_tx, put_rx) = sync_channel(1);
+        let writer = {
+            let backend = Arc::clone(&backend);
+            std::thread::spawn(move || {
+                let _ = put_tx.send(backend.put_batch(&[LocalPayloadPut {
+                    object_id: new_id,
+                    data: Bytes::from_static(b"new"),
+                    evictable: false,
+                }]));
+            })
+        };
+        let put_result = put_rx.recv_timeout(Duration::from_secs(5));
+        let _ = resume_tx.send(());
+        put_result
+            .expect("materialization put must not wait for the whole bulk removal")
+            .unwrap();
+        writer.join().expect("writer thread panicked");
+        remover
+            .join()
+            .expect("remover thread panicked")
+            .expect("bulk removal succeeds");
+
+        for &object_id in &removed_ids {
+            assert!(backend.index.get_entry(object_id).unwrap().is_none());
+            assert!(!layout.payload_object_path(object_id).exists());
+        }
+        assert_eq!(backend.get_for_upload(new_id).unwrap().as_ref(), b"new");
     }
 
     #[test]
