@@ -99,22 +99,10 @@ impl PendingInvalidations {
             }
     }
 
-    /// Position after the intents recorded so far, for [`Self::truncate`].
-    pub(crate) fn mark(&self) -> usize {
-        self.intents.len()
-    }
-
-    /// Drops the intents recorded after `mark`. A reset already subsumed them
-    /// and cannot be undone, so it stays.
-    pub(crate) fn truncate(&mut self, mark: usize) {
-        if mark >= self.intents.len()
-            || matches!(self.intents.first(), Some(InvalidationIntent::Reset))
-        {
-            return;
-        }
-        for intent in self.intents.drain(mark..) {
-            self.bytes -= Self::intent_bytes(&intent);
-            self.seen.remove(&intent);
+    /// Appends every intent of `scoped`, as if each had been pushed here.
+    pub(crate) fn absorb(&mut self, scoped: Self) {
+        for intent in scoped.intents {
+            self.push(intent);
         }
     }
 }

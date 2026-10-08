@@ -1451,7 +1451,7 @@ impl RedbMetaEngine {
         } else {
             None
         };
-        let invalidation_mark = txn.invalidation_mark();
+        let invalidation_scope = txn.invalidation_scope();
         let view_before = scope
             .as_ref()
             .map(|scope| Self::replay_scope_view(txn, scope))
@@ -1460,7 +1460,7 @@ impl RedbMetaEngine {
         if let (Some(scope), Some(before)) = (scope.as_ref(), view_before.as_ref())
             && Self::replay_scope_view(txn, scope)? == *before
         {
-            txn.discard_invalidations_since(invalidation_mark);
+            invalidation_scope.discard();
         }
         Ok(())
     }
@@ -1784,7 +1784,7 @@ impl RedbMetaEngine {
         };
 
         for ino in inodes {
-            let invalidation_mark = txn.invalidation_mark();
+            let invalidation_scope = txn.invalidation_scope();
             let view_before = Self::serving_view_of_inode(txn, *ino)?;
             Self::invalidate_replica_inode(txn, *ino, false)?;
             let base_attr = base_attrs.get(ino).and_then(|attr| attr.as_ref());
@@ -1830,7 +1830,7 @@ impl RedbMetaEngine {
             // acknowledged writes; only a real change to what the mount serves
             // can leave cached kernel state stale.
             if Self::serving_view_of_inode(txn, *ino)? == view_before {
-                txn.discard_invalidations_since(invalidation_mark);
+                invalidation_scope.discard();
             }
         }
 
@@ -2009,7 +2009,7 @@ impl RedbMetaEngine {
                 continue;
             }
             let (parent, name) = decode_dentry_key(key)?;
-            let invalidation_mark = txn.invalidation_mark();
+            let invalidation_scope = txn.invalidation_scope();
             let binding_before = Self::invalidation_binding(txn, key)?;
             Self::invalidate_replica_entry(txn, parent, name, None)?;
             let base_entry = base_entries
@@ -2022,7 +2022,7 @@ impl RedbMetaEngine {
                 Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
             }
             if Self::invalidation_binding(txn, key)? == binding_before {
-                txn.discard_invalidations_since(invalidation_mark);
+                invalidation_scope.discard();
             }
             changed = true;
         }

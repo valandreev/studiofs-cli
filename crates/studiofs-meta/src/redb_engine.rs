@@ -660,6 +660,31 @@ impl Deref for RedbWriteTransaction<'_> {
     }
 }
 
+/// Guard returned by [`RedbWriteTransaction::invalidation_scope`].
+pub(crate) struct InvalidationScope<'t, 'db> {
+    txn: &'t RedbWriteTransaction<'db>,
+    outer: Option<PendingInvalidations>,
+}
+
+impl InvalidationScope<'_, '_> {
+    /// Drops every scope journaled since the guard was created.
+    pub(crate) fn discard(mut self) {
+        if let Some(outer) = self.outer.take() {
+            *self.txn.invalidations.borrow_mut() = outer;
+        }
+    }
+}
+
+impl Drop for InvalidationScope<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(mut outer) = self.outer.take() {
+            let mut current = self.txn.invalidations.borrow_mut();
+            outer.absorb(std::mem::take(&mut *current));
+            *current = outer;
+        }
+    }
+}
+
 impl RedbWriteTransaction<'_> {
     pub(crate) fn invalidate(&self, intent: InvalidationIntent) {
         if self.invalidations_suppressed.get() {
@@ -668,15 +693,17 @@ impl RedbWriteTransaction<'_> {
         self.invalidations.borrow_mut().push(intent);
     }
 
-    /// Journal position for [`Self::discard_invalidations_since`].
-    pub(crate) fn invalidation_mark(&self) -> usize {
-        self.invalidations.borrow().mark()
-    }
-
-    /// Drops the scopes journaled since `mark`, for a write that left the
-    /// serving view exactly as it was.
-    pub(crate) fn discard_invalidations_since(&self, mark: usize) {
-        self.invalidations.borrow_mut().truncate(mark);
+    /// Journals the following scopes separately until the returned guard is
+    /// resolved. [`InvalidationScope::discard`] drops them, for a write that
+    /// left the serving view exactly as it was; dropping the guard otherwise
+    /// keeps them. Isolation means an overflow to `Reset` inside the scope
+    /// cannot destroy the intents journaled before it.
+    pub(crate) fn invalidation_scope(&self) -> InvalidationScope<'_, '_> {
+        let outer = std::mem::take(&mut *self.invalidations.borrow_mut());
+        InvalidationScope {
+            txn: self,
+            outer: Some(outer),
+        }
     }
 
     /// Runs `apply` without journaling the invalidation scopes it records.
