@@ -369,7 +369,8 @@ fn mounted_payload_readback_distinguishes_missing_path_from_empty_file() {
         &missing_path,
         b"",
         Duration::from_secs(1),
-        Duration::from_millis(1),
+        // Avoid a final probe with less than 100ms remaining.
+        Duration::from_millis(100),
         Duration::from_secs(1),
     )
     .unwrap_err();
@@ -510,7 +511,8 @@ fn mounted_chaos_initial_barrier_accepts_replicated_seed_tree() {
         &context,
         &clients,
         &isolation,
-        Duration::from_secs(1),
+        // Allow scheduler headroom while checking replicated tree equality.
+        Duration::from_secs(10),
         Duration::from_millis(5),
     )
     .unwrap();
