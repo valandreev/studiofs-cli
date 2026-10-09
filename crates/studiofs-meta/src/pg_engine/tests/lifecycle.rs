@@ -4279,7 +4279,7 @@ fn allocator_bootstrap_does_not_hold_retry_lock_during_mint() {
 }
 
 #[test]
-fn pending_local_graph_repair_marker_blocks_catchup_completion() {
+fn resolved_local_graph_repair_marker_allows_catchup_completion() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine
         .local
@@ -4287,21 +4287,43 @@ fn pending_local_graph_repair_marker_blocks_catchup_completion() {
         .expect("set local graph recovery marker");
     engine
         .metadata_startup_target_version
-        .store(0, std::sync::atomic::Ordering::Release);
+        .store(1, std::sync::atomic::Ordering::Release);
     engine.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
 
     engine
         .try_complete_catchup_sync()
-        .expect("pending local graph recovery blocks catch-up completion");
+        .expect("repair cannot complete before reaching the target");
 
     assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
     assert!(!engine.pg_sync_status().allows_new_mutations());
     assert_eq!(
         engine
+            .local
+            .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+            .unwrap(),
+        1
+    );
+    engine
+        .local_version
+        .store(1, std::sync::atomic::Ordering::Release);
+    engine
+        .try_complete_catchup_sync()
+        .expect("complete resolved repair");
+    assert_eq!(engine.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(engine.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        engine
+            .local
+            .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        engine
             .metadata_startup_target_version
             .load(std::sync::atomic::Ordering::Acquire),
         -1,
-        "a later poll must capture a new remote head after reaching the pinned target"
+        "a later recovery must capture a new remote head"
     );
 }
 

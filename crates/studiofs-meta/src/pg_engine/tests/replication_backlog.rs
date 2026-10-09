@@ -24,6 +24,102 @@ fn uploaded_pending_file(pg: &PgMetaEngine, name: &[u8], object_id: u64) -> Inod
     attr
 }
 
+#[test]
+fn local_graph_repair_marker_clears_only_after_conflicting_payload_is_published() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let name = b"repair-conflicting-name.bin";
+    let file = uploaded_pending_file(&pg, name, 77_028);
+    let replacement = pg
+        .create_file(ROOT_INO, b"replacement.bin", 0, 0, 0o644)
+        .unwrap();
+    pg.local
+        .apply_replica_serving_state(&[
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: name.to_vec(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: name.to_vec(),
+                entry: crate::types::DirEntryValue {
+                    ino: replacement.ino,
+                    kind: replacement.kind,
+                },
+            },
+        ])
+        .unwrap();
+    assert!(
+        !pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .unwrap()
+    );
+    pg.local
+        .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)
+        .unwrap();
+    pg.metadata_startup_target_version
+        .store(0, Ordering::Release);
+    pg.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    pg.try_complete_catchup_sync().unwrap();
+    assert_eq!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!pg.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        pg.local.lookup(ROOT_INO, name).unwrap().ino,
+        replacement.ino
+    );
+    assert_eq!(
+        pg.local.pending_uploaded_regular_file_recoveries().unwrap()[0]
+            .attr
+            .ino,
+        file.ino
+    );
+    assert!(
+        pg.local
+            .get_referenced_object_ids()
+            .unwrap()
+            .contains(&77_028)
+    );
+    assert_eq!(
+        pg.metadata_startup_target_version.load(Ordering::Acquire),
+        -1
+    );
+    assert!(
+        pg.local
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, file.content_epoch)
+            .unwrap()
+    );
+    assert!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .unwrap()
+            .is_empty()
+    );
+    pg.metadata_startup_target_version
+        .store(1, Ordering::Release);
+    pg.local_version.store(1, Ordering::Release);
+    pg.try_complete_catchup_sync().unwrap();
+    assert_eq!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(pg.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        pg.local.lookup(ROOT_INO, name).unwrap().ino,
+        replacement.ino
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, file.size).unwrap(),
+        vec![77_028]
+    );
+}
+
 fn reject_oversized_test_event(pg: &mut PgMetaEngine, name: &[u8]) -> u64 {
     pg.remote_format_validated.store(true, Ordering::Release);
     pg.sync_max_response_bytes_per_page = 1;
@@ -3128,6 +3224,80 @@ fn restore_pending_state_from_local_log_replays_unflushed_serving_state() {
                     && payload.length == winner_payload.length
             })),
         "pending log replay must restore the unflushed local payload overlay"
+    );
+}
+
+#[test]
+fn restore_pending_state_keeps_newer_published_append_over_stale_updating_attr() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"published-append-replay.txt", 77_031);
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("acknowledge published setup");
+
+    let mut stale_updating = pg.local.get_attr(file.ino).expect("published attr");
+    stale_updating.size = 232;
+    stale_updating.committed_size = 232;
+    stale_updating.content_epoch = 2;
+    stale_updating.committed_content_epoch = 1;
+    stale_updating.upload_state = UploadState::Updating;
+    pg.local
+        .set_attr(&stale_updating)
+        .expect("append stale updating attr to local journal");
+
+    let head = PayloadRef::new_partial(77_032, 232);
+    let tail = PayloadRef::new_partial(77_033, 206);
+    let mut ready = stale_updating.clone();
+    ready.size = 438;
+    ready.committed_size = 438;
+    ready.committed_content_epoch = 2;
+    ready.upload_state = UploadState::Ready;
+    let published = [
+        MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: vec![(
+                ChunkId(0),
+                vec![
+                    SliceRecord {
+                        payload_state: PayloadRefState::Published,
+                        ..SliceRecord::new(
+                            SliceId(1),
+                            SliceOrder(1),
+                            SliceRange::new(0, 232).expect("head range"),
+                            head,
+                        )
+                    },
+                    SliceRecord {
+                        payload_state: PayloadRefState::Published,
+                        ..SliceRecord::new(
+                            SliceId(2),
+                            SliceOrder(2),
+                            SliceRange::new(232, 438).expect("tail range"),
+                            tail,
+                        )
+                    },
+                ],
+            )],
+        },
+        MetaEvent::SetAttr {
+            attr: ready.clone(),
+        },
+    ];
+    pg.local
+        .apply_replica_events_to_base(&published)
+        .expect("apply remote append to base");
+    pg.local
+        .apply_replica_serving_state(&published)
+        .expect("apply remote append to serving state");
+
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending local log");
+
+    assert_eq!(pg.local.get_attr(file.ino).expect("final attr"), ready);
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, ready.size).expect("final payload IDs"),
+        vec![head.object_id, tail.object_id],
+        "replaying the stale local attr must keep both published append payloads"
     );
 }
 

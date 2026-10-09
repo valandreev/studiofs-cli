@@ -1493,8 +1493,8 @@ impl RedbMetaEngine {
                         && ((attr.mtime < current.mtime
                             && attr.ctime < current.ctime
                             && attr.committed_size > current.committed_size)
-                            || (attr.committed_size >= current.committed_size
-                                && attr.content_epoch == current.content_epoch
+                            // Append publication grows committed size within the same epoch.
+                            || (attr.content_epoch == current.content_epoch
                                 && attr.committed_content_epoch < current.committed_content_epoch))
                     {
                         continue;
@@ -1979,6 +1979,13 @@ impl RedbMetaEngine {
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(changed)
+    }
+
+    pub(crate) fn serving_dentry_keys_for_inode_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        ino: Ino,
+    ) -> MetaResult<Vec<Vec<u8>>> {
+        Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, ino)
     }
 
     pub(crate) fn reconcile_serving_dentries_from_base_in_txn(

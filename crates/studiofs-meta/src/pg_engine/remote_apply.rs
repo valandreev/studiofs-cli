@@ -515,10 +515,21 @@ impl<'a> RemoteApplyCoordinator<'a> {
     }
 
     pub(super) fn collect_replay_reconcile_dentries(
+        txn: &RedbWriteTransaction<'_>,
         candidates: &mut HashSet<Vec<u8>>,
         batch_events: &[MetaEvent],
-    ) {
+    ) -> MetaResult<()> {
         candidates.extend(Self::overlay_conflicts_for_events(batch_events).dentry_keys);
+        for event in batch_events {
+            if let MetaEvent::RenameEntry { entry, .. } = event {
+                // A cursor gap can keep a published local rename loser in the
+                // serving index; reconcile it with the current overlay authority.
+                candidates.extend(RedbMetaEngine::serving_dentry_keys_for_inode_in_txn(
+                    txn, entry.ino,
+                )?);
+            }
+        }
+        Ok(())
     }
 
     // Foreign replay can transiently protect a regular file while repair-restored
@@ -2157,7 +2168,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 execution.check()?;
             }
             Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
-            Self::collect_replay_reconcile_dentries(&mut reconcile_dentry_keys, &batch.events);
+            Self::collect_replay_reconcile_dentries(
+                txn,
+                &mut reconcile_dentry_keys,
+                &batch.events,
+            )?;
             if batch.is_self_batch {
                 applied_any |= self.apply_visible_self_batch_in_txn(txn, &batch.events)?;
                 let acknowledged_seq = self.acknowledge_local_prefix_from_self_batch_in_txn(
