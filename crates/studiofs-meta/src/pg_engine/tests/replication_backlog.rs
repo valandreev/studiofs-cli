@@ -3228,6 +3228,80 @@ fn restore_pending_state_from_local_log_replays_unflushed_serving_state() {
 }
 
 #[test]
+fn restore_pending_state_keeps_newer_published_append_over_stale_updating_attr() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"published-append-replay.txt", 77_031);
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("acknowledge published setup");
+
+    let mut stale_updating = pg.local.get_attr(file.ino).expect("published attr");
+    stale_updating.size = 232;
+    stale_updating.committed_size = 232;
+    stale_updating.content_epoch = 2;
+    stale_updating.committed_content_epoch = 1;
+    stale_updating.upload_state = UploadState::Updating;
+    pg.local
+        .set_attr(&stale_updating)
+        .expect("append stale updating attr to local journal");
+
+    let head = PayloadRef::new_partial(77_032, 232);
+    let tail = PayloadRef::new_partial(77_033, 206);
+    let mut ready = stale_updating.clone();
+    ready.size = 438;
+    ready.committed_size = 438;
+    ready.committed_content_epoch = 2;
+    ready.upload_state = UploadState::Ready;
+    let published = [
+        MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: vec![(
+                ChunkId(0),
+                vec![
+                    SliceRecord {
+                        payload_state: PayloadRefState::Published,
+                        ..SliceRecord::new(
+                            SliceId(1),
+                            SliceOrder(1),
+                            SliceRange::new(0, 232).expect("head range"),
+                            head,
+                        )
+                    },
+                    SliceRecord {
+                        payload_state: PayloadRefState::Published,
+                        ..SliceRecord::new(
+                            SliceId(2),
+                            SliceOrder(2),
+                            SliceRange::new(232, 438).expect("tail range"),
+                            tail,
+                        )
+                    },
+                ],
+            )],
+        },
+        MetaEvent::SetAttr {
+            attr: ready.clone(),
+        },
+    ];
+    pg.local
+        .apply_replica_events_to_base(&published)
+        .expect("apply remote append to base");
+    pg.local
+        .apply_replica_serving_state(&published)
+        .expect("apply remote append to serving state");
+
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending local log");
+
+    assert_eq!(pg.local.get_attr(file.ino).expect("final attr"), ready);
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, ready.size).expect("final payload IDs"),
+        vec![head.object_id, tail.object_id],
+        "replaying the stale local attr must keep both published append payloads"
+    );
+}
+
+#[test]
 fn pg_event_insert_chunking_covers_all_events() {
     let events = vec![MetaEvent::RemoveAttr { ino: 1 }; 1_025];
     let chunk_sizes: Vec<usize> = events

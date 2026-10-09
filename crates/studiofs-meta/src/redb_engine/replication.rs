@@ -1493,8 +1493,8 @@ impl RedbMetaEngine {
                         && ((attr.mtime < current.mtime
                             && attr.ctime < current.ctime
                             && attr.committed_size > current.committed_size)
-                            || (attr.committed_size >= current.committed_size
-                                && attr.content_epoch == current.content_epoch
+                            // Append publication grows committed size within the same epoch.
+                            || (attr.content_epoch == current.content_epoch
                                 && attr.committed_content_epoch < current.committed_content_epoch))
                     {
                         continue;
