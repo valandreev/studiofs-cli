@@ -2663,7 +2663,7 @@ fn read_into_fh_reads_dirty_overlay_while_materialize_is_active() {
 #[test]
 fn opportunistic_write_does_not_wait_for_background_materialize_session() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "write-during-materialize");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "write-during-materialize");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -2676,7 +2676,9 @@ fn opportunistic_write_does_not_wait_for_background_materialize_session() {
             .enter_op(attr.ino, FileSessionOperation::Materialize)
             .await;
 
-        let written = tokio::time::timeout(Duration::from_millis(100), async {
+        // The first write syncs a local recovery marker; only waiting on the
+        // held materialize permit is forbidden, not slow disk IO under load.
+        let written = tokio::time::timeout(Duration::from_secs(5), async {
             vfs.write_fh_with_deferred_materialize(
                 fh,
                 attr.ino,
@@ -2691,6 +2693,13 @@ fn opportunistic_write_does_not_wait_for_background_materialize_session() {
         .expect("foreground write should be accepted");
 
         assert_eq!(written, b"foreground".len() as u32);
+        assert!(vfs.state.writer_stack.has_dirty_writers(attr.ino));
+        let mut out = [0; 10];
+        assert_eq!(
+            vfs.read_into_fh(fh, attr.ino, 0, &mut out).await.unwrap(),
+            written
+        );
+        assert_eq!(&out, b"foreground");
         drop(materialize);
         vfs.release_fh(fh).await.unwrap();
     });
