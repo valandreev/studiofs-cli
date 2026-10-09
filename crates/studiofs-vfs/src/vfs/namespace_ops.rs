@@ -2540,17 +2540,6 @@ impl StudioVfs {
                 })),
             };
         }
-        if self
-            .state
-            .namespace
-            .deferred
-            .inner
-            .lock()
-            .locally_created_dirs
-            .contains(&parent)
-        {
-            return Ok(());
-        }
         match self.sync_meta().lookup(parent, name) {
             Ok(_) => Err(VfsError::Meta(MetaError::EntryExists {
                 parent,

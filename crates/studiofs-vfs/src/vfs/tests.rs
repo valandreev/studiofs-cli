@@ -16916,6 +16916,103 @@ fn deferred_create_respects_dentry_cache_admission() {
 }
 
 #[test]
+fn deferred_create_rejects_committed_children_after_dentry_cache_invalidation() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-committed-child-collision");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(true, AtomicOrdering::Release);
+        let parent = vfs
+            .mkdir_with_deferred_metadata_admission(ROOT_INO, b"nested", 0, 0, 0o755, rt.handle())
+            .expect("admit parent");
+        assert!(matches!(
+            meta.get_attr(parent.ino),
+            Err(MetaError::InodeNotFound(_))
+        ));
+        let child = vfs
+            .mkdir_with_deferred_metadata_admission(
+                parent.ino,
+                b"level-two",
+                0,
+                0,
+                0o755,
+                rt.handle(),
+            )
+            .expect("admit child directory");
+        let file = vfs
+            .create_with_deferred_metadata_admission(
+                parent.ino,
+                b"existing.bin",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .expect("admit child file");
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(false, AtomicOrdering::Release);
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+        for ino in [parent.ino, child.ino, file.ino] {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                vfs.wait_for_deferred_namespace_metadata(ino),
+            )
+            .await
+            .expect("bounded namespace commit")
+            .expect("namespace commit");
+        }
+        vfs.bump_namespace_epoch();
+        assert!(vfs.dentry_cache_lookup(parent.ino, b"level-two").is_none());
+
+        let directory_error = vfs
+            .mkdir_with_deferred_metadata_admission(
+                parent.ino,
+                b"level-two",
+                0,
+                0,
+                0o755,
+                rt.handle(),
+            )
+            .expect_err("committed directory must reject duplicate admission");
+        let file_error = vfs
+            .create_with_deferred_metadata_admission(
+                parent.ino,
+                b"existing.bin",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .expect_err("committed file must reject duplicate admission");
+        for error in [directory_error, file_error] {
+            assert!(matches!(
+                error,
+                VfsError::Meta(MetaError::EntryExists { .. })
+            ));
+        }
+        assert_eq!(
+            meta.lookup(parent.ino, b"level-two")
+                .expect("original directory")
+                .ino,
+            child.ino
+        );
+        assert_eq!(
+            meta.lookup(parent.ino, b"existing.bin")
+                .expect("original file")
+                .ino,
+            file.ino
+        );
+    });
+}
+
+#[test]
 fn deferred_lookup_under_locally_created_dir_uses_negative_cache() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-local-dir-negative-lookup");
