@@ -915,17 +915,33 @@ impl PgMetaEngine {
             != 0
         {
             let target = self.metadata_startup_target_version.load(Ordering::Acquire);
-            if target >= 0 && self.local_version.load(Ordering::Acquire) >= target {
-                // Keep polling remote history while graph repair denies write authority.
-                let _ = self.metadata_startup_target_version.compare_exchange(
-                    target,
-                    -1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+            let target_reached =
+                target >= 0 && self.local_version.load(Ordering::Acquire) >= target;
+            if target_reached {
+                self.local.reconcile_pending_regular_file_recoveries()?;
             }
-            self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
-            return Ok(());
+            if target_reached
+                && self
+                    .local
+                    .pending_uploaded_regular_file_recoveries()?
+                    .is_empty()
+            {
+                // Replay can retire the rows that made startup repair read-only.
+                self.local
+                    .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
+            } else {
+                if target_reached {
+                    // Keep polling remote history while graph repair denies write authority.
+                    let _ = self.metadata_startup_target_version.compare_exchange(
+                        target,
+                        -1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                self.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+                return Ok(());
+            }
         }
 
         if !self.remote_identity_validated.load(Ordering::Acquire) {

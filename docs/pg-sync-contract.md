@@ -411,10 +411,14 @@ inode is absent, a strictly newer content epoch superseded it, or the published
 base contains every payload object retained by the row. A same-numbered
 committed epoch alone does not prove that the row's payload was published. An
 ambiguous identity or namespace conflict keeps the recovery row and its object
-references. The local-graph repair marker then keeps the mount degraded and
-read-only for that session; reopening retries, but a persistent conflict or
-legacy row without namespace identity needs external resolution. Remote event
-polling continues while the marker is set. The janitor explicitly removes only
+references. The local-graph repair marker keeps the mount degraded and
+read-only while recovery rows remain unresolved. After remote replay reaches
+its pinned target, catch-up reconciles provably obsolete rows and clears the
+marker only when no uploaded recovery rows remain; write authority still
+requires the normal identity and allocator checks. Reopening retries repair,
+but a persistent conflict or legacy row without namespace identity needs
+external resolution. Remote event polling continues while the marker is set.
+The janitor explicitly removes only
 rows that can be proven obsolete from the serving inode and published payload
 graph before its reachability scan. This recovery path does not reopen the
 flushed event cursor or prune local events.

@@ -24,6 +24,102 @@ fn uploaded_pending_file(pg: &PgMetaEngine, name: &[u8], object_id: u64) -> Inod
     attr
 }
 
+#[test]
+fn local_graph_repair_marker_clears_only_after_conflicting_payload_is_published() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let name = b"repair-conflicting-name.bin";
+    let file = uploaded_pending_file(&pg, name, 77_028);
+    let replacement = pg
+        .create_file(ROOT_INO, b"replacement.bin", 0, 0, 0o644)
+        .unwrap();
+    pg.local
+        .apply_replica_serving_state(&[
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: name.to_vec(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: name.to_vec(),
+                entry: crate::types::DirEntryValue {
+                    ino: replacement.ino,
+                    kind: replacement.kind,
+                },
+            },
+        ])
+        .unwrap();
+    assert!(
+        !pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .unwrap()
+    );
+    pg.local
+        .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)
+        .unwrap();
+    pg.metadata_startup_target_version
+        .store(0, Ordering::Release);
+    pg.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+    pg.try_complete_catchup_sync().unwrap();
+    assert_eq!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert!(!pg.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        pg.local.lookup(ROOT_INO, name).unwrap().ino,
+        replacement.ino
+    );
+    assert_eq!(
+        pg.local.pending_uploaded_regular_file_recoveries().unwrap()[0]
+            .attr
+            .ino,
+        file.ino
+    );
+    assert!(
+        pg.local
+            .get_referenced_object_ids()
+            .unwrap()
+            .contains(&77_028)
+    );
+    assert_eq!(
+        pg.metadata_startup_target_version.load(Ordering::Acquire),
+        -1
+    );
+    assert!(
+        pg.local
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, file.content_epoch)
+            .unwrap()
+    );
+    assert!(
+        pg.local
+            .pending_uploaded_regular_file_recoveries()
+            .unwrap()
+            .is_empty()
+    );
+    pg.metadata_startup_target_version
+        .store(1, Ordering::Release);
+    pg.local_version.store(1, Ordering::Release);
+    pg.try_complete_catchup_sync().unwrap();
+    assert_eq!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(pg.pg_sync_status().allows_new_mutations());
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        pg.local.lookup(ROOT_INO, name).unwrap().ino,
+        replacement.ino
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, file.size).unwrap(),
+        vec![77_028]
+    );
+}
+
 fn reject_oversized_test_event(pg: &mut PgMetaEngine, name: &[u8]) -> u64 {
     pg.remote_format_validated.store(true, Ordering::Release);
     pg.sync_max_response_bytes_per_page = 1;
