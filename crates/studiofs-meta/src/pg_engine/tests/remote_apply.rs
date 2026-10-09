@@ -1978,6 +1978,101 @@ fn foreign_unlink_after_local_rename_removes_destination_alias() {
 }
 
 #[test]
+fn foreign_rename_removes_published_local_loser_across_cursor_gap() {
+    use crate::coherence::InvalidationIntent;
+
+    for completed in [false, true] {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let gap_start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("gap start");
+        pg.local
+            .set_xattr(ROOT_INO, b"user.cursor-gap", b"local", 0)
+            .expect("append cursor barrier");
+        let published_start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("publish start");
+        pg.reject_local_event_ranges(&[LocalEventRange {
+            start: gap_start,
+            end: published_start,
+        }])
+        .expect("retain cursor barrier");
+        let file = create_published_small_file(&pg, ROOT_INO, b"source.txt", 77_011);
+        pg.rename(ROOT_INO, b"source.txt", ROOT_INO, b"renamed-a.txt")
+            .expect("local rename");
+        let published_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("publish end");
+        let range = LocalEventRange {
+            start: published_start,
+            end: published_end,
+        };
+        if completed {
+            pg.complete_local_event_ranges(&[range])
+                .expect("complete range");
+        } else {
+            pg.mark_local_event_ranges_published(&[range])
+                .expect("publish range");
+        }
+        pg.link(file.ino, ROOT_INO, b"pending-link.txt")
+            .expect("create pending local hardlink");
+        let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+        let initial_overlay = pg.local_overlay_conflicts().expect("overlay");
+        journaled_invalidation_intents(&pg);
+
+        pg.apply_replay_page_atomically(
+            vec![DecodedReplayBatch {
+                batch_version: 1,
+                events: vec![MetaEvent::RenameEntry {
+                    parent: ROOT_INO,
+                    name: b"source.txt".to_vec(),
+                    new_parent: ROOT_INO,
+                    new_name: b"renamed-b.txt".to_vec(),
+                    entry: DirEntryValue {
+                        ino: file.ino,
+                        kind: FileType::RegularFile,
+                    },
+                    displaced_set_attr: Box::new(None),
+                    displaced_remove_attr_ino: None,
+                    moved_dir_attr: Box::new(None),
+                    old_parent_attr: Box::new(None),
+                    new_parent_attr: Box::new(None),
+                }],
+                is_self_batch: false,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq: gap_start,
+                next_event_seq,
+                initial_overlay,
+            },
+        )
+        .expect("apply foreign rename winner");
+
+        assert!(pg.lookup(ROOT_INO, b"source.txt").is_err());
+        assert!(
+            pg.lookup(ROOT_INO, b"renamed-a.txt").is_err(),
+            "published loser must disappear (completed={completed})"
+        );
+        for name in [b"renamed-b.txt".as_slice(), b"pending-link.txt".as_slice()] {
+            assert_eq!(
+                pg.lookup(ROOT_INO, name)
+                    .expect("visible winner or pending link")
+                    .ino,
+                file.ino
+            );
+        }
+        assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), gap_start);
+        assert!(
+            journaled_invalidation_intents(&pg)
+                .iter()
+                .any(|intent| matches!(
+                    intent,
+                    InvalidationIntent::Entry { name, ino: Some(ino), .. }
+                        if name.as_slice() == b"renamed-a.txt" && *ino == file.ino
+                )),
+            "removed loser must invalidate its cached binding"
+        );
+    }
+}
+
+#[test]
 fn foreign_unlink_during_local_append_removes_serving_dentry() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

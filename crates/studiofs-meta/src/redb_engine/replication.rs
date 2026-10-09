@@ -1981,6 +1981,13 @@ impl RedbMetaEngine {
         Ok(changed)
     }
 
+    pub(crate) fn serving_dentry_keys_for_inode_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        ino: Ino,
+    ) -> MetaResult<Vec<Vec<u8>>> {
+        Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, ino)
+    }
+
     pub(crate) fn reconcile_serving_dentries_from_base_in_txn(
         txn: &RedbWriteTransaction<'_>,
         dentry_keys: &HashSet<Vec<u8>>,
