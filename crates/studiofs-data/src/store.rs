@@ -768,8 +768,9 @@ impl DataStore {
         let prefix = format!("{}/", self.volume_name);
         info!("deleting all objects with prefix: {}", prefix);
 
-        // Delete all objects with the given prefix
-        self.op.remove_all(&prefix).await?;
+        // S3 prefixes need not be objects; remove_all's preliminary stat is unnecessary.
+        let objects = self.op.lister_with(&prefix).recursive(true).await?;
+        self.op.delete_try_stream(objects).await?;
 
         Ok(())
     }
@@ -1237,6 +1238,75 @@ mod tests {
 
         store.delete_by_key(key).await.unwrap();
         assert!(!raw.exists(key).await.unwrap());
+    }
+
+    #[derive(Debug)]
+    struct PrefixStatFailure(opendal::raw::Accessor);
+
+    impl opendal::raw::Access for PrefixStatFailure {
+        type Reader = opendal::raw::oio::Reader;
+        type Writer = opendal::raw::oio::Writer;
+        type Lister = opendal::raw::oio::Lister;
+        type Deleter = opendal::raw::oio::Deleter;
+
+        fn info(&self) -> Arc<opendal::raw::AccessorInfo> {
+            self.0.info_dyn()
+        }
+
+        async fn stat(
+            &self,
+            _path: &str,
+            _args: opendal::raw::OpStat,
+        ) -> opendal::Result<opendal::raw::RpStat> {
+            Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "prefix stat timed out",
+            ))
+        }
+
+        async fn list(
+            &self,
+            path: &str,
+            args: opendal::raw::OpList,
+        ) -> opendal::Result<(opendal::raw::RpList, Self::Lister)> {
+            self.0.list_dyn(path, args).await
+        }
+
+        async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+            self.0.delete_dyn().await
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_volume_data_does_not_stat_prefix_or_delete_neighboring_keys() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let owned = [
+            "unit-volume/objects/aa/bb/payload",
+            "unit-volume/snapshots/marker",
+        ];
+        let neighbors = [
+            "unit-volume-other/objects/payload",
+            "unit-volume",
+            "other/marker",
+        ];
+        for key in owned.into_iter().chain(neighbors) {
+            raw.write(key, "payload").await.unwrap();
+        }
+        let op = Operator::from_inner(Arc::new(PrefixStatFailure(raw.clone().into_inner())));
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), op).unwrap();
+
+        store.delete_volume_data().await.unwrap();
+
+        for key in owned {
+            assert!(!raw.exists(key).await.unwrap(), "volume key remains: {key}");
+        }
+        for key in neighbors {
+            assert!(
+                raw.exists(key).await.unwrap(),
+                "neighbor key deleted: {key}"
+            );
+        }
+        store.delete_volume_data().await.unwrap();
     }
 
     #[tokio::test]
