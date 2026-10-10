@@ -257,11 +257,11 @@ impl SfecHeader {
 }
 
 /// Parsed SFEC envelope: strict header plus encrypted frame bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SfecEnvelope {
     header: SfecHeader,
     header_bytes: Bytes,
-    ciphertext: Bytes,
+    ciphertext: Buffer,
 }
 
 impl SfecEnvelope {
@@ -284,12 +284,16 @@ impl SfecEnvelope {
     }
 
     /// Parse and strictly validate a complete SFEC envelope.
-    pub fn parse(data: Bytes) -> Result<Self, SfecError> {
+    ///
+    /// Only the small header is made contiguous; chunked ciphertext stays as
+    /// the caller's `Buffer` chunks.
+    pub fn parse(data: impl Into<Buffer>) -> Result<Self, SfecError> {
+        let data = data.into();
         if data.len() < SFEC_HEADER_FIXED_LEN {
             return Err(SfecError::TruncatedHeader);
         }
 
-        let mut fixed = &data[..SFEC_HEADER_FIXED_LEN];
+        let mut fixed = data.slice(..SFEC_HEADER_FIXED_LEN);
         let mut magic = [0u8; 4];
         fixed.copy_to_slice(&mut magic);
         if &magic != SFEC_MAGIC {
@@ -335,6 +339,7 @@ impl SfecEnvelope {
         let wrapped_dek_start = data_nonce_prefix_start + data_nonce_prefix_len;
         let ciphertext_start = wrapped_dek_start + wrapped_dek_len;
 
+        let header_bytes = data.slice(..ciphertext_start).to_bytes();
         let header = SfecHeader {
             algorithm,
             flags,
@@ -342,13 +347,12 @@ impl SfecEnvelope {
             plaintext_len,
             frame_size,
             frame_count,
-            wrap_nonce: data.slice(wrap_nonce_start..data_nonce_prefix_start),
-            data_nonce_prefix: data.slice(data_nonce_prefix_start..wrapped_dek_start),
-            wrapped_dek: data.slice(wrapped_dek_start..ciphertext_start),
+            wrap_nonce: header_bytes.slice(wrap_nonce_start..data_nonce_prefix_start),
+            data_nonce_prefix: header_bytes.slice(data_nonce_prefix_start..wrapped_dek_start),
+            wrapped_dek: header_bytes.slice(wrapped_dek_start..ciphertext_start),
         };
         header.validate_shape()?;
 
-        let header_bytes = data.slice(..ciphertext_start);
         let ciphertext = data.slice(ciphertext_start..);
         validate_ciphertext_len(&header, ciphertext.len())?;
 
@@ -369,8 +373,8 @@ impl SfecEnvelope {
         &self.header_bytes
     }
 
-    /// Encrypted frame bytes following the header.
-    pub fn ciphertext(&self) -> &Bytes {
+    /// Encrypted frame bytes following the header, possibly chunked.
+    pub fn ciphertext(&self) -> &Buffer {
         &self.ciphertext
     }
 }

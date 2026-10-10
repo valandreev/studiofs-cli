@@ -799,15 +799,12 @@ impl DataStore {
     }
 
     async fn encrypt_payload(&self, key: &str, plaintext: Buffer) -> DataResult<Buffer> {
-        // SFS-351 wires the complete-object crypto boundary; chunked encryption
-        // belongs to the follow-up serializer path once the crypto API supports it.
         let key = key.to_string();
         let crypto = self.crypto.clone();
         run_crypto_blocking(move || {
-            let plaintext = plaintext.to_bytes();
             crypto
                 .cipher
-                .encrypt_object(plaintext.as_ref(), &key, crypto.key_id)
+                .encrypt_object(plaintext, &key, crypto.key_id)
                 .map_err(DataError::from)
         })
         .await
@@ -817,7 +814,7 @@ impl DataStore {
         let key = key.to_string();
         let crypto = self.crypto.clone();
         run_crypto_blocking(move || {
-            let plaintext = crypto.cipher.decrypt_object(ciphertext.to_bytes(), &key)?;
+            let plaintext = crypto.cipher.decrypt_object(ciphertext, &key)?;
             Ok(Buffer::from(plaintext))
         })
         .await
