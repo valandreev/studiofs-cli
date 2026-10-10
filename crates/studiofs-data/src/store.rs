@@ -1304,6 +1304,138 @@ mod tests {
         assert!(reads <= 3, "expected at most 3 reads, got {reads}");
     }
 
+    /// Tracks ranged OpenDAL `read` calls that are pending at the same time.
+    #[derive(Debug)]
+    struct InFlightReadLayer(Arc<InFlightReads>);
+
+    #[derive(Debug)]
+    struct InFlightReads {
+        armed: std::sync::atomic::AtomicBool,
+        in_flight: tokio::sync::watch::Sender<usize>,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    impl InFlightReads {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                armed: std::sync::atomic::AtomicBool::new(false),
+                in_flight: tokio::sync::watch::channel(0).0,
+                max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct InFlightReadAccess<A: Access> {
+        inner: A,
+        reads: Arc<InFlightReads>,
+    }
+
+    impl<A: Access> Layer<A> for InFlightReadLayer {
+        type LayeredAccess = InFlightReadAccess<A>;
+
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            InFlightReadAccess {
+                inner,
+                reads: self.0.clone(),
+            }
+        }
+    }
+
+    impl<A: Access> LayeredAccess for InFlightReadAccess<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = A::Deleter;
+
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+
+        async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
+            // The 40-byte prefix (offset 0) is legitimately alone, so it passes through.
+            if !self.reads.armed.load(std::sync::atomic::Ordering::SeqCst)
+                || args.range().offset() == 0
+            {
+                return self.inner.read(path, args).await;
+            }
+            let max = &self.reads.max_in_flight;
+            self.reads.in_flight.send_modify(|pending| {
+                *pending += 1;
+                max.fetch_max(*pending, std::sync::atomic::Ordering::SeqCst);
+            });
+            // Bounded wait on the real condition: a second ranged read is pending.
+            let mut pending = self.reads.in_flight.subscribe();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(2), pending.wait_for(|n| *n >= 2)).await;
+            let result = self.inner.read(path, args).await;
+            self.reads.in_flight.send_modify(|pending| *pending -= 1);
+            result
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(RpWrite, Self::Writer)> {
+            self.inner.write(path, args).await
+        }
+
+        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
+            self.inner.list(path, args).await
+        }
+
+        async fn delete(&self) -> opendal::Result<(RpDelete, Self::Deleter)> {
+            self.inner.delete().await
+        }
+    }
+
+    /// Reads `len` plaintext bytes at `plaintext_start` from a four-frame object and
+    /// returns the peak number of concurrently pending ranged reads.
+    async fn peak_concurrent_range_reads(plaintext_start: u64, len: u64) -> usize {
+        let gate = InFlightReads::new();
+        let raw = Operator::new(Memory::default())
+            .unwrap()
+            .layer(InFlightReadLayer(gate.clone()))
+            .finish();
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
+        let key = "unit-volume/objects/aa/bb/range-concurrent";
+        let payload = Bytes::from(vec![
+            7u8;
+            crate::object::CLOUD_FRAGMENT_SIZE - ObjectHeader::SIZE
+        ]);
+        store
+            .put_by_key(key, create_object_buffer(payload.clone()).unwrap())
+            .await
+            .unwrap();
+
+        gate.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let start = plaintext_start - ObjectHeader::SIZE as u64;
+        let (bytes, _) = store
+            .get_payload_range_by_key_with_stats(key, start..start + len)
+            .await
+            .unwrap();
+        assert_eq!(bytes, payload.slice(start as usize..(start + len) as usize));
+        gate.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn payload_range_reads_distant_target_concurrently_with_head() {
+        use crate::envelope::DEFAULT_SFEC_FRAME_SIZE;
+        // Frame 2 is not adjacent to frame 0: the head and target reads must overlap.
+        let peak = peak_concurrent_range_reads(2 * DEFAULT_SFEC_FRAME_SIZE as u64 + 10, 4096).await;
+        assert_eq!(peak, 2, "head and target reads must be in flight together");
+    }
+
+    #[tokio::test]
+    async fn payload_range_adjacent_frame_merges_into_single_gated_read() {
+        use crate::envelope::DEFAULT_SFEC_FRAME_SIZE;
+        // Frame 1 directly follows frame 0 and is merged into the head read: nothing to overlap.
+        let peak = peak_concurrent_range_reads(DEFAULT_SFEC_FRAME_SIZE as u64 + 10, 4096).await;
+        assert_eq!(peak, 1, "adjacent frame must not issue a separate read");
+    }
+
     #[tokio::test]
     async fn payload_range_short_object_stays_within_remote_length() {
         let raw = Operator::new(Memory::default()).unwrap().finish();
