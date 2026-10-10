@@ -880,7 +880,11 @@ impl PgMetaEngine {
             &projected.events,
             None,
         )?
-        .and_then(|consumed| Self::selected_local_event_seq(&selected.ranges, consumed - 1))
+        .and_then(|consumed| {
+            consumed
+                .checked_sub(1)
+                .and_then(|index| Self::selected_local_event_seq(&selected.ranges, index))
+        })
         .map(|last_seq| {
             selected
                 .ranges
