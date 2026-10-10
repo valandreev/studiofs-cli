@@ -771,10 +771,7 @@ impl DataStore {
             .read_with(key)
             .range(SFEC_HEADER_FIXED_LEN as u64..header_len as u64)
             .await?;
-        let mut header_bytes = Vec::with_capacity(header_len);
-        header_bytes.extend_from_slice(&fixed);
-        header_bytes.extend_from_slice(&tail.to_bytes());
-        let header_bytes = Bytes::from(header_bytes);
+        let header_bytes = Bytes::from([fixed.as_ref(), tail.to_bytes().as_ref()].concat());
         let header = SfecHeader::parse(header_bytes.clone()).map_err(crypto::CryptoError::from)?;
         let plaintext_len = header.plaintext_len();
         if plaintext_len < ObjectHeader::SIZE as u64

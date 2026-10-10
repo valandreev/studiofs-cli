@@ -270,15 +270,10 @@ impl<'a> DataReader<'a> {
         if !self.allow_partial_remote_read {
             Self::fetch_missing_remote_blocks(self.vfs, &segments).await?;
         }
-        let written = Self::assemble_into(
-            self.vfs,
-            self.offset,
-            &segments,
-            buffer,
-            self.allow_partial_remote_read,
-        )
-        .await?
-        .max(writer_stack_written);
+        let written = self
+            .assemble_into(&segments, buffer)
+            .await?
+            .max(writer_stack_written);
         Ok(written)
     }
 
@@ -889,13 +884,9 @@ impl<'a> DataReader<'a> {
         }
     }
 
-    async fn assemble_into(
-        vfs: &StudioVfs,
-        offset: u64,
-        segments: &[ReadSegment],
-        buffer: &mut [u8],
-        allow_partial_remote_read: bool,
-    ) -> VfsResult<usize> {
+    async fn assemble_into(&self, segments: &[ReadSegment], buffer: &mut [u8]) -> VfsResult<usize> {
+        let vfs = self.vfs;
+        let offset = self.offset;
         let mut written = 0usize;
         let mut index = 0usize;
         let prefetched_runs =
@@ -980,12 +971,10 @@ impl<'a> DataReader<'a> {
                     // unresolved runs take the serial path with all its fallbacks.
                     if prefetched_runs.binary_search(&index).is_err() {
                         let dst = &mut buffer[dst_start..run_dst_end];
-                        Self::assemble_committed_payload_into(
-                            vfs,
+                        self.assemble_committed_payload_into(
                             &run_payload,
                             segment.range.start(),
                             dst,
-                            allow_partial_remote_read,
                         )
                         .await?;
                     }
@@ -1274,12 +1263,12 @@ impl<'a> DataReader<'a> {
     }
 
     async fn assemble_committed_payload_into(
-        vfs: &StudioVfs,
+        &self,
         payload: &PayloadRef,
         file_offset: u64,
         dst: &mut [u8],
-        allow_partial_remote_read: bool,
     ) -> VfsResult<()> {
+        let vfs = self.vfs;
         let block_offset = usize::try_from(payload.offset).map_err(|_| {
             VfsError::Other(format!(
                 "block offset does not fit usize: object_id={}, offset={}",
@@ -1320,7 +1309,7 @@ impl<'a> DataReader<'a> {
         }
 
         if !span_resolved {
-            if allow_partial_remote_read {
+            if self.allow_partial_remote_read {
                 match vfs
                     .fetch_payload_range_for_ref_after_local_miss(payload, dst.len())
                     .await
@@ -3078,7 +3067,8 @@ mod tests {
             };
             let mut out = vec![0; data.len()];
 
-            DataReader::assemble_committed_payload_into(&vfs, &payload, 0, &mut out, false)
+            DataReader::new(&vfs, ROOT_INO, 0, out.len() as u64, None, None)
+                .assemble_committed_payload_into(&payload, 0, &mut out)
                 .await
                 .expect("committed read should resolve the staged payload");
 
@@ -3168,8 +3158,10 @@ mod tests {
                 },
             };
             let mut out = vec![0; data.len()];
+            let reader = DataReader::new(&vfs, ROOT_INO, 0, out.len() as u64, None, None);
 
-            DataReader::assemble_into(&vfs, 0, &[segment], &mut out, false)
+            reader
+                .assemble_into(&[segment], &mut out)
                 .await
                 .expect("pending extent read should resolve the staged payload");
 
@@ -3206,8 +3198,10 @@ mod tests {
                 },
             };
             let mut out = vec![0; data.len()];
+            let reader = DataReader::new(&vfs, ROOT_INO, 0, out.len() as u64, None, None);
 
-            DataReader::assemble_into(&vfs, 0, &[segment], &mut out, false)
+            reader
+                .assemble_into(&[segment], &mut out)
                 .await
                 .expect("pending extent read should recover from staged payload");
 
@@ -4755,7 +4749,8 @@ mod tests {
             }];
             let mut buffer = [0_u8; 4];
             counting_backend.reset_counters();
-            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer, false)
+            let written = DataReader::new(&vfs, ROOT_INO, 0, buffer.len() as u64, None, None)
+                .assemble_into(&segments, &mut buffer)
                 .await
                 .expect("assemble data reader output");
             assert_eq!(written, 4);
@@ -4805,7 +4800,8 @@ mod tests {
             ];
             let mut buffer = [0_u8; 5];
             counting_backend.reset_counters();
-            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer, false)
+            let written = DataReader::new(&vfs, ROOT_INO, 0, buffer.len() as u64, None, None)
+                .assemble_into(&segments, &mut buffer)
                 .await
                 .expect("assemble data reader output");
 
@@ -4875,7 +4871,8 @@ mod tests {
                 .collect();
             let mut buffer = vec![0_u8; OBJECT_LEN * 3];
             counting_backend.reset_counters();
-            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer, false)
+            let written = DataReader::new(&vfs, ROOT_INO, 0, buffer.len() as u64, None, None)
+                .assemble_into(&segments, &mut buffer)
                 .await
                 .expect("assemble data reader output");
 

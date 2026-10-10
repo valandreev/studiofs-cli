@@ -213,6 +213,7 @@ impl ObjectCipher {
             envelope.header_bytes(),
             context,
             header,
+            0..header.frame_count(),
             workers,
         )
     }
@@ -250,7 +251,7 @@ impl ObjectCipher {
             .map_err(|_| CryptoError::FrameLayoutOverflow)?;
         let frame_end = u32::try_from((range.end - 1) / u64::from(header.frame_size()) + 1)
             .map_err(|_| CryptoError::FrameLayoutOverflow)?;
-        let plaintext = decrypt_range_frames(
+        let plaintext = decrypt_frames(
             ciphertext,
             &dek,
             &data_nonce_prefix,
@@ -258,6 +259,7 @@ impl ObjectCipher {
             context,
             &header,
             first_frame..frame_end,
+            1,
         )?;
         let requested_start =
             usize::try_from(range.start - u64::from(first_frame) * u64::from(header.frame_size()))
@@ -365,6 +367,10 @@ fn encrypt_frames(
     Ok(output)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Frame selection and worker admission are independent of the authenticated object context"
+)]
 fn decrypt_frames(
     mut ciphertext: Buffer,
     dek: &[u8; KEY_LEN],
@@ -372,17 +378,28 @@ fn decrypt_frames(
     header_bytes: &[u8],
     context: ObjectEncryptionContext<'_>,
     header: &SfecHeader,
+    frames: std::ops::Range<u32>,
     workers: usize,
 ) -> Result<Bytes, CryptoError> {
+    let first_frame = frames.start;
+    if first_frame > frames.end || frames.end > header.frame_count() {
+        return Err(CryptoError::FrameLayoutOverflow);
+    }
     let cipher = XChaCha20Poly1305::new(Key::from_slice(dek));
-    let plaintext_len =
-        usize::try_from(header.plaintext_len()).map_err(|_| CryptoError::FrameLayoutOverflow)?;
+    let frame_count = (frames.end - first_frame) as usize;
+    let tag_bytes = frame_count
+        .checked_mul(SfecAlgorithm::XChaCha20Poly1305V1.tag_len())
+        .ok_or(CryptoError::FrameLayoutOverflow)?;
+    let plaintext_len = ciphertext
+        .len()
+        .checked_sub(tag_bytes)
+        .ok_or(CryptoError::FrameLayoutOverflow)?;
     let mut plaintext = Vec::with_capacity(plaintext_len);
-    let mut tags = Vec::with_capacity(header.frame_count() as usize);
+    let mut tags = Vec::with_capacity(frame_count);
 
     // Validate the layout and gather bodies and tags sequentially; both may
     // straddle Buffer chunks.
-    for frame_index in 0..header.frame_count() {
+    for frame_index in frames {
         let frame_len = header
             .encrypted_frame_len(frame_index)
             .ok_or(CryptoError::FrameLayoutOverflow)?;
@@ -406,74 +423,8 @@ fn decrypt_frames(
     let tags = tags.as_slice();
     for_each_frame(
         &mut plaintext,
-        DEFAULT_ENCRYPTION_FRAME_SIZE,
+        usize::try_from(header.frame_size()).map_err(|_| CryptoError::FrameLayoutOverflow)?,
         workers,
-        &aad_base,
-        |frame_index, aad, frame| {
-            let nonce = data_nonce(data_nonce_prefix, frame_index);
-            let tag = tags
-                .get(frame_index as usize)
-                .ok_or(CryptoError::FrameLayoutOverflow)?;
-            cipher
-                .decrypt_in_place_detached(XNonce::from_slice(&nonce), aad, frame, tag)
-                .map_err(|_| CryptoError::AuthenticationFailed)
-        },
-    )?;
-
-    Ok(Bytes::from(plaintext))
-}
-
-fn decrypt_range_frames(
-    mut ciphertext: Buffer,
-    dek: &[u8; KEY_LEN],
-    data_nonce_prefix: &[u8; DATA_NONCE_PREFIX_LEN],
-    header_bytes: &[u8],
-    context: ObjectEncryptionContext<'_>,
-    header: &SfecHeader,
-    frames: std::ops::Range<u32>,
-) -> Result<Bytes, CryptoError> {
-    let first_frame = frames.start;
-    let frame_end = frames.end;
-    if first_frame >= frame_end || frame_end > header.frame_count() {
-        return Err(CryptoError::FrameLayoutOverflow);
-    }
-    let frame_count = frame_end - first_frame;
-
-    let frame_size =
-        usize::try_from(header.frame_size()).map_err(|_| CryptoError::FrameLayoutOverflow)?;
-    let expected_ciphertext_len = ciphertext.len();
-    let mut plaintext = Vec::with_capacity(ciphertext.len());
-    let mut tags = Vec::with_capacity(frame_count as usize);
-    let mut offset = 0usize;
-    for frame_index in first_frame..frame_end {
-        let frame_len = header
-            .encrypted_frame_len(frame_index)
-            .ok_or(CryptoError::FrameLayoutOverflow)?;
-        let frame_end_offset = offset
-            .checked_add(frame_len)
-            .ok_or(CryptoError::FrameLayoutOverflow)?;
-        let body_len = frame_len
-            .checked_sub(SfecAlgorithm::XChaCha20Poly1305V1.tag_len())
-            .ok_or(CryptoError::FrameLayoutOverflow)?;
-        if frame_len > ciphertext.remaining() {
-            return Err(CryptoError::FrameLayoutOverflow);
-        }
-        plaintext.put(Buf::take(&mut ciphertext, body_len));
-        let mut tag = Tag::default();
-        ciphertext.copy_to_slice(&mut tag);
-        tags.push(tag);
-        offset = frame_end_offset;
-    }
-    if offset != expected_ciphertext_len || ciphertext.has_remaining() {
-        return Err(CryptoError::FrameLayoutOverflow);
-    }
-
-    let aad_base = frame_aad_base(header.key_id(), context, header_bytes)?;
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(dek));
-    for_each_frame(
-        &mut plaintext,
-        frame_size,
-        1,
         &aad_base,
         |local_index, aad, frame| {
             let frame_index = first_frame
@@ -489,6 +440,7 @@ fn decrypt_range_frames(
                 .map_err(|_| CryptoError::AuthenticationFailed)
         },
     )?;
+
     Ok(Bytes::from(plaintext))
 }
 

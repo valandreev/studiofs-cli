@@ -474,12 +474,18 @@ impl FetchScheduler {
                 reason: "partial payload range is empty or exceeds the limit".to_string(),
             });
         }
-        if let Some(payload) = self.payload_store_get_async(object_id).await? {
+        let cached_range = async || -> Result<Option<Bytes>, FetchError> {
+            let Some(payload) = self.payload_store_get_async(object_id).await? else {
+                return Ok(None);
+            };
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .cache_hit_bytes
                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
-            return Ok(slice_payload_range(payload, &range));
+            Ok(Some(slice_payload_range(payload, &range)))
+        };
+        if let Some(payload) = cached_range().await? {
+            return Ok(payload);
         }
 
         // A partial read may reuse a complete fetch already in flight, but never
@@ -498,12 +504,8 @@ impl FetchScheduler {
         }
 
         // A full fetch may have populated cache while this partial read waited.
-        if joined_full_fetch && let Some(payload) = self.payload_store_get_async(object_id).await? {
-            self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-            self.metrics
-                .cache_hit_bytes
-                .fetch_add(payload.len() as u64, Ordering::Relaxed);
-            return Ok(slice_payload_range(payload, &range));
+        if joined_full_fetch && let Some(payload) = cached_range().await? {
+            return Ok(payload);
         }
 
         let budget_bytes = fetch_transit_budget_bytes(keys.len());
