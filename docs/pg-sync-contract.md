@@ -228,6 +228,13 @@ is at-least-once for event-log publication, not exactly-once row insertion.
 When a self-ack advances the cursor to a locally completed range, the cursor
 must continue through adjacent completed ranges before pending replay is
 restored, stopping at any rejected range.
+For a projected publication split across transport batches, the producer also
+records the matched unsplit local prefix and the last committed batch version.
+Replay retires that prefix only after applying through the last batch, writing
+the journal cursor in the same local transaction as the replay position. A
+local-only suffix remains replayable, and a failed local commit retains the
+pending acknowledgment. These markers are in-memory; restart before complete
+catch-up retains the existing at-least-once recovery behavior.
 Journal-derived overlay conflicts include unprocessed and rejected local
 events; published and completed ranges no longer reserve their old keys.
 Rejected ranges remain local authority until replay can resume past the gap.

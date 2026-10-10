@@ -201,6 +201,7 @@ use std::cell::Cell;
 #[cfg(test)]
 thread_local! {
     static REGULAR_FILE_SERVING_RECONCILE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static PENDING_LOCAL_ALIAS_EVENT_SCAN_COUNT: Cell<usize> = const { Cell::new(0) };
 }
 
 impl RedbMetaEngine {
@@ -549,6 +550,16 @@ impl RedbMetaEngine {
     #[cfg(test)]
     pub(crate) fn regular_file_serving_reconcile_call_count_for_test() -> usize {
         REGULAR_FILE_SERVING_RECONCILE_CALLS.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_pending_local_alias_event_scan_count_for_test() {
+        PENDING_LOCAL_ALIAS_EVENT_SCAN_COUNT.set(0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_local_alias_event_scan_count_for_test() -> usize {
+        PENDING_LOCAL_ALIAS_EVENT_SCAN_COUNT.get()
     }
 
     fn remove_dentry_mirrors_for_inode_in_txn(
@@ -2323,15 +2334,18 @@ impl RedbMetaEngine {
     ) -> MetaResult<()> {
         let keys =
             Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, entry.ino)?;
-        let protected = Self::pending_local_alias_dentry_keys_for_inode_in_txn(txn, entry)?;
         let current = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let base = txn
             .open_table(BASE_DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut stale = Vec::new();
+        let mut candidates = Vec::new();
         for key in keys {
+            if protected_dentry_keys.contains(&key) {
+                continue;
+            }
+
             let (parent, name) = decode_dentry_key(&key)?;
             let current_matches = Self::lookup_in_opened_dentry_table(&current, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
@@ -2343,15 +2357,24 @@ impl RedbMetaEngine {
             let base_matches = Self::lookup_in_opened_dentry_table(&base, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
-            if !base_matches && !protected.contains(&key) && !protected_dentry_keys.contains(&key) {
-                stale.push((parent, name.to_vec()));
+            if !base_matches {
+                candidates.push(key);
             }
         }
         drop(base);
         drop(current);
 
-        for (parent, name) in stale {
-            Self::remove_dentry_mirror_in_txn(txn, parent, &name)?;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        let protected = Self::pending_local_alias_dentry_keys_for_inode_in_txn(txn, entry)?;
+        for key in candidates {
+            if protected.contains(&key) {
+                continue;
+            }
+            let (parent, name) = decode_dentry_key(&key)?;
+            Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
         }
         Ok(())
     }
@@ -2405,6 +2428,9 @@ impl RedbMetaEngine {
             .range(start_seq..end_seq)
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
+            #[cfg(test)]
+            PENDING_LOCAL_ALIAS_EVENT_SCAN_COUNT
+                .set(PENDING_LOCAL_ALIAS_EVENT_SCAN_COUNT.get().saturating_add(1));
             let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             match crate::events::decode_event(bytes.value())? {
                 crate::events::MetaEvent::AddEntry {

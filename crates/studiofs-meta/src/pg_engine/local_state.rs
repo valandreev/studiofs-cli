@@ -212,9 +212,18 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn mark_local_event_ranges_published(
         &self,
         ranges: &[LocalEventRange],
+    ) -> MetaResult<()> {
+        self.mark_local_event_ranges_published_with_prefix(ranges, None)
+    }
+
+    pub(super) fn mark_local_event_ranges_published_with_prefix(
+        &self,
+        ranges: &[LocalEventRange],
+        prefix: Option<(i64, Vec<LocalEventRange>)>,
     ) -> MetaResult<()> {
         if ranges.is_empty() {
             return Ok(());
@@ -235,6 +244,9 @@ impl PgMetaEngine {
             }
         }
         merge_local_event_ranges(&mut progress.published);
+        if let Some(prefix) = prefix {
+            progress.published_prefixes.push(prefix);
+        }
         Ok(())
     }
 
@@ -290,26 +302,49 @@ impl PgMetaEngine {
     pub(super) fn flushed_event_seq_after_completed_ranges_locked(
         &self,
         cursor: u64,
+        applied_version: i64,
     ) -> MetaResult<u64> {
         let progress = self
             .local_event_progress
             .lock()
             .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
+        let mut completed = progress.completed.clone();
+        for (version, ranges) in &progress.published_prefixes {
+            if *version <= applied_version {
+                completed.extend_from_slice(ranges);
+            }
+        }
+        merge_local_event_ranges(&mut completed);
         Ok(flushed_event_seq_after_completed_ranges(
             cursor,
-            &progress.completed,
+            &completed,
             &progress.rejected,
         ))
     }
 
     /// Trim acknowledged ranges while the caller holds `local_position_lock`
     /// and `pending_state`.
-    pub(super) fn trim_local_event_progress_before_locked(&self, cursor: u64) -> MetaResult<()> {
+    pub(super) fn trim_local_event_progress_before_locked(
+        &self,
+        cursor: u64,
+        applied_version: i64,
+    ) -> MetaResult<()> {
         let mut progress = self
             .local_event_progress
             .lock()
             .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
         let cursor = cursor.max(self.flushed_event_seq.load(Ordering::SeqCst));
+        let mut prefixes = std::mem::take(&mut progress.published_prefixes);
+        prefixes.retain(|(version, ranges)| {
+            if *version <= applied_version {
+                progress.completed.extend_from_slice(ranges);
+                false
+            } else {
+                true
+            }
+        });
+        progress.published_prefixes = prefixes;
+        merge_local_event_ranges(&mut progress.completed);
         trim_local_event_ranges_before(&mut progress.rejected, cursor);
         trim_local_event_ranges_before(&mut progress.completed, cursor);
         trim_local_event_ranges_before(&mut progress.published, cursor);

@@ -25,6 +25,187 @@ fn uploaded_pending_file(pg: &PgMetaEngine, name: &[u8], object_id: u64) -> Inod
 }
 
 #[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn drained_out_of_order_file_publications_reopen_without_metadata_backlog() {
+    let dsn = pg_dsn().expect("PostgreSQL regression requires STUDIOFS_TEST_PG_DSN");
+    let _bytes = set_test_env(PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR, "1024");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-drained-publications-reopen");
+    seed_local(&path, &volume.format_info());
+    let options = PgOpenOptions {
+        background_poll: false,
+        ..Default::default()
+    };
+    let pg = PgMetaEngine::open_with_options(&path, options).expect("open writer");
+    let files = (0..32)
+        .map(|index| {
+            let name = format!("import-{index:03}.bin").into_bytes();
+            let attr = uploaded_pending_file(&pg, &name, 90_000 + index);
+            (name, attr)
+        })
+        .collect::<Vec<_>>();
+    let mut local_tail = None;
+    for (index, (_, attr)) in files.iter().rev().enumerate() {
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(attr.ino, attr.content_epoch)
+                .expect("publish uploaded file")
+        );
+        if index + 1 == files.len() {
+            let tail = pg
+                .create_file(ROOT_INO, b"local-tail.bin", 0, 0, 0o644)
+                .unwrap();
+            set_file_state(&pg, tail.ino, 152, 1);
+            pg.stage_payload_slice(tail.ino, 0, &PayloadRef::new_partial(91_001, 152))
+                .unwrap();
+            local_tail = Some(tail);
+        }
+        if index % 4 == 3 {
+            pg.flush_due_pending().expect("drain publication batch");
+        }
+    }
+    pg.flush_due_pending().expect("finish metadata publication");
+    assert_eq!(pg.replication_backlog().total_ops(), 0, "writer drained");
+    let target = pg
+        .remote_metadata_head_version()
+        .expect("publication target");
+    for _ in 0..128 {
+        if pg.local_version.load(Ordering::SeqCst) >= target {
+            break;
+        }
+        pg.sync_metadata()
+            .expect("apply remaining publication pages");
+    }
+    assert_eq!(
+        pg.local_version.load(Ordering::SeqCst),
+        target,
+        "writer caught up"
+    );
+    pg.prepare_for_close().expect("close writer workers");
+    pg.flush_local_metadata().expect("persist local metadata");
+    drop(pg);
+
+    let reopened = PgMetaEngine::open_with_options(&path, options).expect("reopen writer");
+    assert_eq!(
+        reopened.replication_backlog().total_ops(),
+        0,
+        "a fully drained close must not republish previously uploaded files"
+    );
+    for (name, attr) in files {
+        assert_eq!(reopened.lookup(ROOT_INO, &name).unwrap().ino, attr.ino);
+        let restored = reopened.get_attr(attr.ino).unwrap();
+        assert_eq!(restored.size, 152);
+        assert_eq!(restored.committed_size, 152);
+        assert_eq!(restored.upload_state, UploadState::Ready);
+    }
+    let tail = local_tail.unwrap();
+    assert_eq!(
+        reopened.lookup(ROOT_INO, b"local-tail.bin").unwrap().ino,
+        tail.ino
+    );
+    assert_eq!(reopened.get_attr(tail.ino).unwrap().size, 152);
+    assert!(
+        reopened
+            .local
+            .export_snapshot()
+            .unwrap()
+            .regular_file_overlay
+            .iter()
+            .any(|(ino, _)| *ino == tail.ino)
+    );
+    reopened.prepare_for_close().expect("close reopened writer");
+}
+
+#[test]
+fn split_publication_prefix_ack_waits_for_last_page_and_survives_rollback() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.local
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, start)
+        .unwrap();
+    let attr = uploaded_pending_file(&pg, b"split-publish.bin", 91_000);
+    pg.publish_regular_file_overlay_to_base_if_matches(attr.ino, attr.content_epoch)
+        .unwrap();
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let projected = RemoteApplyCoordinator::project_local_batch(
+        &pg.local.read_events_range(start, end).unwrap(),
+    );
+    let split = projected.events.len() / 2;
+    let prefix = vec![LocalEventRange { start, end }];
+    pg.mark_local_event_ranges_published_with_prefix(&prefix, Some((2, prefix.clone())))
+        .unwrap();
+    let apply = |version, events| {
+        pg.apply_replay_page_atomically(
+            vec![DecodedReplayBatch {
+                batch_version: version,
+                events,
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: pg.local_version.load(Ordering::SeqCst),
+                current_namespace_version: pg.namespace_version.load(Ordering::SeqCst),
+                flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
+                next_event_seq: end,
+                initial_overlay: pg.local_overlay_conflicts().unwrap(),
+            },
+        )
+    };
+    apply(1, projected.events[..split].to_vec()).unwrap();
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local).unwrap(),
+        start
+    );
+    pg.set_catch_up_fault_hook(Arc::new(|point| {
+        if matches!(
+            point,
+            CatchUpFaultPoint::BeforeLocalCommit {
+                last_batch_version: 2
+            }
+        ) {
+            Err(MetaError::Storage(
+                "injected publication page rollback".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }));
+    assert!(apply(2, projected.events[split..].to_vec()).is_err());
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local).unwrap(),
+        start
+    );
+    assert_eq!(
+        PgMetaEngine::load_persisted_local_version(&pg.local).unwrap(),
+        1
+    );
+    assert_eq!(
+        pg.unprocessed_local_event_progress()
+            .unwrap()
+            .published_prefixes
+            .len(),
+        1
+    );
+
+    pg.set_catch_up_fault_hook(Arc::new(|_| Ok(())));
+    apply(2, projected.events[split..].to_vec()).unwrap();
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local).unwrap(),
+        end
+    );
+    assert_eq!(
+        PgMetaEngine::load_persisted_local_version(&pg.local).unwrap(),
+        2
+    );
+    assert!(
+        pg.unprocessed_local_event_progress()
+            .unwrap()
+            .published_prefixes
+            .is_empty()
+    );
+}
+
+#[test]
 fn local_graph_repair_marker_clears_only_after_conflicting_payload_is_published() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let name = b"repair-conflicting-name.bin";
