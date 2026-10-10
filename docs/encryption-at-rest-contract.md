@@ -32,7 +32,7 @@ StudioFS encryption-at-rest is a remote object-store boundary feature:
    objects.
 5. Full remote fetch decrypts the object before passing plaintext bytes to the
    existing object decoder and checksum validator. Cold random foreground reads
-   of at most 256 KiB without a speculative read window
+   of at most 256 KiB within one logical block, without a speculative read window,
    can instead fetch the SFEC header, authenticate the frame containing the
    STFS header, and authenticate only the additional frames covering the payload
    range. Frame offsets include the envelope header and each authentication tag.

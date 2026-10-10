@@ -2226,6 +2226,7 @@ impl StudioVfs {
         // check is allowed to finish.
         let allow_partial_remote_read = access.class == AccessClass::RandomInteractiveRead
             && speculative_read.is_none()
+            && blocks_needed.len() == 1
             && planned_read_len <= crate::fetch::MAX_PARTIAL_FETCH_SIZE;
         let read_len = match speculative_read {
             Some((token, fallback_len)) if !self.read_ahead_token_is_current(token) => {
@@ -2522,6 +2523,46 @@ mod tests {
                     .load(AtomicOrdering::Relaxed)
                     < raw.stat(&key).await.unwrap().content_length(),
                 "the actual VFS read must select frame-bounded remote transfer"
+            );
+
+            let second_object_id = object_id + 1;
+            let second_payload = Bytes::from(vec![0xAB; 4096]);
+            let second_key = format_object_fragment_key(
+                &format!("{}/objects", data_config.volume_name),
+                second_object_id,
+                0,
+            );
+            data_store
+                .put_by_key(
+                    &second_key,
+                    create_object_buffer(second_payload.clone()).unwrap(),
+                )
+                .await
+                .unwrap();
+            attr.size += second_payload.len() as u64;
+            attr.committed_size = attr.size;
+            meta.set_attr(&attr).unwrap();
+            meta.stage_payload_slice(
+                ino,
+                1,
+                &PayloadRef::new_partial(second_object_id, second_payload.len() as u32),
+            )
+            .unwrap();
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+            let across_blocks = vfs
+                .read(ino, u64::from(DEFAULT_BLOCK_SIZE) - 32, 64)
+                .await
+                .unwrap();
+            assert_eq!(&across_blocks[..32], &payload[payload.len() - 32..]);
+            assert_eq!(&across_blocks[32..], &second_payload[..32]);
+            assert_eq!(
+                vfs.cached_store.get(object_id).unwrap().as_ref(),
+                payload.as_slice(),
+                "even a small multi-block request keeps complete fetch and cache population"
+            );
+            assert_eq!(
+                vfs.cached_store.get(second_object_id).unwrap(),
+                second_payload
             );
         });
     }
