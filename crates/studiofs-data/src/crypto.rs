@@ -356,7 +356,7 @@ fn decrypt_frames(
 }
 
 /// Run `seal` over each `stride`-sized frame of `buffer` on up to `workers`
-/// scoped threads, each owning a contiguous run of frames and its own AAD.
+/// scoped threads, each pulling frames from a shared queue with its own AAD.
 ///
 /// The caller must already hold admission for `workers` CPU slots.
 fn for_each_frame<F>(
