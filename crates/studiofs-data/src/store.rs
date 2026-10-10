@@ -1,6 +1,6 @@
 //! DataStore — S3 storage abstraction via OpenDAL.
 
-use crate::crypto::{self, ObjectEncryptionContext, VolumeMasterKey};
+use crate::crypto::{self, ObjectCipher, VolumeMasterKey};
 use crate::snapshot_key::{SnapshotArtifactKey, SnapshotArtifactPrefix};
 use futures::{Stream, StreamExt};
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
@@ -128,8 +128,15 @@ pub struct DataStoreCryptoConfig {
 }
 
 impl DataStoreCryptoConfig {
-    fn to_runtime(&self) -> DataResult<DataStoreCryptoRuntime> {
-        DataStoreCryptoRuntime::try_from(self)
+    fn to_runtime(&self, volume_uuid: &str) -> DataResult<DataStoreCryptoRuntime> {
+        self.encryption.validate()?;
+        Ok(DataStoreCryptoRuntime {
+            cipher: ObjectCipher::new(
+                &VolumeMasterKey::from_bytes(self.encryption.volume_master_key),
+                volume_uuid,
+            )?,
+            key_id: self.encryption.active_key_id,
+        })
     }
 }
 
@@ -155,20 +162,8 @@ impl fmt::Debug for DataStoreCryptoConfig {
 
 #[derive(Clone)]
 struct DataStoreCryptoRuntime {
-    master_key: VolumeMasterKey,
+    cipher: ObjectCipher,
     key_id: u32,
-}
-
-impl TryFrom<&DataStoreCryptoConfig> for DataStoreCryptoRuntime {
-    type Error = DataError;
-
-    fn try_from(config: &DataStoreCryptoConfig) -> Result<Self, Self::Error> {
-        config.encryption.validate()?;
-        Ok(Self {
-            master_key: VolumeMasterKey::from_bytes(config.encryption.volume_master_key),
-            key_id: config.encryption.active_key_id,
-        })
-    }
 }
 
 impl fmt::Debug for DataStoreConfig {
@@ -407,7 +402,11 @@ impl DataStore {
 
     /// Create a DataStore with a specific I/O profile.
     pub fn with_profile(config: &DataStoreConfig, profile: IoProfile) -> DataResult<Self> {
-        Self::with_profile_and_crypto(config, profile, config.crypto.to_runtime()?)
+        Self::with_profile_and_crypto(
+            config,
+            profile,
+            config.crypto.to_runtime(&config.volume_uuid)?,
+        )
     }
 
     fn with_profile_and_crypto(
@@ -553,7 +552,7 @@ impl DataStore {
             op,
             volume_name: config.volume_name.clone(),
             volume_uuid: Arc::from(config.volume_uuid.as_str()),
-            crypto: config.crypto.to_runtime()?,
+            crypto: config.crypto.to_runtime(&config.volume_uuid)?,
             config,
             profile: IoProfile::Default,
         })
@@ -803,38 +802,25 @@ impl DataStore {
         // SFS-351 wires the complete-object crypto boundary; chunked encryption
         // belongs to the follow-up serializer path once the crypto API supports it.
         let key = key.to_string();
-        let volume_uuid = self.volume_uuid.clone();
         let crypto = self.crypto.clone();
         run_crypto_blocking(move || {
             let plaintext = plaintext.to_bytes();
-            crypto::encrypt_object(
-                plaintext.as_ref(),
-                &crypto.master_key,
-                ObjectEncryptionContext {
-                    volume_uuid: &volume_uuid,
-                    storage_key: &key,
-                    key_id: crypto.key_id,
-                },
-            )
-            .map_err(DataError::from)
+            crypto
+                .cipher
+                .encrypt_object(plaintext.as_ref(), &key, crypto.key_id)
+                .map_err(DataError::from)
         })
         .await
     }
 
     async fn decrypt_payload(&self, key: &str, ciphertext: Buffer) -> DataResult<Buffer> {
         let key = key.to_string();
-        let volume_uuid = self.volume_uuid.clone();
         let crypto = self.crypto.clone();
         run_crypto_blocking(move || {
-            let plaintext = crypto::decrypt_object(
-                ciphertext.to_bytes(),
-                &crypto.master_key,
-                ObjectEncryptionContext {
-                    volume_uuid: &volume_uuid,
-                    storage_key: &key,
-                    key_id: crypto.key_id,
-                },
-            )?;
+            let plaintext =
+                crypto
+                    .cipher
+                    .decrypt_object(ciphertext.to_bytes(), &key, crypto.key_id)?;
             Ok(Buffer::from(plaintext))
         })
         .await

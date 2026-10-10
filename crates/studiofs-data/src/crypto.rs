@@ -38,15 +38,22 @@ impl VolumeMasterKey {
     }
 }
 
+/// Per-volume object cipher holding the HKDF-derived wrapping key.
+///
+/// The wrapping key depends only on the master key and volume UUID, so it is
+/// derived once here and zeroized on drop. Build a new cipher if either changes.
+#[derive(Clone)]
+pub struct ObjectCipher {
+    volume_uuid: Box<str>,
+    wrapping_key: Zeroizing<[u8; KEY_LEN]>,
+}
+
 /// Context authenticated into every encrypted object.
 #[derive(Debug, Clone, Copy)]
-pub struct ObjectEncryptionContext<'a> {
-    /// Immutable volume UUID from `FormatInfo.uuid`.
-    pub volume_uuid: &'a str,
-    /// Exact remote object storage key.
-    pub storage_key: &'a str,
-    /// Active wrapping key identifier.
-    pub key_id: u32,
+struct ObjectEncryptionContext<'a> {
+    volume_uuid: &'a str,
+    storage_key: &'a str,
+    key_id: u32,
 }
 
 /// Errors returned by object encryption/decryption.
@@ -113,35 +120,88 @@ impl From<SfecError> for CryptoError {
     }
 }
 
-/// Encrypt one complete STFS object into an SFEC envelope.
-pub fn encrypt_object(
+impl ObjectCipher {
+    /// Derive the wrapping key for one volume.
+    pub fn new(master_key: &VolumeMasterKey, volume_uuid: &str) -> Result<Self, CryptoError> {
+        Ok(Self {
+            volume_uuid: volume_uuid.into(),
+            wrapping_key: derive_wrapping_key(master_key, volume_uuid)?,
+        })
+    }
+
+    /// Encrypt one complete STFS object into an SFEC envelope.
+    pub fn encrypt_object(
+        &self,
+        plaintext: &[u8],
+        storage_key: &str,
+        key_id: u32,
+    ) -> Result<Buffer, CryptoError> {
+        encrypt_object(
+            plaintext,
+            &self.wrapping_key,
+            self.context(storage_key, key_id),
+        )
+    }
+
+    /// Decrypt one complete SFEC envelope back into its STFS object bytes.
+    pub fn decrypt_object(
+        &self,
+        envelope: Bytes,
+        storage_key: &str,
+        key_id: u32,
+    ) -> Result<Bytes, CryptoError> {
+        decrypt_object(
+            envelope,
+            &self.wrapping_key,
+            self.context(storage_key, key_id),
+        )
+    }
+
+    fn context<'a>(&'a self, storage_key: &'a str, key_id: u32) -> ObjectEncryptionContext<'a> {
+        ObjectEncryptionContext {
+            volume_uuid: &self.volume_uuid,
+            storage_key,
+            key_id,
+        }
+    }
+}
+
+fn encrypt_object(
     plaintext: &[u8],
-    master_key: &VolumeMasterKey,
+    wrapping_key: &[u8; KEY_LEN],
     context: ObjectEncryptionContext<'_>,
 ) -> Result<Buffer, CryptoError> {
-    let dek = random_array::<KEY_LEN>();
-    let wrap_nonce = random_array::<XNONCE_LEN>();
-    let data_nonce_prefix = random_array::<DATA_NONCE_PREFIX_LEN>();
-    let wrapping_key = derive_wrapping_key(master_key, context)?;
+    // One OS RNG call yields the DEK, wrap nonce and data nonce prefix.
+    let mut random = Zeroizing::new([0u8; KEY_LEN + XNONCE_LEN + DATA_NONCE_PREFIX_LEN]);
+    OsRng.fill_bytes(random.as_mut());
+    let (dek, rest) = random
+        .split_first_chunk::<KEY_LEN>()
+        .ok_or(CryptoError::FrameLayoutOverflow)?;
+    let (wrap_nonce, data_nonce_prefix) = rest
+        .split_first_chunk::<XNONCE_LEN>()
+        .ok_or(CryptoError::FrameLayoutOverflow)?;
+    let data_nonce_prefix: &[u8; DATA_NONCE_PREFIX_LEN] = data_nonce_prefix
+        .try_into()
+        .map_err(|_| CryptoError::FrameLayoutOverflow)?;
     let plaintext_len =
         u64::try_from(plaintext.len()).map_err(|_| CryptoError::FrameLayoutOverflow)?;
-    let wrap_aad = wrap_aad(context.key_id, context, plaintext_len, &data_nonce_prefix)?;
-    let wrapped_dek = encrypt_with_key(&wrapping_key, &wrap_nonce, &wrap_aad, dek.as_ref())?;
+    let wrap_aad = wrap_aad(context.key_id, context, plaintext_len, data_nonce_prefix)?;
+    let wrapped_dek = encrypt_with_key(wrapping_key, wrap_nonce, &wrap_aad, dek)?;
 
     let header = SfecHeader::new(
         SfecAlgorithm::XChaCha20Poly1305V1,
         context.key_id,
         plaintext_len,
         DEFAULT_ENCRYPTION_FRAME_SIZE,
-        Bytes::copy_from_slice(wrap_nonce.as_ref()),
-        Bytes::copy_from_slice(data_nonce_prefix.as_ref()),
+        Bytes::copy_from_slice(wrap_nonce),
+        Bytes::copy_from_slice(data_nonce_prefix),
         Bytes::from(wrapped_dek),
     )?;
     let header_bytes = header.serialized_header()?;
     let ciphertext = encrypt_frames(
         plaintext,
-        &dek,
-        &data_nonce_prefix,
+        dek,
+        data_nonce_prefix,
         &header_bytes,
         context.key_id,
         context,
@@ -150,10 +210,9 @@ pub fn encrypt_object(
     SfecEnvelope::serialize_buffer(&header, Bytes::from(ciphertext)).map_err(CryptoError::from)
 }
 
-/// Decrypt one complete SFEC envelope back into its STFS object bytes.
-pub fn decrypt_object(
+fn decrypt_object(
     envelope: Bytes,
-    master_key: &VolumeMasterKey,
+    wrapping_key: &[u8; KEY_LEN],
     context: ObjectEncryptionContext<'_>,
 ) -> Result<Bytes, CryptoError> {
     let envelope = SfecEnvelope::parse(envelope)?;
@@ -161,14 +220,13 @@ pub fn decrypt_object(
     let wrap_nonce = fixed_slice::<XNONCE_LEN>("wrap_nonce", header.wrap_nonce())?;
     let data_nonce_prefix =
         fixed_slice::<DATA_NONCE_PREFIX_LEN>("data_nonce_prefix", header.data_nonce_prefix())?;
-    let wrapping_key = derive_wrapping_key(master_key, context)?;
     let wrap_aad = wrap_aad(
         header.key_id(),
         context,
         header.plaintext_len(),
         &data_nonce_prefix,
     )?;
-    let dek = decrypt_with_key(&wrapping_key, &wrap_nonce, &wrap_aad, header.wrapped_dek())?;
+    let dek = decrypt_with_key(wrapping_key, &wrap_nonce, &wrap_aad, header.wrapped_dek())?;
     let dek_bytes: &[u8; KEY_LEN] = dek
         .as_slice()
         .try_into()
@@ -185,17 +243,11 @@ pub fn decrypt_object(
     )
 }
 
-fn random_array<const N: usize>() -> Zeroizing<[u8; N]> {
-    let mut bytes = Zeroizing::new([0u8; N]);
-    OsRng.fill_bytes(bytes.as_mut());
-    bytes
-}
-
 fn derive_wrapping_key(
     master_key: &VolumeMasterKey,
-    context: ObjectEncryptionContext<'_>,
+    volume_uuid: &str,
 ) -> Result<Zeroizing<[u8; KEY_LEN]>, CryptoError> {
-    let hkdf = Hkdf::<Sha256>::new(Some(context.volume_uuid.as_bytes()), master_key.as_bytes());
+    let hkdf = Hkdf::<Sha256>::new(Some(volume_uuid.as_bytes()), master_key.as_bytes());
     let mut output = Zeroizing::new([0u8; KEY_LEN]);
     hkdf.expand(
         b"studiofs sfec v1 xchacha20poly1305 object wrapping key",
@@ -427,6 +479,60 @@ mod tests {
         encrypt_object(plaintext, master_key, context)
             .unwrap()
             .to_bytes()
+    }
+
+    fn encrypt_object(
+        plaintext: &[u8],
+        master_key: &VolumeMasterKey,
+        context: ObjectEncryptionContext<'_>,
+    ) -> Result<Buffer, CryptoError> {
+        ObjectCipher::new(master_key, context.volume_uuid)?.encrypt_object(
+            plaintext,
+            context.storage_key,
+            context.key_id,
+        )
+    }
+
+    fn decrypt_object(
+        envelope: Bytes,
+        master_key: &VolumeMasterKey,
+        context: ObjectEncryptionContext<'_>,
+    ) -> Result<Bytes, CryptoError> {
+        ObjectCipher::new(master_key, context.volume_uuid)?.decrypt_object(
+            envelope,
+            context.storage_key,
+            context.key_id,
+        )
+    }
+
+    #[test]
+    fn decrypts_envelope_produced_before_wrapping_key_caching() {
+        // Generated by the per-object HKDF implementation (pre SFS-786).
+        const HISTORICAL: &str = "534645430100800000000100000007000000170000000000000000001000010000001800100030000858a4106e6436ea7fde8ec4ef8eb14a76bb3f5bd407e68d38fbb26c32400a31898510efb228dc4fd52b108b812935a8e34d4f974c2b96c6d7671d1f3725261090c0ad8853bbcf7ef900897366fb79aa5e23ee2610c603a6e6a6490191e4357efd25836cd3c810b403c24b69d4cdd4f8fd2029ff4c48e7001b8f96ce887bb6";
+        let envelope: Vec<u8> = (0..HISTORICAL.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&HISTORICAL[i..i + 2], 16).unwrap())
+            .collect();
+        let ctx = context("vol/objects/0000/0000000000000001/0");
+
+        let plaintext = decrypt_object(Bytes::from(envelope), &MASTER_KEY, ctx).unwrap();
+
+        assert_eq!(plaintext.as_ref(), b"historical sfec payload");
+    }
+
+    #[test]
+    fn one_cipher_gives_each_object_fresh_random_material() {
+        let cipher = ObjectCipher::new(&MASTER_KEY, context("k").volume_uuid).unwrap();
+        let parse = |bytes: Bytes| SfecEnvelope::parse(bytes).unwrap();
+        let first = parse(cipher.encrypt_object(b"x", "k", 7).unwrap().to_bytes());
+        let second = parse(cipher.encrypt_object(b"x", "k", 7).unwrap().to_bytes());
+
+        assert_ne!(first.header().wrap_nonce(), second.header().wrap_nonce());
+        assert_ne!(
+            first.header().data_nonce_prefix(),
+            second.header().data_nonce_prefix()
+        );
+        assert_ne!(first.header().wrapped_dek(), second.header().wrapped_dek());
     }
 
     fn roundtrip_payload(size: usize) {
