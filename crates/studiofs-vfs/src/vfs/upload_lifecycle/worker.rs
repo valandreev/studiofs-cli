@@ -1782,11 +1782,15 @@ impl VfsRemoteUploadPort {
                 Bytes::new()
             };
             let payload = create_object_buffer(fragment_payload)?;
-            let expected_bytes = payload.clone().to_bytes();
+            // Hash the object chunks in place; the ledger digest stays the SHA-256 of the exact uploaded bytes.
+            let mut hasher = Sha256::new();
+            for chunk in payload.clone() {
+                hasher.update(&chunk);
+            }
             fragments.push(BuiltFragment {
+                expected_byte_length: payload.len() as u64,
+                expected_sha256: hasher.finalize().into(),
                 payload,
-                expected_byte_length: expected_bytes.len() as u64,
-                expected_sha256: Sha256::digest(&expected_bytes).into(),
             });
         }
         Ok(fragments)
@@ -2579,6 +2583,21 @@ mod tests {
         assert_eq!(fragments[0].expected_byte_length, bytes.len() as u64);
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
         assert_eq!(fragments[0].expected_sha256, digest);
+    }
+
+    #[test]
+    fn built_fragments_ledger_matches_materialized_bytes_across_chunk_boundaries() {
+        for size in [0, 1024 * 1024 + 128, CLOUD_FRAGMENT_SIZE + 1] {
+            let raw = Bytes::from((0..size).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+            for fragment in VfsRemoteUploadPort::build_fragments(raw).expect("build fragments") {
+                let bytes = fragment.payload.to_bytes();
+                assert_eq!(fragment.expected_byte_length, bytes.len() as u64);
+                assert_eq!(
+                    fragment.expected_sha256,
+                    <[u8; 32]>::from(Sha256::digest(&bytes))
+                );
+            }
+        }
     }
 
     #[test]
