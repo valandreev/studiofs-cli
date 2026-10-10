@@ -131,10 +131,10 @@ impl DataStoreCryptoConfig {
     fn to_runtime(&self, volume_uuid: &str) -> DataResult<DataStoreCryptoRuntime> {
         self.encryption.validate()?;
         Ok(DataStoreCryptoRuntime {
-            cipher: ObjectCipher::new(
+            cipher: Arc::new(ObjectCipher::new(
                 &VolumeMasterKey::from_bytes(self.encryption.volume_master_key),
                 volume_uuid,
-            )?,
+            )?),
             key_id: self.encryption.active_key_id,
         })
     }
@@ -162,7 +162,7 @@ impl fmt::Debug for DataStoreCryptoConfig {
 
 #[derive(Clone)]
 struct DataStoreCryptoRuntime {
-    cipher: ObjectCipher,
+    cipher: Arc<ObjectCipher>,
     key_id: u32,
 }
 
@@ -817,10 +817,7 @@ impl DataStore {
         let key = key.to_string();
         let crypto = self.crypto.clone();
         run_crypto_blocking(move || {
-            let plaintext =
-                crypto
-                    .cipher
-                    .decrypt_object(ciphertext.to_bytes(), &key, crypto.key_id)?;
+            let plaintext = crypto.cipher.decrypt_object(ciphertext.to_bytes(), &key)?;
             Ok(Buffer::from(plaintext))
         })
         .await
