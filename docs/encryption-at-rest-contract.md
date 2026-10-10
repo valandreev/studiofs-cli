@@ -53,6 +53,23 @@ Prefetch and larger foreground reads keep complete fetch and cache population.
 The range reader always authenticates frame zero, so a middle read can require
 two frames even when the requested bytes fit in one frame.
 
+Partial reads trade remote request count for transfer volume: the successful
+range path reads the fixed SFEC prefix, its variable header tail, and the frames
+containing the STFS header, then reads additional target frames when needed.
+That is three or four sequential OpenDAL reads, so fewer transferred bytes do
+not establish lower latency. The exact header reads avoid requesting past EOF
+for short objects; a known upper size bound does not make a larger probe safe.
+
+Fetch metrics retain their existing names: `s3_get_calls` counts completed
+logical DataStore read/decrypt attempts, including errors and timeouts, while
+`s3_fetches` counts successful DataStore read attempts. `s3_get_total_ns` and
+`s3_get_max_ns` measure the whole logical attempt, including decryption and all
+range reads for a partial fetch. These counters are not physical HTTP GET
+counts or per-GET latency; provider retries can add further HTTP requests.
+`encrypted_bytes_read` records actual encrypted bytes returned by successful
+logical reads, while `bytes_downloaded` records their returned plaintext bytes
+before complete-read STFS decoding.
+
 ## Plaintext And Ciphertext Boundaries
 
 Plaintext remains inside trusted local runtime boundaries:

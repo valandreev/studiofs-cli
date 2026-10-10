@@ -4,8 +4,8 @@
 //! retry loop with a clean, self-contained component that:
 //!
 //! 1. Uses an [`AimdController`] for elastic concurrency (TCP-cwnd–like).
-//! 2. Coalesces concurrent requests for the same block via singleflight (DashMap +
-//!    tokio broadcast), so only one S3 GET is issued per block.
+//! 2. Coalesces concurrent complete requests for the same block via singleflight
+//!    (DashMap + tokio broadcast), so only one complete fetch runs per block.
 //! 3. Applies its own retry with exponential backoff per fetch, independent of
 //!    OpenDAL's internal `RetryLayer`.
 //! 4. Routes local cache get/put through Tokio's blocking pool so file-backed
@@ -107,7 +107,7 @@ pub struct FetchMetrics {
     pub cache_hits: AtomicU64,
     /// Bytes served from the local payload-cache fast path.
     pub cache_hit_bytes: AtomicU64,
-    /// Number of S3 fetch attempts (including retries that progressed to fetch stage).
+    /// Number of successful logical DataStore fragment-read attempts.
     pub s3_fetches: AtomicU64,
     /// Number of fetch errors reported by S3.
     pub s3_errors: AtomicU64,
@@ -137,11 +137,12 @@ pub struct FetchMetrics {
     pub local_cache_io_backend_total_ns: AtomicU64,
     /// Peak local cache backend I/O latency in nanoseconds.
     pub local_cache_io_backend_max_ns: AtomicU64,
-    /// Count of S3 GET requests.
+    /// Completed logical DataStore read attempts, including errors and timeouts.
+    /// A partial read can issue several HTTP GETs within one attempt.
     pub s3_get_calls: AtomicU64,
-    /// Total S3 GET latency in nanoseconds.
+    /// Total logical read/decrypt attempt latency in nanoseconds.
     pub s3_get_total_ns: AtomicU64,
-    /// Peak S3 GET latency in nanoseconds.
+    /// Peak logical read/decrypt attempt latency in nanoseconds, not per-HTTP-GET.
     pub s3_get_max_ns: AtomicU64,
     /// Count of object decode calls.
     pub object_decode_calls: AtomicU64,
@@ -417,9 +418,9 @@ impl FetchScheduler {
 
     /// Fetch a block, returning validated raw payload data.
     ///
-    /// This is the **single entry-point** for all remote reads.  It handles:
+    /// Entry point for complete-object reads. It handles:
     /// 1. L1/L2 cache check (fast path).
-    /// 2. Singleflight dedup (only one S3 GET per `object_id`).
+    /// 2. Singleflight dedup (only one complete fetch per `object_id`).
     /// 3. AIMD-governed concurrency for the actual HTTP request.
     /// 4. Retry with exponential backoff on transient errors.
     /// 5. Cache population on success.
@@ -987,7 +988,7 @@ impl FetchScheduler {
         result.map_err(|error| FetchError::CacheAccess(error.to_string()))
     }
 
-    /// Perform S3 GET for one fragment with retries + AIMD.
+    /// Read/decrypt one fragment or payload range with retries + AIMD.
     async fn fetch_fragment_with_retry(
         &self,
         object_id: u64,
@@ -1088,7 +1089,7 @@ impl FetchScheduler {
                         req_ms,
                         total_ms = duration_to_millis_u64(overall_start.elapsed()),
                         attempt,
-                        "S3 GET ok"
+                        "remote fragment read ok"
                     );
 
                     let payload = if payload_range.is_some() {
