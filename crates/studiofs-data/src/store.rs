@@ -8,7 +8,7 @@ use opendal::{Buffer, EntryMode, Operator, services::S3};
 use std::collections::HashSet;
 use std::fmt;
 use std::net::Ipv6Addr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use studiofs_meta::{EncryptionConfig, FormatInfo};
 use thiserror::Error;
@@ -239,13 +239,10 @@ fn invalid_endpoint(message: impl Into<String>) -> DataError {
 
 /// Process-wide admission for object crypto: one permit per CPU thread that
 /// may run SFEC frame work at once, shared by every `DataStore`.
-fn crypto_admission() -> &'static Arc<Semaphore> {
-    static ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    ADMISSION.get_or_init(|| {
-        let cpus = std::thread::available_parallelism().map_or(1, usize::from);
-        Arc::new(Semaphore::new(cpus))
-    })
-}
+static CRYPTO_ADMISSION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    Arc::new(Semaphore::new(cpus))
+});
 
 /// Frame-parallelism hint for an object payload of `len` bytes.
 fn crypto_worker_hint(len: usize) -> usize {
@@ -268,12 +265,13 @@ async fn run_crypto_blocking<T: Send + 'static>(
         .acquire_owned()
         .await
         .expect("crypto admission semaphore is never closed");
-    let extra = (1..max_workers.min(admission.available_permits() + 1))
-        .rev()
-        .find_map(|n| {
-            let n = u32::try_from(n).ok()?;
-            Arc::clone(admission).try_acquire_many_owned(n).ok()
-        });
+    let extra = u32::try_from(
+        admission
+            .available_permits()
+            .min(max_workers.saturating_sub(1)),
+    )
+    .ok()
+    .and_then(|n| Arc::clone(admission).try_acquire_many_owned(n).ok());
     let workers = 1 + extra.as_ref().map_or(0, |permits| permits.num_permits());
     // `spawn_blocking` tasks cannot be aborted once running, so CPU pressure is
     // bounded by admission above rather than by a per-task timeout.
@@ -841,10 +839,10 @@ impl DataStore {
         let key = key.to_string();
         let crypto = self.crypto.clone();
         let max_workers = crypto_worker_hint(plaintext.len());
-        run_crypto_blocking(crypto_admission(), max_workers, move |workers| {
+        run_crypto_blocking(&CRYPTO_ADMISSION, max_workers, move |workers| {
             crypto
                 .cipher
-                .encrypt_object_with_workers(plaintext, &key, crypto.key_id, workers)
+                .encrypt_object(plaintext, &key, crypto.key_id, workers)
                 .map_err(DataError::from)
         })
         .await
@@ -854,10 +852,8 @@ impl DataStore {
         let key = key.to_string();
         let crypto = self.crypto.clone();
         let max_workers = crypto_worker_hint(ciphertext.len());
-        run_crypto_blocking(crypto_admission(), max_workers, move |workers| {
-            let plaintext = crypto
-                .cipher
-                .decrypt_object_with_workers(ciphertext, &key, workers)?;
+        run_crypto_blocking(&CRYPTO_ADMISSION, max_workers, move |workers| {
+            let plaintext = crypto.cipher.decrypt_object(ciphertext, &key, workers)?;
             Ok(Buffer::from(plaintext))
         })
         .await
@@ -1049,7 +1045,7 @@ mod tests {
         let async_worker_thread = thread::current().id();
 
         let crypto_thread =
-            run_crypto_blocking(crypto_admission(), 1, |_| Ok(thread::current().id()))
+            run_crypto_blocking(&CRYPTO_ADMISSION, 1, |_| Ok(thread::current().id()))
                 .await
                 .unwrap();
 

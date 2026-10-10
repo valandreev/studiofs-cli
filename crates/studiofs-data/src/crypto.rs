@@ -131,18 +131,9 @@ impl ObjectCipher {
     ///
     /// `plaintext` may be chunked (e.g. an OpenDAL `Buffer`); frames are
     /// copied straight from its chunks into the ciphertext allocation.
+    /// Independent frames are sealed on up to `workers` threads; the output
+    /// format is identical for any count.
     pub fn encrypt_object(
-        &self,
-        plaintext: impl Buf,
-        storage_key: &str,
-        key_id: u32,
-    ) -> Result<Buffer, CryptoError> {
-        self.encrypt_object_with_workers(plaintext, storage_key, key_id, 1)
-    }
-
-    /// Like [`Self::encrypt_object`], sealing independent frames on up to
-    /// `workers` threads. The output format is identical for any count.
-    pub fn encrypt_object_with_workers(
         &self,
         plaintext: impl Buf,
         storage_key: &str,
@@ -195,18 +186,9 @@ impl ObjectCipher {
     /// Decrypt one complete SFEC envelope back into its STFS object bytes.
     ///
     /// A chunked envelope is decrypted frame by frame across chunk boundaries
-    /// without first concatenating the whole object.
+    /// without first concatenating the whole object, and frames are opened on
+    /// up to `workers` threads.
     pub fn decrypt_object(
-        &self,
-        envelope: impl Into<Buffer>,
-        storage_key: &str,
-    ) -> Result<Bytes, CryptoError> {
-        self.decrypt_object_with_workers(envelope, storage_key, 1)
-    }
-
-    /// Like [`Self::decrypt_object`], opening independent frames on up to
-    /// `workers` threads.
-    pub fn decrypt_object_with_workers(
         &self,
         envelope: impl Into<Buffer>,
         storage_key: &str,
@@ -401,10 +383,11 @@ where
         return run(0, buffer);
     }
     let frames_per_worker = frame_count.div_ceil(workers);
-    let (first, rest) = buffer.split_at_mut(stride * frames_per_worker);
+    let mut groups = buffer.chunks_mut(stride * frames_per_worker);
+    // `workers > 1` implies at least two frames, so a first group exists.
+    let first = groups.next().expect("multi-frame buffer has a first group");
     std::thread::scope(|scope| {
-        let handles: Vec<_> = rest
-            .chunks_mut(stride * frames_per_worker)
+        let handles: Vec<_> = groups
             .enumerate()
             .map(|(group, frames)| {
                 scope.spawn(move || run((group + 1) * frames_per_worker, frames))
@@ -543,7 +526,7 @@ mod tests {
 
     fn encrypt(plaintext: &[u8], storage_key: &str) -> Bytes {
         cipher()
-            .encrypt_object(plaintext, storage_key, KEY_ID)
+            .encrypt_object(plaintext, storage_key, KEY_ID, 1)
             .unwrap()
             .to_bytes()
     }
@@ -558,7 +541,7 @@ mod tests {
             .collect();
         let envelope = Bytes::from(envelope);
         for input in [Buffer::from(envelope.clone()), fragment(&envelope)] {
-            let plaintext = cipher().decrypt_object(input, OBJECT_KEY).unwrap();
+            let plaintext = cipher().decrypt_object(input, OBJECT_KEY, 1).unwrap();
             assert_eq!(plaintext.as_ref(), b"historical sfec payload");
         }
     }
@@ -575,18 +558,18 @@ mod tests {
             let sequential = encrypt(&plaintext, OBJECT_KEY);
             for workers in [2, 3, 4, 8] {
                 let parallel = cipher()
-                    .encrypt_object_with_workers(fragment(&plaintext), OBJECT_KEY, KEY_ID, workers)
+                    .encrypt_object(fragment(&plaintext), OBJECT_KEY, KEY_ID, workers)
                     .unwrap()
                     .to_bytes();
                 assert_eq!(parallel.len(), sequential.len(), "size {size}");
                 // Parallel output decrypts sequentially and vice versa.
                 assert_eq!(
-                    cipher().decrypt_object(parallel, OBJECT_KEY).unwrap(),
+                    cipher().decrypt_object(parallel, OBJECT_KEY, 1).unwrap(),
                     plaintext
                 );
                 assert_eq!(
                     cipher()
-                        .decrypt_object_with_workers(fragment(&sequential), OBJECT_KEY, workers)
+                        .decrypt_object(fragment(&sequential), OBJECT_KEY, workers)
                         .unwrap(),
                     plaintext,
                     "size {size} workers {workers}"
@@ -607,7 +590,7 @@ mod tests {
             let mut mutated = ciphertext.to_vec();
             mutated[header_len + frame * stride + 5] ^= 0x01;
             assert!(matches!(
-                cipher().decrypt_object_with_workers(Bytes::from(mutated), OBJECT_KEY, 4),
+                cipher().decrypt_object(Bytes::from(mutated), OBJECT_KEY, 4),
                 Err(CryptoError::AuthenticationFailed)
             ));
         }
@@ -619,13 +602,13 @@ mod tests {
         let parse = |bytes: Bytes| SfecEnvelope::parse(bytes).unwrap();
         let first = parse(
             cipher
-                .encrypt_object(&b"x"[..], "k", KEY_ID)
+                .encrypt_object(&b"x"[..], "k", KEY_ID, 1)
                 .unwrap()
                 .to_bytes(),
         );
         let second = parse(
             cipher
-                .encrypt_object(&b"x"[..], "k", KEY_ID)
+                .encrypt_object(&b"x"[..], "k", KEY_ID, 1)
                 .unwrap()
                 .to_bytes(),
         );
@@ -644,7 +627,7 @@ mod tests {
         assert!(ciphertext.starts_with(SFEC_MAGIC));
         assert_ne!(ciphertext.as_ref(), plaintext.as_ref());
 
-        let decrypted = cipher().decrypt_object(ciphertext, OBJECT_KEY).unwrap();
+        let decrypted = cipher().decrypt_object(ciphertext, OBJECT_KEY, 1).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -688,19 +671,19 @@ mod tests {
         ] {
             let plaintext = Bytes::from_iter((0..size).map(|idx| (idx % 251) as u8));
             let ciphertext = cipher()
-                .encrypt_object(fragment(&plaintext), OBJECT_KEY, KEY_ID)
+                .encrypt_object(fragment(&plaintext), OBJECT_KEY, KEY_ID, 1)
                 .unwrap()
                 .to_bytes();
             assert_eq!(
                 cipher()
-                    .decrypt_object(ciphertext.clone(), OBJECT_KEY)
+                    .decrypt_object(ciphertext.clone(), OBJECT_KEY, 1)
                     .unwrap(),
                 plaintext
             );
             let fragmented = fragment(&ciphertext);
             assert!(Buffer::count(&fragmented) > 3);
             assert_eq!(
-                cipher().decrypt_object(fragmented, OBJECT_KEY).unwrap(),
+                cipher().decrypt_object(fragmented, OBJECT_KEY, 1).unwrap(),
                 plaintext,
                 "size {size}"
             );
@@ -717,7 +700,7 @@ mod tests {
         for envelope in [truncated, Bytes::from(trailing)] {
             assert!(
                 cipher()
-                    .decrypt_object(fragment(&envelope), OBJECT_KEY)
+                    .decrypt_object(fragment(&envelope), OBJECT_KEY, 1)
                     .is_err()
             );
         }
@@ -737,14 +720,14 @@ mod tests {
         let ciphertext = encrypt(b"bound aad", OBJECT_KEY);
 
         assert!(matches!(
-            cipher().decrypt_object(ciphertext.clone(), "vol/objects/0000/0000000000000004/0"),
+            cipher().decrypt_object(ciphertext.clone(), "vol/objects/0000/0000000000000004/0", 1),
             Err(CryptoError::AuthenticationFailed)
         ));
 
         let wrong_volume =
             ObjectCipher::new(&MASTER_KEY, "8160fc5f-6a18-43c9-a34c-1c4f6e82dce1").unwrap();
         assert!(matches!(
-            wrong_volume.decrypt_object(ciphertext, OBJECT_KEY),
+            wrong_volume.decrypt_object(ciphertext, OBJECT_KEY, 1),
             Err(CryptoError::AuthenticationFailed)
         ));
     }
@@ -752,11 +735,11 @@ mod tests {
     #[test]
     fn decrypt_accepts_historical_key_id_from_envelope() {
         let ciphertext = cipher()
-            .encrypt_object(&b"historical key id"[..], OBJECT_KEY, KEY_ID + 1)
+            .encrypt_object(&b"historical key id"[..], OBJECT_KEY, KEY_ID + 1, 1)
             .unwrap()
             .to_bytes();
 
-        let decrypted = cipher().decrypt_object(ciphertext, OBJECT_KEY).unwrap();
+        let decrypted = cipher().decrypt_object(ciphertext, OBJECT_KEY, 1).unwrap();
 
         assert_eq!(decrypted.as_ref(), b"historical key id");
     }
@@ -768,7 +751,7 @@ mod tests {
             ObjectCipher::new(&VolumeMasterKey::from_bytes([0x24; 32]), UUID).unwrap();
 
         assert!(matches!(
-            wrong_master.decrypt_object(ciphertext, OBJECT_KEY),
+            wrong_master.decrypt_object(ciphertext, OBJECT_KEY, 1),
             Err(CryptoError::AuthenticationFailed)
         ));
     }
@@ -784,7 +767,7 @@ mod tests {
             mutated[offset] ^= 0x55;
             assert!(
                 cipher()
-                    .decrypt_object(Bytes::from(mutated), OBJECT_KEY)
+                    .decrypt_object(Bytes::from(mutated), OBJECT_KEY, 1)
                     .is_err(),
                 "mutation at offset {offset} should be rejected"
             );
@@ -804,7 +787,7 @@ mod tests {
         truncated[frame_count_offset..frame_count_offset + 4].copy_from_slice(&0u32.to_le_bytes());
 
         assert!(matches!(
-            cipher().decrypt_object(Bytes::from(truncated), OBJECT_KEY),
+            cipher().decrypt_object(Bytes::from(truncated), OBJECT_KEY, 1),
             Err(CryptoError::AuthenticationFailed)
         ));
     }
