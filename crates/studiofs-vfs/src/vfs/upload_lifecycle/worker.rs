@@ -2586,6 +2586,21 @@ mod tests {
     }
 
     #[test]
+    fn built_fragments_ledger_matches_materialized_bytes_across_chunk_boundaries() {
+        for size in [0, 1024 * 1024 + 128, CLOUD_FRAGMENT_SIZE + 1] {
+            let raw = Bytes::from((0..size).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+            for fragment in VfsRemoteUploadPort::build_fragments(raw).expect("build fragments") {
+                let bytes = fragment.payload.to_bytes();
+                assert_eq!(fragment.expected_byte_length, bytes.len() as u64);
+                assert_eq!(
+                    fragment.expected_sha256,
+                    <[u8; 32]>::from(Sha256::digest(&bytes))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn upload_completion_drain_guard_resets_draining_on_drop() {
         let draining = AtomicBool::new(true);
         {
