@@ -288,6 +288,30 @@ impl StudioVfs {
             .await
     }
 
+    pub(super) async fn fetch_payload_range_for_ref_after_local_miss(
+        &self,
+        block: &PayloadRef,
+        length: usize,
+    ) -> Result<Option<Bytes>, crate::fetch::FetchError> {
+        if length == 0 || length > crate::fetch::MAX_PARTIAL_FETCH_SIZE {
+            return Ok(None);
+        }
+        let start = u64::from(block.offset);
+        let Some(end) = start.checked_add(length as u64) else {
+            return Ok(None);
+        };
+        let fragment_size = studiofs_data::object::CLOUD_FRAGMENT_SIZE as u64;
+        if start / fragment_size != (end - 1) / fragment_size {
+            return Ok(None);
+        }
+
+        let keys = format_object_fragment_keys(&self.data_prefix, block.object_id);
+        self.fetch_scheduler
+            .fetch_block_range_after_local_miss(block.object_id, &keys, start..end)
+            .await
+            .map(Some)
+    }
+
     /// Copy raw payload bytes into `dst`, zero-filling areas beyond available source data.
     ///
     /// This helper converts block-relative offsets into destination spans while preserving

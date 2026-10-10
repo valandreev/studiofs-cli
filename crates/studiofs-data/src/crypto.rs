@@ -116,7 +116,8 @@ impl From<SfecError> for CryptoError {
             | SfecError::InvalidFrameSize(_)
             | SfecError::TruncatedHeader
             | SfecError::TruncatedCiphertext
-            | SfecError::TrailingMalformedData => Self::MalformedEnvelope(value),
+            | SfecError::TrailingMalformedData
+            | SfecError::InvalidRange => Self::MalformedEnvelope(value),
         }
     }
 }
@@ -203,6 +204,82 @@ impl ObjectCipher {
         };
         let envelope = SfecEnvelope::parse(envelope)?;
         let header = envelope.header();
+        let (dek, data_nonce_prefix) = self.unwrap_dek(header, context)?;
+
+        decrypt_frames(
+            envelope.ciphertext().clone(),
+            &dek,
+            &data_nonce_prefix,
+            envelope.header_bytes(),
+            context,
+            header,
+            0..header.frame_count(),
+            workers,
+        )
+    }
+
+    /// Decrypt a plaintext range from exactly the encrypted frames that cover it.
+    ///
+    /// `ciphertext` must begin at `header.ciphertext_range(range)?.start` and
+    /// contain precisely through that mapped range's exclusive end.
+    pub fn decrypt_range(
+        &self,
+        header_bytes: Bytes,
+        ciphertext: Buffer,
+        storage_key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes, CryptoError> {
+        let context = ObjectEncryptionContext {
+            volume_uuid: &self.volume_uuid,
+            storage_key,
+        };
+        let header = SfecHeader::parse(header_bytes.clone())?;
+        let ciphertext_range = header.ciphertext_range(range.clone())?;
+        let expected_ciphertext_len =
+            usize::try_from(ciphertext_range.end - ciphertext_range.start)
+                .map_err(|_| CryptoError::FrameLayoutOverflow)?;
+        if ciphertext.len() < expected_ciphertext_len {
+            return Err(CryptoError::from(SfecError::TruncatedCiphertext));
+        }
+        if ciphertext.len() > expected_ciphertext_len {
+            return Err(CryptoError::from(SfecError::TrailingMalformedData));
+        }
+
+        let (dek, data_nonce_prefix) = self.unwrap_dek(&header, context)?;
+
+        let first_frame = u32::try_from(range.start / u64::from(header.frame_size()))
+            .map_err(|_| CryptoError::FrameLayoutOverflow)?;
+        let frame_end = u32::try_from((range.end - 1) / u64::from(header.frame_size()) + 1)
+            .map_err(|_| CryptoError::FrameLayoutOverflow)?;
+        let plaintext = decrypt_frames(
+            ciphertext,
+            &dek,
+            &data_nonce_prefix,
+            &header_bytes,
+            context,
+            &header,
+            first_frame..frame_end,
+            1,
+        )?;
+        let requested_start =
+            usize::try_from(range.start - u64::from(first_frame) * u64::from(header.frame_size()))
+                .map_err(|_| CryptoError::FrameLayoutOverflow)?;
+        let requested_len = usize::try_from(range.end - range.start)
+            .map_err(|_| CryptoError::FrameLayoutOverflow)?;
+        let requested_end = requested_start
+            .checked_add(requested_len)
+            .ok_or(CryptoError::FrameLayoutOverflow)?;
+        if requested_end > plaintext.len() {
+            return Err(CryptoError::FrameLayoutOverflow);
+        }
+        Ok(plaintext.slice(requested_start..requested_end))
+    }
+
+    fn unwrap_dek(
+        &self,
+        header: &SfecHeader,
+        context: ObjectEncryptionContext<'_>,
+    ) -> Result<(Zeroizing<[u8; KEY_LEN]>, [u8; DATA_NONCE_PREFIX_LEN]), CryptoError> {
         let wrap_nonce = fixed_slice::<XNONCE_LEN>("wrap_nonce", header.wrap_nonce())?;
         let data_nonce_prefix =
             fixed_slice::<DATA_NONCE_PREFIX_LEN>("data_nonce_prefix", header.data_nonce_prefix())?;
@@ -222,16 +299,9 @@ impl ObjectCipher {
             .as_slice()
             .try_into()
             .map_err(|_| CryptoError::InvalidDataKeyLength(dek.len()))?;
-
-        decrypt_frames(
-            envelope.ciphertext().clone(),
-            dek_bytes,
-            &data_nonce_prefix,
-            envelope.header_bytes(),
-            context,
-            header,
-            workers,
-        )
+        let mut key = Zeroizing::new([0; KEY_LEN]);
+        key.copy_from_slice(dek_bytes);
+        Ok((key, data_nonce_prefix))
     }
 }
 
@@ -283,6 +353,7 @@ fn encrypt_frames(
         DEFAULT_ENCRYPTION_FRAME_SIZE + tag_len,
         workers,
         &aad_base,
+        0,
         |frame_index, aad, frame| {
             let nonce = data_nonce(data_nonce_prefix, frame_index);
             let (body, tag_slot) = frame.split_at_mut(frame.len() - tag_len);
@@ -297,6 +368,10 @@ fn encrypt_frames(
     Ok(output)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Frame selection and worker admission are independent of the authenticated object context"
+)]
 fn decrypt_frames(
     mut ciphertext: Buffer,
     dek: &[u8; KEY_LEN],
@@ -304,17 +379,28 @@ fn decrypt_frames(
     header_bytes: &[u8],
     context: ObjectEncryptionContext<'_>,
     header: &SfecHeader,
+    frames: std::ops::Range<u32>,
     workers: usize,
 ) -> Result<Bytes, CryptoError> {
+    let first_frame = frames.start;
+    if first_frame > frames.end || frames.end > header.frame_count() {
+        return Err(CryptoError::FrameLayoutOverflow);
+    }
     let cipher = XChaCha20Poly1305::new(Key::from_slice(dek));
-    let plaintext_len =
-        usize::try_from(header.plaintext_len()).map_err(|_| CryptoError::FrameLayoutOverflow)?;
+    let frame_count = (frames.end - first_frame) as usize;
+    let tag_bytes = frame_count
+        .checked_mul(SfecAlgorithm::XChaCha20Poly1305V1.tag_len())
+        .ok_or(CryptoError::FrameLayoutOverflow)?;
+    let plaintext_len = ciphertext
+        .len()
+        .checked_sub(tag_bytes)
+        .ok_or(CryptoError::FrameLayoutOverflow)?;
     let mut plaintext = Vec::with_capacity(plaintext_len);
-    let mut tags = Vec::with_capacity(header.frame_count() as usize);
+    let mut tags = Vec::with_capacity(frame_count);
 
     // Validate the layout and gather bodies and tags sequentially; both may
     // straddle Buffer chunks.
-    for frame_index in 0..header.frame_count() {
+    for frame_index in frames {
         let frame_len = header
             .encrypted_frame_len(frame_index)
             .ok_or(CryptoError::FrameLayoutOverflow)?;
@@ -338,13 +424,20 @@ fn decrypt_frames(
     let tags = tags.as_slice();
     for_each_frame(
         &mut plaintext,
-        DEFAULT_ENCRYPTION_FRAME_SIZE,
+        usize::try_from(header.frame_size()).map_err(|_| CryptoError::FrameLayoutOverflow)?,
         workers,
         &aad_base,
+        first_frame,
         |frame_index, aad, frame| {
             let nonce = data_nonce(data_nonce_prefix, frame_index);
+            let tag_index = usize::try_from(
+                frame_index
+                    .checked_sub(first_frame)
+                    .ok_or(CryptoError::FrameLayoutOverflow)?,
+            )
+            .map_err(|_| CryptoError::FrameLayoutOverflow)?;
             let tag = tags
-                .get(frame_index as usize)
+                .get(tag_index)
                 .ok_or(CryptoError::FrameLayoutOverflow)?;
             cipher
                 .decrypt_in_place_detached(XNonce::from_slice(&nonce), aad, frame, tag)
@@ -364,6 +457,7 @@ fn for_each_frame<F>(
     stride: usize,
     workers: usize,
     aad_base: &[u8],
+    base_frame_index: u32,
     seal: F,
 ) -> Result<(), CryptoError>
 where
@@ -382,12 +476,17 @@ where
             let Some((index, frame)) = next else {
                 break;
             };
-            let sealed = u32::try_from(index)
+            let frame_index = u32::try_from(index)
                 .map_err(|_| CryptoError::FrameLayoutOverflow)
-                .and_then(|frame_index| {
-                    set_frame_aad(&mut aad, aad_base.len(), frame_index);
-                    seal(frame_index, &aad, frame)
+                .and_then(|local_index| {
+                    base_frame_index
+                        .checked_add(local_index)
+                        .ok_or(CryptoError::FrameLayoutOverflow)
                 });
+            let sealed = frame_index.and_then(|frame_index| {
+                set_frame_aad(&mut aad, aad_base.len(), frame_index);
+                seal(frame_index, &aad, frame)
+            });
             if let Err(err) = sealed {
                 failed.store(true, Ordering::Relaxed);
                 return Err(err);
@@ -593,19 +692,31 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
 
         let mut buffer = vec![0u8; 64 * 3 + 1];
-        for_each_frame(&mut buffer, 3, 4, b"aad", |frame_index, aad, frame| {
+        for_each_frame(&mut buffer, 3, 4, b"aad", 17, |frame_index, aad, frame| {
             assert_eq!(&aad[3..], &frame_index.to_le_bytes());
             frame.fill(frame.len() as u8 + frame_index as u8);
             Ok(())
         })
         .unwrap();
         for (index, frame) in buffer.chunks(3).enumerate() {
-            assert!(frame.iter().all(|&b| b == frame.len() as u8 + index as u8));
+            assert!(
+                frame
+                    .iter()
+                    .all(|&b| b == frame.len() as u8 + index as u8 + 17)
+            );
         }
+
+        let mut overflow_buffer = [0u8; 2];
+        assert!(matches!(
+            for_each_frame(&mut overflow_buffer, 1, 1, b"aad", u32::MAX, |_, _, _| Ok(
+                ()
+            )),
+            Err(CryptoError::FrameLayoutOverflow)
+        ));
 
         // Every call fails, so each of the 4 threads seals at most one frame.
         let calls = AtomicUsize::new(0);
-        let result = for_each_frame(&mut buffer, 3, 4, b"aad", |_, _, _| {
+        let result = for_each_frame(&mut buffer, 3, 4, b"aad", 0, |_, _, _| {
             calls.fetch_add(1, Ordering::Relaxed);
             Err(CryptoError::AuthenticationFailed)
         });
@@ -787,6 +898,171 @@ mod tests {
 
         assert!(matches!(
             wrong_master.decrypt_object(ciphertext, OBJECT_KEY, 1),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn decrypt_range_opens_first_middle_last_and_cross_frame_ranges() {
+        let plaintext = Bytes::from_iter(
+            (0..2 * DEFAULT_ENCRYPTION_FRAME_SIZE + 37).map(|idx| (idx % 251) as u8),
+        );
+        let envelope_bytes = encrypt(&plaintext, OBJECT_KEY);
+        let envelope = SfecEnvelope::parse(envelope_bytes.clone()).unwrap();
+        let header_bytes = envelope.header_bytes().clone();
+        let header = SfecHeader::parse(header_bytes.clone()).unwrap();
+        let frame_size = DEFAULT_ENCRYPTION_FRAME_SIZE as u64;
+
+        for range in [
+            0..17,
+            frame_size + 101..frame_size + 300,
+            2 * frame_size + 11..2 * frame_size + 37,
+            frame_size - 9..frame_size + 13,
+        ] {
+            let ciphertext_range = header.ciphertext_range(range.clone()).unwrap();
+            let ciphertext = envelope_bytes
+                .slice(ciphertext_range.start as usize..ciphertext_range.end as usize);
+            let decrypted = cipher()
+                .decrypt_range(
+                    header_bytes.clone(),
+                    Buffer::from(ciphertext),
+                    OBJECT_KEY,
+                    range.clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                decrypted,
+                plaintext.slice(range.start as usize..range.end as usize)
+            );
+        }
+    }
+
+    #[test]
+    fn decrypt_range_rejects_bad_ranges_and_inexact_ciphertext() {
+        let envelope_bytes = encrypt(&vec![0xC7; DEFAULT_ENCRYPTION_FRAME_SIZE + 31], OBJECT_KEY);
+        let envelope = SfecEnvelope::parse(envelope_bytes.clone()).unwrap();
+        let header_bytes = envelope.header_bytes().clone();
+        let range = 3..9;
+        let mapped = envelope.header().ciphertext_range(range.clone()).unwrap();
+        let selected = envelope_bytes.slice(mapped.start as usize..mapped.end as usize);
+
+        for invalid in [0..0, std::ops::Range { start: 9, end: 3 }, 0..u64::MAX] {
+            assert!(matches!(
+                cipher().decrypt_range(
+                    header_bytes.clone(),
+                    Buffer::from(selected.clone()),
+                    OBJECT_KEY,
+                    invalid,
+                ),
+                Err(CryptoError::MalformedEnvelope(SfecError::InvalidRange))
+            ));
+        }
+        assert!(matches!(
+            cipher().decrypt_range(
+                header_bytes.clone(),
+                Buffer::from(selected.slice(..selected.len() - 1)),
+                OBJECT_KEY,
+                range.clone(),
+            ),
+            Err(CryptoError::MalformedEnvelope(
+                SfecError::TruncatedCiphertext
+            ))
+        ));
+        let mut with_trailing = selected.to_vec();
+        with_trailing.push(0);
+        assert!(matches!(
+            cipher().decrypt_range(
+                header_bytes,
+                Buffer::from(Bytes::from(with_trailing)),
+                OBJECT_KEY,
+                range,
+            ),
+            Err(CryptoError::MalformedEnvelope(
+                SfecError::TrailingMalformedData
+            ))
+        ));
+    }
+
+    #[test]
+    fn decrypt_range_authenticates_header_frames_and_object_context() {
+        let envelope_bytes = encrypt(&vec![0xA5; DEFAULT_ENCRYPTION_FRAME_SIZE + 19], OBJECT_KEY);
+        let envelope = SfecEnvelope::parse(envelope_bytes.clone()).unwrap();
+        let header_bytes = envelope.header_bytes().clone();
+        let range = DEFAULT_ENCRYPTION_FRAME_SIZE as u64..DEFAULT_ENCRYPTION_FRAME_SIZE as u64 + 19;
+        let mapped = envelope.header().ciphertext_range(range.clone()).unwrap();
+        let selected = envelope_bytes.slice(mapped.start as usize..mapped.end as usize);
+
+        let wrong_storage_key = "vol/objects/0000/0000000000000004/0";
+        assert!(matches!(
+            cipher().decrypt_range(
+                header_bytes.clone(),
+                Buffer::from(selected.clone()),
+                wrong_storage_key,
+                range.clone(),
+            ),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+
+        let wrong_volume =
+            ObjectCipher::new(&MASTER_KEY, "8160fc5f-6a18-43c9-a34c-1c4f6e82dce1").unwrap();
+        assert!(matches!(
+            wrong_volume.decrypt_range(
+                header_bytes.clone(),
+                Buffer::from(selected.clone()),
+                OBJECT_KEY,
+                range.clone(),
+            ),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+
+        let wrong_master =
+            ObjectCipher::new(&VolumeMasterKey::from_bytes([0x24; 32]), UUID).unwrap();
+        assert!(matches!(
+            wrong_master.decrypt_range(
+                header_bytes.clone(),
+                Buffer::from(selected.clone()),
+                OBJECT_KEY,
+                range.clone(),
+            ),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+
+        let mut changed_header = header_bytes.to_vec();
+        changed_header[14] ^= 1; // key_id is included in wrapping and frame authentication.
+        assert!(
+            cipher()
+                .decrypt_range(
+                    Bytes::from(changed_header),
+                    Buffer::from(selected.clone()),
+                    OBJECT_KEY,
+                    range.clone(),
+                )
+                .is_err()
+        );
+
+        let mut swapped_header = header_bytes.to_vec();
+        swapped_header[26..30]
+            .copy_from_slice(&(DEFAULT_ENCRYPTION_FRAME_SIZE as u32 / 2).to_le_bytes());
+        swapped_header[30..34].copy_from_slice(&3u32.to_le_bytes());
+        assert!(matches!(
+            cipher().decrypt_range(
+                Bytes::from(swapped_header),
+                Buffer::from(selected.clone()),
+                OBJECT_KEY,
+                range.clone(),
+            ),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+
+        let mut changed_frame = selected.to_vec();
+        changed_frame[0] ^= 1;
+        assert!(matches!(
+            cipher().decrypt_range(
+                header_bytes,
+                Buffer::from(Bytes::from(changed_frame)),
+                OBJECT_KEY,
+                range,
+            ),
             Err(CryptoError::AuthenticationFailed)
         ));
     }

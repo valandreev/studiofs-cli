@@ -20,7 +20,8 @@ pub const DEFAULT_SFEC_FRAME_SIZE: usize = 1024 * 1024;
 /// XChaCha20-Poly1305 authentication tag length appended to each frame.
 pub const SFEC_FRAME_TAG_LEN: usize = 16;
 
-const SFEC_HEADER_FIXED_LEN: usize = 40;
+/// Number of bytes in the fixed SFEC v1 header prefix.
+pub const SFEC_HEADER_FIXED_LEN: usize = 40;
 const SUPPORTED_SFEC_FLAGS: u16 = 0;
 const XCHACHA20_POLY1305_V1_ID: u16 = 1;
 
@@ -95,6 +96,9 @@ pub enum SfecError {
     /// The envelope contains bytes past the expected encrypted frames.
     #[error("trailing malformed SFEC data")]
     TrailingMalformedData,
+    /// The plaintext range is empty, reversed, or outside the object.
+    #[error("invalid SFEC plaintext range")]
+    InvalidRange,
 }
 
 /// Parsed SFEC v1 header.
@@ -111,7 +115,215 @@ pub struct SfecHeader {
     wrapped_dek: Bytes,
 }
 
+/// Validated SFEC header geometry derived from the fixed 40-byte prefix.
+///
+/// Lets callers map plaintext ranges to ciphertext byte ranges before reading
+/// the variable header tail or any frame. Shares its range math with
+/// [`SfecHeader::ciphertext_range`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfecHeaderLayout {
+    header_len: usize,
+    algorithm: SfecAlgorithm,
+    flags: u16,
+    key_id: u32,
+    plaintext_len: u64,
+    frame_size: u32,
+    frame_count: u32,
+    wrap_nonce_len: usize,
+    data_nonce_prefix_len: usize,
+    wrapped_dek_len: usize,
+}
+
+impl SfecHeaderLayout {
+    /// Validate the fixed 40-byte prefix and return the header geometry it declares.
+    ///
+    /// `prefix` must contain at least the complete fixed header; only its first
+    /// 40 bytes are read.
+    pub fn from_prefix(prefix: &[u8]) -> Result<Self, SfecError> {
+        if prefix.len() < SFEC_HEADER_FIXED_LEN {
+            return Err(SfecError::TruncatedHeader);
+        }
+        if &prefix[..4] != SFEC_MAGIC {
+            return Err(SfecError::InvalidMagic);
+        }
+        let mut fixed = &prefix[4..SFEC_HEADER_FIXED_LEN];
+        let version = fixed.get_u16_le();
+        if version != SFEC_VERSION {
+            return Err(SfecError::UnsupportedVersion(version));
+        }
+        let declared_header_len = fixed.get_u32_le();
+        let algorithm = SfecAlgorithm::from_wire_id(fixed.get_u16_le())?;
+        let flags = fixed.get_u16_le();
+        let key_id = fixed.get_u32_le();
+        let plaintext_len = fixed.get_u64_le();
+        let frame_size = fixed.get_u32_le();
+        let frame_count = fixed.get_u32_le();
+        let wrap_nonce_len = usize::from(fixed.get_u16_le());
+        let data_nonce_prefix_len = usize::from(fixed.get_u16_le());
+        let wrapped_dek_len = usize::from(fixed.get_u16_le());
+        let header_len = SFEC_HEADER_FIXED_LEN
+            .checked_add(wrap_nonce_len)
+            .and_then(|len| len.checked_add(data_nonce_prefix_len))
+            .and_then(|len| len.checked_add(wrapped_dek_len))
+            .ok_or(SfecError::ObjectLengthOverflow)?;
+        if usize::try_from(declared_header_len).ok() != Some(header_len) {
+            return Err(SfecError::InvalidHeaderLength(declared_header_len));
+        }
+        validate_fixed_shape(key_id, flags, plaintext_len, frame_size, frame_count)?;
+
+        Ok(Self {
+            header_len,
+            algorithm,
+            flags,
+            key_id,
+            plaintext_len,
+            frame_size,
+            frame_count,
+            wrap_nonce_len,
+            data_nonce_prefix_len,
+            wrapped_dek_len,
+        })
+    }
+
+    /// Serialized header length in bytes, including the fixed prefix and variable fields.
+    pub fn header_len(&self) -> usize {
+        self.header_len
+    }
+
+    /// Plaintext STFS object length declared by the prefix.
+    pub fn plaintext_len(&self) -> u64 {
+        self.plaintext_len
+    }
+
+    /// Plaintext frame size declared by the prefix.
+    pub fn frame_size(&self) -> u32 {
+        self.frame_size
+    }
+
+    /// Map a nonempty plaintext range to the absolute ciphertext range covering
+    /// all intersecting frames, including the serialized header offset.
+    pub fn ciphertext_range(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> Result<std::ops::Range<u64>, SfecError> {
+        if range.start >= range.end || range.end > self.plaintext_len {
+            return Err(SfecError::InvalidRange);
+        }
+        let frame_size = u64::from(self.frame_size);
+        let first_frame = range.start / frame_size;
+        let last_frame_exclusive = (range.end - 1) / frame_size + 1;
+        let frame_stride = frame_size
+            .checked_add(self.algorithm.tag_len() as u64)
+            .ok_or(SfecError::ObjectLengthOverflow)?;
+        let header_len =
+            u64::try_from(self.header_len).map_err(|_| SfecError::ObjectLengthOverflow)?;
+        let ciphertext_start = first_frame
+            .checked_mul(frame_stride)
+            .and_then(|offset| offset.checked_add(header_len))
+            .ok_or(SfecError::ObjectLengthOverflow)?;
+        let ciphertext_end = if last_frame_exclusive == u64::from(self.frame_count) {
+            let len = u64::try_from(self.expected_ciphertext_len()?)
+                .map_err(|_| SfecError::ObjectLengthOverflow)?;
+            header_len.checked_add(len)
+        } else {
+            last_frame_exclusive
+                .checked_mul(frame_stride)
+                .and_then(|offset| offset.checked_add(header_len))
+        }
+        .ok_or(SfecError::ObjectLengthOverflow)?;
+        Ok(ciphertext_start..ciphertext_end)
+    }
+
+    fn encrypted_frame_len(&self, frame_index: u32) -> Option<usize> {
+        if frame_index >= self.frame_count {
+            return None;
+        }
+        let full_frame_size = u64::from(self.frame_size);
+        let start = u64::from(frame_index).checked_mul(full_frame_size)?;
+        let remaining = self.plaintext_len.checked_sub(start)?;
+        let plaintext_frame_len = remaining.min(full_frame_size);
+        usize::try_from(plaintext_frame_len)
+            .ok()?
+            .checked_add(self.algorithm.tag_len())
+    }
+
+    fn expected_ciphertext_len(&self) -> Result<usize, SfecError> {
+        if self.frame_count == 0 {
+            return Ok(0);
+        }
+
+        let full_frames = self.frame_count - 1;
+        let full_frame_cipher_len = usize::try_from(self.frame_size)
+            .ok()
+            .and_then(|frame_size| frame_size.checked_add(self.algorithm.tag_len()))
+            .ok_or(SfecError::ObjectLengthOverflow)?;
+        let full_frames_len = usize::try_from(full_frames)
+            .map_err(|_| SfecError::ObjectLengthOverflow)?
+            .checked_mul(full_frame_cipher_len)
+            .ok_or(SfecError::ObjectLengthOverflow)?;
+        let final_frame_len = self
+            .encrypted_frame_len(full_frames)
+            .ok_or(SfecError::ObjectLengthOverflow)?;
+
+        full_frames_len
+            .checked_add(final_frame_len)
+            .ok_or(SfecError::ObjectLengthOverflow)
+    }
+
+    fn into_header(self, header_bytes: Bytes) -> Result<SfecHeader, SfecError> {
+        let wrap_nonce_end = SFEC_HEADER_FIXED_LEN + self.wrap_nonce_len;
+        let data_nonce_prefix_end = wrap_nonce_end + self.data_nonce_prefix_len;
+        let wrapped_dek_end = data_nonce_prefix_end + self.wrapped_dek_len;
+        let header = SfecHeader {
+            algorithm: self.algorithm,
+            flags: self.flags,
+            key_id: self.key_id,
+            plaintext_len: self.plaintext_len,
+            frame_size: self.frame_size,
+            frame_count: self.frame_count,
+            wrap_nonce: header_bytes.slice(SFEC_HEADER_FIXED_LEN..wrap_nonce_end),
+            data_nonce_prefix: header_bytes.slice(wrap_nonce_end..data_nonce_prefix_end),
+            wrapped_dek: header_bytes.slice(data_nonce_prefix_end..wrapped_dek_end),
+        };
+        header.header_len()?;
+        header.expected_ciphertext_len()?;
+        Ok(header)
+    }
+}
+
 impl SfecHeader {
+    /// Parse exactly one SFEC header, without requiring any encrypted frames.
+    pub fn parse(data: impl Into<Buffer>) -> Result<Self, SfecError> {
+        let data = data.into();
+        let prefix = data
+            .slice(..data.len().min(SFEC_HEADER_FIXED_LEN))
+            .to_bytes();
+        let parsed_prefix = SfecHeaderLayout::from_prefix(&prefix)?;
+        let header_len = parsed_prefix.header_len;
+        if data.len() < header_len {
+            return Err(SfecError::TruncatedHeader);
+        }
+        if data.len() > header_len {
+            return Err(SfecError::TrailingMalformedData);
+        }
+        parsed_prefix.into_header(data.to_bytes())
+    }
+
+    fn layout(&self) -> Result<SfecHeaderLayout, SfecError> {
+        Ok(SfecHeaderLayout {
+            header_len: self.header_len()?,
+            algorithm: self.algorithm,
+            flags: self.flags,
+            key_id: self.key_id,
+            plaintext_len: self.plaintext_len,
+            frame_size: self.frame_size,
+            frame_count: self.frame_count,
+            wrap_nonce_len: self.wrap_nonce.len(),
+            data_nonce_prefix_len: self.data_nonce_prefix.len(),
+            wrapped_dek_len: self.wrapped_dek.len(),
+        })
+    }
+
     /// Build a current SFEC header and derive frame count from plaintext length.
     pub fn new(
         algorithm: SfecAlgorithm,
@@ -193,16 +405,16 @@ impl SfecHeader {
 
     /// Encrypted frame length including AEAD tag for a frame index.
     pub fn encrypted_frame_len(&self, frame_index: u32) -> Option<usize> {
-        if frame_index >= self.frame_count {
-            return None;
-        }
-        let full_frame_size = u64::from(self.frame_size);
-        let start = u64::from(frame_index).checked_mul(full_frame_size)?;
-        let remaining = self.plaintext_len.checked_sub(start)?;
-        let plaintext_frame_len = remaining.min(full_frame_size);
-        usize::try_from(plaintext_frame_len)
-            .ok()?
-            .checked_add(self.algorithm.tag_len())
+        self.layout().ok()?.encrypted_frame_len(frame_index)
+    }
+
+    /// Map a nonempty plaintext range to the absolute ciphertext range covering
+    /// all intersecting frames, including the serialized header offset.
+    pub fn ciphertext_range(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> Result<std::ops::Range<u64>, SfecError> {
+        self.layout()?.ciphertext_range(range)
     }
 
     fn header_len(&self) -> Result<usize, SfecError> {
@@ -214,46 +426,48 @@ impl SfecHeader {
     }
 
     fn expected_ciphertext_len(&self) -> Result<usize, SfecError> {
-        if self.frame_count == 0 {
-            return Ok(0);
-        }
-
-        let full_frames = self.frame_count - 1;
-        let full_frame_cipher_len = usize::try_from(self.frame_size)
-            .ok()
-            .and_then(|frame_size| frame_size.checked_add(self.algorithm.tag_len()))
-            .ok_or(SfecError::ObjectLengthOverflow)?;
-        let full_frames_len = usize::try_from(full_frames)
-            .map_err(|_| SfecError::ObjectLengthOverflow)?
-            .checked_mul(full_frame_cipher_len)
-            .ok_or(SfecError::ObjectLengthOverflow)?;
-        let final_frame_len = self
-            .encrypted_frame_len(full_frames)
-            .ok_or(SfecError::ObjectLengthOverflow)?;
-
-        full_frames_len
-            .checked_add(final_frame_len)
-            .ok_or(SfecError::ObjectLengthOverflow)
+        self.layout()?.expected_ciphertext_len()
     }
 
     fn validate_shape(&self) -> Result<(), SfecError> {
-        if self.key_id == 0 {
-            return Err(SfecError::InvalidKeyId(self.key_id));
-        }
-        if self.flags & !SUPPORTED_SFEC_FLAGS != 0 {
-            return Err(SfecError::UnsupportedFlags(self.flags));
-        }
-        if self.frame_size == 0 {
-            return Err(SfecError::InvalidFrameSize(self.frame_size));
-        }
-        let expected = expected_frame_count(self.plaintext_len, self.frame_size)?;
-        if expected != self.frame_count {
-            return Err(SfecError::FrameCountOverflow);
-        }
+        self.validate_fixed_shape()?;
         self.header_len()?;
         self.expected_ciphertext_len()?;
         Ok(())
     }
+
+    fn validate_fixed_shape(&self) -> Result<(), SfecError> {
+        validate_fixed_shape(
+            self.key_id,
+            self.flags,
+            self.plaintext_len,
+            self.frame_size,
+            self.frame_count,
+        )
+    }
+}
+
+fn validate_fixed_shape(
+    key_id: u32,
+    flags: u16,
+    plaintext_len: u64,
+    frame_size: u32,
+    frame_count: u32,
+) -> Result<(), SfecError> {
+    if key_id == 0 {
+        return Err(SfecError::InvalidKeyId(key_id));
+    }
+    if flags & !SUPPORTED_SFEC_FLAGS != 0 {
+        return Err(SfecError::UnsupportedFlags(flags));
+    }
+    if frame_size == 0 {
+        return Err(SfecError::InvalidFrameSize(frame_size));
+    }
+    let expected = expected_frame_count(plaintext_len, frame_size)?;
+    if expected != frame_count {
+        return Err(SfecError::FrameCountOverflow);
+    }
+    Ok(())
 }
 
 /// Parsed SFEC envelope: strict header plus encrypted frame bytes.
@@ -289,71 +503,17 @@ impl SfecEnvelope {
     /// the caller's `Buffer` chunks.
     pub fn parse(data: impl Into<Buffer>) -> Result<Self, SfecError> {
         let data = data.into();
-        if data.len() < SFEC_HEADER_FIXED_LEN {
+        let prefix = data
+            .slice(..data.len().min(SFEC_HEADER_FIXED_LEN))
+            .to_bytes();
+        let parsed_prefix = SfecHeaderLayout::from_prefix(&prefix)?;
+        let header_len = parsed_prefix.header_len;
+        if data.len() < header_len {
             return Err(SfecError::TruncatedHeader);
         }
-
-        let mut fixed = data.slice(..SFEC_HEADER_FIXED_LEN);
-        let mut magic = [0u8; 4];
-        fixed.copy_to_slice(&mut magic);
-        if &magic != SFEC_MAGIC {
-            return Err(SfecError::InvalidMagic);
-        }
-
-        let version = fixed.get_u16_le();
-        if version != SFEC_VERSION {
-            return Err(SfecError::UnsupportedVersion(version));
-        }
-
-        let header_len = fixed.get_u32_le();
-        let header_len_usize =
-            usize::try_from(header_len).map_err(|_| SfecError::ObjectLengthOverflow)?;
-        if header_len_usize < SFEC_HEADER_FIXED_LEN {
-            return Err(SfecError::InvalidHeaderLength(header_len));
-        }
-        if data.len() < header_len_usize {
-            return Err(SfecError::TruncatedHeader);
-        }
-
-        let algorithm = SfecAlgorithm::from_wire_id(fixed.get_u16_le())?;
-        let flags = fixed.get_u16_le();
-        let key_id = fixed.get_u32_le();
-        let plaintext_len = fixed.get_u64_le();
-        let frame_size = fixed.get_u32_le();
-        let frame_count = fixed.get_u32_le();
-        let wrap_nonce_len = usize::from(fixed.get_u16_le());
-        let data_nonce_prefix_len = usize::from(fixed.get_u16_le());
-        let wrapped_dek_len = usize::from(fixed.get_u16_le());
-
-        let expected_header_len = SFEC_HEADER_FIXED_LEN
-            .checked_add(wrap_nonce_len)
-            .and_then(|len| len.checked_add(data_nonce_prefix_len))
-            .and_then(|len| len.checked_add(wrapped_dek_len))
-            .ok_or(SfecError::ObjectLengthOverflow)?;
-        if header_len_usize != expected_header_len {
-            return Err(SfecError::InvalidHeaderLength(header_len));
-        }
-
-        let wrap_nonce_start = SFEC_HEADER_FIXED_LEN;
-        let data_nonce_prefix_start = wrap_nonce_start + wrap_nonce_len;
-        let wrapped_dek_start = data_nonce_prefix_start + data_nonce_prefix_len;
-        let ciphertext_start = wrapped_dek_start + wrapped_dek_len;
-
-        let header_bytes = data.slice(..ciphertext_start).to_bytes();
-        let header = SfecHeader {
-            algorithm,
-            flags,
-            key_id,
-            plaintext_len,
-            frame_size,
-            frame_count,
-            wrap_nonce: header_bytes.slice(wrap_nonce_start..data_nonce_prefix_start),
-            data_nonce_prefix: header_bytes.slice(data_nonce_prefix_start..wrapped_dek_start),
-            wrapped_dek: header_bytes.slice(wrapped_dek_start..ciphertext_start),
-        };
-        header.validate_shape()?;
-
-        let ciphertext = data.slice(ciphertext_start..);
+        let header_bytes = data.slice(..header_len).to_bytes();
+        let header = parsed_prefix.into_header(header_bytes.clone())?;
+        let ciphertext = data.slice(header_len..);
         validate_ciphertext_len(&header, ciphertext.len())?;
 
         Ok(Self {
@@ -434,5 +594,129 @@ fn validate_ciphertext_len(header: &SfecHeader, actual_len: usize) -> Result<(),
         std::cmp::Ordering::Less => Err(SfecError::TruncatedCiphertext),
         std::cmp::Ordering::Greater => Err(SfecError::TrailingMalformedData),
         std::cmp::Ordering::Equal => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header() -> SfecHeader {
+        SfecHeader::new(
+            SfecAlgorithm::XChaCha20Poly1305V1,
+            7,
+            19,
+            8,
+            Bytes::from_static(b"wrapnonce"),
+            Bytes::from_static(b"nonce-prefix-123"),
+            Bytes::from_static(b"wrapped-dek-material"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn header_parser_accepts_exact_bytes_and_rejects_frame_data() {
+        let encoded = header().serialized_header().unwrap();
+        assert_eq!(SfecHeader::parse(encoded.clone()).unwrap(), header());
+
+        let mut with_trailing = encoded.to_vec();
+        with_trailing.push(0);
+        assert_eq!(
+            SfecHeader::parse(Bytes::from(with_trailing)),
+            Err(SfecError::TrailingMalformedData)
+        );
+        assert_eq!(
+            SfecHeader::parse(encoded.slice(..encoded.len() - 1)),
+            Err(SfecError::TruncatedHeader)
+        );
+    }
+
+    #[test]
+    fn header_prefix_length_checks_fixed_fields_and_variable_lengths() {
+        let encoded = header().serialized_header().unwrap();
+        assert_eq!(
+            SfecHeaderLayout::from_prefix(&encoded[..SFEC_HEADER_FIXED_LEN])
+                .map(|layout| layout.header_len()),
+            Ok(encoded.len())
+        );
+        assert_eq!(
+            SfecHeaderLayout::from_prefix(&encoded[..SFEC_HEADER_FIXED_LEN - 1])
+                .map(|layout| layout.header_len()),
+            Err(SfecError::TruncatedHeader)
+        );
+
+        let mut bad_length = encoded.to_vec();
+        bad_length[6..10].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            SfecHeaderLayout::from_prefix(&bad_length[..SFEC_HEADER_FIXED_LEN])
+                .map(|layout| layout.header_len()),
+            Err(SfecError::InvalidHeaderLength(_))
+        ));
+    }
+
+    #[test]
+    fn prefix_layout_maps_ranges_without_the_full_header() {
+        // Fixture: 9 + 16 + 20 variable bytes => header 85; frame stride 8 + 16 = 24.
+        let encoded = header_for_layout().serialized_header().unwrap();
+        assert_eq!(encoded.len(), 85);
+        let layout = SfecHeaderLayout::from_prefix(&encoded[..SFEC_HEADER_FIXED_LEN]).unwrap();
+        assert_eq!(layout.header_len(), 85);
+        assert_eq!(layout.ciphertext_range(1..3), Ok(85..109));
+        assert_eq!(layout.ciphertext_range(8..10), Ok(109..133));
+        assert_eq!(layout.ciphertext_range(15..19), Ok(109..152));
+        assert_eq!(layout.ciphertext_range(7..10), Ok(85..133));
+        assert_eq!(layout.ciphertext_range(0..0), Err(SfecError::InvalidRange));
+    }
+
+    fn header_for_layout() -> SfecHeader {
+        SfecHeader::new(
+            SfecAlgorithm::XChaCha20Poly1305V1,
+            7,
+            19,
+            8,
+            Bytes::from_static(b"wrapnonce"),
+            Bytes::from_static(b"nonce-prefix-123"),
+            Bytes::from_static(b"wrapped-dek-material"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ciphertext_range_includes_header_and_only_covering_frames() {
+        let header = SfecHeader::new(
+            SfecAlgorithm::XChaCha20Poly1305V1,
+            7,
+            19,
+            8,
+            Bytes::from_static(b"wrapnonce"),
+            Bytes::from_static(b"nonce-prefix-123"),
+            Bytes::from_static(b"wrapped-dek-material"),
+        )
+        .unwrap();
+        let header_len = header.serialized_header().unwrap().len() as u64;
+        let stride = 8 + SFEC_FRAME_TAG_LEN as u64;
+
+        assert_eq!(
+            header.ciphertext_range(1..3).unwrap(),
+            header_len..header_len + stride
+        );
+        assert_eq!(
+            header.ciphertext_range(8..10).unwrap(),
+            header_len + stride..header_len + 2 * stride
+        );
+        assert_eq!(
+            header.ciphertext_range(15..19).unwrap(),
+            header_len + stride..header_len + 2 * stride + 19
+        );
+        assert_eq!(
+            header.ciphertext_range(7..10).unwrap(),
+            header_len..header_len + 2 * stride
+        );
+        assert_eq!(header.ciphertext_range(0..19).unwrap().start, header_len);
+        assert_eq!(header.ciphertext_range(0..0), Err(SfecError::InvalidRange));
+        assert_eq!(
+            header.ciphertext_range(18..20),
+            Err(SfecError::InvalidRange)
+        );
     }
 }

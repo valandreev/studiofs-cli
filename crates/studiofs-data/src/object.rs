@@ -374,27 +374,8 @@ pub fn read_object(data: impl Into<Buffer>) -> Result<Bytes, ObjectError> {
     let header = ObjectHeader::from_bytes(&header_bytes)?;
     let payload = data.slice(ObjectHeader::SIZE..);
 
-    if header.is_compressed() {
-        return Err(ObjectError::LegacyCompressionUnsupported);
-    }
-
-    // Without compression, both header sizes must describe the actual payload.
     let payload_len = payload.len();
-    if header.original_size != header.compressed_size
-        || !usize::try_from(header.compressed_size).is_ok_and(|size| size == payload_len)
-    {
-        return Err(ObjectError::SizeMismatch {
-            original_size: header.original_size,
-            compressed_size: header.compressed_size,
-            actual_size: payload_len,
-        });
-    }
-
-    if header.compressed_size > MAX_OBJECT_SIZE {
-        return Err(ObjectError::ObjectTooLarge(u64::from(
-            header.compressed_size,
-        )));
-    }
+    validate_object_payload_size(&header, payload_len)?;
 
     // Verify checksum
     let computed_checksum = xxh64_buffer(&payload);
@@ -411,6 +392,34 @@ pub fn read_object(data: impl Into<Buffer>) -> Result<Bytes, ObjectError> {
     } else {
         Ok(payload.to_bytes())
     }
+}
+
+/// Validate an authenticated STFS header against the complete declared payload length.
+/// Partial readers use frame authentication rather than the whole-payload checksum.
+pub(crate) fn validate_object_payload_size(
+    header: &ObjectHeader,
+    payload_len: usize,
+) -> Result<(), ObjectError> {
+    if header.is_compressed() {
+        return Err(ObjectError::LegacyCompressionUnsupported);
+    }
+    if header.original_size != header.compressed_size
+        || !usize::try_from(header.compressed_size).is_ok_and(|size| size == payload_len)
+    {
+        return Err(ObjectError::SizeMismatch {
+            original_size: header.original_size,
+            compressed_size: header.compressed_size,
+            actual_size: payload_len,
+        });
+    }
+
+    if header.compressed_size > MAX_OBJECT_SIZE {
+        return Err(ObjectError::ObjectTooLarge(u64::from(
+            header.compressed_size,
+        )));
+    }
+
+    Ok(())
 }
 
 fn xxh64_buffer(data: &Buffer) -> u64 {

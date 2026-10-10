@@ -172,6 +172,8 @@ pub(crate) struct AccessDecision {
     pub(crate) previous_class: AccessClass,
     pub(crate) class: AccessClass,
     pub(crate) policy: AccessPolicy,
+    /// True only when a read with prior stream history lands non-contiguously.
+    pub(crate) confirmed_seek: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +239,7 @@ impl HandleAccessState {
             self.last_last_block = None;
         }
 
+        let mut confirmed_seek = false;
         let mut next_class = match self.current_class {
             AccessClass::SequentialWriter | AccessClass::RandomWriter => {
                 AccessClass::RandomInteractiveRead
@@ -301,6 +304,7 @@ impl HandleAccessState {
                 next_class = AccessClass::SequentialMediaRead;
             }
         } else {
+            confirmed_seek = true;
             let penalty = if backward_seek || large_jump { 2 } else { 1 };
             self.bump_random(penalty);
             self.sequential_score = self.sequential_score.saturating_sub(penalty + 1);
@@ -318,6 +322,7 @@ impl HandleAccessState {
             previous_class,
             class: next_class,
             policy: AccessPolicy::from_class(next_class, cfg),
+            confirmed_seek,
         }
     }
 
@@ -365,6 +370,7 @@ impl HandleAccessState {
             previous_class,
             class: next_class,
             policy: AccessPolicy::from_class(next_class, cfg),
+            confirmed_seek: false,
         }
     }
 
@@ -629,6 +635,36 @@ mod tests {
         assert_eq!(random.readahead_min_prefetch, cfg.readahead_min_prefetch);
         assert!(!sequential.cache_promotion_on_read);
         assert!(random.cache_promotion_on_read);
+    }
+
+    #[test]
+    fn first_read_on_a_stream_is_not_a_confirmed_seek() {
+        let mut state = HandleAccessState::new(20, OpenFlags::RDONLY);
+        let first = state.observe_read(64 * 1024, 1024, config());
+
+        assert!(!first.confirmed_seek);
+    }
+
+    #[test]
+    fn far_jump_after_history_is_a_confirmed_seek() {
+        let mut state = HandleAccessState::new(21, OpenFlags::RDONLY);
+        let cfg = config();
+        let _ = state.observe_read(0, 1024, cfg);
+        let jump = state.observe_read(64 * 1024, 1024, cfg);
+
+        assert!(jump.confirmed_seek);
+    }
+
+    #[test]
+    fn contiguous_and_overlapping_reads_are_not_confirmed_seeks() {
+        let mut state = HandleAccessState::new(22, OpenFlags::RDONLY);
+        let cfg = config();
+        let _ = state.observe_read(0, 1024, cfg);
+        let contiguous = state.observe_read(1024, 1024, cfg);
+        let same_block = state.observe_read(1536, 256, cfg);
+
+        assert!(!contiguous.confirmed_seek);
+        assert!(!same_block.confirmed_seek);
     }
 
     #[test]

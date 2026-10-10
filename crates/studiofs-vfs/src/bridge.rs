@@ -157,7 +157,8 @@ fn classify_fetch_error(error: &FetchError) -> BridgeVfsErrorKind {
     match error {
         FetchError::NotFound { .. } => BridgeVfsErrorKind::NotFound,
         FetchError::Exhausted { source, .. } => match source {
-            DataError::Crypto(_) | DataError::InvalidCryptoConfig(_) => {
+            DataError::InvalidRange { .. } => BridgeVfsErrorKind::InvalidInput,
+            DataError::Crypto(_) | DataError::InvalidCryptoConfig(_) | DataError::Object(_) => {
                 BridgeVfsErrorKind::DataCorruption
             }
             _ => BridgeVfsErrorKind::TimedOut,
@@ -167,6 +168,7 @@ fn classify_fetch_error(error: &FetchError) -> BridgeVfsErrorKind {
             BridgeVfsErrorKind::DataCorruption
         }
         FetchError::TransitBudgetTooSmall { .. } => BridgeVfsErrorKind::InsufficientResources,
+        FetchError::InvalidRange { .. } => BridgeVfsErrorKind::InvalidInput,
     }
 }
 
@@ -438,6 +440,34 @@ mod tests {
         assert_eq!(
             classify_vfs_error(&config_exhausted),
             BridgeVfsErrorKind::DataCorruption
+        );
+
+        let object_exhausted = crate::VfsError::Fetch(crate::fetch::FetchError::Exhausted {
+            attempts: 1,
+            source: DataError::Object(studiofs_data::object::ObjectError::InvalidMagic),
+        });
+        assert_eq!(
+            classify_vfs_error(&object_exhausted),
+            BridgeVfsErrorKind::DataCorruption
+        );
+
+        let invalid_caller_range = crate::VfsError::Fetch(crate::fetch::FetchError::InvalidRange {
+            object_id: 42,
+            start: 5,
+            end: 2,
+        });
+        assert_eq!(
+            classify_vfs_error(&invalid_caller_range),
+            BridgeVfsErrorKind::InvalidInput
+        );
+
+        let invalid_store_range = crate::VfsError::Fetch(crate::fetch::FetchError::Exhausted {
+            attempts: 1,
+            source: DataError::InvalidRange { start: 0, end: 0 },
+        });
+        assert_eq!(
+            classify_vfs_error(&invalid_store_range),
+            BridgeVfsErrorKind::InvalidInput
         );
 
         let skipped = crate::VfsError::Fetch(crate::fetch::FetchError::PrefetchSkipped);
