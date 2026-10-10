@@ -478,11 +478,12 @@ impl FetchScheduler {
             let Some(payload) = self.payload_store_get_async(object_id).await? else {
                 return Ok(None);
             };
+            let payload = slice_payload_range(payload, &range);
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             self.metrics
                 .cache_hit_bytes
                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
-            Ok(Some(slice_payload_range(payload, &range)))
+            Ok(Some(payload))
         };
         if let Some(payload) = cached_range().await? {
             return Ok(payload);
@@ -508,7 +509,8 @@ impl FetchScheduler {
             return Ok(payload);
         }
 
-        let budget_bytes = fetch_transit_budget_bytes(keys.len());
+        // Partial reads stage one fragment regardless of the object's key count.
+        let budget_bytes = fetch_transit_budget_bytes(1);
         let budget_limit = self.transit_memory_budget.budget_bytes();
         if budget_bytes > budget_limit {
             return Err(FetchError::TransitBudgetTooSmall {
@@ -1773,6 +1775,59 @@ mod tests {
             expected
         );
         assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_cache_hit_counts_only_requested_bytes() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (scheduler, _, cached_store, config) =
+            make_encrypted_fetch_scheduler(&tmp, "partial-cache-hit");
+        let object_id = 0x3539;
+        let key = fragment_key(&config, object_id, 0);
+        cached_store
+            .put(object_id, b"cached payload", true)
+            .unwrap();
+
+        let payload = scheduler
+            .fetch_block_range_after_local_miss(object_id, &[key], 2..5)
+            .await
+            .unwrap();
+
+        assert_eq!(payload.as_ref(), b"che");
+        assert_eq!(scheduler.metrics.cache_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(scheduler.metrics.cache_hit_bytes.load(Ordering::Relaxed), 3);
+        assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn partial_fetch_reserves_only_one_fragment_budget() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (mut scheduler, raw, _, config) =
+            make_encrypted_fetch_scheduler(&tmp, "partial-fragment-budget");
+        Arc::get_mut(&mut scheduler).unwrap().transit_memory_budget =
+            TransitMemoryBudget::new(CLOUD_FRAGMENT_SIZE);
+        let object_id = 0x3540;
+        let keys = vec![
+            fragment_key(&config, object_id, 0),
+            "unused-fragment-key".to_string(),
+        ];
+        let expected = Bytes::from_static(b"selected fragment");
+        put_encrypted_fragment(&scheduler, &raw, &keys[0], expected.clone()).await;
+
+        let payload = scheduler
+            .fetch_block_range_after_local_miss(object_id, &keys, 0..8)
+            .await
+            .expect("one selected fragment fits the budget even with multiple keys");
+
+        assert_eq!(payload, expected.slice(..8));
+        assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 1);
+        Arc::get_mut(&mut scheduler).unwrap().transit_memory_budget =
+            TransitMemoryBudget::new(CLOUD_FRAGMENT_SIZE - 1);
+        assert!(matches!(
+            scheduler.fetch_block_range_after_local_miss(object_id, &keys, 0..8).await,
+            Err(FetchError::TransitBudgetTooSmall { required_bytes, .. })
+                if required_bytes == CLOUD_FRAGMENT_SIZE
+        ));
     }
 
     #[tokio::test]

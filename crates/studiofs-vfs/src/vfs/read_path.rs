@@ -2395,12 +2395,14 @@ fn copy_partial_committed_payload_into(
     dst: &mut [u8],
 ) -> VfsResult<()> {
     if data.len() != dst.len() {
-        return Err(VfsError::Other(format!(
-            "partial committed payload length mismatch: object_id={}, requested={}, received={}",
+        return Err(VfsError::Fetch(crate::fetch::FetchError::CorruptFragment {
             object_id,
-            dst.len(),
-            data.len()
-        )));
+            reason: format!(
+                "partial committed payload length mismatch: requested={}, received={}",
+                dst.len(),
+                data.len()
+            ),
+        }));
     }
     dst.copy_from_slice(data);
     Ok(())
@@ -2415,7 +2417,10 @@ mod tests {
         let error = super::copy_partial_committed_payload_into(&[1, 2, 3], 42, &mut dst)
             .expect_err("short committed range must not be zero-filled");
 
-        assert!(matches!(error, super::VfsError::Other(_)));
+        assert_eq!(
+            crate::bridge::classify_vfs_error(&error),
+            crate::bridge::BridgeVfsErrorKind::DataCorruption
+        );
         assert_eq!(dst, [0xAA; 4]);
     }
 

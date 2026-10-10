@@ -353,6 +353,7 @@ fn encrypt_frames(
         DEFAULT_ENCRYPTION_FRAME_SIZE + tag_len,
         workers,
         &aad_base,
+        0,
         |frame_index, aad, frame| {
             let nonce = data_nonce(data_nonce_prefix, frame_index);
             let (body, tag_slot) = frame.split_at_mut(frame.len() - tag_len);
@@ -426,14 +427,17 @@ fn decrypt_frames(
         usize::try_from(header.frame_size()).map_err(|_| CryptoError::FrameLayoutOverflow)?,
         workers,
         &aad_base,
-        |local_index, aad, frame| {
-            let frame_index = first_frame
-                .checked_add(local_index)
-                .ok_or(CryptoError::FrameLayoutOverflow)?;
-            aad[aad_base.len()..].copy_from_slice(&frame_index.to_le_bytes());
+        first_frame,
+        |frame_index, aad, frame| {
             let nonce = data_nonce(data_nonce_prefix, frame_index);
+            let tag_index = usize::try_from(
+                frame_index
+                    .checked_sub(first_frame)
+                    .ok_or(CryptoError::FrameLayoutOverflow)?,
+            )
+            .map_err(|_| CryptoError::FrameLayoutOverflow)?;
             let tag = tags
-                .get(local_index as usize)
+                .get(tag_index)
                 .ok_or(CryptoError::FrameLayoutOverflow)?;
             cipher
                 .decrypt_in_place_detached(XNonce::from_slice(&nonce), aad, frame, tag)
@@ -453,10 +457,11 @@ fn for_each_frame<F>(
     stride: usize,
     workers: usize,
     aad_base: &[u8],
+    base_frame_index: u32,
     seal: F,
 ) -> Result<(), CryptoError>
 where
-    F: Fn(u32, &mut [u8], &mut [u8]) -> Result<(), CryptoError> + Sync,
+    F: Fn(u32, &[u8], &mut [u8]) -> Result<(), CryptoError> + Sync,
 {
     let workers = workers.clamp(1, buffer.len().div_ceil(stride).max(1));
     // Threads pull frames from a shared queue: a helper that fails to spawn
@@ -471,12 +476,17 @@ where
             let Some((index, frame)) = next else {
                 break;
             };
-            let sealed = u32::try_from(index)
+            let frame_index = u32::try_from(index)
                 .map_err(|_| CryptoError::FrameLayoutOverflow)
-                .and_then(|frame_index| {
-                    set_frame_aad(&mut aad, aad_base.len(), frame_index);
-                    seal(frame_index, &mut aad, frame)
+                .and_then(|local_index| {
+                    base_frame_index
+                        .checked_add(local_index)
+                        .ok_or(CryptoError::FrameLayoutOverflow)
                 });
+            let sealed = frame_index.and_then(|frame_index| {
+                set_frame_aad(&mut aad, aad_base.len(), frame_index);
+                seal(frame_index, &aad, frame)
+            });
             if let Err(err) = sealed {
                 failed.store(true, Ordering::Relaxed);
                 return Err(err);
@@ -682,19 +692,31 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
 
         let mut buffer = vec![0u8; 64 * 3 + 1];
-        for_each_frame(&mut buffer, 3, 4, b"aad", |frame_index, aad, frame| {
+        for_each_frame(&mut buffer, 3, 4, b"aad", 17, |frame_index, aad, frame| {
             assert_eq!(&aad[3..], &frame_index.to_le_bytes());
             frame.fill(frame.len() as u8 + frame_index as u8);
             Ok(())
         })
         .unwrap();
         for (index, frame) in buffer.chunks(3).enumerate() {
-            assert!(frame.iter().all(|&b| b == frame.len() as u8 + index as u8));
+            assert!(
+                frame
+                    .iter()
+                    .all(|&b| b == frame.len() as u8 + index as u8 + 17)
+            );
         }
+
+        let mut overflow_buffer = [0u8; 2];
+        assert!(matches!(
+            for_each_frame(&mut overflow_buffer, 1, 1, b"aad", u32::MAX, |_, _, _| Ok(
+                ()
+            )),
+            Err(CryptoError::FrameLayoutOverflow)
+        ));
 
         // Every call fails, so each of the 4 threads seals at most one frame.
         let calls = AtomicUsize::new(0);
-        let result = for_each_frame(&mut buffer, 3, 4, b"aad", |_, _, _| {
+        let result = for_each_frame(&mut buffer, 3, 4, b"aad", 0, |_, _, _| {
             calls.fetch_add(1, Ordering::Relaxed);
             Err(CryptoError::AuthenticationFailed)
         });
