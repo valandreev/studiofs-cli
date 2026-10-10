@@ -3,7 +3,7 @@
 use crate::envelope::{
     DEFAULT_SFEC_FRAME_SIZE, SFEC_VERSION, SfecAlgorithm, SfecEnvelope, SfecError, SfecHeader,
 };
-use bytes::{BufMut, Bytes};
+use bytes::{Buf, BufMut, Bytes};
 use chacha20poly1305::{
     Key, Tag, XChaCha20Poly1305, XNonce,
     aead::{Aead, AeadInPlace, KeyInit, OsRng, Payload, rand_core::RngCore},
@@ -128,9 +128,12 @@ impl ObjectCipher {
     }
 
     /// Encrypt one complete STFS object into an SFEC envelope.
+    ///
+    /// `plaintext` may be chunked (e.g. an OpenDAL `Buffer`); frames are
+    /// copied straight from its chunks into the ciphertext allocation.
     pub fn encrypt_object(
         &self,
-        plaintext: &[u8],
+        plaintext: impl Buf,
         storage_key: &str,
         key_id: u32,
     ) -> Result<Buffer, CryptoError> {
@@ -150,7 +153,7 @@ impl ObjectCipher {
             .first_chunk::<DATA_NONCE_PREFIX_LEN>()
             .expect("fixed buffer");
         let plaintext_len =
-            u64::try_from(plaintext.len()).map_err(|_| CryptoError::FrameLayoutOverflow)?;
+            u64::try_from(plaintext.remaining()).map_err(|_| CryptoError::FrameLayoutOverflow)?;
         let wrap_aad = wrap_aad(key_id, context, plaintext_len, data_nonce_prefix)?;
         let wrapped_dek = encrypt_with_key(&self.wrapping_key, wrap_nonce, &wrap_aad, dek)?;
 
@@ -177,7 +180,14 @@ impl ObjectCipher {
     }
 
     /// Decrypt one complete SFEC envelope back into its STFS object bytes.
-    pub fn decrypt_object(&self, envelope: Bytes, storage_key: &str) -> Result<Bytes, CryptoError> {
+    ///
+    /// A chunked envelope is decrypted frame by frame across chunk boundaries
+    /// without first concatenating the whole object.
+    pub fn decrypt_object(
+        &self,
+        envelope: impl Into<Buffer>,
+        storage_key: &str,
+    ) -> Result<Bytes, CryptoError> {
         let context = ObjectEncryptionContext {
             volume_uuid: &self.volume_uuid,
             storage_key,
@@ -205,7 +215,7 @@ impl ObjectCipher {
             .map_err(|_| CryptoError::InvalidDataKeyLength(dek.len()))?;
 
         decrypt_frames(
-            envelope.ciphertext(),
+            envelope.ciphertext().clone(),
             dek_bytes,
             &data_nonce_prefix,
             envelope.header_bytes(),
@@ -231,7 +241,7 @@ fn derive_wrapping_key(
 }
 
 fn encrypt_frames(
-    plaintext: &[u8],
+    mut plaintext: impl Buf,
     dek: &[u8; KEY_LEN],
     data_nonce_prefix: &[u8; DATA_NONCE_PREFIX_LEN],
     header_bytes: &[u8],
@@ -239,9 +249,9 @@ fn encrypt_frames(
     context: ObjectEncryptionContext<'_>,
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(dek));
-    let frame_count = plaintext.len().div_ceil(DEFAULT_ENCRYPTION_FRAME_SIZE);
-    let output_len = plaintext
-        .len()
+    let plaintext_len = plaintext.remaining();
+    let frame_count = plaintext_len.div_ceil(DEFAULT_ENCRYPTION_FRAME_SIZE);
+    let output_len = plaintext_len
         .checked_add(
             frame_count
                 .checked_mul(SfecAlgorithm::XChaCha20Poly1305V1.tag_len())
@@ -252,14 +262,15 @@ fn encrypt_frames(
     let mut aad = frame_aad_base(key_id, context, header_bytes)?;
     let aad_base_len = aad.len();
 
-    for (frame_index, frame) in plaintext.chunks(DEFAULT_ENCRYPTION_FRAME_SIZE).enumerate() {
+    for frame_index in 0..frame_count {
         let frame_index =
             u32::try_from(frame_index).map_err(|_| CryptoError::FrameLayoutOverflow)?;
         let nonce = data_nonce(data_nonce_prefix, frame_index);
         set_frame_aad(&mut aad, aad_base_len, frame_index);
 
         let start = output.len();
-        output.extend_from_slice(frame);
+        let frame_len = plaintext.remaining().min(DEFAULT_ENCRYPTION_FRAME_SIZE);
+        output.put((&mut plaintext).take(frame_len));
         let tag = cipher
             .encrypt_in_place_detached(XNonce::from_slice(&nonce), &aad, &mut output[start..])
             .map_err(|_| CryptoError::AuthenticationFailed)?;
@@ -270,7 +281,7 @@ fn encrypt_frames(
 }
 
 fn decrypt_frames(
-    ciphertext: &[u8],
+    mut ciphertext: Buffer,
     dek: &[u8; KEY_LEN],
     data_nonce_prefix: &[u8; DATA_NONCE_PREFIX_LEN],
     header_bytes: &[u8],
@@ -282,7 +293,6 @@ fn decrypt_frames(
     let plaintext_len =
         usize::try_from(header.plaintext_len()).map_err(|_| CryptoError::FrameLayoutOverflow)?;
     let mut plaintext = Vec::with_capacity(plaintext_len);
-    let mut offset = 0usize;
     let mut aad = frame_aad_base(key_id, context, header_bytes)?;
     let aad_base_len = aad.len();
 
@@ -290,34 +300,31 @@ fn decrypt_frames(
         let frame_len = header
             .encrypted_frame_len(frame_index)
             .ok_or(CryptoError::FrameLayoutOverflow)?;
-        let end = offset
-            .checked_add(frame_len)
-            .ok_or(CryptoError::FrameLayoutOverflow)?;
-        let frame = ciphertext
-            .get(offset..end)
-            .ok_or(CryptoError::FrameLayoutOverflow)?;
-        let tag_offset = frame
-            .len()
+        if frame_len > ciphertext.remaining() {
+            return Err(CryptoError::FrameLayoutOverflow);
+        }
+        let body_len = frame_len
             .checked_sub(SfecAlgorithm::XChaCha20Poly1305V1.tag_len())
             .ok_or(CryptoError::FrameLayoutOverflow)?;
-        let (frame_ciphertext, tag) = frame.split_at(tag_offset);
         let nonce = data_nonce(data_nonce_prefix, frame_index);
         set_frame_aad(&mut aad, aad_base_len, frame_index);
 
+        // Frame body and tag may straddle Buffer chunks; copy them per frame.
         let start = plaintext.len();
-        plaintext.extend_from_slice(frame_ciphertext);
+        plaintext.put(Buf::take(&mut ciphertext, body_len));
+        let mut tag = Tag::default();
+        ciphertext.copy_to_slice(&mut tag);
         cipher
             .decrypt_in_place_detached(
                 XNonce::from_slice(&nonce),
                 &aad,
                 &mut plaintext[start..],
-                Tag::from_slice(tag),
+                &tag,
             )
             .map_err(|_| CryptoError::AuthenticationFailed)?;
-        offset = end;
     }
 
-    if offset != ciphertext.len() {
+    if ciphertext.has_remaining() {
         return Err(CryptoError::FrameLayoutOverflow);
     }
 
@@ -458,19 +465,29 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&HISTORICAL[i..i + 2], 16).unwrap())
             .collect();
-        let plaintext = cipher()
-            .decrypt_object(Bytes::from(envelope), OBJECT_KEY)
-            .unwrap();
-
-        assert_eq!(plaintext.as_ref(), b"historical sfec payload");
+        let envelope = Bytes::from(envelope);
+        for input in [Buffer::from(envelope.clone()), fragment(&envelope)] {
+            let plaintext = cipher().decrypt_object(input, OBJECT_KEY).unwrap();
+            assert_eq!(plaintext.as_ref(), b"historical sfec payload");
+        }
     }
 
     #[test]
     fn one_cipher_gives_each_object_fresh_random_material() {
         let cipher = cipher();
         let parse = |bytes: Bytes| SfecEnvelope::parse(bytes).unwrap();
-        let first = parse(cipher.encrypt_object(b"x", "k", KEY_ID).unwrap().to_bytes());
-        let second = parse(cipher.encrypt_object(b"x", "k", KEY_ID).unwrap().to_bytes());
+        let first = parse(
+            cipher
+                .encrypt_object(&b"x"[..], "k", KEY_ID)
+                .unwrap()
+                .to_bytes(),
+        );
+        let second = parse(
+            cipher
+                .encrypt_object(&b"x"[..], "k", KEY_ID)
+                .unwrap()
+                .to_bytes(),
+        );
 
         assert_ne!(first.header().wrap_nonce(), second.header().wrap_nonce());
         assert_ne!(
@@ -504,6 +521,67 @@ mod tests {
         }
     }
 
+    /// Split into odd-sized chunks so header fields, frame bodies and tags
+    /// all straddle chunk boundaries.
+    fn fragment(bytes: &Bytes) -> Buffer {
+        let mut chunks = Vec::new();
+        let mut offset = 0;
+        for len in [1, 6, 33].into_iter().chain(std::iter::repeat(4093)) {
+            if offset == bytes.len() {
+                break;
+            }
+            let end = (offset + len).min(bytes.len());
+            chunks.push(bytes.slice(offset..end));
+            offset = end;
+        }
+        Buffer::from(chunks)
+    }
+
+    #[test]
+    fn fragmented_buffers_roundtrip_across_chunk_boundaries() {
+        for size in [
+            0,
+            1,
+            DEFAULT_ENCRYPTION_FRAME_SIZE,
+            2 * DEFAULT_ENCRYPTION_FRAME_SIZE + 17,
+        ] {
+            let plaintext = Bytes::from_iter((0..size).map(|idx| (idx % 251) as u8));
+            let ciphertext = cipher()
+                .encrypt_object(fragment(&plaintext), OBJECT_KEY, KEY_ID)
+                .unwrap()
+                .to_bytes();
+            assert_eq!(
+                cipher()
+                    .decrypt_object(ciphertext.clone(), OBJECT_KEY)
+                    .unwrap(),
+                plaintext
+            );
+            let fragmented = fragment(&ciphertext);
+            assert!(Buffer::count(&fragmented) > 3);
+            assert_eq!(
+                cipher().decrypt_object(fragmented, OBJECT_KEY).unwrap(),
+                plaintext,
+                "size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn fragmented_ciphertext_rejects_truncation_and_trailing_bytes() {
+        let ciphertext = encrypt(&[0x5A; 3 * 1024], OBJECT_KEY);
+        let truncated = ciphertext.slice(..ciphertext.len() - 1);
+        let mut trailing = ciphertext.to_vec();
+        trailing.push(0);
+
+        for envelope in [truncated, Bytes::from(trailing)] {
+            assert!(
+                cipher()
+                    .decrypt_object(fragment(&envelope), OBJECT_KEY)
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn encrypting_same_plaintext_twice_produces_different_ciphertext() {
         let plaintext = Bytes::from_static(b"same plaintext");
@@ -533,7 +611,7 @@ mod tests {
     #[test]
     fn decrypt_accepts_historical_key_id_from_envelope() {
         let ciphertext = cipher()
-            .encrypt_object(b"historical key id", OBJECT_KEY, KEY_ID + 1)
+            .encrypt_object(&b"historical key id"[..], OBJECT_KEY, KEY_ID + 1)
             .unwrap()
             .to_bytes();
 
