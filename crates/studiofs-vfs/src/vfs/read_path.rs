@@ -2214,6 +2214,7 @@ impl StudioVfs {
         // original caller request; I/O already launched after a successful
         // check is allowed to finish.
         let allow_partial_remote_read = access.class == AccessClass::RandomInteractiveRead
+            && access.confirmed_seek
             && speculative_read.is_none()
             && blocks_needed.len() == 1
             && planned_read_len <= crate::fetch::MAX_PARTIAL_FETCH_SIZE;
@@ -2475,6 +2476,21 @@ mod tests {
                 .await
                 .expect("write encrypted test payload");
 
+            let second_object_id = object_id + 1;
+            let second_payload = Bytes::from(vec![0xAB; 4096]);
+            let second_key = format_object_fragment_key(
+                &format!("{}/objects", data_config.volume_name),
+                second_object_id,
+                0,
+            );
+            data_store
+                .put_by_key(
+                    &second_key,
+                    create_object_buffer(second_payload.clone()).unwrap(),
+                )
+                .await
+                .unwrap();
+
             let ino = vfs
                 .create(ROOT_INO, b"cold-range.bin", 1000, 1000, 0o644)
                 .expect("create committed test file")
@@ -2490,7 +2506,30 @@ mod tests {
                 &PayloadRef::new_partial(object_id, payload.len() as u32),
             )
             .expect("publish test payload reference");
+            attr.size += second_payload.len() as u64;
+            attr.committed_size = attr.size;
+            meta.set_attr(&attr).unwrap();
+            meta.stage_payload_slice(
+                ino,
+                1,
+                &PayloadRef::new_partial(second_object_id, second_payload.len() as u32),
+            )
+            .unwrap();
             vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            // A far prior read on the same stream (block 1) gives the measured
+            // block-0 read history, so it lands as a confirmed backward seek.
+            let seed = vfs
+                .read(ino, u64::from(DEFAULT_BLOCK_SIZE), 16)
+                .await
+                .expect("seed read of the far block should succeed");
+            assert_eq!(seed.as_ref(), &second_payload[..16]);
+            let fetches_before = scheduler.metrics.s3_fetches.load(AtomicOrdering::Relaxed);
+            let encrypted_before = scheduler
+                .metrics
+                .encrypted_bytes_read
+                .load(AtomicOrdering::Relaxed);
+
             let out = vfs
                 .read(ino, u64::from(payload_offset), read_len as u32)
                 .await
@@ -2506,42 +2545,20 @@ mod tests {
                 "a partial response must not be admitted as a complete cached object"
             );
             assert_eq!(
-                scheduler.metrics.s3_fetches.load(AtomicOrdering::Relaxed),
+                scheduler.metrics.s3_fetches.load(AtomicOrdering::Relaxed) - fetches_before,
                 1,
-                "the cold read should issue one remote fragment request"
+                "the measured cold read should issue one remote fragment request"
             );
+            let measured_encrypted = scheduler
+                .metrics
+                .encrypted_bytes_read
+                .load(AtomicOrdering::Relaxed)
+                - encrypted_before;
             assert!(
-                scheduler
-                    .metrics
-                    .encrypted_bytes_read
-                    .load(AtomicOrdering::Relaxed)
-                    < raw.stat(&key).await.unwrap().content_length(),
+                measured_encrypted < raw.stat(&key).await.unwrap().content_length(),
                 "the actual VFS read must select frame-bounded remote transfer"
             );
 
-            let second_object_id = object_id + 1;
-            let second_payload = Bytes::from(vec![0xAB; 4096]);
-            let second_key = format_object_fragment_key(
-                &format!("{}/objects", data_config.volume_name),
-                second_object_id,
-                0,
-            );
-            data_store
-                .put_by_key(
-                    &second_key,
-                    create_object_buffer(second_payload.clone()).unwrap(),
-                )
-                .await
-                .unwrap();
-            attr.size += second_payload.len() as u64;
-            attr.committed_size = attr.size;
-            meta.set_attr(&attr).unwrap();
-            meta.stage_payload_slice(
-                ino,
-                1,
-                &PayloadRef::new_partial(second_object_id, second_payload.len() as u32),
-            )
-            .unwrap();
             vfs.state.namespace.attr_read_cache.lock().remove(ino);
             let across_blocks = vfs
                 .read(ino, u64::from(DEFAULT_BLOCK_SIZE) - 32, 64)
@@ -2557,6 +2574,97 @@ mod tests {
             assert_eq!(
                 vfs.cached_store.get(second_object_id).unwrap(),
                 second_payload
+            );
+        });
+    }
+
+    #[test]
+    fn contiguous_small_cold_reads_fetch_complete_block_once() {
+        use opendal::{Operator, services::Memory};
+        use studiofs_data::object::{create_object_buffer, format_object_fragment_key};
+        use studiofs_data::store::DataStore;
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, mut vfs, meta) = make_unstarted_test_vfs(&tmp, "cold-contiguous-small-reads");
+        let config = VfsConfig::default();
+        let data_config = studiofs_data::store::DataStoreConfig::from(&test_format_info(
+            "cold-contiguous-small-reads",
+        ));
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let data_store = Arc::new(
+            DataStore::with_operator_for_test(&data_config, raw.clone())
+                .expect("construct encrypted test store"),
+        );
+        let scheduler = Arc::new(crate::fetch::FetchScheduler::new(
+            data_store.clone(),
+            vfs.cached_store.clone(),
+            crate::aimd::AimdConfig::fetch_default(),
+            0,
+            Arc::new(crate::qos::QosController::from_config(&config)),
+            crate::qos::TransitMemoryBudget::new(64 * 1024 * 1024),
+            &config,
+        ));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .fetch_scheduler = scheduler.clone();
+
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let object_id = 8_011;
+            let read_len = 128 * 1024_usize;
+            let payload: Vec<u8> = (0..DEFAULT_BLOCK_SIZE)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            let key = format_object_fragment_key(
+                &format!("{}/objects", data_config.volume_name),
+                object_id,
+                0,
+            );
+            data_store
+                .put_by_key(
+                    &key,
+                    create_object_buffer(bytes::Bytes::from(payload.clone())).unwrap(),
+                )
+                .await
+                .expect("write encrypted test payload");
+
+            let ino = vfs
+                .create(ROOT_INO, b"cold-contiguous.bin", 1000, 1000, 0o644)
+                .expect("create committed test file")
+                .ino;
+            let mut attr = meta.get_attr(ino).unwrap();
+            attr.size = payload.len() as u64;
+            attr.committed_size = attr.size;
+            attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&attr).unwrap();
+            meta.stage_payload_slice(
+                ino,
+                0,
+                &PayloadRef::new_partial(object_id, payload.len() as u32),
+            )
+            .expect("publish test payload reference");
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let first = vfs
+                .read(ino, 0, read_len as u32)
+                .await
+                .expect("first contiguous cold read should succeed");
+            let second = vfs
+                .read(ino, read_len as u64, read_len as u32)
+                .await
+                .expect("second contiguous cold read should succeed");
+
+            assert_eq!(first.as_ref(), &payload[..read_len]);
+            assert_eq!(second.as_ref(), &payload[read_len..2 * read_len]);
+            assert_eq!(
+                scheduler.metrics.s3_fetches.load(AtomicOrdering::Relaxed),
+                1,
+                "two contiguous small cold reads should share one complete block fetch"
+            );
+            assert_eq!(
+                vfs.cached_store.get(object_id).unwrap().as_ref(),
+                payload.as_slice(),
+                "a sequential-looking cold read must admit the complete block into the cache"
             );
         });
     }
