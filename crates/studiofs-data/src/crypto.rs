@@ -602,7 +602,7 @@ mod tests {
             .unwrap()
             .header_bytes()
             .len();
-        let stride = DEFAULT_ENCRYPTION_FRAME_SIZE + 16;
+        let stride = DEFAULT_ENCRYPTION_FRAME_SIZE + SfecAlgorithm::XChaCha20Poly1305V1.tag_len();
         for frame in 0..4 {
             let mut mutated = ciphertext.to_vec();
             mutated[header_len + frame * stride + 5] ^= 0x01;

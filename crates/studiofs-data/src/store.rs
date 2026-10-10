@@ -268,10 +268,12 @@ async fn run_crypto_blocking<T: Send + 'static>(
         .acquire_owned()
         .await
         .expect("crypto admission semaphore is never closed");
-    let extra = (1..max_workers).rev().find_map(|n| {
-        let n = u32::try_from(n).ok()?;
-        Arc::clone(admission).try_acquire_many_owned(n).ok()
-    });
+    let extra = (1..max_workers.min(admission.available_permits() + 1))
+        .rev()
+        .find_map(|n| {
+            let n = u32::try_from(n).ok()?;
+            Arc::clone(admission).try_acquire_many_owned(n).ok()
+        });
     let workers = 1 + extra.as_ref().map_or(0, |permits| permits.num_permits());
     // `spawn_blocking` tasks cannot be aborted once running, so CPU pressure is
     // bounded by admission above rather than by a per-task timeout.
