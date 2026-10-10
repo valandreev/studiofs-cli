@@ -271,6 +271,7 @@ async fn run_crypto_blocking<T: Send + 'static>(
             .min(max_workers.saturating_sub(1)),
     )
     .ok()
+    .filter(|&n| n > 0)
     .and_then(|n| Arc::clone(admission).try_acquire_many_owned(n).ok());
     let workers = 1 + extra.as_ref().map_or(0, |permits| permits.num_permits());
     // `spawn_blocking` tasks cannot be aborted once running, so CPU pressure is

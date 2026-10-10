@@ -11,6 +11,9 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use opendal::Buffer;
 use sha2::Sha256;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
+use std::thread;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -366,35 +369,42 @@ fn for_each_frame<F>(
 where
     F: Fn(u32, &[u8], &mut [u8]) -> Result<(), CryptoError> + Sync,
 {
-    let run = |first_frame: usize, frames: &mut [u8]| {
-        let mut aad = aad_base.to_vec();
-        for (offset, frame) in frames.chunks_mut(stride).enumerate() {
-            let frame_index = u32::try_from(first_frame + offset)
-                .map_err(|_| CryptoError::FrameLayoutOverflow)?;
-            set_frame_aad(&mut aad, aad_base.len(), frame_index);
-            seal(frame_index, &aad, frame)?;
+    let workers = workers.clamp(1, buffer.len().div_ceil(stride).max(1));
+    // Threads pull frames from a shared queue: a helper that fails to spawn
+    // leaves its share to the others, and the first failure stops new frames.
+    let queue = Mutex::new(buffer.chunks_mut(stride).enumerate());
+    let failed = AtomicBool::new(false);
+    let run = || {
+        let mut aad = Vec::with_capacity(aad_base.len() + size_of::<u32>());
+        aad.extend_from_slice(aad_base);
+        while !failed.load(Ordering::Relaxed) {
+            let next = queue.lock().unwrap_or_else(PoisonError::into_inner).next();
+            let Some((index, frame)) = next else {
+                break;
+            };
+            let sealed = u32::try_from(index)
+                .map_err(|_| CryptoError::FrameLayoutOverflow)
+                .and_then(|frame_index| {
+                    set_frame_aad(&mut aad, aad_base.len(), frame_index);
+                    seal(frame_index, &aad, frame)
+                });
+            if let Err(err) = sealed {
+                failed.store(true, Ordering::Relaxed);
+                return Err(err);
+            }
         }
         Ok(())
     };
 
-    let frame_count = buffer.len().div_ceil(stride);
-    let workers = workers.clamp(1, frame_count.max(1));
     if workers == 1 {
-        return run(0, buffer);
+        return run();
     }
-    let frames_per_worker = frame_count.div_ceil(workers);
-    let mut groups = buffer.chunks_mut(stride * frames_per_worker);
-    // `workers > 1` implies at least two frames, so a first group exists.
-    let first = groups.next().expect("multi-frame buffer has a first group");
     std::thread::scope(|scope| {
-        let handles: Vec<_> = groups
-            .enumerate()
-            .map(|(group, frames)| {
-                scope.spawn(move || run((group + 1) * frames_per_worker, frames))
-            })
+        let handles: Vec<_> = (1..workers)
+            .filter_map(|_| thread::Builder::new().spawn_scoped(scope, run).ok())
             .collect();
-        // The calling thread seals the first group itself.
-        let mut result = run(0, first);
+        // The calling thread works too, so failed spawns only cost parallelism.
+        let mut result = run();
         for handle in handles {
             let joined = handle
                 .join()
@@ -576,6 +586,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn frame_queue_seals_each_frame_once_and_stops_after_failure() {
+        use std::sync::atomic::AtomicUsize;
+
+        let mut buffer = vec![0u8; 64 * 3 + 1];
+        for_each_frame(&mut buffer, 3, 4, b"aad", |frame_index, aad, frame| {
+            assert_eq!(&aad[3..], &frame_index.to_le_bytes());
+            frame.fill(frame.len() as u8 + frame_index as u8);
+            Ok(())
+        })
+        .unwrap();
+        for (index, frame) in buffer.chunks(3).enumerate() {
+            assert!(frame.iter().all(|&b| b == frame.len() as u8 + index as u8));
+        }
+
+        // Every call fails, so each of the 4 threads seals at most one frame.
+        let calls = AtomicUsize::new(0);
+        let result = for_each_frame(&mut buffer, 3, 4, b"aad", |_, _, _| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err(CryptoError::AuthenticationFailed)
+        });
+        assert!(matches!(result, Err(CryptoError::AuthenticationFailed)));
+        assert!(calls.load(Ordering::Relaxed) <= 4);
     }
 
     #[test]
