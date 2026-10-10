@@ -157,7 +157,7 @@ fn classify_fetch_error(error: &FetchError) -> BridgeVfsErrorKind {
     match error {
         FetchError::NotFound { .. } => BridgeVfsErrorKind::NotFound,
         FetchError::Exhausted { source, .. } => match source {
-            DataError::Crypto(_) | DataError::InvalidCryptoConfig(_) => {
+            DataError::Crypto(_) | DataError::InvalidCryptoConfig(_) | DataError::Object(_) => {
                 BridgeVfsErrorKind::DataCorruption
             }
             _ => BridgeVfsErrorKind::TimedOut,
@@ -437,6 +437,15 @@ mod tests {
         });
         assert_eq!(
             classify_vfs_error(&config_exhausted),
+            BridgeVfsErrorKind::DataCorruption
+        );
+
+        let object_exhausted = crate::VfsError::Fetch(crate::fetch::FetchError::Exhausted {
+            attempts: 1,
+            source: DataError::Object(studiofs_data::object::ObjectError::InvalidMagic),
+        });
+        assert_eq!(
+            classify_vfs_error(&object_exhausted),
             BridgeVfsErrorKind::DataCorruption
         );
 

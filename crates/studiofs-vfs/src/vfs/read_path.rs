@@ -7,6 +7,7 @@ use super::{
     VfsError, VfsResult,
 };
 use crate::VfsMeta;
+use crate::access::AccessClass;
 use crate::runtime::{run_local_cache_io, run_meta};
 use crate::utils::{IntervalRange, subtract_claimed_range};
 use bytes::Bytes;
@@ -227,6 +228,7 @@ struct DataReader<'a> {
     length: u64,
     pending_content_epoch: Option<u64>,
     resolved_regular_file_slices: Option<&'a [ResolvedSliceSpan]>,
+    allow_partial_remote_read: bool,
 }
 
 impl<'a> DataReader<'a> {
@@ -245,6 +247,7 @@ impl<'a> DataReader<'a> {
             length,
             pending_content_epoch,
             resolved_regular_file_slices,
+            allow_partial_remote_read: false,
         }
     }
 
@@ -264,10 +267,18 @@ impl<'a> DataReader<'a> {
             .filter_map(|claim| usize::try_from(claim.end.saturating_sub(self.offset)).ok())
             .max()
             .unwrap_or(0);
-        Self::fetch_missing_remote_blocks(self.vfs, &segments).await?;
-        let written = Self::assemble_into(self.vfs, self.offset, &segments, buffer)
-            .await?
-            .max(writer_stack_written);
+        if !self.allow_partial_remote_read {
+            Self::fetch_missing_remote_blocks(self.vfs, &segments).await?;
+        }
+        let written = Self::assemble_into(
+            self.vfs,
+            self.offset,
+            &segments,
+            buffer,
+            self.allow_partial_remote_read,
+        )
+        .await?
+        .max(writer_stack_written);
         Ok(written)
     }
 
@@ -883,6 +894,7 @@ impl<'a> DataReader<'a> {
         offset: u64,
         segments: &[ReadSegment],
         buffer: &mut [u8],
+        allow_partial_remote_read: bool,
     ) -> VfsResult<usize> {
         let mut written = 0usize;
         let mut index = 0usize;
@@ -973,6 +985,7 @@ impl<'a> DataReader<'a> {
                             &run_payload,
                             segment.range.start(),
                             dst,
+                            allow_partial_remote_read,
                         )
                         .await?;
                     }
@@ -1265,6 +1278,7 @@ impl<'a> DataReader<'a> {
         payload: &PayloadRef,
         file_offset: u64,
         dst: &mut [u8],
+        allow_partial_remote_read: bool,
     ) -> VfsResult<()> {
         let block_offset = usize::try_from(payload.offset).map_err(|_| {
             VfsError::Other(format!(
@@ -1306,6 +1320,31 @@ impl<'a> DataReader<'a> {
         }
 
         if !span_resolved {
+            if allow_partial_remote_read {
+                match vfs
+                    .fetch_payload_range_for_ref_after_local_miss(payload, dst.len())
+                    .await
+                {
+                    Ok(Some(data)) => {
+                        copy_partial_committed_payload_into(data.as_ref(), payload.object_id, dst)?;
+                        return Ok(());
+                    }
+                    Ok(None) => {}
+                    Err(crate::fetch::FetchError::NotFound { key }) => {
+                        warn!(
+                            object_id = payload.object_id,
+                            key,
+                            file_offset,
+                            block_offset = payload.offset,
+                            block_length = payload.length,
+                            "data_reader: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
+                        );
+                        dst.fill(0);
+                        return Ok(());
+                    }
+                    Err(error) => return Err(VfsError::Fetch(error)),
+                }
+            }
             match vfs.fetch_block_for_ref_after_local_miss(payload).await {
                 Ok(data) => {
                     vfs.copy_committed_payload_into_range(
@@ -2185,13 +2224,16 @@ impl StudioVfs {
         // I/O. A Kernel switch before this check shrinks the DataReader to the
         // original caller request; I/O already launched after a successful
         // check is allowed to finish.
+        let allow_partial_remote_read = access.class == AccessClass::RandomInteractiveRead
+            && speculative_read.is_none()
+            && planned_read_len <= crate::fetch::MAX_PARTIAL_FETCH_SIZE;
         let read_len = match speculative_read {
             Some((token, fallback_len)) if !self.read_ahead_token_is_current(token) => {
                 planned_read_len.min(fallback_len)
             }
             _ => planned_read_len,
         };
-        let data_reader = DataReader::new(
+        let mut data_reader = DataReader::new(
             self,
             ino,
             offset,
@@ -2199,6 +2241,7 @@ impl StudioVfs {
             prepared.context.pending_content_epoch,
             Some(prepared.resolved_slices.as_ref()),
         );
+        data_reader.allow_partial_remote_read = allow_partial_remote_read;
         let written = data_reader.read_into(buffer).await?;
 
         guard.record_bytes(written as u64);
@@ -2356,8 +2399,133 @@ impl StudioVfs {
     }
 }
 
+fn copy_partial_committed_payload_into(
+    data: &[u8],
+    object_id: u64,
+    dst: &mut [u8],
+) -> VfsResult<()> {
+    if data.len() != dst.len() {
+        return Err(VfsError::Other(format!(
+            "partial committed payload length mismatch: object_id={}, requested={}, received={}",
+            object_id,
+            dst.len(),
+            data.len()
+        )));
+    }
+    dst.copy_from_slice(data);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_partial_committed_payload_is_an_error() {
+        let mut dst = [0xAA; 4];
+
+        let error = super::copy_partial_committed_payload_into(&[1, 2, 3], 42, &mut dst)
+            .expect_err("short committed range must not be zero-filled");
+
+        assert!(matches!(error, super::VfsError::Other(_)));
+        assert_eq!(dst, [0xAA; 4]);
+    }
+
+    #[test]
+    fn cold_committed_read_fetches_only_requested_range_without_caching_payload() {
+        use opendal::{Operator, services::Memory};
+        use studiofs_data::object::{create_object_buffer, format_object_fragment_key};
+        use studiofs_data::store::DataStore;
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, mut vfs, meta) = make_unstarted_test_vfs(&tmp, "cold-partial-committed-read");
+        let config = VfsConfig::default();
+        let data_config = studiofs_data::store::DataStoreConfig::from(&test_format_info(
+            "cold-partial-committed-read",
+        ));
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let data_store = Arc::new(
+            DataStore::with_operator_for_test(&data_config, raw.clone())
+                .expect("construct encrypted test store"),
+        );
+        let scheduler = Arc::new(crate::fetch::FetchScheduler::new(
+            data_store.clone(),
+            vfs.cached_store.clone(),
+            crate::aimd::AimdConfig::fetch_default(),
+            0,
+            Arc::new(crate::qos::QosController::from_config(&config)),
+            crate::qos::TransitMemoryBudget::new(64 * 1024 * 1024),
+            &config,
+        ));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .fetch_scheduler = scheduler.clone();
+
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let object_id = 8_007;
+            let payload_offset = 2 * 1024 * 1024 + 123_u32;
+            let read_len = 37_usize;
+            let payload: Vec<u8> = (0..DEFAULT_BLOCK_SIZE)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            let key = format_object_fragment_key(
+                &format!("{}/objects", data_config.volume_name),
+                object_id,
+                0,
+            );
+            data_store
+                .put_by_key(
+                    &key,
+                    create_object_buffer(bytes::Bytes::from(payload.clone())).unwrap(),
+                )
+                .await
+                .expect("write encrypted test payload");
+
+            let ino = vfs
+                .create(ROOT_INO, b"cold-range.bin", 1000, 1000, 0o644)
+                .expect("create committed test file")
+                .ino;
+            let mut attr = meta.get_attr(ino).unwrap();
+            attr.size = payload.len() as u64;
+            attr.committed_size = attr.size;
+            attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&attr).unwrap();
+            meta.stage_payload_slice(
+                ino,
+                0,
+                &PayloadRef::new_partial(object_id, payload.len() as u32),
+            )
+            .expect("publish test payload reference");
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+            let out = vfs
+                .read(ino, u64::from(payload_offset), read_len as u32)
+                .await
+                .expect("cold committed range should be read successfully");
+
+            let expected_start = payload_offset as usize;
+            assert_eq!(
+                out.as_ref(),
+                &payload[expected_start..expected_start + read_len]
+            );
+            assert!(
+                vfs.cached_store.get(object_id).is_none(),
+                "a partial response must not be admitted as a complete cached object"
+            );
+            assert_eq!(
+                scheduler.metrics.s3_fetches.load(AtomicOrdering::Relaxed),
+                1,
+                "the cold read should issue one remote fragment request"
+            );
+            assert!(
+                scheduler
+                    .metrics
+                    .encrypted_bytes_read
+                    .load(AtomicOrdering::Relaxed)
+                    < raw.stat(&key).await.unwrap().content_length(),
+                "the actual VFS read must select frame-bounded remote transfer"
+            );
+        });
+    }
+
     #[test]
     fn semantic_invalidation_rejects_inflight_attribute_observation() {
         use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
@@ -2869,7 +3037,7 @@ mod tests {
             };
             let mut out = vec![0; data.len()];
 
-            DataReader::assemble_committed_payload_into(&vfs, &payload, 0, &mut out)
+            DataReader::assemble_committed_payload_into(&vfs, &payload, 0, &mut out, false)
                 .await
                 .expect("committed read should resolve the staged payload");
 
@@ -2960,7 +3128,7 @@ mod tests {
             };
             let mut out = vec![0; data.len()];
 
-            DataReader::assemble_into(&vfs, 0, &[segment], &mut out)
+            DataReader::assemble_into(&vfs, 0, &[segment], &mut out, false)
                 .await
                 .expect("pending extent read should resolve the staged payload");
 
@@ -2998,7 +3166,7 @@ mod tests {
             };
             let mut out = vec![0; data.len()];
 
-            DataReader::assemble_into(&vfs, 0, &[segment], &mut out)
+            DataReader::assemble_into(&vfs, 0, &[segment], &mut out, false)
                 .await
                 .expect("pending extent read should recover from staged payload");
 
@@ -4546,7 +4714,7 @@ mod tests {
             }];
             let mut buffer = [0_u8; 4];
             counting_backend.reset_counters();
-            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer)
+            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer, false)
                 .await
                 .expect("assemble data reader output");
             assert_eq!(written, 4);
@@ -4596,7 +4764,7 @@ mod tests {
             ];
             let mut buffer = [0_u8; 5];
             counting_backend.reset_counters();
-            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer)
+            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer, false)
                 .await
                 .expect("assemble data reader output");
 
@@ -4666,7 +4834,7 @@ mod tests {
                 .collect();
             let mut buffer = vec![0_u8; OBJECT_LEN * 3];
             counting_backend.reset_counters();
-            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer)
+            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer, false)
                 .await
                 .expect("assemble data reader output");
 

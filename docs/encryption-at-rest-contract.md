@@ -30,8 +30,12 @@ StudioFS encryption-at-rest is a remote object-store boundary feature:
    StudioFS remote object for that fragment.
 4. Object storage stores encrypted `SFEC` envelopes, not plaintext `STFS`
    objects.
-5. On remote fetch, StudioFS decrypts the object before passing plaintext bytes
-   to the existing object decoder and checksum validator.
+5. Full remote fetch decrypts the object before passing plaintext bytes to the
+   existing object decoder and checksum validator. Cold random foreground reads
+   of at most 256 KiB without a speculative read window
+   can instead fetch the SFEC header, authenticate the frame containing the
+   STFS header, and authenticate only the additional frames covering the payload
+   range. Frame offsets include the envelope header and each authentication tag.
 6. VFS, FUSE, WinFSP, writer stack, local cache, fetch scheduler, upload
    scheduler, and file streaming semantics remain transparent to callers.
 
@@ -40,6 +44,14 @@ whole user file. Current remote storage uses STFS fragment objects under
 `<volume>/objects/<ab>/<cd>/<object_id>/<block_index>` where each fragment is
 typically up to 4 MiB of raw payload plus the StudioFS object header. Each
 remote payload fragment is encrypted independently.
+
+Partial reads validate the authenticated STFS header and declared payload sizes.
+They rely on SFEC frame authentication for integrity; the whole-payload XXH64
+checksum is checked only by complete reads. Partial plaintext never populates
+the complete local payload cache or the complete-object singleflight broadcast.
+Prefetch and larger foreground reads keep complete fetch and cache population.
+The range reader always authenticates frame zero, so a middle read can require
+two frames even when the requested bytes fit in one frame.
 
 ## Plaintext And Ciphertext Boundaries
 

@@ -19,6 +19,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
 use opendal::ErrorKind;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,6 +39,7 @@ const BROADCAST_CAPACITY: usize = 2;
 /// Cap concurrent fragment GETs per logical object fetch to keep peak
 /// in-flight fragment memory bounded.
 const MAX_FRAGMENT_FETCH_IN_FLIGHT: usize = 8;
+pub(crate) const MAX_PARTIAL_FETCH_SIZE: usize = 256 * 1024;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Errors
@@ -450,6 +452,112 @@ impl FetchScheduler {
         .await
     }
 
+    /// Fetch a small payload range after a confirmed local-cache miss.
+    /// Partial reads never publish a complete-object singleflight result or cache entry.
+    pub async fn fetch_block_range_after_local_miss(
+        &self,
+        object_id: u64,
+        keys: &[String],
+        range: Range<u64>,
+    ) -> Result<Bytes, FetchError> {
+        let range_len =
+            range
+                .end
+                .checked_sub(range.start)
+                .ok_or_else(|| FetchError::CorruptFragment {
+                    object_id,
+                    reason: "partial payload range is reversed".to_string(),
+                })?;
+        if range_len == 0 || range_len > MAX_PARTIAL_FETCH_SIZE as u64 {
+            return Err(FetchError::CorruptFragment {
+                object_id,
+                reason: "partial payload range is empty or exceeds the limit".to_string(),
+            });
+        }
+        if let Some(payload) = self.payload_store_get_async(object_id).await? {
+            self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .cache_hit_bytes
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            return Ok(slice_payload_range(payload, &range));
+        }
+
+        // A partial read may reuse a complete fetch already in flight, but never
+        // registers itself in the full-object singleflight map.
+        let mut joined_full_fetch = false;
+        if let Some(mut rx) = self.inflight.get(&object_id).map(|entry| entry.subscribe()) {
+            joined_full_fetch = true;
+            self.metrics
+                .singleflight_joins
+                .fetch_add(1, Ordering::Relaxed);
+            if let Ok(Ok(BroadcastResult::Success(payload))) =
+                tokio::time::timeout(self.request_timeout, rx.recv()).await
+            {
+                return Ok(slice_payload_range(payload, &range));
+            }
+        }
+
+        // A full fetch may have populated cache while this partial read waited.
+        if joined_full_fetch && let Some(payload) = self.payload_store_get_async(object_id).await? {
+            self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .cache_hit_bytes
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            return Ok(slice_payload_range(payload, &range));
+        }
+
+        let budget_bytes = fetch_transit_budget_bytes(keys.len());
+        let budget_limit = self.transit_memory_budget.budget_bytes();
+        if budget_bytes > budget_limit {
+            return Err(FetchError::TransitBudgetTooSmall {
+                required_bytes: budget_bytes,
+                budget_bytes: budget_limit,
+            });
+        }
+        let _transit_credit = self
+            .transit_memory_budget
+            .acquire_foreground(budget_bytes)
+            .await;
+
+        let fragment_index =
+            usize::try_from(range.start / CLOUD_FRAGMENT_SIZE as u64).map_err(|_| {
+                FetchError::CorruptFragment {
+                    object_id,
+                    reason: "partial payload fragment index does not fit usize".to_string(),
+                }
+            })?;
+        let fragment_start = (fragment_index as u64) * CLOUD_FRAGMENT_SIZE as u64;
+        let local_range = (range.start - fragment_start)..(range.end - fragment_start);
+        if local_range.end > CLOUD_FRAGMENT_SIZE as u64 {
+            return Err(FetchError::CorruptFragment {
+                object_id,
+                reason: "partial payload range crosses a cloud fragment boundary".to_string(),
+            });
+        }
+        let key = keys
+            .get(fragment_index)
+            .ok_or_else(|| FetchError::CorruptFragment {
+                object_id,
+                reason: "partial payload range refers to a missing cloud fragment".to_string(),
+            })?;
+        let payload = self
+            .fetch_fragment_with_retry(
+                object_id,
+                fragment_index,
+                key,
+                FetchClass::Foreground,
+                Some(local_range),
+            )
+            .await?;
+        if payload.len() as u64 > range_len {
+            return Err(FetchError::CorruptFragment {
+                object_id,
+                reason: "partial payload fetch returned more bytes than requested".to_string(),
+            });
+        }
+        Ok(payload)
+    }
+
     /// Best-effort prefetch fetch.
     ///
     /// Uses the same singleflight map as foreground reads but never consumes
@@ -759,7 +867,7 @@ impl FetchScheduler {
 
         if let [key] = keys {
             let payload = self
-                .fetch_fragment_with_retry(object_id, 0, key, class)
+                .fetch_fragment_with_retry(object_id, 0, key, class, None)
                 .await?;
             validate_single_fragment_payload_len(object_id, payload.len())?;
             let cache_put_start = Instant::now();
@@ -775,7 +883,7 @@ impl FetchScheduler {
         let fragment_window = keys.len().min(MAX_FRAGMENT_FETCH_IN_FLIGHT);
         let mut in_flight = futures::stream::iter(keys.iter().cloned().enumerate())
             .map(|(fragment_index, key)| async move {
-                self.fetch_fragment_with_retry(object_id, fragment_index, &key, class)
+                self.fetch_fragment_with_retry(object_id, fragment_index, &key, class, None)
                     .await
                     .map(|part| (fragment_index, part))
             })
@@ -882,6 +990,7 @@ impl FetchScheduler {
         fragment_index: usize,
         key: &str,
         class: FetchClass,
+        payload_range: Option<Range<u64>>,
     ) -> Result<Bytes, FetchError> {
         let mut last_err: Option<DataError> = None;
         let overall_start = Instant::now();
@@ -938,10 +1047,16 @@ impl FetchScheduler {
             // Hard timeout per request — prevents runaway waits from
             // blocking WinFSP/FUSE dispatch threads indefinitely.
             let req_start = Instant::now();
-            let get_result = tokio::time::timeout(
-                self.request_timeout,
-                self.data_store.get_by_key_with_stats(key),
-            )
+            let get_result = tokio::time::timeout(self.request_timeout, async {
+                match &payload_range {
+                    Some(range) => self
+                        .data_store
+                        .get_payload_range_by_key_with_stats(key, range.clone())
+                        .await
+                        .map(|(payload, stats)| (opendal::Buffer::from(payload), stats)),
+                    None => self.data_store.get_by_key_with_stats(key).await,
+                }
+            })
             .await;
             let req_elapsed = req_start.elapsed();
             let req_ms = duration_to_millis_u64(req_elapsed);
@@ -972,11 +1087,15 @@ impl FetchScheduler {
                         "S3 GET ok"
                     );
 
-                    // Decode STFS object payload.
-                    let decode_start = Instant::now();
-                    let payload = read_object(compressed);
-                    self.record_object_decode(decode_start.elapsed());
-                    let payload = payload?;
+                    let payload = if payload_range.is_some() {
+                        compressed.to_bytes()
+                    } else {
+                        // Decode STFS object payload.
+                        let decode_start = Instant::now();
+                        let payload = read_object(compressed);
+                        self.record_object_decode(decode_start.elapsed());
+                        payload?
+                    };
                     return Ok(payload);
                 }
                 Ok(Err(e)) => {
@@ -1216,6 +1335,17 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(duration_to_millis_u64)
         .unwrap_or(0)
+}
+
+fn slice_payload_range(payload: Bytes, range: &Range<u64>) -> Bytes {
+    let start = usize::try_from(range.start).unwrap_or(usize::MAX);
+    if start >= payload.len() {
+        return Bytes::new();
+    }
+    let end = usize::try_from(range.end)
+        .unwrap_or(usize::MAX)
+        .min(payload.len());
+    payload.slice(start..end)
 }
 
 fn fetch_transit_budget_bytes(fragment_count: usize) -> usize {
@@ -1641,6 +1771,46 @@ mod tests {
             expected
         );
         assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_small_range_fetches_only_requested_payload_and_does_not_cache_partial() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (scheduler, raw, cached_store, config) =
+            make_encrypted_fetch_scheduler(&tmp, "cold-small-range");
+        let object_id = 0x3538;
+        let key = fragment_key(&config, object_id, 0);
+        let expected = Bytes::from(
+            (0..3 * 1024 * 1024)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let remote = put_encrypted_fragment(&scheduler, &raw, &key, expected.clone()).await;
+        let range = (2 * 1024 * 1024 + 37) as u64..(2 * 1024 * 1024 + 101) as u64;
+
+        let fetched = scheduler
+            .fetch_block_range_after_local_miss(
+                object_id,
+                std::slice::from_ref(&key),
+                range.clone(),
+            )
+            .await
+            .expect("cold partial fetch should authenticate the requested range");
+
+        assert_eq!(
+            fetched,
+            expected.slice(range.start as usize..range.end as usize)
+        );
+        assert!(cached_store.get(object_id).is_none());
+        assert!(!scheduler.inflight.contains_key(&object_id));
+        assert!(
+            scheduler
+                .metrics
+                .encrypted_bytes_read
+                .load(Ordering::Relaxed)
+                < remote.len() as u64,
+            "frame range read should transfer less ciphertext than the complete STFS object"
+        );
     }
 
     #[tokio::test]

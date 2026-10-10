@@ -1,13 +1,17 @@
 //! DataStore — S3 storage abstraction via OpenDAL.
 
 use crate::crypto::{self, ObjectCipher, VolumeMasterKey};
+use crate::envelope::{SFEC_HEADER_FIXED_LEN, SfecHeader};
+use crate::object::{ObjectHeader, validate_object_payload_size};
 use crate::snapshot_key::{SnapshotArtifactKey, SnapshotArtifactPrefix};
+use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Buffer, EntryMode, Operator, services::S3};
 use std::collections::HashSet;
 use std::fmt;
 use std::net::Ipv6Addr;
+use std::ops::Range;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use studiofs_meta::{EncryptionConfig, FormatInfo};
@@ -39,6 +43,10 @@ pub enum DataError {
     #[error("crypto error: {0}")]
     Crypto(#[from] crypto::CryptoError),
 
+    /// The authenticated plaintext object has invalid STFS metadata.
+    #[error("object error: {0}")]
+    Object(#[from] crate::object::ObjectError),
+
     /// A maintenance key is outside the configured volume or contains path-like segments.
     #[error("invalid object key: {0}")]
     InvalidObjectKey(String),
@@ -61,6 +69,7 @@ impl DataError {
             Self::InvalidEndpoint(_)
             | Self::InvalidCryptoConfig(_)
             | Self::Crypto(_)
+            | Self::Object(_)
             | Self::InvalidObjectKey(_)
             | Self::CryptoWorkerJoin(_) => false,
         }
@@ -93,7 +102,7 @@ pub struct RemoteObjectWriteStats {
 pub struct RemoteObjectReadStats {
     /// Ciphertext SFEC bytes read from the remote object store.
     pub encrypted_bytes: u64,
-    /// Plaintext STFS object bytes returned at the DataStore boundary.
+    /// Plaintext bytes returned: a complete STFS object or a requested payload range.
     pub plaintext_bytes: u64,
 }
 
@@ -735,6 +744,110 @@ impl DataStore {
         ))
     }
 
+    /// Read a payload range by opening only the SFEC frames that cover it.
+    ///
+    /// Frame zero is also authenticated to validate the STFS header. No complete
+    /// payload checksum or cache entry can be produced from these partial bytes.
+    /// Requests past the authenticated payload length return a short read.
+    pub async fn get_payload_range_by_key_with_stats(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> DataResult<(Bytes, RemoteObjectReadStats)> {
+        let invalid_range = || DataError::Crypto(crypto::CryptoError::FrameLayoutOverflow);
+        if range.start >= range.end || range.end > u64::from(crate::object::MAX_OBJECT_SIZE) {
+            return Err(invalid_range());
+        }
+        let fixed = self
+            .op
+            .read_with(key)
+            .range(0..SFEC_HEADER_FIXED_LEN as u64)
+            .await?
+            .to_bytes();
+        let header_len =
+            SfecHeader::serialized_len_from_prefix(&fixed).map_err(crypto::CryptoError::from)?;
+        let tail = self
+            .op
+            .read_with(key)
+            .range(SFEC_HEADER_FIXED_LEN as u64..header_len as u64)
+            .await?;
+        let mut header_bytes = Vec::with_capacity(header_len);
+        header_bytes.extend_from_slice(&fixed);
+        header_bytes.extend_from_slice(&tail.to_bytes());
+        let header_bytes = Bytes::from(header_bytes);
+        let header = SfecHeader::parse(header_bytes.clone()).map_err(crypto::CryptoError::from)?;
+        let plaintext_len = header.plaintext_len();
+        if plaintext_len < ObjectHeader::SIZE as u64
+            || plaintext_len > crate::object::CLOUD_FRAGMENT_SIZE as u64 + ObjectHeader::SIZE as u64
+        {
+            return Err(invalid_range());
+        }
+        let first_end = u64::from(header.frame_size())
+            .max(ObjectHeader::SIZE as u64)
+            .min(plaintext_len);
+        let first_cipher_range = header
+            .ciphertext_range(0..first_end)
+            .map_err(crypto::CryptoError::from)?;
+        let first_ciphertext = self.op.read_with(key).range(first_cipher_range).await?;
+        let mut encrypted_bytes = header_bytes.len() as u64 + first_ciphertext.len() as u64;
+        let first = self
+            .decrypt_payload_range(key, header_bytes.clone(), first_ciphertext, 0..first_end)
+            .await?;
+        let object_header = ObjectHeader::from_bytes(&first)?;
+        let payload_len = usize::try_from(plaintext_len - ObjectHeader::SIZE as u64)
+            .map_err(|_| invalid_range())?;
+        validate_object_payload_size(&object_header, payload_len)?;
+
+        let start = range.start.min(payload_len as u64) + ObjectHeader::SIZE as u64;
+        let end = range.end.min(payload_len as u64) + ObjectHeader::SIZE as u64;
+        let payload = if start == end {
+            Bytes::new()
+        } else if end <= first_end {
+            first.slice(start as usize..end as usize)
+        } else {
+            let remaining_start = start.max(first_end);
+            let ciphertext_range = header
+                .ciphertext_range(remaining_start..end)
+                .map_err(crypto::CryptoError::from)?;
+            let ciphertext = self.op.read_with(key).range(ciphertext_range).await?;
+            encrypted_bytes += ciphertext.len() as u64;
+            let remaining = self
+                .decrypt_payload_range(key, header_bytes, ciphertext, remaining_start..end)
+                .await?;
+            if start >= first_end {
+                remaining
+            } else {
+                let mut payload = Vec::with_capacity((end - start) as usize);
+                payload.extend_from_slice(&first[start as usize..first_end as usize]);
+                payload.extend_from_slice(&remaining);
+                Bytes::from(payload)
+            }
+        };
+        let stats = RemoteObjectReadStats {
+            encrypted_bytes,
+            plaintext_bytes: payload.len() as u64,
+        };
+        Ok((payload, stats))
+    }
+
+    async fn decrypt_payload_range(
+        &self,
+        key: &str,
+        header_bytes: Bytes,
+        ciphertext: Buffer,
+        range: Range<u64>,
+    ) -> DataResult<Bytes> {
+        let key = key.to_owned();
+        let crypto = self.crypto.clone();
+        run_crypto_blocking(&CRYPTO_ADMISSION, 1, move |_| {
+            crypto
+                .cipher
+                .decrypt_range(header_bytes, ciphertext, &key, range)
+                .map_err(DataError::from)
+        })
+        .await
+    }
+
     /// Delete a generic object from S3.
     pub async fn delete_object(&self, object_id: &str) -> DataResult<()> {
         let key = self.object_key(object_id);
@@ -871,6 +984,141 @@ mod tests {
     use opendal::services::Memory;
     use std::thread;
     use studiofs_meta::EncryptionConfig;
+
+    #[tokio::test]
+    async fn payload_range_reads_bound_transfer_and_preserve_frame_boundaries() {
+        use crate::envelope::DEFAULT_SFEC_FRAME_SIZE;
+        use crate::object::CLOUD_FRAGMENT_SIZE;
+
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+        let key = "unit-volume/objects/aa/bb/range-object";
+        let payload = Bytes::from(
+            (0..CLOUD_FRAGMENT_SIZE)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        store
+            .put_by_key(key, create_object_buffer(payload.clone()).unwrap())
+            .await
+            .unwrap();
+        let complete_remote_len = raw.stat(key).await.unwrap().content_length();
+        let boundary = DEFAULT_SFEC_FRAME_SIZE as u64 - ObjectHeader::SIZE as u64;
+        for range in [
+            0..4096,
+            boundary..boundary + 4096,
+            boundary - 100..boundary + 100,
+            CLOUD_FRAGMENT_SIZE as u64 - 100..CLOUD_FRAGMENT_SIZE as u64,
+            CLOUD_FRAGMENT_SIZE as u64 - 100..CLOUD_FRAGMENT_SIZE as u64 + 100,
+        ] {
+            let (bytes, stats) = store
+                .get_payload_range_by_key_with_stats(key, range.clone())
+                .await
+                .unwrap();
+            let end = (range.end as usize).min(payload.len());
+            assert_eq!(
+                bytes,
+                payload.slice(range.start as usize..end),
+                "range {range:?}"
+            );
+            assert_eq!(stats.plaintext_bytes, bytes.len() as u64);
+            assert!(
+                stats.encrypted_bytes < complete_remote_len,
+                "range {range:?}: {stats:?}"
+            );
+            assert!(stats.encrypted_bytes <= 2 * DEFAULT_SFEC_FRAME_SIZE as u64 + 512);
+        }
+        let (bytes, _) = store
+            .get_payload_range_by_key_with_stats(
+                key,
+                CLOUD_FRAGMENT_SIZE as u64..CLOUD_FRAGMENT_SIZE as u64 + 100,
+            )
+            .await
+            .unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(
+            read_object(store.get_by_key(key).await.unwrap()).unwrap(),
+            payload
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_range_authenticates_header_and_requested_frames_only() {
+        use crate::envelope::{DEFAULT_SFEC_FRAME_SIZE, SfecEnvelope};
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+        let key = "unit-volume/objects/aa/bb/range-tamper";
+        let payload = Bytes::from(vec![42; 4 * DEFAULT_SFEC_FRAME_SIZE]);
+        store
+            .put_by_key(key, create_object_buffer(payload).unwrap())
+            .await
+            .unwrap();
+        let original = raw.read(key).await.unwrap().to_bytes();
+        let envelope = SfecEnvelope::parse(original.clone()).unwrap();
+        let header_len = envelope.header_bytes().len();
+        let second_frame = header_len + DEFAULT_SFEC_FRAME_SIZE + 16;
+        let mut tampered = original.to_vec();
+        tampered[second_frame] ^= 1;
+        raw.write(key, tampered).await.unwrap();
+        assert!(matches!(
+            store
+                .get_payload_range_by_key_with_stats(
+                    key,
+                    DEFAULT_SFEC_FRAME_SIZE as u64..DEFAULT_SFEC_FRAME_SIZE as u64 + 4096
+                )
+                .await,
+            Err(DataError::Crypto(crypto::CryptoError::AuthenticationFailed))
+        ));
+        assert_eq!(
+            store
+                .get_payload_range_by_key_with_stats(key, 0..4096)
+                .await
+                .unwrap()
+                .0,
+            Bytes::from(vec![42; 4096])
+        );
+        assert!(store.get_by_key(key).await.is_err());
+
+        let mut tampered = original.to_vec();
+        tampered[header_len] ^= 1;
+        raw.write(key, tampered).await.unwrap();
+        assert!(matches!(
+            store
+                .get_payload_range_by_key_with_stats(
+                    key,
+                    DEFAULT_SFEC_FRAME_SIZE as u64..DEFAULT_SFEC_FRAME_SIZE as u64 + 4096
+                )
+                .await,
+            Err(DataError::Crypto(crypto::CryptoError::AuthenticationFailed))
+        ));
+    }
+
+    #[tokio::test]
+    async fn payload_range_rejects_invalid_stfs_sizes_and_request_bounds() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
+        let key = "unit-volume/objects/aa/bb/range-invalid";
+        let mut stfs = create_object_buffer(Bytes::from_static(b"payload"))
+            .unwrap()
+            .to_bytes()
+            .to_vec();
+        stfs[8..12].copy_from_slice(&99u32.to_le_bytes());
+        store.put_by_key(key, stfs).await.unwrap();
+        assert!(matches!(
+            store.get_payload_range_by_key_with_stats(key, 0..3).await,
+            Err(DataError::Object(
+                crate::object::ObjectError::SizeMismatch { .. }
+            ))
+        ));
+        for range in [0..0, Range { start: 2, end: 1 }, 0..u64::MAX] {
+            assert!(matches!(
+                store.get_payload_range_by_key_with_stats(key, range).await,
+                Err(DataError::Crypto(crypto::CryptoError::FrameLayoutOverflow))
+            ));
+        }
+    }
 
     fn encrypted_test_config() -> DataStoreConfig {
         DataStoreConfig {
