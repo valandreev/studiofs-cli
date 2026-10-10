@@ -54,6 +54,15 @@ pub enum DataError {
     /// Dedicated crypto worker failed before returning an encryption result.
     #[error("crypto worker join error: {0}")]
     CryptoWorkerJoin(#[from] task::JoinError),
+
+    /// A caller-requested payload range is empty, reversed, or beyond the object size limit.
+    #[error("invalid payload range {start}..{end}")]
+    InvalidRange {
+        /// Requested inclusive start offset.
+        start: u64,
+        /// Requested exclusive end offset.
+        end: u64,
+    },
 }
 
 impl DataError {
@@ -71,6 +80,7 @@ impl DataError {
             | Self::Crypto(_)
             | Self::Object(_)
             | Self::InvalidObjectKey(_)
+            | Self::InvalidRange { .. }
             | Self::CryptoWorkerJoin(_) => false,
         }
     }
@@ -754,9 +764,13 @@ impl DataStore {
         key: &str,
         range: Range<u64>,
     ) -> DataResult<(Bytes, RemoteObjectReadStats)> {
+        // Caller-range errors are not corruption; envelope-derived failures below stay corrupt.
         let invalid_range = || DataError::Crypto(crypto::CryptoError::FrameLayoutOverflow);
         if range.start >= range.end || range.end > u64::from(crate::object::MAX_OBJECT_SIZE) {
-            return Err(invalid_range());
+            return Err(DataError::InvalidRange {
+                start: range.start,
+                end: range.end,
+            });
         }
         let fixed = self
             .op
@@ -770,7 +784,7 @@ impl DataStore {
         if plaintext_len < ObjectHeader::SIZE as u64
             || plaintext_len > crate::object::CLOUD_FRAGMENT_SIZE as u64 + ObjectHeader::SIZE as u64
         {
-            return Err(invalid_range());
+            return Err(crypto::CryptoError::from(SfecError::InvalidRange).into());
         }
         let first_end = u64::from(layout.frame_size())
             .max(ObjectHeader::SIZE as u64)
@@ -1157,11 +1171,20 @@ mod tests {
                 crate::object::ObjectError::SizeMismatch { .. }
             ))
         ));
-        for range in [0..0, Range { start: 2, end: 1 }, 0..u64::MAX] {
+        for (range, start, end) in [
+            (0..0, 0, 0),
+            (Range { start: 2, end: 1 }, 2, 1),
+            (0..u64::MAX, 0, u64::MAX),
+        ] {
+            let err = store
+                .get_payload_range_by_key_with_stats(key, range)
+                .await
+                .unwrap_err();
             assert!(matches!(
-                store.get_payload_range_by_key_with_stats(key, range).await,
-                Err(DataError::Crypto(crypto::CryptoError::FrameLayoutOverflow))
+                err,
+                DataError::InvalidRange { start: s, end: e } if s == start && e == end
             ));
+            assert!(!err.is_retryable());
         }
     }
 

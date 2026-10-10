@@ -85,6 +85,17 @@ pub enum FetchError {
         reason: String,
     },
 
+    /// Caller requested a payload range that is reversed, empty, oversized, or crosses a fragment.
+    #[error("invalid payload range {start}..{end} for object {object_id}")]
+    InvalidRange {
+        /// Object identifier the caller requested.
+        object_id: u64,
+        /// Requested inclusive start offset.
+        start: u64,
+        /// Requested exclusive end offset.
+        end: u64,
+    },
+
     /// Transit-memory budget was insufficient to stage in-flight fragment buffers.
     #[error(
         "transit memory budget too small: required={required_bytes} bytes, budget={budget_bytes} bytes"
@@ -461,19 +472,18 @@ impl FetchScheduler {
         keys: &[String],
         range: Range<u64>,
     ) -> Result<Bytes, FetchError> {
-        let range_len =
-            range
-                .end
-                .checked_sub(range.start)
-                .ok_or_else(|| FetchError::CorruptFragment {
-                    object_id,
-                    reason: "partial payload range is reversed".to_string(),
-                })?;
+        // Caller-range errors are not remote corruption; they fail before any remote attempt.
+        let invalid_range = || FetchError::InvalidRange {
+            object_id,
+            start: range.start,
+            end: range.end,
+        };
+        let range_len = range
+            .end
+            .checked_sub(range.start)
+            .ok_or_else(invalid_range)?;
         if range_len == 0 || range_len > MAX_PARTIAL_FETCH_SIZE as u64 {
-            return Err(FetchError::CorruptFragment {
-                object_id,
-                reason: "partial payload range is empty or exceeds the limit".to_string(),
-            });
+            return Err(invalid_range());
         }
         let cached_range = async || -> Result<Option<Bytes>, FetchError> {
             let Some(payload) = self.payload_store_get_async(object_id).await? else {
@@ -534,10 +544,7 @@ impl FetchScheduler {
         let fragment_start = (fragment_index as u64) * CLOUD_FRAGMENT_SIZE as u64;
         let local_range = (range.start - fragment_start)..(range.end - fragment_start);
         if local_range.end > CLOUD_FRAGMENT_SIZE as u64 {
-            return Err(FetchError::CorruptFragment {
-                object_id,
-                reason: "partial payload range crosses a cloud fragment boundary".to_string(),
-            });
+            return Err(invalid_range());
         }
         let key = keys
             .get(fragment_index)
@@ -1869,6 +1876,33 @@ mod tests {
                 < remote.len() as u64,
             "frame range read should transfer less ciphertext than the complete STFS object"
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_caller_ranges_fail_without_remote_attempt() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (scheduler, _, _, config) =
+            make_encrypted_fetch_scheduler(&tmp, "invalid-caller-range");
+        let object_id = 0x3541;
+        let key = fragment_key(&config, object_id, 0);
+        // Start, end pairs: reversed, empty, over MAX_PARTIAL_FETCH_SIZE (262144), crossing a 4 MiB fragment.
+        for (start, end) in [(5u64, 2u64), (3, 3), (0, 262_145), (4_194_300, 4_194_308)] {
+            let err = scheduler
+                .fetch_block_range_after_local_miss(
+                    object_id,
+                    std::slice::from_ref(&key),
+                    start..end,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                FetchError::InvalidRange { object_id: 0x3541, start: s, end: e }
+                    if s == start && e == end
+            ));
+        }
+        assert_eq!(scheduler.metrics.s3_get_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
