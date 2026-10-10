@@ -26,6 +26,7 @@ test*.txt
 /.kilocode/*
 /.qwen/*
 .worktrees/
+/.claude/
 deslop*.txt
 .rwx/bin/
 .codebase-memory/
