@@ -137,6 +137,18 @@ impl ObjectCipher {
         storage_key: &str,
         key_id: u32,
     ) -> Result<Buffer, CryptoError> {
+        self.encrypt_object_with_workers(plaintext, storage_key, key_id, 1)
+    }
+
+    /// Like [`Self::encrypt_object`], sealing independent frames on up to
+    /// `workers` threads. The output format is identical for any count.
+    pub fn encrypt_object_with_workers(
+        &self,
+        plaintext: impl Buf,
+        storage_key: &str,
+        key_id: u32,
+        workers: usize,
+    ) -> Result<Buffer, CryptoError> {
         let context = ObjectEncryptionContext {
             volume_uuid: &self.volume_uuid,
             storage_key,
@@ -174,6 +186,7 @@ impl ObjectCipher {
             &header_bytes,
             key_id,
             context,
+            workers,
         )?;
 
         SfecEnvelope::serialize_buffer(&header, Bytes::from(ciphertext)).map_err(CryptoError::from)
@@ -187,6 +200,17 @@ impl ObjectCipher {
         &self,
         envelope: impl Into<Buffer>,
         storage_key: &str,
+    ) -> Result<Bytes, CryptoError> {
+        self.decrypt_object_with_workers(envelope, storage_key, 1)
+    }
+
+    /// Like [`Self::decrypt_object`], opening independent frames on up to
+    /// `workers` threads.
+    pub fn decrypt_object_with_workers(
+        &self,
+        envelope: impl Into<Buffer>,
+        storage_key: &str,
+        workers: usize,
     ) -> Result<Bytes, CryptoError> {
         let context = ObjectEncryptionContext {
             volume_uuid: &self.volume_uuid,
@@ -219,9 +243,9 @@ impl ObjectCipher {
             dek_bytes,
             &data_nonce_prefix,
             envelope.header_bytes(),
-            header.key_id(),
             context,
             header,
+            workers,
         )
     }
 }
@@ -247,35 +271,43 @@ fn encrypt_frames(
     header_bytes: &[u8],
     key_id: u32,
     context: ObjectEncryptionContext<'_>,
+    workers: usize,
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(dek));
+    let tag_len = SfecAlgorithm::XChaCha20Poly1305V1.tag_len();
     let plaintext_len = plaintext.remaining();
     let frame_count = plaintext_len.div_ceil(DEFAULT_ENCRYPTION_FRAME_SIZE);
     let output_len = plaintext_len
         .checked_add(
             frame_count
-                .checked_mul(SfecAlgorithm::XChaCha20Poly1305V1.tag_len())
+                .checked_mul(tag_len)
                 .ok_or(CryptoError::FrameLayoutOverflow)?,
         )
         .ok_or(CryptoError::FrameLayoutOverflow)?;
     let mut output = Vec::with_capacity(output_len);
-    let mut aad = frame_aad_base(key_id, context, header_bytes)?;
-    let aad_base_len = aad.len();
-
-    for frame_index in 0..frame_count {
-        let frame_index =
-            u32::try_from(frame_index).map_err(|_| CryptoError::FrameLayoutOverflow)?;
-        let nonce = data_nonce(data_nonce_prefix, frame_index);
-        set_frame_aad(&mut aad, aad_base_len, frame_index);
-
-        let start = output.len();
+    // Lay out `body || tag slot` per frame, then seal the frames in place.
+    while plaintext.has_remaining() {
         let frame_len = plaintext.remaining().min(DEFAULT_ENCRYPTION_FRAME_SIZE);
         output.put((&mut plaintext).take(frame_len));
-        let tag = cipher
-            .encrypt_in_place_detached(XNonce::from_slice(&nonce), &aad, &mut output[start..])
-            .map_err(|_| CryptoError::AuthenticationFailed)?;
-        output.extend_from_slice(&tag);
+        output.put_bytes(0, tag_len);
     }
+    let aad_base = frame_aad_base(key_id, context, header_bytes)?;
+
+    for_each_frame(
+        &mut output,
+        DEFAULT_ENCRYPTION_FRAME_SIZE + tag_len,
+        workers,
+        &aad_base,
+        |frame_index, aad, frame| {
+            let nonce = data_nonce(data_nonce_prefix, frame_index);
+            let (body, tag_slot) = frame.split_at_mut(frame.len() - tag_len);
+            let tag = cipher
+                .encrypt_in_place_detached(XNonce::from_slice(&nonce), aad, body)
+                .map_err(|_| CryptoError::AuthenticationFailed)?;
+            tag_slot.copy_from_slice(&tag);
+            Ok(())
+        },
+    )?;
 
     Ok(output)
 }
@@ -285,17 +317,18 @@ fn decrypt_frames(
     dek: &[u8; KEY_LEN],
     data_nonce_prefix: &[u8; DATA_NONCE_PREFIX_LEN],
     header_bytes: &[u8],
-    key_id: u32,
     context: ObjectEncryptionContext<'_>,
     header: &SfecHeader,
+    workers: usize,
 ) -> Result<Bytes, CryptoError> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(dek));
     let plaintext_len =
         usize::try_from(header.plaintext_len()).map_err(|_| CryptoError::FrameLayoutOverflow)?;
     let mut plaintext = Vec::with_capacity(plaintext_len);
-    let mut aad = frame_aad_base(key_id, context, header_bytes)?;
-    let aad_base_len = aad.len();
+    let mut tags = Vec::with_capacity(header.frame_count() as usize);
 
+    // Validate the layout and gather bodies and tags sequentially; both may
+    // straddle Buffer chunks.
     for frame_index in 0..header.frame_count() {
         let frame_len = header
             .encrypted_frame_len(frame_index)
@@ -306,29 +339,87 @@ fn decrypt_frames(
         let body_len = frame_len
             .checked_sub(SfecAlgorithm::XChaCha20Poly1305V1.tag_len())
             .ok_or(CryptoError::FrameLayoutOverflow)?;
-        let nonce = data_nonce(data_nonce_prefix, frame_index);
-        set_frame_aad(&mut aad, aad_base_len, frame_index);
-
-        // Frame body and tag may straddle Buffer chunks; copy them per frame.
-        let start = plaintext.len();
         plaintext.put(Buf::take(&mut ciphertext, body_len));
         let mut tag = Tag::default();
         ciphertext.copy_to_slice(&mut tag);
-        cipher
-            .decrypt_in_place_detached(
-                XNonce::from_slice(&nonce),
-                &aad,
-                &mut plaintext[start..],
-                &tag,
-            )
-            .map_err(|_| CryptoError::AuthenticationFailed)?;
+        tags.push(tag);
     }
 
     if ciphertext.has_remaining() {
         return Err(CryptoError::FrameLayoutOverflow);
     }
 
+    let aad_base = frame_aad_base(header.key_id(), context, header_bytes)?;
+    let tags = tags.as_slice();
+    for_each_frame(
+        &mut plaintext,
+        DEFAULT_ENCRYPTION_FRAME_SIZE,
+        workers,
+        &aad_base,
+        |frame_index, aad, frame| {
+            let nonce = data_nonce(data_nonce_prefix, frame_index);
+            let tag = tags
+                .get(frame_index as usize)
+                .ok_or(CryptoError::FrameLayoutOverflow)?;
+            cipher
+                .decrypt_in_place_detached(XNonce::from_slice(&nonce), aad, frame, tag)
+                .map_err(|_| CryptoError::AuthenticationFailed)
+        },
+    )?;
+
     Ok(Bytes::from(plaintext))
+}
+
+/// Run `seal` over each `stride`-sized frame of `buffer` on up to `workers`
+/// scoped threads, each owning a contiguous run of frames and its own AAD.
+///
+/// The caller must already hold admission for `workers` CPU slots.
+fn for_each_frame<F>(
+    buffer: &mut [u8],
+    stride: usize,
+    workers: usize,
+    aad_base: &[u8],
+    seal: F,
+) -> Result<(), CryptoError>
+where
+    F: Fn(u32, &[u8], &mut [u8]) -> Result<(), CryptoError> + Sync,
+{
+    let run = |first_frame: usize, frames: &mut [u8]| {
+        let mut aad = aad_base.to_vec();
+        for (offset, frame) in frames.chunks_mut(stride).enumerate() {
+            let frame_index = u32::try_from(first_frame + offset)
+                .map_err(|_| CryptoError::FrameLayoutOverflow)?;
+            set_frame_aad(&mut aad, aad_base.len(), frame_index);
+            seal(frame_index, &aad, frame)?;
+        }
+        Ok(())
+    };
+
+    let frame_count = buffer.len().div_ceil(stride);
+    let workers = workers.clamp(1, frame_count.max(1));
+    if workers == 1 {
+        return run(0, buffer);
+    }
+    let frames_per_worker = frame_count.div_ceil(workers);
+    let (first, rest) = buffer.split_at_mut(stride * frames_per_worker);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = rest
+            .chunks_mut(stride * frames_per_worker)
+            .enumerate()
+            .map(|(group, frames)| {
+                scope.spawn(move || run((group + 1) * frames_per_worker, frames))
+            })
+            .collect();
+        // The calling thread seals the first group itself.
+        let mut result = run(0, first);
+        for handle in handles {
+            let joined = handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            result = result.and(joined);
+        }
+        result
+    })
 }
 
 fn encrypt_with_key(
@@ -469,6 +560,56 @@ mod tests {
         for input in [Buffer::from(envelope.clone()), fragment(&envelope)] {
             let plaintext = cipher().decrypt_object(input, OBJECT_KEY).unwrap();
             assert_eq!(plaintext.as_ref(), b"historical sfec payload");
+        }
+    }
+
+    #[test]
+    fn worker_count_does_not_change_frame_format_or_compatibility() {
+        for size in [
+            0,
+            1,
+            3 * DEFAULT_ENCRYPTION_FRAME_SIZE + 17,
+            4 * 1024 * 1024,
+        ] {
+            let plaintext = Bytes::from_iter((0..size).map(|idx| (idx % 251) as u8));
+            let sequential = encrypt(&plaintext, OBJECT_KEY);
+            for workers in [2, 3, 4, 8] {
+                let parallel = cipher()
+                    .encrypt_object_with_workers(fragment(&plaintext), OBJECT_KEY, KEY_ID, workers)
+                    .unwrap()
+                    .to_bytes();
+                assert_eq!(parallel.len(), sequential.len(), "size {size}");
+                // Parallel output decrypts sequentially and vice versa.
+                assert_eq!(
+                    cipher().decrypt_object(parallel, OBJECT_KEY).unwrap(),
+                    plaintext
+                );
+                assert_eq!(
+                    cipher()
+                        .decrypt_object_with_workers(fragment(&sequential), OBJECT_KEY, workers)
+                        .unwrap(),
+                    plaintext,
+                    "size {size} workers {workers}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_decrypt_rejects_tampering_in_any_frame() {
+        let ciphertext = encrypt(&vec![0xC3; 4 * DEFAULT_ENCRYPTION_FRAME_SIZE], OBJECT_KEY);
+        let header_len = SfecEnvelope::parse(ciphertext.clone())
+            .unwrap()
+            .header_bytes()
+            .len();
+        let stride = DEFAULT_ENCRYPTION_FRAME_SIZE + 16;
+        for frame in 0..4 {
+            let mut mutated = ciphertext.to_vec();
+            mutated[header_len + frame * stride + 5] ^= 0x01;
+            assert!(matches!(
+                cipher().decrypt_object_with_workers(Bytes::from(mutated), OBJECT_KEY, 4),
+                Err(CryptoError::AuthenticationFailed)
+            ));
         }
     }
 

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use studiofs_meta::{EncryptionConfig, FormatInfo};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tokio::task;
 use tracing::{debug, info};
 
@@ -236,14 +237,50 @@ fn invalid_endpoint(message: impl Into<String>) -> DataError {
     DataError::InvalidEndpoint(message.into())
 }
 
+/// Process-wide admission for object crypto: one permit per CPU thread that
+/// may run SFEC frame work at once, shared by every `DataStore`.
+fn crypto_admission() -> &'static Arc<Semaphore> {
+    static ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    ADMISSION.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+        Arc::new(Semaphore::new(cpus))
+    })
+}
+
+/// Frame-parallelism hint for an object payload of `len` bytes.
+fn crypto_worker_hint(len: usize) -> usize {
+    (len / crypto::DEFAULT_ENCRYPTION_FRAME_SIZE).max(1)
+}
+
+/// Run object crypto on the blocking pool once admitted.
+///
+/// Waits for one CPU permit, then opportunistically takes up to
+/// `max_workers - 1` more without waiting; `operation` gets the number of
+/// threads it may use. Permits move into the blocking task, so they are held
+/// until the crypto work finishes even if the caller is cancelled, and a caller
+/// cancelled while still waiting holds nothing.
 async fn run_crypto_blocking<T: Send + 'static>(
-    operation: impl FnOnce() -> DataResult<T> + Send + 'static,
+    admission: &Arc<Semaphore>,
+    max_workers: usize,
+    operation: impl FnOnce(usize) -> DataResult<T> + Send + 'static,
 ) -> DataResult<T> {
-    // `spawn_blocking` tasks cannot be aborted once running. A timeout around
-    // this join handle would only stop waiting while leaving the crypto worker
-    // occupied, so any future cap on CPU pressure should be a bounded admission
-    // policy rather than a per-task timeout.
-    match task::spawn_blocking(operation).await {
+    let first = Arc::clone(admission)
+        .acquire_owned()
+        .await
+        .expect("crypto admission semaphore is never closed");
+    let extra = (1..max_workers).rev().find_map(|n| {
+        let n = u32::try_from(n).ok()?;
+        Arc::clone(admission).try_acquire_many_owned(n).ok()
+    });
+    let workers = 1 + extra.as_ref().map_or(0, |permits| permits.num_permits());
+    // `spawn_blocking` tasks cannot be aborted once running, so CPU pressure is
+    // bounded by admission above rather than by a per-task timeout.
+    match task::spawn_blocking(move || {
+        let _permits = (first, extra);
+        operation(workers)
+    })
+    .await
+    {
         Ok(result) => result,
         Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
         Err(err) => Err(DataError::from(err)),
@@ -801,10 +838,11 @@ impl DataStore {
     async fn encrypt_payload(&self, key: &str, plaintext: Buffer) -> DataResult<Buffer> {
         let key = key.to_string();
         let crypto = self.crypto.clone();
-        run_crypto_blocking(move || {
+        let max_workers = crypto_worker_hint(plaintext.len());
+        run_crypto_blocking(crypto_admission(), max_workers, move |workers| {
             crypto
                 .cipher
-                .encrypt_object(plaintext, &key, crypto.key_id)
+                .encrypt_object_with_workers(plaintext, &key, crypto.key_id, workers)
                 .map_err(DataError::from)
         })
         .await
@@ -813,8 +851,11 @@ impl DataStore {
     async fn decrypt_payload(&self, key: &str, ciphertext: Buffer) -> DataResult<Buffer> {
         let key = key.to_string();
         let crypto = self.crypto.clone();
-        run_crypto_blocking(move || {
-            let plaintext = crypto.cipher.decrypt_object(ciphertext, &key)?;
+        let max_workers = crypto_worker_hint(ciphertext.len());
+        run_crypto_blocking(crypto_admission(), max_workers, move |workers| {
+            let plaintext = crypto
+                .cipher
+                .decrypt_object_with_workers(ciphertext, &key, workers)?;
             Ok(Buffer::from(plaintext))
         })
         .await
@@ -1005,9 +1046,10 @@ mod tests {
     async fn crypto_blocking_helper_runs_work_off_async_worker_thread() {
         let async_worker_thread = thread::current().id();
 
-        let crypto_thread = run_crypto_blocking(|| Ok(thread::current().id()))
-            .await
-            .unwrap();
+        let crypto_thread =
+            run_crypto_blocking(crypto_admission(), 1, |_| Ok(thread::current().id()))
+                .await
+                .unwrap();
 
         assert_ne!(crypto_thread, async_worker_thread);
     }
@@ -1015,7 +1057,125 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "crypto worker panic")]
     async fn crypto_blocking_helper_resumes_worker_panics() {
-        let _ = run_crypto_blocking::<()>(|| panic!("crypto worker panic")).await;
+        let admission = Arc::new(Semaphore::new(1));
+        let _ = run_crypto_blocking::<()>(&admission, 1, |_| panic!("crypto worker panic")).await;
+    }
+
+    #[tokio::test]
+    async fn crypto_admission_grants_only_idle_extra_workers() {
+        let admission = Arc::new(Semaphore::new(4));
+        let grant = |max| run_crypto_blocking(&admission, max, Ok);
+
+        assert_eq!(grant(3).await.unwrap(), 3);
+        assert_eq!(grant(8).await.unwrap(), 4);
+        assert_eq!(grant(1).await.unwrap(), 1);
+        let held = Arc::clone(&admission).acquire_many_owned(3).await.unwrap();
+        assert_eq!(grant(4).await.unwrap(), 1);
+        drop(held);
+        assert_eq!(admission.available_permits(), 4);
+    }
+
+    /// Start crypto work that reports its start and then holds its permits
+    /// until `release` is signalled.
+    fn gated_crypto(
+        admission: &Arc<Semaphore>,
+        max_workers: usize,
+    ) -> (
+        tokio::task::JoinHandle<DataResult<usize>>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let admission = Arc::clone(admission);
+        let handle = tokio::spawn(async move {
+            run_crypto_blocking(&admission, max_workers, move |workers| {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                Ok(workers)
+            })
+            .await
+        });
+        (handle, started_rx, release_tx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crypto_admission_bounds_concurrency_and_waiters_hold_nothing() {
+        let admission = Arc::new(Semaphore::new(2));
+        let (first, first_started, release_first) = gated_crypto(&admission, 1);
+        let (second, second_started, release_second) = gated_crypto(&admission, 1);
+        task::spawn_blocking(move || {
+            first_started.recv().unwrap();
+            second_started.recv().unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(admission.available_permits(), 0);
+
+        // A third operation must wait; cancelling it while waiting leaks nothing.
+        let mut waiting = Box::pin(run_crypto_blocking(&admission, 1, Ok));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        drop(waiting);
+
+        release_first.send(()).unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), 1);
+        assert_eq!(admission.available_permits(), 1);
+        release_second.send(()).unwrap();
+        assert_eq!(second.await.unwrap().unwrap(), 1);
+        assert_eq!(admission.available_permits(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_caller_keeps_permits_until_crypto_work_finishes() {
+        let admission = Arc::new(Semaphore::new(3));
+        let (caller, started, release) = gated_crypto(&admission, 3);
+        task::spawn_blocking(move || started.recv().unwrap())
+            .await
+            .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        // The running blocking task still owns all three CPU slots.
+        assert_eq!(admission.available_permits(), 0);
+
+        release.send(()).unwrap();
+        let all = tokio::time::timeout(Duration::from_secs(10), admission.acquire_many(3))
+            .await
+            .expect("permits are released once crypto work finishes");
+        drop(all.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn high_concurrency_crypto_never_exceeds_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let admission = Arc::new(Semaphore::new(3));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..64)
+            .map(|i| {
+                let (admission, active, peak) = (
+                    Arc::clone(&admission),
+                    Arc::clone(&active),
+                    Arc::clone(&peak),
+                );
+                tokio::spawn(async move {
+                    run_crypto_blocking(&admission, 1 + i % 4, move |workers| {
+                        let now = active.fetch_add(workers, Ordering::SeqCst) + workers;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::hint::black_box((0..10_000u64).sum::<u64>());
+                        active.fetch_sub(workers, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        assert!(peak.load(Ordering::SeqCst) <= 3);
+        assert_eq!(admission.available_permits(), 3);
     }
 
     #[test]
