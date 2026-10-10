@@ -53,11 +53,15 @@ Prefetch and larger foreground reads keep complete fetch and cache population.
 The range reader always authenticates frame zero, so a middle read can require
 two frames even when the requested bytes fit in one frame.
 
-Partial reads trade remote request count for transfer volume: the successful
-range path reads the fixed SFEC prefix, its variable header tail, and the frames
-containing the STFS header, then reads additional target frames when needed.
-That is three or four sequential OpenDAL reads, so fewer transferred bytes do
-not establish lower latency. The exact header reads avoid requesting past EOF
+Partial reads trade remote request count for transfer volume. The successful
+range path uses two sequential rounds. Round one reads only the fixed 40-byte
+SFEC prefix and validates the geometry it declares. Round two reads the variable
+header tail together with frame zero, which is contiguous with it, and the
+target frames are derived from that prefix as well. A target that starts exactly
+where frame zero ends is merged into the same round-two read. Any other target
+is read concurrently with it, so a middle read costs at most three OpenDAL
+calls. Fewer transferred bytes do not by themselves establish lower latency.
+Every range is computed from the validated prefix, so no read requests past EOF
 for short objects; a known upper size bound does not make a larger probe safe.
 
 Fetch metrics retain their existing names: `s3_get_calls` counts completed

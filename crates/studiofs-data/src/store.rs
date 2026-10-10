@@ -1,7 +1,7 @@
 //! DataStore — S3 storage abstraction via OpenDAL.
 
 use crate::crypto::{self, ObjectCipher, VolumeMasterKey};
-use crate::envelope::{SFEC_HEADER_FIXED_LEN, SfecHeader};
+use crate::envelope::{SFEC_HEADER_FIXED_LEN, SfecError, SfecHeader, SfecHeaderLayout};
 use crate::object::{ObjectHeader, validate_object_payload_size};
 use crate::snapshot_key::{SnapshotArtifactKey, SnapshotArtifactPrefix};
 use bytes::Bytes;
@@ -764,50 +764,95 @@ impl DataStore {
             .range(0..SFEC_HEADER_FIXED_LEN as u64)
             .await?
             .to_bytes();
-        let header_len =
-            SfecHeader::serialized_len_from_prefix(&fixed).map_err(crypto::CryptoError::from)?;
-        let tail = self
-            .op
-            .read_with(key)
-            .range(SFEC_HEADER_FIXED_LEN as u64..header_len as u64)
-            .await?;
-        let header_bytes = Bytes::from([fixed.as_ref(), tail.to_bytes().as_ref()].concat());
-        let header = SfecHeader::parse(header_bytes.clone()).map_err(crypto::CryptoError::from)?;
-        let plaintext_len = header.plaintext_len();
+        let layout = SfecHeaderLayout::from_prefix(&fixed).map_err(crypto::CryptoError::from)?;
+        let header_len = layout.header_len();
+        let plaintext_len = layout.plaintext_len();
         if plaintext_len < ObjectHeader::SIZE as u64
             || plaintext_len > crate::object::CLOUD_FRAGMENT_SIZE as u64 + ObjectHeader::SIZE as u64
         {
             return Err(invalid_range());
         }
-        let first_end = u64::from(header.frame_size())
+        let first_end = u64::from(layout.frame_size())
             .max(ObjectHeader::SIZE as u64)
             .min(plaintext_len);
-        let first_cipher_range = header
+        // Geometry comes from the prefix alone, so every range is known before frame 0 is decrypted.
+        let payload_len = plaintext_len - ObjectHeader::SIZE as u64;
+        let start = range.start.min(payload_len) + ObjectHeader::SIZE as u64;
+        let end = range.end.min(payload_len) + ObjectHeader::SIZE as u64;
+        let remaining_start = start.max(first_end);
+        let target_range = if start == end || end <= first_end {
+            None
+        } else {
+            Some(
+                layout
+                    .ciphertext_range(remaining_start..end)
+                    .map_err(crypto::CryptoError::from)?,
+            )
+        };
+        let head_range = layout
             .ciphertext_range(0..first_end)
             .map_err(crypto::CryptoError::from)?;
-        let first_ciphertext = self.op.read_with(key).range(first_cipher_range).await?;
-        let mut encrypted_bytes = header_bytes.len() as u64 + first_ciphertext.len() as u64;
+        // Round 2: the tail and frame 0 are contiguous; a target directly after
+        // frame 0 is merged into the same read.
+        let merge_target = target_range
+            .as_ref()
+            .is_some_and(|target| target.start == head_range.end);
+        let round2_end = match (&target_range, merge_target) {
+            (Some(target), true) => target.end,
+            _ => head_range.end,
+        };
+        let (round2, separate_target) = match &target_range {
+            Some(target) if !merge_target => {
+                let (round2, target_bytes) = futures::try_join!(
+                    self.op
+                        .read_with(key)
+                        .range(SFEC_HEADER_FIXED_LEN as u64..round2_end)
+                        .into_future(),
+                    self.op.read_with(key).range(target.clone()).into_future(),
+                )?;
+                (round2, Some(target_bytes))
+            }
+            _ => (
+                self.op
+                    .read_with(key)
+                    .range(SFEC_HEADER_FIXED_LEN as u64..round2_end)
+                    .await?,
+                None,
+            ),
+        };
+        let tail_len = header_len - SFEC_HEADER_FIXED_LEN;
+        if round2.len() < tail_len {
+            return Err(crypto::CryptoError::from(SfecError::TruncatedHeader).into());
+        }
+        let header_bytes =
+            Bytes::from([fixed.as_ref(), round2.slice(..tail_len).to_bytes().as_ref()].concat());
+        // Authoritative strict parse of the header bytes read above.
+        SfecHeader::parse(header_bytes.clone()).map_err(crypto::CryptoError::from)?;
+        let local = |offset: u64| {
+            usize::try_from(offset - SFEC_HEADER_FIXED_LEN as u64).map_err(|_| invalid_range())
+        };
+        let first_ciphertext = round2.slice(tail_len..local(head_range.end)?.min(round2.len()));
+        let mut encrypted_bytes = fixed.len() as u64 + round2.len() as u64;
         let first = self
             .decrypt_payload_range(key, header_bytes.clone(), first_ciphertext, 0..first_end)
             .await?;
         let object_header = ObjectHeader::from_bytes(&first)?;
-        let payload_len = usize::try_from(plaintext_len - ObjectHeader::SIZE as u64)
-            .map_err(|_| invalid_range())?;
+        let payload_len = usize::try_from(payload_len).map_err(|_| invalid_range())?;
         validate_object_payload_size(&object_header, payload_len)?;
 
-        let start = range.start.min(payload_len as u64) + ObjectHeader::SIZE as u64;
-        let end = range.end.min(payload_len as u64) + ObjectHeader::SIZE as u64;
         let payload = if start == end {
             Bytes::new()
         } else if end <= first_end {
             first.slice(start as usize..end as usize)
         } else {
-            let remaining_start = start.max(first_end);
-            let ciphertext_range = header
-                .ciphertext_range(remaining_start..end)
-                .map_err(crypto::CryptoError::from)?;
-            let ciphertext = self.op.read_with(key).range(ciphertext_range).await?;
-            encrypted_bytes += ciphertext.len() as u64;
+            let target = target_range.ok_or_else(invalid_range)?;
+            let ciphertext = if merge_target {
+                round2.slice(local(target.start)?..local(target.end)?.min(round2.len()))
+            } else {
+                let read = separate_target.ok_or_else(invalid_range)?;
+                encrypted_bytes += read.len() as u64;
+                read
+            };
             let remaining = self
                 .decrypt_payload_range(key, header_bytes, ciphertext, remaining_start..end)
                 .await?;
@@ -978,6 +1023,9 @@ mod tests {
     use crate::object::{MAGIC as STFS_MAGIC, create_object_buffer, read_object};
     use bytes::Bytes;
     use futures::StreamExt;
+    use opendal::raw::{
+        Access, Layer, LayeredAccess, OpList, OpRead, OpWrite, RpDelete, RpList, RpRead, RpWrite,
+    };
     use opendal::services::Memory;
     use std::thread;
     use studiofs_meta::EncryptionConfig;
@@ -1115,6 +1163,169 @@ mod tests {
                 Err(DataError::Crypto(crypto::CryptoError::FrameLayoutOverflow))
             ));
         }
+    }
+
+    /// Counts OpenDAL `read` calls on the wrapped accessor.
+    #[derive(Debug)]
+    struct ReadCounterLayer(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[derive(Debug)]
+    struct ReadCounterAccess<A: Access> {
+        inner: A,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<A: Access> Layer<A> for ReadCounterLayer {
+        type LayeredAccess = ReadCounterAccess<A>;
+
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            ReadCounterAccess {
+                inner,
+                reads: self.0.clone(),
+            }
+        }
+    }
+
+    impl<A: Access> LayeredAccess for ReadCounterAccess<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = A::Deleter;
+
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+
+        async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read(path, args).await
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(RpWrite, Self::Writer)> {
+            self.inner.write(path, args).await
+        }
+
+        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
+            self.inner.list(path, args).await
+        }
+
+        async fn delete(&self) -> opendal::Result<(RpDelete, Self::Deleter)> {
+            self.inner.delete().await
+        }
+    }
+
+    #[tokio::test]
+    async fn payload_range_middle_frame_uses_at_most_three_reads() {
+        use crate::envelope::DEFAULT_SFEC_FRAME_SIZE;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let raw = Operator::new(Memory::default())
+            .unwrap()
+            .layer(ReadCounterLayer(reads.clone()))
+            .finish();
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
+        let key = "unit-volume/objects/aa/bb/range-count";
+        // Exactly four frames of plaintext (STFS header + payload).
+        let payload = Bytes::from(vec![
+            7u8;
+            crate::object::CLOUD_FRAGMENT_SIZE - ObjectHeader::SIZE
+        ]);
+        store
+            .put_by_key(key, create_object_buffer(payload.clone()).unwrap())
+            .await
+            .unwrap();
+
+        // Plaintext offset 2 * frame + 10 lies in frame 2, away from frames 0 and 1.
+        let start = 2 * DEFAULT_SFEC_FRAME_SIZE as u64 + 10 - ObjectHeader::SIZE as u64;
+        reads.store(0, Ordering::SeqCst);
+        let (bytes, _) = store
+            .get_payload_range_by_key_with_stats(key, start..start + 4096)
+            .await
+            .unwrap();
+        assert_eq!(bytes, payload.slice(start as usize..start as usize + 4096));
+        let read_calls = reads.load(Ordering::SeqCst);
+        assert!(
+            read_calls <= 3,
+            "expected at most 3 reads, got {read_calls}"
+        );
+    }
+
+    /// Read `len` payload bytes at `plaintext_start` (STFS header included in
+    /// plaintext coordinates) from a four-frame object and return the read-call count.
+    async fn range_read_calls(plaintext_start: u64, len: u64) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let raw = Operator::new(Memory::default())
+            .unwrap()
+            .layer(ReadCounterLayer(reads.clone()))
+            .finish();
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
+        let key = "unit-volume/objects/aa/bb/range-count";
+        // Exactly four frames of plaintext (STFS header + payload).
+        let payload = Bytes::from(vec![
+            7u8;
+            crate::object::CLOUD_FRAGMENT_SIZE - ObjectHeader::SIZE
+        ]);
+        store
+            .put_by_key(key, create_object_buffer(payload.clone()).unwrap())
+            .await
+            .unwrap();
+
+        let start = plaintext_start - ObjectHeader::SIZE as u64;
+        reads.store(0, Ordering::SeqCst);
+        let (bytes, _) = store
+            .get_payload_range_by_key_with_stats(key, start..start + len)
+            .await
+            .unwrap();
+        assert_eq!(bytes, payload.slice(start as usize..(start + len) as usize));
+        reads.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn payload_range_adjacent_frame_merges_into_head_read() {
+        use crate::envelope::DEFAULT_SFEC_FRAME_SIZE;
+        // Plaintext offset lies in frame 1, directly after frame 0: prefix plus one merged read.
+        let reads = range_read_calls(DEFAULT_SFEC_FRAME_SIZE as u64 + 10, 4096).await;
+        assert!(reads <= 2, "expected at most 2 reads, got {reads}");
+    }
+
+    #[tokio::test]
+    async fn payload_range_distant_frame_reads_head_and_target_separately() {
+        use crate::envelope::DEFAULT_SFEC_FRAME_SIZE;
+        // Plaintext offset in frame 3 is not adjacent to frame 0: prefix, head, target.
+        let reads = range_read_calls(3 * DEFAULT_SFEC_FRAME_SIZE as u64 + 10, 4096).await;
+        assert!(reads <= 3, "expected at most 3 reads, got {reads}");
+    }
+
+    #[tokio::test]
+    async fn payload_range_short_object_stays_within_remote_length() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+        let key = "unit-volume/objects/aa/bb/range-short";
+        store
+            .put_by_key(
+                key,
+                create_object_buffer(Bytes::from_static(b"short")).unwrap(),
+            )
+            .await
+            .unwrap();
+        let remote_len = raw.stat(key).await.unwrap().content_length();
+        // Requests well past both the payload and the first frame must clamp, not over-read.
+        let (bytes, stats) = store
+            .get_payload_range_by_key_with_stats(key, 1..4096)
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"hort"));
+        assert_eq!(stats.encrypted_bytes, remote_len);
+        assert_eq!(stats.plaintext_bytes, 4);
     }
 
     fn encrypted_test_config() -> DataStoreConfig {
