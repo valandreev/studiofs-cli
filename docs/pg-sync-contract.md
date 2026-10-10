@@ -238,6 +238,11 @@ catch-up retains the existing at-least-once recovery behavior.
 Journal-derived overlay conflicts include unprocessed and rejected local
 events; published and completed ranges no longer reserve their old keys.
 Rejected ranges remain local authority until replay can resume past the gap.
+Replay of inode removal reconciles that inode's serving names against the base
+namespace, including names introduced by a published local rename. Retaining
+inode state for an open handle does not retain those names for new opens;
+unpublished local names remain protected by the current overlay. Removed names
+produce entry invalidations after the replay transaction commits.
 
 The catch-up worker checks the operation deadline and cancellation boundary
 before each batch, after the batch sequence, and after serving-state
