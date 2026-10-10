@@ -2043,6 +2043,7 @@ impl FileSystemContext for StudioFsContext {
         trace!(target: "studiofs_winfsp::metadata_baseline::close", "callback entry");
         if winfsp_read_cache_diagnostics_enabled() {
             let (read_callbacks, read_callback_bytes) = context.read_callback_snapshot();
+            let coherence = self.vfs.coherence_health_snapshot();
             info!(
                 ino = context.ino,
                 fh = context.fh,
@@ -2051,6 +2052,11 @@ impl FileSystemContext for StudioFsContext {
                 disable_os_cache = context.disable_os_cache,
                 read_callbacks,
                 read_callback_bytes,
+                coherence_state = ?coherence.state,
+                coherence_reason = ?coherence.reason,
+                applied_boundary = coherence.applied_boundary,
+                covered_boundary = coherence.covered_boundary,
+                pending_delivery_age_ms = coherence.pending_delivery_age_ms,
                 "winfsp read cache diagnostics"
             );
         }

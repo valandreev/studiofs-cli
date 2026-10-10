@@ -433,10 +433,12 @@ struct LocalEventRange {
 struct LocalEventProgress {
     /// Ranges whose current publication failed because an event was too large.
     rejected: Vec<LocalEventRange>,
-    /// Ranges that need no remote publication and no further serving replay.
+    /// Ranges fully retired locally, including applied publication prefixes.
     completed: Vec<LocalEventRange>,
     /// Ranges committed to PostgreSQL and awaiting local self-acknowledgment.
     published: Vec<LocalEventRange>,
+    /// Complete projected prefixes, gated by the last batch of their publication.
+    published_prefixes: Vec<(i64, Vec<LocalEventRange>)>,
 }
 
 #[derive(Clone, Copy)]

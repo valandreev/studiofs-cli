@@ -495,9 +495,15 @@ impl PgMetaEngine {
                 return Err(error);
             }
         };
-        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
-            outcome.flushed_event_seq =
-                Some(self.flushed_event_seq_after_completed_ranges_locked(flushed_event_seq)?);
+        let flushed_event_seq = outcome
+            .flushed_event_seq
+            .unwrap_or_else(|| self.flushed_event_seq.load(Ordering::SeqCst));
+        let completed_seq = self.flushed_event_seq_after_completed_ranges_locked(
+            flushed_event_seq,
+            outcome.max_version,
+        )?;
+        if outcome.flushed_event_seq.is_some() || completed_seq > flushed_event_seq {
+            outcome.flushed_event_seq = Some(completed_seq);
         }
         if let Err(error) = Self::write_replay_position_in_txn(&txn, &outcome) {
             if let Err(abort_error) = txn.abort() {
@@ -542,9 +548,10 @@ impl PgMetaEngine {
             last_batch_version: outcome.max_version,
         })?;
         self.publish_replay_position(&outcome);
-        if let Some(flushed_event_seq) = outcome.flushed_event_seq {
-            self.trim_local_event_progress_before_locked(flushed_event_seq)?;
-        }
+        self.trim_local_event_progress_before_locked(
+            self.flushed_event_seq.load(Ordering::SeqCst),
+            outcome.max_version,
+        )?;
         Ok(outcome)
     }
 

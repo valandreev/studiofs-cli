@@ -874,6 +874,28 @@ impl PgMetaEngine {
             self.restore_pending_state_from_local_log()?;
             return Ok(None);
         }
+        // Match before transport splitting, retaining any local-only replay suffix.
+        let published_prefix = RemoteApplyCoordinator::matching_local_prefix(
+            selected.events.as_ref(),
+            &projected.events,
+            None,
+        )?
+        .and_then(|consumed| {
+            consumed
+                .checked_sub(1)
+                .and_then(|index| Self::selected_local_event_seq(&selected.ranges, index))
+        })
+        .map(|last_seq| {
+            selected
+                .ranges
+                .iter()
+                .filter(|range| range.start <= last_seq)
+                .map(|range| LocalEventRange {
+                    start: range.start,
+                    end: range.end.min(last_seq.saturating_add(1)),
+                })
+                .collect::<Vec<_>>()
+        });
         let mut oversized_projected_event_index = None;
         let batch_version = match self.push_projected_event_log_batch_locked(
             projected.events,
@@ -910,7 +932,10 @@ impl PgMetaEngine {
             }
             Err(error) => return Err(error),
         };
-        self.mark_local_event_ranges_published(&selected.ranges)?;
+        self.mark_local_event_ranges_published_with_prefix(
+            &selected.ranges,
+            published_prefix.map(|ranges| (batch_version, ranges)),
+        )?;
         // The replay pass acknowledges only the local prefix represented by the
         // projected batch. The remaining local-only suffix must stay replayable.
         self.restore_pending_state_from_local_log()?;

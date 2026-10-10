@@ -1978,6 +1978,108 @@ fn foreign_unlink_after_local_rename_removes_destination_alias() {
 }
 
 #[test]
+fn foreign_unlink_reconciles_published_rename_alias_while_inode_is_open() {
+    use crate::coherence::InvalidationIntent;
+
+    for (with_gap, completed) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"file.txt", 77_013);
+        let gap_start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("gap start");
+        pg.persist_flushed_event_seq(gap_start).expect("ack setup");
+        if with_gap {
+            pg.local
+                .set_xattr(ROOT_INO, b"user.cursor-gap", b"local", 0)
+                .expect("append cursor barrier");
+        }
+        let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("rename start");
+        if with_gap {
+            pg.reject_local_event_ranges(&[LocalEventRange {
+                start: gap_start,
+                end: start,
+            }])
+            .expect("retain cursor barrier");
+        }
+        pg.rename(ROOT_INO, b"file.txt", ROOT_INO, b"renamed.txt")
+            .expect("local rename");
+        let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("rename end");
+        let range = LocalEventRange { start, end };
+        if completed {
+            pg.complete_local_event_ranges(&[range])
+                .expect("complete rename");
+        } else {
+            pg.mark_local_event_ranges_published(&[range])
+                .expect("publish rename");
+        }
+        pg.link(file.ino, ROOT_INO, b"pending-link.txt")
+            .expect("pending link");
+        pg.note_active_open_inode(file.ino);
+        let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+        let flushed_event_seq = pg.flushed_event_seq.load(Ordering::SeqCst);
+        let initial_overlay = pg.local_overlay_conflicts().expect("overlay");
+        assert!(initial_overlay.remove_attr_inodes.contains(&file.ino));
+        assert!(
+            !initial_overlay
+                .dentry_keys
+                .contains(&encode_dentry_key(ROOT_INO, b"renamed.txt"))
+        );
+        journaled_invalidation_intents(&pg);
+
+        pg.apply_replay_page_atomically(
+            vec![DecodedReplayBatch {
+                batch_version: 1,
+                events: vec![
+                    MetaEvent::RemoveAttr { ino: file.ino },
+                    MetaEvent::RemoveEntry {
+                        parent: ROOT_INO,
+                        name: b"file.txt".to_vec(),
+                    },
+                ],
+                is_self_batch: false,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq,
+                next_event_seq,
+                initial_overlay,
+            },
+        )
+        .expect("replay foreign unlink");
+
+        assert!(pg.lookup(ROOT_INO, b"file.txt").is_err());
+        assert!(
+            pg.lookup(ROOT_INO, b"renamed.txt").is_err(),
+            "published alias must disappear (with_gap={with_gap}, completed={completed})"
+        );
+        assert!(
+            pg.get_attr(file.ino).is_ok(),
+            "open handle keeps inode state"
+        );
+        assert_eq!(
+            pg.lookup(ROOT_INO, b"pending-link.txt")
+                .expect("pending link survives")
+                .ino,
+            file.ino
+        );
+        assert_eq!(
+            pg.flushed_event_seq.load(Ordering::SeqCst),
+            flushed_event_seq
+        );
+        assert!(
+            journaled_invalidation_intents(&pg)
+                .iter()
+                .any(|intent| matches!(
+                    intent, InvalidationIntent::Entry { name, ino: Some(ino), .. }
+                        if name.as_slice() == b"renamed.txt" && *ino == file.ino
+                )),
+            "removed alias must invalidate its cached binding"
+        );
+        pg.note_inactive_open_inode(file.ino);
+    }
+}
+
+#[test]
 fn foreign_rename_removes_published_local_loser_across_cursor_gap() {
     use crate::coherence::InvalidationIntent;
 

@@ -2085,6 +2085,57 @@ fn reconcile_regular_file_serving_from_base_removes_stale_namespace_alias() {
 }
 
 #[test]
+fn reconcile_regular_file_serving_skips_pending_alias_journal_when_bindings_match() {
+    let engine = temp_engine();
+    let mut events = Vec::new();
+    let inodes = (95_101..95_105).collect::<Vec<_>>();
+    for (index, ino) in inodes.iter().copied().enumerate() {
+        let mut attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
+        attr.size = 39;
+        attr.committed_size = 39;
+        attr.content_epoch = 1;
+        attr.committed_content_epoch = 1;
+        attr.upload_state = UploadState::Ready;
+        events.push(MetaEvent::SetAttr { attr });
+        events.push(MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: format!("ready-{index}.txt").into_bytes(),
+            entry: DirEntryValue {
+                ino,
+                kind: FileType::RegularFile,
+            },
+        });
+    }
+    engine.apply_replica_events_to_base(&events).unwrap();
+    engine.apply_replica_serving_state(&events).unwrap();
+
+    engine
+        .create_file(ROOT_INO, b"pending-local-event.txt", 1000, 1000, 0o644)
+        .unwrap();
+    assert!(
+        !event_log_sequences(&engine).is_empty(),
+        "the pending local event journal must be retained for this regression"
+    );
+    assert!(
+        engine.get_counter(NEXT_EVENT_SEQ).unwrap()
+            > engine
+                .get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ)
+                .unwrap_or(1)
+    );
+
+    RedbMetaEngine::reset_pending_local_alias_event_scan_count_for_test();
+    assert!(engine
+        .reconcile_regular_file_serving_from_base(&inodes.into_iter().collect())
+        .unwrap());
+
+    assert_eq!(
+        RedbMetaEngine::pending_local_alias_event_scan_count_for_test(),
+        0,
+        "matched serving bindings must not scan the retained pending event journal"
+    );
+}
+
+#[test]
 fn protected_base_publish_merges_disjoint_remote_ranges_without_losing_newer_local_ranges() {
     let engine = temp_engine();
     let file = engine

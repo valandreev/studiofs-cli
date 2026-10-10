@@ -521,13 +521,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
     ) -> MetaResult<()> {
         candidates.extend(Self::overlay_conflicts_for_events(batch_events).dentry_keys);
         for event in batch_events {
-            if let MetaEvent::RenameEntry { entry, .. } = event {
-                // A cursor gap can keep a published local rename loser in the
-                // serving index; reconcile it with the current overlay authority.
-                candidates.extend(RedbMetaEngine::serving_dentry_keys_for_inode_in_txn(
-                    txn, entry.ino,
-                )?);
-            }
+            let ino = match event {
+                MetaEvent::RenameEntry { entry, .. } => entry.ino,
+                MetaEvent::RemoveAttr { ino } => *ino,
+                _ => continue,
+            };
+            // Retaining an open inode or a cursor gap must not retain published
+            // aliases; final reconciliation still protects pending local names.
+            candidates.extend(RedbMetaEngine::serving_dentry_keys_for_inode_in_txn(
+                txn, ino,
+            )?);
         }
         Ok(())
     }
