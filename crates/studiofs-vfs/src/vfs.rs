@@ -3302,9 +3302,7 @@ impl VfsState {
             file_lock: FileLockState::new(),
             shutdown: ShutdownState::new(),
             metrics: MetricsState::new(),
-            fuse_async_write_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
-            fuse_async_write_raw_snapshot: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
-            fuse_async_write_reset_baseline: Mutex::new(VfsFuseAsyncWriteSnapshot::default()),
+            fuse_async_write_diagnostics: Mutex::new(FuseAsyncWriteDiagnostics::default()),
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
             linux_fuse_open_cache: Mutex::new(VfsLinuxFuseOpenCacheStats::default()),
             fuse_invalidation_snapshot: Mutex::new(VfsFuseInvalidationSnapshot::default()),
@@ -3351,6 +3349,14 @@ impl PrefetchedWriterStackObjectIds {
     }
 }
 
+#[derive(Default)]
+struct FuseAsyncWriteDiagnostics {
+    raw: VfsFuseAsyncWriteSnapshot,
+    current: VfsFuseAsyncWriteSnapshot,
+    baseline: VfsFuseAsyncWriteSnapshot,
+    source: Option<Box<dyn Fn() -> Option<VfsFuseAsyncWriteSnapshot> + Send + Sync>>,
+}
+
 struct VfsState {
     upload: UploadState,
     file_session: FileSessionState,
@@ -3364,9 +3370,7 @@ struct VfsState {
     file_lock: FileLockState,
     shutdown: ShutdownState,
     metrics: MetricsState,
-    fuse_async_write_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
-    fuse_async_write_raw_snapshot: Mutex<VfsFuseAsyncWriteSnapshot>,
-    fuse_async_write_reset_baseline: Mutex<VfsFuseAsyncWriteSnapshot>,
+    fuse_async_write_diagnostics: Mutex<FuseAsyncWriteDiagnostics>,
     fuse_async_read_snapshot: Mutex<VfsFuseAsyncReadSnapshot>,
     linux_fuse_open_cache: Mutex<VfsLinuxFuseOpenCacheStats>,
     fuse_invalidation_snapshot: Mutex<VfsFuseInvalidationSnapshot>,
@@ -4871,10 +4875,18 @@ impl StudioVfs {
             .local_dirty
             .hard_backpressure_events
             .store(0, Ordering::Relaxed);
-        let fuse_async_write_reset_baseline =
-            self.state.fuse_async_write_raw_snapshot.lock().clone();
-        *self.state.fuse_async_write_reset_baseline.lock() = fuse_async_write_reset_baseline;
-        *self.state.fuse_async_write_snapshot.lock() = VfsFuseAsyncWriteSnapshot::default();
+        {
+            let mut diagnostics = self.state.fuse_async_write_diagnostics.lock();
+            let mut baseline = diagnostics
+                .source
+                .as_ref()
+                .and_then(|source| source())
+                .unwrap_or_else(|| diagnostics.raw.clone());
+            baseline.pending_writes_per_inode.clear();
+            diagnostics.raw = baseline.clone();
+            diagnostics.baseline = baseline;
+            diagnostics.current = VfsFuseAsyncWriteSnapshot::default();
+        }
         *self.state.linux_fuse_open_cache.lock() = VfsLinuxFuseOpenCacheStats::default();
         *self.state.fuse_invalidation_snapshot.lock() = VfsFuseInvalidationSnapshot::default();
         *self.state.fuse_connection_snapshot.lock() = VfsFuseConnectionSnapshot::default();
@@ -8129,53 +8141,34 @@ impl StudioVfs {
         }
     }
 
+    /// Register a source sampled only by diagnostics reads and resets.
+    ///
+    /// The source must not reenter VFS diagnostics. Returning `None` uses the last
+    /// pushed snapshot, allowing adapters to hold a weak reference to mount state.
+    pub fn set_fuse_async_write_snapshot_source(
+        &self,
+        source: impl Fn() -> Option<VfsFuseAsyncWriteSnapshot> + Send + Sync + 'static,
+    ) {
+        self.state.fuse_async_write_diagnostics.lock().source = Some(Box::new(source));
+    }
+
     /// Replace the latest async FUSE write bridge diagnostics snapshot.
     pub fn record_fuse_async_write_snapshot(&self, snapshot: VfsFuseAsyncWriteSnapshot) {
-        let mut raw = self.state.fuse_async_write_raw_snapshot.lock();
-        if snapshot.snapshot_generation < raw.snapshot_generation {
+        let mut diagnostics = self.state.fuse_async_write_diagnostics.lock();
+        if snapshot.snapshot_generation < diagnostics.raw.snapshot_generation {
             return;
         }
-        *raw = snapshot.clone();
-        drop(raw);
+        diagnostics.raw = snapshot.clone();
+        diagnostics.current =
+            Self::apply_fuse_async_write_reset_baseline(snapshot, &diagnostics.baseline);
+    }
 
-        let baseline = self.state.fuse_async_write_reset_baseline.lock().clone();
-        let snapshot = Self::apply_fuse_async_write_reset_baseline(snapshot, &baseline);
-        let mut current = self.state.fuse_async_write_snapshot.lock();
-        if snapshot.snapshot_generation >= current.snapshot_generation {
-            current.snapshot_generation = snapshot.snapshot_generation;
-            current.enabled = snapshot.enabled;
-            current.linux_fuse_profile = snapshot.linux_fuse_profile;
-            current.fuse_max_write_bytes = snapshot.fuse_max_write_bytes;
-            current.fuse_max_readahead_bytes = snapshot.fuse_max_readahead_bytes;
-            current.fuse_max_background = snapshot.fuse_max_background;
-            current.fuse_congestion_threshold = snapshot.fuse_congestion_threshold;
-            current.shared_buffer_budget_bytes = snapshot.shared_buffer_budget_bytes;
-            current.read_buffer_budget_bytes = snapshot.read_buffer_budget_bytes;
-            current.write_buffer_budget_bytes = snapshot.write_buffer_budget_bytes;
-            current.prefetch_concurrency = snapshot.prefetch_concurrency;
-            current.upload_concurrency = snapshot.upload_concurrency;
-            current.download_concurrency = snapshot.download_concurrency;
-            current.kernel_writeback_cache = snapshot.kernel_writeback_cache;
-            current.max_pending_bytes = snapshot.max_pending_bytes;
-            current.max_pending_writes = snapshot.max_pending_writes;
-            current.per_handle_pending_bytes = snapshot.per_handle_pending_bytes;
-            current.pending_writes = snapshot.pending_writes;
-            current.pending_bytes = snapshot.pending_bytes;
-            current.pending_handles = snapshot.pending_handles;
-            current.pending_writes_per_inode = snapshot.pending_writes_per_inode;
-            current.peak_pending_bytes = snapshot.peak_pending_bytes;
-            current.completed_writes = snapshot.completed_writes;
-            current.failed_writes = snapshot.failed_writes;
-            current.task_failed_writes = snapshot.task_failed_writes;
-            current.canceled_writes = snapshot.canceled_writes;
-            current.shutdown_timeouts = snapshot.shutdown_timeouts;
-            current.barrier_timeouts = snapshot.barrier_timeouts;
-            current.admission_waits = snapshot.admission_waits;
-            current.admission_wait_total_ms = snapshot.admission_wait_total_ms;
-            current.barrier_waits = snapshot.barrier_waits;
-            current.inode_barrier_waits = snapshot.inode_barrier_waits;
-            current.handle_barrier_waits = snapshot.handle_barrier_waits;
-            current.barrier_wait_total_ms = snapshot.barrier_wait_total_ms;
+    fn fuse_async_write_snapshot(&self) -> VfsFuseAsyncWriteSnapshot {
+        let diagnostics = self.state.fuse_async_write_diagnostics.lock();
+        if let Some(snapshot) = diagnostics.source.as_ref().and_then(|source| source()) {
+            Self::apply_fuse_async_write_reset_baseline(snapshot, &diagnostics.baseline)
+        } else {
+            diagnostics.current.clone()
         }
     }
 
@@ -9337,7 +9330,7 @@ impl StudioVfs {
             linux_fuse_open_cache: self.state.linux_fuse_open_cache.lock().clone(),
             fuse_invalidation: self.state.fuse_invalidation_snapshot.lock().clone(),
             fuse_connection: self.state.fuse_connection_snapshot.lock().clone(),
-            fuse_async_write: self.state.fuse_async_write_snapshot.lock().clone(),
+            fuse_async_write: self.fuse_async_write_snapshot(),
             fuse_async_read: self.state.fuse_async_read_snapshot.lock().clone(),
             landing_zone: VfsWritePathLandingZoneStats {
                 accepted_writes: landing_zone_stats.accepted_writes,
