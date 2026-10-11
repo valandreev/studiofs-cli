@@ -18494,6 +18494,21 @@ fn attribute_observation_saturated_reset_epoch_cannot_allow_reuse() {
 }
 
 #[test]
+fn attribute_reuse_rejects_attrs_requiring_authoritative_refresh() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "attr-reuse-authoritative");
+    let attr = vfs
+        .create(1, b"pending.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let observed = vfs.observe_attributes();
+    assert!(vfs.can_reuse_attributes(&attr, observed).unwrap());
+    let mut pending = attr;
+    pending.upload_state = MetaUploadState::Uploading;
+    pending.content_epoch = pending.committed_content_epoch + 1;
+    assert!(!vfs.can_reuse_attributes(&pending, observed).unwrap());
+}
+
+#[test]
 fn attr_read_cache_is_bounded_and_tracks_hotset_hits() {
     let mut cache = AttrReadCache::new(2, AttrReadCache::estimate_entry_charge() * 4);
     let now = Instant::now();

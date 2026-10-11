@@ -2072,11 +2072,19 @@ impl StudioVfs {
     /// pending-reply or open-handle notification path.
     pub fn can_reuse_attributes(
         &self,
-        ino: Ino,
+        attr: &InodeAttr,
         observed: super::AttributeObservation,
     ) -> VfsResult<bool> {
+        let ino = attr.ino;
         // Synthetic attributes can change without ordinary cache retirement.
-        if ino >= 1u64 << 63 {
+        if ino >= super::FIRST_IGNORED_INO {
+            return Ok(false);
+        }
+        // Mirror the path shortcut: attributes that need an authoritative
+        // re-read must not skip it.
+        if self.local_attr_refresh_decision(ino, attr)
+            == MetadataRefreshDecision::RefreshAuthoritative
+        {
             return Ok(false);
         }
         self.enforce_access(ino, AccessLevel::ReadOnly)?;

@@ -1730,7 +1730,7 @@ impl SessionState {
             .is_some_and(|deadline| Instant::now() < deadline)
             && self
                 .vfs
-                .can_reuse_attributes(observed.attr.ino, observed.observation)
+                .can_reuse_attributes(&observed.attr, observed.observation)
                 .map_err(|error| vfs_err_to_errno(&error))?
         {
             Ok(observed.attr)
@@ -5489,24 +5489,41 @@ mod tests {
 
     #[test]
     fn create_reply_refreshes_after_reservation_and_keeps_follow_up() {
-        let (fixture, state) = reply_fixture("create-refresh-race");
-        let allocated = state
-            .create_with_flags(1, b"raced", libc::S_IFREG | 0o644, libc::O_RDONLY)
-            .expect("allocate create");
-        let ino = allocated.open.observed.attr.ino;
-        let fh = allocated.open.fh;
+        let (fixture, mut state) = reply_fixture("create-refresh-race");
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
+        // Same reusable allocation as `stable_reply_create_avoids_second_getattr`,
+        // so only the post-reservation change can force the refresh.
+        let ino = fixture
+            .vfs()
+            .create(1, b"raced", 0, 0, 0o644)
+            .expect("create inode")
+            .ino;
+        let open = state
+            .open_with_flags(ino, libc::O_RDONLY)
+            .expect("allocate handle");
+        let fh = open.fh;
+        let allocated = super::LinuxFuseAllocatedCreate {
+            open,
+            lookup: state.inode_liveness.reserve_lookup(ino),
+        };
         fixture
             .vfs()
             .setattr(ino, studiofs_meta::SetattrArgs::size_only(83))
             .expect("change size after lookup reservation");
         let admission = state.inode_liveness.admit_invalidation(ino, || {});
         assert_eq!(admission.deferred_reply_count(), 1);
+        let before = state.getattr_calls.load(Ordering::Relaxed);
         assert_eq!(
             state.run_create_reply_transaction(allocated, |attr, _, reservation| {
                 assert_eq!(attr.size, 83);
                 super::reply_reserved_entry_with(&state, attr, reservation, |_| 0)
             }),
             Ok(0)
+        );
+        assert_eq!(
+            state.getattr_calls.load(Ordering::Relaxed),
+            before + 1,
+            "post-reservation change must force an attribute refresh"
         );
         assert_eq!(
             state.invalidation_queue.pop(),

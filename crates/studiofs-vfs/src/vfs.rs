@@ -749,6 +749,8 @@ fn is_blocked_root_macos_metadata(name: &[u8]) -> bool {
 
 /// Attribute cache TTL — read-through attributes are valid for 1 second.
 const ATTR_CACHE_TTL: Duration = Duration::from_secs(1);
+/// Ignored-entry inodes are allocated from here upward.
+const FIRST_IGNORED_INO: Ino = 1 << 63;
 pub(crate) const REMOTE_OBJECT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
@@ -2853,7 +2855,7 @@ impl MetricsState {
         Self {
             materialize_batch_stats: MaterializeBatchStats::default(),
             ignored_entries: OrderedMutex::new(IgnoredEntryRegistry::default(), LockTier::Metrics),
-            next_ignored_ino: AtomicU64::new(1u64 << 63),
+            next_ignored_ino: AtomicU64::new(FIRST_IGNORED_INO),
             prefetch_queue_depth: AtomicU64::new(0),
             prefetch_ingress_dropped_hints: AtomicU64::new(0),
             prefetch_ingress_dropped_blocks: AtomicU64::new(0),
