@@ -2048,6 +2048,50 @@ impl StudioVfs {
         self.state.namespace.attr_read_cache.lock().observation(ino)
     }
 
+    /// Capture invalidation ordering before reading attributes for an unknown inode.
+    pub fn observe_attributes(&self) -> super::AttributeObservation {
+        self.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .observe_attributes()
+    }
+
+    /// Preserve the source cache deadline when retaining an attribute snapshot.
+    pub fn attribute_cache_deadline(&self, attr: &InodeAttr) -> Option<Instant> {
+        self.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .inner
+            .entries
+            .get(&attr.ino)
+            .filter(|entry| entry.value == *attr)
+            .map(|entry| entry.meta.expires_at)
+    }
+
+    /// Validate access and invalidation ordering before reusing reply attributes.
+    ///
+    /// Later invalidations must still be delivered through the bridge's normal
+    /// pending-reply or open-handle notification path.
+    pub fn can_reuse_attributes(
+        &self,
+        ino: Ino,
+        observed: super::AttributeObservation,
+    ) -> VfsResult<bool> {
+        // Synthetic attributes can change without ordinary cache retirement.
+        if ino >= 1u64 << 63 {
+            return Ok(false);
+        }
+        self.enforce_access(ino, AccessLevel::ReadOnly)?;
+        Ok(self
+            .state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .attributes_unchanged(ino, observed))
+    }
+
     /// Returns a reusable cached attribute when the expected observation and
     /// local-first read-safety checks still permit the path shortcut.
     ///

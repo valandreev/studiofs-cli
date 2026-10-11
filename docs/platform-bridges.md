@@ -441,6 +441,15 @@ preserving lookup/reply and deferred-release lifetimes.
 The bridge installs a bounded, coalescing invalidation worker through libfuse3
 low-level inode notifications. Successful entry/create replies and `forget`
 maintain lookup liveness, while open handles independently keep an inode live.
+Linux entry and allocated open/create replies reuse their original attributes
+when the VFS observation captured before the read remains valid after reply
+liveness and access validation. Per-inode retirement stamps detect local changes
+before native notification delivery; parent-only changes preserve a created
+child's snapshot. Matching cached snapshots retain their source deadline.
+Retired, expired, or uncached observations, reset boundaries, truncating opens, and
+synthetic high-range inodes use the local getattr refresh. Pending lookup replies
+retain post-reply DATA invalidation when a notification crosses the reservation.
+Fresh-create handle allocation can itself retire the original snapshot.
 Directory replies intentionally leave libfuse3's `cache_readdir` disabled:
 remote namespace changes currently arrive through inode invalidation rather than
 individual dirent notifications, so caching a kernel-side directory snapshot
