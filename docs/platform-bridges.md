@@ -429,6 +429,13 @@ changed generation replaces cached pages. Set
 `STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct` and remount for the operational
 rollback.
 
+Adaptive sessions sample available memory in an owned background thread. Open
+callbacks read an atomic snapshot; samples expire one second after measurement
+starts. Missing, failed, or expired samples select direct I/O, including for
+stable generations. Session teardown stops and joins the sampler. Inode liveness
+and regular-file handle bookkeeping use 32 independent lock segments while
+preserving lookup/reply and deferred-release lifetimes.
+
 The bridge installs a bounded, coalescing invalidation worker through libfuse3
 low-level inode notifications. Successful entry/create replies and `forget`
 maintain lookup liveness, while open handles independently keep an inode live.

@@ -19,7 +19,7 @@ use crate::invalidation::{
     FuseInodeLiveness, FuseInvalidationGeometry, FuseInvalidationKind,
     FuseInvalidationMetricsSnapshot, FuseInvalidationQueue, FuseInvalidationReceiptOutcome,
     FuseInvalidationShutdownOutcome, FuseInvalidationWorker, FuseLookupReservation,
-    FuseOpenHandleGuard,
+    FuseOpenHandleGuard, LIVENESS_SHARDS,
 };
 use bytes::Bytes;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
@@ -219,11 +219,11 @@ pub(crate) struct SessionState {
     connection_config: LinuxFuseConnectionConfig,
     cache_policy: LinuxFuseCachePolicy,
     async_direct_io: bool,
-    available_memory: Mutex<SystemMemorySampler>,
+    available_memory: Option<SystemMemorySampler>,
     read_buffers: SyncReadBufferPool,
     open_reply_serializer: FuseOpenReplySerializer,
     inode_liveness: FuseInodeLiveness,
-    open_liveness: Mutex<HashMap<u64, FuseOpenHandleGuard>>,
+    open_liveness: [Mutex<HashMap<u64, FuseOpenHandleGuard>>; LIVENESS_SHARDS],
     invalidation_queue: FuseInvalidationQueue,
 }
 
@@ -262,11 +262,12 @@ impl SessionState {
             connection_config,
             cache_policy,
             async_direct_io: linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO"),
-            available_memory: Mutex::new(SystemMemorySampler::system()),
+            available_memory: (cache_policy == LinuxFuseCachePolicy::Adaptive)
+                .then(SystemMemorySampler::system),
             read_buffers: SyncReadBufferPool::new(),
             open_reply_serializer: FuseOpenReplySerializer::new(),
             inode_liveness: FuseInodeLiveness::default(),
-            open_liveness: Mutex::new(HashMap::new()),
+            open_liveness: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             invalidation_queue: FuseInvalidationQueue::default(),
         }
     }
@@ -1954,9 +1955,8 @@ impl SessionState {
             .prepare_os_cache_open_with_attr(fh, participation, attr);
         let available_memory = if self.cache_policy == LinuxFuseCachePolicy::Adaptive {
             self.available_memory
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .available_memory()
+                .as_ref()
+                .and_then(SystemMemorySampler::available_memory)
         } else {
             None
         };
@@ -2069,18 +2069,22 @@ impl SessionState {
     fn install_open_liveness(&self, ino: u64, fh: u64) {
         let guard = self.inode_liveness.open_handle(ino);
         let replaced = self
-            .open_liveness
+            .open_liveness_shard(fh)
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .insert(fh, guard);
         debug_assert!(replaced.is_none(), "VFS file handles must be unique");
     }
 
-    fn remove_open_liveness(&self, fh: u64) {
-        self.open_liveness
+    fn open_liveness_shard(&self, fh: u64) -> &Mutex<HashMap<u64, FuseOpenHandleGuard>> {
+        &self.open_liveness[usize::from(fh.to_le_bytes()[0]) % LIVENESS_SHARDS]
+    }
+
+    fn remove_open_liveness(&self, fh: u64) -> Option<FuseOpenHandleGuard> {
+        self.open_liveness_shard(fh)
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .remove(&fh);
+            .remove(&fh)
     }
 
     fn enqueue_follow_up_invalidation(&self, ino: u64) {
@@ -2789,11 +2793,7 @@ fn finish_regular_release_with(
 ) {
     reply(result.err().unwrap_or(0));
     if let Some(fh) = fh {
-        let guard = state
-            .open_liveness
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&fh);
+        let guard = state.remove_open_liveness(fh);
         if state.vfs.get_open_file(fh).is_some() {
             let vfs = Arc::clone(&state.vfs);
             let runtime = state.runtime_handle.clone();
@@ -2981,6 +2981,14 @@ impl DirectoryEntryBuffer {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Some(sampler) = self
+            .state
+            .as_ref()
+            .and_then(|state| state.available_memory.as_ref())
+        {
+            // Callback state can be retained after timeout, so stop its worker independently.
+            sampler.shutdown();
+        }
         let writes_drained = self.state.as_ref().is_none_or(|state| {
             let drained = shutdown_async_writes(&state.async_writes);
             if !drained {
@@ -3707,6 +3715,66 @@ mod tests {
         assert_eq!(
             snapshot.completed_writes, 2,
             "new ledger stays live and unbiased"
+        );
+    }
+
+    #[test]
+    fn timed_out_session_teardown_stops_sampler_before_retaining_state() {
+        struct SampleOwner(std::sync::mpsc::Sender<()>);
+        impl Drop for SampleOwner {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-retained-memory-sampler",
+        )
+        .expect("create fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let owner = SampleOwner(exited_tx);
+        state.available_memory = Some(crate::cache_policy::SystemMemorySampler::start(move || {
+            let _ = &owner;
+            Some(4096)
+        }));
+        let pending = state.async_writes.admit(10, 100, 8).unwrap();
+        let mut args = super::OwnedFuseArgs::new(super::argv_strings("demo", false)).unwrap();
+        // SAFETY: the empty ops table has no callbacks; this test owns the raw session.
+        let raw = std::ptr::NonNull::new(unsafe {
+            super::studiofs_linux_fuse_session_new(
+                args.as_mut_ptr(),
+                super::studiofs_linux_fuse_empty_low_level_ops(),
+                super::studiofs_linux_fuse_low_level_ops_size(),
+                std::ptr::null_mut(),
+            )
+        })
+        .unwrap();
+        let state = Box::into_raw(Box::new(state));
+        drop(super::Session {
+            raw,
+            // SAFETY: transfer our unique allocation into Session until retention.
+            state: Some(unsafe { Box::from_raw(state) }),
+            invalidation_state: Arc::new(super::SessionInvalidationState::new()),
+            invalidation_worker: None,
+            invalidation_metrics_generation: Arc::new(super::AtomicU64::new(0)),
+            signal_handlers_installed: false,
+        });
+        let stopped = exited_rx.recv_timeout(Duration::from_secs(2));
+        pending.complete(Ok(()));
+        // SAFETY: the pending write forced retention; it is now complete, and
+        // the empty callback table and absent invalidation worker retain no pointers.
+        unsafe {
+            super::raw::fuse_session_destroy(raw.as_ptr());
+            drop(Box::from_raw(state));
+        }
+        assert!(
+            stopped.is_ok(),
+            "retaining state must not retain the sampler thread"
         );
     }
 
@@ -4672,8 +4740,12 @@ mod tests {
                     })
                 },
                 |prepared| {
-                    assert!(
-                        prepared.cache.keep_cache,
+                    assert_eq!(
+                        (prepared.disposition, prepared.reason),
+                        (
+                            studiofs_vfs::vfs::OsCacheDisposition::Reuse,
+                            studiofs_vfs::vfs::OsCacheReason::StableGeneration
+                        ),
                         "rejected transaction must start from a reusable generation"
                     );
                     -libc::ENOENT
@@ -4703,8 +4775,9 @@ mod tests {
             )
             .expect("reopen after rejected reply");
         let next = state.prepare_file_open(&attr, libc::O_RDONLY, next_fh);
-        assert!(
-            !next.cache.keep_cache,
+        assert_ne!(
+            next.reason,
+            studiofs_vfs::vfs::OsCacheReason::StableGeneration,
             "rejected reply must not leave a reusable generation snapshot"
         );
     }
@@ -5297,6 +5370,37 @@ mod tests {
             -libc::ENOENT
         );
         assert!(!state.inode_liveness.is_live(attr.ino));
+    }
+
+    #[test]
+    fn open_handles_on_another_segment_do_not_wait_for_busy_handle() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-open-segments")
+                .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.install_open_liveness(42, 7);
+        state.install_open_liveness(43, 8);
+        let busy = state.open_liveness_shard(7).lock().unwrap();
+        let result = std::thread::scope(|scope| {
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let state = &state;
+            let worker = scope.spawn(move || {
+                drop(state.remove_open_liveness(8));
+                done_tx.send(()).unwrap();
+            });
+            let result = done_rx.recv_timeout(Duration::from_secs(2));
+            drop(busy);
+            worker.join().unwrap();
+            result
+        });
+        assert!(result.is_ok(), "an unrelated handle must make progress");
+        assert!(state.inode_liveness.is_live(42));
+        assert!(!state.inode_liveness.is_live(43));
     }
 
     #[test]

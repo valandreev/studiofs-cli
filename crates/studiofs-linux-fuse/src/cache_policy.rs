@@ -1,4 +1,6 @@
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use studiofs_vfs::vfs::{OsCacheDisposition, OsCacheOpenDecision, OsCacheReason};
 
@@ -128,7 +130,7 @@ pub(crate) fn decide_open_cache(
         {
             LinuxOpenCacheDecision::direct(true)
         }
-        LinuxFuseCachePolicy::Adaptive if !stable_generation => {
+        LinuxFuseCachePolicy::Adaptive if available_memory.is_none() || !stable_generation => {
             // A new generation must be read through VFS before the kernel may
             // retain pages for reuse. This closes the race where an open
             // arrives before the asynchronous inode invalidation reaches the
@@ -142,130 +144,110 @@ pub(crate) fn decide_open_cache(
     }
 }
 
-pub(crate) trait AvailableMemorySource {
-    fn sample(&mut self) -> Option<u64>;
+#[derive(Default)]
+struct MemorySnapshot {
+    available_bytes: AtomicU64,
+    sampled_at_millis: AtomicU64,
 }
 
-impl<F> AvailableMemorySource for F
-where
-    F: FnMut() -> Option<u64>,
-{
-    fn sample(&mut self) -> Option<u64> {
-        self()
-    }
-}
-
-pub(crate) trait MonotonicClock {
-    fn now(&self) -> Duration;
-}
-
-impl<F> MonotonicClock for F
-where
-    F: Fn() -> Duration,
-{
-    fn now(&self) -> Duration {
-        self()
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CachedMemoryMeasurement {
-    sampled_at: Duration,
-    available_memory: Option<u64>,
-}
-
-/// One-second cached available-memory sampler.
-pub(crate) struct MemorySampler<S, C> {
-    source: S,
-    clock: C,
-    cached: Option<CachedMemoryMeasurement>,
-}
-
-impl<S, C> MemorySampler<S, C>
-where
-    S: AvailableMemorySource,
-    C: MonotonicClock,
-{
-    pub(crate) fn new(source: S, clock: C) -> Self {
-        Self {
-            source,
-            clock,
-            cached: None,
-        }
+impl MemorySnapshot {
+    fn publish(&self, available: Option<u64>, sampled_at: Duration) {
+        self.available_bytes
+            .store(available.unwrap_or(0), Ordering::Relaxed);
+        self.sampled_at_millis.store(
+            duration_millis(sampled_at).saturating_add(1),
+            Ordering::Release,
+        );
     }
 
-    pub(crate) fn available_memory(&mut self) -> Option<u64> {
-        let now = self.clock.now();
-        if let Some(cached) = self.cached
-            && now.saturating_sub(cached.sampled_at) < MEMORY_SAMPLE_TTL
+    fn available_memory_at(&self, now: Duration) -> Option<u64> {
+        let sampled_at = self.sampled_at_millis.load(Ordering::Acquire);
+        if sampled_at == 0
+            || duration_millis(now).saturating_sub(sampled_at - 1)
+                >= duration_millis(MEMORY_SAMPLE_TTL)
         {
-            return cached.available_memory;
+            return None;
         }
-
-        let available_memory = self.source.sample();
-        self.cached = Some(CachedMemoryMeasurement {
-            sampled_at: now,
-            available_memory,
-        });
-        available_memory
+        normalize_available_memory(self.available_bytes.load(Ordering::Relaxed))
     }
 }
 
-struct SystemAvailableMemory {
-    system: sysinfo::System,
-}
-
-impl SystemAvailableMemory {
-    fn new() -> Self {
-        Self {
-            system: sysinfo::System::new(),
-        }
-    }
-}
-
-impl AvailableMemorySource for SystemAvailableMemory {
-    fn sample(&mut self) -> Option<u64> {
-        self.system.refresh_memory();
-        normalize_available_memory(self.system.available_memory())
-    }
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX - 1)
 }
 
 fn normalize_available_memory(available_memory: u64) -> Option<u64> {
     (available_memory != 0).then_some(available_memory)
 }
 
-struct SystemClock {
-    started_at: Instant,
-}
-
-impl SystemClock {
-    fn new() -> Self {
-        Self {
-            started_at: Instant::now(),
-        }
-    }
-}
-
-impl MonotonicClock for SystemClock {
-    fn now(&self) -> Duration {
-        self.started_at.elapsed()
-    }
-}
-
-/// Production available-memory sampler with an implementation-independent API.
+/// Owned background sampler; foreground readers only load the atomic snapshot.
 pub(crate) struct SystemMemorySampler {
-    sampler: MemorySampler<SystemAvailableMemory, SystemClock>,
+    started_at: Instant,
+    snapshot: Arc<MemorySnapshot>,
+    stop: mpsc::Sender<()>,
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SystemMemorySampler {
     pub(crate) fn system() -> Self {
+        let mut system = sysinfo::System::new();
+        Self::start(move || {
+            system.refresh_memory();
+            normalize_available_memory(system.available_memory())
+        })
+    }
+
+    pub(crate) fn start(mut sample: impl FnMut() -> Option<u64> + Send + 'static) -> Self {
+        let started_at = Instant::now();
+        let snapshot = Arc::new(MemorySnapshot::default());
+        let (stop, stopped) = mpsc::channel();
+        let worker_snapshot = Arc::clone(&snapshot);
+        let worker = thread::Builder::new()
+            .name("studiofs-fuse-memory".into())
+            .spawn(move || {
+                loop {
+                    let sampled_at = started_at.elapsed();
+                    let available = sample();
+                    worker_snapshot.publish(available, sampled_at);
+                    match stopped.recv_timeout(MEMORY_SAMPLE_TTL) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .inspect_err(
+                |error| tracing::warn!(%error, "Linux FUSE memory sampler could not start"),
+            )
+            .ok();
         Self {
-            sampler: MemorySampler::new(SystemAvailableMemory::new(), SystemClock::new()),
+            started_at,
+            snapshot,
+            stop,
+            worker: Mutex::new(worker),
         }
     }
 
-    pub(crate) fn available_memory(&mut self) -> Option<u64> {
-        self.sampler.available_memory()
+    pub(crate) fn available_memory(&self) -> Option<u64> {
+        self.snapshot.available_memory_at(self.started_at.elapsed())
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let _ = self.stop.send(());
+        let mut worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(worker) = worker.take()
+            && worker.join().is_err()
+        {
+            tracing::warn!("Linux FUSE memory sampler panicked");
+        }
+    }
+}
+
+impl Drop for SystemMemorySampler {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -348,11 +330,10 @@ impl SyncReadBufferPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachePolicySelection, LinuxFuseCachePolicy, MemorySampler, OpenCacheDecision,
-        ReadAheadIntent, SyncReadBufferPool, decide_open_cache, normalize_available_memory,
+        CachePolicySelection, LinuxFuseCachePolicy, MemorySnapshot, OpenCacheDecision,
+        ReadAheadIntent, SyncReadBufferPool, SystemMemorySampler, decide_open_cache,
+        normalize_available_memory,
     };
-    use std::cell::Cell;
-    use std::rc::Rc;
     use std::time::Duration;
     use studiofs_vfs::vfs::{OsCacheDisposition, OsCacheReason};
 
@@ -503,6 +484,19 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_unavailable_memory_uses_direct_io_for_stable_generation() {
+        let decision = decide_open_cache(
+            LinuxFuseCachePolicy::Adaptive,
+            false,
+            generation(OsCacheDisposition::Reuse, OsCacheReason::StableGeneration),
+            4096,
+            None,
+        );
+        assert!(decision.direct_io);
+        assert!(!decision.keep_cache);
+    }
+
+    #[test]
     fn adaptive_memory_measurement_failure_uses_vfs_for_first_read() {
         let decision = decide_open_cache(
             LinuxFuseCachePolicy::Adaptive,
@@ -558,53 +552,68 @@ mod tests {
     }
 
     #[test]
-    fn memory_sampler_caches_measurement_for_one_second() {
-        let now = Rc::new(Cell::new(Duration::ZERO));
-        let samples = Rc::new(Cell::new(0));
-        let mut sampler = MemorySampler::new(
-            {
-                let samples = Rc::clone(&samples);
-                move || {
-                    samples.set(samples.get() + 1);
-                    Some(4096)
-                }
-            },
-            {
-                let now = Rc::clone(&now);
-                move || now.get()
-            },
+    fn memory_snapshot_expires_after_one_second_and_recovers() {
+        let snapshot = MemorySnapshot::default();
+        assert_eq!(snapshot.available_memory_at(Duration::ZERO), None);
+        snapshot.publish(Some(4096), Duration::ZERO);
+        assert_eq!(
+            snapshot.available_memory_at(Duration::from_millis(999)),
+            Some(4096)
         );
-
-        assert_eq!(sampler.available_memory(), Some(4096));
-        assert_eq!(sampler.available_memory(), Some(4096));
-        assert_eq!(samples.get(), 1);
-
-        now.set(Duration::from_millis(999));
-        assert_eq!(sampler.available_memory(), Some(4096));
-        assert_eq!(samples.get(), 1);
-
-        now.set(Duration::from_secs(1));
-        assert_eq!(sampler.available_memory(), Some(4096));
-        assert_eq!(samples.get(), 2);
+        assert_eq!(snapshot.available_memory_at(Duration::from_secs(1)), None);
+        snapshot.publish(None, Duration::from_secs(1));
+        assert_eq!(snapshot.available_memory_at(Duration::from_secs(1)), None);
+        snapshot.publish(Some(8192), Duration::from_secs(2));
+        assert_eq!(
+            snapshot.available_memory_at(Duration::from_secs(2)),
+            Some(8192)
+        );
     }
 
     #[test]
-    fn memory_sampler_caches_measurement_failure() {
-        let samples = Rc::new(Cell::new(0));
-        let mut sampler = MemorySampler::new(
-            {
-                let samples = Rc::clone(&samples);
-                move || {
-                    samples.set(samples.get() + 1);
-                    None
-                }
-            },
-            || Duration::ZERO,
-        );
+    fn memory_snapshot_does_not_treat_slow_measurement_as_fresh() {
+        let snapshot = MemorySnapshot::default();
+        snapshot.publish(Some(4096), Duration::ZERO);
+        assert_eq!(snapshot.available_memory_at(Duration::from_secs(2)), None);
+    }
 
-        assert_eq!(sampler.available_memory(), None);
-        assert_eq!(sampler.available_memory(), None);
-        assert_eq!(samples.get(), 1);
+    #[test]
+    fn memory_readers_finish_while_background_sample_is_blocked_and_drop_joins() {
+        use std::sync::mpsc;
+        use std::thread;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (exited_tx, exited_rx) = mpsc::channel();
+        let sampler = SystemMemorySampler::start(move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            exited_tx.send(()).unwrap();
+            Some(4096)
+        });
+        let snapshot = std::sync::Arc::downgrade(&sampler.snapshot);
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let results = thread::scope(|scope| {
+            let (done_tx, done_rx) = mpsc::channel();
+            let sampler = &sampler;
+            let readers: Vec<_> = (0..16)
+                .map(|_| {
+                    let done_tx = done_tx.clone();
+                    scope.spawn(move || done_tx.send(sampler.available_memory()).unwrap())
+                })
+                .collect();
+            let results: Vec<_> = (0..16)
+                .map(|_| done_rx.recv_timeout(Duration::from_secs(2)))
+                .collect();
+            resume_tx.send(()).unwrap();
+            for reader in readers {
+                reader.join().unwrap();
+            }
+            results
+        });
+        drop(sampler);
+        assert!(snapshot.upgrade().is_none(), "drop must join the worker");
+        exited_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(results.iter().all(|result| matches!(result, Ok(None))));
     }
 
     #[test]

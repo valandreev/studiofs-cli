@@ -44,10 +44,13 @@ snapshot and retires the VFS handle before a later open can decide to reuse it.
 legacy aliases, or `kernel` and its legacy aliases. Unset and empty select
 adaptive. Unknown values warn and select adaptive.
 
-Available memory is sampled at most once per second. If sampling fails, a safe
-clean read-only file may use the page cache but cannot use `keep_cache` until
-its generation is observed as stable. Linux requests read/readahead geometry
-up to 4 MiB and records the negotiated values in runtime stats.
+Adaptive sessions sample available memory in an owned background thread, at
+most once per second, and open callbacks load an atomic snapshot. Samples
+expire one second after measurement starts. Missing, failed or expired samples
+conservatively select direct I/O, including for stable generations. Teardown
+stops and joins the sampler even when callback state must be retained after a
+shutdown timeout. Linux requests read/readahead geometry up to 4 MiB and records
+the negotiated values in runtime stats.
 
 ## Consequences
 
