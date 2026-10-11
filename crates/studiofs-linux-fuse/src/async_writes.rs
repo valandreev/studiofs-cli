@@ -7,6 +7,8 @@ use tokio::task::AbortHandle;
 pub(crate) const DEFAULT_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_PENDING_WRITES: usize = 1024;
 const DEFAULT_MAX_RECORDED_ERRORS: usize = 8192;
+// Bound callback occupancy, including time queued for global write admission.
+const DEFAULT_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionError {
@@ -80,6 +82,8 @@ struct LedgerState {
     errors: BTreeMap<u64, WriteError>,
     closed_handles: HashMap<u64, u64>,
     task_abort_handles: HashMap<u64, AbortHandle>,
+    deferred_releases: HashMap<u64, DeferredRelease>,
+    running_releases: BTreeSet<u64>,
     snapshot_generation: u64,
     peak_admitted_bytes: usize,
     completed_writes: u64,
@@ -87,6 +91,7 @@ struct LedgerState {
     task_failed_writes: u64,
     canceled_writes: u64,
     shutdown_timeouts: u64,
+    barrier_timeouts: u64,
     admission_waits: u64,
     admission_wait_total_nanos: u64,
     barrier_waits: u64,
@@ -108,6 +113,7 @@ pub(crate) struct AsyncWriteMetricsSnapshot {
     pub(crate) task_failed_writes: u64,
     pub(crate) canceled_writes: u64,
     pub(crate) shutdown_timeouts: u64,
+    pub(crate) barrier_timeouts: u64,
     pub(crate) admission_waits: u64,
     pub(crate) admission_wait_total_nanos: u64,
     pub(crate) barrier_waits: u64,
@@ -118,6 +124,7 @@ pub(crate) struct AsyncWriteMetricsSnapshot {
 
 #[derive(Debug)]
 pub(crate) struct AsyncWriteLedger {
+    barrier_timeout: Duration,
     max_pending_bytes: usize,
     max_pending_writes: usize,
     max_recorded_errors: usize,
@@ -155,12 +162,19 @@ impl AsyncWriteLedger {
             "recorded error limit must be non-zero"
         );
         Self {
+            barrier_timeout: DEFAULT_BARRIER_TIMEOUT,
             max_pending_bytes,
             max_pending_writes,
             max_recorded_errors,
             state: Mutex::new(LedgerState::default()),
             changed: Condvar::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_barrier_timeout(mut self, timeout: Duration) -> Self {
+        self.barrier_timeout = timeout;
+        self
     }
 
     #[cfg(test)]
@@ -262,6 +276,8 @@ impl AsyncWriteLedger {
     pub(crate) fn forget_handle(&self, fh: u64) -> bool {
         let mut state = self.lock_state();
         if state.pending_by_handle.contains_key(&fh)
+            || state.deferred_releases.contains_key(&fh)
+            || state.running_releases.contains(&fh)
             || state.errors.values().any(|error| error.fh == fh)
         {
             return false;
@@ -269,6 +285,29 @@ impl AsyncWriteLedger {
         state.closed_handles.remove(&fh);
         self.changed.notify_all();
         true
+    }
+
+    /// Own a kernel release until its closed handle has no remaining writes.
+    pub(crate) fn defer_release(&self, fh: u64, release: impl FnOnce() + Send + 'static) {
+        let release = DeferredRelease(Box::new(release));
+        let mut state = self.lock_state();
+        if state.pending_by_handle.contains_key(&fh) {
+            state.deferred_releases.insert(fh, release);
+            return;
+        }
+        state.running_releases.insert(fh);
+        drop(state);
+        self.finish_deferred_release(fh, release);
+    }
+
+    fn finish_deferred_release(&self, fh: u64, release: DeferredRelease) {
+        (release.0)();
+        let mut state = self.lock_state();
+        // The kernel already received EIO; no later callback can consume these errors.
+        state.errors.retain(|_, error| error.fh != fh);
+        state.closed_handles.remove(&fh);
+        state.running_releases.remove(&fh);
+        self.changed.notify_all();
     }
 
     pub(crate) fn wait_inode(&self, watermark: InodeWatermark) -> BarrierOutcome {
@@ -279,15 +318,13 @@ impl AsyncWriteLedger {
     ///
     /// Namespace operations use this to observe prior write effects while
     /// leaving error delivery to the next flush, fsync, or release barrier.
-    pub(crate) fn wait_inode_completion(&self, watermark: InodeWatermark) {
-        let mut state = self.lock_state();
-        let scope = BarrierScope::Inode(watermark.ino);
-        while scope.has_pending(&state, watermark.through) {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
+    pub(crate) fn wait_inode_completion(&self, watermark: InodeWatermark) -> BarrierOutcome {
+        self.wait_scope_timed(
+            BarrierScope::Inode(watermark.ino),
+            watermark.through,
+            self.barrier_timeout,
+            ErrorDelivery::Preserve,
+        )
     }
 
     pub(crate) fn wait_handle(&self, watermark: HandleWatermark) -> BarrierOutcome {
@@ -300,6 +337,7 @@ impl AsyncWriteLedger {
             BarrierScope::Inode(watermark.ino),
             watermark.through,
             timeout,
+            ErrorDelivery::Consume,
         )
     }
 
@@ -309,6 +347,7 @@ impl AsyncWriteLedger {
             BarrierScope::Handle(watermark.fh),
             watermark.through,
             timeout,
+            ErrorDelivery::Consume,
         )
     }
 
@@ -316,7 +355,7 @@ impl AsyncWriteLedger {
         let state = self.lock_state();
         let through = state.next_sequence;
         drop(state);
-        self.wait_scope_timed(BarrierScope::All, through, timeout)
+        self.wait_scope_timed(BarrierScope::All, through, timeout, ErrorDelivery::Consume)
     }
 
     pub(crate) fn shutdown(&self) {
@@ -408,6 +447,7 @@ impl AsyncWriteLedger {
             task_failed_writes: state.task_failed_writes,
             canceled_writes: state.canceled_writes,
             shutdown_timeouts: state.shutdown_timeouts,
+            barrier_timeouts: state.barrier_timeouts,
             admission_waits: state.admission_waits,
             admission_wait_total_nanos: state.admission_wait_total_nanos,
             barrier_waits: state.barrier_waits,
@@ -490,17 +530,7 @@ impl AsyncWriteLedger {
     }
 
     fn wait_scope(&self, scope: BarrierScope, through: u64) -> BarrierOutcome {
-        let mut state = self.lock_state();
-        let wait_started =
-            (scope != BarrierScope::All && scope.has_pending(&state, through)).then(Instant::now);
-        while scope.has_pending(&state, through) {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        record_barrier_wait(&mut state, scope, wait_started);
-        BarrierOutcome::Complete(scope.consume_errors(&mut state, through))
+        self.wait_scope_timed(scope, through, self.barrier_timeout, ErrorDelivery::Consume)
     }
 
     fn wait_scope_timed(
@@ -508,6 +538,7 @@ impl AsyncWriteLedger {
         scope: BarrierScope,
         through: u64,
         timeout: Duration,
+        error_delivery: ErrorDelivery,
     ) -> BarrierOutcome {
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -518,27 +549,40 @@ impl AsyncWriteLedger {
         loop {
             if !scope.has_pending(&state, through) {
                 record_barrier_wait(&mut state, scope, wait_started);
-                let errno = scope.consume_errors(&mut state, through);
+                let errno = if error_delivery == ErrorDelivery::Consume {
+                    scope.consume_errors(&mut state, through)
+                } else {
+                    None
+                };
                 return BarrierOutcome::Complete(errno);
             }
 
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                record_barrier_wait(&mut state, scope, wait_started);
-                return BarrierOutcome::TimedOut;
-            };
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
             if remaining.is_zero() {
                 record_barrier_wait(&mut state, scope, wait_started);
+                if scope != BarrierScope::All {
+                    state.barrier_timeouts = state.barrier_timeouts.saturating_add(1);
+                    let pending_writes = state.pending.len();
+                    let pending_bytes = state.admitted_bytes;
+                    drop(state);
+                    tracing::warn!(
+                        ?scope,
+                        through,
+                        ?timeout,
+                        pending_writes,
+                        pending_bytes,
+                        "Linux FUSE async-write barrier timed out; pending writes remain owned"
+                    );
+                }
                 return BarrierOutcome::TimedOut;
             }
-            let (next_state, wait_result) = self
+            let (next_state, _) = self
                 .changed
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = next_state;
-            if wait_result.timed_out() && scope.has_pending(&state, through) {
-                record_barrier_wait(&mut state, scope, wait_started);
-                return BarrierOutcome::TimedOut;
-            }
         }
     }
 
@@ -577,7 +621,19 @@ impl AsyncWriteLedger {
             );
         }
         state.task_abort_handles.remove(&sequence);
+        let release = if state.pending_by_handle.contains_key(&write.fh) {
+            None
+        } else {
+            state.deferred_releases.remove(&write.fh)
+        };
+        if release.is_some() {
+            state.running_releases.insert(write.fh);
+        }
         self.changed.notify_all();
+        drop(state);
+        if let Some(release) = release {
+            self.finish_deferred_release(write.fh, release);
+        }
     }
 
     #[cfg(test)]
@@ -650,6 +706,20 @@ fn record_barrier_wait(
         .saturating_add(duration_nanos(started.elapsed()));
 }
 
+struct DeferredRelease(Box<dyn FnOnce() + Send>);
+
+impl fmt::Debug for DeferredRelease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeferredRelease")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ErrorDelivery {
+    Consume,
+    Preserve,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BarrierScope {
     Inode(u64),
@@ -662,7 +732,11 @@ impl BarrierScope {
         let entries = match self {
             Self::Inode(ino) => state.pending_by_inode.get(&ino),
             Self::Handle(fh) => state.pending_by_handle.get(&fh),
-            Self::All => return state.pending.range(..=through).next().is_some(),
+            Self::All => {
+                return state.pending.range(..=through).next().is_some()
+                    || !state.deferred_releases.is_empty()
+                    || !state.running_releases.is_empty();
+            }
         };
         entries.is_some_and(|entries| entries.range(..=through).next().is_some())
     }
@@ -745,6 +819,131 @@ mod tests {
     const SHORT_WAIT: Duration = Duration::from_millis(20);
 
     #[test]
+    fn timeout_does_not_poison_idle_barriers_or_new_admission() {
+        let ledger = Arc::new(AsyncWriteLedger::default().with_barrier_timeout(Duration::ZERO));
+        let ticket = ledger.admit(10, 100, 4).unwrap();
+        assert_eq!(
+            ledger.wait_inode(ledger.capture_inode_watermark(10)),
+            BarrierOutcome::TimedOut
+        );
+        assert_eq!(
+            ledger.wait_inode(ledger.capture_inode_watermark(20)),
+            BarrierOutcome::Complete(None)
+        );
+        assert_eq!(
+            ledger.wait_inode_completion(ledger.capture_inode_watermark(20)),
+            BarrierOutcome::Complete(None)
+        );
+        assert_eq!(
+            ledger.wait_handle(ledger.close_handle(200)),
+            BarrierOutcome::Complete(None)
+        );
+        assert!(ledger.forget_handle(200));
+        ledger
+            .admit(20, 201, 4)
+            .expect("unrelated writes remain usable")
+            .complete(Ok(()));
+        ticket.complete(Ok(()));
+        assert_eq!(
+            ledger.wait_inode(ledger.capture_inode_watermark(10)),
+            BarrierOutcome::Complete(None)
+        );
+    }
+
+    #[test]
+    fn timeout_does_not_fail_registered_capacity_waiter() {
+        let ledger = Arc::new(AsyncWriteLedger {
+            barrier_timeout: Duration::ZERO,
+            ..AsyncWriteLedger::with_limits(4, 1)
+        });
+        let owner = ledger.admit(10, 100, 4).unwrap();
+        let mut waiter = ledger.start_request(20, 200).unwrap();
+        assert_eq!(
+            ledger.wait_inode(ledger.capture_inode_watermark(20)),
+            BarrierOutcome::TimedOut
+        );
+        owner.complete(Ok(()));
+        waiter
+            .reserve_capacity(4)
+            .expect("timeout must not become shutdown");
+        waiter.complete(Ok(()));
+        assert_eq!(
+            ledger.wait_inode(ledger.capture_inode_watermark(20)),
+            BarrierOutcome::Complete(None)
+        );
+    }
+
+    #[test]
+    fn timeout_preserves_late_write_error_for_next_barrier() {
+        let ledger = Arc::new(AsyncWriteLedger::default().with_barrier_timeout(Duration::ZERO));
+        let ticket = ledger.admit(10, 100, 4).unwrap();
+        let watermark = ledger.capture_inode_watermark(10);
+        assert_eq!(ledger.wait_inode(watermark), BarrierOutcome::TimedOut);
+        ticket.complete(Err(libc::ENOSPC));
+        assert_eq!(
+            ledger.wait_inode_completion(watermark),
+            BarrierOutcome::Complete(None)
+        );
+        assert_eq!(
+            ledger.wait_inode(watermark),
+            BarrierOutcome::Complete(Some(libc::ENOSPC))
+        );
+        assert_eq!(ledger.wait_inode(watermark), BarrierOutcome::Complete(None));
+        assert_eq!(ledger.metrics_snapshot().barrier_timeouts, 1);
+    }
+
+    #[test]
+    fn deferred_release_runs_after_last_write_and_is_included_in_shutdown_drain() {
+        let ledger = Arc::new(AsyncWriteLedger::with_limits(16, 4));
+        let first = ledger.admit(10, 100, 4).unwrap();
+        let last = ledger.admit(10, 100, 4).unwrap();
+        ledger.close_handle(100);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        ledger.defer_release(100, move || {
+            entered_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+        first.complete(Err(libc::ENOSPC));
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "cleanup must await every handle write"
+        );
+        let worker = thread::spawn(move || last.complete(Ok(())));
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        ledger.shutdown();
+        let drained = ledger.wait_all(Duration::ZERO);
+        let forgotten = ledger.forget_handle(100);
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(
+            drained,
+            BarrierOutcome::TimedOut,
+            "shutdown must retain running cleanup"
+        );
+        assert!(!forgotten, "cleanup still owns the closed handle");
+        assert_eq!(
+            ledger.wait_all(Duration::ZERO),
+            BarrierOutcome::Complete(None)
+        );
+        assert!(ledger.lock_state().closed_handles.is_empty());
+        assert!(ledger.lock_state().errors.is_empty());
+    }
+
+    #[test]
+    fn deferred_release_handles_completion_before_registration() {
+        let ledger = Arc::new(AsyncWriteLedger::with_limits(16, 4));
+        let ticket = ledger.admit(10, 100, 4).unwrap();
+        ledger.close_handle(100);
+        ticket.complete(Err(libc::EIO));
+        let (sender, receiver) = mpsc::channel();
+        ledger.defer_release(100, move || sender.send(()).unwrap());
+        receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(ledger.lock_state().closed_handles.is_empty());
+        assert!(ledger.lock_state().errors.is_empty());
+    }
+
+    #[test]
     fn defaults_preserve_global_admission_limits() {
         let ledger = AsyncWriteLedger::default();
 
@@ -817,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn untimed_inode_barrier_waits_for_pre_watermark_write_only() {
+    fn inode_barrier_waits_for_pre_watermark_write_only() {
         let ledger = Arc::new(AsyncWriteLedger::default());
         let before = ledger.admit(10, 100, 4).expect("write should admit");
         let watermark = ledger.capture_inode_watermark(10);
@@ -857,7 +1056,10 @@ mod tests {
         let watermark = ledger.capture_inode_watermark(10);
 
         ticket.complete(Err(libc::ENOSPC));
-        ledger.wait_inode_completion(watermark);
+        assert_eq!(
+            ledger.wait_inode_completion(watermark),
+            BarrierOutcome::Complete(None)
+        );
 
         assert_eq!(
             ledger.wait_inode(watermark),
@@ -866,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn untimed_handle_barrier_waits_for_pre_watermark_write_only() {
+    fn handle_barrier_waits_for_pre_watermark_write_only() {
         let ledger = Arc::new(AsyncWriteLedger::default());
         let before = ledger.admit(10, 100, 4).expect("write should admit");
         let watermark = ledger.capture_handle_watermark(100);
@@ -900,7 +1102,7 @@ mod tests {
     }
 
     #[test]
-    fn untimed_inode_barrier_drains_registered_write_after_shutdown() {
+    fn inode_barrier_drains_registered_write_after_shutdown() {
         let ledger = Arc::new(AsyncWriteLedger::default());
         let ticket = ledger.admit(10, 100, 4).expect("write should admit");
         let watermark = ledger.capture_inode_watermark(10);
