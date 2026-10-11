@@ -214,6 +214,7 @@ pub(crate) struct SessionState {
     mount_gid: u32,
     connection_config: LinuxFuseConnectionConfig,
     cache_policy: LinuxFuseCachePolicy,
+    async_direct_io: bool,
     available_memory: Mutex<SystemMemorySampler>,
     read_buffers: SyncReadBufferPool,
     open_reply_serializer: FuseOpenReplySerializer,
@@ -252,6 +253,7 @@ impl SessionState {
             mount_gid: current_gid(),
             connection_config,
             cache_policy: linux_fuse_cache_policy_from_env(),
+            async_direct_io: linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO"),
             available_memory: Mutex::new(SystemMemorySampler::system()),
             read_buffers: SyncReadBufferPool::new(),
             open_reply_serializer: FuseOpenReplySerializer::new(),
@@ -489,13 +491,9 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_congestion_threshold(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_async_dio(
-    _userdata: *mut c_void,
+    userdata: *mut c_void,
 ) -> c_int {
-    if linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO") {
-        1
-    } else {
-        0
-    }
+    fuse_flag(callback_state_from_userdata(userdata).is_some_and(|state| state.async_direct_io))
 }
 
 #[unsafe(no_mangle)]
@@ -1964,7 +1962,7 @@ impl SessionState {
                 generation,
                 attr.size,
                 available_memory,
-                linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO"),
+                self.async_direct_io,
             )
         };
         let owner_was_set = self.vfs.set_read_ahead_owner(fh, cache.read_ahead_owner);
@@ -3968,6 +3966,78 @@ mod tests {
             *replies.lock().unwrap_or_else(|error| error.into_inner()),
             [Err(libc::EIO)]
         );
+    }
+
+    #[test]
+    fn async_dio_session_configuration_controls_connection_and_opens() {
+        const CHILD_EXPECTED: &str = "STUDIOFS_TEST_ASYNC_DIO_EXPECTED";
+        let Ok(expected) = std::env::var(CHILD_EXPECTED) else {
+            for (value, expected) in [
+                (None, false),
+                (Some("1"), true),
+                (Some("true"), true),
+                (Some("yes"), true),
+                (Some(" ON "), true),
+                (Some("0"), false),
+                (Some("false"), false),
+                (Some("off"), false),
+                (Some(""), false),
+                (Some("invalid"), false),
+            ] {
+                let mut child = Command::new(std::env::current_exe().expect("test executable"));
+                child
+                    .args([
+                        "--exact",
+                        "low_level::tests::async_dio_session_configuration_controls_connection_and_opens",
+                    ])
+                    .env(CHILD_EXPECTED, if expected { "1" } else { "0" })
+                    .env_remove("STUDIOFS_FUSE_ASYNC_DIO");
+                if let Some(value) = value {
+                    child.env("STUDIOFS_FUSE_ASYNC_DIO", value);
+                }
+                let output = child.output().expect("run isolated configuration test");
+                assert!(
+                    output.status.success(),
+                    "async-DIO value {value:?}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            return;
+        };
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-async-dio")
+                .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        assert_eq!(state.async_direct_io, expected == "1");
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
+        let attr = fixture
+            .vfs()
+            .create(1, b"async-dio.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let fh = fixture
+            .vfs()
+            .open_file(attr.ino, studiofs_vfs::OpenFlags::RDONLY, false)
+            .expect("open file");
+        for enabled in [false, true] {
+            // Explicit session configuration must win over the child environment.
+            state.async_direct_io = enabled;
+            let userdata = std::ptr::from_mut(&mut state).cast();
+            // SAFETY: userdata points to the live session for this synchronous call.
+            let requested =
+                unsafe { super::studiofs_linux_fuse_connection_wants_async_dio(userdata) };
+            assert_eq!(requested, i32::from(enabled));
+            for _ in 0..2 {
+                let prepared = state.prepare_file_open(&attr, libc::O_RDONLY, fh);
+                assert!(prepared.cache.direct_io);
+                assert_eq!(prepared.cache.parallel_direct_writes, enabled);
+            }
+        }
     }
 
     #[test]
