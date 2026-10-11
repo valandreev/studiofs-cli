@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
@@ -67,6 +68,7 @@ struct WriteError {
 struct LedgerState {
     shutting_down: bool,
     next_sequence: u64,
+    next_capacity_sequence: Option<u64>,
     // These counters cover only callbacks admitted to async execution. Callbacks waiting for
     // capacity remain synchronous libfuse workers, but are already present in the indexes below
     // so barriers cannot miss them. Libfuse callback concurrency bounds that registered set.
@@ -98,6 +100,19 @@ struct LedgerState {
     inode_barrier_waits: u64,
     handle_barrier_waits: u64,
     barrier_wait_total_nanos: u64,
+}
+
+impl LedgerState {
+    fn advance_capacity_sequence(&mut self, sequence: u64) {
+        if self.next_capacity_sequence == Some(sequence) {
+            // Ordered admission means every later pending request is still unreserved.
+            self.next_capacity_sequence = self
+                .pending
+                .range((Excluded(sequence), Unbounded))
+                .next()
+                .map(|(&next, _)| next);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -220,6 +235,7 @@ impl AsyncWriteLedger {
             .checked_add(1)
             .ok_or(AdmissionError::SequenceExhausted)?;
         state.next_sequence = sequence;
+        state.next_capacity_sequence.get_or_insert(sequence);
         state.pending.insert(
             sequence,
             PendingWrite {
@@ -497,11 +513,7 @@ impl AsyncWriteLedger {
             {
                 return Ok(());
             }
-            let is_next = state
-                .pending
-                .iter()
-                .find(|(_, write)| write.reserved_bytes.is_none())
-                .is_some_and(|(&next_sequence, _)| next_sequence == sequence);
+            let is_next = state.next_capacity_sequence == Some(sequence);
             if is_next && !self.at_capacity(&state, bytes) {
                 break;
             }
@@ -525,6 +537,7 @@ impl AsyncWriteLedger {
         if let Some(write) = state.pending.get_mut(&sequence) {
             write.reserved_bytes = Some(bytes);
         }
+        state.advance_capacity_sequence(sequence);
         self.changed.notify_all();
         Ok(())
     }
@@ -591,6 +604,7 @@ impl AsyncWriteLedger {
         let Some(write) = state.pending.remove(&sequence) else {
             return;
         };
+        state.advance_capacity_sequence(sequence);
         if let Some(bytes) = write.reserved_bytes {
             state.admitted_bytes = state
                 .admitted_bytes
@@ -1663,6 +1677,96 @@ mod tests {
         reservation.expect("later waiter should reserve capacity");
         after_watermark.complete(Ok(()));
         later_waiter.join().expect("waiter should not panic");
+    }
+
+    #[test]
+    fn capacity_admission_skips_requests_finished_before_reservation() {
+        let ledger = Arc::new(AsyncWriteLedger::with_limits(4, 1));
+        let owner = ledger.admit(10, 100, 4).unwrap();
+        let head = ledger.start_request(20, 200).unwrap();
+        let mut oversized = ledger.start_request(30, 300).unwrap();
+        let later = ledger.start_request(40, 400).unwrap();
+        let mut survivor = ledger.start_request(50, 500).unwrap();
+
+        // Remove a later request before the head, then fail the next head before admission.
+        later.complete(Ok(()));
+        drop(head);
+        assert_eq!(
+            oversized.reserve_capacity(5),
+            Err(AdmissionError::RequestTooLarge)
+        );
+        oversized.complete(Err(libc::EINVAL));
+        owner.complete(Ok(()));
+
+        let (sender, receiver) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let result = survivor.reserve_capacity(4);
+            survivor.complete(Ok(()));
+            sender.send(result).unwrap();
+        });
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("removed requests must not strand the surviving waiter")
+            .unwrap();
+        waiter.join().unwrap();
+        assert_eq!(ledger.pending_for_test(), (0, 0));
+        assert_eq!(
+            ledger.wait_inode(ledger.capture_inode_watermark(20)),
+            BarrierOutcome::Complete(Some(libc::EIO))
+        );
+        assert_eq!(
+            ledger.wait_inode(ledger.capture_inode_watermark(30)),
+            BarrierOutcome::Complete(Some(libc::EINVAL))
+        );
+        ledger.admit(60, 600, 4).unwrap().complete(Ok(()));
+    }
+
+    #[test]
+    fn capacity_admission_drains_large_queue_with_reserved_prefix_and_cancellation_holes() {
+        const QUEUE_SIZE: usize = 2048;
+        let ledger = Arc::new(AsyncWriteLedger::with_limits(
+            QUEUE_SIZE * 2,
+            QUEUE_SIZE * 2,
+        ));
+        let owners = (0..QUEUE_SIZE)
+            .map(|_| ledger.admit(10, 100, 1).unwrap())
+            .collect::<Vec<_>>();
+        let requests = (0..QUEUE_SIZE)
+            .map(|_| ledger.start_request(20, 200).unwrap())
+            .collect::<Vec<_>>();
+        let (sender, receiver) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let mut admitted = Vec::new();
+            for (index, mut request) in requests.into_iter().enumerate() {
+                if index % 3 == 0 {
+                    drop(request);
+                } else {
+                    request.reserve_capacity(1).unwrap();
+                    // Repeated reservation must not advance past the next waiting request.
+                    request.reserve_capacity(1).unwrap();
+                    admitted.push(request);
+                }
+            }
+            sender.send(admitted).unwrap();
+        });
+        let admitted = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("large queue must drain despite cancellations and a live reserved prefix");
+        waiter.join().unwrap();
+        assert_eq!(admitted.len(), QUEUE_SIZE - QUEUE_SIZE.div_ceil(3));
+        assert_eq!(
+            ledger.admission_for_test(),
+            (owners.len() + admitted.len(), owners.len() + admitted.len())
+        );
+        for ticket in owners.into_iter().chain(admitted) {
+            ticket.complete(Ok(()));
+        }
+        assert_eq!(ledger.pending_for_test(), (0, 0));
+        assert_eq!(
+            ledger.wait_inode(ledger.capture_inode_watermark(20)),
+            BarrierOutcome::Complete(Some(libc::EIO))
+        );
+        ledger.admit(30, 300, 1).unwrap().complete(Ok(()));
     }
 
     #[test]
