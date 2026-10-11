@@ -649,6 +649,11 @@ the normal unmount path. macFUSE 5.3.3 can still leave the handoff stuck after
 an abrupt client kill; if `/sbin/mount`, `umount`, or `diskutil unmount` blocks,
 reboot the host before another native run and retain the failed report.
 
+On Linux and macOS, a write-capable mount is ready only after the native mount
+is active and the client's mount record reports `live`. A fresh client serves
+reads in `mounted` (`local_ready`) but rejects mutations with `EACCES` until
+its startup sync grants write authority, so the runner must not write earlier.
+
 `mounted-sparse-file-range-convergence` is a deliberate post-1-16 promotion
 scenario. It uses a bounded sparse file, validates zero-filled holes,
 shrink/extend truncation, chunk-boundary writes, range read probes, logical

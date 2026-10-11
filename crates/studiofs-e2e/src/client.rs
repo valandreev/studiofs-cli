@@ -480,10 +480,11 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
             if !mount_point_is_active(&command.mount_point)? {
                 return Ok(false);
             }
-            if !windows_mount_lifecycle_is_ready(
+            if !mount_lifecycle_is_ready(
                 &command.client_root,
                 &command.mount_point,
                 process_id,
+                MOUNT_LIFECYCLE_READY_STATUSES,
             )? {
                 return Ok(false);
             }
@@ -496,8 +497,22 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
 
         #[cfg(not(windows))]
         {
-            let _ = process_id;
-            self.is_mount_ready(command)
+            let write_capable = !command
+                .args
+                .iter()
+                .any(|argument| argument == "--read-only");
+            let accepted_statuses = if write_capable {
+                MOUNT_LIFECYCLE_WRITABLE_STATUSES
+            } else {
+                MOUNT_LIFECYCLE_READY_STATUSES
+            };
+            Ok(self.is_mount_ready(command)?
+                && mount_lifecycle_is_ready(
+                    &command.client_root,
+                    &command.mount_point,
+                    process_id,
+                    accepted_statuses,
+                )?)
         }
     }
 
@@ -509,10 +524,11 @@ impl ClientProcessExecutor for SystemClientProcessExecutor {
         #[cfg(windows)]
         {
             Ok(mount_point_is_active(&command.mount_point)?
-                && windows_mount_lifecycle_is_ready(
+                && mount_lifecycle_is_ready(
                     &command.client_root,
                     &command.mount_point,
                     process_id,
+                    MOUNT_LIFECYCLE_READY_STATUSES,
                 )?)
         }
 
@@ -2378,18 +2394,22 @@ pub(crate) fn mount_point_is_active(path: &Path) -> io::Result<bool> {
     Ok(root.exists())
 }
 
-#[cfg(windows)]
 #[derive(Debug, Deserialize)]
-struct WindowsMountLifecycleRecord {
+struct MountLifecycleRecord {
     pid: u32,
     status: String,
 }
 
-#[cfg(windows)]
-fn windows_mount_lifecycle_is_ready(
+/// Mount-record statuses that prove native mount readiness.
+const MOUNT_LIFECYCLE_READY_STATUSES: &[&str] = &["mounted", "live", "degraded"];
+/// Only `live` grants new mutations; fresh clients stay read-only before it.
+const MOUNT_LIFECYCLE_WRITABLE_STATUSES: &[&str] = &["live"];
+
+fn mount_lifecycle_is_ready(
     client_root: &Path,
     mount_point: &Path,
     process_id: u32,
+    accepted_statuses: &[&str],
 ) -> io::Result<bool> {
     let mount_name = mount_point
         .to_string_lossy()
@@ -2409,13 +2429,12 @@ fn windows_mount_lifecycle_is_ready(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    let record = match serde_json::from_str::<WindowsMountLifecycleRecord>(&data) {
+    let record = match serde_json::from_str::<MountLifecycleRecord>(&data) {
         Ok(record) => record,
         Err(_) => return Ok(false),
     };
 
-    Ok(record.pid == process_id
-        && matches!(record.status.as_str(), "mounted" | "live" | "degraded"))
+    Ok(record.pid == process_id && accepted_statuses.contains(&record.status.as_str()))
 }
 
 #[cfg(windows)]
@@ -3471,15 +3490,60 @@ macfuse on /Volumes/studiofs/client-a/projectfs (macfuse, local)\n";
         )
         .unwrap();
 
-        assert!(!windows_mount_lifecycle_is_ready(temp.path(), &mount_point, 42).unwrap());
+        assert!(
+            !mount_lifecycle_is_ready(
+                temp.path(),
+                &mount_point,
+                42,
+                MOUNT_LIFECYCLE_READY_STATUSES
+            )
+            .unwrap()
+        );
 
         fs::write(
             &record_path,
             serde_json::json!({"pid": 42, "status": "mounted"}).to_string(),
         )
         .unwrap();
-        assert!(windows_mount_lifecycle_is_ready(temp.path(), &mount_point, 42).unwrap());
-        assert!(!windows_mount_lifecycle_is_ready(temp.path(), &mount_point, 43).unwrap());
+        assert!(
+            mount_lifecycle_is_ready(
+                temp.path(),
+                &mount_point,
+                42,
+                MOUNT_LIFECYCLE_READY_STATUSES
+            )
+            .unwrap()
+        );
+        assert!(
+            !mount_lifecycle_is_ready(
+                temp.path(),
+                &mount_point,
+                43,
+                MOUNT_LIFECYCLE_READY_STATUSES
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn writable_mount_readiness_waits_for_live_lifecycle() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let mount_point = PathBuf::from("/mnt/studio");
+        let record_path = temp.path().join("mounts").join("mnt_studio.json");
+        fs::create_dir_all(record_path.parent().expect("record parent")).unwrap();
+        let ready = |status: &str, accepted: &[&str]| {
+            fs::write(
+                &record_path,
+                serde_json::json!({"pid": 42, "status": status}).to_string(),
+            )
+            .unwrap();
+            mount_lifecycle_is_ready(temp.path(), &mount_point, 42, accepted).unwrap()
+        };
+
+        assert!(ready("mounted", MOUNT_LIFECYCLE_READY_STATUSES));
+        assert!(!ready("mounted", MOUNT_LIFECYCLE_WRITABLE_STATUSES));
+        assert!(!ready("degraded", MOUNT_LIFECYCLE_WRITABLE_STATUSES));
+        assert!(ready("live", MOUNT_LIFECYCLE_WRITABLE_STATUSES));
     }
 
     #[cfg(windows)]
