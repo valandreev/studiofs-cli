@@ -1857,12 +1857,13 @@ impl SessionState {
             return Err(libc::EROFS);
         }
         let watermark = self.async_writes.capture_inode_watermark(ino);
-        self.async_writes.wait_inode_completion(watermark);
+        let outcome = self.async_writes.wait_inode_completion(watermark);
         record_async_write_metrics(&self.vfs, &self.async_writes, self.cache_policy);
-        let attr = self
-            .vfs
-            .link(ino, newparent, newname)
-            .map_err(|error| vfs_err_to_errno(&error))?;
+        let attr = finish_async_barrier_with(outcome, || {
+            self.vfs
+                .link(ino, newparent, newname)
+                .map_err(|error| vfs_err_to_errno(&error))
+        })?;
         let cache_safe = match self
             .invalidation_queue
             .push_with_receipt(ino, FuseInvalidationKind::Attributes)
@@ -3687,7 +3688,7 @@ mod tests {
 
     #[test]
     fn kernel_barriers_recover_worker_from_incomplete_async_write() {
-        for operation in ["flush", "fsync", "release"] {
+        for operation in ["link", "flush", "fsync", "release"] {
             let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(operation)
                 .expect("create VFS fixture");
             let mut state = super::SessionState::new(
@@ -3724,6 +3725,7 @@ mod tests {
                     "flush" => worker_state.flush(open.fh),
                     "fsync" => worker_state.fsync(Some(open.fh), attr.ino, false),
                     "release" => worker_state.release(open.fh),
+                    "link" => worker_state.link(attr.ino, 1, b"hardlink").map(|_| ()),
                     _ => unreachable!(),
                 };
                 sender.send(result).expect("send barrier result");
@@ -3744,6 +3746,11 @@ mod tests {
                 "timeout must retain its reservation"
             );
             assert_eq!(state.async_writes.metrics_snapshot().pending_writes, 0);
+            assert!(matches!(state.lookup(1, b"hardlink"), Err(libc::ENOENT)));
+            assert!(
+                matches!(state.link(attr.ino, 1, b"hardlink"), Err(libc::EIO)),
+                "link must reject an already failed barrier even after late completion"
+            );
             assert!(
                 state.vfs.get_open_file(open.fh).is_some(),
                 "timeout must retain the VFS handle"

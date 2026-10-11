@@ -292,15 +292,14 @@ impl AsyncWriteLedger {
     ///
     /// Namespace operations use this to observe prior write effects while
     /// leaving error delivery to the next flush, fsync, or release barrier.
-    pub(crate) fn wait_inode_completion(&self, watermark: InodeWatermark) {
-        let mut state = self.lock_state();
-        let scope = BarrierScope::Inode(watermark.ino);
-        while scope.has_pending(&state, watermark.through) {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
+    pub(crate) fn wait_inode_completion(&self, watermark: InodeWatermark) -> BarrierOutcome {
+        self.wait_scope_timed(
+            BarrierScope::Inode(watermark.ino),
+            watermark.through,
+            self.barrier_timeout,
+            true,
+            false,
+        )
     }
 
     pub(crate) fn wait_handle(&self, watermark: HandleWatermark) -> BarrierOutcome {
@@ -314,6 +313,7 @@ impl AsyncWriteLedger {
             watermark.through,
             timeout,
             false,
+            true,
         )
     }
 
@@ -324,6 +324,7 @@ impl AsyncWriteLedger {
             watermark.through,
             timeout,
             false,
+            true,
         )
     }
 
@@ -331,7 +332,7 @@ impl AsyncWriteLedger {
         let state = self.lock_state();
         let through = state.next_sequence;
         drop(state);
-        self.wait_scope_timed(BarrierScope::All, through, timeout, false)
+        self.wait_scope_timed(BarrierScope::All, through, timeout, false, true)
     }
 
     pub(crate) fn shutdown(&self) {
@@ -505,7 +506,7 @@ impl AsyncWriteLedger {
     }
 
     fn wait_scope(&self, scope: BarrierScope, through: u64) -> BarrierOutcome {
-        self.wait_scope_timed(scope, through, self.barrier_timeout, true)
+        self.wait_scope_timed(scope, through, self.barrier_timeout, true, true)
     }
 
     fn wait_scope_timed(
@@ -514,6 +515,7 @@ impl AsyncWriteLedger {
         through: u64,
         timeout: Duration,
         fail_on_timeout: bool,
+        consume_errors: bool,
     ) -> BarrierOutcome {
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -528,7 +530,11 @@ impl AsyncWriteLedger {
             }
             if !scope.has_pending(&state, through) {
                 record_barrier_wait(&mut state, scope, wait_started);
-                let errno = scope.consume_errors(&mut state, through);
+                let errno = if consume_errors {
+                    scope.consume_errors(&mut state, through)
+                } else {
+                    None
+                };
                 return BarrierOutcome::Complete(errno);
             }
 
@@ -876,7 +882,10 @@ mod tests {
         let watermark = ledger.capture_inode_watermark(10);
 
         ticket.complete(Err(libc::ENOSPC));
-        ledger.wait_inode_completion(watermark);
+        assert_eq!(
+            ledger.wait_inode_completion(watermark),
+            BarrierOutcome::Complete(None)
+        );
 
         assert_eq!(
             ledger.wait_inode(watermark),
