@@ -749,6 +749,8 @@ fn is_blocked_root_macos_metadata(name: &[u8]) -> bool {
 
 /// Attribute cache TTL — read-through attributes are valid for 1 second.
 const ATTR_CACHE_TTL: Duration = Duration::from_secs(1);
+/// Ignored-entry inodes are allocated from here upward.
+const FIRST_IGNORED_INO: Ino = 1 << 63;
 pub(crate) const REMOTE_OBJECT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
@@ -1425,6 +1427,13 @@ struct AttrReadObservation {
     inode_generation: u64,
 }
 
+/// Opaque invalidation boundary captured before reading reply attributes.
+#[derive(Clone, Copy, Debug)]
+pub struct AttributeObservation {
+    reset_generation: u64,
+    retirement_sequence: u64,
+}
+
 #[derive(Debug)]
 struct AttrReadCache {
     inner: TwoTierCache<Ino, InodeAttr, AttrReadCachePolicy>,
@@ -1432,6 +1441,7 @@ struct AttrReadCache {
     observation_generation: u64,
     /// Targeted retirement stamps keep unrelated in-flight reads admissible.
     inode_observation_generations: HashMap<Ino, u64>,
+    retirement_sequence: u64,
 }
 
 impl AttrReadCache {
@@ -1440,6 +1450,7 @@ impl AttrReadCache {
             inner: TwoTierCache::new(entry_budget, byte_budget, AttrReadCachePolicy),
             observation_generation: 0,
             inode_observation_generations: HashMap::new(),
+            retirement_sequence: 0,
         }
     }
 
@@ -1470,6 +1481,14 @@ impl AttrReadCache {
 
     fn get(&mut self, ino: Ino, now: Instant) -> Option<InodeAttr> {
         self.inner.get(&ino, now)
+    }
+
+    fn deadline_if_matches(&self, attr: &InodeAttr) -> Option<Instant> {
+        self.inner
+            .entries
+            .get(&attr.ino)
+            .filter(|entry| entry.value == *attr)
+            .map(|entry| entry.meta.expires_at)
     }
 
     fn get_if_observed(
@@ -1506,21 +1525,38 @@ impl AttrReadCache {
     }
 
     fn retire_inode_observation(&mut self, ino: Ino) {
-        if !self.inode_observation_generations.contains_key(&ino)
-            && self.inode_observation_generations.len() >= self.inner.entry_budget.max(1)
+        if self.retirement_sequence == u64::MAX
+            || !self.inode_observation_generations.contains_key(&ino)
+                && self.inode_observation_generations.len() >= self.inner.entry_budget.max(1)
         {
             // Evicting a token without knowing whether a reader still holds it
             // would allow an old result to repopulate the cache. A conservative
             // global epoch keeps the map bounded while preserving that barrier.
             self.retire_observations();
         }
-        let generation = self.inode_observation_generations.entry(ino).or_default();
-        *generation = generation.saturating_add(1);
+        self.retirement_sequence = self.retirement_sequence.saturating_add(1);
+        self.inode_observation_generations
+            .insert(ino, self.retirement_sequence);
+    }
+
+    fn observe_attributes(&self) -> AttributeObservation {
+        AttributeObservation {
+            reset_generation: self.observation_generation,
+            retirement_sequence: self.retirement_sequence,
+        }
+    }
+
+    fn attributes_unchanged(&self, ino: Ino, observed: AttributeObservation) -> bool {
+        observed.reset_generation != u64::MAX
+            && self.retirement_sequence != u64::MAX
+            && observed.reset_generation == self.observation_generation
+            && self.observation(ino).inode_generation <= observed.retirement_sequence
     }
 
     fn retire_observations(&mut self) {
         self.observation_generation = self.observation_generation.saturating_add(1);
         self.inode_observation_generations.clear();
+        self.retirement_sequence = 0;
     }
 
     fn put_observed(
@@ -2819,7 +2855,7 @@ impl MetricsState {
         Self {
             materialize_batch_stats: MaterializeBatchStats::default(),
             ignored_entries: OrderedMutex::new(IgnoredEntryRegistry::default(), LockTier::Metrics),
-            next_ignored_ino: AtomicU64::new(1u64 << 63),
+            next_ignored_ino: AtomicU64::new(FIRST_IGNORED_INO),
             prefetch_queue_depth: AtomicU64::new(0),
             prefetch_ingress_dropped_hints: AtomicU64::new(0),
             prefetch_ingress_dropped_blocks: AtomicU64::new(0),

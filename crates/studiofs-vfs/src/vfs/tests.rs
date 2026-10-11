@@ -18450,6 +18450,65 @@ fn test_validate_name_windows_special_chars() {
 }
 
 #[test]
+fn attribute_observation_rejects_target_changes_but_allows_other_inodes() {
+    let mut cache = AttrReadCache::new(8, 4096);
+    cache.remove(42);
+    cache.remove(43);
+    let observed = cache.observe_attributes();
+    cache.remove(43);
+    assert!(cache.attributes_unchanged(42, observed));
+    cache.remove(42);
+    assert!(!cache.attributes_unchanged(42, observed));
+}
+
+#[test]
+fn attribute_observation_rejects_reset_and_bounded_stamp_eviction() {
+    let mut cache = AttrReadCache::new(1, 4096);
+    let before_reset = cache.observe_attributes();
+    cache.retire_observations();
+    assert!(!cache.attributes_unchanged(42, before_reset));
+    cache.remove(42);
+    let before_eviction = cache.observe_attributes();
+    cache.remove(43);
+    assert!(!cache.attributes_unchanged(42, before_eviction));
+    assert_eq!(cache.inode_observation_generations.len(), 1);
+}
+
+#[test]
+fn attribute_observation_sequence_overflow_retires_existing_cache_tokens() {
+    let mut cache = AttrReadCache::new(8, 4096);
+    cache.retirement_sequence = u64::MAX;
+    let old = cache.observation(42);
+    let observed = cache.observe_attributes();
+    cache.remove(43);
+    assert!(!cache.attributes_unchanged(42, observed));
+    assert_ne!(cache.observation(42), old);
+    assert!(cache.attributes_unchanged(42, cache.observe_attributes()));
+}
+
+#[test]
+fn attribute_observation_saturated_reset_epoch_cannot_allow_reuse() {
+    let mut cache = AttrReadCache::new(8, 4096);
+    cache.observation_generation = u64::MAX;
+    assert!(!cache.attributes_unchanged(42, cache.observe_attributes()));
+}
+
+#[test]
+fn attribute_reuse_rejects_attrs_requiring_authoritative_refresh() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "attr-reuse-authoritative");
+    let attr = vfs
+        .create(1, b"pending.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let observed = vfs.observe_attributes();
+    assert!(vfs.can_reuse_attributes(&attr, observed).unwrap());
+    let mut pending = attr;
+    pending.upload_state = MetaUploadState::Uploading;
+    pending.content_epoch = pending.committed_content_epoch + 1;
+    assert!(!vfs.can_reuse_attributes(&pending, observed).unwrap());
+}
+
+#[test]
 fn attr_read_cache_is_bounded_and_tracks_hotset_hits() {
     let mut cache = AttrReadCache::new(2, AttrReadCache::estimate_entry_charge() * 4);
     let now = Instant::now();

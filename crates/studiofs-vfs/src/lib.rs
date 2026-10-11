@@ -56,9 +56,9 @@ pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;
 pub use utils::parse_size_bytes;
 pub use vfs::{
-    DirEntryWithAttr, DirectoryEnumerationObservation, KernelInvalidator, LocalSyncPolicy,
-    LockKind, NamespaceParent, NamespacePathStyle, NamespaceResolver, OpenFile, OpenFlags,
-    RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_NAME_STR,
+    AttributeObservation, DirEntryWithAttr, DirectoryEnumerationObservation, KernelInvalidator,
+    LocalSyncPolicy, LockKind, NamespaceParent, NamespacePathStyle, NamespaceResolver, OpenFile,
+    OpenFlags, RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_NAME_STR,
     RUNTIME_STATS_FILE_REPORTED_SIZE, RUNTIME_STATS_SCHEMA_VERSION, RUNTIME_STATS_SECTIONS,
     ReadAheadOwner, RuntimeLatencyBucket, RuntimeLatencyHistogram, RuntimeScalarMetric,
     RuntimeStatsParseError, RuntimeStatsSection, RuntimeStatsSnapshot, StatFs, StudioVfs,

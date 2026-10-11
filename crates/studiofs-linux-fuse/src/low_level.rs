@@ -225,6 +225,8 @@ pub(crate) struct SessionState {
     inode_liveness: FuseInodeLiveness,
     open_liveness: [Mutex<HashMap<u64, FuseOpenHandleGuard>>; LIVENESS_SHARDS],
     invalidation_queue: FuseInvalidationQueue,
+    #[cfg(test)]
+    getattr_calls: AtomicU64,
 }
 
 const _: fn() = assert_send_sync_static::<SessionState>;
@@ -269,6 +271,8 @@ impl SessionState {
             inode_liveness: FuseInodeLiveness::default(),
             open_liveness: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             invalidation_queue: FuseInvalidationQueue::default(),
+            #[cfg(test)]
+            getattr_calls: AtomicU64::new(0),
         }
     }
 }
@@ -454,9 +458,16 @@ struct LinuxFusePreparedOpen {
 
 #[derive(Debug)]
 struct LinuxFuseAllocatedOpen {
-    ino: u64,
+    observed: ObservedInodeAttr,
     fh: u64,
     flags: c_int,
+}
+
+#[derive(Debug)]
+struct ObservedInodeAttr {
+    attr: InodeAttr,
+    observation: studiofs_vfs::AttributeObservation,
+    expires_at: Option<Instant>,
 }
 
 struct LinuxFuseAllocatedCreate {
@@ -1698,13 +1709,47 @@ fn with_xattr_value<T>(value: *const c_char, size: usize, f: impl FnOnce(&[u8]) 
 }
 
 impl SessionState {
-    fn lookup(&self, parent: u64, name: &[u8]) -> Result<InodeAttr, i32> {
-        self.vfs
-            .lookup(parent, name)
-            .map_err(|error| vfs_err_to_errno(&error))
+    fn observe_attr(
+        &self,
+        read: impl FnOnce() -> Result<InodeAttr, i32>,
+    ) -> Result<ObservedInodeAttr, i32> {
+        let observation = self.vfs.observe_attributes();
+        read().map(|attr| {
+            let expires_at = self.vfs.attribute_cache_deadline(&attr);
+            ObservedInodeAttr {
+                attr,
+                observation,
+                expires_at,
+            }
+        })
+    }
+
+    fn current_attr(&self, observed: ObservedInodeAttr) -> Result<InodeAttr, i32> {
+        if observed
+            .expires_at
+            .is_some_and(|deadline| Instant::now() < deadline)
+            && self
+                .vfs
+                .can_reuse_attributes(&observed.attr, observed.observation)
+                .map_err(|error| vfs_err_to_errno(&error))?
+        {
+            Ok(observed.attr)
+        } else {
+            self.getattr_attr(observed.attr.ino)
+        }
+    }
+
+    fn lookup(&self, parent: u64, name: &[u8]) -> Result<ObservedInodeAttr, i32> {
+        self.observe_attr(|| {
+            self.vfs
+                .lookup(parent, name)
+                .map_err(|error| vfs_err_to_errno(&error))
+        })
     }
 
     fn getattr_attr(&self, ino: u64) -> Result<InodeAttr, i32> {
+        #[cfg(test)]
+        self.getattr_calls.fetch_add(1, Ordering::Relaxed);
         self.vfs
             .getattr(ino)
             .map_err(|error| vfs_err_to_errno(&error))
@@ -1757,17 +1802,19 @@ impl SessionState {
             return Err(libc::ENOTSUP);
         }
         let mode = (mode & 0o7777) as u16;
-        let attr = self
-            .vfs
-            .create_with_deferred_metadata_admission(
-                parent,
-                name,
-                self.mount_uid,
-                self.mount_gid,
-                mode,
-                &self.runtime_handle,
-            )
-            .map_err(|error| vfs_err_to_errno(&error))?;
+        let observed = self.observe_attr(|| {
+            self.vfs
+                .create_with_deferred_metadata_admission(
+                    parent,
+                    name,
+                    self.mount_uid,
+                    self.mount_gid,
+                    mode,
+                    &self.runtime_handle,
+                )
+                .map_err(|error| vfs_err_to_errno(&error))
+        })?;
+        let attr = &observed.attr;
         // Reserve the kernel lookup before opening the writer handle. Any
         // invalidation from writer admission onward is now marked for a
         // post-reply DATA notification.
@@ -1776,7 +1823,7 @@ impl SessionState {
         let fh = self
             .vfs
             .open_created_file_with_known_attr_and_read_ahead_owner(
-                &attr,
+                attr,
                 open_flags,
                 trunc,
                 ReadAheadOwner::Kernel,
@@ -1785,7 +1832,7 @@ impl SessionState {
         self.install_open_liveness(attr.ino, fh);
         Ok(LinuxFuseAllocatedCreate {
             open: LinuxFuseAllocatedOpen {
-                ino: attr.ino,
+                observed,
                 fh,
                 flags,
             },
@@ -1793,23 +1840,25 @@ impl SessionState {
         })
     }
 
-    fn mkdir(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
+    fn mkdir(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<ObservedInodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
         let mode = (mode & 0o7777) as u16;
-        let result = self.vfs.mkdir_with_deferred_metadata_admission(
-            parent,
-            name,
-            self.mount_uid,
-            self.mount_gid,
-            mode,
-            &self.runtime_handle,
-        );
-        result.map_err(|error| vfs_err_to_errno(&error))
+        self.observe_attr(|| {
+            let result = self.vfs.mkdir_with_deferred_metadata_admission(
+                parent,
+                name,
+                self.mount_uid,
+                self.mount_gid,
+                mode,
+                &self.runtime_handle,
+            );
+            result.map_err(|error| vfs_err_to_errno(&error))
+        })
     }
 
-    fn mknod(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
+    fn mknod(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<ObservedInodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -1818,24 +1867,28 @@ impl SessionState {
             return Err(libc::ENOTSUP);
         }
         let mode = (mode & 0o7777) as u16;
-        let result = self.vfs.create_with_deferred_metadata_admission(
-            parent,
-            name,
-            self.mount_uid,
-            self.mount_gid,
-            mode,
-            &self.runtime_handle,
-        );
-        result.map_err(|error| vfs_err_to_errno(&error))
+        self.observe_attr(|| {
+            let result = self.vfs.create_with_deferred_metadata_admission(
+                parent,
+                name,
+                self.mount_uid,
+                self.mount_gid,
+                mode,
+                &self.runtime_handle,
+            );
+            result.map_err(|error| vfs_err_to_errno(&error))
+        })
     }
 
-    fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Result<InodeAttr, i32> {
+    fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Result<ObservedInodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        self.vfs
-            .symlink(parent, name, target, self.mount_uid, self.mount_gid)
-            .map_err(|error| vfs_err_to_errno(&error))
+        self.observe_attr(|| {
+            self.vfs
+                .symlink(parent, name, target, self.mount_uid, self.mount_gid)
+                .map_err(|error| vfs_err_to_errno(&error))
+        })
     }
 
     fn unlink(&self, parent: u64, name: &[u8]) -> Result<(), i32> {
@@ -1916,7 +1969,8 @@ impl SessionState {
     }
 
     fn open_with_flags(&self, ino: u64, flags: c_int) -> Result<LinuxFuseAllocatedOpen, i32> {
-        let attr = self.getattr_attr(ino)?;
+        let observed = self.observe_attr(|| self.getattr_attr(ino))?;
+        let attr = &observed.attr;
         match attr.kind {
             FileType::RegularFile => {}
             FileType::Directory => return Err(libc::EISDIR),
@@ -1929,7 +1983,7 @@ impl SessionState {
         let fh = self
             .vfs
             .open_file_with_known_attr_and_read_ahead_owner(
-                &attr,
+                attr,
                 open_flags,
                 trunc,
                 ReadAheadOwner::Kernel,
@@ -1938,7 +1992,11 @@ impl SessionState {
         // Establish kernel liveness before generation preparation or any
         // operation that can publish an invalidation for this handle.
         self.install_open_liveness(ino, fh);
-        Ok(LinuxFuseAllocatedOpen { ino, fh, flags })
+        Ok(LinuxFuseAllocatedOpen {
+            observed,
+            fh,
+            flags,
+        })
     }
 
     fn prepare_file_open(&self, attr: &InodeAttr, flags: c_int, fh: u64) -> LinuxFusePreparedOpen {
@@ -1985,13 +2043,24 @@ impl SessionState {
         }
     }
 
+    fn allocated_open_attr(
+        &self,
+        observed: ObservedInodeAttr,
+        flags: c_int,
+    ) -> Result<InodeAttr, i32> {
+        // O_TRUNC changes the snapshot used to allocate the handle itself.
+        if flags & libc::O_TRUNC != 0 {
+            self.getattr_attr(observed.attr.ino)
+        } else {
+            self.current_attr(observed)
+        }
+    }
+
     fn prepare_allocated_open(
         &self,
         allocated: LinuxFuseAllocatedOpen,
     ) -> Result<LinuxFusePreparedOpen, i32> {
-        // Local metadata is cached; this refresh closes the result→reservation
-        // race without introducing remote I/O.
-        let attr = self.getattr_attr(allocated.ino)?;
+        let attr = self.allocated_open_attr(allocated.observed, allocated.flags)?;
         Ok(self.prepare_file_open(&attr, allocated.flags, allocated.fh))
     }
 
@@ -2003,7 +2072,7 @@ impl SessionState {
     ) -> Result<c_int, i32> {
         let _reply_guard = self.open_reply_serializer.lock(ino);
         let allocated = allocate()?;
-        debug_assert_eq!(allocated.ino, ino);
+        debug_assert_eq!(allocated.observed.attr.ino, ino);
         let fh = allocated.fh;
         let prepared = match self.prepare_allocated_open(allocated) {
             Ok(prepared) => prepared,
@@ -2026,9 +2095,9 @@ impl SessionState {
         allocated: LinuxFuseAllocatedCreate,
         reply: impl FnOnce(&InodeAttr, LinuxFusePreparedOpen, FuseLookupReservation) -> c_int,
     ) -> Result<c_int, i32> {
-        let ino = allocated.open.ino;
+        let ino = allocated.open.observed.attr.ino;
         let _reply_guard = self.open_reply_serializer.lock(ino);
-        let attr = match self.getattr_attr(ino) {
+        let attr = match self.allocated_open_attr(allocated.open.observed, allocated.open.flags) {
             Ok(attr) => attr,
             Err(errno) => {
                 self.reject_prepared_open(ino, allocated.open.fh);
@@ -2676,10 +2745,10 @@ fn fuse_flag(value: bool) -> c_int {
 fn reply_entry_result(
     req: *mut raw::FuseReq,
     state: &SessionState,
-    result: Result<InodeAttr, i32>,
+    result: Result<ObservedInodeAttr, i32>,
 ) -> c_int {
     match result {
-        Ok(attr) => match reply_entry_with(state, attr.ino, |entry| {
+        Ok(observed) => match reply_entry_with(state, observed, |entry| {
             // SAFETY: `entry` is initialized and valid for this synchronous reply.
             unsafe { raw::fuse_reply_entry(req, entry) }
         }) {
@@ -2698,13 +2767,12 @@ fn reply_entry_result(
 
 fn reply_entry_with(
     state: &SessionState,
-    ino: u64,
+    observed: ObservedInodeAttr,
     reply: impl FnOnce(*const raw::FuseEntryParam) -> c_int,
 ) -> Result<c_int, i32> {
-    let reservation = state.inode_liveness.reserve_lookup(ino);
-    // Metadata reads are local/cached. Refreshing after reservation guarantees
-    // an invalidation either precedes this snapshot or marks the pending reply.
-    let attr = state.getattr_attr(ino)?;
+    let reservation = state.inode_liveness.reserve_lookup(observed.attr.ino);
+    // Check after reservation: later invalidations mark the pending reply.
+    let attr = state.current_attr(observed)?;
     Ok(reply_reserved_entry_with(state, &attr, reservation, reply))
 }
 
@@ -4731,7 +4799,9 @@ mod tests {
                 || {
                     state.install_open_liveness(attr.ino, fh);
                     Ok(super::LinuxFuseAllocatedOpen {
-                        ino: attr.ino,
+                        observed: state
+                            .observe_attr(|| Ok(attr.clone()))
+                            .expect("observe attrs"),
                         fh,
                         flags: libc::O_RDONLY,
                     })
@@ -5130,6 +5200,380 @@ mod tests {
         assert_eq!(replies.load(Ordering::Relaxed), 1);
     }
 
+    fn install_reply_invalidator(state: &super::SessionState) {
+        state
+            .vfs
+            .set_kernel_invalidator(Arc::new(super::LinuxFuseKernelInvalidator {
+                queue: state.invalidation_queue.clone(),
+            }));
+    }
+
+    fn reply_fixture(
+        name: &str,
+    ) -> (
+        studiofs_vfs::contract_harness::ContractVfsFixture,
+        super::SessionState,
+    ) {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new(name).expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        (fixture, state)
+    }
+
+    #[test]
+    fn reply_getattr_counter_tracks_worker_threads() {
+        let (fixture, state) = reply_fixture("getattr-worker-counter");
+        let attr = fixture
+            .vfs()
+            .create(1, b"file", 0, 0, 0o644)
+            .expect("create inode");
+        let before = state.getattr_calls.load(Ordering::Relaxed);
+        thread::scope(|scope| {
+            scope
+                .spawn(|| state.getattr_attr(attr.ino).expect("read on worker"))
+                .join()
+                .expect("join worker");
+        });
+        assert_eq!(state.getattr_calls.load(Ordering::Relaxed), before + 1);
+        let other_state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        assert_eq!(other_state.getattr_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn stable_reply_entry_avoids_second_getattr() {
+        let (fixture, state) = reply_fixture("stable-entry");
+        fixture
+            .vfs()
+            .create(1, b"stable", 0, 0, 0o644)
+            .expect("create inode");
+        install_reply_invalidator(&state);
+        let observed = state.lookup(1, b"stable").expect("lookup inode");
+        let before = state.getattr_calls.load(Ordering::Relaxed);
+        assert_eq!(super::reply_entry_with(&state, observed, |_| 0), Ok(0));
+        let after = state.getattr_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            after, before,
+            "stable entry must reuse the lookup attributes"
+        );
+    }
+
+    #[test]
+    fn stable_reply_open_avoids_second_getattr() {
+        let (fixture, mut state) = reply_fixture("stable-open");
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
+        let attr = fixture
+            .vfs()
+            .create(1, b"stable", 0, 0, 0o644)
+            .expect("create inode");
+        install_reply_invalidator(&state);
+        let allocated = state
+            .open_with_flags(attr.ino, libc::O_RDONLY)
+            .expect("allocate open");
+        let fh = allocated.fh;
+        let before = state.getattr_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            state.run_open_reply_transaction(attr.ino, || Ok(allocated), |_| 0),
+            Ok(0)
+        );
+        let after = state.getattr_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            after, before,
+            "stable open must reuse the allocated attributes"
+        );
+        state.reject_prepared_open(attr.ino, fh);
+    }
+
+    #[test]
+    fn stable_reply_create_avoids_second_getattr() {
+        let (fixture, mut state) = reply_fixture("stable-create");
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
+        install_reply_invalidator(&state);
+        // Isolate reply preparation from fresh-create incarnation retirement.
+        let attr = fixture
+            .vfs()
+            .create(1, b"stable", 0, 0, 0o644)
+            .expect("create inode");
+        let ino = attr.ino;
+        let open = state
+            .open_with_flags(ino, libc::O_RDONLY)
+            .expect("allocate handle");
+        let fh = open.fh;
+        let allocated = super::LinuxFuseAllocatedCreate {
+            open,
+            lookup: state.inode_liveness.reserve_lookup(ino),
+        };
+        let before = state.getattr_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            state.run_create_reply_transaction(allocated, |attr, _, lookup| {
+                super::reply_reserved_entry_with(&state, attr, lookup, |_| 0)
+            }),
+            Ok(0)
+        );
+        let after = state.getattr_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            after, before,
+            "stable create must reuse the allocated attributes"
+        );
+        state.reject_prepared_open(ino, fh);
+        state.inode_liveness.forget(ino, 1);
+    }
+
+    #[test]
+    fn create_reply_refreshes_invalidation_from_handle_allocation() {
+        let (_fixture, mut state) = reply_fixture("create-own-invalidation");
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
+        let allocated = state
+            .create_with_flags(1, b"new", libc::S_IFREG | 0o644, libc::O_RDONLY)
+            .expect("allocate create");
+        let before = state.getattr_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            state.run_create_reply_transaction(allocated, |_, _, _| -libc::ENOENT),
+            Ok(-libc::ENOENT)
+        );
+        assert_eq!(
+            state.getattr_calls.load(Ordering::Relaxed),
+            before + 1,
+            "allocation retired the original snapshot and must force refresh"
+        );
+    }
+
+    #[test]
+    fn entry_reply_preserves_source_cache_deadline_and_refreshes_expired_snapshot() {
+        let (fixture, state) = reply_fixture("entry-expiry");
+        fixture
+            .vfs()
+            .create(1, b"cached", 0, 0, 0o644)
+            .expect("create inode");
+        let mut observed = state.lookup(1, b"cached").expect("observe cached inode");
+        assert!(observed.expires_at.is_some());
+        assert_eq!(
+            observed.expires_at,
+            state.vfs.attribute_cache_deadline(&observed.attr)
+        );
+        let mut different = observed.attr.clone();
+        different.size += 1;
+        assert_eq!(state.vfs.attribute_cache_deadline(&different), None);
+        observed.expires_at = Some(Instant::now());
+        let before = state.getattr_calls.load(Ordering::Relaxed);
+        assert_eq!(super::reply_entry_with(&state, observed, |_| 0), Ok(0));
+        assert_eq!(state.getattr_calls.load(Ordering::Relaxed), before + 1);
+    }
+
+    #[test]
+    fn entry_reply_refreshes_uncached_snapshot() {
+        let (fixture, state) = reply_fixture("entry-uncached");
+        let attr = fixture
+            .vfs()
+            .create(1, b"uncached", 0, 0, 0o644)
+            .expect("create inode");
+        let observed = state
+            .observe_attr(|| Ok(attr))
+            .expect("observe uncached attributes");
+        assert_eq!(observed.expires_at, None);
+        let before = state.getattr_calls.load(Ordering::Relaxed);
+        assert_eq!(super::reply_entry_with(&state, observed, |_| 0), Ok(0));
+        assert_eq!(state.getattr_calls.load(Ordering::Relaxed), before + 1);
+    }
+
+    #[test]
+    fn entry_reply_refreshes_invalidation_during_attribute_observation() {
+        let (fixture, state) = reply_fixture("entry-read-race");
+        let attr = fixture
+            .vfs()
+            .create(1, b"raced", 0, 0, 0o644)
+            .expect("create inode");
+        install_reply_invalidator(&state);
+        let observed = state
+            .observe_attr(|| {
+                let stale = state.getattr_attr(attr.ino)?;
+                fixture
+                    .vfs()
+                    .setattr(attr.ino, studiofs_meta::SetattrArgs::size_only(73))
+                    .expect("change size during observation");
+                Ok(stale)
+            })
+            .expect("observe raced attributes");
+        assert_eq!(
+            super::reply_entry_with(&state, observed, |entry| {
+                // SAFETY: the entry stays live for the synchronous reply closure.
+                assert_eq!(unsafe { (*entry).attr.st_size }, 73);
+                0
+            }),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn entry_reply_failed_refresh_releases_reservation() {
+        let (fixture, state) = reply_fixture("entry-refresh-error");
+        let attr = fixture
+            .vfs()
+            .create(1, b"removed", 0, 0, 0o644)
+            .expect("create inode");
+        install_reply_invalidator(&state);
+        let observed = state.lookup(1, b"removed").expect("lookup before unlink");
+        fixture.vfs().unlink(1, b"removed").expect("unlink inode");
+        assert_eq!(
+            super::reply_entry_with(&state, observed, |_| panic!("must not reply stale entry")),
+            Err(libc::ENOENT)
+        );
+        assert!(!state.inode_liveness.is_live(attr.ino));
+        assert_eq!(
+            state
+                .inode_liveness
+                .admit_invalidation(attr.ino, || {})
+                .deferred_reply_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn allocated_open_refreshes_local_change_before_native_invalidation() {
+        let (fixture, state) = reply_fixture("open-refresh-race");
+        let attr = fixture
+            .vfs()
+            .create(1, b"raced", 0, 0, 0o644)
+            .expect("create inode");
+        install_reply_invalidator(&state);
+        let allocated = state
+            .open_with_flags(attr.ino, libc::O_RDONLY)
+            .expect("allocate open");
+        fixture
+            .vfs()
+            .setattr(attr.ino, studiofs_meta::SetattrArgs::size_only(91))
+            .expect("change size after handle pinning");
+        let fh = allocated.fh;
+        let current = state
+            .allocated_open_attr(allocated.observed, allocated.flags)
+            .expect("refresh queued change");
+        assert_eq!(current.size, 91);
+        state.reject_prepared_open(attr.ino, fh);
+        assert!(!state.inode_liveness.is_live(attr.ino));
+    }
+
+    #[test]
+    fn allocated_open_truncation_refreshes_its_own_size_change() {
+        let (fixture, state) = reply_fixture("open-trunc-refresh");
+        let attr = fixture
+            .vfs()
+            .create(1, b"truncated", 0, 0, 0o644)
+            .expect("create inode");
+        fixture
+            .vfs()
+            .setattr(attr.ino, studiofs_meta::SetattrArgs::size_only(57))
+            .expect("set initial size");
+        let allocated = state
+            .open_with_flags(attr.ino, libc::O_WRONLY | libc::O_TRUNC)
+            .expect("allocate truncating open");
+        assert_eq!(
+            allocated.observed.attr.size, 57,
+            "allocation observed pre-truncate size"
+        );
+        let fh = allocated.fh;
+        let current = state
+            .allocated_open_attr(allocated.observed, allocated.flags)
+            .expect("refresh truncated size");
+        assert_eq!(current.size, 0);
+        state.reject_prepared_open(attr.ino, fh);
+    }
+
+    #[test]
+    fn create_reply_refreshes_after_reservation_and_keeps_follow_up() {
+        let (fixture, mut state) = reply_fixture("create-refresh-race");
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
+        // Same reusable allocation as `stable_reply_create_avoids_second_getattr`,
+        // so only the post-reservation change can force the refresh.
+        let ino = fixture
+            .vfs()
+            .create(1, b"raced", 0, 0, 0o644)
+            .expect("create inode")
+            .ino;
+        let open = state
+            .open_with_flags(ino, libc::O_RDONLY)
+            .expect("allocate handle");
+        let fh = open.fh;
+        let allocated = super::LinuxFuseAllocatedCreate {
+            open,
+            lookup: state.inode_liveness.reserve_lookup(ino),
+        };
+        fixture
+            .vfs()
+            .setattr(ino, studiofs_meta::SetattrArgs::size_only(83))
+            .expect("change size after lookup reservation");
+        let admission = state.inode_liveness.admit_invalidation(ino, || {});
+        assert_eq!(admission.deferred_reply_count(), 1);
+        let before = state.getattr_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            state.run_create_reply_transaction(allocated, |attr, _, reservation| {
+                assert_eq!(attr.size, 83);
+                super::reply_reserved_entry_with(&state, attr, reservation, |_| 0)
+            }),
+            Ok(0)
+        );
+        assert_eq!(
+            state.getattr_calls.load(Ordering::Relaxed),
+            before + 1,
+            "post-reservation change must force an attribute refresh"
+        );
+        assert_eq!(
+            state.invalidation_queue.pop(),
+            Some((ino, crate::invalidation::FuseInvalidationKind::Data))
+        );
+        state.reject_prepared_open(ino, fh);
+        state.inode_liveness.forget(ino, 1);
+    }
+
+    #[test]
+    fn entry_reply_rechecks_access_after_attribute_observation() {
+        let (fixture, state) = reply_fixture("entry-access-race");
+        let attr = fixture
+            .vfs()
+            .create(1, b"restricted", 0, 0, 0o644)
+            .expect("create inode");
+        let observed = state
+            .lookup(1, b"restricted")
+            .expect("lookup before access change");
+        fixture
+            .vfs()
+            .set_acl_rule(attr.ino, "*", studiofs_meta::AccessLevel::NoAccess)
+            .expect("revoke access without changing attributes");
+        assert_eq!(
+            super::reply_entry_with(&state, observed, |_| panic!("must not bypass access")),
+            Err(libc::ENOENT)
+        );
+        assert!(!state.inode_liveness.is_live(attr.ino));
+    }
+
+    #[test]
+    fn entry_reply_refreshes_synthetic_attributes_without_cache_retirement() {
+        let (fixture, state) = reply_fixture("entry-synthetic");
+        let observed = state
+            .mknod(1, b"._synthetic", libc::S_IFREG | 0o644)
+            .expect("create synthetic inode");
+        fixture
+            .vfs()
+            .setattr(observed.attr.ino, studiofs_meta::SetattrArgs::size_only(61))
+            .expect("change synthetic attributes");
+        assert_eq!(
+            super::reply_entry_with(&state, observed, |entry| {
+                // SAFETY: the entry stays live for the synchronous reply closure.
+                assert_eq!(unsafe { (*entry).attr.st_size }, 61);
+                0
+            }),
+            Ok(0)
+        );
+    }
+
     #[test]
     fn entry_reply_commits_only_after_native_success() {
         let fixture =
@@ -5150,10 +5594,21 @@ mod tests {
             .create(1, b"rejected", 0, 0, 0o644)
             .expect("create rejected inode");
 
-        assert_eq!(super::reply_entry_with(&state, accepted.ino, |_| 0), Ok(0));
+        assert_eq!(
+            super::reply_entry_with(
+                &state,
+                state.observe_attr(|| Ok(accepted.clone())).unwrap(),
+                |_| 0
+            ),
+            Ok(0)
+        );
         assert!(state.inode_liveness.is_live(accepted.ino));
         assert_eq!(
-            super::reply_entry_with(&state, rejected.ino, |_| -libc::ENOENT),
+            super::reply_entry_with(
+                &state,
+                state.observe_attr(|| Ok(rejected.clone())).unwrap(),
+                |_| -libc::ENOENT
+            ),
             Ok(-libc::ENOENT)
         );
         assert!(!state.inode_liveness.is_live(rejected.ino));
@@ -5174,6 +5629,8 @@ mod tests {
             .vfs()
             .create(1, b"fresh-attr", 0, 0, 0o644)
             .expect("create inode");
+        install_reply_invalidator(&state);
+        let observed = state.lookup(1, b"fresh-attr").expect("observe stale attrs");
         fixture
             .vfs()
             .setattr(
@@ -5185,7 +5642,7 @@ mod tests {
             )
             .expect("update size before reply reservation");
 
-        let result = super::reply_entry_with(&state, stale.ino, |entry| {
+        let result = super::reply_entry_with(&state, observed, |entry| {
             // SAFETY: the reply helper keeps the entry live through this closure.
             let entry = unsafe { &*entry };
             assert_eq!(entry.attr.st_size, 99);
@@ -5212,11 +5669,15 @@ mod tests {
             .expect("create raced inode");
 
         assert_eq!(
-            super::reply_entry_with(&state, attr.ino, |_| {
-                let admission = state.inode_liveness.admit_invalidation(attr.ino, || {});
-                assert_eq!(admission.deferred_reply_count(), 1);
-                0
-            }),
+            super::reply_entry_with(
+                &state,
+                state.observe_attr(|| Ok(attr.clone())).unwrap(),
+                |_| {
+                    let admission = state.inode_liveness.admit_invalidation(attr.ino, || {});
+                    assert_eq!(admission.deferred_reply_count(), 1);
+                    0
+                }
+            ),
             Ok(0)
         );
 
@@ -5253,7 +5714,9 @@ mod tests {
                 || {
                     state.install_open_liveness(attr.ino, fh);
                     Ok(super::LinuxFuseAllocatedOpen {
-                        ino: attr.ino,
+                        observed: state
+                            .observe_attr(|| Ok(attr.clone()))
+                            .expect("observe attrs"),
                         fh,
                         flags: libc::O_RDONLY,
                     })
@@ -5314,7 +5777,7 @@ mod tests {
         let allocated = state
             .create_with_flags(1, b"create-gap", libc::S_IFREG | 0o644, libc::O_WRONLY)
             .expect("allocate created writer");
-        let ino = allocated.open.ino;
+        let ino = allocated.open.observed.attr.ino;
         let fh = allocated.open.fh;
 
         let admission = state.inode_liveness.admit_invalidation(ino, || {});
