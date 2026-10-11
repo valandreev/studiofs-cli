@@ -197,6 +197,9 @@ unsafe extern "C" {
     fn studiofs_linux_fuse_conn_wants_writeback_cache_after_set(capable_ext: u64) -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_file_info_direct_io_after_init() -> c_int;
+    /// Returns null on allocation failure; free a nonnull result once with `libc::free`.
+    #[cfg(test)]
+    fn studiofs_linux_fuse_file_info_new_for_test(fh: u64) -> *mut raw::FuseFileInfo;
     #[cfg(test)]
     fn studiofs_linux_fuse_file_info_flags_after_init(
         direct_io: c_int,
@@ -4595,6 +4598,69 @@ mod tests {
                 },
             )
             .expect("prepare refreshed open reply");
+    }
+
+    #[test]
+    fn session_read_reuses_dense_buffer_for_holes_short_reads_and_eof() {
+        struct FileInfo(*mut super::raw::FuseFileInfo);
+        impl Drop for FileInfo {
+            fn drop(&mut self) {
+                // SAFETY: the C test helper allocated this pointer with calloc.
+                unsafe { libc::free(self.0.cast()) };
+            }
+        }
+
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-pooled-sparse-read",
+        )
+        .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let attr = state.vfs.create(1, b"sparse", 0, 0, 0o644).unwrap();
+        let open = state.open_with_flags(attr.ino, libc::O_RDWR).unwrap();
+        fixture.runtime().block_on(async {
+            state
+                .vfs
+                .write_fh(open.fh, attr.ino, 0, b"abcdefgh")
+                .await
+                .unwrap();
+            state
+                .vfs
+                .write_fh(open.fh, attr.ino, 16, b"end")
+                .await
+                .unwrap();
+        });
+        // SAFETY: the helper allocates and initializes the native header's layout.
+        let fi = FileInfo(unsafe { super::studiofs_linux_fuse_file_info_new_for_test(open.fh) });
+        assert!(!fi.0.is_null(), "allocate native file info");
+
+        let dense = state.read(attr.ino, 8, 0, fi.0).unwrap();
+        let allocation = dense.as_ref().as_ptr();
+        state.reply_with_pooled_read_buffer(dense, |bytes| {
+            assert_eq!(bytes, b"abcdefgh");
+            0
+        });
+        for (offset, expected) in [
+            (8, &b"\0\0\0\0\0\0\0\0"[..]),
+            (16, &b"end"[..]),
+            (19, &b""[..]),
+        ] {
+            let buffer = state.read(attr.ino, 8, offset, fi.0).unwrap();
+            assert_eq!(
+                buffer.as_ref().as_ptr(),
+                allocation,
+                "reuse the dense read buffer"
+            );
+            state.reply_with_pooled_read_buffer(buffer, |bytes| {
+                assert_eq!(bytes, expected);
+                0
+            });
+        }
+        state.release(open.fh).unwrap();
     }
 
     #[test]

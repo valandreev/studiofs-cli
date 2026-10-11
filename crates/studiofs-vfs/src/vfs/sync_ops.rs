@@ -1554,6 +1554,8 @@ impl StudioVfs {
     }
 
     /// Read file data into `buffer` using the buffered read path.
+    /// On success, every byte up to the returned length is overwritten, including zero-filled holes.
+    /// On error, the buffer may be partially modified; its contents must not be used as a read result.
     pub async fn read_into_fh(
         &self,
         fh: u64,

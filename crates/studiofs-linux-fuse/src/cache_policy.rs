@@ -303,6 +303,8 @@ impl SyncReadBufferPool {
         Self::default()
     }
 
+    /// Returns initialized storage that may contain data from a previous read.
+    /// Reply only with the prefix overwritten by a successful VFS read.
     pub(crate) fn take(&self, len: usize) -> SyncReadBuffer {
         let mut buffer = self
             .buffers
