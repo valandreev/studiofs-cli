@@ -512,10 +512,11 @@ impl AsyncWriteLedger {
                 record_admission_wait(&mut state, wait_started);
                 return Err(AdmissionError::ShuttingDown);
             }
+            // A live ticket keeps its entry pending, and every pending entry below the capacity
+            // head is already reserved.
             if state
-                .pending
-                .get(&sequence)
-                .is_some_and(|write| write.reserved_bytes.is_some())
+                .next_capacity_sequence
+                .is_none_or(|head| sequence < head)
             {
                 return Ok(());
             }
