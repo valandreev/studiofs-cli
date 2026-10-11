@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const ROOT_INODE: u64 = 1;
+pub(crate) const LIVENESS_SHARDS: usize = 32;
 const DEFAULT_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
 
 #[derive(Default)]
@@ -31,7 +32,13 @@ struct ProvisionalForgetBatch {
 
 #[derive(Default)]
 struct FuseInodeLivenessInner {
-    state: Mutex<FuseInodeLivenessState>,
+    states: [Mutex<FuseInodeLivenessState>; LIVENESS_SHARDS],
+}
+
+impl FuseInodeLivenessInner {
+    fn state(&self, ino: u64) -> &Mutex<FuseInodeLivenessState> {
+        &self.states[usize::from(ino.to_le_bytes()[0]) % LIVENESS_SHARDS]
+    }
 }
 
 #[derive(Clone, Default)]
@@ -42,7 +49,7 @@ pub(crate) struct FuseInodeLiveness {
 impl FuseInodeLiveness {
     pub(crate) fn reserve_lookup(&self, ino: u64) -> FuseLookupReservation {
         let identity = Arc::new(());
-        lock_poison_tolerant(&self.inner.state)
+        lock_poison_tolerant(self.inner.state(ino))
             .reservations
             .push(PendingLookup {
                 ino,
@@ -61,7 +68,7 @@ impl FuseInodeLiveness {
         if ino == ROOT_INODE || nlookup == 0 {
             return;
         }
-        let mut state = lock_poison_tolerant(&self.inner.state);
+        let mut state = lock_poison_tolerant(self.inner.state(ino));
         let remaining = subtract_ref_count(&mut state.lookup_refs, ino, nlookup);
         if remaining == 0 {
             return;
@@ -99,7 +106,7 @@ impl FuseInodeLiveness {
     }
 
     pub(crate) fn open_handle(&self, ino: u64) -> FuseOpenHandleGuard {
-        let mut state = lock_poison_tolerant(&self.inner.state);
+        let mut state = lock_poison_tolerant(self.inner.state(ino));
         increment_ref_count(&mut state.open_refs, ino);
         FuseOpenHandleGuard {
             inner: Arc::clone(&self.inner),
@@ -113,7 +120,7 @@ impl FuseInodeLiveness {
         if ino == ROOT_INODE {
             return true;
         }
-        let state = lock_poison_tolerant(&self.inner.state);
+        let state = lock_poison_tolerant(self.inner.state(ino));
         state.lookup_refs.get(&ino).copied().unwrap_or_default() != 0
             || state.open_refs.get(&ino).copied().unwrap_or_default() != 0
     }
@@ -129,7 +136,7 @@ impl FuseInodeLiveness {
         notify_kernel: impl FnOnce(),
     ) -> FuseInvalidationAdmission {
         let (notify_now, deferred_reply_count) = {
-            let mut state = lock_poison_tolerant(&self.inner.state);
+            let mut state = lock_poison_tolerant(self.inner.state(ino));
             let mut deferred_reply_count = 0;
             for reservation in &mut state.reservations {
                 if reservation.ino == ino {
@@ -183,7 +190,7 @@ impl FuseLookupReservation {
     /// reference after the kernel receives the reply but before libfuse
     /// returns success to the replying thread.
     pub(crate) fn begin_reply(&self) -> bool {
-        let mut state = lock_poison_tolerant(&self.inner.state);
+        let mut state = lock_poison_tolerant(self.inner.state(self.ino));
         let Some(index) = state.reservations.iter().position(|reservation| {
             reservation.ino == self.ino && Arc::ptr_eq(&reservation.identity, &self.identity)
         }) else {
@@ -201,7 +208,7 @@ impl FuseLookupReservation {
     /// Commit a successful entry reply and report whether it needs a follow-up
     /// invalidation because content changed while the reply was in flight.
     pub(crate) fn commit(&self) -> Option<FuseLookupCommitOutcome> {
-        let mut state = lock_poison_tolerant(&self.inner.state);
+        let mut state = lock_poison_tolerant(self.inner.state(self.ino));
         let index = state.reservations.iter().position(|reservation| {
             reservation.ino == self.ino && Arc::ptr_eq(&reservation.identity, &self.identity)
         })?;
@@ -219,7 +226,7 @@ impl FuseLookupReservation {
     }
 
     pub(crate) fn rollback(&self) -> bool {
-        let mut state = lock_poison_tolerant(&self.inner.state);
+        let mut state = lock_poison_tolerant(self.inner.state(self.ino));
         let Some(index) = state.reservations.iter().position(|reservation| {
             reservation.ino == self.ino && Arc::ptr_eq(&reservation.identity, &self.identity)
         }) else {
@@ -269,7 +276,7 @@ impl FuseOpenHandleGuard {
             return false;
         }
         self.active = false;
-        let mut state = lock_poison_tolerant(&self.inner.state);
+        let mut state = lock_poison_tolerant(self.inner.state(self.ino));
         subtract_ref_count(&mut state.open_refs, self.ino, 1);
         true
     }
@@ -849,6 +856,59 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
+
+    #[test]
+    fn open_liveness_on_another_inode_does_not_wait_for_busy_inode() {
+        let liveness = FuseInodeLiveness::default();
+        let busy = lock_poison_tolerant(liveness.inner.state(42));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other = liveness.clone();
+        let worker = thread::spawn(move || {
+            let guard = other.open_handle(43);
+            assert!(other.is_live(43));
+            drop(guard);
+            assert!(!other.is_live(43));
+            done_tx.send(()).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        drop(busy);
+        worker.join().unwrap();
+        assert!(result.is_ok(), "an unrelated inode must make progress");
+    }
+
+    #[test]
+    fn concurrent_open_and_close_keep_inode_live_until_last_handle() {
+        let liveness = FuseInodeLiveness::default();
+        let last = liveness.open_handle(42);
+        let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let other = liveness.clone();
+                let opened_tx = opened_tx.clone();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let worker = thread::spawn(move || {
+                    let guard = other.open_handle(42);
+                    opened_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    drop(guard);
+                });
+                (release_tx, worker)
+            })
+            .collect();
+        for _ in 0..16 {
+            opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        assert!(liveness.is_live(42));
+        for (release, _) in &workers {
+            release.send(()).unwrap();
+        }
+        for (_, worker) in workers {
+            worker.join().unwrap();
+        }
+        assert!(liveness.is_live(42));
+        drop(last);
+        assert!(!liveness.is_live(42));
+    }
 
     #[test]
     fn root_is_always_live() {
