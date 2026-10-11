@@ -8169,6 +8169,7 @@ impl StudioVfs {
             current.task_failed_writes = snapshot.task_failed_writes;
             current.canceled_writes = snapshot.canceled_writes;
             current.shutdown_timeouts = snapshot.shutdown_timeouts;
+            current.barrier_timeouts = snapshot.barrier_timeouts;
             current.admission_waits = snapshot.admission_waits;
             current.admission_wait_total_ms = snapshot.admission_wait_total_ms;
             current.barrier_waits = snapshot.barrier_waits;
@@ -8209,6 +8210,9 @@ impl StudioVfs {
         snapshot.shutdown_timeouts = snapshot
             .shutdown_timeouts
             .saturating_sub(baseline.shutdown_timeouts);
+        snapshot.barrier_timeouts = snapshot
+            .barrier_timeouts
+            .saturating_sub(baseline.barrier_timeouts);
         snapshot.admission_waits = snapshot
             .admission_waits
             .saturating_sub(baseline.admission_waits);

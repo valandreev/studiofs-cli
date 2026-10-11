@@ -1158,6 +1158,8 @@ pub struct VfsFuseAsyncWriteSnapshot {
     pub canceled_writes: u64,
     /// Shutdown drains that still had callbacks after both wait windows.
     pub shutdown_timeouts: u64,
+    /// Foreground async-write barrier callbacks whose wait timed out.
+    pub barrier_timeouts: u64,
     /// Admission waits caused by pending-write caps.
     pub admission_waits: u64,
     /// Total admission wait time in milliseconds.
@@ -2423,6 +2425,7 @@ mod tests {
         assert!(snapshot.pending_writes_per_inode.is_empty());
         assert_eq!(snapshot.canceled_writes, 0);
         assert_eq!(snapshot.shutdown_timeouts, 0);
+        assert_eq!(snapshot.barrier_timeouts, 0);
         assert_eq!(snapshot.inode_barrier_waits, 0);
         assert_eq!(snapshot.handle_barrier_waits, 0);
     }

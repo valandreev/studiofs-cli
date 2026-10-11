@@ -349,6 +349,10 @@ impl StudioVfs {
                 write_path.fuse_async_write.shutdown_timeouts,
             ),
             (
+                "fuse_async_write_barrier_timeouts",
+                write_path.fuse_async_write.barrier_timeouts,
+            ),
+            (
                 "fuse_async_write_admission_waits",
                 write_path.fuse_async_write.admission_waits,
             ),

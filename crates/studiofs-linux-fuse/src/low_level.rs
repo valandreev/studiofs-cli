@@ -2791,7 +2791,19 @@ fn finish_regular_release_with(
 ) {
     reply(result.err().unwrap_or(0));
     if let Some(fh) = fh {
-        state.remove_open_liveness(fh);
+        let guard = state
+            .open_liveness
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&fh);
+        if state.vfs.get_open_file(fh).is_some() {
+            let vfs = Arc::clone(&state.vfs);
+            let runtime = state.runtime_handle.clone();
+            state.async_writes.defer_release(fh, move || {
+                vfs.release_fh_with_deferred_last_handle_barrier(fh, &runtime);
+                drop(guard);
+            });
+        }
     }
 }
 
@@ -3136,6 +3148,7 @@ fn async_write_metrics_snapshot(
         task_failed_writes,
         canceled_writes,
         shutdown_timeouts,
+        barrier_timeouts,
         admission_waits,
         admission_wait_total_nanos,
         barrier_waits,
@@ -3165,6 +3178,7 @@ fn async_write_metrics_snapshot(
         task_failed_writes,
         canceled_writes,
         shutdown_timeouts,
+        barrier_timeouts,
         admission_waits,
         admission_wait_total_ms: admission_wait_total_nanos as f64 / 1_000_000.0,
         barrier_waits,
@@ -3556,8 +3570,15 @@ mod tests {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-write-stats")
                 .expect("create VFS fixture");
-        let ledger = Arc::new(crate::async_writes::AsyncWriteLedger::with_limits(16, 4));
+        let ledger = Arc::new(
+            crate::async_writes::AsyncWriteLedger::with_limits(16, 4)
+                .with_barrier_timeout(Duration::ZERO),
+        );
         let ticket = ledger.admit(10, 100, 8).expect("write should admit");
+        assert_eq!(
+            ledger.wait_inode(ledger.capture_inode_watermark(10)),
+            crate::async_writes::BarrierOutcome::TimedOut
+        );
 
         super::record_async_write_metrics(
             &fixture.vfs(),
@@ -3566,6 +3587,7 @@ mod tests {
         );
         let pending = fixture.vfs().write_path_observability_snapshot();
         assert_eq!(pending.fuse_async_write.pending_writes, 1);
+        assert_eq!(pending.fuse_async_write.barrier_timeouts, 1);
         assert_eq!(pending.fuse_async_write.pending_handles, 1);
         assert_eq!(
             pending.fuse_async_write.pending_writes_per_inode.get(&10),
@@ -3697,10 +3719,13 @@ mod tests {
                 false,
                 default_connection_config(),
             );
-            state.async_writes =
-                Arc::new(crate::async_writes::AsyncWriteLedger::with_barrier_timeout(
-                    Duration::from_millis(10),
-                ));
+            state.async_writes = Arc::new(
+                crate::async_writes::AsyncWriteLedger::with_limits(
+                    super::DEFAULT_MAX_PENDING_BYTES,
+                    super::DEFAULT_MAX_PENDING_WRITES,
+                )
+                .with_barrier_timeout(Duration::from_millis(10)),
+            );
             let attr = state
                 .vfs
                 .create(1, b"wedged-write", 0, 0, 0o644)
@@ -3747,23 +3772,28 @@ mod tests {
             );
             assert_eq!(state.async_writes.metrics_snapshot().pending_writes, 0);
             assert!(matches!(state.lookup(1, b"hardlink"), Err(libc::ENOENT)));
-            assert!(
-                matches!(state.link(attr.ino, 1, b"hardlink"), Err(libc::EIO)),
-                "link must reject an already failed barrier even after late completion"
-            );
+            state
+                .link(attr.ino, 1, b"hardlink")
+                .expect("late completion restores link");
             assert!(
                 state.vfs.get_open_file(open.fh).is_some(),
                 "timeout must retain the VFS handle"
             );
             assert_eq!(
                 state.flush(open.fh),
-                Err(libc::EIO),
-                "timeout error must survive late success"
+                Ok(()),
+                "late success restores barriers"
             );
-            assert!(matches!(
-                state.async_writes.start_request(attr.ino, open.fh),
-                Err(crate::async_writes::AdmissionError::ShuttingDown)
-            ));
+            if operation != "release" {
+                state
+                    .async_writes
+                    .start_request(attr.ino, open.fh)
+                    .expect("timeout does not stop new writes")
+                    .complete(Ok(()));
+            }
+            let release = state.release(open.fh);
+            super::finish_regular_release_with(&state, Some(open.fh), release, |_| {});
+            assert!(state.vfs.get_open_file(open.fh).is_none());
             assert!(
                 matches!(
                     state.async_writes.wait_all(Duration::ZERO),
@@ -3772,6 +3802,110 @@ mod tests {
                 "shutdown must still reconcile late completion"
             );
         }
+    }
+
+    #[test]
+    fn timeout_preserves_release_liveness_until_late_write_reclaims_handle() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("timeout-release-liveness")
+                .unwrap();
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.async_writes = Arc::new(
+            crate::async_writes::AsyncWriteLedger::with_limits(
+                super::DEFAULT_MAX_PENDING_BYTES,
+                super::DEFAULT_MAX_PENDING_WRITES,
+            )
+            .with_barrier_timeout(Duration::ZERO),
+        );
+        let attr = state.vfs.create(1, b"pending", 0, 0, 0o644).unwrap();
+        let open = state.open_with_flags(attr.ino, libc::O_WRONLY).unwrap();
+        let ticket = state.async_writes.admit(attr.ino, open.fh, 4).unwrap();
+        state.unlink(1, b"pending").expect("unlink open file");
+        let release = state.release(open.fh);
+        assert_eq!(release, Err(libc::EIO));
+        super::finish_regular_release_with(&state, Some(open.fh), release, |errno| {
+            assert_eq!(errno, libc::EIO);
+            assert!(state.inode_liveness.is_live(attr.ino));
+        });
+        assert!(state.vfs.get_open_file(open.fh).is_some());
+        assert!(
+            state.inode_liveness.is_live(attr.ino),
+            "pending release must retain its pin after reply"
+        );
+        let policy = state.local_sync_policy_for_handle(open.fh);
+        state
+            .runtime_handle
+            .block_on(
+                state
+                    .vfs
+                    .write_fh_with_deferred_materialize(open.fh, attr.ino, 0, b"late", policy),
+            )
+            .expect("late write must retain access to the unlinked inode");
+        let mut bytes = [0; 4];
+        assert_eq!(
+            state
+                .runtime_handle
+                .block_on(state.vfs.read_into_fh(open.fh, attr.ino, 0, &mut bytes))
+                .unwrap(),
+            4
+        );
+        assert_eq!(&bytes, b"late");
+        ticket.complete(Ok(()));
+        assert!(
+            state.vfs.get_open_file(open.fh).is_none(),
+            "late completion must close the VFS handle"
+        );
+        assert!(!state.inode_liveness.is_live(attr.ino));
+        assert!(state.async_writes.forget_handle(open.fh));
+        assert_eq!(
+            state.async_writes.wait_all(Duration::ZERO),
+            crate::async_writes::BarrierOutcome::Complete(None)
+        );
+    }
+
+    #[test]
+    fn timeout_keeps_unrelated_readonly_callbacks_and_link_usable() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("timeout-unrelated-callbacks")
+                .unwrap();
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.async_writes = Arc::new(
+            crate::async_writes::AsyncWriteLedger::with_limits(
+                super::DEFAULT_MAX_PENDING_BYTES,
+                super::DEFAULT_MAX_PENDING_WRITES,
+            )
+            .with_barrier_timeout(Duration::ZERO),
+        );
+        let wedged = state.vfs.create(1, b"wedged", 0, 0, 0o644).unwrap();
+        let writer = state.open_with_flags(wedged.ino, libc::O_WRONLY).unwrap();
+        let ticket = state.async_writes.admit(wedged.ino, writer.fh, 4).unwrap();
+        assert_eq!(state.flush(writer.fh), Err(libc::EIO));
+        let idle = state.vfs.create(1, b"idle", 0, 0, 0o644).unwrap();
+        let reader = state.open_with_flags(idle.ino, libc::O_RDONLY).unwrap();
+        assert_eq!(state.flush(reader.fh), Ok(()));
+        assert_eq!(state.fsync(Some(reader.fh), idle.ino, false), Ok(()));
+        state
+            .link(idle.ino, 1, b"idle-link")
+            .expect("unrelated link succeeds");
+        let release = state.release(reader.fh);
+        assert_eq!(release, Ok(()));
+        super::finish_regular_release_with(&state, Some(reader.fh), release, |_| {});
+        assert!(state.vfs.get_open_file(reader.fh).is_none());
+        assert!(!state.inode_liveness.is_live(idle.ino));
+        ticket.complete(Ok(()));
+        let release = state.release(writer.fh);
+        assert_eq!(release, Ok(()));
+        super::finish_regular_release_with(&state, Some(writer.fh), release, |_| {});
     }
 
     #[test]

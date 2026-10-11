@@ -21652,6 +21652,7 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
         task_failed_writes: 1,
         admission_waits: 5,
         admission_wait_total_ms: 6.5,
+        barrier_timeouts: 2,
         barrier_waits: 7,
         barrier_wait_total_ms: 8.5,
         ..Default::default()
@@ -21677,6 +21678,11 @@ fn write_path_observability_reports_fuse_async_write_snapshot() {
     assert_eq!(snapshot.fuse_async_write.task_failed_writes, 1);
     assert_eq!(snapshot.fuse_async_write.admission_waits, 5);
     assert_eq!(snapshot.fuse_async_write.admission_wait_total_ms, 6.5);
+    assert_eq!(snapshot.fuse_async_write.barrier_timeouts, 2);
+    assert_eq!(
+        vfs.runtime_stats_snapshot().bridge.counters["fuse_async_write_barrier_timeouts"].value,
+        2
+    );
     assert_eq!(snapshot.fuse_async_write.barrier_waits, 7);
     assert_eq!(snapshot.fuse_async_write.barrier_wait_total_ms, 8.5);
     assert_eq!(
@@ -22148,6 +22154,7 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
         task_failed_writes: 1,
         admission_waits: 4,
         admission_wait_total_ms: 5.0,
+        barrier_timeouts: 2,
         barrier_waits: 6,
         barrier_wait_total_ms: 7.0,
         ..Default::default()
@@ -22163,6 +22170,7 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
         task_failed_writes: 1,
         admission_waits: 4,
         admission_wait_total_ms: 5.0,
+        barrier_timeouts: 2,
         barrier_waits: 6,
         barrier_wait_total_ms: 7.0,
         ..Default::default()
@@ -22175,6 +22183,7 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
     assert_eq!(baseline.failed_writes, 0);
     assert_eq!(baseline.task_failed_writes, 0);
     assert_eq!(baseline.admission_waits, 0);
+    assert_eq!(baseline.barrier_timeouts, 0);
     assert_eq!(baseline.barrier_waits, 0);
 
     vfs.record_fuse_async_write_snapshot(VfsFuseAsyncWriteSnapshot {
@@ -22188,6 +22197,7 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
         task_failed_writes: 1,
         admission_waits: 5,
         admission_wait_total_ms: 6.5,
+        barrier_timeouts: 3,
         barrier_waits: 9,
         barrier_wait_total_ms: 11.0,
         ..Default::default()
@@ -22204,6 +22214,7 @@ fn fuse_async_write_snapshot_reports_values_relative_to_reset_baseline() {
     assert_eq!(after.task_failed_writes, 0);
     assert_eq!(after.admission_waits, 1);
     assert_eq!(after.admission_wait_total_ms, 1.5);
+    assert_eq!(after.barrier_timeouts, 1);
     assert_eq!(after.barrier_waits, 3);
     assert_eq!(after.barrier_wait_total_ms, 4.0);
 }

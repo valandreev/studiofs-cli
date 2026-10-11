@@ -387,13 +387,26 @@ metadata worker; the batch age is bounded to one second. An async-write ledger
 uses sequence-number watermarks, so a barrier waits for earlier writes to its
 own inode or handle, never unrelated inodes or later writes.
 
-Linux `flush`, `fsync`, `release`, and `link` limit this async-write wait to 30 seconds.
-On timeout they log the scope and pending work, return `EIO` without entering
-the VFS barrier, and retain a mount-wide write failure: new async writes and
-subsequent write barriers fail until remount. Pending tasks, reservations, and
-VFS handles remain owned so late completion can reconcile safely; a timed-out
-release does not close a handle underneath its write. Session teardown still
-uses the bounded write drain and retains callback state if it cannot drain.
+Linux `flush`, `fsync`, `release`, and `link` limit this async-write wait to 30 seconds,
+including time that matching writes spend in the global admission queue. A slow
+healthy disk can exhaust this callback budget. On timeout the callback logs its
+scope and pending work, increments `fuse_async_write_barrier_timeouts`, and returns
+`EIO` without entering the VFS barrier. The timeout fails only that invocation:
+idle and unrelated files continue to flush, fsync, link, close, and admit writes.
+A read-only close can still report an inode-scoped flush timeout if another
+handle on the same inode has pending writes. Later barriers can succeed once
+those writes finish; actual write errors retain their normal sticky delivery.
+
+Pending tasks and reservations remain owned because VFS writes cannot safely be
+cancelled. A timed-out release retains its VFS handle and inode liveness pin until
+all of that handle's writes finish, then automatically closes the handle through
+the VFS-owned deferred last-handle barrier and removes the ledger close state.
+The pin remains live through the kernel release reply and late handle close.
+Session teardown includes this cleanup in its bounded write drain and retains
+callback state if it cannot drain. Permanently stuck writes therefore retain
+only their own resources; a barrier timeout does not require remount to restore
+the write path. Admission remains subject to the existing global pending-byte
+and pending-write limits.
 
 The `link` wait preserves sticky write errors for the next `flush`, `fsync`, or
 `release`; a timed-out link returns `EIO` without changing the namespace.
