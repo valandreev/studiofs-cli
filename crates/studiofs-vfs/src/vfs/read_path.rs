@@ -2063,11 +2063,7 @@ impl StudioVfs {
             .namespace
             .attr_read_cache
             .lock()
-            .inner
-            .entries
-            .get(&attr.ino)
-            .filter(|entry| entry.value == *attr)
-            .map(|entry| entry.meta.expires_at)
+            .deadline_if_matches(attr)
     }
 
     /// Validate access and invalidation ordering before reusing reply attributes.

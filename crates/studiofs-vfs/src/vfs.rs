@@ -1481,6 +1481,14 @@ impl AttrReadCache {
         self.inner.get(&ino, now)
     }
 
+    fn deadline_if_matches(&self, attr: &InodeAttr) -> Option<Instant> {
+        self.inner
+            .entries
+            .get(&attr.ino)
+            .filter(|entry| entry.value == *attr)
+            .map(|entry| entry.meta.expires_at)
+    }
+
     fn get_if_observed(
         &mut self,
         ino: Ino,

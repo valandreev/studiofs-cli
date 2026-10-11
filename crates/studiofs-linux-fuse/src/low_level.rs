@@ -225,6 +225,8 @@ pub(crate) struct SessionState {
     inode_liveness: FuseInodeLiveness,
     open_liveness: [Mutex<HashMap<u64, FuseOpenHandleGuard>>; LIVENESS_SHARDS],
     invalidation_queue: FuseInvalidationQueue,
+    #[cfg(test)]
+    getattr_calls: AtomicU64,
 }
 
 const _: fn() = assert_send_sync_static::<SessionState>;
@@ -269,6 +271,8 @@ impl SessionState {
             inode_liveness: FuseInodeLiveness::default(),
             open_liveness: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             invalidation_queue: FuseInvalidationQueue::default(),
+            #[cfg(test)]
+            getattr_calls: AtomicU64::new(0),
         }
     }
 }
@@ -463,7 +467,7 @@ struct LinuxFuseAllocatedOpen {
 struct ObservedInodeAttr {
     attr: InodeAttr,
     observation: studiofs_vfs::AttributeObservation,
-    expires_at: Instant,
+    expires_at: Option<Instant>,
 }
 
 struct LinuxFuseAllocatedCreate {
@@ -1711,10 +1715,7 @@ impl SessionState {
     ) -> Result<ObservedInodeAttr, i32> {
         let observation = self.vfs.observe_attributes();
         read().map(|attr| {
-            let expires_at = self
-                .vfs
-                .attribute_cache_deadline(&attr)
-                .unwrap_or_else(Instant::now);
+            let expires_at = self.vfs.attribute_cache_deadline(&attr);
             ObservedInodeAttr {
                 attr,
                 observation,
@@ -1724,11 +1725,13 @@ impl SessionState {
     }
 
     fn current_attr(&self, observed: ObservedInodeAttr) -> Result<InodeAttr, i32> {
-        if self
-            .vfs
-            .can_reuse_attributes(observed.attr.ino, observed.observation)
-            .map_err(|error| vfs_err_to_errno(&error))?
-            && Instant::now() < observed.expires_at
+        if observed
+            .expires_at
+            .is_some_and(|deadline| Instant::now() < deadline)
+            && self
+                .vfs
+                .can_reuse_attributes(observed.attr.ino, observed.observation)
+                .map_err(|error| vfs_err_to_errno(&error))?
         {
             Ok(observed.attr)
         } else {
@@ -1746,7 +1749,7 @@ impl SessionState {
 
     fn getattr_attr(&self, ino: u64) -> Result<InodeAttr, i32> {
         #[cfg(test)]
-        tests::GETATTR_CALLS.with(|calls| calls.set(calls.get() + 1));
+        self.getattr_calls.fetch_add(1, Ordering::Relaxed);
         self.vfs
             .getattr(ino)
             .map_err(|error| vfs_err_to_errno(&error))
@@ -3292,10 +3295,6 @@ fn detach_raw_session_with(
 
 #[cfg(test)]
 mod tests {
-    thread_local! {
-        pub(super) static GETATTR_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    }
-
     use std::cell::RefCell;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::ffi::OsStrExt;
@@ -5227,6 +5226,30 @@ mod tests {
     }
 
     #[test]
+    fn reply_getattr_counter_tracks_worker_threads() {
+        let (fixture, state) = reply_fixture("getattr-worker-counter");
+        let attr = fixture
+            .vfs()
+            .create(1, b"file", 0, 0, 0o644)
+            .expect("create inode");
+        let before = state.getattr_calls.load(Ordering::Relaxed);
+        thread::scope(|scope| {
+            scope
+                .spawn(|| state.getattr_attr(attr.ino).expect("read on worker"))
+                .join()
+                .expect("join worker");
+        });
+        assert_eq!(state.getattr_calls.load(Ordering::Relaxed), before + 1);
+        let other_state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        assert_eq!(other_state.getattr_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn stable_reply_entry_avoids_second_getattr() {
         let (fixture, state) = reply_fixture("stable-entry");
         fixture
@@ -5235,9 +5258,9 @@ mod tests {
             .expect("create inode");
         install_reply_invalidator(&state);
         let observed = state.lookup(1, b"stable").expect("lookup inode");
-        let before = GETATTR_CALLS.get();
+        let before = state.getattr_calls.load(Ordering::Relaxed);
         assert_eq!(super::reply_entry_with(&state, observed, |_| 0), Ok(0));
-        let after = GETATTR_CALLS.get();
+        let after = state.getattr_calls.load(Ordering::Relaxed);
         assert_eq!(
             after, before,
             "stable entry must reuse the lookup attributes"
@@ -5257,12 +5280,12 @@ mod tests {
             .open_with_flags(attr.ino, libc::O_RDONLY)
             .expect("allocate open");
         let fh = allocated.fh;
-        let before = GETATTR_CALLS.get();
+        let before = state.getattr_calls.load(Ordering::Relaxed);
         assert_eq!(
             state.run_open_reply_transaction(attr.ino, || Ok(allocated), |_| 0),
             Ok(0)
         );
-        let after = GETATTR_CALLS.get();
+        let after = state.getattr_calls.load(Ordering::Relaxed);
         assert_eq!(
             after, before,
             "stable open must reuse the allocated attributes"
@@ -5289,14 +5312,14 @@ mod tests {
             open,
             lookup: state.inode_liveness.reserve_lookup(ino),
         };
-        let before = GETATTR_CALLS.get();
+        let before = state.getattr_calls.load(Ordering::Relaxed);
         assert_eq!(
             state.run_create_reply_transaction(allocated, |attr, _, lookup| {
                 super::reply_reserved_entry_with(&state, attr, lookup, |_| 0)
             }),
             Ok(0)
         );
-        let after = GETATTR_CALLS.get();
+        let after = state.getattr_calls.load(Ordering::Relaxed);
         assert_eq!(
             after, before,
             "stable create must reuse the allocated attributes"
@@ -5312,13 +5335,13 @@ mod tests {
         let allocated = state
             .create_with_flags(1, b"new", libc::S_IFREG | 0o644, libc::O_RDONLY)
             .expect("allocate create");
-        let before = GETATTR_CALLS.get();
+        let before = state.getattr_calls.load(Ordering::Relaxed);
         assert_eq!(
             state.run_create_reply_transaction(allocated, |_, _, _| -libc::ENOENT),
             Ok(-libc::ENOENT)
         );
         assert_eq!(
-            GETATTR_CALLS.get(),
+            state.getattr_calls.load(Ordering::Relaxed),
             before + 1,
             "allocation retired the original snapshot and must force refresh"
         );
@@ -5332,17 +5355,34 @@ mod tests {
             .create(1, b"cached", 0, 0, 0o644)
             .expect("create inode");
         let mut observed = state.lookup(1, b"cached").expect("observe cached inode");
+        assert!(observed.expires_at.is_some());
         assert_eq!(
-            Some(observed.expires_at),
+            observed.expires_at,
             state.vfs.attribute_cache_deadline(&observed.attr)
         );
         let mut different = observed.attr.clone();
         different.size += 1;
         assert_eq!(state.vfs.attribute_cache_deadline(&different), None);
-        observed.expires_at = Instant::now();
-        let before = GETATTR_CALLS.get();
+        observed.expires_at = Some(Instant::now());
+        let before = state.getattr_calls.load(Ordering::Relaxed);
         assert_eq!(super::reply_entry_with(&state, observed, |_| 0), Ok(0));
-        assert_eq!(GETATTR_CALLS.get(), before + 1);
+        assert_eq!(state.getattr_calls.load(Ordering::Relaxed), before + 1);
+    }
+
+    #[test]
+    fn entry_reply_refreshes_uncached_snapshot() {
+        let (fixture, state) = reply_fixture("entry-uncached");
+        let attr = fixture
+            .vfs()
+            .create(1, b"uncached", 0, 0, 0o644)
+            .expect("create inode");
+        let observed = state
+            .observe_attr(|| Ok(attr))
+            .expect("observe uncached attributes");
+        assert_eq!(observed.expires_at, None);
+        let before = state.getattr_calls.load(Ordering::Relaxed);
+        assert_eq!(super::reply_entry_with(&state, observed, |_| 0), Ok(0));
+        assert_eq!(state.getattr_calls.load(Ordering::Relaxed), before + 1);
     }
 
     #[test]

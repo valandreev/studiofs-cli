@@ -450,6 +450,10 @@ Retired, expired, or uncached observations, reset boundaries, truncating opens, 
 synthetic high-range inodes use the local getattr refresh. Pending lookup replies
 retain post-reply DATA invalidation when a notification crosses the reservation.
 Fresh-create handle allocation can itself retire the original snapshot.
+`mkdir`, `mknod`, and `symlink` do not admit their returned attributes to the
+attribute read cache, so their uncached snapshots conservatively refresh.
+Missing or expired source deadlines skip reuse validation and go directly to
+the normal local getattr access and freshness checks.
 Directory replies intentionally leave libfuse3's `cache_readdir` disabled:
 remote namespace changes currently arrive through inode invalidation rather than
 individual dirent notifications, so caching a kernel-side directory snapshot
