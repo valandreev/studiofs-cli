@@ -387,6 +387,11 @@ metadata worker; the batch age is bounded to one second. An async-write ledger
 uses sequence-number watermarks, so a barrier waits for earlier writes to its
 own inode or handle, never unrelated inodes or later writes.
 
+Async-write capacity is granted in registration order. Each admission predicate
+evaluation is O(1); advancing the queue on reservation or completion is O(log N)
+in the pending-request tree. The shared condition variable wakes all waiters,
+including inode and handle barriers, after admission or completion.
+
 Linux `flush`, `fsync`, `release`, and `link` limit this async-write wait to 30 seconds,
 including time that matching writes spend in the global admission queue. A slow
 healthy disk can exhaust this callback budget. On timeout the callback logs its

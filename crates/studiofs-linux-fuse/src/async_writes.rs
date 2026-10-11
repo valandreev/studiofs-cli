@@ -95,6 +95,8 @@ struct LedgerState {
     shutdown_timeouts: u64,
     barrier_timeouts: u64,
     admission_waits: u64,
+    #[cfg(test)]
+    started_admission_waits: usize,
     admission_wait_total_nanos: u64,
     barrier_waits: u64,
     inode_barrier_waits: u64,
@@ -145,6 +147,8 @@ pub(crate) struct AsyncWriteLedger {
     max_recorded_errors: usize,
     state: Mutex<LedgerState>,
     changed: Condvar,
+    #[cfg(test)]
+    admission_wait_started: Condvar,
 }
 
 impl Default for AsyncWriteLedger {
@@ -183,6 +187,8 @@ impl AsyncWriteLedger {
             max_recorded_errors,
             state: Mutex::new(LedgerState::default()),
             changed: Condvar::new(),
+            #[cfg(test)]
+            admission_wait_started: Condvar::new(),
         }
     }
 
@@ -516,6 +522,11 @@ impl AsyncWriteLedger {
             let is_next = state.next_capacity_sequence == Some(sequence);
             if is_next && !self.at_capacity(&state, bytes) {
                 break;
+            }
+            #[cfg(test)]
+            if wait_started.is_none() {
+                state.started_admission_waits += 1;
+                self.admission_wait_started.notify_all();
             }
             wait_started.get_or_insert_with(Instant::now);
             state = self
@@ -1767,6 +1778,64 @@ mod tests {
             BarrierOutcome::Complete(Some(libc::EIO))
         );
         ledger.admit(30, 300, 1).unwrap().complete(Ok(()));
+    }
+
+    #[test]
+    fn capacity_admission_drains_concurrent_waiters_under_saturation() {
+        const CONCURRENCY: usize = 16;
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        // Saturate bytes below the write limit, then writes below the byte limit.
+        for (max_bytes, max_writes) in [(4, 2), (8, 1)] {
+            let ledger = Arc::new(AsyncWriteLedger::with_limits(max_bytes, max_writes));
+            let owner = ledger.admit(10, 100, 4).unwrap();
+            let requests = (0..CONCURRENCY)
+                .map(|_| ledger.start_request(20, 200).unwrap())
+                .collect::<Vec<_>>();
+            let (sender, receiver) = mpsc::channel();
+            let waiters = requests
+                .into_iter()
+                .rev()
+                .map(|mut request| {
+                    let sender = sender.clone();
+                    thread::spawn(move || {
+                        let result = request.reserve_capacity(4);
+                        sender.send((request, result)).unwrap();
+                    })
+                })
+                .collect::<Vec<_>>();
+            drop(sender);
+
+            let (state, _) = ledger
+                .admission_wait_started
+                .wait_timeout_while(ledger.lock_state(), TIMEOUT, |state| {
+                    state.started_admission_waits < CONCURRENCY
+                })
+                .unwrap();
+            assert_eq!(state.started_admission_waits, CONCURRENCY);
+            drop(state);
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            owner.complete(Ok(()));
+
+            for sequence in 2..=17 {
+                let (request, result) = receiver
+                    .recv_timeout(TIMEOUT)
+                    .expect("releasing capacity must wake the next registered waiter");
+                result.unwrap();
+                assert_eq!(request.sequence(), sequence);
+                assert_eq!(ledger.admission_for_test(), (1, 4));
+                request.complete(Ok(()));
+            }
+            for waiter in waiters {
+                waiter.join().unwrap();
+            }
+            assert_eq!(ledger.pending_for_test(), (0, 0));
+            assert_eq!(ledger.admission_for_test(), (0, 0));
+            assert_eq!(ledger.metrics_snapshot().admission_waits, 16);
+        }
     }
 
     #[test]
