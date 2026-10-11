@@ -1,6 +1,7 @@
 #include <errno.h> /* IWYU pragma: keep */
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <fuse_lowlevel.h>
 
 #define STUDIOFS_LINUX_FUSE_MAX_READ_SIZE (4U * 1024U * 1024U)
@@ -329,6 +330,14 @@ int studiofs_linux_fuse_file_info_direct_io_after_init(void) {
     struct fuse_file_info info = {0};
     studiofs_linux_fuse_file_info_init(&info, 7, 1, 0, 0);
     return info.fh == 7 && info.direct_io == 1 && info.keep_cache == 0;
+}
+
+struct fuse_file_info *studiofs_linux_fuse_file_info_new_for_test(uint64_t fh) {
+    struct fuse_file_info *info = calloc(1, sizeof(*info));
+    if (info) {
+        info->fh = fh;
+    }
+    return info;
 }
 
 int studiofs_linux_fuse_file_info_flags_after_init(int direct_io,

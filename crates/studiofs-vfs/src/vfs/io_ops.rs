@@ -62,6 +62,8 @@ impl StudioVfs {
     ///
     /// Same as `read()` but writes directly to the output buffer, avoiding one memcpy.
     /// Returns the number of bytes written.
+    /// On success, every byte up to the returned length is overwritten, including zero-filled holes.
+    /// On error, the buffer may be partially modified; its contents must not be used as a read result.
     pub async fn read_into(&self, ino: Ino, offset: u64, buffer: &mut [u8]) -> VfsResult<u32> {
         self.wait_for_deferred_release_inflight(ino).await;
         let session = self
