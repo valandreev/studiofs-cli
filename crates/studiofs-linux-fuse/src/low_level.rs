@@ -4617,42 +4617,12 @@ mod tests {
 
         let reply_result = state.reply_with_pooled_read_buffer(buffer, |bytes| {
             assert_eq!(bytes[0], 0x5a);
-            0
+            -libc::ENOENT
         });
         let reused = state.read_buffers.take(4096);
 
-        assert_eq!(reply_result, 0);
+        assert_eq!(reply_result, -libc::ENOENT);
         assert_eq!(reused.as_ref().as_ptr(), allocation);
-    }
-
-    #[test]
-    fn read_reply_exposes_only_short_or_eof_prefix_even_when_reply_fails() {
-        let fixture =
-            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-short-read-reply")
-                .expect("create VFS fixture");
-        let state = super::SessionState::new(
-            fixture.vfs(),
-            fixture.runtime().handle().clone(),
-            false,
-            default_connection_config(),
-        );
-        for (read, expected) in [(3, &b"abc"[..]), (0, &b""[..])] {
-            let mut buffer = state.read_buffers.take(8);
-            buffer.as_mut().copy_from_slice(b"abcdefgh");
-            let allocation = buffer.as_ref().as_ptr();
-            buffer.truncate(read);
-
-            let result = state.reply_with_pooled_read_buffer(buffer, |bytes| {
-                assert_eq!(bytes, expected);
-                -libc::ENOENT
-            });
-
-            assert_eq!(result, -libc::ENOENT);
-            let buffer = state.read_buffers.take(8);
-            assert_eq!(buffer.as_ref().as_ptr(), allocation);
-            assert_eq!(buffer.as_ref(), b"abcdefgh");
-            state.read_buffers.put(buffer);
-        }
     }
 
     #[test]

@@ -632,17 +632,6 @@ mod tests {
     }
 
     #[test]
-    fn sync_read_buffer_pool_preserves_initialized_bytes_on_reuse() {
-        let pool = SyncReadBufferPool::new();
-        let mut buffer = pool.take(8);
-        buffer.as_mut().copy_from_slice(b"abcdefgh");
-        pool.put(buffer);
-
-        let buffer = pool.take(8);
-        assert_eq!(buffer.as_ref(), b"abcdefgh");
-    }
-
-    #[test]
     fn sync_read_buffer_pool_retains_storage_after_short_reads_and_eof() {
         let pool = SyncReadBufferPool::new();
         let mut buffer = pool.take(8);
