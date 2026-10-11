@@ -207,6 +207,12 @@ Notes:
   `STUDIOFS_FUSE_ASYNC_WRITE`, `STUDIOFS_FUSE_ASYNC_WRITE_DISABLED`, and
   `STUDIOFS_FUSE_ASYNC_DIO` compatibility toggles remain supported; removed
   raw-transport queue/profile tuning is not restored.
+- `STUDIOFS_FUSE_ASYNC_DIO` is read once when each Linux mount session is
+  created. After trimming whitespace, `1`, `true`, `yes`, and `on` enable it
+  case-insensitively; unset, empty, false, and invalid values disable it.
+  The session uses the same stored decision for capability negotiation and
+  parallel direct writes on file opens. Set the variable before mounting;
+  changing it requires a new mount session.
 - `STUDIOFS_LINUX_FUSE_CACHE_POLICY=adaptive` is the Linux default. Clean,
   read-only files participate in the kernel page cache when their size does
   not exceed sampled available memory; write-capable, dirty, actively written,
