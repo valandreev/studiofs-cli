@@ -4,7 +4,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use studiofs_vfs::vfs::{OsCacheDisposition, OsCacheOpenDecision, OsCacheReason};
 
-const MEMORY_SAMPLE_TTL: Duration = Duration::from_secs(1);
+const MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+// Leave room for measurement and scheduling before the previous sample expires.
+const MEMORY_SAMPLE_TTL: Duration = Duration::from_secs(2);
 const MAX_SYNC_READ_BUFFERS: usize = 32;
 const MAX_RETAINED_SYNC_READ_BUFFER_CAPACITY: usize = 8 * 1024 * 1024;
 
@@ -131,6 +133,7 @@ pub(crate) fn decide_open_cache(
             LinuxOpenCacheDecision::direct(true)
         }
         LinuxFuseCachePolicy::Adaptive if available_memory.is_none() || !stable_generation => {
+            // Without fresh memory telemetry, conservatively bypass the page cache.
             // A new generation must be read through VFS before the kernel may
             // retain pages for reuse. This closes the race where an open
             // arrives before the asynchronous inode invalidation reaches the
@@ -209,7 +212,7 @@ impl SystemMemorySampler {
                     let sampled_at = started_at.elapsed();
                     let available = sample();
                     worker_snapshot.publish(available, sampled_at);
-                    match stopped.recv_timeout(MEMORY_SAMPLE_TTL) {
+                    match stopped.recv_timeout(MEMORY_SAMPLE_INTERVAL) {
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
@@ -330,9 +333,9 @@ impl SyncReadBufferPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachePolicySelection, LinuxFuseCachePolicy, MemorySnapshot, OpenCacheDecision,
-        ReadAheadIntent, SyncReadBufferPool, SystemMemorySampler, decide_open_cache,
-        normalize_available_memory,
+        CachePolicySelection, LinuxFuseCachePolicy, MEMORY_SAMPLE_INTERVAL, MemorySnapshot,
+        OpenCacheDecision, ReadAheadIntent, SyncReadBufferPool, SystemMemorySampler,
+        decide_open_cache, normalize_available_memory,
     };
     use std::time::Duration;
     use studiofs_vfs::vfs::{OsCacheDisposition, OsCacheReason};
@@ -552,20 +555,39 @@ mod tests {
     }
 
     #[test]
-    fn memory_snapshot_expires_after_one_second_and_recovers() {
+    fn memory_snapshot_stays_fresh_while_next_scheduled_sample_completes() {
+        let snapshot = MemorySnapshot::default();
+        snapshot.publish(Some(4096), Duration::ZERO);
+        // Two 10 ms measurements around the worker's one-second wait.
+        assert_eq!(
+            snapshot.available_memory_at(MEMORY_SAMPLE_INTERVAL + Duration::from_millis(20)),
+            Some(4096)
+        );
+        snapshot.publish(
+            Some(8192),
+            MEMORY_SAMPLE_INTERVAL + Duration::from_millis(10),
+        );
+        assert_eq!(
+            snapshot.available_memory_at(MEMORY_SAMPLE_INTERVAL * 2 + Duration::from_millis(40)),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn memory_snapshot_expires_after_two_seconds_and_recovers() {
         let snapshot = MemorySnapshot::default();
         assert_eq!(snapshot.available_memory_at(Duration::ZERO), None);
         snapshot.publish(Some(4096), Duration::ZERO);
         assert_eq!(
-            snapshot.available_memory_at(Duration::from_millis(999)),
+            snapshot.available_memory_at(Duration::from_millis(1999)),
             Some(4096)
         );
-        assert_eq!(snapshot.available_memory_at(Duration::from_secs(1)), None);
-        snapshot.publish(None, Duration::from_secs(1));
-        assert_eq!(snapshot.available_memory_at(Duration::from_secs(1)), None);
-        snapshot.publish(Some(8192), Duration::from_secs(2));
+        assert_eq!(snapshot.available_memory_at(Duration::from_secs(2)), None);
+        snapshot.publish(None, Duration::from_secs(2));
+        assert_eq!(snapshot.available_memory_at(Duration::from_secs(2)), None);
+        snapshot.publish(Some(8192), Duration::from_secs(3));
         assert_eq!(
-            snapshot.available_memory_at(Duration::from_secs(2)),
+            snapshot.available_memory_at(Duration::from_secs(3)),
             Some(8192)
         );
     }

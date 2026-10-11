@@ -1953,13 +1953,10 @@ impl SessionState {
         let generation = self
             .vfs
             .prepare_os_cache_open_with_attr(fh, participation, attr);
-        let available_memory = if self.cache_policy == LinuxFuseCachePolicy::Adaptive {
-            self.available_memory
-                .as_ref()
-                .and_then(SystemMemorySampler::available_memory)
-        } else {
-            None
-        };
+        let available_memory = self
+            .available_memory
+            .as_ref()
+            .and_then(SystemMemorySampler::available_memory);
         let cache = if self.vfs.is_runtime_stats_file_ino(ino) {
             LinuxFuseOpenCachePolicy {
                 direct_io: true,
