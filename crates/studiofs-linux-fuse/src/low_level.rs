@@ -4002,6 +4002,11 @@ mod tests {
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr),
                 );
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed;"),
+                    "child must execute exactly one configuration test: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                );
             }
             return;
         };
