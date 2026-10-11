@@ -275,27 +275,56 @@ pub(crate) struct SyncReadBufferPool {
     buffers: Mutex<Vec<Vec<u8>>>,
 }
 
+pub(crate) struct SyncReadBuffer {
+    buffer: Vec<u8>,
+    visible_len: usize,
+}
+
+impl SyncReadBuffer {
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.visible_len = self.visible_len.min(len);
+    }
+}
+
+impl AsMut<[u8]> for SyncReadBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.buffer[..self.visible_len]
+    }
+}
+
+impl AsRef<[u8]> for SyncReadBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.buffer[..self.visible_len]
+    }
+}
+
 impl SyncReadBufferPool {
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn take(&self, len: usize) -> Vec<u8> {
+    pub(crate) fn take(&self, len: usize) -> SyncReadBuffer {
         let mut buffer = self
             .buffers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop()
             .unwrap_or_default();
-        buffer.resize(len, 0);
-        buffer
+        // Preserve initialized storage across short reads; only growth needs zero-fill.
+        if buffer.len() < len {
+            buffer.resize(len, 0);
+        }
+        SyncReadBuffer {
+            buffer,
+            visible_len: len,
+        }
     }
 
-    pub(crate) fn put(&self, mut buffer: Vec<u8>) {
+    pub(crate) fn put(&self, buffer: SyncReadBuffer) {
+        let buffer = buffer.buffer;
         if buffer.capacity() > MAX_RETAINED_SYNC_READ_BUFFER_CAPACITY {
             return;
         }
-        buffer.clear();
         let mut buffers = self
             .buffers
             .lock()
@@ -586,25 +615,63 @@ mod tests {
     fn sync_read_buffer_pool_reuses_buffers_and_is_bounded() {
         let pool = SyncReadBufferPool::new();
         let buffer = pool.take(4096);
-        let allocation = buffer.as_ptr();
-        assert_eq!(buffer.len(), 4096);
+        let allocation = buffer.as_ref().as_ptr();
+        assert_eq!(buffer.as_ref().len(), 4096);
         pool.put(buffer);
 
         let buffer = pool.take(1024);
-        assert_eq!(buffer.as_ptr(), allocation);
-        assert_eq!(buffer.len(), 1024);
+        assert_eq!(buffer.as_ref().as_ptr(), allocation);
+        assert_eq!(buffer.as_ref().len(), 1024);
         pool.put(buffer);
 
-        for _ in 0..40 {
-            pool.put(Vec::with_capacity(64));
+        let buffers: Vec<_> = (0..40).map(|_| pool.take(64)).collect();
+        for buffer in buffers {
+            pool.put(buffer);
         }
         assert_eq!(pool.retained_count(), 32);
     }
 
     #[test]
+    fn sync_read_buffer_pool_preserves_initialized_bytes_on_reuse() {
+        let pool = SyncReadBufferPool::new();
+        let mut buffer = pool.take(8);
+        buffer.as_mut().copy_from_slice(b"abcdefgh");
+        pool.put(buffer);
+
+        let buffer = pool.take(8);
+        assert_eq!(buffer.as_ref(), b"abcdefgh");
+    }
+
+    #[test]
+    fn sync_read_buffer_pool_retains_storage_after_short_reads_and_eof() {
+        let pool = SyncReadBufferPool::new();
+        let mut buffer = pool.take(8);
+        buffer.as_mut().copy_from_slice(b"abcdefgh");
+        let allocation = buffer.as_ref().as_ptr();
+        buffer.truncate(3);
+        assert_eq!(buffer.as_ref(), b"abc");
+        pool.put(buffer);
+
+        let mut buffer = pool.take(2);
+        assert_eq!(buffer.as_ref(), b"ab");
+        assert_eq!(buffer.as_mut().len(), 2);
+        buffer.truncate(0);
+        assert!(buffer.as_ref().is_empty());
+        pool.put(buffer);
+
+        let buffer = pool.take(8);
+        assert_eq!(buffer.as_ref().as_ptr(), allocation);
+        assert_eq!(buffer.as_ref(), b"abcdefgh");
+        pool.put(buffer);
+
+        let buffer = pool.take(10);
+        assert_eq!(buffer.as_ref(), b"abcdefgh\0\0");
+    }
+
+    #[test]
     fn sync_read_buffer_pool_discards_oversized_capacity() {
         let pool = SyncReadBufferPool::new();
-        pool.put(Vec::with_capacity(8 * 1024 * 1024 + 1));
+        pool.put(pool.take(8 * 1024 * 1024 + 1));
 
         assert_eq!(pool.retained_count(), 0);
     }

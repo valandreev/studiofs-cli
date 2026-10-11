@@ -12,7 +12,7 @@ use crate::async_writes::{
     DEFAULT_MAX_PENDING_BYTES, DEFAULT_MAX_PENDING_WRITES,
 };
 use crate::cache_policy::{
-    LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBufferPool,
+    LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBuffer, SyncReadBufferPool,
     SystemMemorySampler, decide_open_cache,
 };
 use crate::invalidation::{
@@ -1332,7 +1332,7 @@ pub extern "C" fn studiofs_linux_fuse_read(
     let started = Instant::now();
     match state.read(ino, size, off, fi) {
         Ok(buffer) => {
-            let read = buffer.len();
+            let read = buffer.as_ref().len();
             state
                 .vfs
                 .record_fuse_read_callback(read, started.elapsed(), false);
@@ -2091,10 +2091,10 @@ impl SessionState {
 
     fn reply_with_pooled_read_buffer(
         &self,
-        buffer: Vec<u8>,
+        buffer: SyncReadBuffer,
         reply: impl FnOnce(&[u8]) -> c_int,
     ) -> c_int {
-        let result = reply(&buffer);
+        let result = reply(buffer.as_ref());
         self.read_buffers.put(buffer);
         result
     }
@@ -2105,22 +2105,23 @@ impl SessionState {
         size: usize,
         offset: off_t,
         fi: *const raw::FuseFileInfo,
-    ) -> Result<Vec<u8>, i32> {
+    ) -> Result<SyncReadBuffer, i32> {
         let fh = file_handle(fi).ok_or(libc::EBADF)?;
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size = clamp_read_size(size);
         let mut buffer = self.read_buffers.take(size);
-        let read =
-            match self
-                .runtime_handle
-                .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut buffer))
-            {
-                Ok(read) => read,
-                Err(error) => {
-                    self.read_buffers.put(buffer);
-                    return Err(vfs_err_to_errno(&error));
-                }
-            };
+        let read = match self.runtime_handle.block_on(self.vfs.read_into_fh(
+            fh,
+            ino,
+            offset,
+            buffer.as_mut(),
+        )) {
+            Ok(read) => read,
+            Err(error) => {
+                self.read_buffers.put(buffer);
+                return Err(vfs_err_to_errno(&error));
+            }
+        };
         buffer.truncate(read as usize);
         Ok(buffer)
     }
@@ -4608,10 +4609,10 @@ mod tests {
             default_connection_config(),
         );
         let mut buffer = state.read_buffers.take(4096);
-        buffer[0] = 0x5a;
-        let allocation = buffer.as_ptr();
-        let spare = vec![0_u8; 4096];
-        assert_ne!(spare.as_ptr(), allocation);
+        buffer.as_mut()[0] = 0x5a;
+        let allocation = buffer.as_ref().as_ptr();
+        let spare = state.read_buffers.take(4096);
+        assert_ne!(spare.as_ref().as_ptr(), allocation);
         state.read_buffers.put(spare);
 
         let reply_result = state.reply_with_pooled_read_buffer(buffer, |bytes| {
@@ -4621,7 +4622,37 @@ mod tests {
         let reused = state.read_buffers.take(4096);
 
         assert_eq!(reply_result, 0);
-        assert_eq!(reused.as_ptr(), allocation);
+        assert_eq!(reused.as_ref().as_ptr(), allocation);
+    }
+
+    #[test]
+    fn read_reply_exposes_only_short_or_eof_prefix_even_when_reply_fails() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-short-read-reply")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        for (read, expected) in [(3, &b"abc"[..]), (0, &b""[..])] {
+            let mut buffer = state.read_buffers.take(8);
+            buffer.as_mut().copy_from_slice(b"abcdefgh");
+            let allocation = buffer.as_ref().as_ptr();
+            buffer.truncate(read);
+
+            let result = state.reply_with_pooled_read_buffer(buffer, |bytes| {
+                assert_eq!(bytes, expected);
+                -libc::ENOENT
+            });
+
+            assert_eq!(result, -libc::ENOENT);
+            let buffer = state.read_buffers.take(8);
+            assert_eq!(buffer.as_ref().as_ptr(), allocation);
+            assert_eq!(buffer.as_ref(), b"abcdefgh");
+            state.read_buffers.put(buffer);
+        }
     }
 
     #[test]
