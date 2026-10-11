@@ -48,9 +48,10 @@ Adaptive sessions sample available memory in an owned background thread, at
 most once per second, and open callbacks load an atomic snapshot. Samples
 expire two seconds after measurement starts, leaving time for the next sample
 to complete without a periodic expiry gap. Missing, failed or expired samples
-conservatively select direct I/O, including for stable generations. Teardown
-stops and joins the sampler even when callback state must be retained after a
-shutdown timeout. Linux requests read/readahead geometry up to 4 MiB and records
+conservatively select direct I/O, including for stable generations. Such opens
+count in `linux_fuse_memory_bypasses`: a host without memory telemetry loses
+page-cache throughput, but visibly. Teardown stops and joins the sampler even
+when callback state must be retained after a shutdown timeout. Linux requests read/readahead geometry up to 4 MiB and records
 the negotiated values in runtime stats.
 
 ## Consequences

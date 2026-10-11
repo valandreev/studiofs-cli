@@ -132,8 +132,12 @@ pub(crate) fn decide_open_cache(
         {
             LinuxOpenCacheDecision::direct(true)
         }
-        LinuxFuseCachePolicy::Adaptive if available_memory.is_none() || !stable_generation => {
-            // Without fresh memory telemetry, conservatively bypass the page cache.
+        LinuxFuseCachePolicy::Adaptive if stable_generation && available_memory.is_none() => {
+            // Without fresh memory telemetry, conservatively bypass the page cache
+            // and count it as a memory bypass so a dead sampler is visible.
+            LinuxOpenCacheDecision::direct(true)
+        }
+        LinuxFuseCachePolicy::Adaptive if !stable_generation => {
             // A new generation must be read through VFS before the kernel may
             // retain pages for reuse. This closes the race where an open
             // arrives before the asynchronous inode invalidation reaches the
@@ -497,6 +501,7 @@ mod tests {
         );
         assert!(decision.direct_io);
         assert!(!decision.keep_cache);
+        assert!(decision.memory_bypassed);
     }
 
     #[test]
@@ -608,7 +613,8 @@ mod tests {
         let (exited_tx, exited_rx) = mpsc::channel();
         let sampler = SystemMemorySampler::start(move || {
             entered_tx.send(()).unwrap();
-            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Later samples see Disconnected once the test drops resume_tx.
+            let _ = resume_rx.recv_timeout(Duration::from_secs(5));
             exited_tx.send(()).unwrap();
             Some(4096)
         });
@@ -627,6 +633,7 @@ mod tests {
                 .map(|_| done_rx.recv_timeout(Duration::from_secs(2)))
                 .collect();
             resume_tx.send(()).unwrap();
+            drop(resume_tx);
             for reader in readers {
                 reader.join().unwrap();
             }

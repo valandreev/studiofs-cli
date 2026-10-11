@@ -432,8 +432,9 @@ rollback.
 Adaptive sessions sample available memory in an owned background thread. Open
 callbacks read an atomic snapshot; samples expire two seconds after measurement
 starts, with a one-second sampling interval. Missing, failed, or expired samples
-select direct I/O, including for stable generations. Session teardown stops and
-joins the sampler. Inode liveness and regular-file handle bookkeeping use 32
+select direct I/O, including for stable generations, and count in
+`linux_fuse_memory_bypasses`; a host without memory telemetry therefore loses
+page-cache throughput visibly. Session teardown stops and joins the sampler. Inode liveness and regular-file handle bookkeeping use 32
 independent lock segments while
 preserving lookup/reply and deferred-release lifetimes.
 
