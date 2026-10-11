@@ -3349,12 +3349,16 @@ impl PrefetchedWriterStackObjectIds {
     }
 }
 
+type FuseAsyncWriteSource = Box<dyn Fn() -> Option<VfsFuseAsyncWriteSnapshot> + Send + Sync>;
+
 #[derive(Default)]
 struct FuseAsyncWriteDiagnostics {
     raw: VfsFuseAsyncWriteSnapshot,
     current: VfsFuseAsyncWriteSnapshot,
     baseline: VfsFuseAsyncWriteSnapshot,
-    source: Option<Box<dyn Fn() -> Option<VfsFuseAsyncWriteSnapshot> + Send + Sync>>,
+    /// Owner id and sampler; the id keeps a stale session from detaching a newer one.
+    source: Option<(u64, FuseAsyncWriteSource)>,
+    next_source_id: u64,
 }
 
 struct VfsState {
@@ -4880,7 +4884,7 @@ impl StudioVfs {
             let mut baseline = diagnostics
                 .source
                 .as_ref()
-                .and_then(|source| source())
+                .and_then(|(_, source)| source())
                 .unwrap_or_else(|| diagnostics.raw.clone());
             baseline.pending_writes_per_inode.clear();
             diagnostics.raw = baseline.clone();
@@ -8143,23 +8147,54 @@ impl StudioVfs {
 
     /// Register a source sampled only by diagnostics reads and resets.
     ///
-    /// The source must not reenter VFS diagnostics. Returning `None` uses the last
-    /// pushed snapshot, allowing adapters to hold a weak reference to mount state.
+    /// The source runs under the diagnostics mutex (diagnostics -> source's own locks), so it
+    /// must not reenter VFS diagnostics. Returning `None` uses the last pushed snapshot,
+    /// allowing adapters to hold a weak reference to mount state. A new source starts a new
+    /// counter epoch, so the previous source's snapshots and reset baseline are discarded.
+    /// Returns the id required by [`Self::detach_fuse_async_write_snapshot_source`].
     pub fn set_fuse_async_write_snapshot_source(
         &self,
         source: impl Fn() -> Option<VfsFuseAsyncWriteSnapshot> + Send + Sync + 'static,
-    ) {
-        self.state.fuse_async_write_diagnostics.lock().source = Some(Box::new(source));
+    ) -> u64 {
+        let mut diagnostics = self.state.fuse_async_write_diagnostics.lock();
+        diagnostics.next_source_id += 1;
+        let id = diagnostics.next_source_id;
+        diagnostics.source = Some((id, Box::new(source)));
+        diagnostics.raw = VfsFuseAsyncWriteSnapshot::default();
+        diagnostics.current = VfsFuseAsyncWriteSnapshot::default();
+        diagnostics.baseline = VfsFuseAsyncWriteSnapshot::default();
+        id
     }
 
-    /// Detach the diagnostics source, retaining the last pushed snapshot and reset baseline.
-    pub fn clear_fuse_async_write_snapshot_source(&self) {
-        self.state.fuse_async_write_diagnostics.lock().source = None;
+    /// Record the owner's final snapshot and detach its source, retaining the snapshot and
+    /// reset baseline. A no-op when a newer source has replaced `id`.
+    pub fn detach_fuse_async_write_snapshot_source(
+        &self,
+        id: u64,
+        final_snapshot: VfsFuseAsyncWriteSnapshot,
+    ) {
+        let mut diagnostics = self.state.fuse_async_write_diagnostics.lock();
+        if diagnostics
+            .source
+            .as_ref()
+            .is_none_or(|(owner, _)| *owner != id)
+        {
+            return;
+        }
+        diagnostics.source = None;
+        Self::store_fuse_async_write_snapshot(&mut diagnostics, final_snapshot);
     }
 
     /// Replace the latest async FUSE write bridge diagnostics snapshot.
     pub fn record_fuse_async_write_snapshot(&self, snapshot: VfsFuseAsyncWriteSnapshot) {
         let mut diagnostics = self.state.fuse_async_write_diagnostics.lock();
+        Self::store_fuse_async_write_snapshot(&mut diagnostics, snapshot);
+    }
+
+    fn store_fuse_async_write_snapshot(
+        diagnostics: &mut FuseAsyncWriteDiagnostics,
+        snapshot: VfsFuseAsyncWriteSnapshot,
+    ) {
         if snapshot.snapshot_generation < diagnostics.raw.snapshot_generation {
             return;
         }
@@ -8171,7 +8206,7 @@ impl StudioVfs {
     fn fuse_async_write_snapshot(&self) -> VfsFuseAsyncWriteSnapshot {
         // Keep sampling and baseline application serialized with diagnostics resets.
         let diagnostics = self.state.fuse_async_write_diagnostics.lock();
-        if let Some(snapshot) = diagnostics.source.as_ref().and_then(|source| source()) {
+        if let Some(snapshot) = diagnostics.source.as_ref().and_then(|(_, source)| source()) {
             Self::apply_fuse_async_write_reset_baseline(snapshot, &diagnostics.baseline)
         } else {
             diagnostics.current.clone()

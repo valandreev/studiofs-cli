@@ -209,6 +209,7 @@ unsafe extern "C" {
 }
 
 pub(crate) struct SessionState {
+    async_write_source: u64,
     vfs: Arc<StudioVfs>,
     runtime_handle: Handle,
     async_writes: Arc<AsyncWriteLedger>,
@@ -249,8 +250,9 @@ impl SessionState {
             DEFAULT_MAX_PENDING_WRITES,
         ));
         let cache_policy = linux_fuse_cache_policy_from_env();
-        register_async_write_metrics(&vfs, &async_writes, cache_policy);
+        let async_write_source = register_async_write_metrics(&vfs, &async_writes, cache_policy);
         Self {
+            async_write_source,
             vfs,
             runtime_handle,
             async_writes,
@@ -2984,8 +2986,14 @@ impl Drop for Session {
             if !drained {
                 state.async_writes.record_shutdown_timeout();
             }
-            record_async_write_metrics(&state.vfs, &state.async_writes, state.cache_policy);
-            state.vfs.clear_fuse_async_write_snapshot_source();
+            state.vfs.detach_fuse_async_write_snapshot_source(
+                state.async_write_source,
+                async_write_metrics_snapshot(
+                    &state.async_writes,
+                    state.cache_policy,
+                    linux_fuse_async_write_enabled(),
+                ),
+            );
             drained
         });
         let worker_outcome = shutdown_invalidation_with(
@@ -3122,24 +3130,14 @@ fn register_async_write_metrics(
     vfs: &StudioVfs,
     ledger: &Arc<AsyncWriteLedger>,
     cache_policy: LinuxFuseCachePolicy,
-) {
+) -> u64 {
     let ledger = Arc::downgrade(ledger);
     let enabled = linux_fuse_async_write_enabled();
     vfs.set_fuse_async_write_snapshot_source(move || {
         ledger
             .upgrade()
             .map(|ledger| async_write_metrics_snapshot(&ledger, cache_policy, enabled))
-    });
-}
-
-fn record_async_write_metrics(
-    vfs: &StudioVfs,
-    ledger: &AsyncWriteLedger,
-    cache_policy: LinuxFuseCachePolicy,
-) {
-    let snapshot =
-        async_write_metrics_snapshot(ledger, cache_policy, linux_fuse_async_write_enabled());
-    vfs.record_fuse_async_write_snapshot(snapshot);
+    })
 }
 
 fn async_write_metrics_snapshot(
@@ -3664,11 +3662,11 @@ mod tests {
             crate::cache_policy::LinuxFuseCachePolicy::Adaptive,
         );
         ledger.admit(10, 100, 8).unwrap().complete(Ok(()));
-        super::record_async_write_metrics(
-            &vfs,
+        vfs.record_fuse_async_write_snapshot(super::async_write_metrics_snapshot(
             &ledger,
             crate::cache_policy::LinuxFuseCachePolicy::Adaptive,
-        );
+            true,
+        ));
         drop(ledger);
 
         assert!(weak.upgrade().is_none());
@@ -3677,6 +3675,38 @@ mod tests {
                 .fuse_async_write
                 .completed_writes,
             1
+        );
+    }
+
+    #[test]
+    fn stale_async_write_source_cannot_detach_or_poison_a_newer_one() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-write-stale")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+        let old = Arc::new(crate::async_writes::AsyncWriteLedger::with_limits(16, 4));
+        let old_id = super::register_async_write_metrics(&vfs, &old, policy);
+        for _ in 0..3 {
+            old.admit(10, 100, 8).unwrap().complete(Ok(()));
+        }
+        vfs.reset_diagnostics_observability();
+        old.admit(10, 100, 8).unwrap().complete(Ok(()));
+
+        let new = Arc::new(crate::async_writes::AsyncWriteLedger::with_limits(16, 4));
+        super::register_async_write_metrics(&vfs, &new, policy);
+        new.admit(20, 200, 8).unwrap().complete(Ok(()));
+        // The old session tears down after the new one registered.
+        vfs.detach_fuse_async_write_snapshot_source(
+            old_id,
+            super::async_write_metrics_snapshot(&old, policy, true),
+        );
+
+        new.admit(20, 200, 8).unwrap().complete(Ok(()));
+        let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
+        assert_eq!(
+            snapshot.completed_writes, 2,
+            "new ledger stays live and unbiased"
         );
     }
 
