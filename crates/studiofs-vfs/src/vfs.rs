@@ -8152,6 +8152,11 @@ impl StudioVfs {
         self.state.fuse_async_write_diagnostics.lock().source = Some(Box::new(source));
     }
 
+    /// Detach the diagnostics source, retaining the last pushed snapshot and reset baseline.
+    pub fn clear_fuse_async_write_snapshot_source(&self) {
+        self.state.fuse_async_write_diagnostics.lock().source = None;
+    }
+
     /// Replace the latest async FUSE write bridge diagnostics snapshot.
     pub fn record_fuse_async_write_snapshot(&self, snapshot: VfsFuseAsyncWriteSnapshot) {
         let mut diagnostics = self.state.fuse_async_write_diagnostics.lock();
@@ -8164,6 +8169,7 @@ impl StudioVfs {
     }
 
     fn fuse_async_write_snapshot(&self) -> VfsFuseAsyncWriteSnapshot {
+        // Keep sampling and baseline application serialized with diagnostics resets.
         let diagnostics = self.state.fuse_async_write_diagnostics.lock();
         if let Some(snapshot) = diagnostics.source.as_ref().and_then(|source| source()) {
             Self::apply_fuse_async_write_reset_baseline(snapshot, &diagnostics.baseline)

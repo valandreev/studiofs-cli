@@ -2985,6 +2985,7 @@ impl Drop for Session {
                 state.async_writes.record_shutdown_timeout();
             }
             record_async_write_metrics(&state.vfs, &state.async_writes, state.cache_policy);
+            state.vfs.clear_fuse_async_write_snapshot_source();
             drained
         });
         let worker_outcome = shutdown_invalidation_with(
@@ -3676,6 +3677,58 @@ mod tests {
                 .fuse_async_write
                 .completed_writes,
             1
+        );
+    }
+
+    #[test]
+    fn session_drop_detaches_async_write_metrics_and_keeps_final_snapshot() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-write-detach")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let state = super::SessionState::new(
+            Arc::clone(&vfs),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let ledger = Arc::clone(&state.async_writes);
+        ledger.admit(10, 100, 8).unwrap().complete(Ok(()));
+        let mut args = super::OwnedFuseArgs::new(super::argv_strings("demo", false))
+            .expect("build FUSE arguments");
+        // SAFETY: the empty ops table has no callbacks; Session owns and destroys the raw session.
+        let raw = std::ptr::NonNull::new(unsafe {
+            super::studiofs_linux_fuse_session_new(
+                args.as_mut_ptr(),
+                super::studiofs_linux_fuse_empty_low_level_ops(),
+                super::studiofs_linux_fuse_low_level_ops_size(),
+                std::ptr::null_mut(),
+            )
+        })
+        .expect("create unmounted FUSE session");
+        drop(super::Session {
+            raw,
+            state: Some(Box::new(state)),
+            invalidation_state: Arc::new(super::SessionInvalidationState::new()),
+            invalidation_worker: None,
+            invalidation_metrics_generation: Arc::new(super::AtomicU64::new(0)),
+            signal_handlers_installed: false,
+        });
+
+        ledger.record_shutdown_timeout();
+        let snapshot = vfs.write_path_observability_snapshot().fuse_async_write;
+        assert_eq!(snapshot.completed_writes, 1, "retain final counters");
+        assert_eq!(
+            snapshot.shutdown_timeouts, 0,
+            "stop sampling the detached ledger"
+        );
+        vfs.reset_diagnostics_observability();
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .fuse_async_write
+                .shutdown_timeouts,
+            0,
+            "reset must use the retained final snapshot"
         );
     }
 

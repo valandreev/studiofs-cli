@@ -176,3 +176,37 @@ mounted smoke permission failure; a separate root smoke checks the write path.
 Revision: root mounted smoke also failed with EACCES and successful cleanup.
 Recorded both retained runs and marked focused implementation/review complete
 without claiming mounted acceptance or sustained mounted throughput.
+
+## Code-review follow-up (2026-10-11)
+
+Confirmed the lifecycle cleanup recommendation: detach the on-demand source
+immediately after `Session::drop` publishes its final snapshot, including the
+timeout path that retains callback state. Added
+`StudioVfs::clear_fuse_async_write_snapshot_source`, preserving the pushed
+snapshot and reset baseline. A real unmounted libfuse session regression keeps
+the ledger alive after teardown and changes its timeout counter. Before the
+fix, diagnostics incorrectly observed that later counter (1 instead of 0);
+after the fix, they retain the final snapshot. No mount or remote services are
+needed for this regression.
+
+Rejected the dynamic-flag recommendation: `linux_fuse_async_write_enabled`
+already uses a process-wide `OnceLock<bool>`, so registration and final
+publication cannot disagree because of an environment change. Preserved the
+reset clone: raw and baseline both need the sampled values, and the per-inode
+map is empty before cloning. Preserved serialized sampling/reset and added its
+reason beside the read lock. The barrier-expression finding already describes
+the current correct code and needs no change. Full disposition is also recorded
+in the supplied review document, which is ignored by repository policy.
+
+Follow-up verification passed:
+
+- `cargo test -p studiofs-linux-fuse --lib session_drop_detaches_async_write_metrics_and_keeps_final_snapshot -- --nocapture` — 1 passed after the observed red regression.
+- `cargo test -p studiofs-linux-fuse --lib async_write -- --nocapture` — 51 passed, including the new teardown regression.
+- `cargo test -p studiofs-vfs --lib fuse_async_write -- --nocapture` — 5 passed.
+- `cargo check -p studiofs-linux-fuse -p studiofs-vfs` — passed.
+- `cargo clippy -p studiofs-linux-fuse -p studiofs-vfs --all-targets -- -D warnings` — passed.
+- `cargo fmt --all --check` and `git diff --check` — passed.
+
+No workspace-wide suites or mounted E2E reruns were performed for this
+diagnostics-only cleanup. Earlier mounted EACCES failures remain unresolved;
+these focused checks do not establish mounted acceptance.
