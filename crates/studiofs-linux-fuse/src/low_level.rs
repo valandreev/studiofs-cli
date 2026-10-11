@@ -406,7 +406,7 @@ fn finish_async_barrier_with<T>(
 ) -> Result<T, i32> {
     let async_errno = match outcome {
         BarrierOutcome::Complete(errno) => errno,
-        BarrierOutcome::TimedOut => Some(libc::EIO),
+        BarrierOutcome::TimedOut => return Err(libc::EIO),
     };
     let vfs_result = vfs_barrier();
     async_errno.map_or(vfs_result, Err)
@@ -2302,11 +2302,11 @@ impl SessionState {
     fn release(&self, fh: u64) -> Result<(), i32> {
         let local_sync_policy = self.local_sync_policy_for_handle(fh);
         let watermark = self.async_writes.close_handle(fh);
-        let _forget = ForgetClosedHandle {
+        let outcome = self.async_writes.wait_handle(watermark);
+        let _forget = matches!(outcome, BarrierOutcome::Complete(_)).then(|| ForgetClosedHandle {
             ledger: &self.async_writes,
             fh,
-        };
-        let outcome = self.async_writes.wait_handle(watermark);
+        });
         let result = finish_async_barrier_with(outcome, || {
             if local_sync_policy.is_opportunistic() {
                 self.vfs
@@ -3686,6 +3686,97 @@ mod tests {
     }
 
     #[test]
+    fn kernel_barriers_recover_worker_from_incomplete_async_write() {
+        for operation in ["flush", "fsync", "release"] {
+            let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(operation)
+                .expect("create VFS fixture");
+            let mut state = super::SessionState::new(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                false,
+                default_connection_config(),
+            );
+            state.async_writes =
+                Arc::new(crate::async_writes::AsyncWriteLedger::with_barrier_timeout(
+                    Duration::from_millis(10),
+                ));
+            let attr = state
+                .vfs
+                .create(1, b"wedged-write", 0, 0, 0o644)
+                .expect("create file");
+            let open = state
+                .open_with_flags(attr.ino, libc::O_WRONLY)
+                .expect("open file");
+            let state = Arc::new(state);
+            let ticket = state
+                .async_writes
+                .admit(attr.ino, open.fh, 4)
+                .expect("admit write");
+            assert!(
+                state
+                    .async_writes
+                    .mark_task_non_cancellable(ticket.sequence())
+            );
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker_state = Arc::clone(&state);
+            let worker = std::thread::spawn(move || {
+                let result = match operation {
+                    "flush" => worker_state.flush(open.fh),
+                    "fsync" => worker_state.fsync(Some(open.fh), attr.ino, false),
+                    "release" => worker_state.release(open.fh),
+                    _ => unreachable!(),
+                };
+                sender.send(result).expect("send barrier result");
+            });
+            let result = receiver.recv_timeout(Duration::from_secs(1));
+            let pending = state.async_writes.metrics_snapshot();
+            // Always unblock and join even when the regression fails.
+            ticket.complete(Ok(()));
+            worker.join().expect("barrier worker should not panic");
+            assert_eq!(
+                result,
+                Ok(Err(libc::EIO)),
+                "{operation} must recover its worker"
+            );
+            assert_eq!(pending.pending_writes, 1, "timeout must retain the write");
+            assert_eq!(
+                pending.pending_bytes, 4,
+                "timeout must retain its reservation"
+            );
+            assert_eq!(state.async_writes.metrics_snapshot().pending_writes, 0);
+            assert!(
+                state.vfs.get_open_file(open.fh).is_some(),
+                "timeout must retain the VFS handle"
+            );
+            assert_eq!(
+                state.flush(open.fh),
+                Err(libc::EIO),
+                "timeout error must survive late success"
+            );
+            assert!(matches!(
+                state.async_writes.start_request(attr.ino, open.fh),
+                Err(crate::async_writes::AdmissionError::ShuttingDown)
+            ));
+            assert!(
+                matches!(
+                    state.async_writes.wait_all(Duration::ZERO),
+                    crate::async_writes::BarrierOutcome::Complete(None)
+                ),
+                "shutdown must still reconcile late completion"
+            );
+        }
+    }
+
+    #[test]
+    fn timed_out_async_barrier_does_not_enter_vfs() {
+        let result = super::finish_async_barrier_with::<()>(
+            crate::async_writes::BarrierOutcome::TimedOut,
+            || panic!("a timed out write must not enter a VFS barrier"),
+        );
+        assert_eq!(result, Err(libc::EIO));
+    }
+
+    #[test]
     fn async_error_has_precedence_but_vfs_barrier_still_runs() {
         let vfs_calls = AtomicUsize::new(0);
 
@@ -4822,7 +4913,7 @@ mod tests {
             .open_with_flags(attr.ino, libc::O_RDONLY | libc::O_APPEND)
             .expect("O_APPEND does not make a read-only open writable");
         let release = state.release(open.fh);
-        finish_regular_release_with(&state, Some(open.fh), release, |_| {});
+        super::finish_regular_release_with(&state, Some(open.fh), release, |_| {});
     }
 
     #[test]

@@ -386,6 +386,15 @@ Linux ordinary `flush` and final `release` admit state to the shared volatile
 metadata worker; the batch age is bounded to one second. An async-write ledger
 uses sequence-number watermarks, so a barrier waits for earlier writes to its
 own inode or handle, never unrelated inodes or later writes.
+
+Linux `flush`, `fsync`, and `release` limit this async-write wait to 30 seconds.
+On timeout they log the scope and pending work, return `EIO` without entering
+the VFS barrier, and retain a mount-wide write failure: new async writes and
+subsequent write barriers fail until remount. Pending tasks, reservations, and
+VFS handles remain owned so late completion can reconcile safely; a timed-out
+release does not close a handle underneath its write. Session teardown still
+uses the bounded write drain and retains callback state if it cannot drain.
+
 Linux `fsync` maps to the shared strict metadata sync boundary after any
 handle-local payload state is drained. The adapter only translates resulting
 errors to errno; queue draining and the redb barrier remain in shared VFS and

@@ -7,6 +7,8 @@ use tokio::task::AbortHandle;
 pub(crate) const DEFAULT_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_PENDING_WRITES: usize = 1024;
 const DEFAULT_MAX_RECORDED_ERRORS: usize = 8192;
+// Local writes should finish promptly; allow 30 seconds under load before failing the mount's write path.
+const DEFAULT_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionError {
@@ -64,6 +66,7 @@ struct WriteError {
 #[derive(Debug, Default)]
 struct LedgerState {
     shutting_down: bool,
+    barrier_failed: bool,
     next_sequence: u64,
     // These counters cover only callbacks admitted to async execution. Callbacks waiting for
     // capacity remain synchronous libfuse workers, but are already present in the indexes below
@@ -118,6 +121,7 @@ pub(crate) struct AsyncWriteMetricsSnapshot {
 
 #[derive(Debug)]
 pub(crate) struct AsyncWriteLedger {
+    barrier_timeout: Duration,
     max_pending_bytes: usize,
     max_pending_writes: usize,
     max_recorded_errors: usize,
@@ -155,11 +159,20 @@ impl AsyncWriteLedger {
             "recorded error limit must be non-zero"
         );
         Self {
+            barrier_timeout: DEFAULT_BARRIER_TIMEOUT,
             max_pending_bytes,
             max_pending_writes,
             max_recorded_errors,
             state: Mutex::new(LedgerState::default()),
             changed: Condvar::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_barrier_timeout(timeout: Duration) -> Self {
+        Self {
+            barrier_timeout: timeout,
+            ..Self::default()
         }
     }
 
@@ -300,6 +313,7 @@ impl AsyncWriteLedger {
             BarrierScope::Inode(watermark.ino),
             watermark.through,
             timeout,
+            false,
         )
     }
 
@@ -309,6 +323,7 @@ impl AsyncWriteLedger {
             BarrierScope::Handle(watermark.fh),
             watermark.through,
             timeout,
+            false,
         )
     }
 
@@ -316,7 +331,7 @@ impl AsyncWriteLedger {
         let state = self.lock_state();
         let through = state.next_sequence;
         drop(state);
-        self.wait_scope_timed(BarrierScope::All, through, timeout)
+        self.wait_scope_timed(BarrierScope::All, through, timeout, false)
     }
 
     pub(crate) fn shutdown(&self) {
@@ -490,17 +505,7 @@ impl AsyncWriteLedger {
     }
 
     fn wait_scope(&self, scope: BarrierScope, through: u64) -> BarrierOutcome {
-        let mut state = self.lock_state();
-        let wait_started =
-            (scope != BarrierScope::All && scope.has_pending(&state, through)).then(Instant::now);
-        while scope.has_pending(&state, through) {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-        record_barrier_wait(&mut state, scope, wait_started);
-        BarrierOutcome::Complete(scope.consume_errors(&mut state, through))
+        self.wait_scope_timed(scope, through, self.barrier_timeout, true)
     }
 
     fn wait_scope_timed(
@@ -508,6 +513,7 @@ impl AsyncWriteLedger {
         scope: BarrierScope,
         through: u64,
         timeout: Duration,
+        fail_on_timeout: bool,
     ) -> BarrierOutcome {
         let deadline = Instant::now()
             .checked_add(timeout)
@@ -516,29 +522,42 @@ impl AsyncWriteLedger {
         let wait_started =
             (scope != BarrierScope::All && scope.has_pending(&state, through)).then(Instant::now);
         loop {
+            if fail_on_timeout && state.barrier_failed {
+                record_barrier_wait(&mut state, scope, wait_started);
+                return BarrierOutcome::TimedOut;
+            }
             if !scope.has_pending(&state, through) {
                 record_barrier_wait(&mut state, scope, wait_started);
                 let errno = scope.consume_errors(&mut state, through);
                 return BarrierOutcome::Complete(errno);
             }
 
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                record_barrier_wait(&mut state, scope, wait_started);
-                return BarrierOutcome::TimedOut;
-            };
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
             if remaining.is_zero() {
                 record_barrier_wait(&mut state, scope, wait_started);
+                if fail_on_timeout {
+                    // Retain tasks and reservations: VFS mutations cannot safely be cancelled.
+                    state.barrier_failed = true;
+                    state.shutting_down = true;
+                    tracing::warn!(
+                        ?scope,
+                        through,
+                        ?timeout,
+                        pending_writes = state.pending.len(),
+                        pending_bytes = state.admitted_bytes,
+                        "Linux FUSE async-write barrier timed out; write path requires remount"
+                    );
+                    self.changed.notify_all();
+                }
                 return BarrierOutcome::TimedOut;
             }
-            let (next_state, wait_result) = self
+            let (next_state, _) = self
                 .changed
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = next_state;
-            if wait_result.timed_out() && scope.has_pending(&state, through) {
-                record_barrier_wait(&mut state, scope, wait_started);
-                return BarrierOutcome::TimedOut;
-            }
         }
     }
 
@@ -817,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn untimed_inode_barrier_waits_for_pre_watermark_write_only() {
+    fn inode_barrier_waits_for_pre_watermark_write_only() {
         let ledger = Arc::new(AsyncWriteLedger::default());
         let before = ledger.admit(10, 100, 4).expect("write should admit");
         let watermark = ledger.capture_inode_watermark(10);
@@ -866,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn untimed_handle_barrier_waits_for_pre_watermark_write_only() {
+    fn handle_barrier_waits_for_pre_watermark_write_only() {
         let ledger = Arc::new(AsyncWriteLedger::default());
         let before = ledger.admit(10, 100, 4).expect("write should admit");
         let watermark = ledger.capture_handle_watermark(100);
@@ -900,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn untimed_inode_barrier_drains_registered_write_after_shutdown() {
+    fn inode_barrier_drains_registered_write_after_shutdown() {
         let ledger = Arc::new(AsyncWriteLedger::default());
         let ticket = ledger.admit(10, 100, 4).expect("write should admit");
         let watermark = ledger.capture_inode_watermark(10);
