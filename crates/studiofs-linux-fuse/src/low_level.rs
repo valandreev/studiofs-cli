@@ -3257,6 +3257,14 @@ impl Session {
             || {
                 // SAFETY: handlers were installed for this retained live session.
                 unsafe { raw::fuse_remove_signal_handlers(raw.as_ptr()) };
+                // libfuse restores SIG_DFL, but `studiofs umount` sends SIGTERM after
+                // the lazy detach; dying here skips VFS/redb shutdown and forces repair.
+                // SIGINT keeps its default so a second Ctrl+C can still force-quit.
+                // SAFETY: setting a disposition to SIG_IGN is async-signal-safe.
+                unsafe {
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                }
             },
             || {
                 // SAFETY: libfuse tolerates unmount after regular kernel disconnects.
