@@ -220,6 +220,7 @@ unsafe extern "C" {
     fn studiofs_linux_fuse_init_effective_max_readahead(offered: u32) -> u32;
     #[cfg(test)]
     fn studiofs_linux_fuse_loop_config_uses_loop_config_api() -> c_int;
+    fn studiofs_linux_fuse_loop_has_worker_limit() -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_conn_wants_async_dio_after_set(capable_ext: u64) -> c_int;
     #[cfg(test)]
@@ -508,22 +509,6 @@ struct LinuxFuseAllocatedCreate {
     lookup: FuseLookupReservation,
 }
 
-fn linux_fuse_loop_thread_count(max_background: u32) -> c_uint {
-    let parallelism = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1);
-    linux_fuse_loop_thread_count_for_parallelism(parallelism, max_background)
-}
-
-fn linux_fuse_loop_thread_count_for_parallelism(parallelism: usize, max_background: u32) -> c_uint {
-    u32::try_from(parallelism)
-        .unwrap_or(u32::MAX)
-        // FUSE callbacks can block on local disk and remote object I/O, so keep
-        // a small surplus over CPU count without exceeding kernel queue bounds.
-        .saturating_mul(2)
-        .clamp(1, max_background.max(1))
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_max_background(
     userdata: *mut c_void,
@@ -590,6 +575,15 @@ pub unsafe extern "C" fn studiofs_linux_fuse_record_connection(
         LinuxFuseCachePolicy::Adaptive => "adaptive",
         LinuxFuseCachePolicy::Kernel => "kernel",
     };
+    tracing::info!(
+        requested_max_background = state.connection_config.max_background,
+        effective_max_background,
+        effective_congestion_threshold,
+        worker_threads = state
+            .connection_config
+            .worker_thread_count(has_worker_limit()),
+        "Linux FUSE connection initialized"
+    );
     state
         .vfs
         .record_fuse_connection_snapshot(VfsFuseConnectionSnapshot {
@@ -605,6 +599,11 @@ pub unsafe extern "C" fn studiofs_linux_fuse_record_connection(
             capable_features,
             enabled_features,
         });
+}
+
+pub(crate) fn has_worker_limit() -> bool {
+    // SAFETY: the C shim reports its compile-time loop API selection.
+    unsafe { studiofs_linux_fuse_loop_has_worker_limit() != 0 }
 }
 
 fn current_uid() -> u32 {
@@ -913,12 +912,20 @@ impl Session {
     }
 
     pub(crate) fn run(&mut self) -> io::Result<()> {
-        let max_background = self
+        let connection_config = self
             .state
             .as_ref()
-            .map(|state| state.connection_config.max_background)
-            .unwrap_or_else(|| LinuxFuseConnectionConfig::default().max_background);
-        let loop_threads = linux_fuse_loop_thread_count(max_background);
+            .map(|state| state.connection_config)
+            .unwrap_or_default();
+        let hard_worker_limit = has_worker_limit();
+        let loop_threads = connection_config.worker_thread_count(hard_worker_limit);
+        tracing::info!(
+            requested_worker_threads = ?connection_config.worker_threads,
+            worker_threads = loop_threads,
+            max_background = connection_config.max_background,
+            hard_worker_limit,
+            "Linux FUSE callback worker policy"
+        );
         // SAFETY: `self.raw` is a live libfuse session owned by this wrapper.
         // Keep idle workers equal to the cap so bursty filesystem I/O does not
         // pay thread create/destroy overhead between request spikes.
@@ -5142,19 +5149,23 @@ mod tests {
     }
 
     #[test]
-    fn loop_thread_count_scales_with_parallelism_and_background_queue() {
-        assert_eq!(
-            super::linux_fuse_loop_thread_count_for_parallelism(4, 16),
-            8
-        );
+    fn loop_thread_count_caps_default_at_small_queue() {
+        let config = super::LinuxFuseConnectionConfig {
+            max_background: 16,
+            congestion_threshold: 12,
+            ..Default::default()
+        };
+        assert_eq!(config.worker_thread_count(true), 16);
     }
 
     #[test]
     fn loop_thread_count_caps_at_background_queue() {
-        assert_eq!(
-            super::linux_fuse_loop_thread_count_for_parallelism(64, 16),
-            16
-        );
+        let config = super::LinuxFuseConnectionConfig {
+            max_background: 16,
+            congestion_threshold: 12,
+            worker_threads: Some(64),
+        };
+        assert_eq!(config.worker_thread_count(true), 16);
     }
 
     #[test]
@@ -5189,6 +5200,7 @@ mod tests {
         let config = super::LinuxFuseConnectionConfig {
             max_background: 32,
             congestion_threshold: 24,
+            worker_threads: None,
         };
         let mut state = super::SessionState::new(
             fixture.vfs(),

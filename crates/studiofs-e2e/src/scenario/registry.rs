@@ -45,6 +45,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
                 .definition(),
             SnapshotV2Scenario::new(SnapshotV2Kind::ManualRecovery).definition(),
             SnapshotV2Scenario::new(SnapshotV2Kind::MaterializerTakeover).definition(),
+            WorkerConcurrency.definition(),
         ]
     })
 }
@@ -52,6 +53,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
 /// Resolves a scenario name to a concrete scenario implementation.
 pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
     match name {
+        "mounted-worker-concurrency" => Some(Box::new(WorkerConcurrency)),
         BASIC_MULTI_CLIENT_SMOKE | "smoke" => Some(Box::new(BasicMultiClientSmoke)),
         POSTGRES_OUTAGE_MULTI_CLIENT_RECOVERY | "postgres-outage" => {
             Some(Box::new(PostgresOutageMultiClientRecovery))

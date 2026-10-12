@@ -223,6 +223,13 @@ Notes:
   also emit a warning. Retained direct aliases are `direct_io`, `dio`, `0`,
   `false`, `no`, and `off`; retained kernel aliases are `cached`,
   `page_cache`, `1`, `true`, `yes`, and `on`.
+- `STUDIOFS_LINUX_FUSE_WORKER_THREADS` sets the Linux libfuse callback worker
+  limit (positive integer; remount to apply). Unset selects
+  `max(16, 2 * available CPUs)`; every value is capped by the kernel background
+  queue (`max_background`, default 128) and 128 workers. Invalid values fail
+  before mounting. Requires libfuse 3.12+: older system libfuse (Rocky 9.x
+  ships 3.10) rejects any explicit value as unsupported and keeps the
+  CPU-based default.
 - Read access is tracked per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.

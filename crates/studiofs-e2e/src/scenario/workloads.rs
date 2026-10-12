@@ -256,6 +256,7 @@ mod smoke_outage;
 mod snapshot_v2;
 #[cfg(test)]
 mod test_fixtures;
+mod worker_concurrency;
 
 pub(super) use actions::*;
 pub use actions::{
@@ -270,6 +271,7 @@ pub(super) use smoke_outage::*;
 pub(super) use snapshot_v2::*;
 #[cfg(test)]
 pub(super) use test_fixtures::*;
+pub(super) use worker_concurrency::WorkerConcurrency;
 
 #[cfg(test)]
 mod tests;
