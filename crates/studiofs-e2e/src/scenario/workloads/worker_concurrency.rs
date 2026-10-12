@@ -111,7 +111,7 @@ fn measure(
                 Err(ScenarioError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            thread::park_timeout(remaining.min(Duration::from_millis(50)));
+            thread::sleep(remaining.min(Duration::from_millis(50)));
         }
     }
     let cold_started = Instant::now();
@@ -163,17 +163,18 @@ fn read_batch(root: &Path, files: usize, file_bytes: usize) -> Result<u64, Scena
                 })
             })
             .collect::<io::Result<Vec<_>>>()?;
-        let results: Vec<_> = workers
-            .into_iter()
-            .map(|worker| {
-                worker.join().map_err(|_| {
+        let mut total = Ok(0);
+        // Join every worker even after an error so scope cannot rethrow an unhandled panic.
+        for worker in workers {
+            let result = worker
+                .join()
+                .map_err(|_| {
                     ScenarioError::Io(io::Error::other("worker measurement reader panicked"))
-                })?
-            })
-            .collect();
-        results
-            .into_iter()
-            .try_fold(0, |total, result| result.map(|bytes| total + bytes))
+                })
+                .and_then(|result| result);
+            total = total.and_then(|total| result.map(|bytes| total + bytes));
+        }
+        total
     })
 }
 

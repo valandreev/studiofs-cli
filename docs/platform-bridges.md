@@ -505,7 +505,7 @@ the connection init callback caps the kernel background queue
 apply backpressure instead of growing unbounded request memory. The Linux
 bridge request can override those queue bounds before mounting. StudioFS uses
 the libfuse3 `fuse_loop_config` multithreaded loop API:
-libfuse 3.12+ builds use the opaque config setters with `clone_fd=0` and an
+libfuse 3.12+ builds use the opaque config setters with `clone_fd=0` and a
 worker-pool limit of `min(max_background, 16)` independent of CPU count.
 Set `STUDIOFS_LINUX_FUSE_WORKER_THREADS` to a positive integer and remount
 to override it; bridge callers can set `LinuxFuseConnectionConfig.worker_threads`,
