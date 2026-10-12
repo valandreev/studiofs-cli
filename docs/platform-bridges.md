@@ -356,6 +356,39 @@ owns size, alignment, and encoding; StudioFS does not duplicate the dirent ABI.
 An entry that does not fit ends the reply and is returned first by the next
 `readdir`. Names with embedded NUL bytes are rejected with `EINVAL`.
 
+Directory handles capture a compact immutable snapshot of names, inode numbers,
+and file types on the first read that reaches child entries. Opening a directory
+or a reply with too little space for the smallest child dirent does not
+enumerate its children. Before snapshot capture, the bridge queries libfuse
+for that minimum size using a one-byte name; it does not hardcode the ABI.
+A longer actual child name may still fail to fit after capture.
+Chunked reads and backward seeks to a nonzero offset keep the same offsets after
+namespace mutations. A read at offset 0 (the first read, or `rewinddir`) drops
+the handle's snapshot so the next child read observes the current namespace,
+matching WinFSP's marker-less `read_directory`. Because capture happens on first
+child read, `ENOENT` for a directory removed before then is returned by
+`readdir`, not `opendir`.
+
+As on WinFSP, snapshots are shared through a session cache keyed by inode and
+validated by `StudioVfs::directory_enumeration_observation`. The cache keeps at
+most 64 snapshots and 4 MiB of entry/name bytes with LRU eviction, clears on a
+newer namespace epoch, and does not admit a build whose observation changed
+during enumeration. Unlike WinFSP, the Linux key ignores the attribute
+generation because dirents carry only inode and file type. A cache hit skips VFS
+enumeration entirely; an existing handle's snapshot is never replaced.
+Full child attributes are not retained because ordinary libfuse dirents use only
+inode and file type. A captured snapshot still holds O(N) names, like WinFSP's
+per-handle `DirBuffer`, rather than paging metadata. A 1024-entry fixture with
+nine-byte names retains 50,176 entry/name bytes, compared with 156,672 for the
+previous attribute-bearing snapshot (68% less); these are allocation-layout
+measurements, not mounted RSS measurements.
+
+Reply storage is pooled per session after each synchronous reply, including
+error replies. The pool retains at most 16 buffers, each with at most 128 KiB of
+aligned reply storage and 4 KiB of scratch-name storage. Larger requests still
+work, but their buffers are discarded after use. A reused buffer honours the
+current requested size and exposes only bytes initialized for that reply.
+
 Current Linux callbacks:
 
 | libfuse3 Callback | VFS Method |
@@ -382,7 +415,7 @@ Current Linux callbacks:
 | `statfs` | `statfs()` |
 | `access(2)` | Native kernel permission check (`default_permissions`); no userspace access callback |
 | `opendir` | `getattr()` directory check |
-| `readdir` | `readdir_with_attrs()` |
+| `readdir` | lazy per-handle `readdir()` snapshot |
 | `releasedir` | success reply |
 | `getxattr` | `get_xattr()`; missing attributes return `ENODATA` |
 | `setxattr` | `set_xattr()` |

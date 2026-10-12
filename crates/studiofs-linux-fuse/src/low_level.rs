@@ -15,6 +15,7 @@ use crate::cache_policy::{
     LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBuffer, SyncReadBufferPool,
     SystemMemorySampler, decide_open_cache,
 };
+use crate::directory_cache::{DirectorySnapshot, DirectorySnapshotCache, linux_observation};
 use crate::invalidation::{
     FuseInodeLiveness, FuseInvalidationGeometry, FuseInvalidationKind,
     FuseInvalidationMetricsSnapshot, FuseInvalidationQueue, FuseInvalidationReceiptOutcome,
@@ -30,8 +31,8 @@ use studiofs_bridge::posix::{
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::vfs::OsCacheParticipation;
 use studiofs_vfs::{
-    DirEntryWithAttr, KernelInvalidator, LocalSyncPolicy, OpenFlags, ReadAheadOwner, StatFs,
-    StudioVfs, VfsFuseAsyncWriteSnapshot, VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot,
+    KernelInvalidator, LocalSyncPolicy, OpenFlags, ReadAheadOwner, StatFs, StudioVfs,
+    VfsFuseAsyncWriteSnapshot, VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -249,6 +250,8 @@ pub(crate) struct SessionState {
     async_direct_io: bool,
     available_memory: Option<SystemMemorySampler>,
     read_buffers: SyncReadBufferPool,
+    directory_buffers: DirectoryEntryBufferPool,
+    directory_snapshots: DirectorySnapshotCache,
     open_reply_serializer: FuseOpenReplySerializer,
     inode_liveness: FuseInodeLiveness,
     open_liveness: [Mutex<HashMap<u64, FuseOpenHandleGuard>>; LIVENESS_SHARDS],
@@ -295,6 +298,8 @@ impl SessionState {
             available_memory: (cache_policy == LinuxFuseCachePolicy::Adaptive)
                 .then(SystemMemorySampler::system),
             read_buffers: SyncReadBufferPool::new(),
+            directory_buffers: DirectoryEntryBufferPool::default(),
+            directory_snapshots: DirectorySnapshotCache::default(),
             open_reply_serializer: FuseOpenReplySerializer::new(),
             inode_liveness: FuseInodeLiveness::default(),
             open_liveness: std::array::from_fn(|_| Mutex::new(HashMap::new())),
@@ -1553,14 +1558,16 @@ pub extern "C" fn studiofs_linux_fuse_readdir(
         reply_error(req, libc::EBADF);
         return;
     };
-    match state.readdir(req, ino, handle, off, size) {
-        Ok(buffer) => {
+    let mut buffer = state.directory_buffers.take(size);
+    match state.readdir(req, ino, handle, off, &mut buffer) {
+        Ok(()) => {
             let bytes = buffer.as_slice();
             // SAFETY: `bytes` is valid for this synchronous reply.
             unsafe { raw::fuse_reply_buf(req, bytes.as_ptr().cast::<c_char>(), bytes.len()) };
         }
         Err(errno) => reply_error(req, errno),
     }
+    state.directory_buffers.put(buffer);
 }
 
 #[unsafe(no_mangle)]
@@ -2423,16 +2430,9 @@ impl SessionState {
     }
 
     fn open_dir(&self, ino: u64) -> Result<NonNull<DirectoryHandle>, i32> {
-        // SFS-604 snapshots each directory handle eagerly so Linux readdir offsets
-        // stay stable across chunked kernel reads. Replace with VFS cursors if
-        // huge-directory memory use shows up in workload evidence.
-        let entries = self
-            .vfs
-            .readdir_with_attrs(ino)
-            .map_err(|error| vfs_err_to_errno(&error))?;
         let liveness = self.inode_liveness.open_handle(ino);
         let raw = Box::into_raw(Box::new(DirectoryHandle {
-            entries,
+            entries: Mutex::new(None),
             _liveness: liveness,
         }));
         NonNull::new(raw).ok_or(libc::ENOMEM)
@@ -2444,44 +2444,80 @@ impl SessionState {
         ino: u64,
         handle: NonNull<DirectoryHandle>,
         offset: off_t,
-        size: usize,
-    ) -> Result<DirectoryEntryBuffer, i32> {
-        let mut buffer = DirectoryEntryBuffer::new(size);
+        buffer: &mut DirectoryEntryBuffer,
+    ) -> Result<(), i32> {
         let mut idx = usize::try_from(offset).map_err(|_| libc::EINVAL)?;
         let dir_attr = minimal_dir_stat(ino);
+        // SAFETY: `handle` comes from `opendir` and remains owned by the
+        // matching directory handle until `releasedir`.
+        let entries = unsafe { &handle.as_ref().entries };
         if idx == 0 {
+            // Like WinFSP's marker-less read, a rewind starts a fresh enumeration.
+            *entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             if !buffer.push(req, OsStr::new("."), &dir_attr, 1)? {
-                return Ok(buffer);
+                return Ok(());
             }
             idx = 1;
         }
         if idx == 1 {
             if !buffer.push(req, OsStr::new(".."), &dir_attr, 2)? {
-                return Ok(buffer);
+                return Ok(());
             }
             idx = 2;
         }
 
-        // SAFETY: `handle` comes from `opendir` and remains owned by the
-        // matching directory handle until `releasedir`.
-        let entries = unsafe { &handle.as_ref().entries };
+        // SAFETY: a null buffer queries size only; name and attr are valid, req is ignored.
+        let minimum_entry_size = unsafe {
+            raw::fuse_add_direntry(req, std::ptr::null_mut(), 0, c".".as_ptr(), &dir_attr, 0)
+        };
+        if buffer.capacity.saturating_sub(buffer.len) < minimum_entry_size {
+            return Ok(());
+        }
+        let mut snapshot = entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Capture once per enumeration; namespace changes must not shift existing offsets.
+        let entries = match snapshot.as_ref() {
+            Some(entries) => entries,
+            None => snapshot.insert(self.directory_snapshot(ino)?),
+        };
         for (i, entry) in entries.iter().enumerate().skip(idx.saturating_sub(2)) {
             let entry_idx = i + 2;
-            let attr = entry.attr.as_ref().map_or_else(
-                || minimal_entry_stat(entry.entry.ino, entry.entry.kind),
-                |attr| self.attr_to_stat(attr),
-            );
+            let attr = minimal_entry_stat(entry.ino, entry.kind);
             let next_offset = off_t::try_from(entry_idx + 1).map_err(|_| libc::EOVERFLOW)?;
-            if !buffer.push(
-                req,
-                OsStr::from_bytes(&entry.entry.name),
-                &attr,
-                next_offset,
-            )? {
+            if !buffer.push(req, OsStr::from_bytes(&entry.name), &attr, next_offset)? {
                 break;
             }
         }
-        Ok(buffer)
+        Ok(())
+    }
+
+    /// Reuses a session-cached snapshot while the directory observation is unchanged.
+    // shortcut: an uncached capture still holds O(N) names per handle, as WinFSP's
+    // DirBuffer does; use metadata cursors if large directories need bounded memory.
+    fn directory_snapshot(&self, ino: u64) -> Result<DirectorySnapshot, i32> {
+        let observe = || {
+            self.vfs
+                .directory_enumeration_observation(ino)
+                .map_err(|error| vfs_err_to_errno(&error))
+        };
+        let observation = observe()?;
+        if let Some(snapshot) = self.directory_snapshots.lookup(ino, observation) {
+            return Ok(snapshot);
+        }
+        let snapshot = DirectorySnapshot::from(
+            self.vfs
+                .readdir(ino)
+                .map_err(|error| vfs_err_to_errno(&error))?,
+        );
+        // Never cache a build that crossed an invalidation.
+        if linux_observation(observe()?) == linux_observation(observation) {
+            self.directory_snapshots
+                .insert(ino, observation, Arc::clone(&snapshot));
+        }
+        Ok(snapshot)
     }
 
     fn statfs(&self) -> Result<statvfs, i32> {
@@ -2538,7 +2574,7 @@ impl SessionState {
 }
 
 struct DirectoryHandle {
-    entries: Vec<DirEntryWithAttr>,
+    entries: Mutex<Option<DirectorySnapshot>>,
     _liveness: FuseOpenHandleGuard,
 }
 
@@ -2996,7 +3032,51 @@ fn xattr_mutation_err_to_errno(err: &studiofs_vfs::VfsError) -> i32 {
     }
 }
 
+// Bound idle reply storage independently of how many directories remain open.
+const MAX_DIRECTORY_BUFFERS: usize = 16;
+const MAX_DIRECTORY_BUFFER_CAPACITY: usize = 128 * 1024;
+const MAX_DIRECTORY_SCRATCH_CAPACITY: usize = 4096;
+
+#[derive(Default)]
+struct DirectoryEntryBufferPool {
+    buffers: Mutex<Vec<DirectoryEntryBuffer>>,
+}
+
+impl DirectoryEntryBufferPool {
+    fn take(&self, capacity: usize) -> DirectoryEntryBuffer {
+        let buffer = self
+            .buffers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        let mut buffer = buffer.unwrap_or_else(|| DirectoryEntryBuffer::new(capacity));
+        buffer
+            .words
+            .reserve_exact(capacity.div_ceil(std::mem::size_of::<u64>()));
+        buffer.scratch_name.clear();
+        buffer.len = 0;
+        buffer.capacity = capacity;
+        buffer
+    }
+
+    fn put(&self, buffer: DirectoryEntryBuffer) {
+        if buffer.words.capacity() > MAX_DIRECTORY_BUFFER_CAPACITY / std::mem::size_of::<u64>()
+            || buffer.scratch_name.capacity() > MAX_DIRECTORY_SCRATCH_CAPACITY
+        {
+            return;
+        }
+        let mut buffers = self
+            .buffers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buffers.len() < MAX_DIRECTORY_BUFFERS {
+            buffers.push(buffer);
+        }
+    }
+}
+
 struct DirectoryEntryBuffer {
+    // Keep Vec length zero; libfuse initializes bytes tracked by `len` in spare storage.
     words: Vec<MaybeUninit<u64>>,
     len: usize,
     scratch_name: Vec<u8>,
@@ -3058,15 +3138,7 @@ impl DirectoryEntryBuffer {
             return Ok(false);
         }
 
-        let new_len = start + required;
-        let required_words = new_len.div_ceil(std::mem::size_of::<u64>());
-        debug_assert!(required_words <= self.words.capacity());
-        // SAFETY: new_len <= self.capacity, so required_words <= words.capacity().
-        // Elements are MaybeUninit<u64>; only the initialized bytes up to new_len are read.
-        unsafe {
-            self.words.set_len(required_words);
-        }
-        self.len = new_len;
+        self.len = start + required;
         Ok(true)
     }
 }
@@ -3333,6 +3405,436 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use studiofs_meta::MetaInodes;
+
+    fn decode_directory_reply(buffer: &super::DirectoryEntryBuffer) -> Vec<(Vec<u8>, u64, u32)> {
+        let mut bytes = buffer.as_slice();
+        let mut entries = Vec::new();
+        while !bytes.is_empty() {
+            let offset = u64::from_ne_bytes(bytes[8..16].try_into().unwrap());
+            let name_len = u32::from_ne_bytes(bytes[16..20].try_into().unwrap()) as usize;
+            let kind = u32::from_ne_bytes(bytes[20..24].try_into().unwrap());
+            entries.push((bytes[24..24 + name_len].to_vec(), offset, kind));
+            bytes = &bytes[(24 + name_len).next_multiple_of(8)..];
+        }
+        entries
+    }
+
+    #[test]
+    fn directory_offsets_stay_stable_across_chunks_and_namespace_mutations() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-dir-offsets")
+            .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let dir = fixture.vfs().mkdir(1, b"dir", 0, 0, 0o755).unwrap();
+        for name in [b"a", b"b", b"c", b"d"] {
+            fixture.vfs().create(dir.ino, name, 0, 0, 0o644).unwrap();
+        }
+        let raw_handle = state.open_dir(dir.ino).unwrap();
+        // SAFETY: this test owns the handle and keeps the box alive through every read.
+        let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
+        fixture.vfs().mkdir(dir.ino, b"e", 0, 0, 0o755).unwrap();
+        let read = |offset, size| {
+            let mut buffer = state.directory_buffers.take(size);
+            state
+                .readdir(
+                    std::ptr::null_mut(),
+                    dir.ino,
+                    raw_handle,
+                    offset,
+                    &mut buffer,
+                )
+                .unwrap();
+            let result = decode_directory_reply(&buffer);
+            state.directory_buffers.put(buffer);
+            result
+        };
+        let first = read(0, 96);
+        assert_eq!(
+            first,
+            vec![
+                (b".".to_vec(), 1, u32::from(libc::DT_DIR)),
+                (b"..".to_vec(), 2, u32::from(libc::DT_DIR)),
+                (b"a".to_vec(), 3, u32::from(libc::DT_REG)),
+            ]
+        );
+
+        std::thread::scope(|scope| {
+            let vfs = fixture.vfs();
+            scope
+                .spawn(move || {
+                    vfs.unlink(dir.ino, b"b").unwrap();
+                    vfs.rename(dir.ino, b"c", dir.ino, b"z", false).unwrap();
+                    vfs.create(dir.ino, b"aa", 0, 0, 0o644).unwrap();
+                })
+                .join()
+                .unwrap();
+        });
+        assert_eq!(
+            read(3, 64),
+            vec![
+                (b"b".to_vec(), 4, u32::from(libc::DT_REG)),
+                (b"c".to_vec(), 5, u32::from(libc::DT_REG)),
+            ]
+        );
+        assert_eq!(
+            read(5, 64),
+            vec![
+                (b"d".to_vec(), 6, u32::from(libc::DT_REG)),
+                (b"e".to_vec(), 7, u32::from(libc::DT_DIR)),
+            ]
+        );
+        assert!(read(7, 64).is_empty());
+        assert_eq!(
+            read(3, 32),
+            vec![(b"b".to_vec(), 4, u32::from(libc::DT_REG))],
+            "seeking back within an enumeration must replay the original offsets"
+        );
+        assert!(read(i64::MAX, 64).is_empty());
+        assert_eq!(read(0, 96), first);
+        assert_eq!(
+            read(3, 32),
+            vec![(b"aa".to_vec(), 4, u32::from(libc::DT_REG))],
+            "rewinding to offset 0 must start a fresh enumeration, as on WinFSP"
+        );
+
+        let fresh = state.open_dir(dir.ino).unwrap();
+        let mut buffer = state.directory_buffers.take(4096);
+        state
+            .readdir(std::ptr::null_mut(), dir.ino, fresh, 2, &mut buffer)
+            .unwrap();
+        // SAFETY: this test owns this second handle, with no further reads pending.
+        let _fresh = unsafe { Box::from_raw(fresh.as_ptr()) };
+        assert_eq!(
+            decode_directory_reply(&buffer)
+                .into_iter()
+                .map(|e| e.0)
+                .collect::<Vec<_>>(),
+            vec![
+                b"a".to_vec(),
+                b"aa".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec(),
+                b"z".to_vec()
+            ]
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn directory_snapshot_is_shared_until_namespace_changes() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-dir-shared")
+            .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let dir = fixture.vfs().mkdir(1, b"dir", 0, 0, 0o755).unwrap();
+        fixture.vfs().create(dir.ino, b"a", 0, 0, 0o644).unwrap();
+        let capture = || {
+            let raw = state.open_dir(dir.ino).unwrap();
+            let mut buffer = state.directory_buffers.take(4096);
+            state
+                .readdir(std::ptr::null_mut(), dir.ino, raw, 2, &mut buffer)
+                .unwrap();
+            state.directory_buffers.put(buffer);
+            // SAFETY: this test exclusively owns the handle returned by open_dir.
+            let handle = unsafe { Box::from_raw(raw.as_ptr()) };
+            handle.entries.lock().unwrap().clone().unwrap()
+        };
+        let first = capture();
+        let second = capture();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "an unchanged directory reuses the session snapshot"
+        );
+        fixture
+            .vfs()
+            .setattr(
+                first[0].ino,
+                studiofs_meta::SetattrArgs {
+                    mtime: studiofs_meta::TimeSpec::Now,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &capture()),
+            "attribute-only invalidation keeps Linux dirents valid"
+        );
+        fixture.vfs().create(dir.ino, b"b", 0, 0, 0o644).unwrap();
+        let third = capture();
+        assert!(!std::sync::Arc::ptr_eq(&first, &third));
+        assert_eq!(
+            third
+                .iter()
+                .map(|entry| entry.name.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"a".as_slice(), b"b".as_slice()]
+        );
+        assert_eq!(first.len(), 1, "an existing snapshot stays immutable");
+        assert!(std::sync::Arc::ptr_eq(&third, &capture()));
+    }
+
+    #[test]
+    fn directory_empty_and_invalid_reads_do_not_capture_snapshot() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-dir-empty")
+            .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        fixture.vfs().create(1, b"child", 0, 0, 0o644).unwrap();
+        let raw_handle = state.open_dir(1).unwrap();
+        // SAFETY: this test keeps its handle alive until all reads complete.
+        let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
+        for (offset, size, expected) in [
+            (0, 0, Ok(())),
+            (2, 0, Ok(())),
+            (0, 31, Ok(())),
+            (2, 31, Ok(())),
+            (-1, 4096, Err(libc::EINVAL)),
+        ] {
+            let mut buffer = state.directory_buffers.take(size);
+            assert_eq!(
+                state.readdir(std::ptr::null_mut(), 1, raw_handle, offset, &mut buffer),
+                expected
+            );
+            assert!(buffer.as_slice().is_empty());
+            state.directory_buffers.put(buffer);
+            assert!(handle.entries.lock().unwrap().is_none());
+        }
+        for (offset, sizes, names) in [
+            (0, 64..96, vec![b".".to_vec(), b"..".to_vec()]),
+            (1, 32..64, vec![b"..".to_vec()]),
+        ] {
+            for size in sizes {
+                let mut buffer = state.directory_buffers.take(size);
+                state
+                    .readdir(std::ptr::null_mut(), 1, raw_handle, offset, &mut buffer)
+                    .unwrap();
+                assert_eq!(
+                    decode_directory_reply(&buffer)
+                        .into_iter()
+                        .map(|entry| entry.0)
+                        .collect::<Vec<_>>(),
+                    names
+                );
+                state.directory_buffers.put(buffer);
+                assert!(
+                    handle.entries.lock().unwrap().is_none(),
+                    "offset {offset}, size {size} must not capture children"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_buffer_pool_reuses_storage_without_stale_bytes() {
+        let pool = super::DirectoryEntryBufferPool::default();
+        let mut buffer = pool.take(4096);
+        assert!(
+            buffer
+                .push(
+                    std::ptr::null_mut(),
+                    std::ffi::OsStr::new("old"),
+                    &super::minimal_dir_stat(1),
+                    1
+                )
+                .unwrap()
+        );
+        let words = buffer.words.as_ptr();
+        let scratch = buffer.scratch_name.as_ptr();
+        pool.put(buffer);
+        let mut buffer = pool.take(32);
+        assert_eq!(buffer.words.as_ptr(), words);
+        assert_eq!(buffer.scratch_name.as_ptr(), scratch);
+        assert!(buffer.as_slice().is_empty());
+        assert!(buffer.scratch_name.is_empty());
+        assert!(
+            buffer
+                .push(
+                    std::ptr::null_mut(),
+                    std::ffi::OsStr::new("x"),
+                    &super::minimal_dir_stat(1),
+                    9
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            decode_directory_reply(&buffer),
+            vec![(b"x".to_vec(), 9, u32::from(libc::DT_DIR))]
+        );
+        assert!(
+            !buffer
+                .push(
+                    std::ptr::null_mut(),
+                    std::ffi::OsStr::new("y"),
+                    &super::minimal_dir_stat(1),
+                    10
+                )
+                .unwrap()
+        );
+        pool.put(buffer);
+        let mut buffer = pool.take(31);
+        assert!(
+            !buffer
+                .push(
+                    std::ptr::null_mut(),
+                    std::ffi::OsStr::new("x"),
+                    &super::minimal_dir_stat(1),
+                    9
+                )
+                .unwrap()
+        );
+        assert!(
+            buffer.as_slice().is_empty(),
+            "allocated capacity must not override requested size"
+        );
+        pool.put(buffer);
+        let mut buffer = pool.take(8192);
+        assert!(buffer.words.capacity() * 8 >= 8192);
+        assert_eq!(
+            buffer.push(
+                std::ptr::null_mut(),
+                std::ffi::OsStr::from_bytes(b"bad\0name"),
+                &super::minimal_dir_stat(1),
+                1
+            ),
+            Err(libc::EINVAL)
+        );
+        let words = buffer.words.as_ptr();
+        pool.put(buffer);
+        assert_eq!(
+            pool.take(4096).words.as_ptr(),
+            words,
+            "errors must not prevent reuse"
+        );
+    }
+
+    #[test]
+    fn directory_buffer_pool_reuses_storage_grown_to_retention_limit() {
+        let pool = super::DirectoryEntryBufferPool::default();
+        pool.put(pool.take(96 * 1024));
+        let buffer = pool.take(super::MAX_DIRECTORY_BUFFER_CAPACITY);
+        assert!(buffer.words.capacity() * 8 >= super::MAX_DIRECTORY_BUFFER_CAPACITY);
+        let words = buffer.words.as_ptr();
+        pool.put(buffer);
+        assert_eq!(pool.buffers.lock().unwrap().len(), 1);
+        assert_eq!(
+            pool.take(super::MAX_DIRECTORY_BUFFER_CAPACITY)
+                .words
+                .as_ptr(),
+            words,
+            "storage grown to the limit must be recycled"
+        );
+    }
+
+    #[test]
+    fn directory_buffer_pool_bounds_count_and_retained_capacities() {
+        let pool = super::DirectoryEntryBufferPool::default();
+        let buffers = (0..super::MAX_DIRECTORY_BUFFERS + 3)
+            .map(|_| pool.take(4096))
+            .collect::<Vec<_>>();
+        for buffer in buffers {
+            pool.put(buffer);
+        }
+        assert_eq!(
+            pool.buffers.lock().unwrap().len(),
+            super::MAX_DIRECTORY_BUFFERS
+        );
+        let _held = (0..super::MAX_DIRECTORY_BUFFERS)
+            .map(|_| pool.take(4096))
+            .collect::<Vec<_>>();
+        pool.put(pool.take(super::MAX_DIRECTORY_BUFFER_CAPACITY + 1));
+        assert!(
+            pool.buffers.lock().unwrap().is_empty(),
+            "oversized reply storage must be discarded"
+        );
+        let mut buffer = pool.take(64);
+        let name = vec![b'x'; super::MAX_DIRECTORY_SCRATCH_CAPACITY + 1];
+        assert!(
+            !buffer
+                .push(
+                    std::ptr::null_mut(),
+                    std::ffi::OsStr::from_bytes(&name),
+                    &super::minimal_dir_stat(1),
+                    1
+                )
+                .unwrap()
+        );
+        pool.put(buffer);
+        assert!(
+            pool.buffers.lock().unwrap().is_empty(),
+            "oversized scratch storage must be discarded"
+        );
+    }
+
+    #[test]
+    fn directory_open_does_not_materialize_unused_entries() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-dir-lazy")
+            .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        fixture.vfs().create(1, b"child", 0, 0, 0o644).unwrap();
+        let handle = state.open_dir(1).unwrap();
+        // SAFETY: this test exclusively owns the handle returned by open_dir.
+        let handle = unsafe { Box::from_raw(handle.as_ptr()) };
+        assert!(
+            handle.entries.lock().unwrap().is_none(),
+            "an unused handle must not enumerate"
+        );
+    }
+
+    #[test]
+    fn directory_large_snapshot_retains_only_dirent_fields() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-dir-compact")
+            .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let dir = fixture.vfs().mkdir(1, b"large", 0, 0, 0o755).unwrap();
+        for index in 0..1024 {
+            fixture
+                .vfs()
+                .create(dir.ino, format!("file-{index:04}").as_bytes(), 0, 0, 0o644)
+                .unwrap();
+        }
+        let handle = state.open_dir(dir.ino).unwrap();
+        let mut reply = state.directory_buffers.take(4096);
+        state
+            .readdir(std::ptr::null_mut(), dir.ino, handle, 2, &mut reply)
+            .unwrap();
+        assert!(!reply.as_slice().is_empty());
+        // SAFETY: this test exclusively owns the handle returned by open_dir.
+        let handle = unsafe { Box::from_raw(handle.as_ptr()) };
+        let snapshot = handle.entries.lock().unwrap();
+        let entries = snapshot.as_deref().unwrap();
+        assert_eq!(entries.len(), 1024);
+        let names: usize = entries.iter().map(|entry| entry.name.capacity()).sum();
+        let retained = crate::directory_cache::snapshot_byte_size(entries);
+        let previous =
+            entries.len() * std::mem::size_of::<studiofs_vfs::DirEntryWithAttr>() + names;
+        eprintln!("directory retained bytes: {retained}; old snapshot bytes: {previous}");
+        assert!(
+            retained * 3 < previous,
+            "retain less than one third of the old snapshot"
+        );
+    }
 
     #[test]
     fn directory_entry_buffer_encodes_once_per_entry() {
