@@ -446,7 +446,12 @@ fn create_published_small_file(
 pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
-    let local = Arc::new(RedbMetaEngine::open(&path).expect("open local redb"));
+    // The periodic durability worker takes the redb write lock and would make try-lock based
+    // background pruning report "busy" nondeterministically.
+    let local = Arc::new(RedbMetaEngine::open_relaxed_with_interval_for_test(
+        &path,
+        Duration::from_secs(3600),
+    ));
     local.init_root(0, 0).expect("init root");
     local
         .set_format_info(&format_info(
