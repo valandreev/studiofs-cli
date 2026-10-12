@@ -356,6 +356,23 @@ owns size, alignment, and encoding; StudioFS does not duplicate the dirent ABI.
 An entry that does not fit ends the reply and is returned first by the next
 `readdir`. Names with embedded NUL bytes are rejected with `EINVAL`.
 
+Directory handles capture a compact immutable snapshot of names, inode numbers,
+and file types on the first read that reaches child entries. Opening a directory
+or filling a reply with only `.` and `..` does not enumerate its children.
+Chunked reads and backward seeks keep the same offsets after namespace mutations; a new handle
+captures the current names on its first child read. Full child attributes are
+not retained because ordinary libfuse dirents use only inode and file type.
+The snapshot still retains O(N) names once used, rather than paging metadata.
+A 1024-entry fixture with nine-byte names retains 50,176 entry/name bytes,
+compared with 156,672 for the previous attribute-bearing snapshot (68% less);
+these are allocation-layout measurements, not mounted RSS measurements.
+
+Reply storage is pooled per session after each synchronous reply, including
+error replies. The pool retains at most 16 buffers, each with at most 128 KiB of
+aligned reply storage and 4 KiB of scratch-name storage. Larger requests still
+work, but their buffers are discarded after use. A reused buffer honours the
+current requested size and exposes only bytes initialized for that reply.
+
 Current Linux callbacks:
 
 | libfuse3 Callback | VFS Method |
@@ -382,7 +399,7 @@ Current Linux callbacks:
 | `statfs` | `statfs()` |
 | `access(2)` | Native kernel permission check (`default_permissions`); no userspace access callback |
 | `opendir` | `getattr()` directory check |
-| `readdir` | `readdir_with_attrs()` |
+| `readdir` | lazy per-handle `readdir()` snapshot |
 | `releasedir` | success reply |
 | `getxattr` | `get_xattr()`; missing attributes return `ENODATA` |
 | `setxattr` | `set_xattr()` |
