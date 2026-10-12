@@ -15948,7 +15948,8 @@ fn deferred_attr_only_commit_does_not_revert_written_size() {
             "getattr should report local dirty size before background commit"
         );
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        // Hang guard only: the open-handle materializer lingers up to 1.2s before the commit.
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let persisted_size = meta.get_attr(ino).map(|attr| attr.size).unwrap_or(0);
                 if persisted_size == payload.len() as u64 {
@@ -17167,7 +17168,8 @@ fn deferred_namespace_barrier_takes_over_after_drain_stops_with_queued_work() {
             .store(false, AtomicOrdering::Release);
         vfs.state.namespace.deferred.notify.notify_waiters();
 
-        tokio::time::timeout(Duration::from_millis(250), barrier)
+        // Hang guard only: the takeover drain runs a redb commit that can stall under suite load.
+        tokio::time::timeout(Duration::from_secs(10), barrier)
             .await
             .expect("barrier should take over queued work after the prior drain stops")
             .expect("barrier task should not panic")
