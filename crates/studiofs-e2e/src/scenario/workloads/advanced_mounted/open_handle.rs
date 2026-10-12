@@ -35,9 +35,25 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
             .map_err(scenario_error_to_io)
         },
     ))?);
+    // Peers must see client-a's create before writing; otherwise a lagging peer
+    // creates its own isolation root and loses the deferred namespace conflict.
     operations.push(required_op(
         started,
         2,
+        &clients[0],
+        "client_a_peer_visible",
+        &path,
+        wait_for_mounted_initial_payloads_until(
+            clients,
+            &[(path.as_str(), client_a_payload.as_slice())],
+            Instant::now() + LWW_RECONNECT_CONVERGENCE_TIMEOUT,
+            MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+            "lww reconnect client-a",
+        ),
+    )?);
+    operations.push(required_op(
+        started,
+        3,
         &clients[2],
         "stale_writer_offline",
         clients[2].name.as_str(),
@@ -48,7 +64,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     let client_b_payload = isolation.payload("write_client_b", &path, "version from client-b\n");
     operations.push(required_record(fs_op(
         started,
-        3,
+        4,
         &clients[1],
         "write",
         &path,
@@ -64,7 +80,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     ))?);
     operations.push(required_op(
         started,
-        4,
+        5,
         &clients[0],
         "client_b_peer_visible",
         &path,
@@ -79,7 +95,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     let client_d_payload = isolation.payload("write_client_d", &path, "version from client-d\n");
     operations.push(required_record(fs_op(
         started,
-        5,
+        6,
         &clients[3],
         "write",
         &path,
@@ -95,7 +111,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     ))?);
     operations.push(required_op(
         started,
-        6,
+        7,
         &clients[0],
         "client_d_peer_visible",
         &path,
@@ -109,7 +125,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     )?);
     operations.push(required_op(
         started,
-        7,
+        8,
         &clients[2],
         "stale_writer_reconnect",
         clients[2].name.as_str(),
@@ -119,7 +135,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     )?);
     operations.push(required_op(
         started,
-        8,
+        9,
         &clients[2],
         "reconnected_client_c_catches_up",
         &path,
@@ -138,7 +154,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     );
     operations.push(required_record(fs_op(
         started,
-        9,
+        10,
         &clients[2],
         "write_lww_winner",
         &path,
@@ -154,7 +170,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     ))?);
     operations.push(required_op(
         started,
-        10,
+        11,
         &clients[2],
         "winner_peer_visible",
         &path,
@@ -168,7 +184,7 @@ pub(in crate::scenario) fn run_lww_reconnect_operations(
     )?);
     operations.push(required_op(
         started,
-        11,
+        12,
         &clients[2],
         "winner_crash_restart",
         clients[2].name.as_str(),
