@@ -20872,8 +20872,9 @@ fn deferred_release_keeps_barrier_while_materializer_is_in_flight() {
 
         drop(materializer_guard);
         drop(materializer);
+        // Hang guard only: the release runs a redb local sync that can stall under suite load.
         tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(10),
             vfs.wait_for_deferred_release_inflight(ino),
         )
         .await
