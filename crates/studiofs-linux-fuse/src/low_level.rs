@@ -2458,14 +2458,18 @@ impl SessionState {
             idx = 2;
         }
 
+        // SAFETY: a null buffer queries size only; name and attr are valid, req is ignored.
+        let minimum_entry_size = unsafe {
+            raw::fuse_add_direntry(req, std::ptr::null_mut(), 0, c".".as_ptr(), &dir_attr, 0)
+        };
+        if buffer.capacity.saturating_sub(buffer.len) < minimum_entry_size {
+            return Ok(());
+        }
         // SAFETY: `handle` comes from `opendir` and remains owned by the
         // matching directory handle until `releasedir`.
         let mut snapshot = unsafe { &handle.as_ref().entries }
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if buffer.len == buffer.capacity {
-            return Ok(());
-        }
         // Capture once at first use; namespace changes must not shift existing offsets.
         // shortcut: used handles retain O(N) names, use metadata cursors if this remains too large.
         let entries = match snapshot.as_ref() {
@@ -3018,10 +3022,9 @@ impl DirectoryEntryBufferPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop();
         let mut buffer = buffer.unwrap_or_else(|| DirectoryEntryBuffer::new(capacity));
-        buffer.words.clear();
         buffer
             .words
-            .reserve(capacity.div_ceil(std::mem::size_of::<u64>()));
+            .reserve_exact(capacity.div_ceil(std::mem::size_of::<u64>()));
         buffer.scratch_name.clear();
         buffer.len = 0;
         buffer.capacity = capacity;
@@ -3109,11 +3112,6 @@ impl DirectoryEntryBuffer {
         let new_len = start + required;
         let required_words = new_len.div_ceil(std::mem::size_of::<u64>());
         debug_assert!(required_words <= self.words.capacity());
-        // SAFETY: new_len <= self.capacity, so required_words <= words.capacity().
-        // Elements are MaybeUninit<u64>; only the initialized bytes up to new_len are read.
-        unsafe {
-            self.words.set_len(required_words);
-        }
         self.len = new_len;
         Ok(true)
     }
@@ -3516,6 +3514,7 @@ mod tests {
             (0, 0, Ok(())),
             (2, 0, Ok(())),
             (0, 31, Ok(())),
+            (2, 31, Ok(())),
             (-1, 4096, Err(libc::EINVAL)),
         ] {
             let mut buffer = state.directory_buffers.take(size);
@@ -3526,6 +3525,29 @@ mod tests {
             assert!(buffer.as_slice().is_empty());
             state.directory_buffers.put(buffer);
             assert!(handle.entries.lock().unwrap().is_none());
+        }
+        for (offset, sizes, names) in [
+            (0, 64..96, vec![b".".to_vec(), b"..".to_vec()]),
+            (1, 32..64, vec![b"..".to_vec()]),
+        ] {
+            for size in sizes {
+                let mut buffer = state.directory_buffers.take(size);
+                state
+                    .readdir(std::ptr::null_mut(), 1, raw_handle, offset, &mut buffer)
+                    .unwrap();
+                assert_eq!(
+                    decode_directory_reply(&buffer)
+                        .into_iter()
+                        .map(|entry| entry.0)
+                        .collect::<Vec<_>>(),
+                    names
+                );
+                state.directory_buffers.put(buffer);
+                assert!(
+                    handle.entries.lock().unwrap().is_none(),
+                    "offset {offset}, size {size} must not capture children"
+                );
+            }
         }
     }
 
@@ -3609,6 +3631,24 @@ mod tests {
             pool.take(4096).words.as_ptr(),
             words,
             "errors must not prevent reuse"
+        );
+    }
+
+    #[test]
+    fn directory_buffer_pool_reuses_storage_grown_to_retention_limit() {
+        let pool = super::DirectoryEntryBufferPool::default();
+        pool.put(pool.take(96 * 1024));
+        let buffer = pool.take(super::MAX_DIRECTORY_BUFFER_CAPACITY);
+        assert!(buffer.words.capacity() * 8 >= super::MAX_DIRECTORY_BUFFER_CAPACITY);
+        let words = buffer.words.as_ptr();
+        pool.put(buffer);
+        assert_eq!(pool.buffers.lock().unwrap().len(), 1);
+        assert_eq!(
+            pool.take(super::MAX_DIRECTORY_BUFFER_CAPACITY)
+                .words
+                .as_ptr(),
+            words,
+            "storage grown to the limit must be recycled"
         );
     }
 

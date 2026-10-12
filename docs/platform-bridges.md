@@ -358,7 +358,10 @@ An entry that does not fit ends the reply and is returned first by the next
 
 Directory handles capture a compact immutable snapshot of names, inode numbers,
 and file types on the first read that reaches child entries. Opening a directory
-or filling a reply with only `.` and `..` does not enumerate its children.
+or a reply with too little space for the smallest child dirent does not
+enumerate its children. Before snapshot capture, the bridge queries libfuse
+for that minimum size using a one-byte name; it does not hardcode the ABI.
+A longer actual child name may still fail to fit after capture.
 Chunked reads and backward seeks keep the same offsets after namespace mutations; a new handle
 captures the current names on its first child read. Full child attributes are
 not retained because ordinary libfuse dirents use only inode and file type.
