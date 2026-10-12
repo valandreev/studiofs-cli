@@ -25,10 +25,16 @@ impl Scenario for WorkerConcurrency {
     }
 
     fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
-        let config = context
+        let mut config = context
             .client_controller_config
             .clone()
             .ok_or_else(|| io::Error::other("worker measurement requires real mounted clients"))?;
+        // Direct I/O keeps the warm pass in FUSE callbacks instead of the kernel page cache.
+        config
+            .client_env_overrides
+            .entry("client-b".into())
+            .or_default()
+            .push(("STUDIOFS_LINUX_FUSE_CACHE_POLICY".into(), "direct".into()));
         let mut controller = MultiClientController::new(config, SystemClientProcessExecutor);
         let result = measure(context, &mut controller);
         let cleanup = if matches!(
@@ -105,6 +111,7 @@ fn measure(
     let warm_started = Instant::now();
     let warm_bytes = read_batch(&observer, FILE_COUNT, FILE_BYTES)?;
     let warm_seconds = warm_started.elapsed().as_secs_f64();
+    let observer_process = clients[1].process_id.map(observer_process_stats);
     fs::write(
         context.scenario_dir.join("worker-measurement.json"),
         serde_json::to_vec_pretty(&json!({
@@ -113,9 +120,47 @@ fn measure(
             "warm_bytes": warm_bytes, "warm_seconds": warm_seconds,
             "writer_mount": writer, "observer_mount": observer,
             "observer_cache": clients[1].cache_dir,
+            "observer_cache_policy": "direct",
+            "available_parallelism": thread::available_parallelism().map(|count| count.get()).ok(),
+            "requested_worker_threads": std::env::var("STUDIOFS_LINUX_FUSE_WORKER_THREADS").ok(),
+            "observer_process": observer_process,
         }))?,
     )?;
     Ok(())
+}
+
+/// Kernel-tracked peak RSS and retained libfuse worker threads; `null` fields when unreadable.
+fn observer_process_stats(pid: u32) -> serde_json::Value {
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    let status = fs::read_to_string(proc_dir.join("status")).unwrap_or_default();
+    let kib = |field: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(field))
+            .and_then(|value| {
+                value
+                    .trim()
+                    .trim_end_matches("kB")
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+    };
+    let fuse_workers = fs::read_dir(proc_dir.join("task")).ok().map(|tasks| {
+        tasks
+            .filter_map(Result::ok)
+            .filter(|task| {
+                fs::read_to_string(task.path().join("comm"))
+                    .is_ok_and(|comm| comm.trim() == "fuse_worker")
+            })
+            .count()
+    });
+    json!({
+        "pid": pid,
+        "peak_rss_kib": kib("VmHWM:"),
+        "rss_kib": kib("VmRSS:"),
+        "fuse_workers": fuse_workers,
+    })
 }
 
 fn wait_for_publication(observer: &Path, timeout: Duration) -> Result<(), ScenarioError> {
@@ -234,6 +279,15 @@ fn read_worker(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observer_process_stats_reads_kernel_peak_rss() {
+        let stats = super::observer_process_stats(std::process::id());
+        assert!(stats["peak_rss_kib"].as_u64().is_some_and(|kib| kib > 0));
+        assert!(stats["peak_rss_kib"].as_u64() >= stats["rss_kib"].as_u64());
+        assert_eq!(stats["fuse_workers"].as_u64(), Some(0));
+        assert!(super::observer_process_stats(u32::MAX)["peak_rss_kib"].is_null());
+    }
+
     #[test]
     fn concurrent_read_batch_validates_every_file() {
         let root = studiofs_test_support::workspace_target_tempdir("worker-read-batch");

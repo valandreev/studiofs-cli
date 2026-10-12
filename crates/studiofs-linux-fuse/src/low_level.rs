@@ -5149,7 +5149,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_thread_count_uses_queue_bound_without_cpu_count() {
+    fn loop_thread_count_caps_default_at_small_queue() {
         let config = super::LinuxFuseConnectionConfig {
             max_background: 16,
             congestion_threshold: 12,

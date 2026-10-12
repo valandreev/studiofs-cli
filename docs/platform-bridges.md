@@ -506,7 +506,9 @@ apply backpressure instead of growing unbounded request memory. The Linux
 bridge request can override those queue bounds before mounting. StudioFS uses
 the libfuse3 `fuse_loop_config` multithreaded loop API:
 libfuse 3.12+ builds use the opaque config setters with `clone_fd=0` and a
-worker-pool limit of `min(max_background, 16)` independent of CPU count.
+worker-pool limit of `min(max(16, 2 * available_parallelism), max_background, 128)`.
+The 16-worker floor keeps small hosts from serializing blocking I/O callbacks;
+larger hosts keep the previous `2 * available_parallelism` count.
 Set `STUDIOFS_LINUX_FUSE_WORKER_THREADS` to a positive integer and remount
 to override it; bridge callers can set `LinuxFuseConnectionConfig.worker_threads`,
 which takes precedence over the environment. Overrides are capped by
@@ -514,7 +516,9 @@ which takes precedence over the environment. Overrides are capped by
 values fail before mounting. Workers grow on demand; idle workers remain
 available for later bursts. Startup tracing records requested/selected workers,
 queue bounds, and `hard_worker_limit`; the connection-init event also records
-effective queue and congestion values.
+effective queue and congestion values. "Effective" is the value libfuse sends
+in the init reply; the kernel may still lower it for unprivileged mounts
+(`max_user_bgreq`), which userspace cannot observe.
 
 Older supported 3.x headers keep the public pre-3.12 `struct fuse_loop_config`
 fallback with `clone_fd=0` and the previous CPU-based idle retention

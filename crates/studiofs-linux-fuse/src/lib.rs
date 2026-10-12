@@ -25,7 +25,7 @@ pub struct LinuxFuseConnectionConfig {
     pub max_background: u32,
     /// Kernel congestion threshold for applying request backpressure.
     pub congestion_threshold: u32,
-    /// Requested callback workers; `None` uses the queue-derived modern default.
+    /// Requested callback workers; `None` uses `max(16, 2 * CPUs)` on libfuse 3.12+.
     /// Positive values are capped at `max_background` and 128 workers.
     /// Explicit overrides require libfuse 3.12+; older builds keep CPU-based idle retention.
     pub worker_threads: Option<u32>,
@@ -71,18 +71,26 @@ impl LinuxFuseConnectionConfig {
     }
 
     pub(crate) fn worker_thread_count(self, hard_worker_limit: bool) -> u32 {
+        let parallelism = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1);
+        self.worker_thread_count_for_parallelism(hard_worker_limit, parallelism)
+    }
+
+    fn worker_thread_count_for_parallelism(
+        self,
+        hard_worker_limit: bool,
+        parallelism: usize,
+    ) -> u32 {
+        let cpu_workers = u32::try_from(parallelism)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(2);
         if !hard_worker_limit {
-            let parallelism = std::thread::available_parallelism()
-                .map(|count| count.get())
-                .unwrap_or(1);
-            return u32::try_from(parallelism)
-                .unwrap_or(u32::MAX)
-                .saturating_mul(2)
-                .clamp(1, self.max_background.max(1));
+            return cpu_workers.clamp(1, self.max_background.max(1));
         }
-        // More workers increased retained read-buffer RSS in the mounted 64-reader A/B gate.
+        // Small hosts get a 16-worker floor for blocking I/O; large hosts keep the old 2x CPU count.
         self.worker_threads
-            .unwrap_or(16)
+            .unwrap_or(cpu_workers.max(16))
             .clamp(1, self.max_background.clamp(1, 128))
     }
 }
@@ -102,6 +110,17 @@ fn parse_worker_threads(value: Option<std::ffi::OsString>) -> io::Result<Option<
                 })
         })
         .transpose()
+}
+
+/// A request-level worker count takes precedence over the environment override.
+fn resolve_worker_threads(
+    mut config: LinuxFuseConnectionConfig,
+    env_value: Option<std::ffi::OsString>,
+) -> io::Result<LinuxFuseConnectionConfig> {
+    if config.worker_threads.is_none() {
+        config.worker_threads = parse_worker_threads(env_value)?;
+    }
+    Ok(config)
 }
 
 /// Request used by the CLI backend router to launch the Linux libfuse3 bridge.
@@ -163,12 +182,11 @@ pub fn mount_with_request(request: LinuxFuseMountRequest) -> io::Result<()> {
         connection_config,
         mount_ready_callback,
     } = request;
-    let mut connection_config = connection_config;
-    if connection_config.worker_threads.is_none() {
-        connection_config.worker_threads =
-            parse_worker_threads(std::env::var_os("STUDIOFS_LINUX_FUSE_WORKER_THREADS"))?;
-    }
-    let connection_config = connection_config.validate(low_level::has_worker_limit())?;
+    let connection_config = resolve_worker_threads(
+        connection_config,
+        std::env::var_os("STUDIOFS_LINUX_FUSE_WORKER_THREADS"),
+    )?
+    .validate(low_level::has_worker_limit())?;
     let mut session = low_level::Session::mount(
         low_level::SessionState::new(vfs, runtime_handle, read_only, connection_config),
         mount_point,
@@ -319,11 +337,41 @@ mod tests {
     }
 
     #[test]
-    fn modern_default_worker_count_stays_bounded_for_large_queues() {
-        let config = super::LinuxFuseConnectionConfig {
+    fn modern_default_worker_count_uses_floor_or_cpu_surplus_within_queue() {
+        let config = super::LinuxFuseConnectionConfig::default();
+        for (parallelism, expected) in [(1, 16), (4, 16), (8, 16), (32, 64), (64, 128), (512, 128)]
+        {
+            assert_eq!(
+                config.worker_thread_count_for_parallelism(true, parallelism),
+                expected,
+                "parallelism {parallelism}"
+            );
+        }
+        let large_queue = super::LinuxFuseConnectionConfig {
             max_background: 1024,
             ..Default::default()
         };
-        assert_eq!(config.worker_thread_count(true), 16);
+        assert_eq!(
+            large_queue.worker_thread_count_for_parallelism(true, 512),
+            128
+        );
+    }
+
+    #[test]
+    fn request_worker_threads_take_precedence_over_environment() {
+        let request = super::LinuxFuseConnectionConfig {
+            worker_threads: Some(24),
+            ..Default::default()
+        };
+        let resolved =
+            super::resolve_worker_threads(request, Some(std::ffi::OsString::from("48"))).unwrap();
+        assert_eq!(resolved.worker_threads, Some(24));
+
+        let resolved = super::resolve_worker_threads(
+            super::LinuxFuseConnectionConfig::default(),
+            Some(std::ffi::OsString::from("48")),
+        )
+        .unwrap();
+        assert_eq!(resolved.worker_threads, Some(48));
     }
 }
