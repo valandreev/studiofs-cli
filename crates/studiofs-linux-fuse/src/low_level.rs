@@ -57,6 +57,32 @@ const FUSE_SET_ATTR_MTIME_NOW: c_int = 1 << 8;
 pub(crate) mod raw {
     use super::*;
 
+    #[cfg(not(test))]
+    pub(crate) use libfuse_add_direntry as fuse_add_direntry;
+
+    #[cfg(test)]
+    thread_local! {
+        pub(crate) static DIRENTRY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// # Safety
+    /// `name` must be a readable NUL-terminated string and `stbuf` a valid stat.
+    /// A non-null `buf` must be aligned for a FUSE dirent and writable for `bufsize`
+    /// bytes without aliasing the inputs. Null requests are supported: libfuse ignores `req`.
+    #[cfg(test)]
+    pub(crate) unsafe fn fuse_add_direntry(
+        req: *mut FuseReq,
+        buf: *mut c_char,
+        bufsize: size_t,
+        name: *const c_char,
+        stbuf: *const stat,
+        off: off_t,
+    ) -> size_t {
+        DIRENTRY_CALLS.with(|calls| calls.set(calls.get() + 1));
+        // SAFETY: the caller supplies the same pointers and capacity as the libfuse API.
+        unsafe { libfuse_add_direntry(req, buf, bufsize, name, stbuf, off) }
+    }
+
     pub(crate) type FuseIno = u64;
 
     pub(crate) enum FuseReq {}
@@ -105,7 +131,8 @@ pub(crate) mod raw {
         pub(crate) fn fuse_reply_write(req: *mut FuseReq, count: size_t) -> c_int;
         pub(crate) fn fuse_reply_statfs(req: *mut FuseReq, stat: *const statvfs) -> c_int;
         pub(crate) fn fuse_req_userdata(req: *mut FuseReq) -> *mut c_void;
-        pub(crate) fn fuse_add_direntry(
+        #[link_name = "fuse_add_direntry"]
+        pub(crate) fn libfuse_add_direntry(
             req: *mut FuseReq,
             buf: *mut c_char,
             bufsize: size_t,
@@ -3001,16 +3028,26 @@ impl DirectoryEntryBuffer {
         if name_bytes.contains(&0) {
             return Err(libc::EINVAL);
         }
+        let available = self.capacity.saturating_sub(self.len);
+        if available == 0 {
+            return Ok(false);
+        }
         self.scratch_name.clear();
         self.scratch_name.extend_from_slice(name_bytes);
         self.scratch_name.push(0);
-        let available = self.capacity.saturating_sub(self.len);
-        // SAFETY: null buffer asks libfuse for required size; pointers stay valid.
+        let start = self.len;
+        // SAFETY: words has `available` writable bytes at `start`, aligned for libfuse.
+        // The name is NUL-terminated, attr is valid, and libfuse ignores req.
+        // Libfuse writes only if the entry fits, initializing the entry and padding.
         let required = unsafe {
             raw::fuse_add_direntry(
                 req,
-                std::ptr::null_mut(),
-                0,
+                self.words
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(start)
+                    .cast::<c_char>(),
+                available,
                 self.scratch_name.as_ptr().cast::<c_char>(),
                 attr,
                 next_offset,
@@ -3020,26 +3057,15 @@ impl DirectoryEntryBuffer {
             return Ok(false);
         }
 
-        let start = self.len;
         let new_len = start + required;
         let required_words = new_len.div_ceil(std::mem::size_of::<u64>());
-        // SAFETY: capacity check above ensures `required` bytes of spare room.
+        debug_assert!(required_words <= self.words.capacity());
+        // SAFETY: new_len <= self.capacity, so required_words <= words.capacity().
+        // Elements are MaybeUninit<u64>; only the initialized bytes up to new_len are read.
         unsafe {
-            raw::fuse_add_direntry(
-                req,
-                self.words
-                    .as_mut_ptr()
-                    .cast::<u8>()
-                    .add(start)
-                    .cast::<c_char>(),
-                required,
-                self.scratch_name.as_ptr().cast::<c_char>(),
-                attr,
-                next_offset,
-            );
             self.words.set_len(required_words);
-            self.len = new_len;
         }
+        self.len = new_len;
         Ok(true)
     }
 }
@@ -3306,6 +3332,138 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use studiofs_meta::MetaInodes;
+
+    #[test]
+    fn directory_entry_buffer_encodes_once_per_entry() {
+        let mut buffer = super::DirectoryEntryBuffer::new(4096);
+        let attr = super::minimal_dir_stat(42);
+        super::raw::DIRENTRY_CALLS.with(|calls| calls.set(0));
+        for (index, name) in [".", "..", "file"].into_iter().enumerate() {
+            assert!(
+                buffer
+                    .push(
+                        std::ptr::null_mut(),
+                        std::ffi::OsStr::new(name),
+                        &attr,
+                        (index + 1) as libc::off_t
+                    )
+                    .unwrap()
+            );
+        }
+        super::raw::DIRENTRY_CALLS.with(|calls| {
+            assert_eq!(
+                calls.get(),
+                3,
+                "each entry must cross the libfuse boundary once"
+            );
+        });
+    }
+
+    #[test]
+    fn directory_entry_buffer_matches_libfuse_at_capacity_boundaries() {
+        let attr = super::minimal_dir_stat(42);
+        for name_len in [
+            0, 1, 2, 7, 8, 9, 15, 16, 17, 63, 64, 65, 254, 255, 256, 4096,
+        ] {
+            let name = vec![0xff; name_len];
+            let c_name = std::ffi::CString::new(name.clone()).unwrap();
+            // SAFETY: libfuse ignores req; a null buffer queries size without writing.
+            let required = unsafe {
+                super::raw::libfuse_add_direntry(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    c_name.as_ptr(),
+                    &attr,
+                    7,
+                )
+            };
+            let mut expected = vec![0u64; required.div_ceil(8)];
+            // SAFETY: expected is aligned and has at least required writable bytes.
+            unsafe {
+                super::raw::libfuse_add_direntry(
+                    std::ptr::null_mut(),
+                    expected.as_mut_ptr().cast(),
+                    required,
+                    c_name.as_ptr(),
+                    &attr,
+                    7,
+                );
+            }
+            // SAFETY: libfuse initialized required bytes above.
+            let expected =
+                unsafe { std::slice::from_raw_parts(expected.as_ptr().cast::<u8>(), required) };
+            for capacity in [0, required - 1, required, required + 1, required * 2] {
+                let mut buffer = super::DirectoryEntryBuffer::new(capacity);
+                super::raw::DIRENTRY_CALLS.with(|calls| calls.set(0));
+                let accepted = buffer
+                    .push(
+                        std::ptr::null_mut(),
+                        std::ffi::OsStr::from_bytes(&name),
+                        &attr,
+                        7,
+                    )
+                    .unwrap();
+                super::raw::DIRENTRY_CALLS.with(|calls| {
+                    assert_eq!(calls.get(), usize::from(capacity != 0));
+                });
+                if capacity == 0 {
+                    assert!(buffer.scratch_name.is_empty());
+                }
+                assert_eq!(
+                    accepted,
+                    capacity >= required,
+                    "name length {name_len}, capacity {capacity}"
+                );
+                assert_eq!(buffer.as_slice(), if accepted { expected } else { &[] });
+                if accepted {
+                    let before = buffer.as_slice().to_vec();
+                    super::raw::DIRENTRY_CALLS.with(|calls| calls.set(0));
+                    let accepted_again = buffer
+                        .push(
+                            std::ptr::null_mut(),
+                            std::ffi::OsStr::from_bytes(&name),
+                            &attr,
+                            7,
+                        )
+                        .unwrap();
+                    super::raw::DIRENTRY_CALLS.with(|calls| {
+                        assert_eq!(calls.get(), usize::from(capacity != required));
+                    });
+                    assert_eq!(accepted_again, capacity >= required * 2);
+                    if accepted_again {
+                        assert_eq!(buffer.as_slice(), [before.as_slice(), expected].concat());
+                    } else {
+                        assert_eq!(
+                            buffer.as_slice(),
+                            before,
+                            "a rejected entry must preserve prior entries"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn directory_entry_buffer_rejects_nul_without_calling_libfuse() {
+        let attr = super::minimal_dir_stat(42);
+        super::raw::DIRENTRY_CALLS.with(|calls| calls.set(0));
+        for capacity in [0, 4096] {
+            let mut buffer = super::DirectoryEntryBuffer::new(capacity);
+            assert_eq!(
+                buffer.push(
+                    std::ptr::null_mut(),
+                    std::ffi::OsStr::from_bytes(b"bad\0name"),
+                    &attr,
+                    1
+                ),
+                Err(libc::EINVAL)
+            );
+            assert!(buffer.as_slice().is_empty());
+        }
+        super::raw::DIRENTRY_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+    }
 
     struct UnmountGuard(Option<std::path::PathBuf>);
 

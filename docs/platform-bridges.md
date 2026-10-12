@@ -349,6 +349,13 @@ Linux mount starts through a thin libfuse3 low-level bridge. The bridge uses
 the system libfuse3 development/runtime packages and `fusermount3`; StudioFS
 does not vendor, bundle, or build libfuse3.
 
+Linux directory replies call `fuse_add_direntry` once per entry with the remaining
+buffer capacity. Its [public contract](https://libfuse.github.io/doxygen/fuse__lowlevel_8h.html)
+returns the required size without writing when the entry does not fit. Libfuse
+owns size, alignment, and encoding; StudioFS does not duplicate the dirent ABI.
+With no remaining capacity, StudioFS rejects the entry without copying its name
+or calling libfuse, while still rejecting embedded NUL bytes with `EINVAL`.
+
 Current Linux callbacks:
 
 | libfuse3 Callback | VFS Method |
