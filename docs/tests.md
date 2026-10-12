@@ -699,6 +699,23 @@ Hosted Linux real mounted E2E is operator-run once the target host has
 See the SFS-610 Linux Platform Release Gate in
 [docs/local-first-validation-matrix.md](local-first-validation-matrix.md#sfs-610-linux-platform-release-gate).
 
+The opt-in `mounted-worker-concurrency` scenario writes 128 distinct 256 KiB
+files, waits for their published sizes on a separate observer using metadata
+only, then checks every byte with 64 concurrent readers. It records isolated
+cold and warm read times in `worker-measurement.json`; setup and cleanup time
+are excluded. Use separate retained runs for each worker setting, keep build
+and other workloads idle during measurement, and record product RSS and actual
+`fuse_worker` counts. For high-latency comparisons, route the isolated test S3
+endpoint through a latency proxy and record the injected latency and observed
+GET count. This scenario does not simulate latency itself or prove full mounted
+scenario acceptance. Explicit worker overrides require libfuse 3.12+.
+
+```bash
+cargo build -p studiofs -p studiofs-e2e
+STUDIOFS_LINUX_FUSE_WORKER_THREADS=16 target/debug/studiofs-e2e run --scenario mounted-worker-concurrency --studiofs-bin target/debug/studiofs --run-id worker-16 --seed 789 --retain always --timeout 180s
+STUDIOFS_LINUX_FUSE_WORKER_THREADS=32 target/debug/studiofs-e2e run --scenario mounted-worker-concurrency --studiofs-bin target/debug/studiofs --run-id worker-32 --seed 789 --retain always --timeout 180s
+```
+
 ```powershell
 rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
 rwx run .rwx/e2e.yml --target e2e-full --wait --open

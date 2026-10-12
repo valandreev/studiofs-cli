@@ -506,10 +506,24 @@ apply backpressure instead of growing unbounded request memory. The Linux
 bridge request can override those queue bounds before mounting. StudioFS uses
 the libfuse3 `fuse_loop_config` multithreaded loop API:
 libfuse 3.12+ builds use the opaque config setters with `clone_fd=0` and an
-adaptive worker-pool limit based on available CPU parallelism, capped by the
-configured `max_background` queue. Older supported 3.x headers use the public
-pre-3.12 `struct fuse_loop_config` fallback with the same `clone_fd=0` and
-adaptive `max_idle_threads` cap.
+worker-pool limit of `min(max_background, 16)` independent of CPU count.
+Set `STUDIOFS_LINUX_FUSE_WORKER_THREADS` to a positive integer and remount
+to override it; bridge callers can set `LinuxFuseConnectionConfig.worker_threads`,
+which takes precedence over the environment. Overrides are capped by
+`max_background` and an absolute ceiling of 128 workers. Invalid environment
+values fail before mounting. Workers grow on demand; idle workers remain
+available for later bursts. Startup tracing records requested/selected workers,
+queue bounds, and `hard_worker_limit`; the connection-init event also records
+effective queue and congestion values.
+
+Older supported 3.x headers keep the public pre-3.12 `struct fuse_loop_config`
+fallback with `clone_fd=0` and the previous CPU-based idle retention
+(`min(2 * available_parallelism, max_background)`). That API bounds idle
+retention, **not active concurrency**. Explicit worker overrides fail before
+mounting with an unsupported error on those builds; the startup diagnostic
+reports `hard_worker_limit=false` for the default. Use libfuse 3.12+ for an
+enforced callback-worker cap. The kernel background queue remains configured
+on both paths.
 
 First validated target: Ubuntu 24.04+. Required release target: Rocky Linux
 9.4+ (system `fuse3-devel` is currently 3.10.x, so it uses the pre-3.12

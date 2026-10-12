@@ -217,6 +217,14 @@ int studiofs_linux_fuse_session_loop_mt(struct fuse_session *session,
 #endif
 }
 
+int studiofs_linux_fuse_loop_has_worker_limit(void) {
+#if FUSE_USE_VERSION >= FUSE_MAKE_VERSION(3, 12)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 int studiofs_linux_fuse_notify_inval_inode(struct fuse_session *session,
                                            uint64_t ino,
                                            off_t offset,
