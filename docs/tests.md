@@ -703,8 +703,11 @@ The opt-in `mounted-worker-concurrency` scenario writes 128 distinct 256 KiB
 files, waits for their published sizes on a separate observer using metadata
 only, then checks every byte with 64 concurrent readers. It records isolated
 cold and warm read times in `worker-measurement.json`; setup and cleanup time
-are excluded. Use separate retained runs for each worker setting, keep build
-and other workloads idle during measurement, and record product RSS and actual
+are excluded. Each file read runs in a separate bounded I/O thread so a blocked
+mounted syscall can time out; thread creation and joining are included in both
+measured passes. A reader failure stops subsequent reads; in-flight reads retain
+their per-call timeout. Use separate retained runs for each worker setting, keep
+build and other workloads idle during measurement, and record product RSS and actual
 `fuse_worker` counts. For high-latency comparisons, route the isolated test S3
 endpoint through a latency proxy and record the injected latency and observed
 GET count. This scenario does not simulate latency itself or prove full mounted
