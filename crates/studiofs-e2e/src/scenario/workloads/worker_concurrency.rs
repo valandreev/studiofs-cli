@@ -146,6 +146,7 @@ fn observer_process_stats(pid: u32) -> serde_json::Value {
                     .ok()
             })
     };
+    // Best-effort: tasks that exit mid-scan are skipped, so the count can slightly undercount.
     let fuse_workers = fs::read_dir(proc_dir.join("task")).ok().map(|tasks| {
         tasks
             .filter_map(Result::ok)
@@ -280,6 +281,7 @@ fn read_worker(
 #[cfg(test)]
 mod tests {
     #[test]
+    #[cfg(target_os = "linux")]
     fn observer_process_stats_reads_kernel_peak_rss() {
         let stats = super::observer_process_stats(std::process::id());
         assert!(stats["peak_rss_kib"].as_u64().is_some_and(|kib| kib > 0));
