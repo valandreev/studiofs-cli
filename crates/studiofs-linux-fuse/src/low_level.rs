@@ -15,6 +15,7 @@ use crate::cache_policy::{
     LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBuffer, SyncReadBufferPool,
     SystemMemorySampler, decide_open_cache,
 };
+use crate::directory_cache::{DirectorySnapshot, DirectorySnapshotCache};
 use crate::invalidation::{
     FuseInodeLiveness, FuseInvalidationGeometry, FuseInvalidationKind,
     FuseInvalidationMetricsSnapshot, FuseInvalidationQueue, FuseInvalidationReceiptOutcome,
@@ -27,7 +28,7 @@ use studiofs_bridge::fuse_open_reply::FuseOpenReplySerializer;
 use studiofs_bridge::posix::{
     BridgeFileAttr, BridgeFileType, posix_flags_to_open_flags, to_bridge_attr, vfs_err_to_errno,
 };
-use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec};
+use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::vfs::OsCacheParticipation;
 use studiofs_vfs::{
     KernelInvalidator, LocalSyncPolicy, OpenFlags, ReadAheadOwner, StatFs, StudioVfs,
@@ -250,6 +251,7 @@ pub(crate) struct SessionState {
     available_memory: Option<SystemMemorySampler>,
     read_buffers: SyncReadBufferPool,
     directory_buffers: DirectoryEntryBufferPool,
+    directory_snapshots: DirectorySnapshotCache,
     open_reply_serializer: FuseOpenReplySerializer,
     inode_liveness: FuseInodeLiveness,
     open_liveness: [Mutex<HashMap<u64, FuseOpenHandleGuard>>; LIVENESS_SHARDS],
@@ -297,6 +299,7 @@ impl SessionState {
                 .then(SystemMemorySampler::system),
             read_buffers: SyncReadBufferPool::new(),
             directory_buffers: DirectoryEntryBufferPool::default(),
+            directory_snapshots: DirectorySnapshotCache::default(),
             open_reply_serializer: FuseOpenReplySerializer::new(),
             inode_liveness: FuseInodeLiveness::default(),
             open_liveness: std::array::from_fn(|_| Mutex::new(HashMap::new())),
@@ -2445,7 +2448,14 @@ impl SessionState {
     ) -> Result<(), i32> {
         let mut idx = usize::try_from(offset).map_err(|_| libc::EINVAL)?;
         let dir_attr = minimal_dir_stat(ino);
+        // SAFETY: `handle` comes from `opendir` and remains owned by the
+        // matching directory handle until `releasedir`.
+        let entries = unsafe { &handle.as_ref().entries };
         if idx == 0 {
+            // Like WinFSP's marker-less read, a rewind starts a fresh enumeration.
+            *entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             if !buffer.push(req, OsStr::new("."), &dir_attr, 1)? {
                 return Ok(());
             }
@@ -2465,21 +2475,13 @@ impl SessionState {
         if buffer.capacity.saturating_sub(buffer.len) < minimum_entry_size {
             return Ok(());
         }
-        // SAFETY: `handle` comes from `opendir` and remains owned by the
-        // matching directory handle until `releasedir`.
-        let mut snapshot = unsafe { &handle.as_ref().entries }
+        let mut snapshot = entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Capture once at first use; namespace changes must not shift existing offsets.
-        // shortcut: used handles retain O(N) names, use metadata cursors if this remains too large.
+        // Capture once per enumeration; namespace changes must not shift existing offsets.
         let entries = match snapshot.as_ref() {
             Some(entries) => entries,
-            None => snapshot.insert(
-                self.vfs
-                    .readdir(ino)
-                    .map_err(|error| vfs_err_to_errno(&error))?
-                    .into_boxed_slice(),
-            ),
+            None => snapshot.insert(self.directory_snapshot(ino)?),
         };
         for (i, entry) in entries.iter().enumerate().skip(idx.saturating_sub(2)) {
             let entry_idx = i + 2;
@@ -2490,6 +2492,32 @@ impl SessionState {
             }
         }
         Ok(())
+    }
+
+    /// Reuses a session-cached snapshot while the directory observation is unchanged.
+    // shortcut: an uncached capture still holds O(N) names per handle, as WinFSP's
+    // DirBuffer does; use metadata cursors if large directories need bounded memory.
+    fn directory_snapshot(&self, ino: u64) -> Result<DirectorySnapshot, i32> {
+        let observe = || {
+            self.vfs
+                .directory_enumeration_observation(ino)
+                .map_err(|error| vfs_err_to_errno(&error))
+        };
+        let observation = observe()?;
+        if let Some(snapshot) = self.directory_snapshots.lookup(ino, observation) {
+            return Ok(snapshot);
+        }
+        let snapshot = DirectorySnapshot::from(
+            self.vfs
+                .readdir(ino)
+                .map_err(|error| vfs_err_to_errno(&error))?,
+        );
+        // Never cache a build that crossed an invalidation.
+        if observe()? == observation {
+            self.directory_snapshots
+                .insert(ino, observation, Arc::clone(&snapshot));
+        }
+        Ok(snapshot)
     }
 
     fn statfs(&self) -> Result<statvfs, i32> {
@@ -2546,7 +2574,7 @@ impl SessionState {
 }
 
 struct DirectoryHandle {
-    entries: Mutex<Option<Box<[DirEntry]>>>,
+    entries: Mutex<Option<DirectorySnapshot>>,
     _liveness: FuseOpenHandleGuard,
 }
 
@@ -3109,10 +3137,7 @@ impl DirectoryEntryBuffer {
             return Ok(false);
         }
 
-        let new_len = start + required;
-        let required_words = new_len.div_ceil(std::mem::size_of::<u64>());
-        debug_assert!(required_words <= self.words.capacity());
-        self.len = new_len;
+        self.len = start + required;
         Ok(true)
     }
 }
@@ -3463,15 +3488,17 @@ mod tests {
         );
         assert!(read(7, 64).is_empty());
         assert_eq!(
-            read(0, 96),
-            first,
-            "seeking back must replay the original offsets"
-        );
-        assert_eq!(
             read(3, 32),
-            vec![(b"b".to_vec(), 4, u32::from(libc::DT_REG))]
+            vec![(b"b".to_vec(), 4, u32::from(libc::DT_REG))],
+            "seeking back within an enumeration must replay the original offsets"
         );
         assert!(read(i64::MAX, 64).is_empty());
+        assert_eq!(read(0, 96), first);
+        assert_eq!(
+            read(3, 32),
+            vec![(b"aa".to_vec(), 4, u32::from(libc::DT_REG))],
+            "rewinding to offset 0 must start a fresh enumeration, as on WinFSP"
+        );
 
         let fresh = state.open_dir(dir.ino).unwrap();
         let mut buffer = state.directory_buffers.take(4096);
@@ -3494,6 +3521,49 @@ mod tests {
             ]
         );
         drop(handle);
+    }
+
+    #[test]
+    fn directory_snapshot_is_shared_until_namespace_changes() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-dir-shared")
+            .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let dir = fixture.vfs().mkdir(1, b"dir", 0, 0, 0o755).unwrap();
+        fixture.vfs().create(dir.ino, b"a", 0, 0, 0o644).unwrap();
+        let capture = || {
+            let raw = state.open_dir(dir.ino).unwrap();
+            let mut buffer = state.directory_buffers.take(4096);
+            state
+                .readdir(std::ptr::null_mut(), dir.ino, raw, 2, &mut buffer)
+                .unwrap();
+            state.directory_buffers.put(buffer);
+            // SAFETY: this test exclusively owns the handle returned by open_dir.
+            let handle = unsafe { Box::from_raw(raw.as_ptr()) };
+            handle.entries.lock().unwrap().clone().unwrap()
+        };
+        let first = capture();
+        let second = capture();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "an unchanged directory reuses the session snapshot"
+        );
+        fixture.vfs().create(dir.ino, b"b", 0, 0, 0o644).unwrap();
+        let third = capture();
+        assert!(!std::sync::Arc::ptr_eq(&first, &third));
+        assert_eq!(
+            third
+                .iter()
+                .map(|entry| entry.name.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"a".as_slice(), b"b".as_slice()]
+        );
+        assert_eq!(first.len(), 1, "an existing snapshot stays immutable");
+        assert!(std::sync::Arc::ptr_eq(&third, &capture()));
     }
 
     #[test]

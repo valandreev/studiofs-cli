@@ -362,13 +362,26 @@ or a reply with too little space for the smallest child dirent does not
 enumerate its children. Before snapshot capture, the bridge queries libfuse
 for that minimum size using a one-byte name; it does not hardcode the ABI.
 A longer actual child name may still fail to fit after capture.
-Chunked reads and backward seeks keep the same offsets after namespace mutations; a new handle
-captures the current names on its first child read. Full child attributes are
-not retained because ordinary libfuse dirents use only inode and file type.
-The snapshot still retains O(N) names once used, rather than paging metadata.
-A 1024-entry fixture with nine-byte names retains 50,176 entry/name bytes,
-compared with 156,672 for the previous attribute-bearing snapshot (68% less);
-these are allocation-layout measurements, not mounted RSS measurements.
+Chunked reads and backward seeks to a nonzero offset keep the same offsets after
+namespace mutations. A read at offset 0 (the first read, or `rewinddir`) drops
+the handle's snapshot so the next child read observes the current namespace,
+matching WinFSP's marker-less `read_directory`. Because capture happens on first
+child read, `ENOENT` for a directory removed before then is returned by
+`readdir`, not `opendir`.
+
+As on WinFSP, snapshots are shared through a session cache keyed by inode and
+validated by `StudioVfs::directory_enumeration_observation`. The cache keeps at
+most 64 snapshots and 4 MiB of entry/name bytes with LRU eviction, clears on a
+newer namespace epoch, and does not admit a build whose observation changed
+during enumeration. Unlike WinFSP, the Linux key ignores the attribute
+generation because dirents carry only inode and file type. A cache hit skips VFS
+enumeration entirely; an existing handle's snapshot is never replaced.
+Full child attributes are not retained because ordinary libfuse dirents use only
+inode and file type. A captured snapshot still holds O(N) names, like WinFSP's
+per-handle `DirBuffer`, rather than paging metadata. A 1024-entry fixture with
+nine-byte names retains 50,176 entry/name bytes, compared with 156,672 for the
+previous attribute-bearing snapshot (68% less); these are allocation-layout
+measurements, not mounted RSS measurements.
 
 Reply storage is pooled per session after each synchronous reply, including
 error replies. The pool retains at most 16 buffers, each with at most 128 KiB of

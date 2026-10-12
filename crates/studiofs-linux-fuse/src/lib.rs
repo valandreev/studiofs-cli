@@ -14,6 +14,7 @@ use studiofs_vfs::StudioVfs;
 use tokio::runtime::Handle;
 mod async_writes;
 mod cache_policy;
+mod directory_cache;
 mod invalidation;
 mod low_level;
 
