@@ -353,8 +353,8 @@ Linux directory replies call `fuse_add_direntry` once per entry with the remaini
 buffer capacity. Its [public contract](https://libfuse.github.io/doxygen/fuse__lowlevel_8h.html)
 returns the required size without writing when the entry does not fit. Libfuse
 owns size, alignment, and encoding; StudioFS does not duplicate the dirent ABI.
-With no remaining capacity, StudioFS rejects the entry without copying its name
-or calling libfuse, while still rejecting embedded NUL bytes with `EINVAL`.
+An entry that does not fit ends the reply and is returned first by the next
+`readdir`. Names with embedded NUL bytes are rejected with `EINVAL`.
 
 Current Linux callbacks:
 

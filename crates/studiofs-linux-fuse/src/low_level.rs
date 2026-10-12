@@ -60,6 +60,7 @@ pub(crate) mod raw {
     #[cfg(not(test))]
     pub(crate) use libfuse_add_direntry as fuse_add_direntry;
 
+    // Per-thread so parallel libtest threads don't share counts; tests must call `push` on their own thread.
     #[cfg(test)]
     thread_local! {
         pub(crate) static DIRENTRY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
