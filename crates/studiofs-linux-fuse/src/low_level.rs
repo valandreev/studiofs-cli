@@ -15,7 +15,7 @@ use crate::cache_policy::{
     LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBuffer, SyncReadBufferPool,
     SystemMemorySampler, decide_open_cache,
 };
-use crate::directory_cache::{DirectorySnapshot, DirectorySnapshotCache};
+use crate::directory_cache::{DirectorySnapshot, DirectorySnapshotCache, linux_observation};
 use crate::invalidation::{
     FuseInodeLiveness, FuseInvalidationGeometry, FuseInvalidationKind,
     FuseInvalidationMetricsSnapshot, FuseInvalidationQueue, FuseInvalidationReceiptOutcome,
@@ -2513,7 +2513,7 @@ impl SessionState {
                 .map_err(|error| vfs_err_to_errno(&error))?,
         );
         // Never cache a build that crossed an invalidation.
-        if observe()? == observation {
+        if linux_observation(observe()?) == linux_observation(observation) {
             self.directory_snapshots
                 .insert(ino, observation, Arc::clone(&snapshot));
         }
@@ -3076,6 +3076,7 @@ impl DirectoryEntryBufferPool {
 }
 
 struct DirectoryEntryBuffer {
+    // Keep Vec length zero; libfuse initializes bytes tracked by `len` in spare storage.
     words: Vec<MaybeUninit<u64>>,
     len: usize,
     scratch_name: Vec<u8>,
@@ -3552,6 +3553,20 @@ mod tests {
             std::sync::Arc::ptr_eq(&first, &second),
             "an unchanged directory reuses the session snapshot"
         );
+        fixture
+            .vfs()
+            .setattr(
+                first[0].ino,
+                studiofs_meta::SetattrArgs {
+                    mtime: studiofs_meta::TimeSpec::Now,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &capture()),
+            "attribute-only invalidation keeps Linux dirents valid"
+        );
         fixture.vfs().create(dir.ino, b"b", 0, 0, 0o644).unwrap();
         let third = capture();
         assert!(!std::sync::Arc::ptr_eq(&first, &third));
@@ -3811,7 +3826,7 @@ mod tests {
         let entries = snapshot.as_deref().unwrap();
         assert_eq!(entries.len(), 1024);
         let names: usize = entries.iter().map(|entry| entry.name.capacity()).sum();
-        let retained = std::mem::size_of_val(entries) + names;
+        let retained = crate::directory_cache::snapshot_byte_size(entries);
         let previous =
             entries.len() * std::mem::size_of::<studiofs_vfs::DirEntryWithAttr>() + names;
         eprintln!("directory retained bytes: {retained}; old snapshot bytes: {previous}");

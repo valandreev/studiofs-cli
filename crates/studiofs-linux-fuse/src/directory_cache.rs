@@ -13,16 +13,17 @@ const DEFAULT_ENTRY_BUDGET: usize = 64;
 const DEFAULT_BYTE_BUDGET: usize = 4 * 1024 * 1024;
 
 pub(crate) fn snapshot_byte_size(entries: &[DirEntry]) -> usize {
-    entries
-        .iter()
-        .fold(std::mem::size_of_val(entries), |bytes, entry| {
-            bytes.saturating_add(entry.name.capacity())
-        })
+    // Arc's strong and weak counters precede the entry array.
+    let allocation =
+        std::mem::size_of_val(entries).saturating_add(2 * std::mem::size_of::<usize>());
+    entries.iter().fold(allocation, |bytes, entry| {
+        bytes.saturating_add(entry.name.capacity())
+    })
 }
 
 /// Linux dirents carry only inode and file type, so attribute-only changes
 /// cannot stale a snapshot; every other observation field still must match.
-fn linux_observation(
+pub(crate) fn linux_observation(
     observation: DirectoryEnumerationObservation,
 ) -> DirectoryEnumerationObservation {
     DirectoryEnumerationObservation {
@@ -197,6 +198,45 @@ mod tests {
                 kind: FileType::RegularFile,
             })
             .collect()
+    }
+
+    #[test]
+    fn byte_budget_counts_entry_array_names_and_arc_counters() {
+        let built: DirectorySnapshot = (0..3)
+            .map(|_| {
+                let mut name = Vec::with_capacity(128);
+                name.extend_from_slice(b"a");
+                DirEntry {
+                    name,
+                    ino: 10,
+                    kind: FileType::RegularFile,
+                }
+            })
+            .collect();
+        let names: usize = built.iter().map(|entry| entry.name.capacity()).sum();
+        let expected =
+            3 * std::mem::size_of::<DirEntry>() + names + 2 * std::mem::size_of::<usize>();
+        let too_small = DirectorySnapshotCache::new(64, expected - 1);
+        assert!(
+            !too_small.insert(7, observation(1, 1), Arc::clone(&built)),
+            "a snapshot exceeding the full allocation budget must be rejected"
+        );
+        let exact = DirectorySnapshotCache::new(64, expected);
+        assert!(exact.insert(7, observation(1, 1), built));
+        assert_eq!(exact.occupancy(), (1, expected));
+    }
+
+    #[test]
+    fn regressed_epoch_preserves_newer_cached_snapshot() {
+        let cache = DirectorySnapshotCache::default();
+        let built = snapshot(&[b"new"]);
+        assert!(cache.insert(7, observation(2, 1), Arc::clone(&built)));
+        assert!(cache.lookup(7, observation(1, 1)).is_none());
+        assert!(!cache.insert(7, observation(1, 1), snapshot(&[b"old"])));
+        assert!(Arc::ptr_eq(
+            &cache.lookup(7, observation(2, 1)).unwrap(),
+            &built
+        ));
     }
 
     #[test]
