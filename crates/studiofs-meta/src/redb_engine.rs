@@ -1145,7 +1145,10 @@ impl RedbMetaEngine {
     }
 
     #[cfg(test)]
-    pub(crate) fn open_relaxed_with_interval_for_test(path: impl AsRef<Path>, interval: Duration) -> Self {
+    pub(crate) fn open_relaxed_with_interval_for_test(
+        path: impl AsRef<Path>,
+        interval: Duration,
+    ) -> Self {
         Self::open_with_relaxed_interval(path, interval).expect("open relaxed redb test engine")
     }
 
