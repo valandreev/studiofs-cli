@@ -1,11 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "c432501880f85f713ec79789de63ad62aece3458",
-    "indexed_at": "2026-10-13T21:43:40Z",
+    "commit": "c0f79dba370255c8beea1624eb1904b261adc176",
+    "indexed_at": "2026-10-13T22:33:54Z",
     "project": "E-dev-studiofs-cli",
-    "nodes": 28566,
-    "edges": 181288,
-    "original_size": 81264640,
-    "compressed_size": 13325876,
+    "nodes": 28592,
+    "edges": 181447,
+    "original_size": 81395712,
+    "compressed_size": 13335200,
     "compression_level": 9
 }

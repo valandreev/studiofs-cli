@@ -11,7 +11,7 @@ mod session_tests;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CString, OsStr};
 use std::io;
-use std::mem::MaybeUninit;
+use std::mem::{self, MaybeUninit};
 use std::os::raw::{c_char, c_double, c_int, c_uint, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,24 @@ const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 // Bound unique invalidation targets per session; producers apply backpressure
 // instead of dropping invalidations when this finite metadata budget is exhausted.
 const MACFUSE_INVALIDATION_QUEUE_CAPACITY: usize = 8192;
+
+pub(crate) fn catch_callback_unwind(callback: impl FnOnce()) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
+        Ok(()) => false,
+        Err(payload) => {
+            discard_panic_payload(payload);
+            true
+        }
+    }
+}
+
+fn discard_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    // Retain only a secondary payload if its destructor also panics.
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))) {
+        mem::forget(payload);
+    }
+}
+
 static NEXT_INTERRUPT_KEY: AtomicUsize = AtomicUsize::new(1);
 #[cfg(test)]
 static INTERRUPT_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -67,13 +85,13 @@ fn insert_interrupt_token(key: usize, token: CancellationToken) -> bool {
             drop(entry);
             // The read task starts after registration, so cancelling its token
             // makes this request return without replacing the existing entry.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| token.cancel()));
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            catch_callback_unwind(|| token.cancel());
+            catch_callback_unwind(|| {
                 error!(
                     key,
                     "macFUSE interrupt key collision; cancelling read request"
                 );
-            }));
+            });
             false
         }
         dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -1329,12 +1347,33 @@ pub struct Request {
     raw: Option<NonNull<raw::FuseReq>>,
     interrupt_key: Option<usize>,
     completion: RequestCompletion,
+    #[cfg(test)]
+    test_reply_sink: Option<ReplyTestSink>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RequestCompletion {
     Error,
     None,
+}
+
+/// Reply ownership or completion-state error.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ReplyError {
+    /// The request was already consumed by a reply.
+    #[error("macFUSE request was already replied")]
+    AlreadyReplied,
+    /// The request's completion kind does not support this reply.
+    #[error("macFUSE request cannot be completed with this reply kind")]
+    WrongCompletion,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) struct ReplyTestSink {
+    pub(crate) error: fn(*mut raw::FuseReq, c_int) -> c_int,
+    pub(crate) standard: fn(*mut raw::FuseReq) -> c_int,
+    pub(crate) none: fn(*mut raw::FuseReq),
 }
 
 // SAFETY: macFUSE low-level requests may be handed off to worker threads and
@@ -1347,7 +1386,7 @@ impl Request {
     ///
     /// # Safety
     ///
-    /// `raw` must be a live macFUSE request pointer for a callback that accepts
+    /// `raw` must be null or a live macFUSE request pointer for a callback that accepts
     /// an errno reply and has not been replied to. The wrapper must be consumed
     /// by exactly one reply method.
     pub unsafe fn from_raw(raw: *mut raw::FuseReq) -> Option<Self> {
@@ -1359,7 +1398,7 @@ impl Request {
     ///
     /// # Safety
     ///
-    /// `raw` must be a live macFUSE request pointer for a callback that has not
+    /// `raw` must be null or a live macFUSE request pointer for a callback that has not
     /// been replied to. The returned wrapper must be consumed by exactly one
     /// reply method.
     /// `completion` must match the callback: `None` for forget, `Error` otherwise.
@@ -1371,7 +1410,22 @@ impl Request {
             raw: Some(raw),
             interrupt_key: None,
             completion,
+            #[cfg(test)]
+            test_reply_sink: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_raw_with_test_sink(
+        completion: RequestCompletion,
+        sink: ReplyTestSink,
+    ) -> Self {
+        Self {
+            raw: Some(NonNull::dangling()),
+            interrupt_key: None,
+            completion,
+            test_reply_sink: Some(sink),
+        }
     }
 
     pub(crate) fn register_interrupt_token(&mut self, token: CancellationToken) {
@@ -1401,57 +1455,82 @@ impl Request {
         };
         if let Some(raw) = self.raw {
             // SAFETY: `raw` is still owned by this request; unregister before
-            // freeing callback data so macFUSE cannot call into dangling state.
+            // release. A callback that already copied the opaque integer key
+            // can still race with removal: registry lookup either clones a
+            // live token or finds no entry, never dereferences callback data.
             unsafe {
                 raw::fuse_req_interrupt_func(raw.as_ptr(), None, std::ptr::null_mut());
             }
         }
-        remove_interrupt_token(key);
+        // A removed token's destructor must not prevent the kernel completion.
+        catch_callback_unwind(|| remove_interrupt_token(key));
     }
 
     fn as_ptr(&self) -> io::Result<*mut raw::FuseReq> {
         self.raw
             .map(NonNull::as_ptr)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))
+            .ok_or_else(|| reply_state_error(ReplyError::AlreadyReplied))
     }
 
     fn take_raw(&mut self) -> io::Result<NonNull<raw::FuseReq>> {
         self.clear_interrupt_token();
         self.raw
             .take()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))
+            .ok_or_else(|| reply_state_error(ReplyError::AlreadyReplied))
+    }
+
+    fn take_raw_for(&mut self, completion: RequestCompletion) -> io::Result<NonNull<raw::FuseReq>> {
+        if self.completion != completion {
+            return Err(reply_state_error(ReplyError::WrongCompletion));
+        }
+        self.take_raw()
+    }
+
+    fn reply_error(&mut self, raw: NonNull<raw::FuseReq>, errno: c_int) -> c_int {
+        #[cfg(test)]
+        if let Some(sink) = self.test_reply_sink {
+            return (sink.error)(raw.as_ptr(), errno);
+        }
+        // SAFETY: The request was taken from this sole owner immediately before
+        // the FFI call.
+        unsafe { raw::fuse_reply_err(raw.as_ptr(), errno) }
+    }
+
+    fn reply_standard(
+        &mut self,
+        raw: NonNull<raw::FuseReq>,
+        reply: impl FnOnce(*mut raw::FuseReq) -> c_int,
+    ) -> c_int {
+        #[cfg(test)]
+        if let Some(sink) = self.test_reply_sink {
+            return (sink.standard)(raw.as_ptr());
+        }
+        reply(raw.as_ptr())
+    }
+
+    fn reply_none(&mut self, raw: NonNull<raw::FuseReq>) {
+        #[cfg(test)]
+        if let Some(sink) = self.test_reply_sink {
+            (sink.none)(raw.as_ptr());
+            return;
+        }
+        // SAFETY: The request was taken from this sole owner immediately before
+        // the FFI call.
+        unsafe { raw::fuse_reply_none(raw.as_ptr()) };
     }
 }
 
 impl Drop for Request {
     fn drop(&mut self) {
         self.clear_interrupt_token();
-        drop_unreplied_request(
-            &mut self.raw,
-            self.completion,
-            |raw, errno| {
-                // SAFETY: `Request` owns a live, unreplied callback request.
-                unsafe { raw::fuse_reply_err(raw, errno) };
-            },
-            |raw| {
-                // SAFETY: `Request` owns a live forget request, which requires
-                // completion without a kernel reply.
-                unsafe { raw::fuse_reply_none(raw) };
-            },
-        );
-    }
-}
-
-fn drop_unreplied_request(
-    raw: &mut Option<NonNull<raw::FuseReq>>,
-    completion: RequestCompletion,
-    reply_error: impl FnOnce(*mut raw::FuseReq, c_int),
-    reply_none: impl FnOnce(*mut raw::FuseReq),
-) {
-    if let Some(raw) = raw.take() {
-        match completion {
-            RequestCompletion::Error => reply_error(raw.as_ptr(), libc::EIO),
-            RequestCompletion::None => reply_none(raw.as_ptr()),
+        let Some(raw) = self.raw.take() else {
+            return;
+        };
+        match self.completion {
+            RequestCompletion::Error => {
+                let _ = self.reply_error(raw, libc::EIO);
+            }
+            RequestCompletion::None => self.reply_none(raw),
         }
     }
 }
@@ -1462,22 +1541,22 @@ unsafe extern "C" fn request_interrupted(_req: *mut raw::FuseReq, data: *mut c_v
     }
     let key = data as usize;
     // An unwind crossing this non-unwinding C ABI boundary aborts the process.
-    let cancellation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let cancellation_panicked = catch_callback_unwind(|| {
         let token = interrupt_registry()
             .get(&key)
             .map(|entry| entry.value().clone());
         if let Some(token) = token {
             token.cancel();
         }
-    }));
-    if cancellation.is_err() {
+    });
+    if cancellation_panicked {
         // Tokio stops notifying this token's remaining waiters when a waker
         // panics; they may stay asleep until another event polls them again.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        catch_callback_unwind(|| {
             error!(
                 "macFUSE interrupt cancellation panicked; some waiters may remain asleep until polled again"
             );
-        }));
+        });
     }
 }
 
@@ -1494,81 +1573,80 @@ impl Reply {
 
     /// Reply with a POSIX errno.
     pub fn error(mut self, errno: c_int) -> io::Result<()> {
-        let request = self.request.take_raw()?;
-        // SAFETY: `Request` guarantees a live, unreplied low-level request and
-        // this method consumes it, so macFUSE sees at most one reply.
-        reply_result(unsafe { raw::fuse_reply_err(request.as_ptr(), errno) })
+        let request = self.request.take_raw_for(RequestCompletion::Error)?;
+        reply_result(self.request.reply_error(request, errno))
     }
 
     /// Complete a forget request without sending a kernel reply.
     pub fn none(mut self) -> io::Result<()> {
-        let request = self.request.take_raw()?;
-        // SAFETY: This consumes the sole owner of the live forget request.
-        unsafe { raw::fuse_reply_none(request.as_ptr()) };
+        let request = self.request.take_raw_for(RequestCompletion::None)?;
+        self.request.reply_none(request);
         Ok(())
     }
 
     /// Reply with an entry.
     pub fn entry(mut self, entry: &Entry) -> io::Result<()> {
-        let request = self.request.take_raw()?;
-        // SAFETY: `entry.raw` points to initialized C-compatible data for the
-        // duration of the call; `self` consumes the single request reply.
-        reply_result(unsafe { raw::fuse_reply_entry(request.as_ptr(), &entry.raw) })
+        let request = self.request.take_raw_for(RequestCompletion::Error)?;
+        reply_result(self.request.reply_standard(request, |request| {
+            // SAFETY: `entry.raw` is initialized and borrowed for this reply.
+            unsafe { raw::fuse_reply_entry(request, &entry.raw) }
+        }))
     }
 
     /// Reply with attributes.
     pub fn attr(mut self, attr: &stat, timeout: f64) -> io::Result<()> {
-        let request = self.request.take_raw()?;
-        // SAFETY: `attr` is initialized and borrowed for the duration of the
-        // call; `self` consumes the single request reply.
-        reply_result(unsafe { raw::fuse_reply_attr(request.as_ptr(), attr, timeout) })
+        let request = self.request.take_raw_for(RequestCompletion::Error)?;
+        reply_result(self.request.reply_standard(request, |request| {
+            // SAFETY: `attr` is initialized and borrowed for this reply.
+            unsafe { raw::fuse_reply_attr(request, attr, timeout) }
+        }))
     }
 
     /// Reply with open parameters.
     pub fn open(mut self, open: OpenReply) -> io::Result<()> {
-        let request = self.request.take_raw()?;
+        let request = self.request.take_raw_for(RequestCompletion::Error)?;
         let file_info = raw::FuseFileInfo::from_open_reply(open);
-        // SAFETY: `file_info` is initialized and borrowed for the duration of
-        // the call; `self` consumes the single request reply.
-        reply_result(unsafe { raw::fuse_reply_open(request.as_ptr(), &file_info) })
+        reply_result(self.request.reply_standard(request, |request| {
+            // SAFETY: `file_info` is initialized and borrowed for this reply.
+            unsafe { raw::fuse_reply_open(request, &file_info) }
+        }))
     }
 
     /// Reply with a newly created entry and open parameters.
     pub fn create(mut self, entry: &Entry, open: OpenReply) -> io::Result<()> {
-        let request = self.request.take_raw()?;
+        let request = self.request.take_raw_for(RequestCompletion::Error)?;
         let file_info = raw::FuseFileInfo::from_open_reply(open);
-        // SAFETY: `entry` and `file_info` are initialized and borrowed for the
-        // duration of the call; `self` consumes the single request reply.
-        reply_result(unsafe { raw::fuse_reply_create(request.as_ptr(), &entry.raw, &file_info) })
+        reply_result(self.request.reply_standard(request, |request| {
+            // SAFETY: `entry` and `file_info` are initialized and borrowed for this reply.
+            unsafe { raw::fuse_reply_create(request, &entry.raw, &file_info) }
+        }))
     }
 
     /// Reply with a read buffer.
     pub fn read_buffer(mut self, bytes: &[u8]) -> io::Result<()> {
-        let request = self.request.take_raw()?;
-        // SAFETY: `bytes` is valid for the duration of the call and macFUSE
-        // copies/sends it synchronously; `self` consumes the single reply.
-        reply_result(unsafe {
-            raw::fuse_reply_buf(
-                request.as_ptr(),
-                bytes.as_ptr().cast::<c_char>(),
-                bytes.len(),
-            )
-        })
+        let request = self.request.take_raw_for(RequestCompletion::Error)?;
+        reply_result(self.request.reply_standard(request, |request| {
+            // SAFETY: `bytes` is valid for the call and macFUSE copies it synchronously.
+            unsafe { raw::fuse_reply_buf(request, bytes.as_ptr().cast::<c_char>(), bytes.len()) }
+        }))
     }
 
     /// Reply with a symbolic link target.
     pub fn readlink(mut self, target: &std::ffi::CStr) -> io::Result<()> {
-        let request = self.request.take_raw()?;
-        // SAFETY: `target` is NUL-terminated and valid for the duration of the
-        // call; macFUSE copies/sends it synchronously and `self` is consumed.
-        reply_result(unsafe { raw::fuse_reply_readlink(request.as_ptr(), target.as_ptr()) })
+        let request = self.request.take_raw_for(RequestCompletion::Error)?;
+        reply_result(self.request.reply_standard(request, |request| {
+            // SAFETY: `target` is NUL-terminated and valid for this reply.
+            unsafe { raw::fuse_reply_readlink(request, target.as_ptr()) }
+        }))
     }
 
     /// Reply with a write byte count.
     pub fn write_count(mut self, count: usize) -> io::Result<()> {
-        let request = self.request.take_raw()?;
-        // SAFETY: `self` owns a live, unreplied request and is consumed here.
-        reply_result(unsafe { raw::fuse_reply_write(request.as_ptr(), count) })
+        let request = self.request.take_raw_for(RequestCompletion::Error)?;
+        reply_result(self.request.reply_standard(request, |request| {
+            // SAFETY: The request was taken from its sole owner for this reply.
+            unsafe { raw::fuse_reply_write(request, count) }
+        }))
     }
 
     /// Reply with owned directory entries.
@@ -1578,17 +1656,20 @@ impl Reply {
 
     /// Reply with filesystem statistics.
     pub fn statfs(mut self, stat: &statvfs) -> io::Result<()> {
-        let request = self.request.take_raw()?;
-        // SAFETY: `stat` is initialized and borrowed for the duration of the
-        // call; `self` consumes the single request reply.
-        reply_result(unsafe { raw::fuse_reply_statfs(request.as_ptr(), stat) })
+        let request = self.request.take_raw_for(RequestCompletion::Error)?;
+        reply_result(self.request.reply_standard(request, |request| {
+            // SAFETY: `stat` is initialized and borrowed for this reply.
+            unsafe { raw::fuse_reply_statfs(request, stat) }
+        }))
     }
 
     /// Reply with the required xattr value/list buffer size.
     pub fn xattr_size(mut self, count: usize) -> io::Result<()> {
-        let request = self.request.take_raw()?;
-        // SAFETY: `self` owns a live, unreplied request and is consumed here.
-        reply_result(unsafe { raw::fuse_reply_xattr(request.as_ptr(), count) })
+        let request = self.request.take_raw_for(RequestCompletion::Error)?;
+        reply_result(self.request.reply_standard(request, |request| {
+            // SAFETY: The request was taken from its sole owner for this reply.
+            unsafe { raw::fuse_reply_xattr(request, count) }
+        }))
     }
 }
 
@@ -1804,7 +1885,17 @@ fn reply_result(result: c_int) -> io::Result<()> {
     if result == 0 {
         Ok(())
     } else {
-        Err(io::Error::from_raw_os_error(-result))
+        let error = io::Error::from_raw_os_error(-result);
+        catch_callback_unwind(|| debug!(%error, "macFUSE reply failed"));
+        Err(error)
+    }
+}
+
+fn reply_state_error(error: ReplyError) -> io::Error {
+    catch_callback_unwind(|| warn!(%error, "macFUSE reply state rejected"));
+    match error {
+        ReplyError::AlreadyReplied => io::Error::from_raw_os_error(libc::EIO),
+        ReplyError::WrongCompletion => io::Error::new(io::ErrorKind::InvalidInput, error),
     }
 }
 
@@ -1812,8 +1903,64 @@ fn reply_result(result: c_int) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::future::Future;
+    use std::sync::Mutex;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ReplyTestEvent {
+        Error(c_int),
+        Standard,
+        None,
+    }
+
+    static REPLY_TEST_EVENTS: Mutex<Vec<ReplyTestEvent>> = Mutex::new(Vec::new());
+    static REPLY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_reply_test_events() -> std::sync::MutexGuard<'static, ()> {
+        REPLY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn take_reply_test_events() -> Vec<ReplyTestEvent> {
+        std::mem::take(
+            &mut *REPLY_TEST_EVENTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    fn test_reply_error(_raw: *mut raw::FuseReq, errno: c_int) -> c_int {
+        REPLY_TEST_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(ReplyTestEvent::Error(errno));
+        0
+    }
+
+    fn test_reply_standard(_raw: *mut raw::FuseReq) -> c_int {
+        REPLY_TEST_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(ReplyTestEvent::Standard);
+        0
+    }
+
+    fn test_reply_none(_raw: *mut raw::FuseReq) {
+        REPLY_TEST_EVENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(ReplyTestEvent::None);
+    }
+
+    fn test_sink() -> ReplyTestSink {
+        ReplyTestSink {
+            error: test_reply_error,
+            standard: test_reply_standard,
+            none: test_reply_none,
+        }
+    }
 
     #[test]
     fn consumed_request_reply_returns_eio_without_panicking() {
@@ -1821,6 +1968,7 @@ mod tests {
             raw: None,
             interrupt_key: None,
             completion: RequestCompletion::Error,
+            test_reply_sink: None,
         };
         let result = std::panic::catch_unwind(|| Reply::new(request).error(libc::EIO));
         assert!(result.is_ok(), "consumed request must not panic");
@@ -1829,51 +1977,82 @@ mod tests {
 
     #[test]
     fn request_raw_ownership_can_only_be_taken_once() {
-        let raw = NonNull::dangling();
-        // This pointer is only moved between Rust values, never passed to FFI.
-        let mut request = Request {
-            raw: Some(raw),
-            interrupt_key: None,
-            completion: RequestCompletion::Error,
-        };
+        let _reply_lock = lock_reply_test_events();
+        let mut request = Request::from_raw_with_test_sink(RequestCompletion::Error, test_sink());
+        let raw = request.raw.expect("test request has raw ownership");
         assert_eq!(request.take_raw().unwrap(), raw);
         assert_eq!(
             request.take_raw().unwrap_err().raw_os_error(),
             Some(libc::EIO)
         );
+    }
+
+    #[test]
+    fn dropping_live_request_uses_its_completion_once() {
+        let _reply_lock = lock_reply_test_events();
+        let request = Request::from_raw_with_test_sink(RequestCompletion::Error, test_sink());
+        drop(request);
+        assert_eq!(take_reply_test_events(), [ReplyTestEvent::Error(libc::EIO)]);
+
+        let request = Request::from_raw_with_test_sink(RequestCompletion::None, test_sink());
+        drop(request);
+        assert_eq!(take_reply_test_events(), [ReplyTestEvent::None]);
+    }
+
+    #[test]
+    fn explicit_reply_uses_test_sink_once() {
+        let _reply_lock = lock_reply_test_events();
+        let request = Request::from_raw_with_test_sink(RequestCompletion::Error, test_sink());
+        Reply::new(request).error(libc::ENOENT).unwrap();
         assert_eq!(
-            request.as_ptr().unwrap_err().raw_os_error(),
-            Some(libc::EIO)
+            take_reply_test_events(),
+            [ReplyTestEvent::Error(libc::ENOENT)]
         );
     }
 
     #[test]
-    fn forget_request_drop_uses_none_completion_once_after_move() {
-        let raw = NonNull::dangling();
-        let request = Request {
-            raw: Some(raw),
-            interrupt_key: None,
-            completion: RequestCompletion::None,
-        };
-        let mut moved = request;
-        let mut errors = Vec::new();
-        let mut none_replies = Vec::new();
+    fn wrong_reply_completion_returns_typed_error_and_drops_correctly() {
+        let _reply_lock = lock_reply_test_events();
+        let request = Request::from_raw_with_test_sink(RequestCompletion::Error, test_sink());
+        let error = Reply::new(request).none().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<ReplyError>()),
+            Some(ReplyError::WrongCompletion)
+        ));
+        assert_eq!(take_reply_test_events(), [ReplyTestEvent::Error(libc::EIO)]);
 
-        let mut complete = || {
-            drop_unreplied_request(
-                &mut moved.raw,
-                moved.completion,
-                |raw, errno| errors.push((raw, errno)),
-                |raw| none_replies.push(raw),
-            );
-        };
-        complete();
-        complete();
+        let request = Request::from_raw_with_test_sink(RequestCompletion::None, test_sink());
+        let error = Reply::new(request).error(libc::EINVAL).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<ReplyError>()),
+            Some(ReplyError::WrongCompletion)
+        ));
+        assert_eq!(take_reply_test_events(), [ReplyTestEvent::None]);
+    }
 
-        assert!(errors.is_empty());
-        assert_eq!(none_replies, [raw.as_ptr()]);
-        assert!(moved.raw.is_none());
-        drop(moved);
+    #[test]
+    fn standard_reply_on_forget_is_rejected_before_reply_sink() {
+        let _reply_lock = lock_reply_test_events();
+        // SAFETY: An all-zero stat is valid initialized input and the injected
+        // sink guarantees no fake request reaches FFI.
+        let attr = unsafe { std::mem::zeroed::<stat>() };
+        let entry = Entry::new(2, 0, attr, 0.0, 0.0);
+        let request = Request::from_raw_with_test_sink(RequestCompletion::None, test_sink());
+        let error = Reply::new(request).entry(&entry).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<ReplyError>()),
+            Some(ReplyError::WrongCompletion)
+        ));
+        assert_eq!(take_reply_test_events(), [ReplyTestEvent::None]);
     }
 
     #[test]
@@ -1886,6 +2065,7 @@ mod tests {
             raw: None,
             interrupt_key: Some(key),
             completion: RequestCompletion::Error,
+            test_reply_sink: None,
         };
         assert_eq!(
             request.take_raw().unwrap_err().raw_os_error(),
@@ -1903,6 +2083,7 @@ mod tests {
             raw: None,
             interrupt_key: None,
             completion: RequestCompletion::Error,
+            test_reply_sink: None,
         };
         let mut buffer = DirectoryEntryBuffer::new(1024);
         // SAFETY: An all-zero stat is valid initialized input; no FFI call is
@@ -2367,11 +2548,19 @@ mod tests {
 
     #[test]
     fn request_interrupted_contains_panics_from_cancellation_and_logging() {
+        struct PanickingPayload;
+
+        impl Drop for PanickingPayload {
+            fn drop(&mut self) {
+                panic!("simulated panic payload destructor");
+            }
+        }
+
         struct PanickingWake;
 
         impl std::task::Wake for PanickingWake {
             fn wake(self: Arc<Self>) {
-                std::panic::resume_unwind(Box::new("simulated waker panic"));
+                std::panic::panic_any(PanickingPayload);
             }
         }
 
@@ -2397,7 +2586,7 @@ mod tests {
                     *event.metadata().level() == tracing::Level::ERROR,
                     Ordering::Relaxed,
                 );
-                std::panic::resume_unwind(Box::new("simulated subscriber panic"));
+                std::panic::panic_any(PanickingPayload);
             }
 
             fn enter(&self, _: &tracing::span::Id) {}

@@ -41,7 +41,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::low_level::{
-    DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, RequestCompletion, raw,
+    DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, RequestCompletion,
+    catch_callback_unwind, raw,
 };
 
 const TTL_SECONDS: f64 = 1.0;
@@ -2433,7 +2434,7 @@ impl ReplyTaskTracker {
                 self.active.clear_poison();
                 let active_reply_tasks = *active;
                 // A subscriber panic must not escape a native callback or guard Drop.
-                let _ = std::panic::catch_unwind(|| {
+                catch_callback_unwind(|| {
                     warn!(
                         active_reply_tasks,
                         "macFUSE reply task tracker lock was poisoned; recovering count"
@@ -2561,48 +2562,37 @@ fn callback_error_log_level(operation: &'static str, errno: i32) -> Option<Callb
 }
 
 fn contain_callback_panic(
-    req: *mut raw::FuseReq,
+    mut request: Option<Request>,
     operation: &'static str,
-    completion: RequestCompletion,
     callback: impl FnOnce(&mut Option<Request>),
 ) {
-    // SAFETY: The C callback supplies a live unreplied request, owned here once.
-    let mut request = unsafe { Request::from_raw_with_completion(req, completion) };
-    let panicked = catch_callback_unwind(|| callback(&mut request));
+    if catch_callback_unwind(|| callback(&mut request)) {
+        // Report the operation before cleanup, which may itself fail. Panic
+        // payload text is not guaranteed to respect credential redaction.
+        catch_callback_unwind(|| warn!(operation, "macFUSE callback panicked"));
+    }
     // Move all remaining ownership into protected cleanup, including Drop.
     catch_callback_unwind(move || {
         drop(request);
-        if panicked {
-            warn!(operation, "macFUSE callback panicked");
-        }
     });
 }
 
 macro_rules! macfuse_callback {
     ($(#[$attr:meta])* $vis:vis fn $name:ident($req:ident: $req_type:ty, $($arg:ident: $arg_type:ty),* $(,)?)
-        |$pending:ident| $operation:literal, $completion:ident $body:block) => {
+        |$pending:ident $(, $state:ident)?| $operation:literal, $completion:ident $body:block) => {
         $(#[$attr])*
-        $vis extern "C" fn $name($req: $req_type, $($arg: $arg_type),*) {
-            contain_callback_panic($req, $operation, RequestCompletion::$completion,
-                |$pending| $body);
+        /// # Safety
+        /// Pointers must satisfy macFUSE's callback contract: any non-null
+        /// request is live and unreplied; names and structs/buffers are valid for the call.
+        $vis unsafe extern "C" fn $name(raw_request: $req_type, $($arg: $arg_type),*) {
+            // SAFETY: The callback caller supplies sole ownership of a live request.
+            let request = unsafe { Request::from_raw_with_completion(raw_request, RequestCompletion::$completion) };
+            contain_callback_panic(request, $operation, |$pending| {
+                $(let Some($state) = callback_state(raw_request) else { return; };)?
+                $body
+            });
         }
     };
-}
-
-fn catch_callback_unwind(callback: impl FnOnce()) -> bool {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
-        Ok(()) => false,
-        Err(payload) => {
-            // Drop ordinary payloads; retain only a second panic's payload so
-            // a custom destructor cannot unwind through the C ABI.
-            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                drop(payload);
-            })) {
-                mem::forget(payload);
-            }
-            true
-        }
-    }
 }
 
 fn directory_entry_errno(error: crate::low_level::DirectoryEntryError) -> i32 {
@@ -3321,11 +3311,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         parent: raw::FuseIno,
         name: *const c_char,
-    ) |pending| "lookup", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "lookup", Error {
         if name.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3362,11 +3348,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         nlookup: c_ulong,
-    ) |pending| "forget", None {
-        let Some(state) = callback_state(req) else {
-            reply_none(pending);
-            return;
-        };
+    ) |pending, state| "forget", None {
         state.adapter.forget(ino, nlookup);
         reply_none(pending);
     }
@@ -3379,11 +3361,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         _fi: *mut raw::FuseFileInfo,
-    ) |pending| "getattr", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "getattr", Error {
         match state.adapter.getattr(ino) {
             Ok(attr) => {
                 if let Some(request) = pending.take() {
@@ -3408,11 +3386,7 @@ macfuse_callback! {
         parent: raw::FuseIno,
         name: *const c_char,
         mode: mode_t,
-    ) |pending| "mkdir", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "mkdir", Error {
         if name.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3455,11 +3429,7 @@ macfuse_callback! {
         target: *const c_char,
         parent: raw::FuseIno,
         name: *const c_char,
-    ) |pending| "symlink", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "symlink", Error {
         if target.is_null() || name.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3486,11 +3456,7 @@ macfuse_callback! {
         name: *const c_char,
         mode: mode_t,
         _rdev: libc::dev_t,
-    ) |pending| "mknod", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "mknod", Error {
         if name.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3535,11 +3501,7 @@ macfuse_callback! {
         name: *const c_char,
         mode: mode_t,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "create", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "create", Error {
         if name.is_null() || fi.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3601,11 +3563,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         parent: raw::FuseIno,
         name: *const c_char,
-    ) |pending| "unlink", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "unlink", Error {
         if name.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3634,11 +3592,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         parent: raw::FuseIno,
         name: *const c_char,
-    ) |pending| "rmdir", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "rmdir", Error {
         if name.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3663,11 +3617,7 @@ macfuse_callback! {
         name: *const c_char,
         newparent: raw::FuseIno,
         newname: *const c_char,
-    ) |pending| "rename", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "rename", Error {
         if name.is_null() || newname.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3701,11 +3651,7 @@ macfuse_callback! {
         ino: raw::FuseIno,
         newparent: raw::FuseIno,
         newname: *const c_char,
-    ) |pending| "link", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "link", Error {
         if newname.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3741,11 +3687,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "open", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "open", Error {
         if fi.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3809,11 +3751,7 @@ macfuse_callback! {
         size: size_t,
         off: off_t,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "read", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "read", Error {
         if fi.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3853,11 +3791,7 @@ macfuse_callback! {
         size: size_t,
         off: off_t,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "write", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "write", Error {
         if fi.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3903,11 +3837,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "flush", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "flush", Error {
         if fi.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -3935,11 +3865,7 @@ macfuse_callback! {
         ino: raw::FuseIno,
         datasync: libc::c_int,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "fsync", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "fsync", Error {
         let file_handle = if fi.is_null() {
             None
         } else {
@@ -3971,11 +3897,7 @@ macfuse_callback! {
         attr: *mut stat,
         to_set: libc::c_int,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "setattr", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "setattr", Error {
         if attr.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -4059,11 +3981,7 @@ macfuse_callback! {
         attr: *mut raw::FuseSetattrX,
         to_set: libc::c_int,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "setattr_x", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "setattr_x", Error {
         if attr.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -4344,11 +4262,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "release", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "release", Error {
         if fi.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -4375,11 +4289,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "opendir", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "opendir", Error {
         if fi.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -4414,11 +4324,7 @@ macfuse_callback! {
         size: size_t,
         off: off_t,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "readdir", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "readdir", Error {
         if fi.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -4450,11 +4356,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         _ino: raw::FuseIno,
         fi: *mut raw::FuseFileInfo,
-    ) |pending| "releasedir", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "releasedir", Error {
         if fi.is_null() {
             reply_error(pending, libc::EINVAL);
             return;
@@ -4471,11 +4373,7 @@ macfuse_callback! {
 macfuse_callback! {
     /// macFUSE readlink callback for the StudioVfs bridge.
     #[unsafe(no_mangle)]
-    pub fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::FuseIno) |pending| "readlink", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    pub fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::FuseIno) |pending, state| "readlink", Error {
         match state.adapter.readlink(ino) {
             Ok(target) => match CString::new(target) {
                 Ok(target) => {
@@ -4493,11 +4391,7 @@ macfuse_callback! {
 macfuse_callback! {
     /// macFUSE statfs callback for the StudioVfs bridge.
     #[unsafe(no_mangle)]
-    pub fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::FuseIno) |pending| "statfs", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    pub fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::FuseIno) |pending, state| "statfs", Error {
         match state.adapter.statfs() {
             Ok(stats) => {
                 if let Some(request) = pending.take() {
@@ -4520,11 +4414,7 @@ macfuse_callback! {
         size: size_t,
         flags: libc::c_int,
         position: u32,
-    ) |pending| "setxattr", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "setxattr", Error {
         // SAFETY: The returned slice is used only within this callback while the
         // macFUSE-provided request arguments are live.
         let Some(name) = (unsafe { xattr_name_from_callback(pending, name) }) else {
@@ -4562,11 +4452,7 @@ macfuse_callback! {
         name: *const c_char,
         size: size_t,
         position: u32,
-    ) |pending| "getxattr", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "getxattr", Error {
         // SAFETY: The returned slice is used only within this callback while the
         // macFUSE-provided request arguments are live.
         let Some(name) = (unsafe { xattr_name_from_callback(pending, name) }) else {
@@ -4600,11 +4486,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         size: size_t,
-    ) |pending| "listxattr", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "listxattr", Error {
         match state.adapter.list_xattrs(ino) {
             Ok(names) if size == 0 => reply_xattr_size(pending, xattr_name_list_len(&names)),
             Ok(names) => reply_xattr_value(pending, size, &format_xattr_name_list(&names)),
@@ -4620,11 +4502,7 @@ macfuse_callback! {
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         name: *const c_char,
-    ) |pending| "removexattr", Error {
-        let Some(state) = callback_state(req) else {
-            reply_error(pending, libc::EIO);
-            return;
-        };
+    ) |pending, state| "removexattr", Error {
         // SAFETY: The returned slice is used only within this callback while the
         // macFUSE-provided request arguments are live.
         let Some(name) = (unsafe { xattr_name_from_callback(pending, name) }) else {
@@ -5235,11 +5113,90 @@ mod tests {
     // Serialize initialization of the shared tracing callsite against a scoped subscriber.
     static CALLBACK_LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum BoundaryReply {
+        Error(i32),
+        Standard,
+        None,
+    }
+
+    static BOUNDARY_REPLIES: std::sync::Mutex<Vec<BoundaryReply>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn boundary_test_request(completion: RequestCompletion) -> Request {
+        use crate::low_level::ReplyTestSink;
+        Request::from_raw_with_test_sink(
+            completion,
+            ReplyTestSink {
+                error: |_, errno| {
+                    BOUNDARY_REPLIES
+                        .lock()
+                        .unwrap()
+                        .push(BoundaryReply::Error(errno));
+                    0
+                },
+                standard: |_| {
+                    BOUNDARY_REPLIES
+                        .lock()
+                        .unwrap()
+                        .push(BoundaryReply::Standard);
+                    0
+                },
+                none: |_| BOUNDARY_REPLIES.lock().unwrap().push(BoundaryReply::None),
+            },
+        )
+    }
+
+    #[test]
+    fn callback_boundary_panic_completes_live_request_once() {
+        let _logging = CALLBACK_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (completion, expected) in [
+            (RequestCompletion::Error, BoundaryReply::Error(libc::EIO)),
+            (RequestCompletion::None, BoundaryReply::None),
+        ] {
+            BOUNDARY_REPLIES.lock().unwrap().clear();
+            let mut entered = false;
+            contain_callback_panic(Some(boundary_test_request(completion)), "test", |_| {
+                entered = true;
+                panic!("panic before reply");
+            });
+            let replies = std::mem::take(&mut *BOUNDARY_REPLIES.lock().unwrap());
+            assert!(entered);
+            assert_eq!(replies, [expected]);
+        }
+    }
+
+    #[test]
+    fn callback_boundary_panic_after_reply_sends_no_second_completion() {
+        let _logging = CALLBACK_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (completion, expected) in [
+            (RequestCompletion::Error, BoundaryReply::Error(0)),
+            (RequestCompletion::None, BoundaryReply::None),
+        ] {
+            BOUNDARY_REPLIES.lock().unwrap().clear();
+            contain_callback_panic(Some(boundary_test_request(completion)), "test", |pending| {
+                let reply = Reply::new(pending.take().unwrap());
+                match completion {
+                    RequestCompletion::Error => reply.error(0).unwrap(),
+                    RequestCompletion::None => reply.none().unwrap(),
+                }
+                panic!("panic after reply");
+            });
+            let replies = std::mem::take(&mut *BOUNDARY_REPLIES.lock().unwrap());
+            assert_eq!(replies, [expected]);
+        }
+    }
+
     #[test]
     fn callback_boundary_contains_panics() {
-        let _logging = CALLBACK_LOG_TEST_LOCK.lock().unwrap();
-        let req = std::ptr::null_mut();
-        contain_callback_panic(req, "test", RequestCompletion::Error, |_pending| {
+        let _logging = CALLBACK_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        contain_callback_panic(None, "test", |_pending| {
             panic!("simulated callback panic");
         });
     }
@@ -5256,14 +5213,17 @@ mod tests {
 
     #[test]
     fn callback_boundary_macro_contains_panic_through_c_abi() {
-        let _logging = CALLBACK_LOG_TEST_LOCK.lock().unwrap();
+        let _logging = CALLBACK_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut entered = false;
-        test_macfuse_panicking_callback(std::ptr::null_mut(), &mut entered);
+        // SAFETY: The callback receives no request and a live exclusive boolean.
+        unsafe { test_macfuse_panicking_callback(std::ptr::null_mut(), &mut entered) };
         assert!(entered);
     }
 
     #[test]
-    fn consumed_callback_owner_does_not_send_another_reply() {
+    fn empty_callback_owner_reply_helpers_are_noops() {
         let mut pending = None;
         reply_error(&mut pending, libc::EIO);
         reply_none(&mut pending);
@@ -5274,7 +5234,9 @@ mod tests {
 
     #[test]
     fn callback_boundary_contains_panicking_log_subscriber() {
-        let _logging = CALLBACK_LOG_TEST_LOCK.lock().unwrap();
+        let _logging = CALLBACK_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         struct PanickingWarnSubscriber {
             warnings: std::sync::mpsc::Sender<()>,
         }
@@ -5307,14 +5269,16 @@ mod tests {
             warnings: warnings_tx,
         });
         let _dispatch = tracing::dispatcher::set_default(&dispatch);
-        contain_callback_panic(
-            std::ptr::null_mut(),
-            "test",
-            RequestCompletion::Error,
-            |_pending| panic!("simulated callback panic"),
-        );
+        contain_callback_panic(None, "test", |_pending| panic!("simulated callback panic"));
 
-        assert_eq!(warnings_rx.try_iter().count(), 1);
+        BOUNDARY_REPLIES.lock().unwrap().clear();
+        let error = Reply::new(boundary_test_request(RequestCompletion::Error))
+            .none()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(warnings_rx.try_iter().count(), 2);
+        let replies = std::mem::take(&mut *BOUNDARY_REPLIES.lock().unwrap());
+        assert_eq!(replies, [BoundaryReply::Error(libc::EIO)]);
     }
 
     #[test]
