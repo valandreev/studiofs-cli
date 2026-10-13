@@ -40,7 +40,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, raw};
+use crate::low_level::{
+    DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, RequestCompletion,
+    catch_callback_unwind, raw,
+};
 
 const TTL_SECONDS: f64 = 1.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = crate::low_level::MACOS_FUSE_IOSIZE_BYTES;
@@ -2431,7 +2434,7 @@ impl ReplyTaskTracker {
                 self.active.clear_poison();
                 let active_reply_tasks = *active;
                 // A subscriber panic must not escape a native callback or guard Drop.
-                let _ = std::panic::catch_unwind(|| {
+                catch_callback_unwind(|| {
                     warn!(
                         active_reply_tasks,
                         "macFUSE reply task tracker lock was poisoned; recovering count"
@@ -2505,15 +2508,21 @@ fn callback_state<'a>(req: *mut raw::FuseReq) -> Option<&'a CallbackState> {
     }
 }
 
-fn reply_error(req: *mut raw::FuseReq, errno: i32) {
-    if let Some(request) = owned_request(req) {
+fn reply_error(pending: &mut Option<Request>, errno: i32) {
+    if let Some(request) = pending.take() {
         let _ = Reply::new(request).error(errno);
     }
 }
 
-fn reply_callback_error(req: *mut raw::FuseReq, operation: &'static str, errno: i32) {
+fn reply_none(pending: &mut Option<Request>) {
+    if let Some(request) = pending.take() {
+        let _ = Reply::new(request).none();
+    }
+}
+
+fn reply_callback_error(pending: &mut Option<Request>, operation: &'static str, errno: i32) {
     log_callback_error(operation, errno);
-    reply_error(req, errno);
+    reply_error(pending, errno);
 }
 
 fn log_callback_error(operation: &'static str, errno: i32) {
@@ -2552,15 +2561,45 @@ fn callback_error_log_level(operation: &'static str, errno: i32) -> Option<Callb
     Some(CallbackErrorLogLevel::Warn)
 }
 
-fn owned_request(req: *mut raw::FuseReq) -> Option<Request> {
-    // SAFETY: Each low-level callback receives a live unreplied request pointer.
-    unsafe { Request::from_raw(req) }
+fn contain_callback_panic(
+    mut request: Option<Request>,
+    operation: &'static str,
+    callback: impl FnOnce(&mut Option<Request>),
+) {
+    if catch_callback_unwind(|| callback(&mut request)) {
+        // Report the operation before cleanup, which may itself fail. Panic
+        // payload text is omitted because it may expose credentials without redaction.
+        catch_callback_unwind(|| warn!(operation, "macFUSE callback panicked"));
+    }
+    // Move all remaining ownership into protected cleanup, including Drop.
+    catch_callback_unwind(move || {
+        drop(request);
+    });
+}
+
+macro_rules! macfuse_callback {
+    ($(#[$attr:meta])* $vis:vis fn $name:ident($req:ident: $req_type:ty, $($arg:ident: $arg_type:ty),* $(,)?)
+        |$pending:ident $(, $state:ident)?| $operation:literal, $completion:ident $body:block) => {
+        $(#[$attr])*
+        /// # Safety
+        /// Pointers must satisfy macFUSE's callback contract: any non-null
+        /// request is live and unreplied; names and structs/buffers are valid for the call.
+        $vis unsafe extern "C" fn $name(raw_request: $req_type, $($arg: $arg_type),*) {
+            // SAFETY: The callback caller supplies sole ownership of a live request.
+            let request = unsafe { Request::from_raw_with_completion(raw_request, RequestCompletion::$completion) };
+            contain_callback_panic(request, $operation, |$pending| {
+                $(let Some($state) = callback_state(raw_request) else { return; };)?
+                $body
+            });
+        }
+    };
 }
 
 fn directory_entry_errno(error: crate::low_level::DirectoryEntryError) -> i32 {
     match error {
         crate::low_level::DirectoryEntryError::InsufficientCapacity { .. } => libc::ERANGE,
         crate::low_level::DirectoryEntryError::InteriorNul => libc::EINVAL,
+        crate::low_level::DirectoryEntryError::AlreadyReplied => libc::EIO,
     }
 }
 
@@ -3265,775 +3304,741 @@ fn statfs_to_statvfs(stats: StatFs) -> statvfs {
     out
 }
 
-/// macFUSE lookup callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_lookup(
-    req: *mut raw::FuseReq,
-    parent: raw::FuseIno,
-    name: *const c_char,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if name.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes a NUL-terminated entry name for lookup callbacks.
-    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    match state.adapter.lookup(parent, name) {
-        Ok(attr) => {
-            let stat = state.adapter.attr_to_stat(&attr);
-            if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
-                let _ = Reply::new(request).entry(&entry);
+macfuse_callback! {
+    /// macFUSE lookup callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_lookup(
+        req: *mut raw::FuseReq,
+        parent: raw::FuseIno,
+        name: *const c_char,
+    ) |pending, state| "lookup", Error {
+        if name.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes a NUL-terminated entry name for lookup callbacks.
+        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+        match state.adapter.lookup(parent, name) {
+            Ok(attr) => {
+                let stat = state.adapter.attr_to_stat(&attr);
+                if let Some(request) = pending.take() {
+                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let _ = Reply::new(request).entry(&entry);
+                }
+            }
+            Err(errno) => {
+                if callback_error_log_level("lookup", errno).is_some() {
+                    warn!(
+                        parent,
+                        name = %String::from_utf8_lossy(name),
+                        errno,
+                        "macFUSE lookup callback returned error"
+                    );
+                }
+                reply_error(pending, errno);
             }
         }
-        Err(errno) => {
-            if callback_error_log_level("lookup", errno).is_some() {
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE forget callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_forget(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        nlookup: c_ulong,
+    ) |pending, state| "forget", None {
+        state.adapter.forget(ino, nlookup);
+        reply_none(pending);
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE getattr callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_getattr(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        _fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "getattr", Error {
+        match state.adapter.getattr(ino) {
+            Ok(attr) => {
+                if let Some(request) = pending.take() {
+                    let _ = Reply::new(request).attr(&attr, TTL_SECONDS);
+                }
+            }
+            Err(errno) => {
+                if callback_error_log_level("getattr", errno).is_some() {
+                    warn!(ino, errno, "macFUSE getattr callback returned error");
+                }
+                reply_error(pending, errno);
+            }
+        }
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE mkdir callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_mkdir(
+        req: *mut raw::FuseReq,
+        parent: raw::FuseIno,
+        name: *const c_char,
+        mode: mode_t,
+    ) |pending, state| "mkdir", Error {
+        if name.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes a NUL-terminated entry name for mkdir callbacks.
+        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+        match state.adapter.mkdir(parent, name, mode) {
+            Ok(attr) => {
+                debug!(
+                    parent,
+                    name = %String::from_utf8_lossy(name),
+                    ino = attr.ino,
+                    mode,
+                    "macFUSE mkdir callback created entry"
+                );
+                let stat = state.adapter.attr_to_stat(&attr);
+                if let Some(request) = pending.take() {
+                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let _ = Reply::new(request).entry(&entry);
+                }
+            }
+            Err(errno) => {
                 warn!(
                     parent,
                     name = %String::from_utf8_lossy(name),
                     errno,
-                    "macFUSE lookup callback returned error"
+                    "macFUSE mkdir callback returned error"
                 );
-            }
-            reply_error(req, errno);
-        }
-    }
-}
-
-/// macFUSE forget callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_forget(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    nlookup: c_ulong,
-) {
-    let Some(state) = callback_state(req) else {
-        return;
-    };
-    state.adapter.forget(ino, nlookup);
-}
-
-/// macFUSE getattr callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_getattr(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    _fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    match state.adapter.getattr(ino) {
-        Ok(attr) => {
-            if let Some(request) = owned_request(req) {
-                let _ = Reply::new(request).attr(&attr, TTL_SECONDS);
+                reply_error(pending, errno);
             }
         }
-        Err(errno) => {
-            if callback_error_log_level("getattr", errno).is_some() {
-                warn!(ino, errno, "macFUSE getattr callback returned error");
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE symlink callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_symlink(
+        req: *mut raw::FuseReq,
+        target: *const c_char,
+        parent: raw::FuseIno,
+        name: *const c_char,
+    ) |pending, state| "symlink", Error {
+        if target.is_null() || name.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes NUL-terminated symlink target and entry name strings.
+        let target = unsafe { CStr::from_ptr(target) }.to_bytes();
+        // SAFETY: macFUSE passes NUL-terminated symlink target and entry name strings.
+        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+        let Some(request) = pending.take() else {
+            return;
+        };
+        state
+            .adapter
+            .queue_symlink_reply(parent, name.to_vec(), target.to_vec(), request);
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE mknod callback for regular-file creation paths that do not use create.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_mknod(
+        req: *mut raw::FuseReq,
+        parent: raw::FuseIno,
+        name: *const c_char,
+        mode: mode_t,
+        _rdev: libc::dev_t,
+    ) |pending, state| "mknod", Error {
+        if name.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes a NUL-terminated entry name for mknod callbacks.
+        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+        match state.adapter.mknod(parent, name, mode) {
+            Ok(attr) => {
+                debug!(
+                    parent,
+                    name = %String::from_utf8_lossy(name),
+                    ino = attr.ino,
+                    mode,
+                    "macFUSE mknod callback created entry"
+                );
+                let stat = state.adapter.attr_to_stat(&attr);
+                if let Some(request) = pending.take() {
+                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let _ = Reply::new(request).entry(&entry);
+                }
             }
-            reply_error(req, errno);
-        }
-    }
-}
-
-/// macFUSE mkdir callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_mkdir(
-    req: *mut raw::FuseReq,
-    parent: raw::FuseIno,
-    name: *const c_char,
-    mode: mode_t,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if name.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes a NUL-terminated entry name for mkdir callbacks.
-    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    match state.adapter.mkdir(parent, name, mode) {
-        Ok(attr) => {
-            debug!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                ino = attr.ino,
-                mode,
-                "macFUSE mkdir callback created entry"
-            );
-            let stat = state.adapter.attr_to_stat(&attr);
-            if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
-                let _ = Reply::new(request).entry(&entry);
-            }
-        }
-        Err(errno) => {
-            warn!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                errno,
-                "macFUSE mkdir callback returned error"
-            );
-            reply_error(req, errno);
-        }
-    }
-}
-
-/// macFUSE symlink callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_symlink(
-    req: *mut raw::FuseReq,
-    target: *const c_char,
-    parent: raw::FuseIno,
-    name: *const c_char,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if target.is_null() || name.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes NUL-terminated symlink target and entry name strings.
-    let target = unsafe { CStr::from_ptr(target) }.to_bytes();
-    // SAFETY: macFUSE passes NUL-terminated symlink target and entry name strings.
-    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    let Some(request) = owned_request(req) else {
-        return;
-    };
-    state
-        .adapter
-        .queue_symlink_reply(parent, name.to_vec(), target.to_vec(), request);
-}
-
-/// macFUSE mknod callback for regular-file creation paths that do not use create.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_mknod(
-    req: *mut raw::FuseReq,
-    parent: raw::FuseIno,
-    name: *const c_char,
-    mode: mode_t,
-    _rdev: libc::dev_t,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if name.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes a NUL-terminated entry name for mknod callbacks.
-    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    match state.adapter.mknod(parent, name, mode) {
-        Ok(attr) => {
-            debug!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                ino = attr.ino,
-                mode,
-                "macFUSE mknod callback created entry"
-            );
-            let stat = state.adapter.attr_to_stat(&attr);
-            if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
-                let _ = Reply::new(request).entry(&entry);
+            Err(errno) => {
+                warn!(
+                    parent,
+                    name = %String::from_utf8_lossy(name),
+                    mode,
+                    errno,
+                    "macFUSE mknod callback returned error"
+                );
+                reply_error(pending, errno);
             }
         }
-        Err(errno) => {
-            warn!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                mode,
-                errno,
-                "macFUSE mknod callback returned error"
-            );
-            reply_error(req, errno);
-        }
     }
 }
 
-/// macFUSE create callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_create(
-    req: *mut raw::FuseReq,
-    parent: raw::FuseIno,
-    name: *const c_char,
-    mode: mode_t,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if name.is_null() || fi.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes a NUL-terminated entry name for create callbacks.
-    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    // SAFETY: macFUSE passes initialized file info for create callbacks.
-    let flags = unsafe { (*fi).flags };
-    match state.adapter.create_for_reply(parent, name, mode, flags) {
-        Ok((attr, open, _reply_guard)) => {
-            debug!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                ino = attr.ino,
-                mode,
-                flags,
-                file_handle = open.file_handle(),
-                "macFUSE create callback created entry"
-            );
-            let stat = state.adapter.attr_to_stat(&attr);
-            if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
-                if let Err(error) = Reply::new(request).create(&entry, open) {
-                    warn!(
-                        ino = attr.ino,
-                        file_handle = open.file_handle(),
-                        ?error,
-                        "macFUSE create reply was rejected"
-                    );
+macfuse_callback! {
+    /// macFUSE create callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_create(
+        req: *mut raw::FuseReq,
+        parent: raw::FuseIno,
+        name: *const c_char,
+        mode: mode_t,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "create", Error {
+        if name.is_null() || fi.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes a NUL-terminated entry name for create callbacks.
+        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+        // SAFETY: macFUSE passes initialized file info for create callbacks.
+        let flags = unsafe { (*fi).flags };
+        match state.adapter.create_for_reply(parent, name, mode, flags) {
+            Ok((attr, open, _reply_guard)) => {
+                debug!(
+                    parent,
+                    name = %String::from_utf8_lossy(name),
+                    ino = attr.ino,
+                    mode,
+                    flags,
+                    file_handle = open.file_handle(),
+                    "macFUSE create callback created entry"
+                );
+                let stat = state.adapter.attr_to_stat(&attr);
+                if let Some(request) = pending.take() {
+                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    if let Err(error) = Reply::new(request).create(&entry, open) {
+                        warn!(
+                            ino = attr.ino,
+                            file_handle = open.file_handle(),
+                            ?error,
+                            "macFUSE create reply was rejected"
+                        );
+                        state
+                            .adapter
+                            .reject_prepared_open(attr.ino, open.file_handle());
+                    }
+                } else {
                     state
                         .adapter
                         .reject_prepared_open(attr.ino, open.file_handle());
                 }
-            } else {
-                state
-                    .adapter
-                    .reject_prepared_open(attr.ino, open.file_handle());
+            }
+            Err(errno) => {
+                warn!(
+                    parent,
+                    name = %String::from_utf8_lossy(name),
+                    mode,
+                    flags,
+                    errno,
+                    "macFUSE create callback returned error"
+                );
+                reply_error(pending, errno);
             }
         }
-        Err(errno) => {
-            warn!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                mode,
-                flags,
-                errno,
-                "macFUSE create callback returned error"
-            );
-            reply_error(req, errno);
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE unlink callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_unlink(
+        req: *mut raw::FuseReq,
+        parent: raw::FuseIno,
+        name: *const c_char,
+    ) |pending, state| "unlink", Error {
+        if name.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
         }
-    }
-}
-
-/// macFUSE unlink callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_unlink(
-    req: *mut raw::FuseReq,
-    parent: raw::FuseIno,
-    name: *const c_char,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if name.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes a NUL-terminated entry name for unlink callbacks.
-    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    match state.adapter.unlink(parent, name) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => {
-            warn!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                errno,
-                "macFUSE unlink callback returned error"
-            );
-            reply_error(req, errno);
-        }
-    }
-}
-
-/// macFUSE rmdir callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_rmdir(
-    req: *mut raw::FuseReq,
-    parent: raw::FuseIno,
-    name: *const c_char,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if name.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes a NUL-terminated entry name for rmdir callbacks.
-    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    let Some(request) = owned_request(req) else {
-        return;
-    };
-    state
-        .adapter
-        .queue_rmdir_reply(parent, name.to_vec(), request);
-}
-
-/// macFUSE rename callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_rename(
-    req: *mut raw::FuseReq,
-    parent: raw::FuseIno,
-    name: *const c_char,
-    newparent: raw::FuseIno,
-    newname: *const c_char,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if name.is_null() || newname.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes NUL-terminated entry names for rename callbacks.
-    let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    // SAFETY: macFUSE passes NUL-terminated entry names for rename callbacks.
-    let newname = unsafe { CStr::from_ptr(newname) }.to_bytes();
-    match state.adapter.rename(parent, name, newparent, newname) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => {
-            warn!(
-                parent,
-                name = %String::from_utf8_lossy(name),
-                newparent,
-                newname = %String::from_utf8_lossy(newname),
-                errno,
-                "macFUSE rename callback returned error"
-            );
-            reply_error(req, errno);
-        }
-    }
-}
-
-/// macFUSE hard-link callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_link(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    newparent: raw::FuseIno,
-    newname: *const c_char,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if newname.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes a NUL-terminated entry name for link callbacks.
-    let newname = unsafe { CStr::from_ptr(newname) }.to_bytes();
-    match state.adapter.link(ino, newparent, newname) {
-        Ok(attr) => {
-            let stat = state.adapter.attr_to_stat(&attr);
-            if let Some(request) = owned_request(req) {
-                let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
-                let _ = Reply::new(request).entry(&entry);
+        // SAFETY: macFUSE passes a NUL-terminated entry name for unlink callbacks.
+        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+        match state.adapter.unlink(parent, name) {
+            Ok(()) => reply_error(pending, 0),
+            Err(errno) => {
+                warn!(
+                    parent,
+                    name = %String::from_utf8_lossy(name),
+                    errno,
+                    "macFUSE unlink callback returned error"
+                );
+                reply_error(pending, errno);
             }
         }
-        Err(errno) => {
-            warn!(
-                ino,
-                newparent,
-                newname = %String::from_utf8_lossy(newname),
-                errno,
-                "macFUSE link callback returned error"
-            );
-            reply_error(req, errno);
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE rmdir callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_rmdir(
+        req: *mut raw::FuseReq,
+        parent: raw::FuseIno,
+        name: *const c_char,
+    ) |pending, state| "rmdir", Error {
+        if name.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes a NUL-terminated entry name for rmdir callbacks.
+        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+        let Some(request) = pending.take() else {
+            return;
+        };
+        state
+            .adapter
+            .queue_rmdir_reply(parent, name.to_vec(), request);
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE rename callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_rename(
+        req: *mut raw::FuseReq,
+        parent: raw::FuseIno,
+        name: *const c_char,
+        newparent: raw::FuseIno,
+        newname: *const c_char,
+    ) |pending, state| "rename", Error {
+        if name.is_null() || newname.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes NUL-terminated entry names for rename callbacks.
+        let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+        // SAFETY: macFUSE passes NUL-terminated entry names for rename callbacks.
+        let newname = unsafe { CStr::from_ptr(newname) }.to_bytes();
+        match state.adapter.rename(parent, name, newparent, newname) {
+            Ok(()) => reply_error(pending, 0),
+            Err(errno) => {
+                warn!(
+                    parent,
+                    name = %String::from_utf8_lossy(name),
+                    newparent,
+                    newname = %String::from_utf8_lossy(newname),
+                    errno,
+                    "macFUSE rename callback returned error"
+                );
+                reply_error(pending, errno);
+            }
         }
     }
 }
 
-/// macFUSE open callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_open(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if fi.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
+macfuse_callback! {
+    /// macFUSE hard-link callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_link(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        newparent: raw::FuseIno,
+        newname: *const c_char,
+    ) |pending, state| "link", Error {
+        if newname.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes a NUL-terminated entry name for link callbacks.
+        let newname = unsafe { CStr::from_ptr(newname) }.to_bytes();
+        match state.adapter.link(ino, newparent, newname) {
+            Ok(attr) => {
+                let stat = state.adapter.attr_to_stat(&attr);
+                if let Some(request) = pending.take() {
+                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let _ = Reply::new(request).entry(&entry);
+                }
+            }
+            Err(errno) => {
+                warn!(
+                    ino,
+                    newparent,
+                    newname = %String::from_utf8_lossy(newname),
+                    errno,
+                    "macFUSE link callback returned error"
+                );
+                reply_error(pending, errno);
+            }
+        }
     }
-    // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for open.
-    let flags = unsafe { (*fi).flags };
-    let _reply_guard =
-        (!state.adapter.is_runtime_stats_file_ino(ino)).then(|| state.adapter.lock_open_reply(ino));
-    match state.adapter.open(ino, flags) {
-        Ok(open) => {
-            if let Some(request) = owned_request(req) {
-                if let Err(error) = Reply::new(request).open(open) {
-                    warn!(
-                        ino,
-                        file_handle = open.file_handle(),
-                        ?error,
-                        "macFUSE open reply was rejected"
-                    );
+}
+
+macfuse_callback! {
+    /// macFUSE open callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_open(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "open", Error {
+        if fi.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for open.
+        let flags = unsafe { (*fi).flags };
+        let _reply_guard =
+            (!state.adapter.is_runtime_stats_file_ino(ino)).then(|| state.adapter.lock_open_reply(ino));
+        match state.adapter.open(ino, flags) {
+            Ok(open) => {
+                if let Some(request) = pending.take() {
+                    if let Err(error) = Reply::new(request).open(open) {
+                        warn!(
+                            ino,
+                            file_handle = open.file_handle(),
+                            ?error,
+                            "macFUSE open reply was rejected"
+                        );
+                        if state.adapter.is_runtime_stats_file_ino(ino) {
+                            if let Err(errno) = state.adapter.release(ino, open.file_handle()) {
+                                warn!(
+                                    ino,
+                                    file_handle = open.file_handle(),
+                                    errno,
+                                    "macFUSE failed to close runtime stats after rejected open reply"
+                                );
+                            }
+                        } else {
+                            state.adapter.reject_prepared_open(ino, open.file_handle());
+                        }
+                    }
+                } else {
                     if state.adapter.is_runtime_stats_file_ino(ino) {
                         if let Err(errno) = state.adapter.release(ino, open.file_handle()) {
                             warn!(
                                 ino,
                                 file_handle = open.file_handle(),
                                 errno,
-                                "macFUSE failed to close runtime stats after rejected open reply"
+                                "macFUSE failed to close runtime stats without an open request"
                             );
                         }
                     } else {
                         state.adapter.reject_prepared_open(ino, open.file_handle());
                     }
                 }
-            } else {
-                if state.adapter.is_runtime_stats_file_ino(ino) {
-                    if let Err(errno) = state.adapter.release(ino, open.file_handle()) {
-                        warn!(
-                            ino,
-                            file_handle = open.file_handle(),
-                            errno,
-                            "macFUSE failed to close runtime stats without an open request"
-                        );
-                    }
-                } else {
-                    state.adapter.reject_prepared_open(ino, open.file_handle());
-                }
             }
-        }
-        Err(errno) => {
-            warn!(ino, flags, errno, "macFUSE open callback returned error");
-            reply_error(req, errno);
+            Err(errno) => {
+                warn!(ino, flags, errno, "macFUSE open callback returned error");
+                reply_error(pending, errno);
+            }
         }
     }
 }
 
-/// macFUSE read callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_read(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    size: size_t,
-    off: off_t,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if fi.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    let size = match u32::try_from(size) {
-        Ok(size) => size,
-        Err(_) => {
-            reply_error(req, libc::EOVERFLOW);
+macfuse_callback! {
+    /// macFUSE read callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_read(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        size: size_t,
+        off: off_t,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "read", Error {
+        if fi.is_null() {
+            reply_error(pending, libc::EINVAL);
             return;
         }
-    };
-    // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for read.
-    let file_handle = unsafe { (*fi).fh };
-    let Some(request) = owned_request(req) else {
-        debug!(
-            ino,
-            file_handle,
-            offset = off,
-            size,
-            "macFUSE read request ownership unavailable"
-        );
-        return;
-    };
-    state
-        .adapter
-        .queue_read_reply(ino, file_handle, off, size, request);
-}
-
-/// macFUSE write callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_write(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    buf: *const c_char,
-    size: size_t,
-    off: off_t,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if fi.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    let data = if size == 0 {
-        &[]
-    } else {
-        if buf.is_null() {
-            reply_error(req, libc::EINVAL);
-            return;
-        }
-        // SAFETY: macFUSE passes a valid buffer of `size` bytes for non-empty
-        // writes, and the borrowed slice is used only within this callback.
-        unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size) }
-    };
-    // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for write.
-    let file_handle = unsafe { (*fi).fh };
-    match state.adapter.write(ino, file_handle, off, data) {
-        Ok(count) => {
-            if let Some(request) = owned_request(req) {
-                let _ = Reply::new(request).write_count(count as usize);
+        let size = match u32::try_from(size) {
+            Ok(size) => size,
+            Err(_) => {
+                reply_error(pending, libc::EOVERFLOW);
+                return;
             }
-        }
-        Err(errno) => {
-            warn!(
+        };
+        // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for read.
+        let file_handle = unsafe { (*fi).fh };
+        let Some(request) = pending.take() else {
+            debug!(
                 ino,
                 file_handle,
                 offset = off,
                 size,
-                errno,
-                "macFUSE write callback returned error"
+                "macFUSE read request ownership unavailable"
             );
-            reply_error(req, errno);
-        }
+            return;
+        };
+        state
+            .adapter
+            .queue_read_reply(ino, file_handle, off, size, request);
     }
 }
 
-/// macFUSE flush callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_flush(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if fi.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for flush.
-    let file_handle = unsafe { (*fi).fh };
-    match state.adapter.flush(ino, file_handle) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => {
-            warn!(
-                ino,
-                file_handle, errno, "macFUSE flush callback returned error"
-            );
-            reply_error(req, errno);
-        }
-    }
-}
-
-/// macFUSE fsync callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_fsync(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    datasync: libc::c_int,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    let file_handle = if fi.is_null() {
-        None
-    } else {
-        // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for handle-backed fsync.
-        Some(unsafe { (*fi).fh })
-    };
-    match state.adapter.fsync(file_handle, ino, datasync != 0) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => {
-            warn!(
-                ino,
-                file_handle,
-                datasync = datasync != 0,
-                errno,
-                "macFUSE fsync callback returned error"
-            );
-            reply_error(req, errno);
-        }
-    }
-}
-
-/// macFUSE setattr callback for size-changing truncate/extend operations.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_setattr(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    attr: *mut stat,
-    to_set: libc::c_int,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if attr.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    let args = match setattr_args_from_callback(attr, to_set) {
-        Ok(args) => args,
-        Err(errno) => {
-            warn!(
-                ino,
-                to_set, errno, "macFUSE setattr callback rejected arguments"
-            );
-            reply_error(req, errno);
+macfuse_callback! {
+    /// macFUSE write callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_write(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        buf: *const c_char,
+        size: size_t,
+        off: off_t,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "write", Error {
+        if fi.is_null() {
+            reply_error(pending, libc::EINVAL);
             return;
         }
-    };
-    if setattr_args_are_empty(&args) {
-        if setattr_mask_is_accepted_noop(to_set) {
-            state
-                .adapter
-                .remember_callback_file_flags(ino, attr, to_set);
-            debug!(
-                ino,
-                to_set, "macFUSE setattr callback accepted unsupported metadata bits as no-op"
-            );
-            match state.adapter.getattr(ino) {
-                Ok(stat) => {
-                    if let Some(request) = owned_request(req) {
-                        let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+        let data = if size == 0 {
+            &[]
+        } else {
+            if buf.is_null() {
+                reply_error(pending, libc::EINVAL);
+                return;
+            }
+            // SAFETY: macFUSE passes a valid buffer of `size` bytes for non-empty
+            // writes, and the borrowed slice is used only within this callback.
+            unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), size) }
+        };
+        // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for write.
+        let file_handle = unsafe { (*fi).fh };
+        match state.adapter.write(ino, file_handle, off, data) {
+            Ok(count) => {
+                if let Some(request) = pending.take() {
+                    let _ = Reply::new(request).write_count(count as usize);
+                }
+            }
+            Err(errno) => {
+                warn!(
+                    ino,
+                    file_handle,
+                    offset = off,
+                    size,
+                    errno,
+                    "macFUSE write callback returned error"
+                );
+                reply_error(pending, errno);
+            }
+        }
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE flush callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_flush(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "flush", Error {
+        if fi.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for flush.
+        let file_handle = unsafe { (*fi).fh };
+        match state.adapter.flush(ino, file_handle) {
+            Ok(()) => reply_error(pending, 0),
+            Err(errno) => {
+                warn!(
+                    ino,
+                    file_handle, errno, "macFUSE flush callback returned error"
+                );
+                reply_error(pending, errno);
+            }
+        }
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE fsync callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_fsync(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        datasync: libc::c_int,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "fsync", Error {
+        let file_handle = if fi.is_null() {
+            None
+        } else {
+            // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for handle-backed fsync.
+            Some(unsafe { (*fi).fh })
+        };
+        match state.adapter.fsync(file_handle, ino, datasync != 0) {
+            Ok(()) => reply_error(pending, 0),
+            Err(errno) => {
+                warn!(
+                    ino,
+                    file_handle,
+                    datasync = datasync != 0,
+                    errno,
+                    "macFUSE fsync callback returned error"
+                );
+                reply_error(pending, errno);
+            }
+        }
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE setattr callback for size-changing truncate/extend operations.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_setattr(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        attr: *mut stat,
+        to_set: libc::c_int,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "setattr", Error {
+        if attr.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        let args = match setattr_args_from_callback(attr, to_set) {
+            Ok(args) => args,
+            Err(errno) => {
+                warn!(
+                    ino,
+                    to_set, errno, "macFUSE setattr callback rejected arguments"
+                );
+                reply_error(pending, errno);
+                return;
+            }
+        };
+        if setattr_args_are_empty(&args) {
+            if setattr_mask_is_accepted_noop(to_set) {
+                state
+                    .adapter
+                    .remember_callback_file_flags(ino, attr, to_set);
+                debug!(
+                    ino,
+                    to_set, "macFUSE setattr callback accepted unsupported metadata bits as no-op"
+                );
+                match state.adapter.getattr(ino) {
+                    Ok(stat) => {
+                        if let Some(request) = pending.take() {
+                            let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                        }
+                    }
+                    Err(errno) => {
+                        warn!(
+                            ino,
+                            to_set, errno, "macFUSE setattr no-op getattr returned error"
+                        );
+                        reply_error(pending, errno);
                     }
                 }
-                Err(errno) => {
-                    warn!(
-                        ino,
-                        to_set, errno, "macFUSE setattr no-op getattr returned error"
-                    );
-                    reply_error(req, errno);
-                }
+                return;
             }
-            return;
-        }
-        warn!(
-            ino,
-            to_set,
-            errno = libc::ENOTSUP,
-            "macFUSE setattr callback received no supported attributes"
-        );
-        reply_error(req, libc::ENOTSUP);
-        return;
-    }
-    let file_handle = if fi.is_null() || !setattr_mask_has_fh(to_set) {
-        None
-    } else {
-        // SAFETY: macFUSE guarantees a valid file handle pointer when the
-        // callback mask includes the header-defined file-handle bit.
-        Some(unsafe { (*fi).fh })
-    };
-    match state.adapter.setattr(file_handle, ino, args) {
-        Ok(attr) => {
-            let stat = state.adapter.attr_to_stat(&attr);
-            if let Some(request) = owned_request(req) {
-                let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
-            }
-        }
-        Err(errno) => {
             warn!(
                 ino,
-                file_handle, to_set, errno, "macFUSE setattr callback returned error"
+                to_set,
+                errno = libc::ENOTSUP,
+                "macFUSE setattr callback received no supported attributes"
             );
-            reply_error(req, errno);
-        }
-    }
-}
-
-/// macFUSE Darwin setattr extension callback for file flags and extra times.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_setattr_x(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    attr: *mut raw::FuseSetattrX,
-    to_set: libc::c_int,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if attr.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    let flags = unsafe { (*attr).flags };
-    if setattr_mask_has_flags(to_set) {
-        state.adapter.file_flags.lock().insert(ino, flags);
-    }
-    let args = match setattr_x_args_from_callback(attr, to_set) {
-        Ok(args) => args,
-        Err(errno) => {
-            warn!(
-                ino,
-                to_set, errno, "macFUSE setattr_x callback rejected arguments"
-            );
-            reply_error(req, errno);
+            reply_error(pending, libc::ENOTSUP);
             return;
         }
-    };
-    debug!(
-        ino,
-        file_handle = ?setattr_x_file_handle(fi),
-        to_set,
-        flags,
-        "macFUSE setattr_x callback accepted Darwin metadata as overlay"
-    );
-    if !setattr_args_are_empty(&args) {
-        match state.adapter.setattr(setattr_x_file_handle(fi), ino, args) {
+        let file_handle = if fi.is_null() || !setattr_mask_has_fh(to_set) {
+            None
+        } else {
+            // SAFETY: macFUSE guarantees a valid file handle pointer when the
+            // callback mask includes the header-defined file-handle bit.
+            Some(unsafe { (*fi).fh })
+        };
+        match state.adapter.setattr(file_handle, ino, args) {
             Ok(attr) => {
                 let stat = state.adapter.attr_to_stat(&attr);
-                if let Some(request) = owned_request(req) {
+                if let Some(request) = pending.take() {
                     let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
                 }
             }
             Err(errno) => {
                 warn!(
                     ino,
-                    to_set, errno, "macFUSE setattr_x callback returned error"
+                    file_handle, to_set, errno, "macFUSE setattr callback returned error"
                 );
-                reply_error(req, errno);
+                reply_error(pending, errno);
             }
         }
-        return;
     }
-    match state.adapter.getattr(ino) {
-        Ok(stat) => {
-            if let Some(request) = owned_request(req) {
-                let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
-            }
+}
+
+macfuse_callback! {
+    /// macFUSE Darwin setattr extension callback for file flags and extra times.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_setattr_x(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        attr: *mut raw::FuseSetattrX,
+        to_set: libc::c_int,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "setattr_x", Error {
+        if attr.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
         }
-        Err(errno) => {
-            warn!(
-                ino,
-                to_set, errno, "macFUSE setattr_x getattr returned error"
-            );
-            reply_error(req, errno);
+        let flags = unsafe { (*attr).flags };
+        if setattr_mask_has_flags(to_set) {
+            state.adapter.file_flags.lock().insert(ino, flags);
+        }
+        let args = match setattr_x_args_from_callback(attr, to_set) {
+            Ok(args) => args,
+            Err(errno) => {
+                warn!(
+                    ino,
+                    to_set, errno, "macFUSE setattr_x callback rejected arguments"
+                );
+                reply_error(pending, errno);
+                return;
+            }
+        };
+        debug!(
+            ino,
+            file_handle = ?setattr_x_file_handle(fi),
+            to_set,
+            flags,
+            "macFUSE setattr_x callback accepted Darwin metadata as overlay"
+        );
+        if !setattr_args_are_empty(&args) {
+            match state.adapter.setattr(setattr_x_file_handle(fi), ino, args) {
+                Ok(attr) => {
+                    let stat = state.adapter.attr_to_stat(&attr);
+                    if let Some(request) = pending.take() {
+                        let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                    }
+                }
+                Err(errno) => {
+                    warn!(
+                        ino,
+                        to_set, errno, "macFUSE setattr_x callback returned error"
+                    );
+                    reply_error(pending, errno);
+                }
+            }
+            return;
+        }
+        match state.adapter.getattr(ino) {
+            Ok(stat) => {
+                if let Some(request) = pending.take() {
+                    let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                }
+            }
+            Err(errno) => {
+                warn!(
+                    ino,
+                    to_set, errno, "macFUSE setattr_x getattr returned error"
+                );
+                reply_error(pending, errno);
+            }
         }
     }
 }
@@ -4250,301 +4255,281 @@ fn setattr_supported_mask() -> libc::c_int {
     }
 }
 
-/// macFUSE release callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_release(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if fi.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for release.
-    let file_handle = unsafe { (*fi).fh };
-    match state.adapter.release(ino, file_handle) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => {
-            warn!(
-                ino,
-                file_handle, errno, "macFUSE release callback returned error"
-            );
-            reply_error(req, errno);
-        }
-    }
-}
-
-/// macFUSE opendir callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_opendir(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if fi.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    match state.adapter.opendir(ino) {
-        Ok(file_handle) => {
-            let Some(request) = owned_request(req) else {
-                let _ = state.adapter.releasedir(file_handle);
-                return;
-            };
-            if let Err(error) = Reply::new(request).open(OpenReply::new(file_handle)) {
-                warn!(
-                    ino,
-                    file_handle,
-                    ?error,
-                    "macFUSE opendir reply was rejected"
-                );
-                let _ = state.adapter.releasedir(file_handle);
-            }
-        }
-        Err(errno) => reply_callback_error(req, "opendir", errno),
-    }
-}
-
-/// macFUSE readdir callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_readdir(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    size: size_t,
-    off: off_t,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if fi.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for readdir.
-    let file_handle = unsafe { (*fi).fh };
-    let Some(request) = owned_request(req) else {
-        return;
-    };
-    match state
-        .adapter
-        .readdir_with_handle(&request, ino, file_handle, off, size)
-    {
-        Ok(entries) => {
-            let _ = Reply::new(request).directory_entries(&entries);
-        }
-        Err(errno) => {
-            log_callback_error("readdir", errno);
-            let _ = Reply::new(request).error(errno);
-        }
-    }
-}
-
-/// macFUSE releasedir callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_releasedir(
-    req: *mut raw::FuseReq,
-    _ino: raw::FuseIno,
-    fi: *mut raw::FuseFileInfo,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    if fi.is_null() {
-        reply_error(req, libc::EINVAL);
-        return;
-    }
-    // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for releasedir.
-    let file_handle = unsafe { (*fi).fh };
-    match state.adapter.releasedir(file_handle) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_callback_error(req, "releasedir", errno),
-    }
-}
-
-/// macFUSE readlink callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::FuseIno) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    match state.adapter.readlink(ino) {
-        Ok(target) => match CString::new(target) {
-            Ok(target) => {
-                if let Some(request) = owned_request(req) {
-                    let _ = Reply::new(request).readlink(&target);
-                }
-            }
-            Err(_) => reply_error(req, libc::EINVAL),
-        },
-        Err(errno) => reply_callback_error(req, "readlink", errno),
-    }
-}
-
-/// macFUSE statfs callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::FuseIno) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    match state.adapter.statfs() {
-        Ok(stats) => {
-            if let Some(request) = owned_request(req) {
-                let _ = Reply::new(request).statfs(&stats);
-            }
-        }
-        Err(errno) => reply_callback_error(req, "statfs", errno),
-    }
-}
-
-/// macFUSE setxattr callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_setxattr(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    name: *const c_char,
-    value: *const c_char,
-    size: size_t,
-    flags: libc::c_int,
-    position: u32,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    // SAFETY: The returned slice is used only within this callback while the
-    // macFUSE-provided request arguments are live.
-    let Some(name) = (unsafe { xattr_name_from_callback(req, name) }) else {
-        return;
-    };
-    // SAFETY: The returned slice is used only within this callback while the
-    // macFUSE-provided request arguments are live.
-    let Some(value) = (unsafe { xattr_value_from_callback(req, value, size) }) else {
-        return;
-    };
-    if position != 0 {
-        reply_error(req, libc::ENOTSUP);
-        return;
-    }
-    let flags = match u32::try_from(flags) {
-        Ok(flags) => flags,
-        Err(_) => {
-            reply_error(req, libc::EINVAL);
+macfuse_callback! {
+    /// macFUSE release callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_release(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "release", Error {
+        if fi.is_null() {
+            reply_error(pending, libc::EINVAL);
             return;
         }
-    };
-    match state.adapter.set_xattr(ino, name, value, flags) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_callback_error(req, "setxattr", errno),
-    }
-}
-
-/// macFUSE getxattr callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_getxattr(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    name: *const c_char,
-    size: size_t,
-    position: u32,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    // SAFETY: The returned slice is used only within this callback while the
-    // macFUSE-provided request arguments are live.
-    let Some(name) = (unsafe { xattr_name_from_callback(req, name) }) else {
-        return;
-    };
-    let position = position as usize;
-    if size == 0 {
-        match state.adapter.get_xattr_size(ino, name) {
-            Ok(Some(value_size)) => {
-                reply_xattr_size(req, xattr_size_from_position(value_size, position))
+        // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for release.
+        let file_handle = unsafe { (*fi).fh };
+        match state.adapter.release(ino, file_handle) {
+            Ok(()) => reply_error(pending, 0),
+            Err(errno) => {
+                warn!(
+                    ino,
+                    file_handle, errno, "macFUSE release callback returned error"
+                );
+                reply_error(pending, errno);
             }
-            Ok(None) => reply_callback_error(req, "getxattr", xattr_not_found_errno()),
-            Err(errno) => reply_callback_error(req, "getxattr", errno),
         }
-        return;
-    }
-    match state.adapter.get_xattr(ino, name) {
-        Ok(Some(value)) => {
-            reply_xattr_value(req, size, xattr_value_from_position(&value, position))
-        }
-        Ok(None) => reply_callback_error(req, "getxattr", xattr_not_found_errno()),
-        Err(errno) => reply_callback_error(req, "getxattr", errno),
     }
 }
 
-/// macFUSE listxattr callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_listxattr(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    size: size_t,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    match state.adapter.list_xattrs(ino) {
-        Ok(names) if size == 0 => reply_xattr_size(req, xattr_name_list_len(&names)),
-        Ok(names) => reply_xattr_value(req, size, &format_xattr_name_list(&names)),
-        Err(errno) => reply_callback_error(req, "listxattr", errno),
+macfuse_callback! {
+    /// macFUSE opendir callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_opendir(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "opendir", Error {
+        if fi.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        match state.adapter.opendir(ino) {
+            Ok(file_handle) => {
+                let Some(request) = pending.take() else {
+                    let _ = state.adapter.releasedir(file_handle);
+                    return;
+                };
+                if let Err(error) = Reply::new(request).open(OpenReply::new(file_handle)) {
+                    warn!(
+                        ino,
+                        file_handle,
+                        ?error,
+                        "macFUSE opendir reply was rejected"
+                    );
+                    let _ = state.adapter.releasedir(file_handle);
+                }
+            }
+            Err(errno) => reply_callback_error(pending, "opendir", errno),
+        }
     }
 }
 
-/// macFUSE removexattr callback for the StudioVfs bridge.
-#[unsafe(no_mangle)]
-pub extern "C" fn studiofs_macfuse_removexattr(
-    req: *mut raw::FuseReq,
-    ino: raw::FuseIno,
-    name: *const c_char,
-) {
-    let Some(state) = callback_state(req) else {
-        reply_error(req, libc::EIO);
-        return;
-    };
-    // SAFETY: The returned slice is used only within this callback while the
-    // macFUSE-provided request arguments are live.
-    let Some(name) = (unsafe { xattr_name_from_callback(req, name) }) else {
-        return;
-    };
-    match state.adapter.remove_xattr(ino, name) {
-        Ok(()) => reply_error(req, 0),
-        Err(errno) => reply_callback_error(req, "removexattr", errno),
+macfuse_callback! {
+    /// macFUSE readdir callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_readdir(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        size: size_t,
+        off: off_t,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "readdir", Error {
+        if fi.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for readdir.
+        let file_handle = unsafe { (*fi).fh };
+        let Some(request) = pending.take() else {
+            return;
+        };
+        match state
+            .adapter
+            .readdir_with_handle(&request, ino, file_handle, off, size)
+        {
+            Ok(entries) => {
+                let _ = Reply::new(request).directory_entries(&entries);
+            }
+            Err(errno) => {
+                log_callback_error("readdir", errno);
+                let _ = Reply::new(request).error(errno);
+            }
+        }
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE releasedir callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_releasedir(
+        req: *mut raw::FuseReq,
+        _ino: raw::FuseIno,
+        fi: *mut raw::FuseFileInfo,
+    ) |pending, state| "releasedir", Error {
+        if fi.is_null() {
+            reply_error(pending, libc::EINVAL);
+            return;
+        }
+        // SAFETY: macFUSE passes a valid `fuse_file_info` pointer for releasedir.
+        let file_handle = unsafe { (*fi).fh };
+        match state.adapter.releasedir(file_handle) {
+            Ok(()) => reply_error(pending, 0),
+            Err(errno) => reply_callback_error(pending, "releasedir", errno),
+        }
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE readlink callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::FuseIno) |pending, state| "readlink", Error {
+        match state.adapter.readlink(ino) {
+            Ok(target) => match CString::new(target) {
+                Ok(target) => {
+                    if let Some(request) = pending.take() {
+                        let _ = Reply::new(request).readlink(&target);
+                    }
+                }
+                Err(_) => reply_error(pending, libc::EINVAL),
+            },
+            Err(errno) => reply_callback_error(pending, "readlink", errno),
+        }
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE statfs callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::FuseIno) |pending, state| "statfs", Error {
+        match state.adapter.statfs() {
+            Ok(stats) => {
+                if let Some(request) = pending.take() {
+                    let _ = Reply::new(request).statfs(&stats);
+                }
+            }
+            Err(errno) => reply_callback_error(pending, "statfs", errno),
+        }
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE setxattr callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_setxattr(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        name: *const c_char,
+        value: *const c_char,
+        size: size_t,
+        flags: libc::c_int,
+        position: u32,
+    ) |pending, state| "setxattr", Error {
+        // SAFETY: The returned slice is used only within this callback while the
+        // macFUSE-provided request arguments are live.
+        let Some(name) = (unsafe { xattr_name_from_callback(pending, name) }) else {
+            return;
+        };
+        // SAFETY: The returned slice is used only within this callback while the
+        // macFUSE-provided request arguments are live.
+        let Some(value) = (unsafe { xattr_value_from_callback(pending, value, size) }) else {
+            return;
+        };
+        if position != 0 {
+            reply_error(pending, libc::ENOTSUP);
+            return;
+        }
+        let flags = match u32::try_from(flags) {
+            Ok(flags) => flags,
+            Err(_) => {
+                reply_error(pending, libc::EINVAL);
+                return;
+            }
+        };
+        match state.adapter.set_xattr(ino, name, value, flags) {
+            Ok(()) => reply_error(pending, 0),
+            Err(errno) => reply_callback_error(pending, "setxattr", errno),
+        }
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE getxattr callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_getxattr(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        name: *const c_char,
+        size: size_t,
+        position: u32,
+    ) |pending, state| "getxattr", Error {
+        // SAFETY: The returned slice is used only within this callback while the
+        // macFUSE-provided request arguments are live.
+        let Some(name) = (unsafe { xattr_name_from_callback(pending, name) }) else {
+            return;
+        };
+        let position = position as usize;
+        if size == 0 {
+            match state.adapter.get_xattr_size(ino, name) {
+                Ok(Some(value_size)) => {
+                    reply_xattr_size(pending, xattr_size_from_position(value_size, position))
+                }
+                Ok(None) => reply_callback_error(pending, "getxattr", xattr_not_found_errno()),
+                Err(errno) => reply_callback_error(pending, "getxattr", errno),
+            }
+            return;
+        }
+        match state.adapter.get_xattr(ino, name) {
+            Ok(Some(value)) => {
+                reply_xattr_value(pending, size, xattr_value_from_position(&value, position))
+            }
+            Ok(None) => reply_callback_error(pending, "getxattr", xattr_not_found_errno()),
+            Err(errno) => reply_callback_error(pending, "getxattr", errno),
+        }
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE listxattr callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_listxattr(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        size: size_t,
+    ) |pending, state| "listxattr", Error {
+        match state.adapter.list_xattrs(ino) {
+            Ok(names) if size == 0 => reply_xattr_size(pending, xattr_name_list_len(&names)),
+            Ok(names) => reply_xattr_value(pending, size, &format_xattr_name_list(&names)),
+            Err(errno) => reply_callback_error(pending, "listxattr", errno),
+        }
+    }
+}
+
+macfuse_callback! {
+    /// macFUSE removexattr callback for the StudioVfs bridge.
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_removexattr(
+        req: *mut raw::FuseReq,
+        ino: raw::FuseIno,
+        name: *const c_char,
+    ) |pending, state| "removexattr", Error {
+        // SAFETY: The returned slice is used only within this callback while the
+        // macFUSE-provided request arguments are live.
+        let Some(name) = (unsafe { xattr_name_from_callback(pending, name) }) else {
+            return;
+        };
+        match state.adapter.remove_xattr(ino, name) {
+            Ok(()) => reply_error(pending, 0),
+            Err(errno) => reply_callback_error(pending, "removexattr", errno),
+        }
     }
 }
 
 unsafe fn xattr_name_from_callback<'a>(
-    req: *mut raw::FuseReq,
+    pending: &mut Option<Request>,
     name: *const c_char,
 ) -> Option<&'a [u8]> {
     // SAFETY CONTRACT: the returned slice is borrowed from callback-owned
     // macFUSE memory and must not escape the current callback invocation.
     if name.is_null() {
-        reply_error(req, libc::EINVAL);
+        reply_error(pending, libc::EINVAL);
         return None;
     }
     Some(unsafe { CStr::from_ptr(name) }.to_bytes())
 }
 
 unsafe fn xattr_value_from_callback<'a>(
-    req: *mut raw::FuseReq,
+    pending: &mut Option<Request>,
     value: *const c_char,
     size: size_t,
 ) -> Option<&'a [u8]> {
@@ -4554,14 +4539,14 @@ unsafe fn xattr_value_from_callback<'a>(
         return Some(&[]);
     }
     if value.is_null() {
-        reply_error(req, libc::EINVAL);
+        reply_error(pending, libc::EINVAL);
         return None;
     }
     Some(unsafe { std::slice::from_raw_parts(value.cast::<u8>(), size) })
 }
 
-fn reply_xattr_size(req: *mut raw::FuseReq, value_len: usize) {
-    let Some(request) = owned_request(req) else {
+fn reply_xattr_size(pending: &mut Option<Request>, value_len: usize) {
+    let Some(request) = pending.take() else {
         return;
     };
     let _ = Reply::new(request).xattr_size(value_len);
@@ -4575,8 +4560,8 @@ pub(crate) fn xattr_value_from_position(value: &[u8], position: usize) -> &[u8] 
     value.get(position..).unwrap_or(&[])
 }
 
-fn reply_xattr_value(req: *mut raw::FuseReq, size: size_t, value: &[u8]) {
-    let Some(request) = owned_request(req) else {
+fn reply_xattr_value(pending: &mut Option<Request>, size: size_t, value: &[u8]) {
+    let Some(request) = pending.take() else {
         return;
     };
     if size < value.len() {
@@ -5123,6 +5108,195 @@ mod tests {
             callback_error_log_level("read", MACFUSE_READ_INTERRUPTED_ERRNO),
             None
         );
+    }
+
+    // Serialize initialization of the shared tracing callsite against a scoped subscriber.
+    static CALLBACK_LOG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum BoundaryReply {
+        Error(i32),
+        Standard,
+        None,
+    }
+
+    static BOUNDARY_REPLIES: std::sync::Mutex<Vec<BoundaryReply>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn boundary_test_request(completion: RequestCompletion) -> Request {
+        use crate::low_level::ReplyTestSink;
+        Request::from_raw_with_test_sink(
+            completion,
+            ReplyTestSink {
+                error: |_, errno| {
+                    BOUNDARY_REPLIES
+                        .lock()
+                        .unwrap()
+                        .push(BoundaryReply::Error(errno));
+                    0
+                },
+                standard: |_| {
+                    BOUNDARY_REPLIES
+                        .lock()
+                        .unwrap()
+                        .push(BoundaryReply::Standard);
+                    0
+                },
+                none: |_| BOUNDARY_REPLIES.lock().unwrap().push(BoundaryReply::None),
+            },
+        )
+    }
+
+    #[test]
+    fn callback_boundary_panic_completes_live_request_once() {
+        let _logging = CALLBACK_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (completion, expected) in [
+            (RequestCompletion::Error, BoundaryReply::Error(libc::EIO)),
+            (RequestCompletion::None, BoundaryReply::None),
+        ] {
+            BOUNDARY_REPLIES.lock().unwrap().clear();
+            let mut entered = false;
+            contain_callback_panic(Some(boundary_test_request(completion)), "test", |_| {
+                entered = true;
+                panic!("panic before reply");
+            });
+            let replies = std::mem::take(&mut *BOUNDARY_REPLIES.lock().unwrap());
+            assert!(entered);
+            assert_eq!(replies, [expected]);
+        }
+    }
+
+    #[test]
+    fn callback_boundary_panic_after_reply_sends_no_second_completion() {
+        let _logging = CALLBACK_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (completion, expected) in [
+            (RequestCompletion::Error, BoundaryReply::Error(0)),
+            (RequestCompletion::None, BoundaryReply::None),
+        ] {
+            BOUNDARY_REPLIES.lock().unwrap().clear();
+            contain_callback_panic(Some(boundary_test_request(completion)), "test", |pending| {
+                let reply = Reply::new(pending.take().unwrap());
+                match completion {
+                    RequestCompletion::Error => reply.error(0).unwrap(),
+                    RequestCompletion::None => reply.none().unwrap(),
+                }
+                panic!("panic after reply");
+            });
+            let replies = std::mem::take(&mut *BOUNDARY_REPLIES.lock().unwrap());
+            assert_eq!(replies, [expected]);
+        }
+    }
+
+    #[test]
+    fn callback_boundary_contains_panics() {
+        let _logging = CALLBACK_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        contain_callback_panic(None, "test", |_pending| {
+            panic!("simulated callback panic");
+        });
+    }
+
+    macfuse_callback! {
+        /// Test callback that panics after recording entry through the C ABI.
+        fn test_macfuse_panicking_callback(req: *mut raw::FuseReq, entered: *mut bool)
+        |_pending| "test", Error {
+            // SAFETY: The test passes a live exclusive boolean for this call.
+            unsafe { *entered = true };
+            panic!("simulated callback panic");
+        }
+    }
+
+    #[test]
+    fn callback_boundary_macro_contains_panic_through_c_abi() {
+        let _logging = CALLBACK_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut entered = false;
+        // SAFETY: The callback receives no request and a live exclusive boolean.
+        unsafe { test_macfuse_panicking_callback(std::ptr::null_mut(), &mut entered) };
+        assert!(entered);
+    }
+
+    #[test]
+    fn empty_callback_owner_reply_helpers_are_noops() {
+        let mut pending = None;
+        reply_error(&mut pending, libc::EIO);
+        reply_none(&mut pending);
+        reply_xattr_size(&mut pending, 0);
+        reply_xattr_value(&mut pending, 0, &[]);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn callback_boundary_contains_panicking_log_subscriber() {
+        let _logging = CALLBACK_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct PanickingWarnSubscriber {
+            warnings: std::sync::mpsc::Sender<()>,
+        }
+
+        impl tracing::Subscriber for PanickingWarnSubscriber {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, _: &tracing::Event<'_>) {
+                self.warnings.send(()).expect("record callback warning");
+                std::panic::resume_unwind(Box::new("simulated logging panic"));
+            }
+
+            fn enter(&self, _: &tracing::span::Id) {}
+
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let (warnings_tx, warnings_rx) = std::sync::mpsc::channel();
+        let dispatch = tracing::Dispatch::new(PanickingWarnSubscriber {
+            warnings: warnings_tx,
+        });
+        let _dispatch = tracing::dispatcher::set_default(&dispatch);
+        contain_callback_panic(None, "test", |_pending| panic!("simulated callback panic"));
+
+        BOUNDARY_REPLIES.lock().unwrap().clear();
+        let error = Reply::new(boundary_test_request(RequestCompletion::Error))
+            .none()
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(warnings_rx.try_iter().count(), 2);
+        let replies = std::mem::take(&mut *BOUNDARY_REPLIES.lock().unwrap());
+        assert_eq!(replies, [BoundaryReply::Error(libc::EIO)]);
+    }
+
+    #[test]
+    fn callback_boundary_contains_panicking_panic_payload_drop() {
+        struct PanicsOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for PanicsOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+                panic!("simulated panic payload destructor");
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(catch_callback_unwind(|| std::panic::panic_any(
+            PanicsOnDrop(Arc::clone(&dropped))
+        )));
+        assert!(dropped.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]

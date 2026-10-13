@@ -87,7 +87,7 @@ unsafe extern "C" fn blocked_write(
 
     // SAFETY: macFUSE supplied a live request and callback-owned arguments; the
     // production callback owns the request reply exactly as it does in a mount.
-    crate::adapter::studiofs_macfuse_write(req, ino, buf, size, offset, fi);
+    unsafe { crate::adapter::studiofs_macfuse_write(req, ino, buf, size, offset, fi) };
     if let Some(gate) = gate {
         let _ = gate.finished.send(());
     }

@@ -44,6 +44,8 @@ fn production_rust_sources() -> Vec<PathBuf> {
     [
         "crates/studiofs-cache/src/cached_store.rs",
         "crates/studiofs-cache/src/payload_index.rs",
+        "crates/studiofs-macfuse/src/adapter.rs",
+        "crates/studiofs-macfuse/src/low_level.rs",
         "crates/studiofs-winfsp/src/cache_policy.rs",
         "crates/studiofs-winfsp/src/lib.rs",
     ]
@@ -145,15 +147,32 @@ fn strip_cfg_test_items(contents: &str) -> String {
     let Ok(file) = syn::parse_file(contents) else {
         return contents.to_string();
     };
-    // This scoped tripwire only strips top-level test-only items. Keep nested
-    // test helpers out of production impl/module bodies until this moves to an
-    // AST visitor or a compiler lint.
+    // Strip the test-only items that this scoped production allowlist needs:
+    // top-level items and #[cfg(test)] methods inside production impl blocks.
     let mut excluded_ranges: Vec<_> = file
         .items
         .iter()
         .filter(|item| item_has_cfg_test(item))
         .filter_map(item_source_range)
         .collect();
+    for item in &file.items {
+        let syn::Item::Impl(impl_item) = item else {
+            continue;
+        };
+        for impl_item in &impl_item.items {
+            let syn::ImplItem::Fn(method) = impl_item else {
+                continue;
+            };
+            if method.attrs.iter().any(attr_is_cfg_test)
+                && let Some(attr) = method.attrs.first()
+            {
+                excluded_ranges.push((
+                    attr.span().byte_range().start,
+                    method.span().byte_range().end,
+                ));
+            }
+        }
+    }
 
     if excluded_ranges.is_empty() {
         return contents.to_string();
@@ -239,19 +258,28 @@ fn strip_cfg_test_items_handles_utf8_before_test_item() {
 }
 
 #[test]
-fn strip_cfg_test_items_keeps_nested_cfg_test_items_in_scope() {
+fn strip_cfg_test_items_omits_test_impl_methods_and_keeps_production_methods() {
     let contents = r#"
 struct ProductionType;
 
 impl ProductionType {
     #[cfg(test)]
-    fn nested_test_only() {}
+    fn nested_test_only() { test_value.unwrap(); }
+
+    fn production() { production_value.unwrap(); }
+
+    #[cfg(any(test, feature = "test-helper"))]
+    fn conditionally_compiled_for_production() { feature_value.unwrap(); }
 }
 "#;
 
     let filtered = strip_cfg_test_items(contents);
+    let violations = collect_panic_policy_violations("sample.rs", &filtered);
 
-    assert!(filtered.contains("nested_test_only"));
+    assert!(!filtered.contains("nested_test_only"));
+    assert!(filtered.contains("fn production"));
+    assert!(filtered.contains("fn conditionally_compiled_for_production"));
+    assert_eq!(violations.len(), 2, "{violations:?}");
 }
 
 #[test]
