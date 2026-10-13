@@ -1328,6 +1328,13 @@ impl OpenReply {
 pub struct Request {
     raw: Option<NonNull<raw::FuseReq>>,
     interrupt_key: Option<usize>,
+    completion: RequestCompletion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestCompletion {
+    Error,
+    None,
 }
 
 // SAFETY: macFUSE low-level requests may be handed off to worker threads and
@@ -1340,13 +1347,30 @@ impl Request {
     ///
     /// # Safety
     ///
+    /// `raw` must be a live macFUSE request pointer for a callback that accepts
+    /// an errno reply and has not been replied to. The wrapper must be consumed
+    /// by exactly one reply method.
+    pub unsafe fn from_raw(raw: *mut raw::FuseReq) -> Option<Self> {
+        // SAFETY: This forwards the caller's live, unreplied request contract.
+        unsafe { Self::from_raw_with_completion(raw, RequestCompletion::Error) }
+    }
+
+    /// Wrap a callback request with its fallback completion behavior.
+    ///
+    /// # Safety
+    ///
     /// `raw` must be a live macFUSE request pointer for a callback that has not
     /// been replied to. The returned wrapper must be consumed by exactly one
     /// reply method.
-    pub unsafe fn from_raw(raw: *mut raw::FuseReq) -> Option<Self> {
+    /// `completion` must match the callback: `None` for forget, `Error` otherwise.
+    pub(crate) unsafe fn from_raw_with_completion(
+        raw: *mut raw::FuseReq,
+        completion: RequestCompletion,
+    ) -> Option<Self> {
         NonNull::new(raw).map(|raw| Self {
             raw: Some(raw),
             interrupt_key: None,
+            completion,
         })
     }
 
@@ -1402,11 +1426,32 @@ impl Request {
 impl Drop for Request {
     fn drop(&mut self) {
         self.clear_interrupt_token();
-        if let Some(raw) = self.raw.take() {
-            // SAFETY: `Request` owns a live, unreplied callback request by
-            // construction. Dropping without a reply must fail the request so
-            // the kernel is not left waiting indefinitely.
-            unsafe { raw::fuse_reply_err(raw.as_ptr(), libc::EIO) };
+        drop_unreplied_request(
+            &mut self.raw,
+            self.completion,
+            |raw, errno| {
+                // SAFETY: `Request` owns a live, unreplied callback request.
+                unsafe { raw::fuse_reply_err(raw, errno) };
+            },
+            |raw| {
+                // SAFETY: `Request` owns a live forget request, which requires
+                // completion without a kernel reply.
+                unsafe { raw::fuse_reply_none(raw) };
+            },
+        );
+    }
+}
+
+fn drop_unreplied_request(
+    raw: &mut Option<NonNull<raw::FuseReq>>,
+    completion: RequestCompletion,
+    reply_error: impl FnOnce(*mut raw::FuseReq, c_int),
+    reply_none: impl FnOnce(*mut raw::FuseReq),
+) {
+    if let Some(raw) = raw.take() {
+        match completion {
+            RequestCompletion::Error => reply_error(raw.as_ptr(), libc::EIO),
+            RequestCompletion::None => reply_none(raw.as_ptr()),
         }
     }
 }
@@ -1775,6 +1820,7 @@ mod tests {
         let request = Request {
             raw: None,
             interrupt_key: None,
+            completion: RequestCompletion::Error,
         };
         let result = std::panic::catch_unwind(|| Reply::new(request).error(libc::EIO));
         assert!(result.is_ok(), "consumed request must not panic");
@@ -1788,6 +1834,7 @@ mod tests {
         let mut request = Request {
             raw: Some(raw),
             interrupt_key: None,
+            completion: RequestCompletion::Error,
         };
         assert_eq!(request.take_raw().unwrap(), raw);
         assert_eq!(
@@ -1801,6 +1848,35 @@ mod tests {
     }
 
     #[test]
+    fn forget_request_drop_uses_none_completion_once_after_move() {
+        let raw = NonNull::dangling();
+        let request = Request {
+            raw: Some(raw),
+            interrupt_key: None,
+            completion: RequestCompletion::None,
+        };
+        let mut moved = request;
+        let mut errors = Vec::new();
+        let mut none_replies = Vec::new();
+
+        let mut complete = || {
+            drop_unreplied_request(
+                &mut moved.raw,
+                moved.completion,
+                |raw, errno| errors.push((raw, errno)),
+                |raw| none_replies.push(raw),
+            );
+        };
+        complete();
+        complete();
+
+        assert!(errors.is_empty());
+        assert_eq!(none_replies, [raw.as_ptr()]);
+        assert!(moved.raw.is_none());
+        drop(moved);
+    }
+
+    #[test]
     fn consumed_request_clears_stale_interrupt_registration() {
         let _registry_lock = lock_interrupt_registry_for_test();
         let key = next_interrupt_key();
@@ -1809,6 +1885,7 @@ mod tests {
         let mut request = Request {
             raw: None,
             interrupt_key: Some(key),
+            completion: RequestCompletion::Error,
         };
         assert_eq!(
             request.take_raw().unwrap_err().raw_os_error(),
@@ -1825,6 +1902,7 @@ mod tests {
         let request = Request {
             raw: None,
             interrupt_key: None,
+            completion: RequestCompletion::Error,
         };
         let mut buffer = DirectoryEntryBuffer::new(1024);
         // SAFETY: An all-zero stat is valid initialized input; no FFI call is

@@ -40,7 +40,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::low_level::{DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, raw};
+use crate::low_level::{
+    DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, RequestCompletion, raw,
+};
 
 const TTL_SECONDS: f64 = 1.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = crate::low_level::MACOS_FUSE_IOSIZE_BYTES;
@@ -2558,31 +2560,18 @@ fn callback_error_log_level(operation: &'static str, errno: i32) -> Option<Callb
     Some(CallbackErrorLogLevel::Warn)
 }
 
-#[derive(Clone, Copy)]
-enum CallbackCompletion {
-    Error,
-    None,
-}
-
 fn contain_callback_panic(
     req: *mut raw::FuseReq,
     operation: &'static str,
-    completion: CallbackCompletion,
+    completion: RequestCompletion,
     callback: impl FnOnce(&mut Option<Request>),
 ) {
     // SAFETY: The C callback supplies a live unreplied request, owned here once.
-    let mut request = unsafe { Request::from_raw(req) };
+    let mut request = unsafe { Request::from_raw_with_completion(req, completion) };
     let panicked = catch_callback_unwind(|| callback(&mut request));
-    // Cleanup and diagnostics must also remain inside the non-unwinding boundary.
-    catch_callback_unwind(|| {
-        if let Some(request) = request.take() {
-            match completion {
-                CallbackCompletion::Error => drop(request),
-                CallbackCompletion::None => {
-                    let _ = Reply::new(request).none();
-                }
-            }
-        }
+    // Move all remaining ownership into protected cleanup, including Drop.
+    catch_callback_unwind(move || {
+        drop(request);
         if panicked {
             warn!(operation, "macFUSE callback panicked");
         }
@@ -2590,12 +2579,11 @@ fn contain_callback_panic(
 }
 
 macro_rules! macfuse_callback {
-    ($(#[$attr:meta])* $name:ident($req:ident: $req_type:ty, $($arg:ident: $arg_type:ty),* $(,)?)
+    ($(#[$attr:meta])* $vis:vis fn $name:ident($req:ident: $req_type:ty, $($arg:ident: $arg_type:ty),* $(,)?)
         |$pending:ident| $operation:literal, $completion:ident $body:block) => {
         $(#[$attr])*
-        #[unsafe(no_mangle)]
-        pub extern "C" fn $name($req: $req_type, $($arg: $arg_type),*) {
-            contain_callback_panic($req, $operation, CallbackCompletion::$completion,
+        $vis extern "C" fn $name($req: $req_type, $($arg: $arg_type),*) {
+            contain_callback_panic($req, $operation, RequestCompletion::$completion,
                 |$pending| $body);
         }
     };
@@ -3328,7 +3316,8 @@ fn statfs_to_statvfs(stats: StatFs) -> statvfs {
 
 macfuse_callback! {
     /// macFUSE lookup callback for the StudioVfs bridge.
-    studiofs_macfuse_lookup(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_lookup(
         req: *mut raw::FuseReq,
         parent: raw::FuseIno,
         name: *const c_char,
@@ -3368,7 +3357,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE forget callback for the StudioVfs bridge.
-    studiofs_macfuse_forget(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_forget(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         nlookup: c_ulong,
@@ -3384,7 +3374,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE getattr callback for the StudioVfs bridge.
-    studiofs_macfuse_getattr(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_getattr(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         _fi: *mut raw::FuseFileInfo,
@@ -3411,7 +3402,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE mkdir callback for the StudioVfs bridge.
-    studiofs_macfuse_mkdir(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_mkdir(
         req: *mut raw::FuseReq,
         parent: raw::FuseIno,
         name: *const c_char,
@@ -3457,7 +3449,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE symlink callback for the StudioVfs bridge.
-    studiofs_macfuse_symlink(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_symlink(
         req: *mut raw::FuseReq,
         target: *const c_char,
         parent: raw::FuseIno,
@@ -3486,7 +3479,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE mknod callback for regular-file creation paths that do not use create.
-    studiofs_macfuse_mknod(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_mknod(
         req: *mut raw::FuseReq,
         parent: raw::FuseIno,
         name: *const c_char,
@@ -3534,7 +3528,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE create callback for the StudioVfs bridge.
-    studiofs_macfuse_create(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_create(
         req: *mut raw::FuseReq,
         parent: raw::FuseIno,
         name: *const c_char,
@@ -3601,7 +3596,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE unlink callback for the StudioVfs bridge.
-    studiofs_macfuse_unlink(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_unlink(
         req: *mut raw::FuseReq,
         parent: raw::FuseIno,
         name: *const c_char,
@@ -3633,7 +3629,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE rmdir callback for the StudioVfs bridge.
-    studiofs_macfuse_rmdir(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_rmdir(
         req: *mut raw::FuseReq,
         parent: raw::FuseIno,
         name: *const c_char,
@@ -3659,7 +3656,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE rename callback for the StudioVfs bridge.
-    studiofs_macfuse_rename(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_rename(
         req: *mut raw::FuseReq,
         parent: raw::FuseIno,
         name: *const c_char,
@@ -3697,7 +3695,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE hard-link callback for the StudioVfs bridge.
-    studiofs_macfuse_link(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_link(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         newparent: raw::FuseIno,
@@ -3737,7 +3736,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE open callback for the StudioVfs bridge.
-    studiofs_macfuse_open(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_open(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         fi: *mut raw::FuseFileInfo,
@@ -3802,7 +3802,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE read callback for the StudioVfs bridge.
-    studiofs_macfuse_read(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_read(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         size: size_t,
@@ -3844,7 +3845,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE write callback for the StudioVfs bridge.
-    studiofs_macfuse_write(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_write(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         buf: *const c_char,
@@ -3896,7 +3898,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE flush callback for the StudioVfs bridge.
-    studiofs_macfuse_flush(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_flush(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         fi: *mut raw::FuseFileInfo,
@@ -3926,7 +3929,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE fsync callback for the StudioVfs bridge.
-    studiofs_macfuse_fsync(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_fsync(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         datasync: libc::c_int,
@@ -3960,7 +3964,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE setattr callback for size-changing truncate/extend operations.
-    studiofs_macfuse_setattr(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_setattr(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         attr: *mut stat,
@@ -4047,7 +4052,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE Darwin setattr extension callback for file flags and extra times.
-    studiofs_macfuse_setattr_x(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_setattr_x(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         attr: *mut raw::FuseSetattrX,
@@ -4333,7 +4339,8 @@ fn setattr_supported_mask() -> libc::c_int {
 
 macfuse_callback! {
     /// macFUSE release callback for the StudioVfs bridge.
-    studiofs_macfuse_release(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_release(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         fi: *mut raw::FuseFileInfo,
@@ -4363,7 +4370,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE opendir callback for the StudioVfs bridge.
-    studiofs_macfuse_opendir(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_opendir(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         fi: *mut raw::FuseFileInfo,
@@ -4399,7 +4407,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE readdir callback for the StudioVfs bridge.
-    studiofs_macfuse_readdir(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_readdir(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         size: size_t,
@@ -4436,7 +4445,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE releasedir callback for the StudioVfs bridge.
-    studiofs_macfuse_releasedir(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_releasedir(
         req: *mut raw::FuseReq,
         _ino: raw::FuseIno,
         fi: *mut raw::FuseFileInfo,
@@ -4460,7 +4470,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE readlink callback for the StudioVfs bridge.
-    studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::FuseIno) |pending| "readlink", Error {
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::FuseIno) |pending| "readlink", Error {
         let Some(state) = callback_state(req) else {
             reply_error(pending, libc::EIO);
             return;
@@ -4481,7 +4492,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE statfs callback for the StudioVfs bridge.
-    studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::FuseIno) |pending| "statfs", Error {
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::FuseIno) |pending| "statfs", Error {
         let Some(state) = callback_state(req) else {
             reply_error(pending, libc::EIO);
             return;
@@ -4499,7 +4511,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE setxattr callback for the StudioVfs bridge.
-    studiofs_macfuse_setxattr(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_setxattr(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         name: *const c_char,
@@ -4542,7 +4555,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE getxattr callback for the StudioVfs bridge.
-    studiofs_macfuse_getxattr(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_getxattr(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         name: *const c_char,
@@ -4581,7 +4595,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE listxattr callback for the StudioVfs bridge.
-    studiofs_macfuse_listxattr(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_listxattr(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         size: size_t,
@@ -4600,7 +4615,8 @@ macfuse_callback! {
 
 macfuse_callback! {
     /// macFUSE removexattr callback for the StudioVfs bridge.
-    studiofs_macfuse_removexattr(
+    #[unsafe(no_mangle)]
+    pub fn studiofs_macfuse_removexattr(
         req: *mut raw::FuseReq,
         ino: raw::FuseIno,
         name: *const c_char,
@@ -5223,14 +5239,14 @@ mod tests {
     fn callback_boundary_contains_panics() {
         let _logging = CALLBACK_LOG_TEST_LOCK.lock().unwrap();
         let req = std::ptr::null_mut();
-        contain_callback_panic(req, "test", CallbackCompletion::Error, |_pending| {
+        contain_callback_panic(req, "test", RequestCompletion::Error, |_pending| {
             panic!("simulated callback panic");
         });
     }
 
     macfuse_callback! {
         /// Test callback that panics after recording entry through the C ABI.
-        test_macfuse_panicking_callback(req: *mut raw::FuseReq, entered: *mut bool)
+        fn test_macfuse_panicking_callback(req: *mut raw::FuseReq, entered: *mut bool)
         |_pending| "test", Error {
             // SAFETY: The test passes a live exclusive boolean for this call.
             unsafe { *entered = true };
@@ -5294,7 +5310,7 @@ mod tests {
         contain_callback_panic(
             std::ptr::null_mut(),
             "test",
-            CallbackCompletion::Error,
+            RequestCompletion::Error,
             |_pending| panic!("simulated callback panic"),
         );
 
