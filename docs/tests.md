@@ -577,6 +577,7 @@ cargo run -p studiofs-e2e -- run mounted-large-history-cold-bootstrap-convergenc
 cargo run -p studiofs-e2e -- run rustfs-outage-multi-client-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-concurrent-mkdir-merge-convergence --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- local-first-baseline-gate --studiofs-bin target\debug\studiofs.exe --run-id-prefix sfs405-baseline --iterations 3 --seed 405 --port-range 29700-29800
 cargo run -p studiofs-e2e -- clean
 ```
@@ -588,6 +589,13 @@ repeat earlier pages. Applied versions remain monotonic within each session;
 the final mounted trees must match. Both clients use one batch per catch-up
 page to bound individual metadata commands.
 The scenario does not require elevated Windows privileges or a mounted fsync.
+
+`mounted-concurrent-mkdir-merge-convergence` stops PostgreSQL, lets client-a
+and client-b each `mkdir -p` the same directory and write their own file while
+neither can see the other, restarts PostgreSQL, and requires all three clients
+to converge and read both files. It restarts PostgreSQL even when the outage
+phase fails. The summary artifact is `concurrent-mkdir-merge-summary.json`; see
+ADR 0012 for the merge rule it checks.
 
 SFS-438 mounted runner lifecycle smoke for local operator validation:
 

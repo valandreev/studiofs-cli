@@ -734,6 +734,7 @@ impl RedbMetaEngine {
             symlinks: snapshot.symlinks,
             xattrs: snapshot.xattrs,
             acl_rules: snapshot.acl_rules,
+            directory_aliases: snapshot.directory_aliases,
         })
     }
 

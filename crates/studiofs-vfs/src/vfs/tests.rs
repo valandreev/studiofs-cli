@@ -15948,18 +15948,20 @@ fn deferred_attr_only_commit_does_not_revert_written_size() {
             "getattr should report local dirty size before background commit"
         );
 
-        // Hang guard only: the open-handle materializer lingers up to 1.2s before the commit.
+        // Interrupt the open-handle linger instead of waiting out its timer; the
+        // interrupted materializer commits through the same local-dirty drain.
         tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let persisted_size = meta.get_attr(ino).map(|attr| attr.size).unwrap_or(0);
-                if persisted_size == payload.len() as u64 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            vfs.wait_for_deferred_materialization_inflight(ino).await;
+            vfs.wait_for_deferred_namespace_metadata(ino).await
         })
         .await
-        .expect("attr-only commit must not revert background-written size");
+        .expect("background commits should settle")
+        .expect("deferred attr-only setattr should commit");
+        assert_eq!(
+            meta.get_attr(ino).expect("load persisted attr").size,
+            payload.len() as u64,
+            "attr-only commit must not revert background-written size"
+        );
 
         vfs.release_fh(fh).await.expect("release handle");
     });
@@ -16721,6 +16723,83 @@ fn deferred_namespace_dir_conflict_abandons_child_and_retries_independent_ops_ac
                 .degraded
                 .load(AtomicOrdering::Acquire),
             "a dependent child create must not degrade the mount after a directory conflict"
+        );
+    });
+}
+
+/// A peer's `shared/` replays after a lagging mkdir was admitted but before it
+/// committed. The local directory and its child must commit, shadowing the
+/// peer's entry until the metadata layer merges both on replay.
+#[test]
+fn deferred_namespace_dir_shadows_peer_directory_replayed_after_admission() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-dir-shadows-replayed-peer");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(true, AtomicOrdering::Release);
+        let local_dir = vfs
+            .mkdir_with_deferred_metadata_admission(ROOT_INO, b"shared", 0, 0, 0o755, rt.handle())
+            .expect("admit lagging mkdir");
+        let child = vfs
+            .create_with_deferred_metadata_admission(
+                local_dir.ino,
+                b"child.txt",
+                0,
+                0,
+                0o644,
+                rt.handle(),
+            )
+            .expect("admit child under the lagging directory");
+
+        let peer_dir = InodeAttr::new_dir(9_990_001, ROOT_INO, 0, 0, 0o755);
+        let replayed = [
+            studiofs_meta::MetaEvent::SetAttr {
+                attr: peer_dir.clone(),
+            },
+            studiofs_meta::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"shared".to_vec(),
+                entry: studiofs_meta::schema::DirEntryValue {
+                    ino: peer_dir.ino,
+                    kind: FileType::Directory,
+                },
+            },
+        ];
+        meta.apply_replica_events_to_base(&replayed).unwrap();
+        meta.apply_replica_serving_state(&replayed).unwrap();
+        assert_eq!(meta.lookup(ROOT_INO, b"shared").unwrap().ino, peer_dir.ino);
+
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(false, AtomicOrdering::Release);
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+        for ino in [local_dir.ino, child.ino] {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                vfs.wait_for_deferred_namespace_metadata(ino),
+            )
+            .await
+            .expect("deferred operations should settle")
+            .expect("the lagging peer's work must commit, not be abandoned");
+        }
+
+        assert_eq!(meta.lookup(ROOT_INO, b"shared").unwrap().ino, local_dir.ino);
+        assert_eq!(
+            meta.lookup(local_dir.ino, b"child.txt").unwrap().ino,
+            child.ino
+        );
+        assert!(
+            !vfs.state
+                .namespace
+                .deferred
+                .degraded
+                .load(AtomicOrdering::Acquire)
         );
     });
 }

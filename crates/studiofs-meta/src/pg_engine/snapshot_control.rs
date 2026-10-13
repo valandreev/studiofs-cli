@@ -357,7 +357,7 @@ impl PgSnapshotBackend {
         })?;
         if raw.checkpoint_version < 0
             || raw.checkpoint_version > cut.cut_version()
-            || raw.checkpoint_format_version != ServingCheckpoint::FORMAT_VERSION
+            || !ServingCheckpoint::supports_format_version(raw.checkpoint_format_version)
             || raw.checkpoint_schema_version != ServingCheckpoint::SCHEMA_VERSION
             || raw.checkpoint_sha256.as_slice() != Sha256::digest(&raw.checkpoint_bytes).as_slice()
         {
@@ -422,12 +422,11 @@ impl PgSnapshotBackend {
         loaded: LoadedSnapshotSource,
         destination: &Path,
     ) -> Result<SnapshotReconstruction, SnapshotSourceError> {
-        let checkpoint: ServingCheckpoint = postcard::from_bytes(&loaded.checkpoint_bytes)
-            .map_err(|_| {
-                SnapshotSourceError::permanent(snapshot_control_error(
-                    "decode snapshot source checkpoint",
-                ))
-            })?;
+        let checkpoint = ServingCheckpoint::decode(&loaded.checkpoint_bytes).map_err(|_| {
+            SnapshotSourceError::permanent(snapshot_control_error(
+                "decode snapshot source checkpoint",
+            ))
+        })?;
         let local = RedbMetaEngine::open(destination).map_err(SnapshotSourceError::retryable)?;
         local
             .set_format_info(&loaded.format_info)
@@ -677,7 +676,7 @@ impl<T: SnapshotBackendAccess + Send + Sync> SnapshotSourceReader for T {
             if cut.volume_id() != self.snapshot_volume_id()
                 || descriptor.checkpoint_version < 0
                 || descriptor.checkpoint_version > cut.cut_version()
-                || descriptor.checkpoint_format_version != ServingCheckpoint::FORMAT_VERSION
+                || !ServingCheckpoint::supports_format_version(descriptor.checkpoint_format_version)
                 || descriptor.checkpoint_schema_version != ServingCheckpoint::SCHEMA_VERSION
             {
                 return Err(SnapshotPortError::permanent(
@@ -808,7 +807,7 @@ where
             "published checkpoint version is invalid",
         ));
     }
-    postcard::from_bytes::<ServingCheckpoint>(&checkpoint_bytes)
+    ServingCheckpoint::decode(&checkpoint_bytes)
         .map_err(|_| snapshot_control_error("published checkpoint payload is invalid"))?;
     let event_bounds = client
             .query_one(

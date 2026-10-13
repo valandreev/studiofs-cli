@@ -20,6 +20,7 @@ pub(super) struct NamespaceCreateSpec<'a> {
     uid: u32,
     gid: u32,
     kind: NamespaceCreateKind<'a>,
+    shadows_replayed_entry: bool,
 }
 
 impl<'a> NamespaceCreateSpec<'a> {
@@ -38,6 +39,7 @@ impl<'a> NamespaceCreateSpec<'a> {
             uid,
             gid,
             kind: NamespaceCreateKind::File { mode },
+            shadows_replayed_entry: false,
         }
     }
 
@@ -56,6 +58,7 @@ impl<'a> NamespaceCreateSpec<'a> {
             uid,
             gid,
             kind: NamespaceCreateKind::Directory { mode },
+            shadows_replayed_entry: false,
         }
     }
 
@@ -74,7 +77,16 @@ impl<'a> NamespaceCreateSpec<'a> {
             uid,
             gid,
             kind: NamespaceCreateKind::Symlink { target },
+            shadows_replayed_entry: false,
         }
+    }
+
+    /// Lets a create admitted before a peer's same-kind entry replayed shadow
+    /// that entry locally. Replay of this create then merges directories or
+    /// lets the later file win, like a create that committed first.
+    pub(super) fn shadowing_replayed_entry(mut self) -> Self {
+        self.shadows_replayed_entry = true;
+        self
     }
 
     pub(super) fn kind(&self) -> FileType {
@@ -140,7 +152,10 @@ impl<'a> NamespaceCreateTxn<'a> {
         if parent_attr.kind != FileType::Directory {
             return Err(MetaError::NotADirectory(spec.parent));
         }
-        if RedbMetaEngine::lookup_merged_in_write_txn(self.txn, spec.parent, spec.name)?.is_some() {
+        if let Some(existing) =
+            RedbMetaEngine::lookup_merged_in_write_txn(self.txn, spec.parent, spec.name)?
+            && !(spec.shadows_replayed_entry && self.is_replayed_entry(spec, &existing)?)
+        {
             return Err(MetaError::EntryExists {
                 parent: spec.parent,
                 name: String::from_utf8_lossy(spec.name).to_string(),
@@ -176,6 +191,25 @@ impl<'a> NamespaceCreateTxn<'a> {
 
         self.append_create_events(spec, &attr, parent_attr_event)?;
         Ok(attr)
+    }
+
+    /// A same-kind entry that serving holds only because replay put it in base;
+    /// local authority (an unpublished or locally changed name) never matches.
+    fn is_replayed_entry(
+        &self,
+        spec: &NamespaceCreateSpec<'_>,
+        existing: &DirEntryValue,
+    ) -> MetaResult<bool> {
+        Ok(existing.kind == spec.kind()
+            && matches!(spec.kind(), FileType::Directory | FileType::RegularFile)
+            && RedbMetaEngine::lookup_in_write_table(
+                self.txn,
+                BASE_DENTRIES_TABLE,
+                spec.parent,
+                spec.name,
+            )?
+            .as_ref()
+                == Some(existing))
     }
 
     pub(super) fn increment_total_inodes(&self) -> MetaResult<()> {
@@ -714,9 +748,10 @@ impl RedbMetaEngine {
                     uid,
                     gid,
                     mode,
-                } => namespace_txn.execute(&NamespaceCreateSpec::new_file(
-                    *ino, *parent, name, *uid, *gid, *mode,
-                )),
+                } => namespace_txn.execute(
+                    &NamespaceCreateSpec::new_file(*ino, *parent, name, *uid, *gid, *mode)
+                        .shadowing_replayed_entry(),
+                ),
                 NamespaceMutation::CreateDir {
                     ino,
                     parent,
@@ -724,9 +759,10 @@ impl RedbMetaEngine {
                     uid,
                     gid,
                     mode,
-                } => namespace_txn.execute(&NamespaceCreateSpec::new_dir(
-                    *ino, *parent, name, *uid, *gid, *mode,
-                )),
+                } => namespace_txn.execute(
+                    &NamespaceCreateSpec::new_dir(*ino, *parent, name, *uid, *gid, *mode)
+                        .shadowing_replayed_entry(),
+                ),
                 NamespaceMutation::SetAttr { attr, args } => {
                     let mut committed_attr = Self::get_attr_merged_in_write_txn(&txn, attr.ino)
                         .map_err(|source| MetaError::NamespaceBatchOperation {

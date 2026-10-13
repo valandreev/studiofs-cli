@@ -7902,3 +7902,398 @@ fn restoring_pending_local_state_still_journals_a_real_serving_correction() {
         "restoring newer local state must still be announced: {intents:?}"
     );
 }
+
+fn foreign_page(batch_version: i64, events: Vec<MetaEvent>) -> Vec<DecodedReplayBatch> {
+    vec![DecodedReplayBatch {
+        batch_version,
+        events,
+        is_self_batch: false,
+    }]
+}
+
+fn replay_foreign_page(pg: &PgMetaEngine, batch_version: i64, events: Vec<MetaEvent>) {
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.apply_replay_page_atomically(
+        foreign_page(batch_version, events),
+        None,
+        RemoteReplayApplyContext {
+            last_seq: batch_version - 1,
+            current_namespace_version: batch_version - 1,
+            flushed_event_seq: next_event_seq,
+            next_event_seq,
+            initial_overlay: OverlayConflictSets::default(),
+        },
+    )
+    .unwrap();
+}
+
+fn create_dir_events(ino: Ino, parent: Ino, name: &[u8]) -> Vec<MetaEvent> {
+    vec![
+        MetaEvent::SetAttr {
+            attr: InodeAttr::new_dir(ino, parent, 0, 0, 0o755),
+        },
+        MetaEvent::AddEntry {
+            parent,
+            name: name.to_vec(),
+            entry: DirEntryValue {
+                ino,
+                kind: FileType::Directory,
+            },
+        },
+    ]
+}
+
+/// A published (serving-ready) file, as a peer emits it after its upload commits.
+fn create_file_events(ino: Ino, parent: Ino, name: &[u8]) -> Vec<MetaEvent> {
+    let mut attr = InodeAttr::new_file(ino, parent, 0, 0, 0o644);
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    vec![
+        MetaEvent::SetAttr { attr },
+        MetaEvent::AddEntry {
+            parent,
+            name: name.to_vec(),
+            entry: DirEntryValue {
+                ino,
+                kind: FileType::RegularFile,
+            },
+        },
+    ]
+}
+
+/// Two peers created `shared/` during a sync window and both published. Every
+/// observer replays the same global order and must keep both subtrees.
+#[test]
+fn replay_merges_concurrently_created_directories() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (peer_a_dir, peer_b_dir) = (ROOT_INO + 9_100, ROOT_INO + 9_200);
+    let mut peer_a = create_dir_events(peer_a_dir, ROOT_INO, b"shared");
+    peer_a.extend(create_file_events(
+        ROOT_INO + 9_101,
+        peer_a_dir,
+        b"from-a.txt",
+    ));
+    let mut peer_b = create_dir_events(peer_b_dir, ROOT_INO, b"shared");
+    peer_b.extend(create_file_events(
+        ROOT_INO + 9_201,
+        peer_b_dir,
+        b"from-b.txt",
+    ));
+    replay_foreign_page(&pg, 1, peer_a);
+    replay_foreign_page(&pg, 2, peer_b);
+
+    let shared = pg
+        .local
+        .lookup(ROOT_INO, b"shared")
+        .expect("merged directory");
+    assert_eq!(shared.kind, FileType::Directory);
+    for name in [&b"from-a.txt"[..], b"from-b.txt"] {
+        assert!(
+            pg.local.lookup(shared.ino, name).is_ok(),
+            "{} must survive the directory merge",
+            String::from_utf8_lossy(name)
+        );
+    }
+}
+
+/// The peer whose directory became an alias keeps publishing under its own
+/// inode until it replays the merge; those later events land in the merge.
+#[test]
+fn replay_redirects_later_events_under_a_merged_directory() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (canonical, alias) = (ROOT_INO + 9_300, ROOT_INO + 9_400);
+    replay_foreign_page(&pg, 1, create_dir_events(canonical, ROOT_INO, b"shared"));
+    replay_foreign_page(&pg, 2, create_dir_events(alias, ROOT_INO, b"shared"));
+    let mut later = create_file_events(ROOT_INO + 9_401, alias, b"later.txt");
+    later.extend(create_dir_events(ROOT_INO + 9_402, alias, b"nested"));
+    later.extend(create_file_events(
+        ROOT_INO + 9_403,
+        ROOT_INO + 9_402,
+        b"deep.txt",
+    ));
+    replay_foreign_page(&pg, 3, later);
+
+    assert_eq!(pg.local.lookup(ROOT_INO, b"shared").unwrap().ino, canonical);
+    assert_eq!(
+        pg.local.lookup(canonical, b"later.txt").unwrap().ino,
+        ROOT_INO + 9_401
+    );
+    let nested = pg.local.lookup(canonical, b"nested").unwrap();
+    assert!(pg.local.lookup(nested.ino, b"deep.txt").is_ok());
+    assert_eq!(
+        pg.local.get_attr(ROOT_INO + 9_401).unwrap().parent,
+        canonical,
+        "children adopt the merged directory as parent"
+    );
+}
+
+/// A peer that removes its own empty alias must not delete the merged
+/// directory that now owns the name.
+#[test]
+fn replay_rmdir_of_alias_keeps_merged_directory() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (canonical, alias) = (ROOT_INO + 9_500, ROOT_INO + 9_600);
+    let mut peer_a = create_dir_events(canonical, ROOT_INO, b"shared");
+    peer_a.extend(create_file_events(ROOT_INO + 9_501, canonical, b"keep.txt"));
+    replay_foreign_page(&pg, 1, peer_a);
+    replay_foreign_page(&pg, 2, create_dir_events(alias, ROOT_INO, b"shared"));
+    // Event order emitted by `rmdir`: parent attrs, RemoveAttr, RemoveEntry.
+    replay_foreign_page(
+        &pg,
+        3,
+        vec![
+            MetaEvent::SetAttr {
+                attr: InodeAttr::new_dir(ROOT_INO, 0, 0, 0, 0o755),
+            },
+            MetaEvent::RemoveAttr { ino: alias },
+            MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"shared".to_vec(),
+            },
+        ],
+    );
+
+    assert_eq!(pg.local.lookup(ROOT_INO, b"shared").unwrap().ino, canonical);
+    assert!(pg.local.lookup(canonical, b"keep.txt").is_ok());
+}
+
+/// The lagging peer's own view: it created `shared/` locally, a peer published
+/// `shared/` first, then its own batch replays. It must self-acknowledge its
+/// journal and see both subtrees under the merged directory.
+#[test]
+fn self_replay_of_merged_directory_acknowledges_and_keeps_local_subtree() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let event_start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let alias = pg
+        .local
+        .create_dir(ROOT_INO, b"shared", 0, 0, 0o755)
+        .expect("local mkdir before seeing the peer");
+    pg.local
+        .create_dir(alias.ino, b"from-b", 0, 0, 0o755)
+        .expect("local child under the soon-merged directory");
+    let self_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let self_events = pg.local.read_events_range(event_start, self_end).unwrap();
+    let self_batch = RemoteApplyCoordinator::project_local_batch(&self_events).events;
+
+    let canonical = ROOT_INO + 9_700;
+    let mut peer_a = create_dir_events(canonical, ROOT_INO, b"shared");
+    peer_a.extend(create_dir_events(ROOT_INO + 9_701, canonical, b"from-a"));
+    let context = |last_seq: i64, pg: &PgMetaEngine| RemoteReplayApplyContext {
+        last_seq,
+        current_namespace_version: last_seq,
+        flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
+        next_event_seq: self_end,
+        initial_overlay: pg.local_overlay_conflicts().unwrap(),
+    };
+    pg.apply_replay_page_atomically(foreign_page(1, peer_a), None, context(0, &pg))
+        .unwrap();
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"shared").unwrap().ino,
+        alias.ino,
+        "unpublished local authority keeps serving its own directory"
+    );
+    pg.mark_local_event_ranges_published(&[LocalEventRange {
+        start: event_start,
+        end: self_end,
+    }])
+    .unwrap();
+
+    let outcome = pg
+        .apply_replay_page_atomically(
+            vec![DecodedReplayBatch {
+                batch_version: 2,
+                events: self_batch,
+                is_self_batch: true,
+            }],
+            None,
+            context(1, &pg),
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome.flushed_event_seq,
+        Some(self_end),
+        "raw journal still acknowledges"
+    );
+    assert_eq!(pg.lookup(ROOT_INO, b"shared").unwrap().ino, canonical);
+    assert!(pg.lookup(canonical, b"from-a").is_ok());
+    assert!(
+        pg.lookup(canonical, b"from-b").is_ok(),
+        "the lagging peer's own subtree must survive the merge"
+    );
+}
+
+/// A client bootstrapped from a checkpoint cut after a merge must still
+/// redirect the lagging peer's later events into the merged directory.
+#[test]
+fn checkpoint_carries_directory_aliases_to_cold_clients() {
+    let (_source_dir, source) = temp_pg_engine_for_unit();
+    let (canonical, alias) = (ROOT_INO + 9_800, ROOT_INO + 9_900);
+    replay_foreign_page(
+        &source,
+        1,
+        create_dir_events(canonical, ROOT_INO, b"shared"),
+    );
+    replay_foreign_page(&source, 2, create_dir_events(alias, ROOT_INO, b"shared"));
+    let checkpoint = source.local.export_serving_checkpoint_bytes().unwrap();
+
+    let (_cold_dir, cold) = temp_pg_engine_for_unit();
+    cold.local
+        .import_serving_checkpoint_bytes(&checkpoint)
+        .unwrap();
+    replay_foreign_page(
+        &cold,
+        3,
+        create_file_events(ROOT_INO + 9_901, alias, b"after-cut.txt"),
+    );
+
+    assert_eq!(
+        cold.local.lookup(ROOT_INO, b"shared").unwrap().ino,
+        canonical
+    );
+    assert!(
+        cold.local.lookup(canonical, b"after-cut.txt").is_ok(),
+        "the cold client must apply the alias it imported"
+    );
+}
+
+/// Two peers created the same file name during a sync window. Every client
+/// keeps the file whose create replays last (last writer wins).
+#[test]
+fn replay_resolves_concurrent_file_creates_by_last_writer() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (first, last) = (ROOT_INO + 10_100, ROOT_INO + 10_200);
+    replay_foreign_page(&pg, 1, create_file_events(first, ROOT_INO, b"same.txt"));
+    replay_foreign_page(&pg, 2, create_file_events(last, ROOT_INO, b"same.txt"));
+
+    assert_eq!(pg.local.lookup(ROOT_INO, b"same.txt").unwrap().ino, last);
+    let names = pg.local.readdir(ROOT_INO).unwrap();
+    assert_eq!(
+        names
+            .iter()
+            .filter(|entry| entry.name == b"same.txt")
+            .count(),
+        1,
+        "the name binds exactly one file"
+    );
+}
+
+/// A directory never merges with a file: the later create keeps the name, as
+/// for any other overwrite.
+#[test]
+fn replay_does_not_merge_a_directory_into_a_file() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (file, dir) = (ROOT_INO + 10_300, ROOT_INO + 10_400);
+    replay_foreign_page(&pg, 1, create_file_events(file, ROOT_INO, b"mixed"));
+    replay_foreign_page(&pg, 2, create_dir_events(dir, ROOT_INO, b"mixed"));
+
+    assert_eq!(pg.local.lookup(ROOT_INO, b"mixed").unwrap().ino, dir);
+}
+
+fn deferred_create_dir(ino: Ino, parent: Ino, name: &[u8]) -> crate::engine::NamespaceMutation {
+    crate::engine::NamespaceMutation::CreateDir {
+        ino,
+        parent,
+        name: name.to_vec(),
+        uid: 0,
+        gid: 0,
+        mode: 0o755,
+    }
+}
+
+/// A deferred mkdir admitted before a peer's `shared/` replayed commits over
+/// it locally, then merges with it when its own batch replays.
+#[test]
+fn deferred_create_shadows_replayed_directory_and_merges_on_self_replay() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let canonical = ROOT_INO + 11_000;
+    let mut peer_a = create_dir_events(canonical, ROOT_INO, b"shared");
+    peer_a.extend(create_dir_events(ROOT_INO + 11_001, canonical, b"from-a"));
+    replay_foreign_page(&pg, 1, peer_a);
+
+    let event_start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let (local, child) = (ROOT_INO + 11_100, ROOT_INO + 11_101);
+    pg.local
+        .apply_namespace_mutations(&[
+            deferred_create_dir(local, ROOT_INO, b"shared"),
+            deferred_create_dir(child, local, b"from-b"),
+        ])
+        .expect("a create admitted before the peer's entry replayed must commit");
+    assert_eq!(pg.lookup(ROOT_INO, b"shared").unwrap().ino, local);
+
+    let self_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let self_events = pg.local.read_events_range(event_start, self_end).unwrap();
+    let self_batch = RemoteApplyCoordinator::project_local_batch(&self_events).events;
+    pg.mark_local_event_ranges_published(&[LocalEventRange {
+        start: event_start,
+        end: self_end,
+    }])
+    .unwrap();
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 2,
+            events: self_batch,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 1,
+            current_namespace_version: 1,
+            flushed_event_seq: event_start,
+            next_event_seq: self_end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(pg.lookup(ROOT_INO, b"shared").unwrap().ino, canonical);
+    assert!(pg.lookup(canonical, b"from-a").is_ok());
+    assert!(pg.lookup(canonical, b"from-b").is_ok());
+}
+
+#[test]
+fn deferred_create_keeps_rejecting_local_and_cross_kind_conflicts() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    replay_foreign_page(
+        &pg,
+        1,
+        create_file_events(ROOT_INO + 11_200, ROOT_INO, b"file"),
+    );
+    pg.local.create_dir(ROOT_INO, b"mine", 0, 0, 0o755).unwrap();
+
+    for name in [&b"file"[..], b"mine"] {
+        let error = pg
+            .local
+            .apply_namespace_mutations(&[deferred_create_dir(ROOT_INO + 11_300, ROOT_INO, name)])
+            .expect_err("only a same-kind replayed entry may be shadowed");
+        assert!(
+            matches!(&error, MetaError::NamespaceBatchOperation { source, .. }
+                if matches!(source.as_ref(), MetaError::EntryExists { .. })),
+            "{}: {error}",
+            String::from_utf8_lossy(name)
+        );
+    }
+}
+
+/// A deferred create of a file a peer published first commits locally and,
+/// replaying later in the global order, keeps the name (last writer wins).
+#[test]
+fn deferred_file_create_over_replayed_file_wins_by_last_writer() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let peer_file = ROOT_INO + 11_400;
+    replay_foreign_page(&pg, 1, create_file_events(peer_file, ROOT_INO, b"same.txt"));
+
+    let local_file = ROOT_INO + 11_500;
+    pg.local
+        .apply_namespace_mutations(&[crate::engine::NamespaceMutation::CreateFile {
+            ino: local_file,
+            parent: ROOT_INO,
+            name: b"same.txt".to_vec(),
+            uid: 0,
+            gid: 0,
+            mode: 0o644,
+        }])
+        .expect("a create admitted before the peer's file replayed must commit");
+
+    assert_eq!(pg.lookup(ROOT_INO, b"same.txt").unwrap().ino, local_file);
+}

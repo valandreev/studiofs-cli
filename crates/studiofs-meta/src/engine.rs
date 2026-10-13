@@ -182,11 +182,11 @@ impl BootstrapCheckpointDescriptor {
             });
         }
 
-        postcard::from_bytes::<crate::snapshot::ServingCheckpoint>(&self.checkpoint_bytes).map_err(
-            |_| MetaError::InvalidCheckpointDescriptor {
+        crate::snapshot::ServingCheckpoint::decode(&self.checkpoint_bytes).map_err(|_| {
+            MetaError::InvalidCheckpointDescriptor {
                 reason: CheckpointDescriptorFailure::CheckpointBytes,
-            },
-        )
+            }
+        })
     }
 
     /// Validates all identity, version, publication, and payload invariants.

@@ -981,6 +981,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(BASE_DENTRIES_TABLE);
             let _ = txn.open_table(BASE_DENTRIES_BY_INODE_TABLE);
             let _ = txn.open_table(DENTRY_TOMBSTONES_TABLE);
+            let _ = txn.open_table(DIRECTORY_ALIASES_TABLE);
             let _ = txn.open_table(REGULAR_FILE_OVERLAY_TABLE);
             let _ = txn.open_table(REGULAR_FILE_BASE_TABLE);
             let _ = txn.open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE);
@@ -1207,6 +1208,7 @@ mod gc;
 mod inodes;
 pub(crate) use inodes::PendingRecoveryDentry;
 mod namespace;
+mod namespace_merge;
 mod payload_objects;
 mod recovery;
 mod replication;
