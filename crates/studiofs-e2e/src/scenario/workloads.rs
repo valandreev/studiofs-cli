@@ -250,6 +250,7 @@ use super::types::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioError}
 mod actions;
 mod advanced_mounted;
 mod assertions;
+mod concurrent_mkdir;
 mod faults;
 mod namespace_collision;
 mod smoke_outage;
@@ -265,6 +266,7 @@ pub use actions::{
 };
 pub(super) use advanced_mounted::*;
 pub(super) use assertions::*;
+pub(super) use concurrent_mkdir::ConcurrentMkdirMerge;
 pub(super) use faults::*;
 pub(super) use namespace_collision::*;
 pub(super) use smoke_outage::*;

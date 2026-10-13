@@ -264,6 +264,23 @@ impl RedbMetaEngine {
                 snapshot.event_log.push((k.value(), v.value().to_vec()));
             }
         }
+        // Databases opened read-only before this table existed have no aliases.
+        match txn.open_table(DIRECTORY_ALIASES_TABLE) {
+            Ok(table) => {
+                for row in table
+                    .iter()
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                {
+                    check()?;
+                    let (alias, canonical) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                    snapshot
+                        .directory_aliases
+                        .push((alias.value(), canonical.value()));
+                }
+            }
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(MetaError::Storage(error.to_string())),
+        }
         Ok(snapshot)
     }
 
@@ -317,10 +334,9 @@ impl RedbMetaEngine {
     /// metadata crate while allowing bootstrap callers such as `discover` to
     /// create a local redb view from the thin remote checkpoint.
     pub fn import_serving_checkpoint_bytes(&self, bytes: &[u8]) -> MetaResult<()> {
-        let checkpoint: crate::snapshot::ServingCheckpoint =
-            postcard::from_bytes(bytes).map_err(|error| {
-                MetaError::Serialization(format!("serving checkpoint decode failed: {error}"))
-            })?;
+        let checkpoint = crate::snapshot::ServingCheckpoint::decode(bytes).map_err(|error| {
+            MetaError::Serialization(format!("serving checkpoint decode failed: {error}"))
+        })?;
         self.import_serving_checkpoint(&checkpoint)
     }
 
@@ -466,6 +482,7 @@ impl RedbMetaEngine {
         snapshot.symlinks = checkpoint.symlinks.clone();
         snapshot.xattrs = checkpoint.xattrs.clone();
         snapshot.acl_rules = checkpoint.acl_rules.clone();
+        snapshot.directory_aliases = checkpoint.directory_aliases.clone();
         snapshot.event_log.clear();
         snapshot.local_dentry_mutations.clear();
         Ok(snapshot)
@@ -818,6 +835,20 @@ impl RedbMetaEngine {
             for (k, v) in &snapshot.acl_rules {
                 table
                     .insert(k.as_slice(), *v)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            // Aliases are replicated base state: replace them with the snapshot's.
+            let mut table = txn
+                .open_table(DIRECTORY_ALIASES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for (alias, canonical) in &snapshot.directory_aliases {
+                table
+                    .insert(*alias, *canonical)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }

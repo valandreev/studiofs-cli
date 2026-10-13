@@ -981,6 +981,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(BASE_DENTRIES_TABLE);
             let _ = txn.open_table(BASE_DENTRIES_BY_INODE_TABLE);
             let _ = txn.open_table(DENTRY_TOMBSTONES_TABLE);
+            let _ = txn.open_table(DIRECTORY_ALIASES_TABLE);
             let _ = txn.open_table(REGULAR_FILE_OVERLAY_TABLE);
             let _ = txn.open_table(REGULAR_FILE_BASE_TABLE);
             let _ = txn.open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE);
@@ -1145,7 +1146,10 @@ impl RedbMetaEngine {
     }
 
     #[cfg(test)]
-    fn open_relaxed_with_interval_for_test(path: impl AsRef<Path>, interval: Duration) -> Self {
+    pub(crate) fn open_relaxed_with_interval_for_test(
+        path: impl AsRef<Path>,
+        interval: Duration,
+    ) -> Self {
         Self::open_with_relaxed_interval(path, interval).expect("open relaxed redb test engine")
     }
 
@@ -1204,6 +1208,7 @@ mod gc;
 mod inodes;
 pub(crate) use inodes::PendingRecoveryDentry;
 mod namespace;
+mod namespace_merge;
 mod payload_objects;
 mod recovery;
 mod replication;

@@ -5274,17 +5274,7 @@ impl StudioVfs {
             return Ok(());
         };
 
-        let start_result = catch_startup_panic(|| {
-            #[cfg(target_os = "linux")]
-            if let Err(error) = self.prewarm_namespace_inode_reservation() {
-                warn!(
-                    error = %error,
-                    "failed to force Linux namespace inode reservation durable during startup; metadata will sync on next barrier"
-                );
-            }
-
-            self.spawn_startup_workers(channels)
-        });
+        let start_result = catch_startup_panic(|| self.spawn_startup_workers(channels));
         self.startup.finish_start(&start_result);
         start_result
     }

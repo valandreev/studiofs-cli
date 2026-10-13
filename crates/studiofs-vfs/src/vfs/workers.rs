@@ -1012,6 +1012,7 @@ impl StudioVfs {
 
     fn collect_metadata_snapshot<M: ?Sized + JanitorMeta>(
         engine: &M,
+        cancel: &CancellationToken,
     ) -> MetaResult<MetadataTraversalSnapshot> {
         let mut seen = HashSet::from([ROOT_INO]);
         let mut stack = vec![ROOT_INO];
@@ -1019,6 +1020,11 @@ impl StudioVfs {
         let mut namespace_entries = HashSet::new();
 
         while let Some(ino) = stack.pop() {
+            // The walk is O(volume) on a blocking thread that abort cannot stop; an
+            // uncancelled walk outlives shutdown and leaves redb unclean.
+            if cancel.is_cancelled() {
+                return Err(MetaError::WorkerShutdownCancelled);
+            }
             let attr = match engine.get_attr(ino) {
                 Ok(attr) => attr,
                 Err(MetaError::InodeNotFound(_)) => continue,
@@ -1475,13 +1481,15 @@ impl StudioVfs {
             };
 
             let meta = self.meta.clone();
+            let walk_cancel = self.state.shutdown.background_shutdown_token.clone();
             let current_snapshot =
                 match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                    Self::collect_metadata_snapshot(engine.as_ref())
+                    Self::collect_metadata_snapshot(engine.as_ref(), &walk_cancel)
                 })
                 .await
                 {
                     Ok(snapshot) => snapshot,
+                    Err(_) if self.shutdown_requested() => break,
                     Err(error) => {
                         warn!(
                             ?wake_reason,
@@ -2840,6 +2848,19 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_snapshot_walk_stops_when_shutdown_is_cancelled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine =
+            studiofs_meta::RedbMetaEngine::open(dir.path().join("meta.redb")).expect("open redb");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = StudioVfs::collect_metadata_snapshot(&engine, &cancel);
+
+        assert!(matches!(result, Err(MetaError::WorkerShutdownCancelled)));
+    }
 
     #[test]
     fn local_redb_compaction_requires_measured_file_and_fragmentation_thresholds() {

@@ -283,6 +283,26 @@ The implementation may schedule later bounded catch-up attempts, but it must
 not turn those attempts into an unbounded mount-start wait. Every retry has a
 typed failure outcome and an observable next-resume position.
 
+## Concurrent Same-Name Creates
+
+Clients create names during sync windows without seeing each other, so replay
+must resolve two creates of one name deterministically from the global event
+order (see [ADR 0012](adr/0012-concurrent-same-name-creates-merge-directories.md)).
+Each replayed batch is canonicalized once before any applier runs. When a
+directory `AddEntry` reaches a name that base already binds to a different
+directory, the first directory stays canonical, the later one becomes an alias
+in `directory_aliases`, and events naming the alias as a parent apply to the
+canonical directory. Regular files resolve by last writer: the later
+`AddEntry` binds the name. Self batches still acknowledge the local journal by
+their raw events. Aliases travel in serving checkpoint format version 2 so a
+client bootstrapped after a merge redirects the alias owner's later events.
+
+A VFS deferred create admitted before a peer's same-kind entry replayed
+commits over that entry locally instead of failing; its own replay then merges
+or wins as above. Rename onto a concurrently created directory, file/directory
+type conflicts, and an alias `rmdir` split across publication batches are
+documented gaps.
+
 ## Local Replay Lock Ordering
 
 Operations that update the local replay cursor together with serving state or

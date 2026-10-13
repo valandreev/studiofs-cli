@@ -284,13 +284,60 @@ pub(crate) struct ServingCheckpoint {
     pub(crate) xattrs: Vec<(Vec<u8>, Vec<u8>)>,
     /// Remote-visible ACL rules.
     pub(crate) acl_rules: Vec<(Vec<u8>, u8)>,
+    /// Replay-derived directory merges as `(alias_ino, canonical_ino)` pairs.
+    ///
+    /// Appended in format version 2; peers that created an alias may still
+    /// publish events naming it after this checkpoint's cut.
+    pub(crate) directory_aliases: Vec<(u64, u64)>,
+}
+
+/// Format version 1 layout: the version 2 fields without directory aliases.
+#[derive(Deserialize)]
+struct ServingCheckpointV1 {
+    inodes: Vec<(u64, Vec<u8>)>,
+    dentries: Vec<(Vec<u8>, Vec<u8>)>,
+    regular_file_base: Vec<(u64, Vec<u8>)>,
+    symlinks: Vec<(u64, Vec<u8>)>,
+    xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    acl_rules: Vec<(Vec<u8>, u8)>,
 }
 
 impl ServingCheckpoint {
     /// The persisted checkpoint format version.
-    pub(crate) const FORMAT_VERSION: i16 = 1;
+    pub(crate) const FORMAT_VERSION: i16 = 2;
     /// The serving-state schema version.
     pub(crate) const SCHEMA_VERSION: i16 = 1;
+
+    /// Whether checkpoints written with `version` can be decoded.
+    pub(crate) fn supports_format_version(version: i16) -> bool {
+        (1..=Self::FORMAT_VERSION).contains(&version)
+    }
+
+    /// Decodes either format version.
+    ///
+    /// Both layouts share the version 1 prefix. Only an empty remainder means
+    /// version 1; a present version 2 alias suffix must decode completely.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        let (v1, suffix) = postcard::take_from_bytes::<ServingCheckpointV1>(bytes)?;
+        let directory_aliases = if suffix.is_empty() {
+            Vec::new()
+        } else {
+            let (aliases, remainder) = postcard::take_from_bytes(suffix)?;
+            if !remainder.is_empty() {
+                return Err(postcard::Error::DeserializeBadEncoding);
+            }
+            aliases
+        };
+        Ok(Self {
+            inodes: v1.inodes,
+            dentries: v1.dentries,
+            regular_file_base: v1.regular_file_base,
+            symlinks: v1.symlinks,
+            xattrs: v1.xattrs,
+            acl_rules: v1.acl_rules,
+            directory_aliases,
+        })
+    }
 }
 
 /// Retention attached to a snapshot. `None` means infinite manual retention.
@@ -987,6 +1034,43 @@ fn parse_collision_suffix(value: &str) -> Result<u64, SnapshotIdError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn serving_checkpoint_rejects_truncated_alias_suffix() {
+        // Six empty v1 tables followed by one incomplete v2 alias pair.
+        assert!(ServingCheckpoint::decode(&[0, 0, 0, 0, 0, 0, 1, 40]).is_err());
+    }
+
+    #[test]
+    fn serving_checkpoint_rejects_trailing_bytes() {
+        // Six empty tables, one alias pair, and an extra byte.
+        assert!(ServingCheckpoint::decode(&[0, 0, 0, 0, 0, 0, 1, 40, 30, 0]).is_err());
+    }
+
+    #[test]
+    fn serving_checkpoint_decodes_both_format_versions() {
+        let checkpoint = ServingCheckpoint {
+            inodes: vec![(1, vec![7])],
+            dentries: vec![(vec![1, 2], vec![3])],
+            directory_aliases: vec![(40, 30)],
+            ..ServingCheckpoint::default()
+        };
+        let v2 = postcard::to_stdvec(&checkpoint).unwrap();
+        assert_eq!(ServingCheckpoint::decode(&v2).unwrap(), checkpoint);
+
+        let without_aliases = ServingCheckpoint {
+            directory_aliases: Vec::new(),
+            ..checkpoint
+        };
+        let mut v1 = postcard::to_stdvec(&without_aliases).unwrap();
+        // Version 1 bytes end before the alias vector's length prefix.
+        assert_eq!(v1.pop(), Some(0));
+        assert_eq!(ServingCheckpoint::decode(&v1).unwrap(), without_aliases);
+        assert!(ServingCheckpoint::decode(&v1[..v1.len() - 1]).is_err());
+        assert!(ServingCheckpoint::supports_format_version(1));
+        assert!(ServingCheckpoint::supports_format_version(2));
+        assert!(!ServingCheckpoint::supports_format_version(3));
+    }
     use super::*;
     use chrono::{NaiveDate, TimeZone, Utc};
 

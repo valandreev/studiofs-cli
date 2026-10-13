@@ -2170,14 +2170,15 @@ impl<'a> RemoteApplyCoordinator<'a> {
             if let Some(execution) = execution {
                 execution.check()?;
             }
-            Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, &batch.events);
-            Self::collect_replay_reconcile_dentries(
-                txn,
-                &mut reconcile_dentry_keys,
-                &batch.events,
-            )?;
+            // Raw events still match the local journal; appliers see the merged namespace.
+            let events = RedbMetaEngine::canonicalize_replay_batch_in_txn(txn, &batch.events)?;
+            let rewritten = matches!(events, Cow::Owned(_)).then_some(&events[..]);
+            for events in std::iter::once(&batch.events[..]).chain(rewritten) {
+                Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, events);
+                Self::collect_replay_reconcile_dentries(txn, &mut reconcile_dentry_keys, events)?;
+            }
             if batch.is_self_batch {
-                applied_any |= self.apply_visible_self_batch_in_txn(txn, &batch.events)?;
+                applied_any |= self.apply_visible_self_batch_in_txn(txn, &events)?;
                 let acknowledged_seq = self.acknowledge_local_prefix_from_self_batch_in_txn(
                     txn,
                     &batch.events,
@@ -2201,7 +2202,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     .unwrap_or(&empty_protected_base_inodes);
                 let outcome = self.apply_foreign_batch_in_txn(
                     txn,
-                    &batch.events,
+                    &events,
                     &effective_overlay,
                     protected_base_inodes,
                 )?;

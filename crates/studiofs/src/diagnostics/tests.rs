@@ -1,7 +1,8 @@
 use super::*;
 use tempfile::TempDir;
 
-const DIAGNOSTICS_TEST_LEASE_TTL_MS: u64 = 5_000;
+// Max TTL: multi-step workflow tests fsync heavily and can exceed a short lease under suite load.
+const DIAGNOSTICS_TEST_LEASE_TTL_MS: u64 = MAX_LEASE_TTL_MS;
 
 #[derive(Clone)]
 struct StaticDiagnosticsSource {

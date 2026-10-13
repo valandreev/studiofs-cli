@@ -791,6 +791,7 @@ impl Session {
         mount_point: impl AsRef<std::path::Path>,
         volume_name: impl AsRef<str>,
     ) -> io::Result<Self> {
+        let root_prime_path = mount_point.as_ref().to_path_buf();
         let mount_point = path_to_cstring(mount_point.as_ref())?;
         let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref(), state.read_only))?;
         let mut state = Box::new(state);
@@ -847,6 +848,7 @@ impl Session {
                 .set_kernel_invalidator(Arc::new(LinuxFuseKernelInvalidator {
                     queue: invalidation_queue,
                 }));
+            spawn_root_attr_primer(root_prime_path, Arc::clone(&invalidation_state));
             let session = Self {
                 raw,
                 state: Some(state),
@@ -946,6 +948,29 @@ impl Session {
     }
 }
 
+/// Hold kernel invalidations until the kernel has applied real root attributes.
+///
+/// fusermount3 creates the root inode without permission bits. If an inode
+/// invalidation lands while its first GETATTR reply is in flight, the kernel
+/// drops that reply and `default_permissions` denies the access with EACCES.
+fn spawn_root_attr_primer(mount_point: std::path::PathBuf, state: Arc<SessionInvalidationState>) {
+    let primer_state = Arc::clone(&state);
+    let spawned = std::thread::Builder::new()
+        .name("studiofs-fuse-root-prime".to_owned())
+        .spawn(move || {
+            // Blocks until the session loop answers INIT and GETATTR(root), or
+            // fails once the session is unmounted.
+            if let Err(error) = std::fs::metadata(&mount_point) {
+                debug!(%error, "Linux FUSE root attribute priming failed");
+            }
+            primer_state.mark_root_primed();
+        });
+    if let Err(error) = spawned {
+        warn!(%error, "Linux FUSE root attribute priming thread failed to start");
+        state.mark_root_primed();
+    }
+}
+
 struct LinuxFuseKernelInvalidator {
     queue: FuseInvalidationQueue,
 }
@@ -964,6 +989,7 @@ struct SessionInvalidationState {
 #[derive(Debug)]
 struct SessionInvalidationStatus {
     closed: bool,
+    root_primed: bool,
     active: usize,
 }
 
@@ -976,6 +1002,7 @@ impl SessionInvalidationState {
         Self {
             status: Mutex::new(SessionInvalidationStatus {
                 closed: false,
+                root_primed: false,
                 active: 0,
             }),
             idle: Condvar::new(),
@@ -989,7 +1016,12 @@ impl SessionInvalidationState {
     }
 
     fn begin_invalidation(&self) -> Option<SessionInvalidationGuard<'_>> {
-        let mut status = self.lock_status();
+        let mut status = self
+            .idle
+            .wait_while(self.lock_status(), |status| {
+                !status.root_primed && !status.closed
+            })
+            .unwrap_or_else(|err| err.into_inner());
         if status.closed {
             return None;
         }
@@ -999,6 +1031,12 @@ impl SessionInvalidationState {
 
     fn begin_shutdown(&self) {
         self.lock_status().closed = true;
+        self.idle.notify_all();
+    }
+
+    fn mark_root_primed(&self) {
+        self.lock_status().root_primed = true;
+        self.idle.notify_all();
     }
 
     fn wait_for_idle(&self, timeout: Duration) -> bool {
@@ -3175,6 +3213,8 @@ impl Drop for Session {
             );
             drained
         });
+        // Draining must not wait behind a root primer that never got served.
+        self.invalidation_state.mark_root_primed();
         let worker_outcome = shutdown_invalidation_with(
             || {
                 if let Some(state) = &self.state {
@@ -3257,6 +3297,14 @@ impl Session {
             || {
                 // SAFETY: handlers were installed for this retained live session.
                 unsafe { raw::fuse_remove_signal_handlers(raw.as_ptr()) };
+                // libfuse restores SIG_DFL, but `studiofs umount` sends SIGTERM after
+                // the lazy detach; dying here skips VFS/redb shutdown and forces repair.
+                // SIGINT keeps its default so a second Ctrl+C can still force-quit.
+                // SAFETY: setting a disposition to SIG_IGN is async-signal-safe.
+                unsafe {
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                }
             },
             || {
                 // SAFETY: libfuse tolerates unmount after regular kernel disconnects.
@@ -5717,6 +5765,7 @@ mod tests {
     #[test]
     fn invalidation_state_wait_for_idle_wakes_when_last_guard_drops() {
         let state = Arc::new(super::SessionInvalidationState::new());
+        state.mark_root_primed();
         let guard = state.begin_invalidation().expect("begin invalidation");
         let waiter_state = Arc::clone(&state);
         let (observed_tx, observed_rx) = mpsc::channel();
@@ -5752,9 +5801,44 @@ mod tests {
     #[test]
     fn invalidation_state_wait_for_idle_returns_false_on_timeout() {
         let state = super::SessionInvalidationState::new();
+        state.mark_root_primed();
         let _guard = state.begin_invalidation().expect("begin invalidation");
 
         assert!(!state.wait_for_idle(Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn invalidation_state_holds_invalidations_until_root_is_primed() {
+        let state = Arc::new(super::SessionInvalidationState::new());
+        let waiter_state = Arc::clone(&state);
+        let (admitted_tx, admitted_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let admitted = waiter_state.begin_invalidation().is_some();
+            admitted_tx.send(admitted).expect("send admission");
+        });
+
+        assert_eq!(
+            admitted_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "root invalidation must wait for the first root GETATTR"
+        );
+        state.mark_root_primed();
+        assert!(
+            admitted_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("admission after priming")
+        );
+        waiter.join().expect("join gated invalidation");
+    }
+
+    #[test]
+    fn invalidation_state_shutdown_releases_unprimed_invalidation() {
+        let state = Arc::new(super::SessionInvalidationState::new());
+        let waiter_state = Arc::clone(&state);
+        let waiter = thread::spawn(move || waiter_state.begin_invalidation().is_none());
+
+        state.begin_shutdown();
+        assert!(waiter.join().expect("join gated invalidation"));
     }
 
     #[test]

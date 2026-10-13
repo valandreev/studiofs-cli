@@ -46,6 +46,11 @@ pub(super) const BASE_DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(super) const BASE_DENTRIES_BY_INODE_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("base_dentries_by_inode");
 
+/// Replay-derived merges: a directory created concurrently under an existing
+/// directory's name (alias) -> the directory that kept the name (canonical).
+pub(super) const DIRECTORY_ALIASES_TABLE: TableDefinition<u64, u64> =
+    TableDefinition::new("directory_aliases");
+
 /// Local tombstones hiding remote-visible base dentries.
 pub(super) const DENTRY_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("dentry_tombstones");
@@ -182,6 +187,9 @@ pub struct RedbSnapshot {
     /// Compact local dentry mutation rows as `(encoded_key, status)` pairs.
     #[serde(default)]
     pub local_dentry_mutations: Vec<(Vec<u8>, u8)>,
+    /// Replay-derived directory merges as `(alias_ino, canonical_ino)` pairs.
+    #[serde(default)]
+    pub directory_aliases: Vec<(u64, u64)>,
 }
 
 pub(crate) fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
