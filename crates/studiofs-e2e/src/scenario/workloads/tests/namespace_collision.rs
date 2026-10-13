@@ -761,13 +761,21 @@ fn hotspot_churn_completed_operations_release_worker_before_next_operation() {
 
 #[test]
 fn hotspot_helper_internal_timeout_leaves_parent_kill_reserve() {
+    let termination_reserve = if should_wait_for_timed_out_hotspot_helper_child() {
+        CHILD_TERMINATION_GRACE
+    } else {
+        Duration::ZERO
+    };
     assert_eq!(
-        hotspot_helper_internal_timeout(Duration::from_secs(15)),
-        Duration::from_millis(12_250)
+        hotspot_helper_internal_timeout(MOUNTED_WRITE_READBACK_TIMEOUT)
+            + HOTSPOT_HELPER_CANCEL_GRACE
+            + termination_reserve,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        "reserve child-exit waiting time only on platforms that actually wait"
     );
     assert_eq!(
-        hotspot_helper_internal_timeout(Duration::from_secs(1)),
-        Duration::from_secs(1),
+        hotspot_helper_internal_timeout(Duration::from_millis(100)),
+        Duration::from_millis(100),
         "short operation timeouts should not underflow"
     );
 }

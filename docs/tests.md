@@ -648,6 +648,13 @@ and readdir/stat while mutations are in flight. The overwrite/read scenario
 records repeated read loops during the overwrite. Each collision run writes `operations.ndjson`,
 `namespace-collision-summary.json`, and `validation.json`.
 
+Mounted hotspot helpers reserve cancellation time within the operation timeout.
+Only Windows also reserves child-exit waiting time; Linux and macOS terminate
+timed-out helpers without that wait. The focused regression
+`hotspot_helper_internal_timeout_leaves_parent_kill_reserve` checks this budget;
+run `cargo test -p studiofs-e2e --lib hotspot_helper_` to also check timeout
+enforcement and helper progress reporting.
+
 On macOS, mounted readiness and stale-mount cleanup read the `/sbin/mount`
 table through a bounded helper instead of calling `stat` on the candidate
 FSKit mountpoint. A stale FSKit vnode can block filesystem metadata calls after

@@ -524,7 +524,12 @@ pub(in crate::scenario) fn should_wait_for_timed_out_hotspot_helper_child() -> b
 }
 
 pub(in crate::scenario) fn hotspot_helper_internal_timeout(parent_timeout: Duration) -> Duration {
-    let reserve = CHILD_TERMINATION_GRACE + HOTSPOT_HELPER_CANCEL_GRACE;
+    let reserve = HOTSPOT_HELPER_CANCEL_GRACE
+        + if should_wait_for_timed_out_hotspot_helper_child() {
+            CHILD_TERMINATION_GRACE
+        } else {
+            Duration::ZERO
+        };
     parent_timeout
         .checked_sub(reserve)
         .unwrap_or(parent_timeout)
