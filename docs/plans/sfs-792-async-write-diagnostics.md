@@ -26,8 +26,9 @@ be published afterward: reset advanced the baseline but not the raw snapshot
 used for stale-generation rejection. Preserve reset's sampled scalar values in
 raw state as well, after clearing its unused per-inode map.
 
-The configured Codebase Memory project name is `home-val-dev-studiofs-cli`;
-the contract's `E-dev-studiofs-cli` key is unavailable.
+Correction (2026-10-13): the configured Codebase Memory project is
+`E-dev-studiofs-cli`, rooted at this repository. The shared snapshot has been
+reindexed with that key; use it for graph queries on all machines.
 
 ## Decision Log
 
