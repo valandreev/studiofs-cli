@@ -1,11 +1,12 @@
 {
     "schema_version": 2,
-    "commit": "c10bedccc176d264e73956a861fefa478dae555d",
-    "indexed_at": "2026-10-13T09:35:32Z",
+    "commit": "25b78c732dc94499f7f9f4a66a69be61e0c757d5",
+    "indexed_at": "2026-10-13T15:40:38Z",
     "project": "home-val-dev-studiofs-cli",
-    "nodes": 28554,
-    "edges": 181272,
-    "original_size": 125632512,
-    "compressed_size": 19976690,
-    "compression_level": 3
+    "nodes": 28574,
+    "edges": 181543,
+    "original_size": 125960192,
+    "compressed_size": 20007656,
+    "compression_level": 3,
+    "reconcile_basis": "git-clean-head"
 }
