@@ -8,8 +8,7 @@ use super::*;
 use crate::events::MetaEvent;
 use redb::ReadableTableMetadata;
 
-/// Bounds alias resolution; aliases always point at a dentry holder, so real
-/// chains are a single hop.
+/// Bounds traversal when a previously canonical directory becomes an alias.
 const MAX_ALIAS_HOPS: usize = 8;
 
 impl RedbMetaEngine {
@@ -157,7 +156,9 @@ impl BatchMerge {
                         ino: self.resolve(aliases, entry.ino)?,
                         kind: entry.kind,
                     },
-                    displaced_set_attr: displaced_set_attr.clone(),
+                    displaced_set_attr: Box::new(
+                        self.non_alias_attr(aliases, displaced_set_attr.as_ref().as_ref())?,
+                    ),
                     displaced_remove_attr_ino: *displaced_remove_attr_ino,
                     moved_dir_attr: Box::new(
                         self.resolve_attr(aliases, moved_dir_attr.as_ref().as_ref())?,

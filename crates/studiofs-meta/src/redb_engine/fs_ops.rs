@@ -193,8 +193,8 @@ impl<'a> NamespaceCreateTxn<'a> {
         Ok(attr)
     }
 
-    /// A same-kind entry that serving holds only because replay put it in base;
-    /// local authority (an unpublished or locally changed name) never matches.
+    /// Serving rows also mirror replay; matching base alone does not exclude
+    /// pending local namespace authority with an identical binding.
     fn is_replayed_entry(
         &self,
         spec: &NamespaceCreateSpec<'_>,
@@ -209,7 +209,54 @@ impl<'a> NamespaceCreateTxn<'a> {
                 spec.name,
             )?
             .as_ref()
-                == Some(existing))
+                == Some(existing)
+            && !self.has_pending_local_name(spec.parent, spec.name)?)
+    }
+
+    fn has_pending_local_name(&self, parent: Ino, name: &[u8]) -> MetaResult<bool> {
+        use crate::events::MetaEvent;
+
+        let counters = self
+            .txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let start = counters
+            .get(counters::LOCAL_PG_FLUSHED_EVENT_SEQ)?
+            .map_or(1, |value| value.value());
+        let events = self
+            .txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        // Scan only on a same-name replay conflict, excluding acknowledged history.
+        for row in events.range(start..)? {
+            let (_, bytes) = row?;
+            let touches_name = match crate::events::decode_event(bytes.value())? {
+                MetaEvent::AddEntry {
+                    parent: event_parent,
+                    name: event_name,
+                    ..
+                }
+                | MetaEvent::RemoveEntry {
+                    parent: event_parent,
+                    name: event_name,
+                } => event_parent == parent && event_name == name,
+                MetaEvent::RenameEntry {
+                    parent: old_parent,
+                    name: old_name,
+                    new_parent,
+                    new_name,
+                    ..
+                } => {
+                    (old_parent == parent && old_name == name)
+                        || (new_parent == parent && new_name == name)
+                }
+                _ => false,
+            };
+            if touches_name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(super) fn increment_total_inodes(&self) -> MetaResult<()> {

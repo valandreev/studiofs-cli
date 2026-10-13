@@ -8027,6 +8027,64 @@ fn replay_redirects_later_events_under_a_merged_directory() {
     );
 }
 
+#[test]
+fn replay_rename_resolves_displaced_file_parent_under_merged_directory() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (canonical, alias) = (ROOT_INO + 9_300, ROOT_INO + 9_400);
+    let (displaced, moved) = (ROOT_INO + 9_401, ROOT_INO + 9_402);
+    replay_foreign_page(&pg, 1, create_dir_events(canonical, ROOT_INO, b"shared"));
+    replay_foreign_page(&pg, 2, create_dir_events(alias, ROOT_INO, b"shared"));
+
+    let mut files = create_file_events(displaced, alias, b"retained.txt");
+    let MetaEvent::SetAttr { attr } = &mut files[0] else {
+        unreachable!("file create starts with its attributes");
+    };
+    attr.nlink = 2;
+    let mut displaced_attr = attr.clone();
+    displaced_attr.nlink = 1;
+    files.push(MetaEvent::AddEntry {
+        parent: alias,
+        name: b"target.txt".to_vec(),
+        entry: DirEntryValue {
+            ino: displaced,
+            kind: FileType::RegularFile,
+        },
+    });
+    files.extend(create_file_events(moved, alias, b"source.txt"));
+    replay_foreign_page(&pg, 3, files);
+    replay_foreign_page(
+        &pg,
+        4,
+        vec![MetaEvent::RenameEntry {
+            parent: alias,
+            name: b"source.txt".to_vec(),
+            new_parent: alias,
+            new_name: b"target.txt".to_vec(),
+            entry: DirEntryValue {
+                ino: moved,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(Some(displaced_attr)),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        }],
+    );
+
+    assert_eq!(pg.lookup(canonical, b"target.txt").unwrap().ino, moved);
+    assert_eq!(
+        pg.lookup(canonical, b"retained.txt").unwrap().ino,
+        displaced
+    );
+    let attr = pg.get_attr(displaced).unwrap();
+    assert_eq!(attr.nlink, 1);
+    assert_eq!(
+        attr.parent, canonical,
+        "rename must preserve the merged parent"
+    );
+}
+
 /// A peer that removes its own empty alias must not delete the merged
 /// directory that now owns the name.
 #[test]
@@ -8273,6 +8331,29 @@ fn deferred_create_keeps_rejecting_local_and_cross_kind_conflicts() {
             String::from_utf8_lossy(name)
         );
     }
+}
+
+#[test]
+fn deferred_create_rejects_pending_local_name_matching_base() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let canonical = ROOT_INO + 11_200;
+    replay_foreign_page(&pg, 1, create_dir_events(canonical, ROOT_INO, b"shared"));
+    pg.local
+        .rename_atomic(ROOT_INO, b"shared", ROOT_INO, b"temporary", false)
+        .unwrap();
+    pg.local
+        .rename_atomic(ROOT_INO, b"temporary", ROOT_INO, b"shared", false)
+        .unwrap();
+
+    let error = pg
+        .local
+        .apply_namespace_mutations(&[deferred_create_dir(ROOT_INO + 11_300, ROOT_INO, b"shared")])
+        .expect_err("pending local namespace authority must survive even when it matches base");
+    assert!(
+        matches!(error, MetaError::NamespaceBatchOperation { source, .. }
+        if matches!(*source, MetaError::EntryExists { .. }))
+    );
+    assert_eq!(pg.lookup(ROOT_INO, b"shared").unwrap().ino, canonical);
 }
 
 /// A deferred create of a file a peer published first commits locally and,

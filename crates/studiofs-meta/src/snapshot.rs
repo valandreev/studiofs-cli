@@ -315,21 +315,27 @@ impl ServingCheckpoint {
 
     /// Decodes either format version.
     ///
-    /// Postcard is not self-describing: version 1 bytes end where the alias
-    /// vector would start, so they fail the version 2 layout and decode as
-    /// version 1 without aliases.
+    /// Both layouts share the version 1 prefix. Only an empty remainder means
+    /// version 1; a present version 2 alias suffix must decode completely.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        postcard::from_bytes::<Self>(bytes).or_else(|error| {
-            let v1 = postcard::from_bytes::<ServingCheckpointV1>(bytes).map_err(|_| error)?;
-            Ok(Self {
-                inodes: v1.inodes,
-                dentries: v1.dentries,
-                regular_file_base: v1.regular_file_base,
-                symlinks: v1.symlinks,
-                xattrs: v1.xattrs,
-                acl_rules: v1.acl_rules,
-                directory_aliases: Vec::new(),
-            })
+        let (v1, suffix) = postcard::take_from_bytes::<ServingCheckpointV1>(bytes)?;
+        let directory_aliases = if suffix.is_empty() {
+            Vec::new()
+        } else {
+            let (aliases, remainder) = postcard::take_from_bytes(suffix)?;
+            if !remainder.is_empty() {
+                return Err(postcard::Error::DeserializeBadEncoding);
+            }
+            aliases
+        };
+        Ok(Self {
+            inodes: v1.inodes,
+            dentries: v1.dentries,
+            regular_file_base: v1.regular_file_base,
+            symlinks: v1.symlinks,
+            xattrs: v1.xattrs,
+            acl_rules: v1.acl_rules,
+            directory_aliases,
         })
     }
 }
@@ -1028,6 +1034,18 @@ fn parse_collision_suffix(value: &str) -> Result<u64, SnapshotIdError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn serving_checkpoint_rejects_truncated_alias_suffix() {
+        // Six empty v1 tables followed by one incomplete v2 alias pair.
+        assert!(ServingCheckpoint::decode(&[0, 0, 0, 0, 0, 0, 1, 40]).is_err());
+    }
+
+    #[test]
+    fn serving_checkpoint_rejects_trailing_bytes() {
+        // Six empty tables, one alias pair, and an extra byte.
+        assert!(ServingCheckpoint::decode(&[0, 0, 0, 0, 0, 0, 1, 40, 30, 0]).is_err());
+    }
 
     #[test]
     fn serving_checkpoint_decodes_both_format_versions() {

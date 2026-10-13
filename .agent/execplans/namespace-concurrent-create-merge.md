@@ -12,6 +12,8 @@ After this change, both directories merge into one directory that contains the f
 
 ## Progress
 
+- [x] (2026-10-13) PR #794 follow-up: reproduce and fix displaced-file parent rewriting, pending local name authority matching base, and malformed checkpoint suffix acceptance; correct the alias-chain comment. All four new regression tests failed before their corrections and passed afterwards.
+- [x] (2026-10-13) PR #794 follow-up validation: replay suite 112 passed / 44 ignored; redb suite 328 passed / 1 ignored; snapshot suite 24 passed; metadata check and Clippy; formatting and diff checks. Independent read-only review found no actionable issues.
 - [x] (2026-10-13) Root-cause investigation of the five test-only commits on branch `bug/linux-bughunt-01`; see Surprises & Discoveries.
 - [x] (2026-10-13) User decisions recorded: directories merge; same-name file creates resolve by last writer.
 - [x] (2026-10-13) Red test `replay_merges_concurrently_created_directories` in `crates/studiofs-meta/src/pg_engine/tests/remote_apply.rs` fails: `from-a.txt must survive the directory merge`.
@@ -26,6 +28,8 @@ After this change, both directories merge into one directory that contains the f
 
 ## Surprises & Discoveries
 
+- PR #794 review: `DENTRIES_TABLE` contains replay mirrors as well as local changes, so requiring an absent serving row would reject legitimate deferred creates. A local rename away and back reproduces the actual authority gap: the serving binding equals base while unacknowledged namespace events still protect the name. Check those events only on a same-name replay conflict.
+- PR #794 review: postcard `from_bytes` ignores unused bytes. The v2-error-to-v1 fallback therefore accepted an incomplete alias suffix. Decode the shared six-table prefix once and require any present alias suffix to decode completely, preserving existing v1/v2 bytes.
 - Observation: Commit `463c6433` hid a data-loss bug, not a test race. A lagging client created its own directory with the same name, and the deferred namespace drain abandoned that directory and all dependent operations.
   Evidence: `crates/studiofs-vfs/src/vfs/namespace_ops.rs` `drain_deferred_namespace_metadata` logs "deferred namespace metadata operations lost a concurrent namespace conflict" and calls `abandon_failed_deferred_namespace_batch`; the existing test `deferred_namespace_dir_conflict_abandons_child_and_retries_independent_ops_across_batches` in `crates/studiofs-vfs/src/vfs/tests.rs` codifies that the child file is abandoned.
 
@@ -41,6 +45,8 @@ After this change, both directories merge into one directory that contains the f
 
 ## Decision Log
 
+- PR #794 follow-up: rewrite `displaced_set_attr` with the existing non-alias attribute policy, which resolves a displaced child's parent and preserves canonical owner authority. Keep `displaced_remove_attr_ino` unchanged: `rename_atomic` emits that field only for non-directory victims; only directory inodes become aliases. Resolving an alias removal to the canonical directory would contradict the owner-preservation contract.
+- PR #794 follow-up: skip the encoded in-memory key suggestion (the tuple has identical key semantics), the symlink call-site suggestion (`NamespaceMutation` has only file, directory, and setattr variants), and the hypothetical `has_aliases` reset (the flag is initialized from the table and only transitions to true). These findings do not identify incorrect current behavior.
 - Decision: Concurrently created directories with the same parent and name merge into one directory. The directory whose `AddEntry` appears first in the global PostgreSQL event order is canonical; the later one becomes an alias of it.
   Rationale: User decision (2026-10-13). `mkdir -p` is idempotent in intent, and all clients replay the same order, so "first published wins the identity" is deterministic everywhere without coordination.
   Date/Author: 2026-10-13, user and Claude.
@@ -62,6 +68,8 @@ After this change, both directories merge into one directory that contains the f
   Date/Author: 2026-10-13, Claude.
 
 ## Outcomes & Retrospective
+
+PR #794 follow-up preserves pending local name authority even when serving matches base, rewrites displaced-file parents through directory aliases, and rejects malformed checkpoint suffixes without changing valid v1/v2 bytes. Validation ran `cargo test -p studiofs-meta --lib pg_engine::tests::remote_apply:: -- --quiet`, `cargo test -p studiofs-meta --lib redb_engine::tests:: -- --quiet`, and `cargo test -p studiofs-meta --lib snapshot::tests:: -- --quiet` (464 passed total), plus `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check`. Ignored PostgreSQL tests, the ignored local storage stress test, and mounted E2E scenarios were not run for this follow-up.
 
 Directories created concurrently under one name now merge on every client, including the client whose directory became an alias and clients bootstrapped from a later checkpoint; same-name files resolve by last writer; the VFS deferred window no longer abandons a lagging client's work. The design moved the deferred-window fix into the metadata create path (shadowing a replayed entry) instead of a VFS-wide alias map, which reused the replay merge and kept the VFS unchanged. Remaining gaps are recorded in ADR 0012.
 
