@@ -698,6 +698,16 @@ for both payload updates and deleted-path visibility, and then validates final
 convergence plus deleted-path absence through public mounted reads. It writes
 `operations.ndjson`, `invalidation-dropout-summary.json`,
 `invalidation-fallback-diagnostics.json`, and `validation.json`.
+
+Linux and macOS mounted validation probes have a 15-second I/O budget. A cold
+read includes local cache admission and its synchronous redb index commit; a
+successful Linux read measured 5.22 seconds and exceeded
+the former five-second budget. Check `fetch.local_cache_backend_io_max_ms`,
+`fetch.s3_get_max_ms`, and `fuse_callbacks.read.max_ms` in the retained
+`write_path_observability.json` before attributing a probe timeout to convergence
+or a blocked kernel callback. A timed-out probe still poisons its limiter and
+fails the scenario without spawning more probes.
+
 `mounted-symlink-attribute-convergence` is the next post-1-16 promotion
 scenario. It uses public mounted filesystem behavior for symlink
 create/read-target/rename/unlink-recreate target replacement, writes near the

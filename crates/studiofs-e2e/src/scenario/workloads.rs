@@ -175,9 +175,10 @@ const MOUNTED_SPARSE_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const BOUNDED_MOUNTED_IO_MAX_WORKERS: usize = 1;
 #[cfg(test)]
 const BOUNDED_MOUNTED_IO_MAX_WORKERS: usize = 64;
-#[cfg(target_os = "macos")]
+// Cold reads include local cache admission, whose disk I/O can exceed five seconds.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const MOUNTED_VALIDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const MOUNTED_VALIDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_VALIDATION_MAX_ACTIVE_PROBES: usize = 1;
 #[cfg(target_os = "macos")]
