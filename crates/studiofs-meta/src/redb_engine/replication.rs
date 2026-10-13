@@ -1519,15 +1519,16 @@ impl RedbMetaEngine {
                         && current.content_epoch == current.committed_content_epoch
                         && attr.upload_state == UploadState::Ready
                         && attr.size == attr.committed_size
-                        && attr.content_epoch == current.content_epoch
-                        && attr.size > current.size
-                        && ((attr.mtime < current.mtime && attr.ctime < current.ctime)
-                            || !Self::ready_regular_file_growth_has_payload(
-                                events.iter().map(Borrow::borrow),
-                                attr.ino,
-                                current.size,
-                                attr.size,
-                            ))
+                        && (attr.content_epoch < current.content_epoch
+                            || (attr.content_epoch == current.content_epoch
+                                && attr.size > current.size
+                                && ((attr.mtime < current.mtime && attr.ctime < current.ctime)
+                                    || !Self::ready_regular_file_growth_has_payload(
+                                        events.iter().map(Borrow::borrow),
+                                        attr.ino,
+                                        current.size,
+                                        attr.size,
+                                    ))))
                     {
                         continue;
                     }

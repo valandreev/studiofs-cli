@@ -648,6 +648,13 @@ and readdir/stat while mutations are in flight. The overwrite/read scenario
 records repeated read loops during the overwrite. Each collision run writes `operations.ndjson`,
 `namespace-collision-summary.json`, and `validation.json`.
 
+Mounted hotspot helpers reserve cancellation time within the operation timeout.
+Only Windows also reserves child-exit waiting time; Linux and macOS terminate
+timed-out helpers without that wait. The focused regression
+`hotspot_helper_internal_timeout_leaves_parent_kill_reserve` checks this budget;
+run `cargo test -p studiofs-e2e --lib hotspot_helper_` to also check timeout
+enforcement and helper progress reporting.
+
 On macOS, mounted readiness and stale-mount cleanup read the `/sbin/mount`
 table through a bounded helper instead of calling `stat` on the candidate
 FSKit mountpoint. A stale FSKit vnode can block filesystem metadata calls after
@@ -691,6 +698,25 @@ for both payload updates and deleted-path visibility, and then validates final
 convergence plus deleted-path absence through public mounted reads. It writes
 `operations.ndjson`, `invalidation-dropout-summary.json`,
 `invalidation-fallback-diagnostics.json`, and `validation.json`.
+
+Linux and macOS mounted validation probes have a 15-second I/O budget. A cold
+read includes local cache admission and its synchronous redb index commit; a
+successful Linux read measured 5.22 seconds and exceeded
+the former five-second budget. Check `fetch.local_cache_backend_io_max_ms`,
+`fetch.s3_get_max_ms`, and `fuse_callbacks.read.max_ms` in the retained
+`write_path_observability.json` before attributing a probe timeout to convergence
+or a blocked kernel callback. A timed-out probe still poisons its limiter and
+fails the scenario without spawning more probes.
+
+Linux mounted write/readback operations also have a 15-second I/O budget.
+Cold creates include durable local inode-ID reservation: scenario 23 recorded
+4.464 seconds in `namespace_create.inode_allocation.max_ms`, exceeding the
+former helper's 4.25-second internal deadline (five seconds minus cancellation
+grace). Check that metric and `vfs_write_path.mkdir.max_ms` in the retained
+`write_path_observability.json`. A `completed` progress event after
+`timeout_cancel_requested` still fails the operation; content verification,
+helper exit checks, and timeout containment remain required.
+
 `mounted-symlink-attribute-convergence` is the next post-1-16 promotion
 scenario. It uses public mounted filesystem behavior for symlink
 create/read-target/rename/unlink-recreate target replacement, writes near the

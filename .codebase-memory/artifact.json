@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "ad28f21d609c8cd11d203bac0218e53af2a54d19",
+    "indexed_at": "2026-10-13T19:01:18Z",
+    "project": "home-val-dev-studiofs-cli",
+    "nodes": 28576,
+    "edges": 181570,
+    "original_size": 125960192,
+    "compressed_size": 20015594,
+    "compression_level": 3
+}

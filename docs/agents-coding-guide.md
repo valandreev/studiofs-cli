@@ -13,6 +13,21 @@ key for this repository is `E-dev-studiofs-cli`. Use `search_graph` and
 claims. Use `rg` or PowerShell for Markdown, scripts, literals, and parse-partial or
 excluded files.
 
+The team-shared snapshot is `.codebase-memory/graph.db.zst`, with its
+`artifact.json` metadata and generated `.gitattributes` merge rule. Refresh it
+with `index_repository` using `name="E-dev-studiofs-cli"` and
+`persistence=true`. A fresh checkout imports the snapshot and incrementally
+indexes its local tree, so the same artifact works on Linux, macOS, and Windows.
+The indexer rewrites the artifact during later indexes; commit refreshed copies
+on a deliberate cadence because each changed copy adds binary history to Git.
+Install the native MCP executable and configure the agent client separately on
+each OS; do not share a machine-specific executable path through Git.
+
+If Codebase Memory tools are missing from an agent session, check the local CLI
+with `codebase-memory-mcp cli list_projects --format json` to distinguish a
+session integration problem from a missing local index. Use the exact project
+name shown by `list_projects` for CLI graph queries.
+
 The authoritative order is: user request, applicable scoped `AGENTS.md`, root
 `AGENTS.md`, the canonical local-first contract, relevant ADRs, and then supporting
 documentation. When a review comment or issue description conflicts with current

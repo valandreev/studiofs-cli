@@ -401,9 +401,19 @@ impl PgMetaEngine {
             Self::clear_pending_state(state);
             return Ok(());
         }
+        let selected = self.select_unprocessed_local_events(event_start, pending_events)?;
+        let projected = RemoteApplyCoordinator::project_local_batch(selected.events.as_ref());
+        // Retire local-only completion snapshots before replay can resurrect their overlays.
+        if !selected.events.is_empty()
+            && projected.visible_ops == 0
+            && !projected.needs_local_replay
+        {
+            self.complete_local_event_ranges_locked(&selected.ranges)?;
+        }
+        let replay_start = self.flushed_event_seq.load(Ordering::SeqCst).max(1);
         // Published ranges may remain behind a durable cursor gap after a foreign rename.
         let replay_exclusions = self.local_event_overlay_exclusions()?;
-        let serving_events = if replay_exclusions.is_empty() {
+        let serving_events = if replay_exclusions.is_empty() && event_start.max(1) >= replay_start {
             Cow::Borrowed(pending_events)
         } else {
             Cow::Owned(
@@ -412,7 +422,7 @@ impl PgMetaEngine {
                     .enumerate()
                     .filter(|(index, _)| {
                         let seq = event_start.max(1).saturating_add(*index as u64);
-                        !local_event_range_contains(&replay_exclusions, seq)
+                        seq >= replay_start && !local_event_range_contains(&replay_exclusions, seq)
                     })
                     .map(|(_, event)| event.clone())
                     .collect::<Vec<_>>(),
@@ -420,12 +430,10 @@ impl PgMetaEngine {
         };
         self.local
             .apply_replica_serving_state_for_pending_replay(&serving_events)?;
-        let selected = self.select_unprocessed_local_events(event_start, pending_events)?;
         if selected.events.is_empty() {
             Self::clear_pending_state(state);
             return Ok(());
         }
-        let projected = RemoteApplyCoordinator::project_local_batch(selected.events.as_ref());
         if projected.visible_ops == 0 {
             if projected.needs_local_replay {
                 let now = Instant::now();
@@ -437,7 +445,6 @@ impl PgMetaEngine {
                 state.last_mutation_at = Some(now);
                 return Ok(());
             }
-            self.complete_local_event_ranges_locked(&selected.ranges)?;
             Self::clear_pending_state(state);
             return Ok(());
         }
