@@ -254,6 +254,8 @@ pub(crate) mod raw {
         pub fn fuse_reply_statfs(req: *mut FuseReq, stat: *const statvfs) -> c_int;
         /// Reply with the required xattr buffer size.
         pub fn fuse_reply_xattr(req: *mut FuseReq, count: size_t) -> c_int;
+        /// Release a forget request without sending a kernel reply.
+        pub fn fuse_reply_none(req: *mut FuseReq);
         /// Return session user data associated with a request.
         pub fn fuse_req_userdata(req: *mut FuseReq) -> *mut c_void;
         /// Register or unregister a request interruption callback.
@@ -1383,19 +1385,17 @@ impl Request {
         remove_interrupt_token(key);
     }
 
-    fn as_ptr(&self) -> *mut raw::FuseReq {
-        match self.raw {
-            Some(raw) => raw.as_ptr(),
-            None => unreachable!("type-state invariant: macFUSE request was already replied"),
-        }
+    fn as_ptr(&self) -> io::Result<*mut raw::FuseReq> {
+        self.raw
+            .map(NonNull::as_ptr)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))
     }
 
-    fn take_raw(&mut self) -> NonNull<raw::FuseReq> {
+    fn take_raw(&mut self) -> io::Result<NonNull<raw::FuseReq>> {
         self.clear_interrupt_token();
-        match self.raw.take() {
-            Some(raw) => raw,
-            None => unreachable!("type-state invariant: macFUSE request was already replied"),
-        }
+        self.raw
+            .take()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))
     }
 }
 
@@ -1449,15 +1449,23 @@ impl Reply {
 
     /// Reply with a POSIX errno.
     pub fn error(mut self, errno: c_int) -> io::Result<()> {
-        let request = self.request.take_raw();
+        let request = self.request.take_raw()?;
         // SAFETY: `Request` guarantees a live, unreplied low-level request and
         // this method consumes it, so macFUSE sees at most one reply.
         reply_result(unsafe { raw::fuse_reply_err(request.as_ptr(), errno) })
     }
 
+    /// Complete a forget request without sending a kernel reply.
+    pub fn none(mut self) -> io::Result<()> {
+        let request = self.request.take_raw()?;
+        // SAFETY: This consumes the sole owner of the live forget request.
+        unsafe { raw::fuse_reply_none(request.as_ptr()) };
+        Ok(())
+    }
+
     /// Reply with an entry.
     pub fn entry(mut self, entry: &Entry) -> io::Result<()> {
-        let request = self.request.take_raw();
+        let request = self.request.take_raw()?;
         // SAFETY: `entry.raw` points to initialized C-compatible data for the
         // duration of the call; `self` consumes the single request reply.
         reply_result(unsafe { raw::fuse_reply_entry(request.as_ptr(), &entry.raw) })
@@ -1465,7 +1473,7 @@ impl Reply {
 
     /// Reply with attributes.
     pub fn attr(mut self, attr: &stat, timeout: f64) -> io::Result<()> {
-        let request = self.request.take_raw();
+        let request = self.request.take_raw()?;
         // SAFETY: `attr` is initialized and borrowed for the duration of the
         // call; `self` consumes the single request reply.
         reply_result(unsafe { raw::fuse_reply_attr(request.as_ptr(), attr, timeout) })
@@ -1473,7 +1481,7 @@ impl Reply {
 
     /// Reply with open parameters.
     pub fn open(mut self, open: OpenReply) -> io::Result<()> {
-        let request = self.request.take_raw();
+        let request = self.request.take_raw()?;
         let file_info = raw::FuseFileInfo::from_open_reply(open);
         // SAFETY: `file_info` is initialized and borrowed for the duration of
         // the call; `self` consumes the single request reply.
@@ -1482,7 +1490,7 @@ impl Reply {
 
     /// Reply with a newly created entry and open parameters.
     pub fn create(mut self, entry: &Entry, open: OpenReply) -> io::Result<()> {
-        let request = self.request.take_raw();
+        let request = self.request.take_raw()?;
         let file_info = raw::FuseFileInfo::from_open_reply(open);
         // SAFETY: `entry` and `file_info` are initialized and borrowed for the
         // duration of the call; `self` consumes the single request reply.
@@ -1491,7 +1499,7 @@ impl Reply {
 
     /// Reply with a read buffer.
     pub fn read_buffer(mut self, bytes: &[u8]) -> io::Result<()> {
-        let request = self.request.take_raw();
+        let request = self.request.take_raw()?;
         // SAFETY: `bytes` is valid for the duration of the call and macFUSE
         // copies/sends it synchronously; `self` consumes the single reply.
         reply_result(unsafe {
@@ -1505,7 +1513,7 @@ impl Reply {
 
     /// Reply with a symbolic link target.
     pub fn readlink(mut self, target: &std::ffi::CStr) -> io::Result<()> {
-        let request = self.request.take_raw();
+        let request = self.request.take_raw()?;
         // SAFETY: `target` is NUL-terminated and valid for the duration of the
         // call; macFUSE copies/sends it synchronously and `self` is consumed.
         reply_result(unsafe { raw::fuse_reply_readlink(request.as_ptr(), target.as_ptr()) })
@@ -1513,7 +1521,7 @@ impl Reply {
 
     /// Reply with a write byte count.
     pub fn write_count(mut self, count: usize) -> io::Result<()> {
-        let request = self.request.take_raw();
+        let request = self.request.take_raw()?;
         // SAFETY: `self` owns a live, unreplied request and is consumed here.
         reply_result(unsafe { raw::fuse_reply_write(request.as_ptr(), count) })
     }
@@ -1525,7 +1533,7 @@ impl Reply {
 
     /// Reply with filesystem statistics.
     pub fn statfs(mut self, stat: &statvfs) -> io::Result<()> {
-        let request = self.request.take_raw();
+        let request = self.request.take_raw()?;
         // SAFETY: `stat` is initialized and borrowed for the duration of the
         // call; `self` consumes the single request reply.
         reply_result(unsafe { raw::fuse_reply_statfs(request.as_ptr(), stat) })
@@ -1533,7 +1541,7 @@ impl Reply {
 
     /// Reply with the required xattr value/list buffer size.
     pub fn xattr_size(mut self, count: usize) -> io::Result<()> {
-        let request = self.request.take_raw();
+        let request = self.request.take_raw()?;
         // SAFETY: `self` owns a live, unreplied request and is consumed here.
         reply_result(unsafe { raw::fuse_reply_xattr(request.as_ptr(), count) })
     }
@@ -1609,6 +1617,9 @@ impl DirectoryEntryBuffer {
         attr: &stat,
         next_offset: off_t,
     ) -> Result<(), DirectoryEntryError> {
+        let request = request
+            .as_ptr()
+            .map_err(|_| DirectoryEntryError::AlreadyReplied)?;
         let name_bytes = name.as_bytes();
         if name_bytes.contains(&0) {
             return Err(DirectoryEntryError::InteriorNul);
@@ -1622,7 +1633,7 @@ impl DirectoryEntryBuffer {
         // call.
         let required = unsafe {
             raw::fuse_add_direntry(
-                request.as_ptr(),
+                request,
                 std::ptr::null_mut(),
                 0,
                 self.scratch_name.as_ptr().cast::<c_char>(),
@@ -1647,7 +1658,7 @@ impl DirectoryEntryBuffer {
         // which `set_len` marks the initialized bytes.
         unsafe {
             raw::fuse_add_direntry(
-                request.as_ptr(),
+                request,
                 self.words
                     .as_mut_ptr()
                     .cast::<u8>()
@@ -1716,6 +1727,9 @@ impl DirectoryEntryBuffer {
 /// Directory-entry buffer construction error.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DirectoryEntryError {
+    /// Request has already been consumed by a reply.
+    #[error("macFUSE request was already replied")]
+    AlreadyReplied,
     /// Entry name contains an interior NUL byte.
     #[error("directory entry name contains an interior NUL byte")]
     InteriorNul,
@@ -1755,6 +1769,74 @@ mod tests {
     use std::future::Future;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn consumed_request_reply_returns_eio_without_panicking() {
+        let request = Request {
+            raw: None,
+            interrupt_key: None,
+        };
+        let result = std::panic::catch_unwind(|| Reply::new(request).error(libc::EIO));
+        assert!(result.is_ok(), "consumed request must not panic");
+        assert_eq!(result.unwrap().unwrap_err().raw_os_error(), Some(libc::EIO));
+    }
+
+    #[test]
+    fn request_raw_ownership_can_only_be_taken_once() {
+        let raw = NonNull::dangling();
+        // This pointer is only moved between Rust values, never passed to FFI.
+        let mut request = Request {
+            raw: Some(raw),
+            interrupt_key: None,
+        };
+        assert_eq!(request.take_raw().unwrap(), raw);
+        assert_eq!(
+            request.take_raw().unwrap_err().raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert_eq!(
+            request.as_ptr().unwrap_err().raw_os_error(),
+            Some(libc::EIO)
+        );
+    }
+
+    #[test]
+    fn consumed_request_clears_stale_interrupt_registration() {
+        let _registry_lock = lock_interrupt_registry_for_test();
+        let key = next_interrupt_key();
+        let token = CancellationToken::new();
+        assert!(insert_interrupt_token(key, token.clone()));
+        let mut request = Request {
+            raw: None,
+            interrupt_key: Some(key),
+        };
+        assert_eq!(
+            request.take_raw().unwrap_err().raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert_eq!(request.interrupt_key, None);
+        assert!(!interrupt_registry().contains_key(&key));
+        invoke_interrupt_callback(key);
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn consumed_request_directory_entry_returns_error_without_panicking() {
+        let request = Request {
+            raw: None,
+            interrupt_key: None,
+        };
+        let mut buffer = DirectoryEntryBuffer::new(1024);
+        // SAFETY: An all-zero stat is valid initialized input; no FFI call is
+        // permitted for the consumed request.
+        let attr = unsafe { std::mem::zeroed::<stat>() };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            buffer.push(&request, OsStr::new("entry"), &attr, 1)
+        }));
+        assert!(result.is_ok(), "consumed request must not panic");
+        assert_eq!(result.unwrap(), Err(DirectoryEntryError::AlreadyReplied));
+        assert!(buffer.is_empty());
+    }
 
     #[test]
     fn disabled_entry_invalidation_preserves_inode_and_attr_notifications() {

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
@@ -2511,6 +2512,12 @@ fn reply_error(req: *mut raw::FuseReq, errno: i32) {
     }
 }
 
+fn reply_none(req: *mut raw::FuseReq) {
+    if let Some(request) = owned_request(req) {
+        let _ = Reply::new(request).none();
+    }
+}
+
 fn reply_callback_error(req: *mut raw::FuseReq, operation: &'static str, errno: i32) {
     log_callback_error(operation, errno);
     reply_error(req, errno);
@@ -2553,14 +2560,104 @@ fn callback_error_log_level(operation: &'static str, errno: i32) -> Option<Callb
 }
 
 fn owned_request(req: *mut raw::FuseReq) -> Option<Request> {
+    if let Some(request) = CALLBACK_REQUEST.with(|request| {
+        request
+            .borrow_mut()
+            .as_mut()
+            .filter(|frame| frame.req == req)
+            .map(|frame| frame.request.take())
+    }) {
+        return request;
+    }
     // SAFETY: Each low-level callback receives a live unreplied request pointer.
     unsafe { Request::from_raw(req) }
+}
+
+struct CallbackRequestFrame {
+    req: *mut raw::FuseReq,
+    request: Option<Request>,
+}
+
+thread_local! {
+    static CALLBACK_REQUEST: RefCell<Option<CallbackRequestFrame>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+enum CallbackPanicReply {
+    Error,
+    None,
+}
+
+fn contain_callback_panic(
+    req: *mut raw::FuseReq,
+    operation: &'static str,
+    panic_reply: CallbackPanicReply,
+    callback: impl FnOnce(),
+) {
+    if catch_callback_unwind(|| {
+        contain_callback_panic_inner(req, operation, panic_reply, callback);
+    }) {
+        // This also contains failures in request setup, frame restoration, and fallback replies.
+        catch_callback_unwind(|| warn!(operation, "macFUSE callback boundary panicked"));
+    }
+}
+
+fn contain_callback_panic_inner(
+    req: *mut raw::FuseReq,
+    operation: &'static str,
+    panic_reply: CallbackPanicReply,
+    callback: impl FnOnce(),
+) {
+    // SAFETY: This boundary is called once for each live macFUSE callback request.
+    let request = unsafe { Request::from_raw(req) };
+    // Keep the request in a scoped frame so existing helpers can hand it off
+    // without changing the C ABI or replying to a transferred raw pointer.
+    let previous =
+        CALLBACK_REQUEST.with(|slot| slot.replace(Some(CallbackRequestFrame { req, request })));
+    let panicked = catch_callback_unwind(callback);
+    let request = CALLBACK_REQUEST.with(|slot| {
+        slot.replace(previous)
+            .filter(|frame| frame.req == req)
+            .and_then(|frame| frame.request)
+    });
+    if panicked {
+        if let Some(request) = request {
+            match panic_reply {
+                CallbackPanicReply::Error => drop(request),
+                CallbackPanicReply::None => {
+                    catch_callback_unwind(|| {
+                        let _ = Reply::new(request).none();
+                    });
+                }
+            }
+        }
+        catch_callback_unwind(|| warn!(operation, "macFUSE callback panicked"));
+    } else {
+        drop(request);
+    }
+}
+
+fn catch_callback_unwind(callback: impl FnOnce()) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback)) {
+        Ok(()) => false,
+        Err(payload) => {
+            // Drop ordinary payloads; retain only a second panic's payload so
+            // a custom destructor cannot unwind through the C ABI.
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop(payload);
+            })) {
+                mem::forget(payload);
+            }
+            true
+        }
+    }
 }
 
 fn directory_entry_errno(error: crate::low_level::DirectoryEntryError) -> i32 {
     match error {
         crate::low_level::DirectoryEntryError::InsufficientCapacity { .. } => libc::ERANGE,
         crate::low_level::DirectoryEntryError::InteriorNul => libc::EINVAL,
+        crate::low_level::DirectoryEntryError::AlreadyReplied => libc::EIO,
     }
 }
 
@@ -3272,6 +3369,16 @@ pub extern "C" fn studiofs_macfuse_lookup(
     parent: raw::FuseIno,
     name: *const c_char,
 ) {
+    contain_callback_panic(req, "lookup", CallbackPanicReply::Error, || {
+        studiofs_macfuse_lookup_inner(req, parent, name)
+    });
+}
+
+fn studiofs_macfuse_lookup_inner(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -3311,15 +3418,33 @@ pub extern "C" fn studiofs_macfuse_forget(
     ino: raw::FuseIno,
     nlookup: c_ulong,
 ) {
+    contain_callback_panic(req, "forget", CallbackPanicReply::None, || {
+        studiofs_macfuse_forget_inner(req, ino, nlookup)
+    });
+}
+
+fn studiofs_macfuse_forget_inner(req: *mut raw::FuseReq, ino: raw::FuseIno, nlookup: c_ulong) {
     let Some(state) = callback_state(req) else {
+        reply_none(req);
         return;
     };
     state.adapter.forget(ino, nlookup);
+    reply_none(req);
 }
 
 /// macFUSE getattr callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_getattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    _fi: *mut raw::FuseFileInfo,
+) {
+    contain_callback_panic(req, "getattr", CallbackPanicReply::Error, || {
+        studiofs_macfuse_getattr_inner(req, ino, _fi)
+    });
+}
+
+fn studiofs_macfuse_getattr_inner(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
     _fi: *mut raw::FuseFileInfo,
@@ -3346,6 +3471,17 @@ pub extern "C" fn studiofs_macfuse_getattr(
 /// macFUSE mkdir callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_mkdir(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    mode: mode_t,
+) {
+    contain_callback_panic(req, "mkdir", CallbackPanicReply::Error, || {
+        studiofs_macfuse_mkdir_inner(req, parent, name, mode)
+    });
+}
+
+fn studiofs_macfuse_mkdir_inner(
     req: *mut raw::FuseReq,
     parent: raw::FuseIno,
     name: *const c_char,
@@ -3396,6 +3532,17 @@ pub extern "C" fn studiofs_macfuse_symlink(
     parent: raw::FuseIno,
     name: *const c_char,
 ) {
+    contain_callback_panic(req, "symlink", CallbackPanicReply::Error, || {
+        studiofs_macfuse_symlink_inner(req, target, parent, name)
+    });
+}
+
+fn studiofs_macfuse_symlink_inner(
+    req: *mut raw::FuseReq,
+    target: *const c_char,
+    parent: raw::FuseIno,
+    name: *const c_char,
+) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -3419,6 +3566,18 @@ pub extern "C" fn studiofs_macfuse_symlink(
 /// macFUSE mknod callback for regular-file creation paths that do not use create.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_mknod(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    mode: mode_t,
+    _rdev: libc::dev_t,
+) {
+    contain_callback_panic(req, "mknod", CallbackPanicReply::Error, || {
+        studiofs_macfuse_mknod_inner(req, parent, name, mode, _rdev)
+    });
+}
+
+fn studiofs_macfuse_mknod_inner(
     req: *mut raw::FuseReq,
     parent: raw::FuseIno,
     name: *const c_char,
@@ -3466,6 +3625,18 @@ pub extern "C" fn studiofs_macfuse_mknod(
 /// macFUSE create callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_create(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    mode: mode_t,
+    fi: *mut raw::FuseFileInfo,
+) {
+    contain_callback_panic(req, "create", CallbackPanicReply::Error, || {
+        studiofs_macfuse_create_inner(req, parent, name, mode, fi)
+    });
+}
+
+fn studiofs_macfuse_create_inner(
     req: *mut raw::FuseReq,
     parent: raw::FuseIno,
     name: *const c_char,
@@ -3536,6 +3707,16 @@ pub extern "C" fn studiofs_macfuse_unlink(
     parent: raw::FuseIno,
     name: *const c_char,
 ) {
+    contain_callback_panic(req, "unlink", CallbackPanicReply::Error, || {
+        studiofs_macfuse_unlink_inner(req, parent, name)
+    });
+}
+
+fn studiofs_macfuse_unlink_inner(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -3567,6 +3748,12 @@ pub extern "C" fn studiofs_macfuse_rmdir(
     parent: raw::FuseIno,
     name: *const c_char,
 ) {
+    contain_callback_panic(req, "rmdir", CallbackPanicReply::Error, || {
+        studiofs_macfuse_rmdir_inner(req, parent, name)
+    });
+}
+
+fn studiofs_macfuse_rmdir_inner(req: *mut raw::FuseReq, parent: raw::FuseIno, name: *const c_char) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -3588,6 +3775,18 @@ pub extern "C" fn studiofs_macfuse_rmdir(
 /// macFUSE rename callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_rename(
+    req: *mut raw::FuseReq,
+    parent: raw::FuseIno,
+    name: *const c_char,
+    newparent: raw::FuseIno,
+    newname: *const c_char,
+) {
+    contain_callback_panic(req, "rename", CallbackPanicReply::Error, || {
+        studiofs_macfuse_rename_inner(req, parent, name, newparent, newname)
+    });
+}
+
+fn studiofs_macfuse_rename_inner(
     req: *mut raw::FuseReq,
     parent: raw::FuseIno,
     name: *const c_char,
@@ -3630,6 +3829,17 @@ pub extern "C" fn studiofs_macfuse_link(
     newparent: raw::FuseIno,
     newname: *const c_char,
 ) {
+    contain_callback_panic(req, "link", CallbackPanicReply::Error, || {
+        studiofs_macfuse_link_inner(req, ino, newparent, newname)
+    });
+}
+
+fn studiofs_macfuse_link_inner(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    newparent: raw::FuseIno,
+    newname: *const c_char,
+) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -3664,6 +3874,16 @@ pub extern "C" fn studiofs_macfuse_link(
 /// macFUSE open callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_open(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+) {
+    contain_callback_panic(req, "open", CallbackPanicReply::Error, || {
+        studiofs_macfuse_open_inner(req, ino, fi)
+    });
+}
+
+fn studiofs_macfuse_open_inner(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
     fi: *mut raw::FuseFileInfo,
@@ -3734,6 +3954,18 @@ pub extern "C" fn studiofs_macfuse_read(
     off: off_t,
     fi: *mut raw::FuseFileInfo,
 ) {
+    contain_callback_panic(req, "read", CallbackPanicReply::Error, || {
+        studiofs_macfuse_read_inner(req, ino, size, off, fi)
+    });
+}
+
+fn studiofs_macfuse_read_inner(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    size: size_t,
+    off: off_t,
+    fi: *mut raw::FuseFileInfo,
+) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -3769,6 +4001,19 @@ pub extern "C" fn studiofs_macfuse_read(
 /// macFUSE write callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_write(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    buf: *const c_char,
+    size: size_t,
+    off: off_t,
+    fi: *mut raw::FuseFileInfo,
+) {
+    contain_callback_panic(req, "write", CallbackPanicReply::Error, || {
+        studiofs_macfuse_write_inner(req, ino, buf, size, off, fi)
+    });
+}
+
+fn studiofs_macfuse_write_inner(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
     buf: *const c_char,
@@ -3824,6 +4069,16 @@ pub extern "C" fn studiofs_macfuse_flush(
     ino: raw::FuseIno,
     fi: *mut raw::FuseFileInfo,
 ) {
+    contain_callback_panic(req, "flush", CallbackPanicReply::Error, || {
+        studiofs_macfuse_flush_inner(req, ino, fi)
+    });
+}
+
+fn studiofs_macfuse_flush_inner(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -3849,6 +4104,17 @@ pub extern "C" fn studiofs_macfuse_flush(
 /// macFUSE fsync callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_fsync(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    datasync: libc::c_int,
+    fi: *mut raw::FuseFileInfo,
+) {
+    contain_callback_panic(req, "fsync", CallbackPanicReply::Error, || {
+        studiofs_macfuse_fsync_inner(req, ino, datasync, fi)
+    });
+}
+
+fn studiofs_macfuse_fsync_inner(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
     datasync: libc::c_int,
@@ -3882,6 +4148,18 @@ pub extern "C" fn studiofs_macfuse_fsync(
 /// macFUSE setattr callback for size-changing truncate/extend operations.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_setattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    attr: *mut stat,
+    to_set: libc::c_int,
+    fi: *mut raw::FuseFileInfo,
+) {
+    contain_callback_panic(req, "setattr", CallbackPanicReply::Error, || {
+        studiofs_macfuse_setattr_inner(req, ino, attr, to_set, fi)
+    });
+}
+
+fn studiofs_macfuse_setattr_inner(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
     attr: *mut stat,
@@ -3968,6 +4246,18 @@ pub extern "C" fn studiofs_macfuse_setattr(
 /// macFUSE Darwin setattr extension callback for file flags and extra times.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_setattr_x(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    attr: *mut raw::FuseSetattrX,
+    to_set: libc::c_int,
+    fi: *mut raw::FuseFileInfo,
+) {
+    contain_callback_panic(req, "setattr_x", CallbackPanicReply::Error, || {
+        studiofs_macfuse_setattr_x_inner(req, ino, attr, to_set, fi)
+    });
+}
+
+fn studiofs_macfuse_setattr_x_inner(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
     attr: *mut raw::FuseSetattrX,
@@ -4257,6 +4547,16 @@ pub extern "C" fn studiofs_macfuse_release(
     ino: raw::FuseIno,
     fi: *mut raw::FuseFileInfo,
 ) {
+    contain_callback_panic(req, "release", CallbackPanicReply::Error, || {
+        studiofs_macfuse_release_inner(req, ino, fi)
+    });
+}
+
+fn studiofs_macfuse_release_inner(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -4282,6 +4582,16 @@ pub extern "C" fn studiofs_macfuse_release(
 /// macFUSE opendir callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_opendir(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+) {
+    contain_callback_panic(req, "opendir", CallbackPanicReply::Error, || {
+        studiofs_macfuse_opendir_inner(req, ino, fi)
+    });
+}
+
+fn studiofs_macfuse_opendir_inner(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
     fi: *mut raw::FuseFileInfo,
@@ -4323,6 +4633,18 @@ pub extern "C" fn studiofs_macfuse_readdir(
     off: off_t,
     fi: *mut raw::FuseFileInfo,
 ) {
+    contain_callback_panic(req, "readdir", CallbackPanicReply::Error, || {
+        studiofs_macfuse_readdir_inner(req, ino, size, off, fi)
+    });
+}
+
+fn studiofs_macfuse_readdir_inner(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    size: size_t,
+    off: off_t,
+    fi: *mut raw::FuseFileInfo,
+) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -4357,6 +4679,16 @@ pub extern "C" fn studiofs_macfuse_releasedir(
     _ino: raw::FuseIno,
     fi: *mut raw::FuseFileInfo,
 ) {
+    contain_callback_panic(req, "releasedir", CallbackPanicReply::Error, || {
+        studiofs_macfuse_releasedir_inner(req, _ino, fi)
+    });
+}
+
+fn studiofs_macfuse_releasedir_inner(
+    req: *mut raw::FuseReq,
+    _ino: raw::FuseIno,
+    fi: *mut raw::FuseFileInfo,
+) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -4376,6 +4708,12 @@ pub extern "C" fn studiofs_macfuse_releasedir(
 /// macFUSE readlink callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::FuseIno) {
+    contain_callback_panic(req, "readlink", CallbackPanicReply::Error, || {
+        studiofs_macfuse_readlink_inner(req, ino)
+    });
+}
+
+fn studiofs_macfuse_readlink_inner(req: *mut raw::FuseReq, ino: raw::FuseIno) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -4396,6 +4734,12 @@ pub extern "C" fn studiofs_macfuse_readlink(req: *mut raw::FuseReq, ino: raw::Fu
 /// macFUSE statfs callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::FuseIno) {
+    contain_callback_panic(req, "statfs", CallbackPanicReply::Error, || {
+        studiofs_macfuse_statfs_inner(req, _ino)
+    });
+}
+
+fn studiofs_macfuse_statfs_inner(req: *mut raw::FuseReq, _ino: raw::FuseIno) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -4413,6 +4757,20 @@ pub extern "C" fn studiofs_macfuse_statfs(req: *mut raw::FuseReq, _ino: raw::Fus
 /// macFUSE setxattr callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_setxattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    name: *const c_char,
+    value: *const c_char,
+    size: size_t,
+    flags: libc::c_int,
+    position: u32,
+) {
+    contain_callback_panic(req, "setxattr", CallbackPanicReply::Error, || {
+        studiofs_macfuse_setxattr_inner(req, ino, name, value, size, flags, position)
+    });
+}
+
+fn studiofs_macfuse_setxattr_inner(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
     name: *const c_char,
@@ -4461,6 +4819,18 @@ pub extern "C" fn studiofs_macfuse_getxattr(
     size: size_t,
     position: u32,
 ) {
+    contain_callback_panic(req, "getxattr", CallbackPanicReply::Error, || {
+        studiofs_macfuse_getxattr_inner(req, ino, name, size, position)
+    });
+}
+
+fn studiofs_macfuse_getxattr_inner(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    name: *const c_char,
+    size: size_t,
+    position: u32,
+) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -4497,6 +4867,12 @@ pub extern "C" fn studiofs_macfuse_listxattr(
     ino: raw::FuseIno,
     size: size_t,
 ) {
+    contain_callback_panic(req, "listxattr", CallbackPanicReply::Error, || {
+        studiofs_macfuse_listxattr_inner(req, ino, size)
+    });
+}
+
+fn studiofs_macfuse_listxattr_inner(req: *mut raw::FuseReq, ino: raw::FuseIno, size: size_t) {
     let Some(state) = callback_state(req) else {
         reply_error(req, libc::EIO);
         return;
@@ -4511,6 +4887,16 @@ pub extern "C" fn studiofs_macfuse_listxattr(
 /// macFUSE removexattr callback for the StudioVfs bridge.
 #[unsafe(no_mangle)]
 pub extern "C" fn studiofs_macfuse_removexattr(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    name: *const c_char,
+) {
+    contain_callback_panic(req, "removexattr", CallbackPanicReply::Error, || {
+        studiofs_macfuse_removexattr_inner(req, ino, name)
+    });
+}
+
+fn studiofs_macfuse_removexattr_inner(
     req: *mut raw::FuseReq,
     ino: raw::FuseIno,
     name: *const c_char,
@@ -5123,6 +5509,133 @@ mod tests {
             callback_error_log_level("read", MACFUSE_READ_INTERRUPTED_ERRNO),
             None
         );
+    }
+
+    #[test]
+    fn callback_boundary_contains_panics_and_restores_request_frame() {
+        let req = std::ptr::null_mut();
+        contain_callback_panic(req, "test", CallbackPanicReply::Error, || {
+            panic!("simulated callback panic");
+        });
+
+        assert!(CALLBACK_REQUEST.with(|request| request.borrow().is_none()));
+    }
+
+    #[test]
+    fn callback_boundary_restores_nested_request_frame() {
+        let req = std::ptr::null_mut();
+        let mut restored_inner = false;
+        contain_callback_panic(req, "outer", CallbackPanicReply::Error, || {
+            contain_callback_panic(req, "inner", CallbackPanicReply::Error, || {});
+            restored_inner = CALLBACK_REQUEST.with(|request| {
+                request
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|frame| frame.req == req)
+            });
+        });
+
+        assert!(restored_inner);
+        assert!(CALLBACK_REQUEST.with(|request| request.borrow().is_none()));
+    }
+
+    #[test]
+    fn callback_boundary_contains_request_frame_setup_panics() {
+        let escaped = CALLBACK_REQUEST.with(|slot| {
+            let _request = slot.borrow_mut();
+            catch_callback_unwind(|| {
+                contain_callback_panic(
+                    std::ptr::null_mut(),
+                    "test",
+                    CallbackPanicReply::Error,
+                    || {},
+                );
+            })
+        });
+
+        assert!(!escaped);
+    }
+
+    #[test]
+    fn callback_boundary_contains_panicking_log_subscriber() {
+        struct PanickingWarnSubscriber {
+            warnings: std::sync::mpsc::Sender<()>,
+        }
+
+        impl tracing::Subscriber for PanickingWarnSubscriber {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::always()
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, _: &tracing::Event<'_>) {
+                self.warnings.send(()).expect("record callback warning");
+                std::panic::resume_unwind(Box::new("simulated logging panic"));
+            }
+
+            fn enter(&self, _: &tracing::span::Id) {}
+
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let (warnings_tx, warnings_rx) = std::sync::mpsc::channel();
+        let dispatch = tracing::Dispatch::new(PanickingWarnSubscriber {
+            warnings: warnings_tx,
+        });
+        let _dispatch = tracing::dispatcher::set_default(&dispatch);
+        contain_callback_panic(
+            std::ptr::null_mut(),
+            "test",
+            CallbackPanicReply::Error,
+            || panic!("simulated callback panic"),
+        );
+
+        assert_eq!(warnings_rx.try_iter().count(), 1);
+    }
+
+    #[test]
+    fn consumed_callback_frame_does_not_rewrap_raw_request() {
+        let req = std::ptr::NonNull::<raw::FuseReq>::dangling().as_ptr();
+        let previous = CALLBACK_REQUEST
+            .with(|slot| slot.replace(Some(CallbackRequestFrame { req, request: None })));
+        let request = owned_request(req);
+        CALLBACK_REQUEST.with(|slot| drop(slot.replace(previous)));
+        let was_none = request.is_none();
+        mem::forget(request);
+
+        assert!(was_none);
+    }
+
+    #[test]
+    fn callback_boundary_contains_panicking_panic_payload_drop() {
+        struct PanicsOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for PanicsOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+                panic!("simulated panic payload destructor");
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(catch_callback_unwind(|| std::panic::panic_any(
+            PanicsOnDrop(Arc::clone(&dropped))
+        )));
+        assert!(dropped.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[test]

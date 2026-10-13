@@ -83,6 +83,13 @@ requests to progress. The loop joins those workers before returning. StudioFS
 then drains replies queued on its runtime before destroying the session and
 boxed callback state. Each request retains a single reply owner. The libfuse2
 API has no worker-count configuration argument.
+Legacy request callbacks contain Rust unwinding panics before returning through
+the C ABI. A request that has not been handed to a reply owner is completed with
+`EIO` on failure; `forget` instead releases its request with `fuse_reply_none`.
+Requests already handed to a worker retain that worker's reply ownership.
+Borrowing or consuming an already replied request returns a controlled error
+before calling macFUSE, and interrupt callbacks are unregistered before request
+release. This containment does not recover aborting panics or invalid C pointers.
 macFUSE grows the pool when workers are occupied and retires idle workers;
 StudioFS does not configure an additional worker limit. Write callbacks await
 the VFS local durability path, without synchronous S3 or PostgreSQL publication.
