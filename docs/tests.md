@@ -708,6 +708,15 @@ the former five-second budget. Check `fetch.local_cache_backend_io_max_ms`,
 or a blocked kernel callback. A timed-out probe still poisons its limiter and
 fails the scenario without spawning more probes.
 
+Linux mounted write/readback operations also have a 15-second I/O budget.
+Cold creates include durable local inode-ID reservation: scenario 23 recorded
+4.464 seconds in `namespace_create.inode_allocation.max_ms`, exceeding the
+former helper's 4.25-second internal deadline (five seconds minus cancellation
+grace). Check that metric and `vfs_write_path.mkdir.max_ms` in the retained
+`write_path_observability.json`. A `completed` progress event after
+`timeout_cancel_requested` still fails the operation; content verification,
+helper exit checks, and timeout containment remain required.
+
 `mounted-symlink-attribute-convergence` is the next post-1-16 promotion
 scenario. It uses public mounted filesystem behavior for symlink
 create/read-target/rename/unlink-recreate target replacement, writes near the

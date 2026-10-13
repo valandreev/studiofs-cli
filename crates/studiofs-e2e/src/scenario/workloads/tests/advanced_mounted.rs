@@ -261,7 +261,7 @@ fn sparse_write_timeout_allows_winfsp_cleanup_purge_slack() {
         MOUNTED_SPARSE_WRITE_TIMEOUT >= MOUNTED_WRITE_READBACK_TIMEOUT,
         "sparse range writes and truncates must not have less time than generic mounted readback"
     );
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     assert!(
         MOUNTED_SPARSE_WRITE_TIMEOUT > MOUNTED_WRITE_READBACK_TIMEOUT,
         "WinFSP sparse range writes need slack beyond the generic mounted readback timeout"

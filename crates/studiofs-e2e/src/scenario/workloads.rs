@@ -164,7 +164,10 @@ const ADVANCED_MOUNTED_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(90);
 const ADVANCED_MOUNTED_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(target_os = "macos")]
 const MOUNTED_WRITE_READBACK_TIMEOUT: Duration = Duration::from_secs(45);
-#[cfg(not(target_os = "macos"))]
+// Cold creates durably reserve local inode IDs before writing and reading back.
+#[cfg(target_os = "linux")]
+const MOUNTED_WRITE_READBACK_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const MOUNTED_WRITE_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUNTED_WRITE_READBACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 #[cfg(target_os = "macos")]

@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(unix)]
+static HOTSPOT_HELPER_TIMEOUT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn namespace_collision_records_operations_and_validates_three_client_convergence() {
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
@@ -1149,9 +1152,66 @@ fn hotspot_helper_stat_records_exact_metadata_probe() {
     assert!(progress_log.contains("\"phase\":\"completed\""));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn mounted_create_accepts_slow_local_io_before_readback() {
+    use std::io::Write as _;
+
+    let _guard = HOTSPOT_HELPER_TIMEOUT_TEST_LOCK.lock().unwrap();
+    let temp = studiofs_test_support::workspace_target_tempdir("test-");
+    let mount = temp.path().join("mount");
+    let payload = temp.path().join("slow-payload.fifo");
+    let progress = temp.path().join("progress.jsonl");
+    std::fs::create_dir_all(&mount).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&payload)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let writer_path = payload.clone();
+    let writer = thread::spawn(move || {
+        let mut fifo = std::fs::OpenOptions::new()
+            .write(true)
+            .open(writer_path)
+            .unwrap();
+        let (_release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // Inject the observed 4.46-second local I/O stall after the reader opens.
+        assert!(matches!(
+            release_rx.recv_timeout(Duration::from_millis(4_460)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        fifo.write_all(b"slow local I/O payload").unwrap();
+    });
+
+    let result = run_hotspot_op_helper_with_timeout(
+        "create",
+        mount.clone(),
+        "cold/target.txt",
+        None,
+        Some(&payload),
+        Some(&progress),
+        Some(hotspot_helper_internal_timeout(
+            MOUNTED_WRITE_READBACK_TIMEOUT,
+        )),
+    );
+    writer.join().unwrap();
+    result.expect("cold mounted create must allow local I/O before its readback");
+    assert_eq!(
+        std::fs::read(mount.join("cold/target.txt")).unwrap(),
+        b"slow local I/O payload"
+    );
+    let progress_log = std::fs::read_to_string(progress).unwrap();
+    assert!(progress_log.contains("\"phase\":\"after_readback\""));
+    assert!(!progress_log.contains("\"phase\":\"timeout_cancel_requested\""));
+}
+
 #[cfg(unix)]
 #[test]
 fn hotspot_helper_timeout_is_enforced_before_parent_kill_on_unix() {
+    let _guard = HOTSPOT_HELPER_TIMEOUT_TEST_LOCK.lock().unwrap();
     let temp = studiofs_test_support::workspace_target_tempdir("test-");
     let mount = temp.path().join("mount");
     let payload = temp.path().join("blocked-payload.fifo");

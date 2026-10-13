@@ -36,8 +36,8 @@ publication.
 Use the Codebase Memory MCP first for code structure in project
 `E-dev-studiofs-cli`. The team-shared graph snapshot is stored under
 `.codebase-memory/`; index with `persistence=true` when intentionally refreshing
-it. The indexer rewrites the snapshot on later indexing too, so stage and commit
-it deliberately rather than on every working edit:
+it. The indexer rewrites the snapshot on later indexing too. Preserve those
+changes and include the latest snapshot in the task's Git delivery:
 
 ```text
 index_repository(repo_path="<absolute repository root>", name="E-dev-studiofs-cli", persistence=true)
@@ -50,8 +50,12 @@ If the MCP tools are not exposed in the current agent session, use the local
 The graph artifact is portable across operating systems. A fresh checkout can
 import it and incrementally index that machine's working tree. Track the
 `.codebase-memory/graph.db.zst`, its `artifact.json` metadata, and the generated
-`.gitattributes` merge rule together. The artifact is currently about 13 MB;
-avoid committing every refresh because Git retains each changed snapshot.
+`.gitattributes` merge rule together. Changes under `.codebase-memory/` are
+shared repository state: do not discard them or leave them out of delivery as
+unrelated generated files. Commit the latest snapshot and metadata together,
+include any changed merge rule, and push the commits to GitHub so other
+machines can import the updated graph. Batch intermediate index refreshes into
+the final snapshot commit; Git retains each committed snapshot.
 Each machine still needs its own native MCP installation and client
 configuration; only the graph artifact is shared by Git.
 
