@@ -16,8 +16,27 @@ excluded files.
 The team-shared snapshot is `.codebase-memory/graph.db.zst`, with its
 `artifact.json` metadata and generated `.gitattributes` merge rule. Refresh it
 with `index_repository` using `name="E-dev-studiofs-cli"` and
-`persistence=true`. A fresh checkout imports the snapshot and incrementally
-indexes its local tree, so the same artifact works on Linux, macOS, and Windows.
+`persistence=true`. A fresh local cache can import the snapshot and reconcile
+the checkout. Upstream issue #885 documents that different absolute clone paths
+can cause a full reparse because the imported rows keep the exporting project's
+path-derived identity; do not promise an incremental warm start across machines
+until upstream fixes that limitation.
+Each machine keeps its live SQLite index in its own Codebase Memory cache; sync
+the compressed snapshot through GitHub, never the live cache or a shared network
+directory. Use the same project name on all machines. Pull the latest snapshot
+before intentionally publishing a refreshed one, and serialize snapshot commits
+so concurrent binary updates do not leave one machine's graph behind.
+The tracked merge attribute needs a local Git driver on each clone; set it once
+with `git config --local merge.ours.driver true`. If two branches both update
+the snapshot, Git keeps the current branch's copy, so pull before publishing
+and do not merge competing snapshot commits as a synchronization strategy.
+Codebase Memory currently has no supported per-project `auto_index` or
+`auto_watch` exclusion. Those runtime settings are global to a machine's local
+Codebase Memory config; `.codebase-memory.json` only configures extra file
+extensions. Do not disable them as repository setup when other projects on that
+machine rely on automatic indexing. To use the shared key, run
+`index_repository` with `name="E-dev-studiofs-cli"` after cloning or pulling the
+snapshot. Runtime settings do not travel through Git.
 The indexer rewrites the artifact during later indexes; commit refreshed copies
 on a deliberate cadence because each changed copy adds binary history to Git.
 Install the native MCP executable and configure the agent client separately on
