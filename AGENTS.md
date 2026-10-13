@@ -34,7 +34,28 @@ publication.
 ## Discovery and external references
 
 Use the Codebase Memory MCP first for code structure in project
-`E-dev-studiofs-cli`:
+`E-dev-studiofs-cli`. The team-shared graph snapshot is stored under
+`.codebase-memory/`; index with `persistence=true` when intentionally refreshing
+it. The indexer rewrites the snapshot on later indexing too, so stage and commit
+it deliberately rather than on every working edit:
+
+```text
+index_repository(repo_path="<absolute repository root>", name="E-dev-studiofs-cli", persistence=true)
+```
+
+If the MCP tools are not exposed in the current agent session, use the local
+`codebase-memory-mcp` CLI when available and verify the project name with
+`list_projects`; otherwise continue with `rg` and direct source inspection.
+
+The graph artifact is portable across operating systems. A fresh checkout can
+import it and incrementally index that machine's working tree. Track the
+`.codebase-memory/graph.db.zst`, its `artifact.json` metadata, and the generated
+`.gitattributes` merge rule together. The artifact is currently about 13 MB;
+avoid committing every refresh because Git retains each changed snapshot.
+Each machine still needs its own native MCP installation and client
+configuration; only the graph artifact is shared by Git.
+
+The MCP tools:
 
 1. `search_graph` finds symbols and exact qualified names.
 2. `trace_path` finds callers and callees.
