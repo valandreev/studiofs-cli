@@ -1624,6 +1624,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 && current.upload_state == UploadState::Ready
                 && current.size == current.committed_size
                 && current.content_epoch == current.committed_content_epoch
+                // Equal epochs from concurrent writers are ordered by PG, not timestamps.
+                && attr.content_epoch < current.content_epoch
                 && attr.committed_size > current.committed_size
                 && attr.mtime < current.mtime
                 && attr.ctime < current.ctime

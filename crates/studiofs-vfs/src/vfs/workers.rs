@@ -1083,6 +1083,15 @@ impl StudioVfs {
                     .await;
                 continue;
             }
+            // The upload tombstone is permanent, so a traversal gap (for example a
+            // namespace merge detaching a still-live inode) must not set it.
+            let attr = run_meta_maintenance(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.get_attr(ino)
+            })
+            .await;
+            if !matches!(attr, Err(VfsError::Meta(MetaError::InodeNotFound(_)))) {
+                continue;
+            }
             self.mark_inode_deleted_for_uploads(ino);
             if self.handle_table.open_count(ino) > 0 {
                 self.handle_table.mark_orphan(ino);

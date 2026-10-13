@@ -3903,6 +3903,210 @@ fn ready_foreign_overwrite_attr_after_separate_publish_replaces_larger_same_epoc
 }
 
 #[test]
+fn same_epoch_complete_publications_follow_pg_order_after_self_ack() {
+    // Retained hotspot failures contain complete append and rewrite publications
+    // in the same epoch. Check both PG orders, including self acknowledgment.
+    for self_first in [true, false] {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = create_published_small_file(&pg, ROOT_INO, b"same-epoch.txt", 77_095);
+        let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+        pg.persist_flushed_event_seq(setup_end).unwrap();
+
+        set_file_state(&pg, file.ino, 402, 3);
+        let local_payload = PayloadRef::new_partial(77_096, 402);
+        pg.stage_payload_slice(file.ino, 0, &local_payload).unwrap();
+        mark_overlay_objects_uploaded(&pg, file.ino, 3, &[local_payload.object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+                .unwrap()
+        );
+        let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+        let local_events = pg.local.read_events_range(setup_end, end).unwrap();
+        let projected = RemoteApplyCoordinator::project_local_batch(&local_events);
+        let self_version = if self_first { 21 } else { 22 };
+        pg.mark_local_event_ranges_published_with_prefix(
+            &[LocalEventRange {
+                start: setup_end,
+                end,
+            }],
+            Some((
+                self_version,
+                vec![LocalEventRange {
+                    start: setup_end,
+                    end,
+                }],
+            )),
+        )
+        .unwrap();
+        let recent_flush = RecentFlush {
+            batch_version: self_version,
+            overlay: projected.overlay,
+        };
+
+        let mut updating = pg.get_attr(file.ino).unwrap();
+        updating.size = 0;
+        updating.committed_size = 0;
+        updating.committed_content_epoch = 2;
+        updating.upload_state = UploadState::Updating;
+        updating.mtime += 1;
+        updating.ctime = updating.mtime;
+        let mut ready = updating.clone();
+        ready.size = 205;
+        ready.committed_size = 205;
+        ready.committed_content_epoch = 3;
+        ready.upload_state = UploadState::Ready;
+        let remote_payload = PayloadRef::new_partial(77_097, 205);
+        let remote_events = vec![
+            MetaEvent::SetAttr { attr: updating },
+            MetaEvent::PublishRegularFileBaseSlices {
+                ino: file.ino,
+                chunk_slices: vec![(
+                    ChunkId(0),
+                    vec![SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 205).unwrap(),
+                        payload: Some(remote_payload),
+                        payload_state: PayloadRefState::Published,
+                    }],
+                )],
+            },
+            MetaEvent::SetAttr { attr: ready },
+        ];
+        let mut batches = vec![
+            DecodedReplayBatch {
+                batch_version: self_version,
+                events: projected.events,
+                is_self_batch: true,
+            },
+            DecodedReplayBatch {
+                batch_version: if self_first { 22 } else { 21 },
+                events: remote_events,
+                is_self_batch: false,
+            },
+        ];
+        batches.sort_by_key(|batch| batch.batch_version);
+        pg.apply_replay_page_atomically(
+            batches,
+            Some(&recent_flush),
+            RemoteReplayApplyContext {
+                last_seq: 20,
+                current_namespace_version: 20,
+                flushed_event_seq: setup_end,
+                next_event_seq: end,
+                initial_overlay: pg.local_overlay_conflicts().unwrap(),
+            },
+        )
+        .unwrap();
+        pg.restore_pending_state_from_local_log().unwrap();
+        let attr = pg.get_attr(file.ino).unwrap();
+        let (size, object_id) = if self_first {
+            (205, 77_097)
+        } else {
+            (402, 77_096)
+        };
+        assert_eq!(
+            (
+                attr.size,
+                attr.committed_size,
+                attr.content_epoch,
+                attr.committed_content_epoch,
+                attr.upload_state
+            ),
+            (size, size, 3, 3, UploadState::Ready),
+            "later PG batch must win; self_first={self_first}"
+        );
+        assert_eq!(
+            lookup_object_ids(&pg, file.ino, size).unwrap(),
+            vec![object_id],
+            "later PG payload must win; self_first={self_first}"
+        );
+    }
+}
+
+#[test]
+fn later_same_epoch_complete_foreign_publish_wins_with_older_timestamps() {
+    // fix3-hot-21: the epoch-3 rewrite is PG v20 (207 bytes), then the
+    // rebased append is v21 (406 bytes) with the original head's older mtime.
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"older-timestamp-append.txt", 0, 0, 0o644)
+        .unwrap();
+    set_file_state(&pg, file.ino, 207, 3);
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_100, 207))
+        .unwrap();
+    mark_overlay_objects_uploaded(&pg, file.ino, 3, &[77_100]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .unwrap()
+    );
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = pg
+        .local
+        .read_events_range(pg.flushed_event_seq.load(Ordering::SeqCst), end)
+        .unwrap();
+    RemoteApplyCoordinator::new(&pg.local)
+        .apply_visible_self_batch(&RemoteApplyCoordinator::project_local_batch(&setup).events)
+        .unwrap();
+    pg.persist_flushed_event_seq(end).unwrap();
+    let mut updating = pg.get_attr(file.ino).unwrap();
+    updating.size = 0;
+    updating.committed_size = 0;
+    updating.committed_content_epoch = 2;
+    updating.upload_state = UploadState::Updating;
+    updating.mtime -= 1;
+    updating.ctime -= 1;
+    let mut ready = updating.clone();
+    ready.size = 406;
+    ready.committed_size = 406;
+    ready.committed_content_epoch = 3;
+    ready.upload_state = UploadState::Ready;
+    let slices = [(0, 203, 77_101), (203, 406, 77_102)]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (start, end, id))| SliceRecord {
+            slice_id: SliceId(u64::try_from(index).unwrap()),
+            order: SliceOrder(u64::try_from(index).unwrap()),
+            range: SliceRange::new(start, end).unwrap(),
+            payload: Some(PayloadRef::new_partial(id, end - start)),
+            payload_state: PayloadRefState::Published,
+        })
+        .collect();
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 21,
+            is_self_batch: false,
+            events: vec![
+                MetaEvent::SetAttr { attr: updating },
+                MetaEvent::PublishRegularFileBaseSlices {
+                    ino: file.ino,
+                    chunk_slices: vec![(ChunkId(0), slices)],
+                },
+                MetaEvent::SetAttr { attr: ready },
+            ],
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 20,
+            current_namespace_version: 20,
+            flushed_event_seq: end,
+            next_event_seq: end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pg.get_attr(file.ino).unwrap().size,
+        406,
+        "PG order must override writer timestamps"
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, 406).unwrap(),
+        vec![77_101, 77_102]
+    );
+}
+
+#[test]
 fn ready_foreign_partial_append_extends_same_epoch_committed_base() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
@@ -8377,4 +8581,219 @@ fn deferred_file_create_over_replayed_file_wins_by_last_writer() {
         .expect("a create admitted before the peer's file replayed must commit");
 
     assert_eq!(pg.lookup(ROOT_INO, b"same.txt").unwrap().ino, local_file);
+}
+
+#[test]
+fn pending_restore_preserves_published_content_across_unprocessed_create_gap() {
+    // fix5-hot-debug-20261013-150000-04: the creation prefix remains
+    // unprocessed while the later Ready publication range is excluded from replay.
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let ino = pg.next_inode().unwrap();
+    let mut provisional = InodeAttr::new_file(ino, ROOT_INO, 0, 0, 0o644);
+    provisional.content_epoch = 1;
+    provisional.upload_state = UploadState::Uploading;
+    pg.local.set_attr(&provisional).unwrap();
+    let file = pg
+        .create_file_with_ino(ino, ROOT_INO, b"pending-create-gap.txt", 0, 0, 0o644)
+        .unwrap();
+    let create_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    set_file_state(&pg, file.ino, 233, 1);
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_103, 233))
+        .unwrap();
+    mark_overlay_objects_uploaded(&pg, file.ino, 1, &[77_103]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap()
+    );
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let publication = pg.local.read_events_range(create_end, end).unwrap();
+    let projected = RemoteApplyCoordinator::project_local_batch(&publication);
+    pg.mark_local_event_ranges_published_with_prefix(
+        &[LocalEventRange {
+            start: create_end,
+            end,
+        }],
+        Some((
+            12,
+            vec![LocalEventRange {
+                start: create_end,
+                end,
+            }],
+        )),
+    )
+    .unwrap();
+    pg.restore_pending_state_from_local_log().unwrap();
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 12,
+            events: projected.events,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 11,
+            current_namespace_version: 11,
+            flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
+            next_event_seq: end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+    pg.restore_pending_state_from_local_log().unwrap();
+    let attr = pg.get_attr(file.ino).unwrap();
+    assert_eq!(
+        (
+            attr.size,
+            attr.content_epoch,
+            attr.committed_content_epoch,
+            attr.upload_state
+        ),
+        (233, 1, 1, UploadState::Ready),
+        "self acknowledgment must retain the published state"
+    );
+    assert_eq!(lookup_object_ids(&pg, file.ino, 233).unwrap(), vec![77_103]);
+}
+
+#[test]
+fn later_complete_foreign_publish_does_not_leave_protected_intermediate_attr() {
+    // fix5-hot-debug-20261013-150000-07: a local-only Uploaded snapshot
+    // remained between already-published ranges before the later foreign append.
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"uploaded-gap.txt", 77_104);
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = pg
+        .local
+        .read_events_range(pg.flushed_event_seq.load(Ordering::SeqCst), setup_end)
+        .unwrap();
+    apply_visible_self_batch(
+        &pg,
+        &RemoteApplyCoordinator::project_local_batch(&setup).events,
+    )
+    .unwrap();
+    pg.persist_flushed_event_seq(setup_end).unwrap();
+    set_file_state(&pg, file.ino, 237, 3);
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_107, 237))
+        .unwrap();
+    let upload_start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    mark_overlay_objects_uploaded(&pg, file.ino, 3, &[77_107]);
+    let upload_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .unwrap()
+    );
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let publication = pg.local.read_events_range(upload_end, end).unwrap();
+    let projected = RemoteApplyCoordinator::project_local_batch(&publication);
+    pg.mark_local_event_ranges_published_with_prefix(
+        &[LocalEventRange {
+            start: setup_end,
+            end: upload_start,
+        }],
+        Some((
+            19,
+            vec![LocalEventRange {
+                start: setup_end,
+                end: upload_start,
+            }],
+        )),
+    )
+    .unwrap();
+    pg.mark_local_event_ranges_published_with_prefix(
+        &[LocalEventRange {
+            start: upload_end,
+            end,
+        }],
+        Some((
+            20,
+            vec![LocalEventRange {
+                start: upload_end,
+                end,
+            }],
+        )),
+    )
+    .unwrap();
+    let recent = RecentFlush {
+        batch_version: 20,
+        overlay: projected.overlay,
+    };
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 20,
+            events: projected.events,
+            is_self_batch: true,
+        }],
+        Some(&recent),
+        RemoteReplayApplyContext {
+            last_seq: 19,
+            current_namespace_version: 19,
+            flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
+            next_event_seq: end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+    pg.restore_pending_state_from_local_log().unwrap();
+    let mut updating = pg.get_attr(file.ino).unwrap();
+    updating.content_epoch = 2;
+    updating.committed_content_epoch = 1;
+    updating.size = 233;
+    updating.committed_size = 233;
+    updating.upload_state = UploadState::Updating;
+    updating.mtime += 1;
+    updating.ctime = updating.mtime;
+    let mut ready = updating.clone();
+    ready.size = 466;
+    ready.committed_size = 466;
+    ready.committed_content_epoch = 2;
+    ready.upload_state = UploadState::Ready;
+    let slices = [(0, 233, 77_105), (233, 466, 77_106)]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (start, end, id))| SliceRecord {
+            slice_id: SliceId(u64::try_from(index).unwrap()),
+            order: SliceOrder(u64::try_from(index).unwrap()),
+            range: SliceRange::new(start, end).unwrap(),
+            payload: Some(PayloadRef::new_partial(id, end - start)),
+            payload_state: PayloadRefState::Published,
+        })
+        .collect();
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 21,
+            is_self_batch: false,
+            events: vec![
+                MetaEvent::SetAttr { attr: updating },
+                MetaEvent::PublishRegularFileBaseSlices {
+                    ino: file.ino,
+                    chunk_slices: vec![(ChunkId(0), slices)],
+                },
+                MetaEvent::SetAttr { attr: ready },
+            ],
+        }],
+        Some(&recent),
+        RemoteReplayApplyContext {
+            last_seq: 20,
+            current_namespace_version: 20,
+            flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
+            next_event_seq: end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+    pg.restore_pending_state_from_local_log().unwrap();
+    let attr = pg.get_attr(file.ino).unwrap();
+    assert_eq!(
+        (
+            attr.size,
+            attr.content_epoch,
+            attr.committed_content_epoch,
+            attr.upload_state
+        ),
+        (466, 2, 2, UploadState::Ready),
+        "final Ready publication must supersede its intermediate Updating attr"
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, 466).unwrap(),
+        vec![77_105, 77_106]
+    );
 }

@@ -14629,6 +14629,8 @@ fn foreign_delete_lazy_evict_removes_local_payload_artifacts() {
         assert!(vfs.local_payload_backend().contains(object_id));
         assert!(vfs.cached_store().has_staged_upload(object_id));
         assert!(vfs.cached_store().is_pinned(object_id));
+        meta.remove_attr(attr.ino)
+            .expect("apply foreign inode removal");
 
         vfs.lazy_evict_removed_metadata_payloads(
             std::collections::HashMap::from([(attr.ino, vec![object_id])]),
@@ -14692,6 +14694,33 @@ fn retained_inode_payload_evict_does_not_mark_inode_deleted() {
         assert!(
             vfs.local_payload_backend().contains(object_id),
             "retained-inode payload eviction must not remove bytes while upload is still pending"
+        );
+    });
+}
+
+#[test]
+fn payload_evict_does_not_tombstone_live_inode_missing_from_snapshot() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "live-inode-snapshot-gap");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"live-inode-snapshot-gap.bin", 0, 0, 0o644)
+            .unwrap();
+
+        // A namespace merge can transiently detach a published inode from the
+        // root traversal while its attributes remain live.
+        vfs.lazy_evict_removed_metadata_payloads(
+            std::collections::HashMap::from([(attr.ino, vec![u64::MAX])]),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
+        .await;
+
+        assert!(
+            !vfs.state.upload.deleted_inodes.lock().contains(&attr.ino),
+            "a live inode missing from one traversal snapshot must not be tombstoned for uploads"
         );
     });
 }
