@@ -1466,12 +1466,14 @@ impl Request {
         catch_callback_unwind(|| remove_interrupt_token(key));
     }
 
+    // Borrow without consuming; fails after a reply has taken the raw request.
     fn as_ptr(&self) -> io::Result<*mut raw::FuseReq> {
         self.raw
             .map(NonNull::as_ptr)
             .ok_or_else(|| reply_state_error(ReplyError::AlreadyReplied))
     }
 
+    // Consume reply ownership so later borrows and replies are rejected.
     fn take_raw(&mut self) -> io::Result<NonNull<raw::FuseReq>> {
         self.clear_interrupt_token();
         self.raw

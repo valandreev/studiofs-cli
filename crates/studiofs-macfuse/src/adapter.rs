@@ -2568,7 +2568,7 @@ fn contain_callback_panic(
 ) {
     if catch_callback_unwind(|| callback(&mut request)) {
         // Report the operation before cleanup, which may itself fail. Panic
-        // payload text is not guaranteed to respect credential redaction.
+        // payload text is omitted because it may expose credentials without redaction.
         catch_callback_unwind(|| warn!(operation, "macFUSE callback panicked"));
     }
     // Move all remaining ownership into protected cleanup, including Drop.
