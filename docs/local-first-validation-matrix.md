@@ -84,6 +84,11 @@ SFS-623 contract defines the stable filters implemented by SFS-632.
 | Prepared-read handoff to local overlays | A foreground read prepared before a local overlay is published or committed must re-check local pending state before execution and must not return stale hole or base bytes; local spans are claimed before current metadata is resolved for the remaining ranges | `prepared_read_survives_local_overlay_publication_before_execution`; `prepared_published_read_uses_new_local_write_after_overlay_commit` | `cargo test -p studiofs-vfs --lib prepared_read_survives_local_overlay_publication_before_execution -- --nocapture`<br>`cargo test -p studiofs-vfs --lib prepared_published_read_uses_new_local_write_after_overlay_commit -- --nocapture` |
 | Last-handle kernel attribute refresh | The kernel attribute refresh after the last handle closes is delivered after the release drain, including when local state was flushed while the writer was open, when the visible size is current only after deferred release, and when the release future is cancelled while waiting for materialization; accepted writes keep the refresh pending | `release_fh_invalidates_kernel_attrs_after_dirty_last_handle_close`; `release_fh_invalidates_attrs_after_local_state_was_flushed_while_writer_open`; `deferred_last_handle_release_invalidates_attrs_after_visible_size_is_current`; `release_fh_cancelled_while_waiting_for_materialization_still_invalidates_attrs` | `cargo test -p studiofs-vfs --lib release_fh_ -- --nocapture`<br>`cargo test -p studiofs-vfs --lib deferred_last_handle_release_invalidates_attrs_after_visible_size_is_current -- --nocapture` |
 
+The macFUSE `host_memory_reports_nonzero_reclaimable_bytes` smoke test is
+ignored by default because it requires nonzero reclaimable host memory. Run it
+separately on macOS with
+`cargo test -p studiofs-macfuse --lib host_memory_reports_nonzero_reclaimable_bytes -- --ignored --nocapture`.
+
 ## Infra-Backed Distributed Contract Matrix
 
 These checks require live PostgreSQL and/or S3 because they validate peer

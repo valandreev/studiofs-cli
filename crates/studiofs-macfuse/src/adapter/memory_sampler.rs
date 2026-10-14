@@ -418,6 +418,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a macOS host with nonzero reclaimable memory"]
     fn host_memory_reports_nonzero_reclaimable_bytes() {
         let host = HostMemory::new().expect("host statistics port");
 

@@ -360,7 +360,8 @@ contained. Teardown stops and joins the worker:
 - `snapshot_remains_fresh_between_scheduled_samples`
 - `reclaimable_bytes_ignore_compressor_occupancy`
 - `reclaimable_bytes_saturate_instead_of_overflowing`
-- `host_memory_reports_nonzero_reclaimable_bytes` (calls the host API)
+- `host_memory_reports_nonzero_reclaimable_bytes` (opt-in host smoke test;
+  requires nonzero reclaimable memory)
 - `sample_health_contains_panicking_measurement`
 - `started_sampler_publishes_before_returning`
 - `readers_finish_while_sample_is_blocked_and_shutdown_joins_worker`
@@ -373,6 +374,13 @@ Run the focused macFUSE checks:
 ```bash
 cargo test -p studiofs-macfuse --lib open_cache_snapshot_tests -- --nocapture
 cargo test -p studiofs-macfuse --lib memory_sampler -- --nocapture
+```
+
+The live host-memory smoke test is ignored by default because reclaimable
+memory depends on the host's current pressure. Run it separately on macOS:
+
+```sh
+cargo test -p studiofs-macfuse --lib host_memory_reports_nonzero_reclaimable_bytes -- --ignored --nocapture
 ```
 
 ## Contract/Core Harness
