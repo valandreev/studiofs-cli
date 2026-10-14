@@ -1989,37 +1989,19 @@ impl FsKitDispatcher {
             );
         }
         let file_handle = (input.valid & FATTR_FH != 0).then_some(input.fh);
-        let attr = if args_have_values(&args) {
-            match self.adapter.setattr(file_handle, header.nodeid, args) {
-                Ok(attr) => attr,
-                Err(errno) => {
-                    let _ = request.reply_error(errno);
-                    return;
-                }
+        match self.adapter.setattr_with_file_flags(
+            file_handle,
+            header.nodeid,
+            args,
+            (input.valid & FATTR_FLAGS != 0).then_some(input.flags),
+        ) {
+            Ok(stat) => {
+                let _ = request.reply_struct(attr_out_from_stat(stat));
             }
-        } else {
-            if input.valid & FATTR_FLAGS != 0 {
-                self.adapter
-                    .remember_fskit_file_flags(header.nodeid, input.flags);
+            Err(errno) => {
+                let _ = request.reply_error(errno);
             }
-            match self.adapter.getattr(header.nodeid) {
-                Ok(stat) => {
-                    let _ = request.reply_struct(attr_out_from_stat(stat));
-                    return;
-                }
-                Err(errno) => {
-                    let _ = request.reply_error(errno);
-                    return;
-                }
-            }
-        };
-        // FSKit file flags describe the successfully applied attribute state;
-        // do not cache them when the requested setattr failed.
-        if input.valid & FATTR_FLAGS != 0 {
-            self.adapter
-                .remember_fskit_file_flags(header.nodeid, input.flags);
         }
-        let _ = request.reply_struct(attr_out_from_stat(self.adapter.attr_to_stat(&attr)));
     }
 
     fn setxattr(&self, request: FsKitRequest) {
@@ -2346,17 +2328,6 @@ fn fskit_open_flags(open: low_level::OpenReply) -> u32 {
         } else {
             0
         })
-}
-
-fn args_have_values(args: &SetattrArgs) -> bool {
-    args.size.is_some()
-        || args.mode.is_some()
-        || args.uid.is_some()
-        || args.gid.is_some()
-        || args.atime.resolve().is_some()
-        || args.mtime.resolve().is_some()
-        || args.crtime.resolve().is_some()
-        || args.win_attrs.is_some()
 }
 
 fn entry_from_stat(ino: u64, stat: libc::stat) -> FuseEntryOut {
