@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
-use std::mem::{self, MaybeUninit};
+use std::mem::MaybeUninit;
 #[cfg(test)]
 use std::num::NonZeroUsize;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::os::raw::{c_char, c_ulong};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{
@@ -45,14 +45,15 @@ use crate::low_level::{
     catch_callback_unwind, raw,
 };
 
+mod read_buffer;
+
+#[cfg(test)]
+use read_buffer::MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY;
+use read_buffer::{MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY, PooledReadBuffer, ReadBufferPool};
+
 const TTL_SECONDS: f64 = 1.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = crate::low_level::MACOS_FUSE_IOSIZE_BYTES;
 const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
-const MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
-const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
-// Keep allocator-rounded buffers that grew slightly beyond the reusable read
-// cap, while dropping genuinely oversized requests instead of pinning them.
-const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize = MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 const MACFUSE_AVAILABLE_MEMORY_TTL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
@@ -110,6 +111,23 @@ struct AdapterSharedState {
     read_buffers: Arc<ReadBufferPool>,
     read_diagnostics: AsyncReadDiagnostics,
     kernel_invalidations: Arc<KernelInvalidationGate>,
+    // Lets tests cancel a read while it is inside the VFS fill with pooled storage.
+    #[cfg(test)]
+    vfs_read_stall_for_test: ParkingMutex<Option<Arc<tokio::sync::Notify>>>,
+}
+
+#[cfg(test)]
+impl AdapterSharedState {
+    /// Park the next VFS read until its cancellation token fires, after
+    /// signalling that pooled storage has been handed to the VFS fill.
+    async fn stall_vfs_read_if_requested_for_test(&self) {
+        let stall = self.vfs_read_stall_for_test.lock().take();
+        let Some(reached) = stall else {
+            return;
+        };
+        reached.notify_one();
+        std::future::pending::<()>().await;
+    }
 }
 
 #[derive(Debug)]
@@ -314,57 +332,6 @@ struct MacFuseOpenCachePayload {
     flags: u8,
 }
 
-#[derive(Debug, Default)]
-struct ReadBufferPool {
-    buffers: ParkingMutex<Vec<Vec<u8>>>,
-}
-
-impl ReadBufferPool {
-    fn acquire(self: Arc<Self>, len: usize) -> PooledReadBuffer {
-        let mut buffer = self.buffers.lock().pop().unwrap_or_default();
-        if buffer.capacity() < len {
-            buffer.reserve_exact(len - buffer.len());
-        }
-        // Keep the initialized tail across replies; only new storage needs zeroing.
-        if buffer.len() < len {
-            buffer.resize(len, 0);
-        }
-        PooledReadBuffer {
-            pool: self,
-            buffer,
-            len,
-        }
-    }
-
-    fn recycle(&self, buffer: Vec<u8>) {
-        // `mem::take` during `Drop` leaves a zero-capacity placeholder; recycling
-        // it would only occupy a pool slot without avoiding a future allocation.
-        if buffer.capacity() == 0 || buffer.capacity() > MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY
-        {
-            return;
-        }
-        let mut buffers = self.buffers.lock();
-        if buffers.len() < MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS {
-            buffers.push(buffer);
-        }
-    }
-
-    #[cfg(test)]
-    fn available_count(&self) -> usize {
-        self.buffers.lock().len()
-    }
-
-    #[cfg(test)]
-    fn last_available_capacity(&self) -> Option<usize> {
-        self.buffers.lock().last().map(Vec::capacity)
-    }
-
-    #[cfg(test)]
-    fn last_available_len(&self) -> Option<usize> {
-        self.buffers.lock().last().map(Vec::len)
-    }
-}
-
 struct OpenCacheKernelInvalidator {
     #[cfg(test)]
     open_cache_snapshots: Arc<ParkingMutex<LruCache<u64, MacFuseOpenCacheSnapshot>>>,
@@ -544,46 +511,6 @@ struct ReadExecutionRequest {
     file_handle: u64,
     offset: u64,
     size: u32,
-}
-
-#[derive(Debug)]
-struct PooledReadBuffer {
-    pool: Arc<ReadBufferPool>,
-    // The backing length tracks initialized storage; `len` alone is reply-visible.
-    buffer: Vec<u8>,
-    len: usize,
-}
-
-impl PooledReadBuffer {
-    fn truncate(&mut self, len: usize) {
-        self.len = self.len.min(len);
-    }
-}
-
-impl Deref for PooledReadBuffer {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.buffer[..self.len]
-    }
-}
-
-impl DerefMut for PooledReadBuffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.buffer[..self.len]
-    }
-}
-
-impl AsRef<[u8]> for PooledReadBuffer {
-    fn as_ref(&self) -> &[u8] {
-        self.deref()
-    }
-}
-
-impl Drop for PooledReadBuffer {
-    fn drop(&mut self) {
-        self.pool.recycle(mem::take(&mut self.buffer));
-    }
 }
 
 #[cfg(test)]
@@ -956,6 +883,8 @@ impl StudioVfsAdapter {
                 read_buffers: Arc::new(ReadBufferPool::default()),
                 read_diagnostics: AsyncReadDiagnostics::new(read_queue_byte_limit as usize),
                 kernel_invalidations: Arc::new(KernelInvalidationGate::new()),
+                #[cfg(test)]
+                vfs_read_stall_for_test: ParkingMutex::new(None),
             }),
             open_reply_serializer: FuseOpenReplySerializer::new(),
             file_flags: ParkingMutex::new(HashMap::new()),
@@ -1000,6 +929,20 @@ impl StudioVfsAdapter {
         self.runtime_handle
             .block_on(self.shared.read_admission.acquire_many(bytes))
             .expect("test read capacity should be available")
+    }
+
+    /// Stall the next VFS read until it is canceled; the returned notifier
+    /// fires once the read holds pooled storage inside the VFS fill.
+    #[cfg(test)]
+    pub(crate) fn stall_next_vfs_read_until_canceled_for_test(&self) -> Arc<tokio::sync::Notify> {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        *self.shared.vfs_read_stall_for_test.lock() = Some(Arc::clone(&reached));
+        reached
+    }
+
+    #[cfg(test)]
+    pub(crate) fn freshly_zeroed_read_buffer_bytes_for_test(&self) -> usize {
+        self.shared.read_buffers.freshly_zeroed_bytes()
     }
 
     #[cfg(test)]
@@ -1597,6 +1540,11 @@ impl StudioVfsAdapter {
         }
     }
 
+    /// Fill pooled storage through the VFS and expose only the bytes it wrote.
+    ///
+    /// Pooled storage may hold stale bytes from earlier replies; replying is
+    /// safe only because `StudioVfs::read_into_fh` overwrites every byte up to
+    /// its returned length. Errors and cancellation never return the storage.
     async fn perform_read(
         state: &ReadExecutionState,
         request: ReadExecutionRequest,
@@ -1608,25 +1556,33 @@ impl StudioVfsAdapter {
         }
         if state.vfs.is_runtime_stats_file_ino(request.ino) {
             let size = request.size as usize;
-            let mut out = state.shared.read_buffers.clone().acquire(size);
+            let mut out = state.shared.read_buffers.acquire(size);
             let handles = state.runtime_stats_handles.lock();
             let Some(bytes) = handles.get(&request.file_handle) else {
                 return Err(libc::EBADF);
             };
             let n = studiofs_vfs::read_runtime_stats_buffer(bytes, request.offset, &mut out);
-            out.truncate(n as usize);
+            out.limit_reply_len(n as usize);
             return Ok(out);
         }
         let size =
             clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = size as usize;
 
-        let mut out = state.shared.read_buffers.clone().acquire(size_usize);
+        let mut out = state.shared.read_buffers.acquire(size_usize);
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
+        let read = async {
+            #[cfg(test)]
+            state.shared.stall_vfs_read_if_requested_for_test().await;
+            state
+                .vfs
+                .read_into_fh(request.file_handle, request.ino, request.offset, &mut out)
+                .await
+        };
         let result = tokio::select! {
-            result = state.vfs.read_into_fh(request.file_handle, request.ino, request.offset, &mut out) => result,
+            result = read => result,
             () = cancellation.cancelled() => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
         };
         match result {
@@ -1636,8 +1592,7 @@ impl StudioVfsAdapter {
                 state
                     .vfs
                     .record_fuse_read_callback(reply_len, started.elapsed(), false);
-                out.truncate(reply_len);
-                out.buffer.shrink_to(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
+                out.limit_reply_len(reply_len);
                 Ok(out)
             }
             Err(error) => {
@@ -4778,36 +4733,6 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("reply task drain should finish after the callback exits");
         waiter.join().expect("reply drain waiter should exit");
-    }
-
-    #[test]
-    fn read_buffer_pool_reuses_initialized_tail_after_short_reply() {
-        let pool = Arc::new(ReadBufferPool::default());
-        let mut buffer = Arc::clone(&pool).acquire(16);
-        buffer.fill(0xa5);
-        buffer.truncate(5);
-        assert_eq!(buffer.as_ref(), &[0xa5; 5]);
-
-        drop(buffer);
-
-        assert_eq!(pool.available_count(), 1);
-        assert_eq!(pool.last_available_len(), Some(16));
-        assert!(
-            pool.last_available_capacity()
-                .expect("recycled buffer should retain capacity")
-                >= 16
-        );
-        let buffer = Arc::clone(&pool).acquire(12);
-        assert_eq!(buffer.as_ref(), &[0xa5; 12]);
-        drop(buffer);
-
-        let mut buffer = Arc::clone(&pool).acquire(20);
-        assert_eq!(&buffer[..16], &[0xa5; 16]);
-        assert_eq!(&buffer[16..], &[0; 4]);
-        buffer.truncate(0);
-        assert!(buffer.as_ref().is_empty());
-        drop(buffer);
-        assert_eq!(pool.last_available_len(), Some(20));
     }
 
     #[test]
