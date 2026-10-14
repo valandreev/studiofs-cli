@@ -839,7 +839,22 @@ impl StudioVfsAdapter {
     /// Create a macFUSE adapter over a StudioVfs instance.
     #[cfg(test)]
     pub(crate) fn new(vfs: Arc<StudioVfs>, runtime_handle: Handle) -> Self {
-        Self::new_with_read_only(vfs, runtime_handle, false)
+        Self::new_with_read_only_for_test(vfs, runtime_handle, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_read_only_for_test(
+        vfs: Arc<StudioVfs>,
+        runtime_handle: Handle,
+        read_only: bool,
+    ) -> Self {
+        Self::new_with_read_queue_byte_limit(
+            vfs,
+            runtime_handle,
+            read_only,
+            MACFUSE_READ_MAX_PENDING_BYTES,
+            SystemMemorySampler::fixed(Some(u64::MAX)),
+        )
     }
 
     /// Create a macFUSE adapter over a StudioVfs instance with explicit write policy.
@@ -853,6 +868,7 @@ impl StudioVfsAdapter {
             runtime_handle,
             read_only,
             MACFUSE_READ_MAX_PENDING_BYTES,
+            SystemMemorySampler::system(),
         )
     }
 
@@ -861,6 +877,7 @@ impl StudioVfsAdapter {
         runtime_handle: Handle,
         read_only: bool,
         read_queue_byte_limit: usize,
+        available_memory: SystemMemorySampler,
     ) -> Self {
         let read_queue_byte_limit = read_queue_byte_limit
             .max(1)
@@ -871,7 +888,7 @@ impl StudioVfsAdapter {
             runtime_handle,
             reply_tasks: Arc::new(ReplyTaskTracker::default()),
             read_only,
-            available_memory: SystemMemorySampler::system(),
+            available_memory,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             directory_handles: ParkingMutex::new(HashMap::new()),
@@ -903,7 +920,13 @@ impl StudioVfsAdapter {
         runtime_handle: Handle,
         read_queue_byte_limit: usize,
     ) -> Self {
-        Self::new_with_read_queue_byte_limit(vfs, runtime_handle, false, read_queue_byte_limit)
+        Self::new_with_read_queue_byte_limit(
+            vfs,
+            runtime_handle,
+            false,
+            read_queue_byte_limit,
+            SystemMemorySampler::fixed(Some(u64::MAX)),
+        )
     }
 
     #[cfg(test)]
@@ -1299,7 +1322,7 @@ impl StudioVfsAdapter {
             #[cfg(test)]
             self.shared.open_cache_snapshots.lock().pop(&ino);
             return MacFuseOpenCachePolicy {
-                direct_io: available_memory.is_none(),
+                direct_io: true,
                 keep_cache: false,
                 write_capable: false,
             };
@@ -2725,12 +2748,18 @@ mod open_cache_snapshot_tests {
             .collect();
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
-        let mut adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        adapter.available_memory = super::SystemMemorySampler::start(move || {
+        let sampler = super::SystemMemorySampler::start(move || {
             entered_tx.send(()).expect("signal sampling");
             resume_rx.recv().expect("resume sampling");
             Some(4096)
         });
+        let adapter = StudioVfsAdapter::new_with_read_queue_byte_limit(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            false,
+            super::MACFUSE_READ_MAX_PENDING_BYTES,
+            sampler,
+        );
         entered_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("sampler started");
@@ -2789,13 +2818,18 @@ mod open_cache_snapshot_tests {
             .create(CONTRACT_ROOT_INO, b"missing-attr.bin", 501, 20, 0o644)
             .expect("create file");
         let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        let fh = vfs
-            .open_file(attr.ino, OpenFlags::RDONLY, false)
-            .expect("open file");
-        let policy = adapter.read_only_open_cache_policy(u64::MAX, fh, None);
-        adapter.release(attr.ino, fh).expect("release file");
-        assert!(policy.direct_io);
-        assert!(!policy.keep_cache);
+        for available_memory in [None, Some(4096)] {
+            let fh = vfs
+                .open_file(attr.ino, OpenFlags::RDONLY, false)
+                .expect("open file");
+            let policy = adapter.read_only_open_cache_policy(u64::MAX, fh, available_memory);
+            adapter.release(attr.ino, fh).expect("release file");
+            assert!(
+                policy.direct_io,
+                "unknown file size with {available_memory:?}"
+            );
+            assert!(!policy.keep_cache);
+        }
     }
 
     #[test]

@@ -962,7 +962,7 @@ mod tests {
             source.ino
         );
 
-        let read_only = super::adapter::StudioVfsAdapter::new_with_read_only(
+        let read_only = super::adapter::StudioVfsAdapter::new_with_read_only_for_test(
             vfs,
             fixture.runtime().handle().clone(),
             true,
@@ -2281,7 +2281,7 @@ mod tests {
         let vfs = fixture.vfs();
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        let read_only_adapter = super::adapter::StudioVfsAdapter::new_with_read_only(
+        let read_only_adapter = super::adapter::StudioVfsAdapter::new_with_read_only_for_test(
             vfs.clone(),
             fixture.runtime().handle().clone(),
             true,
@@ -2366,7 +2366,7 @@ mod tests {
                 0o644,
             )
             .expect("create file");
-        let adapter = super::adapter::StudioVfsAdapter::new_with_read_only(
+        let adapter = super::adapter::StudioVfsAdapter::new_with_read_only_for_test(
             vfs,
             fixture.runtime().handle().clone(),
             true,

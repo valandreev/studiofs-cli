@@ -335,6 +335,31 @@ while retaining the underlying I/O source and its operation context.
 Fast-mode coverage demonstrates process interruption recovery with surviving
 OS-cached files; it does not establish power-loss durability.
 
+### SFS-807 macFUSE Memory Sampling and Open Cache Policy
+
+These regressions check that opens do not wait for the background memory
+sample, unknown attributes and unavailable memory select direct I/O, and
+snapshot reads remain nonblocking and expire measurements correctly. The
+sampler shutdown tests also verify that teardown joins its worker:
+
+- `concurrent_opens_finish_while_memory_sampling_is_blocked`
+- `read_only_open_with_missing_attr_and_memory_uses_direct_io`
+- `read_only_open_without_memory_sample_uses_direct_io`
+- `snapshot_handles_missing_zero_and_stale_measurements`
+- `reader_does_not_wait_for_snapshot_publication`
+- `readers_finish_while_sample_is_blocked_and_shutdown_joins_worker`
+- `dropping_sampler_joins_worker_and_drops_sampling_closure`
+- `snapshot_remains_fresh_between_scheduled_samples`
+- `sample_wait_uses_only_the_remaining_interval`
+- `fixed_sampler_returns_snapshot_without_worker` (constant telemetry remains usable beyond production TTL)
+
+Run the focused macFUSE checks:
+
+```bash
+cargo test -p studiofs-macfuse --lib open_cache_snapshot_tests -- --nocapture
+cargo test -p studiofs-macfuse --lib memory_sampler -- --nocapture
+```
+
 ## Contract/Core Harness
 
 Fast contract-level checks that should not require Docker, PostgreSQL, RustFS,

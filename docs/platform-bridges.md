@@ -581,21 +581,25 @@ path is unchanged. Changing the legacy name-cache policy requires revalidating
 entry notification behavior and mounted namespace convergence.
 
 macOS FUSE keeps the Unified Buffer Cache and kernel readahead enabled for
-read-only files that fit in currently available RAM. When a file is larger than
-available RAM, or a fresh memory sample is unavailable, its read-only handle
-uses `direct_io` to avoid cycling the same bytes through both StudioFS's local payload cache and UBC. This does not bypass
-the StudioFS cache: the VFS still reads cached payloads locally and fetches from
+read-only files with known attributes that fit in currently available RAM.
+Unknown attributes, files larger than available RAM, or an unavailable fresh
+memory sample force `direct_io`. This avoids cycling the same bytes through
+both StudioFS's local payload cache and UBC. `direct_io` does not bypass the
+StudioFS cache: the VFS still reads cached payloads locally and fetches from
 object storage only on a payload-cache miss. Each adapter owns a background
 memory sampler that measures RAM once per second and publishes a snapshot under
-a short write lock, after the OS refresh. Opens use `RwLock::try_read` and never
-wait for publication. Missing, zero, or samples at least two seconds old, and a
-busy or poisoned snapshot lock conservatively select direct I/O. Sample age starts before the OS refresh,
-so a slow refresh cannot make an old measurement fresh. Teardown stops and joins
-the sampler after draining callbacks; dropping the adapter also joins it.
-`novncache` keeps namespace lookups coherent. The mount does not pass the global `direct_io`, `nolocalcaches`, or
-`auto_cache` options; data and attribute coherence instead use per-handle
-`keep_cache` decisions plus scoped low-level inode invalidations. The mount also
-passes
+a short write lock after the OS refresh. Opens use `std::sync::RwLock::try_read`
+and never wait for publication. Missing, zero, or samples at least two seconds
+old, and a busy or poisoned snapshot lock conservatively select direct I/O.
+Sample age starts before the OS refresh, so a slow refresh cannot make an old
+measurement fresh. The one-second cadence accounts for time spent sampling; an
+overrun starts the next sample immediately and skips missed ticks without a
+catch-up burst. Teardown stops and joins the sampler after draining callbacks;
+dropping the adapter also joins it. `novncache` keeps namespace
+lookups coherent. The mount does not pass the global `direct_io`,
+`nolocalcaches`, or `auto_cache` options; data and attribute coherence instead
+use per-handle `keep_cache` decisions plus scoped low-level inode invalidations.
+The mount also passes
 `iosize=4194304`, `max_read=4194304`, and `default_permissions`; the 4 MiB
 geometry stays aligned with regular-file `st_blksize` so macFUSE does not split
 large sequential media callbacks into smaller requests. StudioFS does not pass
