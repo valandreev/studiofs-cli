@@ -6,14 +6,21 @@ Individual retained allocations remain limited to 8 MiB. The 64 MiB default
 in-flight read admission budget is separate and unchanged.
 
 Requests and initialized storage are grouped by their next power of two.
-Acquisition selects the smallest adequate allocation in the same class. A
-128 KiB read cannot borrow an idle 8 MiB buffer. Misses allocate exactly the
-request length with `vec![0; len]`, without increasing fresh allocations beyond
-the admitted request length. Reuse can lend larger initialized storage in the
-same class, less than twice the request length. The 64 MiB admission limit
-counts request bytes, not actual active buffer capacity or RSS. Pressure evicts the
-largest idle allocation, preferring the oldest among equal capacities. The
-small bounded vector keeps class lookup simple without a separate bucket map.
+Acquisition reuses an idle buffer only from the same class, and only when its
+length covers the request; among equal capacities the most recently recycled
+buffer is taken. A 128 KiB read cannot borrow an idle 8 MiB buffer. A miss
+allocates the whole class with `vec![0; class_len]`, where `class_len` is the
+next power of two and at most 8 MiB, and the reply is limited to the requested
+length. Reuse can therefore lend initialized storage from the same class, less
+than twice the request length. Requests above 8 MiB get an exact-size allocation
+that is never retained. The 64 MiB admission limit counts request bytes, not
+actual active buffer capacity or RSS.
+
+Recycling pushes the returned buffer as the newest idle entry. Under count
+pressure (more than 32 idle buffers) or byte pressure (more than 32 MiB of idle
+capacity) the oldest idle buffer is evicted first, so the buffer just returned
+survives. Evicted buffers are freed after the pool lock is released. The small
+bounded vector keeps class lookup simple without a separate bucket map.
 
 The existing overwritten-prefix, error, cancellation, and debug-poison contracts
 remain in effect. Empty requests do not allocate or count as pool hits/misses.
@@ -29,6 +36,8 @@ The mounted `.studiofs-runtime-stats` bridge section exports the same names with
 a `fuse_` prefix, as counters for hits/misses and byte gauges for retained/budget.
 Opening this file refreshes pool accounting after completed replies recycle
 storage. Concurrent reads may change the pool after a snapshot is captured.
+The adapter builds and stores each read snapshot under one publish mutex, so a
+later store always carries counters at least as new as an earlier one.
 Legacy JSON snapshots default these new fields; unsupported platforms report no
 pool budget. A nonempty pool miss allocates one buffer, so miss deltas provide
 pool allocation counts; process allocator counters include other allocations.
@@ -46,11 +55,12 @@ Run from the repository root:
     cargo fmt --all -- --check
     git diff --check
 
-On 2026-10-14 the commands above passed: the pool filter ran 14 tests
-(including two adapter reuse tests), the adapter filter ran 20 tests, and the
-runtime stats and JSON compatibility filters each ran one test. Clippy,
-release check, formatting and whitespace checks passed. Two adapter tests
-appear in both filters, so these are 34 distinct tests. No full suite was run.
+On 2026-10-14 the `read_buffer` filter ran 16 tests: 15 pool tests in
+`adapter::read_buffer::tests`, plus the queued-reply test
+`read_only_adapter_reuses_queued_read_buffer_after_reply_completion`, whose name
+contains `read_buffer`. The adapter and runtime-stats counts from that run are
+superseded by the review follow-up below. Clippy, release check, formatting and
+whitespace checks passed for the earlier state. No full suite was run.
 
 Unit tests exercise size matching, initialized reuse, empty/oversized requests,
 actual-capacity pressure, and buffer-count limits. Adapter tests exercise queued
@@ -79,8 +89,9 @@ before treating whole-run deltas as allocation rates.
 The repair addresses three connected paths:
 
 - macFUSE now uses direct I/O when VFS reports active writers, unpublished local
-  content, or an unknown cache generation. Stable published generations retain
-  buffered reads and the existing file-size / available-memory policy.
+  content, or an unknown cache generation. Observed generations (published or
+  locally stable content) retain buffered reads and the existing file-size /
+  available-memory policy.
 - Last-handle attribute invalidation runs after local materialization. Accepted
   writes keep a refresh pending even when a flush clears dirty state before close.
 - A prepared read of unpublished content cannot retain a stale hole map after
@@ -106,8 +117,77 @@ Raw reports: `SFS-806-fixed-128k.json`, `SFS-806-fixed-4m.json` and
 `SFS-806-fixed-summary.json`. The final binary embeds the preceding commit SHA
 because the fix was validated before commit; it was built from the working diff.
 
-Separate limitation: previously exercised test volumes later failed startup
-with `inode not found` (including inode 1649267441820). Those artifacts were
-preserved, and final validation used a new isolated volume. This startup/replay
-failure remains unresolved and is not evidence of a successful remount of the
-old volumes. Pending reads now may perform additional metadata lookups.
+Separate limitation, now resolved: previously exercised test volumes later
+failed startup with `inode not found` (including inode 1649267441820). The
+cause is SFS-855: startup replay of unflushed local events read a file that
+was created and deleted inside the window through its tombstone. The fix is
+part of this branch. Pending reads now may perform additional metadata
+lookups.
+
+## Review follow-up (2026-10-14)
+
+The mounted numbers in the sections above predate the review follow-up. That
+follow-up changed the pool to oldest-first eviction, class-sized misses and
+serialized snapshot publication, and it changed the open policy so that only
+observed generations keep buffered reads. The 128k and 4m tables therefore
+describe the earlier policy and do not establish results for the current code.
+
+### Mounted rerun against a `main` baseline
+
+Both runs used the same macOS volume and directory, one mount per binary, and
+three devbench phases in that mount (`--threads 4 --big-file-size 1GB
+--small-file-count 128`). The baseline binary is `main` plus the SFS-855
+startup-replay fix, which does not touch the read path. Peak RSS is
+`/usr/bin/time -l` maximum resident set size of the mount process; per-phase
+RSS is sampled after each phase. Each configuration ran once, so the elapsed
+times are indicative only.
+
+| Phase | Block | Elapsed, s (branch / baseline) | Mount RSS after phase, MiB (branch / baseline) |
+| --- | --- | --- | --- |
+| 128k | 128 KB | 27 / 22 | 1364 / 1396 |
+| 4m | 4 MB | 25 / 23 | 1729 / 2023 |
+| odd100k | 100 KB, 100 KB small files | 89 / 80 | 2322 / 2698 |
+| Peak RSS | | | 2330 / 2763 |
+
+The branch peak RSS is about 16% lower than the baseline. The phase times
+differ by a few seconds in the baseline's favour, which is within the noise of
+a single run that also measures the write path; a throughput regression is not
+established either way.
+
+Pool counters from the branch run (deltas per phase, from the root
+`.studiofs-runtime-stats` before and after each phase):
+
+| Phase | Hits | Misses | Retained bytes after phase |
+| --- | --- | --- | --- |
+| 128k | 106,951 | 6 | 1,114,112 |
+| 4m | 7,183 | 2 | 4,259,840 |
+| odd100k | 136,737 | 4 | 4,321,280 |
+
+Twelve misses over about 251 thousand reads give a pool allocation rate below
+0.005% of reads, and retained idle storage stayed below 4.2 MiB against the
+32 MiB budget. The baseline has no pool counters, so its allocation rate is
+not available for comparison. The raw reports and runtime-stats snapshots are
+kept under `target/sfs806-bench/{fixed,baseline}/` on the benchmark machine and
+are not committed.
+
+A final run with the merged binary (this branch plus the SFS-855 fix) started
+from the unflushed backlog left by the baseline run. Startup replay succeeded,
+and all three phases passed. The pool recorded 12 misses over about 251
+thousand reads, and peak mount RSS was 2250 MiB. The local event log drained
+before unmount, and a remount succeeded. The first phase took 40 s because it
+overlapped the backlog catch-up.
+
+Focused unit runs on the current code, 2026-10-14, all passed:
+
+- `read_buffer` filter (`cargo test -p studiofs-macfuse --lib read_buffer`):
+  16 tests.
+- Combined macFUSE filter over `read_buffer`, `read_only_adapter`,
+  `runtime_stats_open`, `unpublished_adapter_read`, `stable_empty_file`,
+  `adapter_dirty_write_release`, `adapter_locally_materialized` and
+  `read_only_open_policy`: 41 tests in one run.
+- Combined VFS filter over `release_fh_`, `deferred_last_handle_release`,
+  `prepared_read_survives_local_overlay`,
+  `prepared_published_read_uses_new_local`
+  and `fuse_async_read_snapshot_serializes`: 25 tests in one run.
+
+These are unit-level results; the mounted rerun above covers the current code.

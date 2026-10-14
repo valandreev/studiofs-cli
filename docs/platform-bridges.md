@@ -564,7 +564,7 @@ fallback). Rocky Linux 8.6+ remains best-effort.
 | Kernel `congestion_threshold` | macOS: `40` by default |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
-| macOS: cache policy | UBC for fitting read-only files; direct I/O for write-capable or oversized read-only handles |
+| macOS: cache policy | UBC for fitting read-only files with a clean content generation; direct I/O for write-capable, oversized, or locally dirty/unknown read-only handles |
 | macOS: validated macFUSE | 5.2.0 |
 
 ### macOS cache and I/O policy
@@ -585,19 +585,37 @@ read-only files that fit in currently available RAM. When a file is larger than
 available RAM, its read-only handle uses `direct_io` to avoid cycling the same
 bytes through both StudioFS's local payload cache and UBC. This does not bypass
 the StudioFS cache: the VFS still reads cached payloads locally and fetches from
-object storage only on a payload-cache miss. `novncache` keeps namespace lookups
+object storage only on a payload-cache miss. Read-only handles also use
+`direct_io` unless the VFS cache decision observed a content generation: a
+first observation, a changed generation, or a stable generation. An observed
+generation covers both published content and locally stable content. Locally
+dirty, actively written, and unknown-state files therefore bypass UBC and kernel
+readahead until their state settles, because the kernel's cached size and pages
+cannot track unpublished local state. The file-size and available-memory check
+still applies to every read-only handle. `novncache` keeps namespace lookups
 coherent. The mount does not pass the global `direct_io`, `nolocalcaches`, or
 `auto_cache` options; data and attribute coherence instead use per-handle
 `keep_cache` decisions plus scoped low-level inode invalidations. The mount also
-passes
-`iosize=4194304`, `max_read=4194304`, and `default_permissions`; the 4 MiB
-geometry stays aligned with regular-file `st_blksize` so macFUSE does not split
+passes `iosize=4194304`, `max_read=4194304`, and `default_permissions`; the
+4 MiB geometry stays aligned with regular-file `st_blksize` so macFUSE does not split
 large sequential media callbacks into smaller requests. StudioFS does not pass
 `noappledouble`: macFUSE handles that option before userspace and can hide
 `.DS_Store`, which Finder/copyfile requires for folder copies.
 Write-capable handles use per-handle `direct_io`: macFUSE's buffered Apple
 copy path can otherwise replace valid large-write buffers before the low-level
 write callback. Read-only handles retain the adaptive UBC policy above.
+
+The macFUSE read-reply buffer pool lends storage per request. A buffer is reused
+only for a request in the same power-of-two size class and only when it is large
+enough. A miss allocates the whole class, capped at 8 MiB; the reply is limited
+to the requested length. Requests above 8 MiB get an exact-size buffer that is
+never retained. Idle storage is capped at 32 buffers and 32 MiB of capacity.
+Under count or byte pressure the oldest idle buffer is evicted first, so the
+buffer just returned survives and the pool converges on the current working set.
+Evicted buffers are freed after the pool lock is released. The hit and miss
+counters and the retained-byte gauge are built and stored as one snapshot under
+an adapter mutex, so the exported counters never move backwards.
+
 The native macOS bridge queues read replies asynchronously. Write callbacks are
 currently acknowledged after the shared VFS accepts the write, while the VFS
 materializes and uploads accepted data in the background. The shared writer
