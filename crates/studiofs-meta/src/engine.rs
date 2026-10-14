@@ -247,6 +247,21 @@ pub enum MetaError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// Replaying this client's unflushed local events failed. `source` keeps the typed cause,
+    /// so callers can still match on it; the message names the operation and sequence range.
+    #[error("{operation} failed while replaying local events [{start_seq}, {end_seq}): {source}")]
+    LocalReplayFailed {
+        /// Startup step that owned the replay.
+        operation: &'static str,
+        /// First local event sequence in the replayed range (inclusive).
+        start_seq: u64,
+        /// Local event sequence after the replayed range (exclusive).
+        end_seq: u64,
+        /// Typed error from the replay itself.
+        #[source]
+        source: Box<MetaError>,
+    },
+
     /// A bounded PostgreSQL catch-up page completed without advancing its cursor.
     #[error(
         "postgres metadata catch-up stalled at local version {local_version} while startup target is {target_version}"
@@ -2175,5 +2190,31 @@ mod tests {
             MetadataCheckpointRefreshReason::EventPayloadBytes.to_string(),
             "event payload bytes"
         );
+    }
+}
+
+#[cfg(test)]
+mod local_replay_error_tests {
+    use super::MetaError;
+
+    #[test]
+    fn local_replay_failure_names_operation_range_and_inode_and_keeps_typed_cause() {
+        let error = MetaError::LocalReplayFailed {
+            operation: "restoring pending serving state",
+            start_seq: 21_656,
+            end_seq: 38_144,
+            source: Box::new(MetaError::InodeNotFound(1_649_267_470_662)),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "restoring pending serving state failed while replaying local events \
+             [21656, 38144): inode not found: 1649267470662"
+        );
+        assert!(matches!(
+            &error,
+            MetaError::LocalReplayFailed { source, .. }
+                if matches!(source.as_ref(), MetaError::InodeNotFound(1_649_267_470_662))
+        ));
     }
 }
