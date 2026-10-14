@@ -40,8 +40,5 @@ tracing.workspace = true
 lru.workspace = true
 studiofs-test-support.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
-sysinfo.workspace = true
-
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cc = "1"

@@ -72,12 +72,12 @@ pub use metrics::{
     VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats,
     VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot, VfsFuseIoStats, VfsIngressLane,
     VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsLinuxFuseOpenCacheStats,
-    VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsNamespaceCacheSnapshot,
-    VfsNamespaceCreateObservabilityStats, VfsPortableAllocatorStats, VfsReadPathStats,
-    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
-    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
-    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
-    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsMacFuseOpenMemoryDirectIo,
+    VfsNamespaceCacheSnapshot, VfsNamespaceCreateObservabilityStats, VfsPortableAllocatorStats,
+    VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot,
+    VfsUploadStats, VfsWritePathBackpressureStats, VfsWritePathBurstStats,
+    VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats,
+    VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
     VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
     VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
     VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
@@ -2844,6 +2844,8 @@ struct MetricsState {
     macfuse_open_cache_write_capable: AtomicU64,
     macfuse_open_cache_clean_write_release_seeded: AtomicU64,
     macfuse_open_cache_local_stable_write_release_seeded: AtomicU64,
+    macfuse_open_cache_memory_unavailable_direct_io: AtomicU64,
+    macfuse_open_cache_exceeds_memory_direct_io: AtomicU64,
     zeroio_replay_failures: AtomicU64,
     zeroio_publish_failures: AtomicU64,
     runtime_event_sequence: AtomicU64,
@@ -3048,6 +3050,8 @@ impl MetricsState {
             macfuse_open_cache_write_capable: AtomicU64::new(0),
             macfuse_open_cache_clean_write_release_seeded: AtomicU64::new(0),
             macfuse_open_cache_local_stable_write_release_seeded: AtomicU64::new(0),
+            macfuse_open_cache_memory_unavailable_direct_io: AtomicU64::new(0),
+            macfuse_open_cache_exceeds_memory_direct_io: AtomicU64::new(0),
             zeroio_replay_failures: AtomicU64::new(0),
             zeroio_publish_failures: AtomicU64::new(0),
             runtime_event_sequence: AtomicU64::new(0),
@@ -3226,6 +3230,8 @@ impl MetricsState {
             macfuse_open_cache_write_capable,
             macfuse_open_cache_clean_write_release_seeded,
             macfuse_open_cache_local_stable_write_release_seeded,
+            macfuse_open_cache_memory_unavailable_direct_io,
+            macfuse_open_cache_exceeds_memory_direct_io,
             zeroio_replay_failures,
             zeroio_publish_failures,
             runtime_event_sequence
@@ -8092,6 +8098,23 @@ impl StudioVfs {
         }
     }
 
+    /// Record a read-only macFUSE open that used direct I/O because of memory telemetry.
+    ///
+    /// This refines, and does not replace, the keep/drop decision recorded by
+    /// [`Self::record_macfuse_open_cache_decision`] for the same open.
+    pub fn record_macfuse_open_memory_direct_io(&self, reason: VfsMacFuseOpenMemoryDirectIo) {
+        let metrics = &self.state.metrics;
+        let counter = match reason {
+            VfsMacFuseOpenMemoryDirectIo::MemoryUnavailable => {
+                &metrics.macfuse_open_cache_memory_unavailable_direct_io
+            }
+            VfsMacFuseOpenMemoryDirectIo::ExceedsAvailableMemory => {
+                &metrics.macfuse_open_cache_exceeds_memory_direct_io
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record FUSE write callback observability.
     pub fn record_fuse_write_callback(
         &self,
@@ -8684,6 +8707,10 @@ impl StudioVfs {
                 macfuse_open_cache_clean_write_release_seeded,
             macfuse_open_cache_local_stable_write_release_seeded:
                 macfuse_open_cache_local_stable_write_release_seeded,
+            macfuse_open_cache_memory_unavailable_direct_io:
+                macfuse_open_cache_memory_unavailable_direct_io,
+            macfuse_open_cache_exceeds_memory_direct_io:
+                macfuse_open_cache_exceeds_memory_direct_io,
             sync_calls: payload_store_sync_data_calls,
             sync_deferred_calls: payload_store_sync_data_deferred_calls,
             sync_bytes: payload_store_sync_data_synced_bytes,
@@ -9392,6 +9419,9 @@ impl StudioVfs {
                     clean_write_release_seeded: macfuse_open_cache_clean_write_release_seeded,
                     local_stable_write_release_seeded:
                         macfuse_open_cache_local_stable_write_release_seeded,
+                    read_only_memory_unavailable_direct_io:
+                        macfuse_open_cache_memory_unavailable_direct_io,
+                    read_only_exceeds_memory_direct_io: macfuse_open_cache_exceeds_memory_direct_io,
                 }
             },
             linux_fuse_open_cache: self.state.linux_fuse_open_cache.lock().clone(),

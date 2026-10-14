@@ -335,6 +335,54 @@ while retaining the underlying I/O source and its operation context.
 Fast-mode coverage demonstrates process interruption recovery with surviving
 OS-cached files; it does not establish power-loss durability.
 
+### SFS-807 macFUSE Memory Sampling and Open Cache Policy
+
+These regressions check the open path and the memory sampler. Opens do not
+wait for the background sample, and the first sample is published before the
+mount serves callbacks. Unknown attributes and unavailable memory select direct
+I/O, while a fresh sample keeps kernel I/O. Memory-driven direct I/O is counted
+and preserves the observed cache generation. The estimate ignores compressor
+occupancy, lock-free snapshots expire correctly, and panicking measurements are
+contained. Teardown stops and joins the worker:
+
+- `concurrent_opens_finish_while_memory_sampling_is_blocked`
+- `read_only_open_with_sampled_memory_keeps_kernel_io`
+- `read_only_open_with_missing_attr_and_memory_uses_direct_io`
+- `read_only_open_without_memory_sample_uses_direct_io`
+- `read_only_open_policy_reuses_generation_attr_for_direct_io`
+- `memory_direct_io_open_preserves_generation_for_next_fitting_open`
+- `callback_state_stop_background_work_joins_memory_sampler`
+- `snapshot_without_publication_is_unavailable`
+- `snapshot_with_zero_measurement_is_unavailable`
+- `snapshot_with_failed_measurement_is_unavailable`
+- `snapshot_is_fresh_until_ttl`
+- `snapshot_expires_at_ttl`
+- `snapshot_remains_fresh_between_scheduled_samples`
+- `reclaimable_bytes_ignore_compressor_occupancy`
+- `reclaimable_bytes_saturate_instead_of_overflowing`
+- `host_memory_reports_nonzero_reclaimable_bytes` (opt-in host smoke test;
+  requires nonzero reclaimable memory)
+- `sample_health_contains_panicking_measurement`
+- `started_sampler_publishes_before_returning`
+- `readers_finish_while_sample_is_blocked_and_shutdown_joins_worker`
+- `dropping_sampler_joins_worker_and_drops_sampling_closure`
+- `sample_wait_uses_only_the_remaining_interval`
+- `fixed_sampler_returns_estimate_without_worker` (test fixtures use constant telemetry without expiry)
+
+Run the focused macFUSE checks:
+
+```bash
+cargo test -p studiofs-macfuse --lib open_cache_snapshot_tests -- --nocapture
+cargo test -p studiofs-macfuse --lib memory_sampler -- --nocapture
+```
+
+The live host-memory smoke test is ignored by default because reclaimable
+memory depends on the host's current pressure. Run it separately on macOS:
+
+```sh
+cargo test -p studiofs-macfuse --lib host_memory_reports_nonzero_reclaimable_bytes -- --ignored --nocapture
+```
+
 ## Contract/Core Harness
 
 Fast contract-level checks that should not require Docker, PostgreSQL, RustFS,

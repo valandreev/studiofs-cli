@@ -2522,6 +2522,7 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
     dispatcher.cancel_pending();
     vfs.clear_kernel_invalidator();
     callback_state.wait_for_reply_tasks();
+    callback_state.stop_background_work();
     let unmount_result = session
         .start_unmount()
         .and_then(|_| session.wait_for_unmount(FS_KIT_SHUTDOWN_TIMEOUT))

@@ -8,7 +8,7 @@ use std::ops::Deref;
 use std::os::raw::{c_char, c_ulong};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{
-    Arc, Condvar, LockResult, Mutex, MutexGuard, OnceLock,
+    Arc, Condvar, LockResult, Mutex, MutexGuard,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -30,9 +30,8 @@ use studiofs_vfs::vfs::{
 };
 use studiofs_vfs::{
     KernelInvalidator, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
-    VfsMacFuseOpenCacheDecision, VfsResult,
+    VfsMacFuseOpenCacheDecision, VfsMacFuseOpenMemoryDirectIo, VfsResult,
 };
-use sysinfo::{MemoryRefreshKind, System};
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, SemaphorePermit};
 #[cfg(test)]
@@ -45,8 +44,10 @@ use crate::low_level::{
     catch_callback_unwind, raw,
 };
 
+mod memory_sampler;
 mod read_buffer;
 
+use memory_sampler::SystemMemorySampler;
 use read_buffer::{
     MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY, MACFUSE_READ_BUFFER_POOL_MAX_RETAINED_BYTES,
     PooledReadBuffer, ReadBufferPool,
@@ -56,7 +57,6 @@ const TTL_SECONDS: f64 = 1.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = crate::low_level::MACOS_FUSE_IOSIZE_BYTES;
 const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
-const MACFUSE_AVAILABLE_MEMORY_TTL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
 const MACFUSE_SYMLINK_RETRY_ATTEMPTS: u16 = 200;
 const MACFUSE_SYMLINK_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -84,6 +84,7 @@ pub(crate) struct StudioVfsAdapter {
     runtime_handle: Handle,
     reply_tasks: Arc<ReplyTaskTracker>,
     read_only: bool,
+    available_memory: SystemMemorySampler,
     mount_uid: u32,
     mount_gid: u32,
     directory_handles: ParkingMutex<HashMap<u64, Arc<DirectoryHandle>>>,
@@ -853,7 +854,22 @@ impl StudioVfsAdapter {
     /// Create a macFUSE adapter over a StudioVfs instance.
     #[cfg(test)]
     pub(crate) fn new(vfs: Arc<StudioVfs>, runtime_handle: Handle) -> Self {
-        Self::new_with_read_only(vfs, runtime_handle, false)
+        Self::new_with_read_only_for_test(vfs, runtime_handle, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_read_only_for_test(
+        vfs: Arc<StudioVfs>,
+        runtime_handle: Handle,
+        read_only: bool,
+    ) -> Self {
+        Self::new_with_read_queue_byte_limit(
+            vfs,
+            runtime_handle,
+            read_only,
+            MACFUSE_READ_MAX_PENDING_BYTES,
+            SystemMemorySampler::fixed(Some(u64::MAX)),
+        )
     }
 
     /// Create a macFUSE adapter over a StudioVfs instance with explicit write policy.
@@ -867,6 +883,7 @@ impl StudioVfsAdapter {
             runtime_handle,
             read_only,
             MACFUSE_READ_MAX_PENDING_BYTES,
+            SystemMemorySampler::system(),
         )
     }
 
@@ -875,6 +892,7 @@ impl StudioVfsAdapter {
         runtime_handle: Handle,
         read_only: bool,
         read_queue_byte_limit: usize,
+        available_memory: SystemMemorySampler,
     ) -> Self {
         let read_queue_byte_limit = read_queue_byte_limit
             .max(1)
@@ -885,6 +903,7 @@ impl StudioVfsAdapter {
             runtime_handle,
             reply_tasks: Arc::new(ReplyTaskTracker::default()),
             read_only,
+            available_memory,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             directory_handles: ParkingMutex::new(HashMap::new()),
@@ -916,7 +935,13 @@ impl StudioVfsAdapter {
         runtime_handle: Handle,
         read_queue_byte_limit: usize,
     ) -> Self {
-        Self::new_with_read_queue_byte_limit(vfs, runtime_handle, false, read_queue_byte_limit)
+        Self::new_with_read_queue_byte_limit(
+            vfs,
+            runtime_handle,
+            false,
+            read_queue_byte_limit,
+            SystemMemorySampler::fixed(Some(u64::MAX)),
+        )
     }
 
     #[cfg(test)]
@@ -1279,7 +1304,7 @@ impl StudioVfsAdapter {
             self.shared.open_cache_snapshots.lock().pop(&ino);
             flag_policy
         } else if flag_policy.keep_cache {
-            self.read_only_open_cache_policy(ino, fh, available_memory_bytes())
+            self.read_only_open_cache_policy(ino, fh, self.available_memory.available_memory())
         } else {
             let _ = self
                 .vfs
@@ -1322,23 +1347,38 @@ impl StudioVfsAdapter {
             };
         };
         let keep_cache = decision.disposition() == OsCacheDisposition::Reuse;
+        let memory_direct_io = match available_memory {
+            None => Some(VfsMacFuseOpenMemoryDirectIo::MemoryUnavailable),
+            Some(available) if attr.size > available => {
+                Some(VfsMacFuseOpenMemoryDirectIo::ExceedsAvailableMemory)
+            }
+            Some(_) => None,
+        };
+        // Memory-driven direct I/O keeps cache participation enabled: it only
+        // stops this handle from filling UBC. Disabling participation would clear
+        // the inode generation and make the next fitting open purge pages that
+        // other handles may still be reusing.
         let policy = MacFuseOpenCachePolicy {
             // Unpublished local state cannot safely use the kernel's cached size or pages.
             // Buffered reads are kept only for observed-generation decisions
             // (published or locally stable); unknown, local-dirty, and active-writer
             // state uses direct_io.
-            direct_io: !decision.reason().observes_generation()
-                || available_memory.is_some_and(|available| attr.size > available),
+            direct_io: !decision.reason().observes_generation() || memory_direct_io.is_some(),
             keep_cache,
             write_capable: false,
         };
         let metric = macfuse_cache_metric(&attr, decision);
         self.vfs.record_macfuse_open_cache_decision(metric);
+        if let Some(reason) = memory_direct_io {
+            self.vfs.record_macfuse_open_memory_direct_io(reason);
+        }
         #[cfg(test)]
         self.track_open_cache_observation_for_test(ino, &attr, decision);
         debug!(
             ino,
             keep_cache,
+            direct_io = policy.direct_io,
+            available_memory,
             content_epoch = attr.content_epoch,
             size = attr.size,
             reason = ?decision.reason(),
@@ -2363,6 +2403,14 @@ impl CallbackState {
         self.adapter.reply_tasks.wait_for_idle();
     }
 
+    /// Stop and join adapter-owned background workers.
+    ///
+    /// Call only after native dispatch has stopped and replies are drained;
+    /// later read-only opens would select direct I/O.
+    pub(crate) fn stop_background_work(&self) {
+        self.adapter.available_memory.shutdown();
+    }
+
     #[cfg(all(test, studiofs_fskit))]
     pub(crate) fn poison_reply_tracker_for_test(&self) {
         poison_reply_tracker(&self.adapter.reply_tasks);
@@ -2643,47 +2691,6 @@ fn macfuse_cache_metric(
     }
 }
 
-struct AvailableMemorySnapshot {
-    system: System,
-    available: Option<u64>,
-    refreshed_at: Instant,
-}
-
-impl AvailableMemorySnapshot {
-    fn new() -> Self {
-        let mut snapshot = Self {
-            system: System::new(),
-            available: None,
-            refreshed_at: Instant::now(),
-        };
-        snapshot.refresh();
-        snapshot
-    }
-
-    fn available_memory(&mut self) -> Option<u64> {
-        if self.refreshed_at.elapsed() >= MACFUSE_AVAILABLE_MEMORY_TTL {
-            self.refresh();
-        }
-        self.available
-    }
-
-    fn refresh(&mut self) {
-        self.system
-            .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
-        let available = self.system.available_memory();
-        self.available = (available > 0).then_some(available);
-        self.refreshed_at = Instant::now();
-    }
-}
-
-fn available_memory_bytes() -> Option<u64> {
-    static AVAILABLE_MEMORY: OnceLock<ParkingMutex<AvailableMemorySnapshot>> = OnceLock::new();
-    AVAILABLE_MEMORY
-        .get_or_init(|| ParkingMutex::new(AvailableMemorySnapshot::new()))
-        .lock()
-        .available_memory()
-}
-
 fn current_uid() -> u32 {
     // SAFETY: `geteuid` is thread-safe, takes no pointers, and has no Rust-side
     // invariants beyond the platform libc contract.
@@ -2699,11 +2706,9 @@ fn current_gid() -> u32 {
 #[cfg(test)]
 mod open_cache_snapshot_tests {
     use super::{
-        AvailableMemorySnapshot, MACFUSE_AVAILABLE_MEMORY_TTL, MacFuseOpenCacheGraphSpan,
-        MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind,
-        StudioVfsAdapter,
+        MacFuseOpenCacheGraphSpan, MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot,
+        MacFuseOpenCacheSnapshotKind, StudioVfsAdapter,
     };
-    use std::time::Instant;
     use studiofs_meta::{InodeAttr, UploadState};
     use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
     use studiofs_vfs::vfs::OpenFlags;
@@ -2760,34 +2765,243 @@ mod open_cache_snapshot_tests {
         let policy = adapter.read_only_open_cache_policy(attr.ino, fh, Some(1024));
 
         assert!(policy.direct_io);
+        let stats = vfs.write_path_observability_snapshot().macfuse_open_cache;
+        assert_eq!(stats.read_only_exceeds_memory_direct_io, 1);
+        assert_eq!(stats.read_only_memory_unavailable_direct_io, 0);
         adapter
             .release(attr.ino, fh)
             .expect("release read-only file");
     }
 
     #[test]
-    fn expired_available_memory_snapshot_is_refreshed() {
-        let mut snapshot = AvailableMemorySnapshot {
-            system: sysinfo::System::new(),
-            available: None,
-            refreshed_at: Instant::now() - MACFUSE_AVAILABLE_MEMORY_TTL,
-        };
-        let before_refresh = snapshot.refreshed_at;
+    fn concurrent_opens_finish_while_memory_sampling_is_blocked() {
+        use std::sync::mpsc;
+        use std::time::Duration;
 
-        let _ = snapshot.available_memory();
+        let fixture =
+            ContractVfsFixture::new("macfuse-open-blocked-memory").expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let inodes: Vec<_> = (0..4)
+            .map(|index| {
+                vfs.create(
+                    CONTRACT_ROOT_INO,
+                    format!("open-{index}.bin").as_bytes(),
+                    501,
+                    20,
+                    0o644,
+                )
+                .expect("create file")
+                .ino
+            })
+            .collect();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let sampler = super::SystemMemorySampler::start(move || {
+            entered_tx.send(()).expect("signal sampling");
+            resume_rx.recv().expect("resume sampling");
+            Some(4096)
+        });
+        let adapter = StudioVfsAdapter::new_with_read_queue_byte_limit(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            false,
+            super::MACFUSE_READ_MAX_PENDING_BYTES,
+            sampler,
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sampler started");
 
-        assert!(snapshot.refreshed_at > before_refresh);
+        let results = std::thread::scope(|scope| {
+            let (done_tx, done_rx) = mpsc::channel();
+            for ino in inodes {
+                let done_tx = done_tx.clone();
+                let adapter = &adapter;
+                scope.spawn(move || {
+                    let opened = adapter.open(ino, libc::O_RDONLY).expect("open file");
+                    let direct_io = opened.direct_io();
+                    adapter
+                        .release(ino, opened.file_handle())
+                        .expect("release file");
+                    done_tx.send(direct_io).expect("signal completed open");
+                });
+            }
+            let results: Vec<_> = (0..4)
+                .map(|_| done_rx.recv_timeout(Duration::from_secs(2)))
+                .collect();
+            resume_tx.send(()).expect("resume sampler after callbacks");
+            results
+        });
+        adapter.available_memory.shutdown();
+        for result in results {
+            assert!(result.expect("open must finish before sampling resumes"));
+        }
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .macfuse_open_cache
+                .read_only_memory_unavailable_direct_io,
+            4
+        );
     }
 
     #[test]
-    fn fresh_available_memory_snapshot_is_reused() {
-        let mut snapshot = AvailableMemorySnapshot {
-            system: sysinfo::System::new(),
-            available: None,
-            refreshed_at: Instant::now(),
-        };
+    fn read_only_open_with_sampled_memory_keeps_kernel_io() {
+        let fixture =
+            ContractVfsFixture::new("macfuse-open-sampled-memory").expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"sampled-memory.bin", 501, 20, 0o644)
+            .expect("create file");
+        vfs.setattr(attr.ino, studiofs_meta::SetattrArgs::size_only(1024 * 1024))
+            .expect("set size");
+        fixture
+            .runtime()
+            .block_on(vfs.fsync(attr.ino, false))
+            .expect("settle local file generation");
+        let adapter = StudioVfsAdapter::new_with_read_queue_byte_limit(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            false,
+            super::MACFUSE_READ_MAX_PENDING_BYTES,
+            super::SystemMemorySampler::started(|| Some(1 << 40)),
+        );
 
-        assert_eq!(snapshot.available_memory(), None);
+        let opened = adapter.open(attr.ino, libc::O_RDONLY).expect("open file");
+        adapter
+            .release(attr.ino, opened.file_handle())
+            .expect("release file");
+
+        assert!(!opened.direct_io());
+        let stats = vfs.write_path_observability_snapshot().macfuse_open_cache;
+        assert_eq!(stats.read_only_memory_unavailable_direct_io, 0);
+        assert_eq!(stats.read_only_exceeds_memory_direct_io, 0);
+    }
+
+    #[test]
+    fn memory_direct_io_open_preserves_generation_for_next_fitting_open() {
+        let fixture =
+            ContractVfsFixture::new("macfuse-open-memory-generation").expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"memory-generation.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let bypassed_fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open memory-bypassed file");
+        let bypassed = adapter.read_only_open_cache_policy(attr.ino, bypassed_fh, None);
+        adapter
+            .release(attr.ino, bypassed_fh)
+            .expect("release memory-bypassed file");
+        let fitting_fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open fitting file");
+
+        let fitting = adapter.read_only_open_cache_policy(attr.ino, fitting_fh, Some(u64::MAX));
+        adapter
+            .release(attr.ino, fitting_fh)
+            .expect("release fitting file");
+
+        assert!(bypassed.direct_io);
+        assert!(!fitting.direct_io);
+        assert!(
+            fitting.keep_cache,
+            "memory-driven direct I/O must not clear the observed generation"
+        );
+    }
+
+    #[test]
+    fn callback_state_stop_background_work_joins_memory_sampler() {
+        let fixture =
+            ContractVfsFixture::new("macfuse-callback-stop-sampler").expect("create VFS fixture");
+        let adapter = StudioVfsAdapter::new_with_read_queue_byte_limit(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            super::MACFUSE_READ_MAX_PENDING_BYTES,
+            super::SystemMemorySampler::start(|| Some(4096)),
+        );
+        let state = super::CallbackState {
+            adapter: std::sync::Arc::new(adapter),
+        };
+        assert!(state.adapter.available_memory.is_running());
+
+        state.wait_for_reply_tasks();
+        assert!(
+            state.adapter.available_memory.is_running(),
+            "draining replies alone must not stop background work"
+        );
+        state.stop_background_work();
+
+        assert!(!state.adapter.available_memory.is_running());
+    }
+
+    #[test]
+    fn read_only_open_with_fitting_memory_sample_keeps_kernel_io() {
+        let fixture = ContractVfsFixture::new("macfuse-open-cache-fitting-memory")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"fitting-memory.bin", 501, 20, 0o644)
+            .expect("create file");
+        vfs.setattr(attr.ino, studiofs_meta::SetattrArgs::size_only(1024))
+            .expect("set size");
+        fixture
+            .runtime()
+            .block_on(vfs.fsync(attr.ino, false))
+            .expect("settle local file generation");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open file");
+        let policy = adapter.read_only_open_cache_policy(attr.ino, fh, Some(1024));
+        adapter.release(attr.ino, fh).expect("release file");
+        assert!(!policy.direct_io);
+    }
+
+    #[test]
+    fn read_only_open_with_missing_attr_and_memory_uses_direct_io() {
+        let fixture = ContractVfsFixture::new("macfuse-open-cache-missing-attr-memory")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"missing-attr.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        // No inode uses `u64::MAX`, so `getattr` fails while the cache decision
+        // still runs on the valid handle opened for `attr.ino`.
+        for available_memory in [None, Some(4096)] {
+            let fh = vfs
+                .open_file(attr.ino, OpenFlags::RDONLY, false)
+                .expect("open file");
+            let policy = adapter.read_only_open_cache_policy(u64::MAX, fh, available_memory);
+            adapter.release(attr.ino, fh).expect("release file");
+            assert!(
+                policy.direct_io,
+                "unknown file size with {available_memory:?}"
+            );
+            assert!(!policy.keep_cache);
+        }
+    }
+
+    #[test]
+    fn read_only_open_without_memory_sample_uses_direct_io() {
+        let fixture = ContractVfsFixture::new("macfuse-open-cache-missing-memory")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"missing-memory.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open file");
+        let policy = adapter.read_only_open_cache_policy(attr.ino, fh, None);
+        adapter.release(attr.ino, fh).expect("release file");
+        assert!(policy.direct_io);
+        let stats = vfs.write_path_observability_snapshot().macfuse_open_cache;
+        assert_eq!(stats.read_only_memory_unavailable_direct_io, 1);
+        assert_eq!(stats.read_only_exceeds_memory_direct_io, 0);
     }
 
     #[test]

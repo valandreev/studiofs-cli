@@ -4967,7 +4967,6 @@ dependencies = [
  "studiofs-meta",
  "studiofs-test-support",
  "studiofs-vfs",
- "sysinfo",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

@@ -328,6 +328,7 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     // to the session loop. Drain them before Session::drop destroys the
     // session and request backing storage.
     callback_state.wait_for_reply_tasks();
+    callback_state.stop_background_work();
     drop(session);
     drop(callback_state);
     result
@@ -962,7 +963,7 @@ mod tests {
             source.ino
         );
 
-        let read_only = super::adapter::StudioVfsAdapter::new_with_read_only(
+        let read_only = super::adapter::StudioVfsAdapter::new_with_read_only_for_test(
             vfs,
             fixture.runtime().handle().clone(),
             true,
@@ -2307,7 +2308,7 @@ mod tests {
         let vfs = fixture.vfs();
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        let read_only_adapter = super::adapter::StudioVfsAdapter::new_with_read_only(
+        let read_only_adapter = super::adapter::StudioVfsAdapter::new_with_read_only_for_test(
             vfs.clone(),
             fixture.runtime().handle().clone(),
             true,
@@ -2392,7 +2393,7 @@ mod tests {
                 0o644,
             )
             .expect("create file");
-        let adapter = super::adapter::StudioVfsAdapter::new_with_read_only(
+        let adapter = super::adapter::StudioVfsAdapter::new_with_read_only_for_test(
             vfs,
             fixture.runtime().handle().clone(),
             true,

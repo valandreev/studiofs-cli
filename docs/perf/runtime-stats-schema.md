@@ -50,8 +50,13 @@ valid:
 | `fuse_invalidation` | current/peak queue depth; coalescing; unobserved skips; notification failures and latency; shutdown timeout |
 | `fuse_connection` | requested and negotiated `max_read`, `max_readahead`, `max_write`, background/congestion limits, and enabled capability flags |
 
-`macfuse_open_cache` remains unchanged for compatibility. New producers must
-add fields rather than rename or repurpose existing macOS or Linux keys.
+`macfuse_open_cache` keeps its existing keys for compatibility. It adds the
+defaultable counters `read_only_memory_unavailable_direct_io` and
+`read_only_exceeds_memory_direct_io`. They refine read-only opens that used
+`direct_io` because of host-memory telemetry. They are not part of `total`.
+A steadily rising unavailable count means the memory sampler is failing.
+New producers must add fields rather than rename or repurpose existing macOS
+or Linux keys.
 
 Latency histograms must expose `count` and `sum` so readers can compute interval
 average latency by subtracting two snapshots. Bucket upper bounds are always
@@ -79,7 +84,7 @@ Producers should prefer these names when the signal exists:
 
 | Section | Counters |
 | --- | --- |
-| `bridge` | `read_callbacks`, `write_callbacks`, `flush_callbacks`, `cleanup_callbacks`, `close_callbacks`, `callback_errors` |
+| `bridge` | `read_callbacks`, `write_callbacks`, `flush_callbacks`, `cleanup_callbacks`, `close_callbacks`, `callback_errors`, `fuse_read_buffer_pool_hits`, `fuse_read_buffer_pool_misses` |
 | `vfs_read` | `calls`, `requested_bytes`, `served_bytes`, `cache_hit_reads`, `cache_miss_reads`, `errors` |
 | `vfs_write` | `calls`, `accepted_bytes`, `synced_bytes`, `flush_barrier_calls`, `backpressure_events`, `errors` |
 | `cache` | `hits`, `misses`, `evictions`, `staged_payloads`, `staged_bytes`, `materialized_payloads`, `materialized_bytes` |
@@ -92,7 +97,7 @@ Recommended gauges:
 | Section | Gauges |
 | --- | --- |
 | `system` | `uptime_ms`, `rss_bytes`, `worker_threads` |
-| `bridge` | `fuse_max_read_bytes`, `fuse_max_write_bytes`, `fuse_max_readahead_bytes`, `fuse_max_background`, `fuse_congestion_threshold`, `fuse_read_buffer_budget_bytes`, `fuse_write_buffer_budget_bytes`, `fuse_prefetch_concurrency`, `fuse_upload_concurrency`, `fuse_download_concurrency`, `fuse_kernel_writeback_cache`, `linux_fuse_cache_policy` |
+| `bridge` | `fuse_max_read_bytes`, `fuse_max_write_bytes`, `fuse_max_readahead_bytes`, `fuse_max_background`, `fuse_congestion_threshold`, `fuse_read_buffer_budget_bytes`, `fuse_read_buffer_pool_retained_bytes`, `fuse_read_buffer_pool_budget_bytes`, `fuse_write_buffer_budget_bytes`, `fuse_prefetch_concurrency`, `fuse_upload_concurrency`, `fuse_download_concurrency`, `fuse_kernel_writeback_cache`, `linux_fuse_cache_policy` |
 | `cache` | `resident_bytes`, `dirty_bytes`, `evictable_bytes`, `prefetch_queue_depth` |
 | `upload_queue` | `pending_depth`, `pending_bytes`, `active_uploads`, `oldest_pending_age_ms` |
 | `metadata` | `pending_ops`, `inflight_ops`, `overlay_queue_depth`, `overlay_queue_bytes`, `overlay_dirty_age_ms` |
