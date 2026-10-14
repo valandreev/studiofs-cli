@@ -931,6 +931,10 @@ impl StudioVfsAdapter {
         }
     }
 
+    pub(crate) fn new_namespace_reply_cancellation(&self) -> CancellationToken {
+        self.namespace_reply_shutdown.child_token()
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_read_queue_byte_limit_for_test(
         vfs: Arc<StudioVfs>,
@@ -1105,7 +1109,7 @@ impl StudioVfsAdapter {
         }
         let retry_deadline = tokio::time::Instant::now() + MACFUSE_SYMLINK_RETRY_TIMEOUT;
         loop {
-            if cancellation.is_cancelled() || self.namespace_reply_shutdown.is_cancelled() {
+            if cancellation.is_cancelled() {
                 return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
             }
             let vfs = Arc::clone(&self.vfs);
@@ -1143,14 +1147,14 @@ impl StudioVfsAdapter {
                         let wait_result = tokio::select! {
                             biased;
                             () = cancellation.cancelled() => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
-                            () = self.namespace_reply_shutdown.cancelled() => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
-                            result = tokio::time::timeout_at(retry_deadline, wait) => result,
+                            result = tokio::time::timeout_at(retry_deadline, wait) => {
+                                result.map_err(|_| libc::ENOENT)?
+                            },
                         };
                         match wait_result {
-                            Ok(Ok(true)) => continue,
-                            Ok(Ok(false)) => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
-                            Ok(Err(wait_error)) => return Err(vfs_err_to_errno(&wait_error)),
-                            Err(_) => return Err(libc::ENOENT),
+                            Ok(true) => continue,
+                            Ok(false) => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
+                            Err(wait_error) => return Err(vfs_err_to_errno(&wait_error)),
                         }
                     }
                     return Err(errno);
@@ -1516,7 +1520,7 @@ impl StudioVfsAdapter {
     ) {
         let adapter = Arc::clone(self);
         let task = self.reply_tasks.track();
-        let cancellation = self.namespace_reply_shutdown.child_token();
+        let cancellation = self.new_namespace_reply_cancellation();
         request.register_interrupt_token(cancellation.clone());
         self.runtime_handle.spawn(async move {
             let _task = task;
@@ -4952,41 +4956,23 @@ mod tests {
         let fixture = ContractVfsFixture::new("macfuse-symlink-deferred-interrupt")
             .expect("create VFS fixture");
         let vfs = fixture.vfs();
-        let deferred_runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build dormant metadata runtime");
-        let parent = fixture.runtime().block_on(async {
-            vfs.mkdir_with_deferred_metadata_admission(
-                ROOT_INO,
-                b"pending-parent",
-                501,
-                20,
-                0o755,
-                deferred_runtime.handle(),
-            )
-            .expect("admit deferred parent directory")
-        });
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(1)
-            .max_blocking_threads(1)
-            .build()
-            .expect("build single-worker callback runtime");
+        let deferred_runtime = crate::test_support::dormant_runtime();
+        let parent = crate::test_support::admit_parent_on_runtime(
+            &fixture,
+            &deferred_runtime,
+            b"pending-parent",
+        );
+        let runtime = crate::test_support::callback_runtime();
         let callback_state = CallbackState::new(vfs.clone(), runtime.handle().clone(), false);
         let adapter = Arc::clone(&callback_state.adapter);
+        let cancellation = adapter.new_namespace_reply_cancellation();
         let reply_task = adapter.reply_tasks.track();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let task = runtime.spawn(async move {
             let _reply_task = reply_task;
             let _ = started_tx.send(());
             adapter
-                .symlink(
-                    parent.ino,
-                    b"child-link",
-                    b"target",
-                    CancellationToken::new(),
-                )
+                .symlink(parent.ino, b"child-link", b"target", cancellation)
                 .await
         });
         let started = runtime.spawn(async move {

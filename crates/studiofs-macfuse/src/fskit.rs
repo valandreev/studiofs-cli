@@ -1854,7 +1854,7 @@ impl FsKitDispatcher {
                 }
             };
         let header = request.header();
-        let cancellation = Arc::new(CancellationToken::new());
+        let cancellation = Arc::new(self.adapter.new_namespace_reply_cancellation());
         if let Some(previous) = self
             .cancellations
             .lock()
