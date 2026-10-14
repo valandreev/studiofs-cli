@@ -703,6 +703,17 @@ in-memory pressure from very large native `com.apple.*` writes:
 This keeps shared directories free of macOS-only garbage while preserving normal
 Finder interaction.
 
+### macOS file flags
+
+Darwin `st_flags` (`chflags`, Finder hidden state) are a mount-local overlay in
+the macFUSE adapter, not persisted metadata. `.DS_Store` gets `UF_HIDDEN` on
+lookup/create/rename. `setattr`, `setattr_x`, and FSKit `SETATTR` record the
+requested flags only after the VFS update (or `getattr` for flag-only requests)
+succeeds; a request without the FLAGS bit, including an empty mask, leaves the
+overlay unchanged. Flag changes return `EROFS` on read-only mounts. Overlays
+are dropped on final `unlink`, `rmdir`, rename overwrite, and last `forget`,
+and are never recorded for open-unlinked inodes.
+
 ### macOS unsupported ioctls
 
 During mount/unmount lifecycle macOS may probe some filesystem control operations

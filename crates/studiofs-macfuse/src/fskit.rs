@@ -1989,37 +1989,19 @@ impl FsKitDispatcher {
             );
         }
         let file_handle = (input.valid & FATTR_FH != 0).then_some(input.fh);
-        let attr = if args_have_values(&args) {
-            match self.adapter.setattr(file_handle, header.nodeid, args) {
-                Ok(attr) => attr,
-                Err(errno) => {
-                    let _ = request.reply_error(errno);
-                    return;
-                }
+        match self.adapter.setattr_with_file_flags(
+            file_handle,
+            header.nodeid,
+            args,
+            (input.valid & FATTR_FLAGS != 0).then_some(input.flags),
+        ) {
+            Ok(stat) => {
+                let _ = request.reply_struct(attr_out_from_stat(stat));
             }
-        } else {
-            if input.valid & FATTR_FLAGS != 0 {
-                self.adapter
-                    .remember_fskit_file_flags(header.nodeid, input.flags);
+            Err(errno) => {
+                let _ = request.reply_error(errno);
             }
-            match self.adapter.getattr(header.nodeid) {
-                Ok(stat) => {
-                    let _ = request.reply_struct(attr_out_from_stat(stat));
-                    return;
-                }
-                Err(errno) => {
-                    let _ = request.reply_error(errno);
-                    return;
-                }
-            }
-        };
-        // FSKit file flags describe the successfully applied attribute state;
-        // do not cache them when the requested setattr failed.
-        if input.valid & FATTR_FLAGS != 0 {
-            self.adapter
-                .remember_fskit_file_flags(header.nodeid, input.flags);
         }
-        let _ = request.reply_struct(attr_out_from_stat(self.adapter.attr_to_stat(&attr)));
     }
 
     fn setxattr(&self, request: FsKitRequest) {
@@ -2346,17 +2328,6 @@ fn fskit_open_flags(open: low_level::OpenReply) -> u32 {
         } else {
             0
         })
-}
-
-fn args_have_values(args: &SetattrArgs) -> bool {
-    args.size.is_some()
-        || args.mode.is_some()
-        || args.uid.is_some()
-        || args.gid.is_some()
-        || args.atime.resolve().is_some()
-        || args.mtime.resolve().is_some()
-        || args.crtime.resolve().is_some()
-        || args.win_attrs.is_some()
 }
 
 fn entry_from_stat(ino: u64, stat: libc::stat) -> FuseEntryOut {
@@ -3396,5 +3367,114 @@ mod tests {
         release_result.expect("release blocking task");
         worker_result.expect("join blocking task caller");
         assert_ne!(dispatch_thread, entered_thread);
+    }
+
+    /// Sends one SETATTR frame through a live channel and returns the reply.
+    fn fskit_setattr_round_trip(
+        fixture: &studiofs_vfs::contract_harness::ContractVfsFixture,
+        nodeid: u64,
+        flags: u32,
+    ) -> (FuseOutHeader, Option<FuseAttrOut>, Arc<StudioVfsAdapter>) {
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (server, mut peer) = UnixStream::pair().expect("create FUSE transport");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("bound SETATTR reply wait");
+        // SAFETY: ownership of the valid socket FD transfers to the channel.
+        let channel =
+            NonNull::new(unsafe { MFChannelCreateWithDeviceFileDescriptor(server.into_raw_fd()) })
+                .expect("create channel");
+        let control = FsKitControl::new(channel, None);
+        let dispatcher = FsKitDispatcher::new(
+            Arc::new(CallbackState::new(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                false,
+            )),
+            fixture.runtime().handle().clone(),
+            Arc::clone(&control),
+        );
+
+        let mut input = read_copy::<FuseSetattrIn>(&[0; size_of::<FuseSetattrIn>()], 0)
+            .expect("zeroed SETATTR input");
+        input.valid = FATTR_FLAGS;
+        input.flags = flags;
+        let mut header = read_copy::<FuseInHeader>(&[0; size_of::<FuseInHeader>()], 0)
+            .expect("zeroed request header");
+        header.len = (size_of::<FuseInHeader>() + size_of::<FuseSetattrIn>()) as u32;
+        header.opcode = FUSE_SETATTR;
+        header.unique = 31;
+        header.nodeid = nodeid;
+        let mut frame = encode_copy(header);
+        frame.extend_from_slice(&encode_copy(input));
+        peer.write_all(&frame).expect("send SETATTR");
+
+        let receive_channel = control.retained_channel().expect("retain channel");
+        // SAFETY: the retained channel stays alive for this bounded wait.
+        let ready = unsafe { MFChannelWaitForNextMessage(receive_channel.as_ptr(), 1000) };
+        assert!(ready > 0, "SETATTR frame was not delivered: {ready}");
+        let message = FsKitMessage::receive(&receive_channel).expect("receive SETATTR");
+        drop(receive_channel);
+        dispatcher.dispatch(message);
+
+        let mut reply_header = [0_u8; size_of::<FuseOutHeader>()];
+        peer.read_exact(&mut reply_header)
+            .expect("read SETATTR reply header");
+        let reply_header =
+            read_copy::<FuseOutHeader>(&reply_header, 0).expect("decode SETATTR reply header");
+        let attr_out = (reply_header.error == 0).then(|| {
+            let mut body = [0_u8; size_of::<FuseAttrOut>()];
+            peer.read_exact(&mut body).expect("read SETATTR attr reply");
+            read_copy::<FuseAttrOut>(&body, 0).expect("decode SETATTR attr reply")
+        });
+        let adapter = Arc::clone(&dispatcher.adapter);
+        control.close();
+        (reply_header, attr_out, adapter)
+    }
+
+    #[test]
+    fn fskit_setattr_flags_reply_and_overlay_after_success() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-fskit-setattr-flags")
+                .expect("create VFS fixture");
+        let attr = fixture
+            .vfs()
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"flags.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+
+        let (header, attr_out, adapter) =
+            fskit_setattr_round_trip(&fixture, attr.ino, libc::UF_NODUMP);
+
+        assert_eq!(
+            (
+                header.error,
+                attr_out.map(|out| out.attr.flags),
+                adapter.getattr(attr.ino).map(|stat| stat.st_flags)
+            ),
+            (0, Some(libc::UF_NODUMP), Ok(libc::UF_NODUMP))
+        );
+    }
+
+    #[test]
+    fn fskit_setattr_flags_on_missing_inode_replies_enoent_without_overlay() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-fskit-setattr-flags-missing",
+        )
+        .expect("create VFS fixture");
+
+        let (header, _, adapter) = fskit_setattr_round_trip(&fixture, u64::MAX, libc::UF_NODUMP);
+
+        assert_eq!(
+            (header.error, adapter.file_flags_contains_for_test(u64::MAX)),
+            (-libc::ENOENT, false)
+        );
     }
 }

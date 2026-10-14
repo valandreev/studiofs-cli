@@ -519,6 +519,18 @@ impl SetattrArgs {
         }
     }
 
+    /// Whether the args request no attribute change at all.
+    pub fn is_empty(&self) -> bool {
+        self.size.is_none()
+            && self.mode.is_none()
+            && self.uid.is_none()
+            && self.gid.is_none()
+            && matches!(self.atime, TimeSpec::Omit)
+            && matches!(self.mtime, TimeSpec::Omit)
+            && matches!(self.crtime, TimeSpec::Omit)
+            && self.win_attrs.is_none()
+    }
+
     /// Apply the namespace-safe subset of setattr fields.
     pub fn apply_attr_only(&self, attr: &mut InodeAttr) -> bool {
         let mut changed = false;
@@ -2054,6 +2066,23 @@ pub struct RenameAtomicResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setattr_args_is_empty_only_without_requested_changes() {
+        let now_mtime = SetattrArgs {
+            mtime: TimeSpec::Now,
+            ..SetattrArgs::default()
+        };
+
+        assert_eq!(
+            (
+                SetattrArgs::default().is_empty(),
+                now_mtime.is_empty(),
+                SetattrArgs::size_only(0).is_empty(),
+            ),
+            (true, false, false)
+        );
+    }
 
     #[test]
     fn test_block_index_calculation() {
