@@ -1,12 +1,11 @@
 {
     "schema_version": 2,
-    "commit": "7a2309c71891eb6fde9cbbf4f0cedc4256511f3d",
-    "indexed_at": "2026-10-14T09:49:12Z",
-    "project": "Volumes-Storage-dev-studiofs",
-    "nodes": 28617,
-    "edges": 181602,
-    "original_size": 129957888,
-    "compressed_size": 20070180,
-    "compression_level": 3,
-    "reconcile_basis": "git-clean-head"
+    "commit": "83808ed4535f178a54810456a9599125fa566736",
+    "indexed_at": "2026-10-14T15:33:01Z",
+    "project": "E-dev-studiofs-cli",
+    "nodes": 28707,
+    "edges": 182334,
+    "original_size": 81854464,
+    "compressed_size": 13386065,
+    "compression_level": 9
 }

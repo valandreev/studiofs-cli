@@ -53,6 +53,20 @@ pub enum OsCacheReason {
     StableGeneration,
 }
 
+impl OsCacheReason {
+    /// Return whether the decision compared an observed content generation.
+    ///
+    /// Only these decisions describe content that platform bridges may serve
+    /// through kernel-buffered reads; every other reason reflects local,
+    /// unknown, or non-regular state.
+    pub const fn observes_generation(self) -> bool {
+        matches!(
+            self,
+            Self::FirstObservation | Self::GenerationChanged | Self::StableGeneration
+        )
+    }
+}
+
 /// Generation decision returned to a platform bridge.
 #[must_use = "the platform bridge must apply or explicitly reject this cache decision"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

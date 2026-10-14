@@ -149,6 +149,8 @@ pub(super) struct HandleReleaseContext {
     pub(super) open_file: OpenFile,
     /// Inode associated with the handle.
     pub(super) ino: Ino,
+    /// Whether close observed local state that needs a kernel attr refresh after draining.
+    pub(super) invalidate_kernel_attrs: bool,
     /// Writer participation retained through the final local barrier.
     pub(super) os_cache_writer_lease: Option<OsCacheWriterLease>,
     /// Foreground read participation retained through the final local barrier.

@@ -1,6 +1,7 @@
 use futures::StreamExt;
 use opendal::ErrorKind;
 use sha2::{Digest, Sha256};
+use std::ops::Deref;
 use std::sync::Arc;
 use studiofs_meta::engine::{
     LocalStorageCompactionResult, LocalStorageDiagnostics, MetadataCoherenceProgress,
@@ -1245,12 +1246,12 @@ impl StudioVfs {
         self.should_skip_kernel_invalidation_for_active_open(ino, true)
     }
 
-    pub(super) fn flush_deferred_kernel_invalidations(&self, ino: Ino) {
+    pub(super) fn flush_deferred_kernel_invalidations(&self, ino: Ino, invalidate_attrs: bool) {
         if self.kernel_invalidator().is_none() {
             return;
         }
         let full = self.deferred_kernel_invalidations.remove(&ino).is_some();
-        let attrs = self.deferred_kernel_inode_attrs.remove(&ino).is_some();
+        let attrs = self.deferred_kernel_inode_attrs.remove(&ino).is_some() || invalidate_attrs;
         if full {
             self.invalidate_kernel_inodes([ino]);
         } else if attrs {
@@ -1258,6 +1259,56 @@ impl StudioVfs {
         }
     }
 
+    /// Refresh kernel attributes for an accepted write, skipping the handle-table
+    /// scan when a refresh is already pending for the inode.
+    ///
+    /// Callers publish the dirty attribute before calling this. The pending entry is
+    /// removed by `flush_deferred_kernel_invalidations` and only then is the kernel
+    /// invalidated. If `contains` observes the entry, that removal, and therefore the
+    /// invalidation, happens after this write's attribute update. If the removal has
+    /// already run, the entry is absent and the direct invalidation below runs.
+    pub(super) fn retain_kernel_inode_attr_refresh(&self, ino: Ino) {
+        if self.kernel_invalidator().is_none() {
+            return;
+        }
+        if self.deferred_kernel_inode_attrs.contains(&ino) {
+            return;
+        }
+        self.invalidate_kernel_inode_attrs([ino]);
+    }
+}
+
+/// Delivers the deferred kernel invalidation for one inode when dropped.
+///
+/// Release paths hold this guard across awaits such as the materialization wait and
+/// the file-session gate. Those awaits can be cancelled, and an explicit flush at the
+/// end of the function would then be skipped, leaving the kernel with stale attributes.
+/// Dropping the guard runs the flush on every exit path, including cancellation and a
+/// spawned task that is dropped before it is polled.
+pub(super) struct KernelInvalidationFlush<V: Deref<Target = StudioVfs>> {
+    vfs: V,
+    ino: Ino,
+    invalidate_attrs: bool,
+}
+
+impl<V: Deref<Target = StudioVfs>> KernelInvalidationFlush<V> {
+    pub(super) fn new(vfs: V, ino: Ino, invalidate_attrs: bool) -> Self {
+        Self {
+            vfs,
+            ino,
+            invalidate_attrs,
+        }
+    }
+}
+
+impl<V: Deref<Target = StudioVfs>> Drop for KernelInvalidationFlush<V> {
+    fn drop(&mut self) {
+        self.vfs
+            .flush_deferred_kernel_invalidations(self.ino, self.invalidate_attrs);
+    }
+}
+
+impl StudioVfs {
     pub(super) fn invalidate_attr_read_cache(
         &self,
         inodes: impl IntoIterator<Item = Ino>,

@@ -479,6 +479,71 @@ cargo test -p studiofs-vfs --test vfs_test handle_aware_read_policy_keeps_sequen
 cargo test -p studiofs-vfs --test vfs_test file_session_flush_ordering_is_deterministic -- --exact --nocapture
 ```
 
+### SFS-806 macFUSE Read Buffer and Release Regressions
+
+Run these focused regressions when changing the macFUSE read-reply buffer pool,
+the open cache policy, the prepared-read handoff to local overlays, or the
+last-handle attribute refresh. They use the local VFS fixtures and do not need
+PostgreSQL, S3, or a mounted filesystem.
+
+Pool size classes and budget (`studiofs-macfuse`):
+
+- `acquire_reuses_storage_across_a_power_of_two_size_class`
+- `acquire_reuses_the_most_recently_recycled_buffer_among_equal_capacities`
+- `acquire_allocates_class_sized_storage_and_keeps_other_classes_idle`
+- `small_request_does_not_reuse_a_large_buffer`
+- `recycle_evicts_oldest_buffers_to_stay_within_the_retained_budget`
+- `recycle_under_count_pressure_keeps_the_newly_recycled_larger_buffer`
+- `recycle_under_byte_pressure_keeps_the_newly_recycled_buffer`
+- `recycle_caps_the_buffer_count`
+- `read_only_adapter_reuses_queued_read_buffer_after_reply_completion`
+- `read_only_adapter_allocates_a_new_size_class_for_a_larger_followup_read`
+
+Open cache policy for unpublished local state (`studiofs-macfuse`):
+
+- `unpublished_adapter_read_executes_exact_kernel_requested_range`
+- `stable_empty_file_keeps_buffered_macfuse_reads`
+- `read_only_open_policy_reuses_generation_attr_for_direct_io`
+- `adapter_dirty_write_release_drops_cache_after_final_write_capable_handle`
+- `adapter_locally_materialized_write_release_drops_unpublished_kernel_cache_observation`
+
+Prepared-read handoff to local overlays (`studiofs-vfs`):
+
+- `prepared_read_survives_local_overlay_publication_before_execution`
+- `prepared_published_read_uses_new_local_write_after_overlay_commit`
+
+Last-handle kernel attribute refresh, including cancelled release
+(`studiofs-vfs`):
+
+- `release_fh_invalidates_kernel_attrs_after_dirty_last_handle_close`
+- `release_fh_invalidates_attrs_after_local_state_was_flushed_while_writer_open`
+- `deferred_last_handle_release_invalidates_attrs_after_visible_size_is_current`
+- `release_fh_cancelled_while_waiting_for_materialization_still_invalidates_attrs`
+
+Runtime-stats schema for the pool metrics (`studiofs-vfs`; field names and
+legacy defaults only, not publication ordering):
+
+- `fuse_async_read_snapshot_serializes_buffer_pool_metrics`
+
+```bash
+cargo test -p studiofs-macfuse --lib read_buffer -- --nocapture
+cargo test -p studiofs-macfuse --lib read_only_adapter -- --nocapture
+cargo test -p studiofs-macfuse --lib unpublished_adapter_read_executes_exact_kernel_requested_range -- --nocapture
+cargo test -p studiofs-macfuse --lib stable_empty_file_keeps_buffered_macfuse_reads -- --nocapture
+cargo test -p studiofs-macfuse --lib read_only_open_policy_reuses_generation_attr_for_direct_io -- --nocapture
+cargo test -p studiofs-macfuse --lib adapter_dirty_write_release_drops_cache_after_final_write_capable_handle -- --nocapture
+cargo test -p studiofs-macfuse --lib adapter_locally_materialized_write_release_drops_unpublished_kernel_cache_observation -- --nocapture
+cargo test -p studiofs-vfs --lib prepared_read_survives_local_overlay_publication_before_execution -- --nocapture
+cargo test -p studiofs-vfs --lib prepared_published_read_uses_new_local_write_after_overlay_commit -- --nocapture
+cargo test -p studiofs-vfs --lib release_fh_ -- --nocapture
+cargo test -p studiofs-vfs --lib deferred_last_handle_release_invalidates_attrs_after_visible_size_is_current -- --nocapture
+cargo test -p studiofs-vfs --lib fuse_async_read_snapshot_serializes_buffer_pool_metrics -- --nocapture
+```
+
+The `release_fh_` filter also runs the earlier release tests. These checks are
+unit-level: they do not prove the mounted kernel invalidation or the mounted
+read path.
+
 ### Smoke test descriptions
 
 The `mount_sanity` integration tests in each bridge crate contain two tiers:

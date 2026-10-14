@@ -429,7 +429,13 @@ impl PgMetaEngine {
             )
         };
         self.local
-            .apply_replica_serving_state_for_pending_replay(&serving_events)?;
+            .apply_replica_serving_state_for_pending_replay(&serving_events)
+            .map_err(|source| MetaError::LocalReplayFailed {
+                operation: "restoring pending serving state",
+                start_seq: replay_start,
+                end_seq: event_end,
+                source: Box::new(source),
+            })?;
         if selected.events.is_empty() {
             Self::clear_pending_state(state);
             return Ok(());

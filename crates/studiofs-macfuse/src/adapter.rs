@@ -47,9 +47,10 @@ use crate::low_level::{
 
 mod read_buffer;
 
-#[cfg(test)]
-use read_buffer::MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY;
-use read_buffer::{MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY, PooledReadBuffer, ReadBufferPool};
+use read_buffer::{
+    MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY, MACFUSE_READ_BUFFER_POOL_MAX_RETAINED_BYTES,
+    PooledReadBuffer, ReadBufferPool,
+};
 
 const TTL_SECONDS: f64 = 1.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = crate::low_level::MACOS_FUSE_IOSIZE_BYTES;
@@ -518,21 +519,11 @@ pub(crate) fn max_reusable_read_buffer_capacity_for_test() -> usize {
     MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY
 }
 
-#[cfg(test)]
-pub(crate) fn max_retained_read_buffer_capacity_for_test() -> usize {
-    MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY
-}
-
-fn clamp_reusable_read_size(size: u32, read_queue_byte_limit: u32) -> u32 {
+/// Clamp a read before it reaches `perform_read`, which relies on the result
+/// fitting a reusable pool buffer.
+fn read_execution_size(size: u32, read_queue_byte_limit: u32) -> u32 {
     size.min(read_queue_byte_limit)
         .min(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32)
-}
-
-fn read_execution_size(size: u32, read_queue_byte_limit: u32) -> u32 {
-    clamp_reusable_read_size(
-        size,
-        read_queue_byte_limit.min(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32),
-    )
 }
 
 #[cfg(test)]
@@ -586,6 +577,10 @@ struct AsyncReadDiagnostics {
     admission_waits: CachePaddedAtomicU64,
     admission_wait_total_ns: CachePaddedAtomicU64,
     last_snapshot_publish_ns: CachePaddedAtomicU64,
+    /// Serializes snapshot build and store so exported counters never move
+    /// backwards when two publishers race. Lock order: `publish` -> pool state ->
+    /// VFS snapshot lock; all of them are leaf locks.
+    publish: ParkingMutex<()>,
 }
 
 #[repr(align(128))]
@@ -639,6 +634,7 @@ impl AsyncReadDiagnostics {
             admission_waits: CachePaddedAtomicU64::new(0),
             admission_wait_total_ns: CachePaddedAtomicU64::new(0),
             last_snapshot_publish_ns: CachePaddedAtomicU64::new(0),
+            publish: ParkingMutex::new(()),
         }
     }
 
@@ -681,7 +677,8 @@ impl AsyncReadDiagnostics {
         pending_reads
     }
 
-    fn snapshot(&self) -> VfsFuseAsyncReadSnapshot {
+    fn snapshot(&self, pool: &ReadBufferPool) -> VfsFuseAsyncReadSnapshot {
+        let pool_stats = pool.snapshot();
         VfsFuseAsyncReadSnapshot {
             max_pending_bytes: Some(self.max_pending_bytes),
             pending_reads: self.pending_reads.load(Ordering::Relaxed),
@@ -694,13 +691,30 @@ impl AsyncReadDiagnostics {
             admission_waits: self.admission_waits.load(Ordering::Relaxed),
             admission_wait_total_ms: self.admission_wait_total_ns.load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
+            read_buffer_pool_hits: pool_stats.hits,
+            read_buffer_pool_misses: pool_stats.misses,
+            read_buffer_pool_retained_bytes: pool_stats.retained_bytes,
+            read_buffer_pool_budget_bytes: Some(MACFUSE_READ_BUFFER_POOL_MAX_RETAINED_BYTES),
         }
     }
 
-    fn publish_snapshot_after_finish(&self, vfs: &StudioVfs, pending_reads: usize) {
+    fn publish_snapshot_after_finish(
+        &self,
+        vfs: &StudioVfs,
+        pending_reads: usize,
+        pool: &ReadBufferPool,
+    ) {
         if pending_reads == 0 || self.should_publish_snapshot() {
-            vfs.record_fuse_async_read_snapshot(self.snapshot());
+            self.publish_snapshot(vfs, pool);
         }
+    }
+
+    /// Build and store one snapshot while holding `publish`. Building under the
+    /// lock means a later store always carries counters at least as new as an
+    /// earlier one.
+    fn publish_snapshot(&self, vfs: &StudioVfs, pool: &ReadBufferPool) {
+        let _publish = self.publish.lock();
+        vfs.record_fuse_async_read_snapshot(self.snapshot(pool));
     }
 
     fn should_publish_snapshot(&self) -> bool {
@@ -763,9 +777,11 @@ impl Drop for AsyncReadTaskGuard<'_> {
             .shared
             .read_diagnostics
             .on_finished(self.size, self.outcome);
-        self.shared
-            .read_diagnostics
-            .publish_snapshot_after_finish(self.vfs, pending_reads);
+        self.shared.read_diagnostics.publish_snapshot_after_finish(
+            self.vfs,
+            pending_reads,
+            &self.shared.read_buffers,
+        );
         if let Some(flush) = self.shared.kernel_invalidations.finish_read() {
             flush.flush();
         }
@@ -1214,6 +1230,10 @@ impl StudioVfsAdapter {
                 return Err(libc::EROFS);
             }
             let fh = self.next_runtime_stats_fh.fetch_add(1, Ordering::Relaxed);
+            // Refresh idle storage accounting after replies have recycled their buffers.
+            self.shared
+                .read_diagnostics
+                .publish_snapshot(&self.vfs, &self.shared.read_buffers);
             let bytes = self.vfs.runtime_stats_file_text().into_bytes();
             self.runtime_stats_handles.lock().insert(fh, bytes);
             return Ok(OpenReply::new(fh).with_direct_io(true));
@@ -1296,14 +1316,19 @@ impl StudioVfsAdapter {
             #[cfg(test)]
             self.shared.open_cache_snapshots.lock().pop(&ino);
             return MacFuseOpenCachePolicy {
-                direct_io: false,
+                direct_io: true,
                 keep_cache: false,
                 write_capable: false,
             };
         };
         let keep_cache = decision.disposition() == OsCacheDisposition::Reuse;
         let policy = MacFuseOpenCachePolicy {
-            direct_io: available_memory.is_some_and(|available| attr.size > available),
+            // Unpublished local state cannot safely use the kernel's cached size or pages.
+            // Buffered reads are kept only for observed-generation decisions
+            // (published or locally stable); unknown, local-dirty, and active-writer
+            // state uses direct_io.
+            direct_io: !decision.reason().observes_generation()
+                || available_memory.is_some_and(|available| attr.size > available),
             keep_cache,
             write_capable: false,
         };
@@ -1329,18 +1354,13 @@ impl StudioVfsAdapter {
         attr: &InodeAttr,
         decision: OsCacheOpenDecision,
     ) {
-        match decision.reason() {
-            OsCacheReason::FirstObservation
-            | OsCacheReason::GenerationChanged
-            | OsCacheReason::StableGeneration => {
-                self.shared
-                    .open_cache_snapshots
-                    .lock()
-                    .put(ino, MacFuseOpenCacheSnapshot::from_attr(attr, Vec::new()));
-            }
-            _ => {
-                self.shared.open_cache_snapshots.lock().pop(&ino);
-            }
+        if decision.reason().observes_generation() {
+            self.shared
+                .open_cache_snapshots
+                .lock()
+                .put(ino, MacFuseOpenCacheSnapshot::from_attr(attr, Vec::new()));
+        } else {
+            self.shared.open_cache_snapshots.lock().pop(&ino);
         }
     }
 
@@ -1565,9 +1585,13 @@ impl StudioVfsAdapter {
             out.limit_reply_len(n as usize);
             return Ok(out);
         }
-        let size =
-            clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
-        let size_usize = size as usize;
+        // Every entry point clamps through `read_execution_size`; clamp again here so
+        // release builds never request more than a pool buffer can hold.
+        let size_usize = (request.size as usize).min(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY);
+        debug_assert!(
+            size_usize == request.size as usize,
+            "read entry point must clamp through read_execution_size"
+        );
 
         let mut out = state.shared.read_buffers.acquire(size_usize);
         if cancellation.is_cancelled() {
@@ -2929,6 +2953,8 @@ mod open_cache_snapshot_tests {
             .macfuse_open_cache
             .total;
 
+        drop(adapter.shared.read_buffers.acquire(128 * 1024));
+        drop(adapter.shared.read_buffers.acquire(128 * 1024));
         let open = adapter
             .open(ino, libc::O_RDONLY)
             .expect("open runtime stats");
@@ -2945,6 +2971,33 @@ mod open_cache_snapshot_tests {
         assert!(
             json.get("macfuse_open_cache").is_some(),
             "the existing macfuse_open_cache JSON section must remain present"
+        );
+        assert_eq!(json["fuse_async_read"]["read_buffer_pool_hits"], 1);
+        assert_eq!(json["fuse_async_read"]["read_buffer_pool_misses"], 1);
+        assert_eq!(
+            json["fuse_async_read"]["read_buffer_pool_retained_bytes"],
+            128 * 1024
+        );
+        assert_eq!(
+            json["fuse_async_read"]["read_buffer_pool_budget_bytes"],
+            32 * 1024 * 1024
+        );
+        let runtime = fixture.vfs().runtime_stats_snapshot();
+        assert_eq!(
+            runtime.bridge.counters["fuse_read_buffer_pool_hits"].value,
+            1
+        );
+        assert_eq!(
+            runtime.bridge.counters["fuse_read_buffer_pool_misses"].value,
+            1
+        );
+        assert_eq!(
+            runtime.bridge.gauges["fuse_read_buffer_pool_retained_bytes"].value,
+            128 * 1024
+        );
+        assert_eq!(
+            runtime.bridge.gauges["fuse_read_buffer_pool_budget_bytes"].value,
+            32 * 1024 * 1024
         );
         adapter
             .release(ino, open.file_handle())
