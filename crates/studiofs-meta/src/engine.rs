@@ -945,9 +945,8 @@ impl PgSyncFailure {
             | MetaError::Serialization(_)
             | MetaError::Storage(_) => Self::Storage,
             MetaError::NamespaceBatchOperation { source, .. }
-            | MetaError::RegularFileOverlayBatchOperation { source, .. } => {
-                Self::from_error(source)
-            }
+            | MetaError::RegularFileOverlayBatchOperation { source, .. }
+            | MetaError::LocalReplayFailed { source, .. } => Self::from_error(source),
             _ => Self::Other,
         }
     }
@@ -2121,6 +2120,23 @@ mod tests {
         assert_eq!(
             PgSyncFailure::from_error(&MetaError::CatchUpDeadlineExceeded),
             PgSyncFailure::Timeout
+        );
+    }
+
+    #[test]
+    fn pg_sync_failure_classifies_local_replay_failure_by_its_source() {
+        let error = MetaError::LocalReplayFailed {
+            operation: "restoring pending serving state",
+            start_seq: 1,
+            end_seq: 2,
+            source: Box::new(MetaError::RemoteUnavailable(
+                "test-postgres-dsn".to_string(),
+            )),
+        };
+
+        assert_eq!(
+            PgSyncFailure::from_error(&error),
+            PgSyncFailure::RemoteUnavailable
         );
     }
 

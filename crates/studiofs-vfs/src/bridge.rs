@@ -149,6 +149,8 @@ fn classify_meta_error(error: &MetaError) -> BridgeVfsErrorKind {
         MetaError::NonContiguousRegularFileGraph { .. } => BridgeVfsErrorKind::DataCorruption,
         MetaError::XattrValueTooLarge { .. } => BridgeVfsErrorKind::XattrValueTooLarge,
         MetaError::AccessDenied { .. } => BridgeVfsErrorKind::PermissionDenied,
+        // The replay wrapper only adds context; platform errno follows the cause.
+        MetaError::LocalReplayFailed { source, .. } => classify_meta_error(source),
         _ => BridgeVfsErrorKind::GenericFailure,
     }
 }
@@ -404,6 +406,21 @@ mod tests {
                 BridgeVfsErrorKind::CriticalRuntimeFailure
             );
         }
+    }
+
+    #[test]
+    fn classify_local_replay_failure_by_its_source() {
+        let error = crate::VfsError::Meta(MetaError::LocalReplayFailed {
+            operation: "restoring pending serving state",
+            start_seq: 1,
+            end_seq: 2,
+            source: Box::new(MetaError::RemoteUnavailable("unreachable".to_string())),
+        });
+
+        assert_eq!(
+            classify_vfs_error(&error),
+            BridgeVfsErrorKind::RemoteUnavailable
+        );
     }
 
     #[test]
