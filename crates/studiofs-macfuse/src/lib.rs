@@ -1238,7 +1238,16 @@ mod tests {
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-eof-bytes")
                 .expect("create VFS fixture");
         let vfs = fixture.vfs();
-        let attr = vfs
+        let full_attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"full.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create full-read file");
+        let eof_attr = vfs
             .create(
                 studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
                 b"eof.txt",
@@ -1246,28 +1255,78 @@ mod tests {
                 20,
                 0o644,
             )
-            .expect("create file");
+            .expect("create EOF file");
+        const REQUEST_SIZE: u32 = 4096;
+        let previous_bytes = vec![0xA5; REQUEST_SIZE as usize];
         fixture
             .runtime()
-            .block_on(vfs.write(attr.ino, 0, b"short"))
-            .expect("seed payload");
+            .block_on(vfs.write(full_attr.ino, 0, &previous_bytes))
+            .expect("seed full-read payload");
+        fixture
+            .runtime()
+            .block_on(vfs.write(eof_attr.ino, 0, b"short"))
+            .expect("seed short EOF payload");
         vfs.reset_diagnostics_observability();
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
-            .expect("open reader through macFUSE adapter");
+        let full_reader = adapter
+            .open(full_attr.ino, libc::O_RDONLY)
+            .expect("open full-read handle through macFUSE adapter");
+        let eof_reader = adapter
+            .open(eof_attr.ino, libc::O_RDONLY)
+            .expect("open EOF handle through macFUSE adapter");
 
-        let queued = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 4096)
-            .expect("queue EOF-sized read");
-        let bytes = queued.wait().expect("queued read should complete");
+        let first = adapter
+            .queue_read_for_test(full_attr.ino, full_reader.file_handle(), 0, REQUEST_SIZE)
+            .expect("queue full-sized read");
+        assert_eq!(
+            first.wait().expect("full-sized read should complete"),
+            previous_bytes
+        );
+        let eof = adapter
+            .queue_read_for_test(eof_attr.ino, eof_reader.file_handle(), 0, REQUEST_SIZE)
+            .expect("queue EOF-sized read using the recycled buffer");
+        let bytes = eof.wait().expect("queued EOF read should complete");
 
         assert_eq!(&bytes[..], b"short");
+        let past_eof = adapter
+            .queue_read_for_test(eof_attr.ino, eof_reader.file_handle(), 5, REQUEST_SIZE)
+            .expect("queue read at EOF using the recycled buffer");
+        assert!(
+            past_eof
+                .wait()
+                .expect("EOF read should complete")
+                .is_empty()
+        );
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 3);
+        assert_eq!(metrics.fuse_callbacks.read.bytes, REQUEST_SIZE as u64 + 5);
+        assert_eq!(metrics.fuse_callbacks.read.errors, 0);
+    }
+
+    #[test]
+    fn read_only_adapter_queued_read_preserves_vfs_error_errno() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-async-read-missing-inode",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let queued = adapter
+            .queue_read_for_test(u64::MAX, 0, 0, 32)
+            .expect("queue read for missing inode");
+        let errno = queued
+            .wait()
+            .expect_err("missing inode read should return a VFS error");
+
+        assert_eq!(errno, libc::ENOENT);
         let metrics = vfs.write_path_observability_snapshot();
         assert_eq!(metrics.fuse_callbacks.read.calls, 1);
-        assert_eq!(metrics.fuse_callbacks.read.bytes, 5);
-        assert_eq!(metrics.fuse_callbacks.read.errors, 0);
+        assert_eq!(metrics.fuse_callbacks.read.errors, 1);
+        assert_eq!(metrics.fuse_async_read.pending_reads, 0);
+        assert_eq!(metrics.fuse_async_read.failed_reads, 1);
     }
 
     #[test]

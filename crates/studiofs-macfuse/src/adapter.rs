@@ -331,10 +331,15 @@ impl ReadBufferPool {
         if buffer.capacity() < capacity {
             buffer.reserve_exact(capacity - buffer.len());
         }
-        // TODO(SFS-489): avoid this per-read zero-fill once the VFS read path accepts
-        // MaybeUninit/ReadBuf-style storage instead of initialized `&mut [u8]`.
-        buffer.resize(len, 0);
-        PooledReadBuffer { pool: self, buffer }
+        // Keep the initialized tail across replies; only new storage needs zeroing.
+        if buffer.len() < len {
+            buffer.resize(len, 0);
+        }
+        PooledReadBuffer {
+            pool: self,
+            buffer,
+            len,
+        }
     }
 
     fn recycle(&self, buffer: Vec<u8>) {
@@ -550,12 +555,14 @@ struct ReadExecutionRequest {
 #[derive(Debug)]
 struct PooledReadBuffer {
     pool: Arc<ReadBufferPool>,
+    // The backing length tracks initialized storage; `len` alone is reply-visible.
     buffer: Vec<u8>,
+    len: usize,
 }
 
 impl PooledReadBuffer {
     fn truncate(&mut self, len: usize) {
-        self.buffer.truncate(len);
+        self.len = self.len.min(len);
     }
 }
 
@@ -563,13 +570,13 @@ impl Deref for PooledReadBuffer {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        self.buffer.as_slice()
+        &self.buffer[..self.len]
     }
 }
 
 impl DerefMut for PooledReadBuffer {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.buffer.as_mut_slice()
+        &mut self.buffer[..self.len]
     }
 }
 
@@ -4788,20 +4795,33 @@ mod tests {
     }
 
     #[test]
-    fn read_buffer_pool_keeps_recycled_initialized_prefix_len() {
+    fn read_buffer_pool_reuses_initialized_tail_after_short_reply() {
         let pool = Arc::new(ReadBufferPool::default());
         let mut buffer = Arc::clone(&pool).acquire(16);
+        buffer.fill(0xa5);
         buffer.truncate(5);
+        assert_eq!(buffer.as_ref(), &[0xa5; 5]);
 
         drop(buffer);
 
         assert_eq!(pool.available_count(), 1);
-        assert_eq!(pool.last_available_len(), Some(5));
+        assert_eq!(pool.last_available_len(), Some(16));
         assert!(
             pool.last_available_capacity()
                 .expect("recycled buffer should retain capacity")
                 >= 16
         );
+        let buffer = Arc::clone(&pool).acquire(12);
+        assert_eq!(buffer.as_ref(), &[0xa5; 12]);
+        drop(buffer);
+
+        let mut buffer = Arc::clone(&pool).acquire(20);
+        assert_eq!(&buffer[..16], &[0xa5; 16]);
+        assert_eq!(&buffer[16..], &[0; 4]);
+        buffer.truncate(0);
+        assert!(buffer.as_ref().is_empty());
+        drop(buffer);
+        assert_eq!(pool.last_available_len(), Some(20));
     }
 
     #[test]
