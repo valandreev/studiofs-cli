@@ -12,7 +12,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -129,7 +129,7 @@ impl MacFuseUnmountSignal {
             .wake
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .as_ref()
         {
             wake.wake();
         }
@@ -144,7 +144,7 @@ impl MacFuseUnmountSignal {
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CLI_SIGNAL_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 static SIGNAL_WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-static PROCESS_SIGNAL_WAKE: OnceLock<Mutex<Option<Arc<WakePipe>>>> = OnceLock::new();
+static PROCESS_SIGNAL_WAKE: Mutex<Option<Arc<WakePipe>>> = Mutex::new(None);
 
 #[derive(Debug)]
 struct WakePipe {
@@ -168,7 +168,12 @@ impl WakePipe {
         let mut bytes = [0_u8; 64];
         loop {
             match (&self.read).read(&mut bytes) {
-                Ok(0) => return Ok(()),
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "wake stream closed",
+                    ));
+                }
                 Ok(_) => continue,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
@@ -179,8 +184,7 @@ impl WakePipe {
 }
 
 fn process_signal_wake_pipe() -> io::Result<Arc<WakePipe>> {
-    let slot = PROCESS_SIGNAL_WAKE.get_or_init(|| Mutex::new(None));
-    let mut pipe = slot
+    let mut pipe = PROCESS_SIGNAL_WAKE
         .lock()
         .map_err(|_| io::Error::other("process signal wake pipe lock poisoned"))?;
     if let Some(pipe) = pipe.as_ref() {
@@ -687,6 +691,21 @@ mod tests {
         // SAFETY-free contract check: `fuse_session_loop_mt` invokes low-level
         // callbacks concurrently, so the boxed callback state must be `Sync`.
         assert_send_sync::<super::adapter::CallbackState>();
+    }
+
+    #[test]
+    fn wake_pipe_drain_reports_peer_eof() {
+        let wake = super::WakePipe::new().expect("create isolated wake stream");
+        wake.write
+            .shutdown(std::net::Shutdown::Write)
+            .expect("close wake stream writer");
+
+        assert_eq!(
+            wake.drain()
+                .expect_err("closed wake stream must fail")
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]

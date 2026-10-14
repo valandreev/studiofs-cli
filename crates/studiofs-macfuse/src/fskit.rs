@@ -1871,9 +1871,10 @@ impl FsKitDispatcher {
         let task_guard = self.callback_state.track_reply_task();
         self.runtime_handle.spawn(async move {
             let _task_guard = task_guard;
+            let request_cancellation = (*cancellation_guard.token).clone();
             let _cancellation_guard = cancellation_guard;
             match adapter
-                .symlink(header.nodeid, &name, &target, cancellation.as_ref().clone())
+                .symlink(header.nodeid, &name, &target, request_cancellation)
                 .await
             {
                 Ok(attr) => {
