@@ -1545,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_adapter_reuses_queued_read_buffer_for_larger_followup_read() {
+    fn read_only_adapter_allocates_a_new_size_class_for_a_larger_followup_read() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-grow")
                 .expect("create VFS fixture");
@@ -1569,6 +1569,7 @@ mod tests {
             .open(attr.ino, libc::O_RDONLY)
             .expect("open reader through macFUSE adapter");
 
+        // A 5-byte read is allocated in the 8-byte size class.
         let first = adapter
             .queue_read_for_test(attr.ino, reader.file_handle(), 0, 5)
             .expect("queue first read");
@@ -1576,15 +1577,11 @@ mod tests {
             &first.wait().expect("first read should complete")[..],
             b"small"
         );
-        assert!(
-            adapter.reusable_read_buffer_count_for_test() >= 1,
-            "replied read buffers should remain reusable"
-        );
-        let first_capacity = adapter
-            .reusable_read_buffer_capacity_for_test()
-            .expect("first queued read should recycle one buffer");
-        assert!(first_capacity >= 5);
+        assert_eq!(adapter.freshly_zeroed_read_buffer_bytes_for_test(), 8);
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        assert_eq!(adapter.reusable_read_buffer_capacity_for_test(), Some(8));
 
+        // A 22-byte read is in the 32-byte class, so the 8-byte buffer is not reused.
         let second = adapter
             .queue_read_for_test(attr.ino, reader.file_handle(), 0, 22)
             .expect("queue larger followup read");
@@ -1592,15 +1589,9 @@ mod tests {
             &second.wait().expect("second read should complete")[..],
             b"small then larger read"
         );
-        assert!(
-            adapter.reusable_read_buffer_count_for_test() >= 1,
-            "replied read buffers should remain reusable"
-        );
-        let second_capacity = adapter
-            .reusable_read_buffer_capacity_for_test()
-            .expect("second queued read should recycle one buffer");
-        assert!(second_capacity >= 22);
-        assert!(second_capacity >= first_capacity);
+        assert_eq!(adapter.freshly_zeroed_read_buffer_bytes_for_test(), 8 + 32);
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 2);
+        assert_eq!(adapter.reusable_read_buffer_capacity_for_test(), Some(32));
     }
 
     #[test]
@@ -1968,8 +1959,10 @@ mod tests {
         let recycled_capacity = adapter
             .reusable_read_buffer_capacity_for_test()
             .expect("clamped read should recycle one buffer");
-        assert!(recycled_capacity >= super::adapter::max_reusable_read_buffer_capacity_for_test());
-        assert!(recycled_capacity <= super::adapter::max_retained_read_buffer_capacity_for_test());
+        assert_eq!(
+            recycled_capacity,
+            super::adapter::max_reusable_read_buffer_capacity_for_test()
+        );
     }
 
     #[test]

@@ -1365,7 +1365,8 @@ impl<'a> DataReader<'a> {
 
 struct ReadMetadata {
     attr: InodeAttr,
-    resolved_slices: Arc<[ResolvedSliceSpan]>,
+    /// `None` when slice resolution was deferred to the data reader.
+    resolved_slices: Option<Arc<[ResolvedSliceSpan]>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1395,8 +1396,19 @@ impl MetadataRefreshDecision {
 
 pub(super) struct PreparedForegroundRead {
     pub(super) context: ReadRequestContext,
-    pub(super) resolved_slices: Arc<[ResolvedSliceSpan]>,
+    /// `None` when the inode had local pending state during preparation.
+    pub(super) resolved_slices: Option<Arc<[ResolvedSliceSpan]>>,
     pub(super) read_len: usize,
+}
+
+/// Whether slice resolution may be skipped for an inode with local pending state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SliceResolution {
+    /// Always resolve slices, even when local pending state exists.
+    Eager,
+    /// Skip slice resolution for local pending state; the foreground executor
+    /// re-checks that state and discards prepared slices for such inodes anyway.
+    DeferLocalPending,
 }
 
 struct ReadMetadataResolver<'a> {
@@ -1441,16 +1453,24 @@ impl<'a> ReadMetadataResolver<'a> {
         self.load_attr_from_meta().await
     }
 
-    async fn resolve_for_read(&mut self, offset: u64, buffer_len: u64) -> VfsResult<ReadMetadata> {
+    /// Resolve the read attribute and slices. With `SliceResolution::DeferLocalPending`,
+    /// an inode with local pending state skips slice resolution because the
+    /// foreground executor discards prepared slices for such inodes anyway.
+    async fn resolve_for_read(
+        &mut self,
+        offset: u64,
+        buffer_len: u64,
+        resolution: SliceResolution,
+    ) -> VfsResult<ReadMetadata> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(ReadMetadata {
                 attr,
-                resolved_slices: Arc::from(Vec::<ResolvedSliceSpan>::new()),
+                resolved_slices: Some(Arc::from(Vec::<ResolvedSliceSpan>::new())),
             });
         }
         if let Some(attr) = self.dirty_attr_async().await? {
             let resolved_slices = self
-                .resolve_slices_for_attr(&attr, offset, buffer_len, true)
+                .resolve_slices_for_read(&attr, offset, buffer_len, true, resolution)
                 .await?;
             return Ok(ReadMetadata {
                 attr,
@@ -1459,15 +1479,35 @@ impl<'a> ReadMetadataResolver<'a> {
         }
         if let Some(attr) = self.cached_attr_async().await? {
             let resolved_slices = self
-                .resolve_slices_for_attr(&attr, offset, buffer_len, false)
+                .resolve_slices_for_read(&attr, offset, buffer_len, false, resolution)
                 .await?;
             return Ok(ReadMetadata {
                 attr,
                 resolved_slices,
             });
         }
-        self.load_attr_and_slices_from_meta(offset, buffer_len)
+        self.load_attr_and_slices_from_meta(offset, buffer_len, resolution)
             .await
+    }
+
+    async fn resolve_slices_for_read(
+        &self,
+        attr: &InodeAttr,
+        offset: u64,
+        buffer_len: u64,
+        dirty_attr_present: bool,
+        resolution: SliceResolution,
+    ) -> VfsResult<Option<Arc<[ResolvedSliceSpan]>>> {
+        if resolution == SliceResolution::DeferLocalPending
+            && self
+                .vfs
+                .has_local_pending_regular_file_state(self.ino, attr.committed_content_epoch)
+        {
+            return Ok(None);
+        }
+        self.resolve_slices_for_attr(attr, offset, buffer_len, dirty_attr_present)
+            .await
+            .map(Some)
     }
 
     fn ignored_attr(&self) -> Option<InodeAttr> {
@@ -1841,10 +1881,11 @@ impl<'a> ReadMetadataResolver<'a> {
         &self,
         offset: u64,
         buffer_len: u64,
+        resolution: SliceResolution,
     ) -> VfsResult<ReadMetadata> {
         let attr = self.load_attr_from_meta().await?;
         let resolved_slices = self
-            .resolve_slices_for_attr(&attr, offset, buffer_len, false)
+            .resolve_slices_for_read(&attr, offset, buffer_len, false, resolution)
             .await?;
         self.cache_attr(&attr);
         Ok(ReadMetadata {
@@ -2152,9 +2193,18 @@ impl StudioVfs {
         buffer_len: u64,
     ) -> VfsResult<(InodeAttr, Arc<[ResolvedSliceSpan]>)> {
         let resolved = ReadMetadataResolver::new(self, ino)
-            .resolve_for_read(offset, buffer_len)
+            .resolve_for_read(offset, buffer_len, SliceResolution::Eager)
             .await?;
-        Ok((resolved.attr, resolved.resolved_slices))
+        // With eager resolution every branch must return slices. An empty fallback
+        // here would serve zero-filled data, so treat a missing slice list as an error.
+        debug_assert!(
+            resolved.resolved_slices.is_some(),
+            "eager read metadata resolution must produce slices"
+        );
+        let resolved_slices = resolved.resolved_slices.ok_or_else(|| {
+            VfsError::Other("eager read metadata resolution deferred its slices".to_owned())
+        })?;
+        Ok((resolved.attr, resolved_slices))
     }
 
     pub(super) async fn prepare_foreground_read(
@@ -2173,8 +2223,15 @@ impl StudioVfs {
                 "debug target prepare_foreground_read resolving metadata"
             );
         }
-        let (attr, resolved_slices) = self
-            .resolve_read_metadata_async(ino, offset, requested_len as u64)
+        let ReadMetadata {
+            attr,
+            resolved_slices,
+        } = ReadMetadataResolver::new(self, ino)
+            .resolve_for_read(
+                offset,
+                requested_len as u64,
+                SliceResolution::DeferLocalPending,
+            )
             .await?;
         let context = ReadRequestContext::from_attr(self, ino, attr);
         let read_len = context.read_len(offset, requested_len);
@@ -2189,7 +2246,7 @@ impl StudioVfs {
                 attr_upload_state = ?context.attr.upload_state,
                 attr_content_epoch = context.attr.content_epoch,
                 attr_committed_content_epoch = context.attr.committed_content_epoch,
-                resolved_slice_count = resolved_slices.len(),
+                resolved_slice_count = resolved_slices.as_ref().map(|slices| slices.len()),
                 "debug target prepare_foreground_read resolved metadata"
             );
         }
@@ -2274,15 +2331,13 @@ impl StudioVfs {
         };
         // Pending bytes may move into metadata after preparation; claim local spans
         // before resolving the remaining graph so that handoff cannot become a hole.
-        let resolved_slices = if prepared.context.pending_content_epoch.is_some()
-            || self.has_local_pending_regular_file_state(
-                ino,
-                prepared.context.attr.committed_content_epoch,
-            ) {
-            None
-        } else {
-            Some(prepared.resolved_slices.as_ref())
-        };
+        let resolved_slices = prepared.resolved_slices.as_deref().filter(|_| {
+            prepared.context.pending_content_epoch.is_none()
+                && !self.has_local_pending_regular_file_state(
+                    ino,
+                    prepared.context.attr.committed_content_epoch,
+                )
+        });
         let mut data_reader = DataReader::new(
             self,
             ino,
@@ -5404,19 +5459,31 @@ mod tests {
             let payload = b"accepted bytes must survive prepared-read transition";
 
             vfs.write(ino, 0, payload).await.expect("accept payload");
-            let prepared = vfs
+            let deferred = vfs
                 .prepare_foreground_read(ino, 0, payload.len())
                 .await
                 .expect("prepare foreground read before materialization");
             assert!(
-                prepared.resolved_slices.len() == 1
-                    && prepared.resolved_slices[0].source == ResolvedSliceSource::Hole
-                    && prepared.resolved_slices[0].range.start == 0
-                    && u64::from(prepared.resolved_slices[0].range.end) == payload.len() as u64
-                    && prepared.resolved_slices[0].payload.is_none(),
-                "new file should have one hole covering the prepared range: {:?}",
-                prepared.resolved_slices
+                deferred.resolved_slices.is_none(),
+                "local pending state should defer slice resolution to the data reader"
             );
+            // Model slices resolved just before the local pending state appeared.
+            let (_, stale_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, payload.len() as u64)
+                .await
+                .expect("resolve slices before materialization");
+            assert!(
+                stale_slices.len() == 1
+                    && stale_slices[0].source == ResolvedSliceSource::Hole
+                    && stale_slices[0].range.start == 0
+                    && u64::from(stale_slices[0].range.end) == payload.len() as u64
+                    && stale_slices[0].payload.is_none(),
+                "new file should have one hole covering the prepared range: {stale_slices:?}"
+            );
+            let prepared = super::PreparedForegroundRead {
+                resolved_slices: Some(stale_slices),
+                ..deferred
+            };
 
             vfs.flush(ino)
                 .await

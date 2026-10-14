@@ -21270,6 +21270,66 @@ fn deferred_last_handle_release_invalidates_attrs_after_visible_size_is_current(
 }
 
 #[test]
+fn release_fh_cancelled_while_waiting_for_materialization_still_invalidates_attrs() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "release-cancel-attr-flush");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"release-cancel-attr-flush.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let invalidator = Arc::new(SizeObservingKernelInvalidator::new(&vfs));
+        vfs.set_kernel_invalidator(invalidator.clone());
+        let (materializer, materializer_guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(ino)
+            .expect("test should hold materialization open across the release");
+
+        let writer = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh_with_deferred_materialize(
+            writer,
+            ino,
+            0,
+            b"cancelled release still refreshes",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert!(invalidator.attr_sizes_seen().is_empty());
+
+        // One poll closes the handle and parks on the held materializer. The
+        // release is then dropped mid-flight, which must still deliver the refresh.
+        let mut release = Box::pin(vfs.release_fh_with_outcome(writer));
+        let parked = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(release.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(parked, "release must park behind the held materializer");
+        drop(release);
+
+        let seen = invalidator.attr_sizes_seen();
+        assert_eq!(
+            seen.iter()
+                .map(|(seen_ino, _)| *seen_ino)
+                .collect::<Vec<_>>(),
+            vec![ino],
+            "dropping a parked release must still invalidate kernel attrs exactly once"
+        );
+
+        drop(materializer_guard);
+        drop(materializer);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.wait_for_deferred_release_inflight(ino),
+        )
+        .await
+        .expect("no deferred release should remain after the cancelled release");
+    });
+}
+
+#[test]
 fn deferred_release_barrier_registration_holds_lock_before_marker_is_visible() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-427-release-atomic-register");

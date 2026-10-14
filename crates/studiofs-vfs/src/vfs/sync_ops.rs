@@ -1,3 +1,4 @@
+use super::workers::KernelInvalidationFlush;
 use super::{
     AccessLevel, DeferredInodeGateEntry, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
     FileSessionOperation, FileType, FsyncOutcome, HandleReleaseContext, Ino, InodeAttr,
@@ -715,6 +716,13 @@ impl StudioVfs {
         self.release_fh_with_outcome(fh).await.map(|_| ())
     }
 
+    /// Whether the inode still has local writes or a deferred materialization that a
+    /// last-handle release must drain before its attributes are trusted.
+    fn inode_has_pending_local_state(&self, ino: Ino) -> bool {
+        self.inode_has_local_dirty_state(ino)
+            || self.state.deferred_materialize_inflight.contains(ino)
+    }
+
     fn close_handle_for_release<F>(
         &self,
         fh: u64,
@@ -760,8 +768,7 @@ impl StudioVfs {
             drop(os_cache_foreground_read_lease);
             return None;
         }
-        let invalidate_kernel_attrs = self.inode_has_local_dirty_state(ino)
-            || self.state.deferred_materialize_inflight.contains(ino);
+        let invalidate_kernel_attrs = self.inode_has_pending_local_state(ino);
         self.debug_pending_inode_state(ino, "release_last_handle");
         Some(HandleReleaseContext {
             open_file,
@@ -820,9 +827,7 @@ impl StudioVfs {
         // Materialization clears the writer-stack dirty byte count before it
         // installs the resulting local overlay. Keep the release barrier for
         // that interval so a reader cannot observe the pre-overlay metadata.
-        if !self.inode_has_local_dirty_state(ino)
-            && !self.state.deferred_materialize_inflight.contains(ino)
-        {
+        if !self.inode_has_pending_local_state(ino) {
             return LastHandleReleaseAction::Clean;
         }
 
@@ -944,11 +949,12 @@ impl StudioVfs {
     async fn release_last_handle_with_outcome(
         &self,
         context: HandleReleaseContext,
+        flush: KernelInvalidationFlush<&StudioVfs>,
     ) -> VfsResult<ReleaseFhOutcome> {
         let ino = context.ino;
         let action = self.take_last_handle_release_action(&context);
         let result = self.execute_last_handle_release_action(ino, action).await;
-        self.flush_deferred_kernel_invalidations(ino, context.invalidate_kernel_attrs);
+        drop(flush);
         drop(context);
         result
     }
@@ -963,9 +969,11 @@ impl StudioVfs {
             return Ok(ReleaseFhOutcome::default());
         };
         let ino = context.ino;
+        // Created before the first await so a cancelled release still delivers the refresh.
+        let flush = KernelInvalidationFlush::new(self, ino, context.invalidate_kernel_attrs);
         if let Some(action) = self.take_ignored_entry_release_action(ino) {
             let result = self.execute_last_handle_release_action(ino, action).await;
-            self.flush_deferred_kernel_invalidations(ino, context.invalidate_kernel_attrs);
+            drop(flush);
             self.state.file_session.gc_if_idle(ino);
             return result;
         }
@@ -979,7 +987,7 @@ impl StudioVfs {
             .file_session
             .enter_op(ino, FileSessionOperation::Release)
             .await;
-        let result = self.release_last_handle_with_outcome(context).await;
+        let result = self.release_last_handle_with_outcome(context, flush).await;
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result
@@ -998,11 +1006,7 @@ impl StudioVfs {
         let mut deferred_release_barrier = None;
         let mut deferred_release_ino = None;
         let Some(context) = self.close_handle_for_release(fh, |open_file, remaining| {
-            let local_state_pending = self.inode_has_local_dirty_state(open_file.ino)
-                || self
-                    .state
-                    .deferred_materialize_inflight
-                    .contains(open_file.ino);
+            let local_state_pending = self.inode_has_pending_local_state(open_file.ino);
             let write_capable = open_file.flags.allows_write();
             if remaining == 0 || (write_capable && local_state_pending) {
                 deferred_release_ino = Some(open_file.ino);
@@ -1050,6 +1054,8 @@ impl StudioVfs {
             ..
         } = context;
         let vfs = Arc::clone(self);
+        // Created before spawning: a task dropped before its first poll still flushes.
+        let flush = KernelInvalidationFlush::new(Arc::clone(self), ino, invalidate_kernel_attrs);
         let (barrier, guard) = deferred_release_barrier
             .expect("last-handle deferred release must register its barrier before close");
         self.track_background_task(runtime.spawn(async move {
@@ -1070,7 +1076,7 @@ impl StudioVfs {
             drop(session);
             vfs.state.file_session.gc_if_idle(ino);
             // Refresh after local state drains, including late sticky-error outcomes.
-            vfs.flush_deferred_kernel_invalidations(ino, invalidate_kernel_attrs);
+            drop(flush);
             if let Err(error) = result
                 && !vfs.suppress_deleted_inode_materialization_error(ino, &error)
             {
@@ -2159,7 +2165,7 @@ impl StudioVfs {
         }
         self.invalidate_attr_read_cache([ino]);
         // Keep the refresh pending even if materialization drains all dirty state before close.
-        self.invalidate_kernel_inode_attrs([ino]);
+        self.retain_kernel_inode_attr_refresh(ino);
         Ok(accepted.accepted_bytes)
     }
 
