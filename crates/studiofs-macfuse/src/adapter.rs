@@ -4151,76 +4151,94 @@ macfuse_callback! {
         to_set: libc::c_int,
         fi: *mut raw::FuseFileInfo,
     ) |pending, state| "setattr", Error {
-        if attr.is_null() {
-            reply_error(pending, libc::EINVAL);
-            return;
-        }
-        let args = match setattr_args_from_callback(attr, to_set) {
-            Ok(args) => args,
-            Err(errno) => {
-                warn!(
-                    ino,
-                    to_set, errno, "macFUSE setattr callback rejected arguments"
-                );
-                reply_error(pending, errno);
-                return;
-            }
-        };
-        let flags = setattr_callback_file_flags(attr, to_set);
-        if args.is_empty() {
-            if setattr_mask_is_accepted_noop(to_set) {
-                debug!(
-                    ino,
-                    to_set, "macFUSE setattr callback accepted unsupported metadata bits as no-op"
-                );
-                match state.adapter.setattr_with_file_flags(None, ino, args, flags) {
-                    Ok(stat) => {
-                        if let Some(request) = pending.take() {
-                            let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
-                        }
-                    }
-                    Err(errno) => {
-                        warn!(
-                            ino,
-                            to_set, errno, "macFUSE setattr no-op getattr returned error"
-                        );
-                        reply_error(pending, errno);
-                    }
-                }
-                return;
-            }
+        setattr_callback(pending, state, ino, attr, to_set, fi);
+    }
+}
+
+/// Body of [`studiofs_macfuse_setattr`] without the FFI request/userdata lookup.
+///
+/// Tests drive it with a sink-backed [`Request`] whose raw pointer is dangling;
+/// the body must only touch the request through `Reply`/`reply_error`.
+fn setattr_callback(
+    pending: &mut Option<Request>,
+    state: &CallbackState,
+    ino: raw::FuseIno,
+    attr: *mut stat,
+    to_set: libc::c_int,
+    fi: *mut raw::FuseFileInfo,
+) {
+    if attr.is_null() {
+        reply_error(pending, libc::EINVAL);
+        return;
+    }
+    let args = match setattr_args_from_callback(attr, to_set) {
+        Ok(args) => args,
+        Err(errno) => {
             warn!(
                 ino,
-                to_set,
-                errno = libc::ENOTSUP,
-                "macFUSE setattr callback received no supported attributes"
+                to_set, errno, "macFUSE setattr callback rejected arguments"
             );
-            reply_error(pending, libc::ENOTSUP);
+            reply_error(pending, errno);
             return;
         }
-        let file_handle = if fi.is_null() || !setattr_mask_has_fh(to_set) {
-            None
-        } else {
-            // SAFETY: macFUSE guarantees a valid file handle pointer when the
-            // callback mask includes the header-defined file-handle bit.
-            Some(unsafe { (*fi).fh })
-        };
-        match state
-            .adapter
-            .setattr_with_file_flags(file_handle, ino, args, flags)
-        {
-            Ok(stat) => {
-                if let Some(request) = pending.take() {
-                    let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+    };
+    let flags = setattr_callback_file_flags(attr, to_set);
+    if args.is_empty() {
+        if setattr_mask_is_accepted_noop(to_set) {
+            debug!(
+                ino,
+                to_set, "macFUSE setattr callback accepted unsupported metadata bits as no-op"
+            );
+            match state
+                .adapter
+                .setattr_with_file_flags(None, ino, args, flags)
+            {
+                Ok(stat) => {
+                    if let Some(request) = pending.take() {
+                        let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                    }
+                }
+                Err(errno) => {
+                    warn!(
+                        ino,
+                        to_set, errno, "macFUSE setattr no-op getattr returned error"
+                    );
+                    reply_error(pending, errno);
                 }
             }
-            Err(errno) => {
-                warn!(
-                    ino,
-                    file_handle, to_set, errno, "macFUSE setattr callback returned error"
-                );
-                reply_error(pending, errno);
+            return;
+        }
+        warn!(
+            ino,
+            to_set,
+            errno = libc::ENOTSUP,
+            "macFUSE setattr callback received no supported attributes"
+        );
+        reply_error(pending, libc::ENOTSUP);
+        return;
+    }
+    let file_handle = if fi.is_null() || !setattr_mask_has_fh(to_set) {
+        None
+    } else {
+        // SAFETY: macFUSE guarantees a valid file handle pointer when the
+        // callback mask includes the header-defined file-handle bit.
+        Some(unsafe { (*fi).fh })
+    };
+    match state
+        .adapter
+        .setattr_with_file_flags(file_handle, ino, args, flags)
+    {
+        Ok(stat) => {
+            if let Some(request) = pending.take() {
+                let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
             }
+        }
+        Err(errno) => {
+            warn!(
+                ino,
+                file_handle, to_set, errno, "macFUSE setattr callback returned error"
+            );
+            reply_error(pending, errno);
         }
     }
 }
@@ -4235,48 +4253,63 @@ macfuse_callback! {
         to_set: libc::c_int,
         fi: *mut raw::FuseFileInfo,
     ) |pending, state| "setattr_x", Error {
-        if attr.is_null() {
-            reply_error(pending, libc::EINVAL);
+        setattr_x_callback(pending, state, ino, attr, to_set, fi);
+    }
+}
+
+/// Body of [`studiofs_macfuse_setattr_x`] without the FFI request/userdata lookup.
+///
+/// Tests drive it with a sink-backed [`Request`] whose raw pointer is dangling;
+/// the body must only touch the request through `Reply`/`reply_error`.
+fn setattr_x_callback(
+    pending: &mut Option<Request>,
+    state: &CallbackState,
+    ino: raw::FuseIno,
+    attr: *mut raw::FuseSetattrX,
+    to_set: libc::c_int,
+    fi: *mut raw::FuseFileInfo,
+) {
+    if attr.is_null() {
+        reply_error(pending, libc::EINVAL);
+        return;
+    }
+    // SAFETY: macFUSE supplies an initialized payload and null was rejected above.
+    let flags = unsafe { (*attr).flags };
+    let args = match setattr_x_args_from_callback(attr, to_set) {
+        Ok(args) => args,
+        Err(errno) => {
+            warn!(
+                ino,
+                to_set, errno, "macFUSE setattr_x callback rejected arguments"
+            );
+            reply_error(pending, errno);
             return;
         }
-        // SAFETY: macFUSE supplies an initialized payload and null was rejected above.
-        let flags = unsafe { (*attr).flags };
-        let args = match setattr_x_args_from_callback(attr, to_set) {
-            Ok(args) => args,
-            Err(errno) => {
-                warn!(
-                    ino,
-                    to_set, errno, "macFUSE setattr_x callback rejected arguments"
-                );
-                reply_error(pending, errno);
-                return;
+    };
+    debug!(
+        ino,
+        file_handle = ?setattr_x_file_handle(fi),
+        to_set,
+        flags,
+        "macFUSE setattr_x callback accepted Darwin metadata as overlay"
+    );
+    match state.adapter.setattr_with_file_flags(
+        setattr_x_file_handle(fi),
+        ino,
+        args,
+        setattr_mask_has_flags(to_set).then_some(flags),
+    ) {
+        Ok(stat) => {
+            if let Some(request) = pending.take() {
+                let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
             }
-        };
-        debug!(
-            ino,
-            file_handle = ?setattr_x_file_handle(fi),
-            to_set,
-            flags,
-            "macFUSE setattr_x callback accepted Darwin metadata as overlay"
-        );
-        match state.adapter.setattr_with_file_flags(
-            setattr_x_file_handle(fi),
-            ino,
-            args,
-            setattr_mask_has_flags(to_set).then_some(flags),
-        ) {
-            Ok(stat) => {
-                if let Some(request) = pending.take() {
-                    let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
-                }
-            }
-            Err(errno) => {
-                warn!(
-                    ino,
-                    to_set, errno, "macFUSE setattr_x callback returned error"
-                );
-                reply_error(pending, errno);
-            }
+        }
+        Err(errno) => {
+            warn!(
+                ino,
+                to_set, errno, "macFUSE setattr_x callback returned error"
+            );
+            reply_error(pending, errno);
         }
     }
 }
@@ -5143,6 +5176,237 @@ mod tests {
         assert_eq!(
             result.expect("unrelated inode metadata must progress"),
             (Ok(attr.ino), Ok((attr.ino, MACOS_UF_HIDDEN)))
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SetattrCallbackReply {
+        Error(i32),
+        Attr,
+    }
+
+    thread_local! {
+        // Thread-local so parallel tests never observe each other's replies;
+        // setattr callbacks reply synchronously on the calling thread.
+        static SETATTR_CALLBACK_REPLIES: std::cell::RefCell<Vec<SetattrCallbackReply>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn setattr_callback_test_request() -> Option<Request> {
+        use crate::low_level::ReplyTestSink;
+        SETATTR_CALLBACK_REPLIES.with_borrow_mut(Vec::clear);
+        Some(Request::from_raw_with_test_sink(
+            RequestCompletion::Error,
+            ReplyTestSink {
+                error: |_, errno| {
+                    SETATTR_CALLBACK_REPLIES.with_borrow_mut(|replies| {
+                        replies.push(SetattrCallbackReply::Error(errno))
+                    });
+                    0
+                },
+                standard: |_| {
+                    SETATTR_CALLBACK_REPLIES
+                        .with_borrow_mut(|replies| replies.push(SetattrCallbackReply::Attr));
+                    0
+                },
+                none: |_| unreachable!("setattr requests always expect a reply"),
+            },
+        ))
+    }
+
+    fn setattr_callback_replies(pending: Option<Request>) -> Vec<SetattrCallbackReply> {
+        // An unreplied request falls back to EIO on drop, which the sink records.
+        drop(pending);
+        SETATTR_CALLBACK_REPLIES.with_borrow_mut(std::mem::take)
+    }
+
+    fn setattr_callback_state(
+        name: &str,
+        read_only: bool,
+    ) -> (ContractVfsFixture, CallbackState, InodeAttr) {
+        let fixture = ContractVfsFixture::new(name).expect("create VFS fixture");
+        let attr = fixture
+            .vfs()
+            .create(ROOT_INO, b"flags.txt", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new_with_read_only_for_test(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            read_only,
+        );
+        adapter.remember_file_flags(attr.ino, MACOS_UF_HIDDEN);
+        let state = CallbackState {
+            adapter: Arc::new(adapter),
+        };
+        (fixture, state, attr)
+    }
+
+    fn zeroed_setattr_x() -> raw::FuseSetattrX {
+        // SAFETY: `FuseSetattrX` holds only integers and `timespec`s, for which
+        // all-zero bytes are valid values.
+        unsafe { MaybeUninit::<raw::FuseSetattrX>::zeroed().assume_init() }
+    }
+
+    fn setattr_flags_mask() -> libc::c_int {
+        // SAFETY: The C shim returns the header-defined FLAGS bit for this build.
+        unsafe { crate::low_level::studiofs_macfuse_setattr_flags_mask() }
+    }
+
+    fn setattr_size_mask() -> libc::c_int {
+        // SAFETY: The C shim returns the header-defined SIZE bit for this build.
+        unsafe { crate::low_level::studiofs_macfuse_setattr_size_mask() }
+    }
+
+    #[test]
+    fn setattr_x_callback_rejected_times_do_not_record_flags() {
+        let (_fixture, state, attr) = setattr_callback_state("macfuse-setattr-x-einval", false);
+        let mut payload = zeroed_setattr_x();
+        payload.flags = libc::UF_NODUMP;
+        payload.modtime.tv_nsec = 1_000_000_000;
+        // SAFETY: The C shim returns the header-defined MTIME bit for this build.
+        let to_set = setattr_flags_mask()
+            | unsafe { crate::low_level::studiofs_macfuse_setattr_mtime_mask() };
+        let mut pending = setattr_callback_test_request();
+
+        setattr_x_callback(
+            &mut pending,
+            &state,
+            attr.ino,
+            &mut payload,
+            to_set,
+            std::ptr::null_mut(),
+        );
+
+        let flags = state.adapter.getattr(attr.ino).map(|stat| stat.st_flags);
+        assert_eq!(
+            (setattr_callback_replies(pending), flags),
+            (
+                vec![SetattrCallbackReply::Error(libc::EINVAL)],
+                Ok(MACOS_UF_HIDDEN)
+            )
+        );
+    }
+
+    #[test]
+    fn setattr_x_callback_applies_size_and_flags_together() {
+        let (_fixture, state, attr) = setattr_callback_state("macfuse-setattr-x-size", false);
+        let mut payload = zeroed_setattr_x();
+        payload.size = 3;
+        payload.flags = libc::UF_NODUMP;
+        let mut pending = setattr_callback_test_request();
+
+        setattr_x_callback(
+            &mut pending,
+            &state,
+            attr.ino,
+            &mut payload,
+            setattr_size_mask() | setattr_flags_mask(),
+            std::ptr::null_mut(),
+        );
+
+        let stat = state
+            .adapter
+            .getattr(attr.ino)
+            .map(|stat| (stat.st_size, stat.st_flags));
+        assert_eq!(
+            (setattr_callback_replies(pending), stat),
+            (vec![SetattrCallbackReply::Attr], Ok((3, libc::UF_NODUMP)))
+        );
+    }
+
+    #[test]
+    fn setattr_x_callback_read_only_rejects_flags_and_keeps_overlay() {
+        let (_fixture, state, attr) = setattr_callback_state("macfuse-setattr-x-erofs", true);
+        let mut payload = zeroed_setattr_x();
+        let mut pending = setattr_callback_test_request();
+
+        setattr_x_callback(
+            &mut pending,
+            &state,
+            attr.ino,
+            &mut payload,
+            setattr_flags_mask(),
+            std::ptr::null_mut(),
+        );
+
+        let flags = state.adapter.getattr(attr.ino).map(|stat| stat.st_flags);
+        assert_eq!(
+            (setattr_callback_replies(pending), flags),
+            (
+                vec![SetattrCallbackReply::Error(libc::EROFS)],
+                Ok(MACOS_UF_HIDDEN)
+            )
+        );
+    }
+
+    #[test]
+    fn setattr_x_callback_without_flags_bit_keeps_overlay() {
+        let (_fixture, state, attr) = setattr_callback_state("macfuse-setattr-x-noflags", false);
+        let mut payload = zeroed_setattr_x();
+        let mut pending = setattr_callback_test_request();
+
+        setattr_x_callback(
+            &mut pending,
+            &state,
+            attr.ino,
+            &mut payload,
+            0,
+            std::ptr::null_mut(),
+        );
+
+        let flags = state.adapter.getattr(attr.ino).map(|stat| stat.st_flags);
+        assert_eq!(
+            (setattr_callback_replies(pending), flags),
+            (vec![SetattrCallbackReply::Attr], Ok(MACOS_UF_HIDDEN))
+        );
+    }
+
+    #[test]
+    fn setattr_callback_empty_mask_keeps_overlay() {
+        let (_fixture, state, attr) = setattr_callback_state("macfuse-setattr-empty-mask", false);
+        let mut payload = minimal_stat(attr.ino);
+        let mut pending = setattr_callback_test_request();
+
+        setattr_callback(
+            &mut pending,
+            &state,
+            attr.ino,
+            &mut payload,
+            0,
+            std::ptr::null_mut(),
+        );
+
+        let flags = state.adapter.getattr(attr.ino).map(|stat| stat.st_flags);
+        assert_eq!(
+            (setattr_callback_replies(pending), flags),
+            (vec![SetattrCallbackReply::Attr], Ok(MACOS_UF_HIDDEN))
+        );
+    }
+
+    #[test]
+    fn setattr_callback_applies_size_and_flags_together() {
+        let (_fixture, state, attr) = setattr_callback_state("macfuse-setattr-size-flags", false);
+        let mut payload = minimal_stat(attr.ino);
+        payload.st_size = 2;
+        payload.st_flags = libc::UF_NODUMP;
+        let mut pending = setattr_callback_test_request();
+
+        setattr_callback(
+            &mut pending,
+            &state,
+            attr.ino,
+            &mut payload,
+            setattr_size_mask() | setattr_flags_mask(),
+            std::ptr::null_mut(),
+        );
+
+        let stat = state
+            .adapter
+            .getattr(attr.ino)
+            .map(|stat| (stat.st_size, stat.st_flags));
+        assert_eq!(
+            (setattr_callback_replies(pending), stat),
+            (vec![SetattrCallbackReply::Attr], Ok((2, libc::UF_NODUMP)))
         );
     }
 
