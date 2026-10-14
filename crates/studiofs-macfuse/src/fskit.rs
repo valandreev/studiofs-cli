@@ -2480,10 +2480,7 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
         unmount_signal,
         mount_ready_callback,
     } = request;
-    if !crate::CLI_SIGNAL_HANDLERS_INSTALLED.load(Ordering::Acquire) {
-        crate::process_signal_wake_pipe()?.drain()?;
-        crate::SHUTDOWN_REQUESTED.store(false, Ordering::Release);
-    }
+    crate::reset_process_shutdown_state()?;
     let mut session = FsKitSession::mount(&mount_point, &volume_name, read_only)?;
     let callback_state = Arc::new(CallbackState::new(
         Arc::clone(&vfs),

@@ -113,7 +113,8 @@ pub enum SignalHandling {
 #[derive(Clone, Debug, Default)]
 pub struct MacFuseUnmountSignal {
     requested: Arc<AtomicBool>,
-    wake: Arc<Mutex<Option<Arc<WakePipe>>>>,
+    // Private wake streams of the watchers currently observing this signal.
+    wakes: Arc<Mutex<Vec<Arc<WakePipe>>>>,
 }
 
 impl MacFuseUnmountSignal {
@@ -125,12 +126,7 @@ impl MacFuseUnmountSignal {
     /// Request the mount session to unmount.
     pub fn request_unmount(&self) {
         self.requested.store(true, Ordering::Release);
-        if let Some(wake) = self
-            .wake
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
+        for wake in self.lock_wakes().iter() {
             wake.wake();
         }
     }
@@ -139,6 +135,28 @@ impl MacFuseUnmountSignal {
     pub fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
     }
+
+    fn lock_wakes(&self) -> std::sync::MutexGuard<'_, Vec<Arc<WakePipe>>> {
+        self.wakes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Register `wake`, then report a request that preceded registration.
+    fn attach_wake(&self, wake: &Arc<WakePipe>) {
+        // `request_unmount` stores the flag before taking this lock, so either
+        // it sees the registered stream or this check sees the flag.
+        let mut wakes = self.lock_wakes();
+        wakes.push(Arc::clone(wake));
+        if self.is_requested() {
+            wake.wake();
+        }
+    }
+
+    fn detach_wake(&self, wake: &Arc<WakePipe>) {
+        self.lock_wakes()
+            .retain(|registered| !Arc::ptr_eq(registered, wake));
+    }
 }
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -146,10 +164,15 @@ static CLI_SIGNAL_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 static SIGNAL_WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static PROCESS_SIGNAL_WAKE: Mutex<Option<Arc<WakePipe>>> = Mutex::new(None);
 
-#[derive(Debug)]
 struct WakePipe {
     read: UnixStream,
     write: UnixStream,
+}
+
+impl std::fmt::Debug for WakePipe {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("WakePipe").finish_non_exhaustive()
+    }
 }
 
 impl WakePipe {
@@ -183,6 +206,11 @@ impl WakePipe {
     }
 }
 
+/// Return the process-lifetime stream written by the shutdown signal handler.
+///
+/// Watchers only observe it: signal bytes remain readable while
+/// `SHUTDOWN_REQUESTED` is set, so every watcher wakes. Only a reset with no
+/// StudioFS handler installed consumes them.
 fn process_signal_wake_pipe() -> io::Result<Arc<WakePipe>> {
     let mut pipe = PROCESS_SIGNAL_WAKE
         .lock()
@@ -193,6 +221,15 @@ fn process_signal_wake_pipe() -> io::Result<Arc<WakePipe>> {
     let created = Arc::new(WakePipe::new()?);
     *pipe = Some(Arc::clone(&created));
     Ok(created)
+}
+
+/// Clear a finished shutdown request before a mount that does not own handlers.
+fn reset_process_shutdown_state() -> io::Result<()> {
+    if !CLI_SIGNAL_HANDLERS_INSTALLED.load(Ordering::Acquire) {
+        process_signal_wake_pipe()?.drain()?;
+        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+    }
+    Ok(())
 }
 
 extern "C" fn shutdown_signal_handler(sig: libc::c_int) {
@@ -320,8 +357,9 @@ fn signal_handlers_for_policy(
 struct SignalWatcher {
     stop: Arc<AtomicBool>,
     handlers: Option<CliSignalHandlers>,
-    // The mount uses one watcher; signal, stop and unmount share its wake stream.
+    // Private to this watcher, so stop and unmount wakes never reach another mount.
     wake: Arc<WakePipe>,
+    unmount_signal: Option<MacFuseUnmountSignal>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -332,8 +370,62 @@ impl Drop for SignalWatcher {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        if let Some(signal) = self.unmount_signal.take() {
+            signal.detach_wake(&self.wake);
+        }
         self.handlers.take();
     }
+}
+
+fn exit_requested(stop: &AtomicBool, unmount_signal: Option<&MacFuseUnmountSignal>) -> bool {
+    stop.load(Ordering::Acquire)
+        || SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+        || unmount_signal.is_some_and(MacFuseUnmountSignal::is_requested)
+}
+
+/// Block until stop, process shutdown or unmount is requested.
+fn wait_for_exit_request(
+    private_wake: &WakePipe,
+    process_wake: &WakePipe,
+    stop: &AtomicBool,
+    unmount_signal: Option<&MacFuseUnmountSignal>,
+) -> io::Result<()> {
+    while !exit_requested(stop, unmount_signal) {
+        let mut descriptors = [
+            libc::pollfd {
+                fd: private_wake.read.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: process_wake.read.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `descriptors` is valid for the duration of the blocking poll.
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, -1) };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if descriptors[0].revents != 0 {
+            private_wake.drain()?;
+        }
+        if descriptors[1].revents != 0 && !SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            // The handler sets the flag before writing, so a byte without the
+            // flag is stale. Consume it to stay idle, and restore readiness for
+            // other watchers if a signal raced this drain.
+            process_wake.drain()?;
+            if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+                process_wake.wake();
+            }
+        }
+    }
+    Ok(())
 }
 
 fn spawn_signal_watcher(
@@ -343,54 +435,49 @@ fn spawn_signal_watcher(
 ) -> io::Result<SignalWatcher> {
     let stop = Arc::new(AtomicBool::new(false));
     let handlers = signal_handlers_for_policy(signal_handling)?;
-    let wake = process_signal_wake_pipe()?;
+    let process_wake = process_signal_wake_pipe()?;
+    let wake = Arc::new(WakePipe::new()?);
     if let Some(signal) = &unmount_signal {
-        let mut signal_wake = signal
-            .wake
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *signal_wake = Some(Arc::clone(&wake));
-        if signal.is_requested() {
-            wake.wake();
-        }
+        signal.attach_wake(&wake);
     }
     let watcher_stop = Arc::clone(&stop);
     let watcher_wake = Arc::clone(&wake);
-    let thread = std::thread::Builder::new()
+    let watcher_signal = unmount_signal.clone();
+    let spawned = std::thread::Builder::new()
         .name("macfuse-signal-watcher".into())
         .spawn(move || {
-            while !watcher_stop.load(Ordering::Acquire)
-                && !SHUTDOWN_REQUESTED.load(Ordering::Acquire)
-                && !unmount_signal
-                    .as_ref()
-                    .is_some_and(MacFuseUnmountSignal::is_requested)
-            {
-                let mut descriptor = libc::pollfd {
-                    fd: watcher_wake.read.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: `descriptor` is valid for the duration of the blocking poll.
-                let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
-                if result == -1 {
-                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
-                }
-                if watcher_wake.drain().is_err() {
-                    break;
-                }
+            if let Err(error) = wait_for_exit_request(
+                &watcher_wake,
+                &process_wake,
+                &watcher_stop,
+                watcher_signal.as_ref(),
+            ) {
+                // Without its wake streams the watcher cannot observe signals
+                // or unmount requests, so fail safe by unmounting.
+                tracing::error!(
+                    error = %error,
+                    "macFUSE signal watcher lost its wake stream; requesting unmount"
+                );
             }
             if watcher_stop.load(Ordering::Acquire) {
                 return;
             }
             request_exit();
-        })?;
+        });
+    let thread = match spawned {
+        Ok(thread) => thread,
+        Err(error) => {
+            if let Some(signal) = &unmount_signal {
+                signal.detach_wake(&wake);
+            }
+            return Err(error);
+        }
+    };
     Ok(SignalWatcher {
         stop,
         handlers,
         wake,
+        unmount_signal,
         thread: Some(thread),
     })
 }
@@ -410,6 +497,7 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
         unmount_signal,
         mount_ready_callback,
     } = request;
+    reset_process_shutdown_state()?;
     let config = low_level::SessionConfig::new(mount_point, volume_name)
         .with_read_only(read_only)
         .with_run_in_foreground(run_in_foreground);
@@ -429,10 +517,6 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
             userdata,
         )
     }?;
-    if !CLI_SIGNAL_HANDLERS_INSTALLED.load(Ordering::Acquire) {
-        process_signal_wake_pipe()?.drain()?;
-        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
-    }
     let exit_handle = session.exit_handle();
     let _signal_watcher = spawn_signal_watcher(
         move || {
@@ -497,6 +581,13 @@ mod tests {
     use super::test_support::{admit_parent_on_runtime, callback_runtime, dormant_runtime};
 
     static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Serialize process-global signal state without cascading a failed test's poison.
+    fn lock_signal_tests() -> std::sync::MutexGuard<'static, ()> {
+        SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn callback_file_info_snapshot_is_independent_from_callback_pointer() {
@@ -709,8 +800,87 @@ mod tests {
     }
 
     #[test]
+    fn closed_private_wake_stream_ends_the_exit_wait_with_an_error() {
+        let private_wake = super::WakePipe::new().expect("create private wake stream");
+        let process_wake = super::WakePipe::new().expect("create isolated process stream");
+        private_wake
+            .write
+            .shutdown(std::net::Shutdown::Write)
+            .expect("close private wake writer");
+
+        let result = super::wait_for_exit_request(
+            &private_wake,
+            &process_wake,
+            &std::sync::atomic::AtomicBool::new(false),
+            None,
+        );
+
+        assert_eq!(
+            result
+                .expect_err("closed wake stream must end the wait")
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn unmount_request_wakes_its_watcher_while_another_watcher_runs() {
+        let _signal_test_lock = lock_signal_tests();
+        // Each round races the target wake against another watcher and a mount-start
+        // reset; a shared wake stream lost a few requests per thousand rounds.
+        for _ in 0..300 {
+            let target_signal = super::MacFuseUnmountSignal::new();
+            let other_signal = super::MacFuseUnmountSignal::new();
+            let (target_sender, target_exit) = std::sync::mpsc::channel();
+            let (other_sender, other_exit) = std::sync::mpsc::channel();
+            let target = super::spawn_signal_watcher(
+                move || target_sender.send(()).expect("send target exit"),
+                super::SignalHandling::Disabled,
+                Some(target_signal.clone()),
+            )
+            .expect("spawn target watcher");
+            let other = super::spawn_signal_watcher(
+                move || other_sender.send(()).expect("send other exit"),
+                super::SignalHandling::Disabled,
+                Some(other_signal),
+            )
+            .expect("spawn other watcher");
+
+            target_signal.request_unmount();
+            super::reset_process_shutdown_state().expect("reset process shutdown state");
+
+            target_exit
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("another watcher must not consume the target wake");
+            assert!(matches!(
+                other_exit.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            drop(target);
+            drop(other);
+        }
+    }
+
+    #[test]
+    fn dropped_watcher_detaches_from_unmount_signal() {
+        let _signal_test_lock = lock_signal_tests();
+        let signal = super::MacFuseUnmountSignal::new();
+        let watcher = super::spawn_signal_watcher(
+            || {},
+            super::SignalHandling::Disabled,
+            Some(signal.clone()),
+        )
+        .expect("spawn signal watcher");
+        assert_eq!(signal.lock_wakes().len(), 1);
+
+        drop(watcher);
+
+        assert!(signal.lock_wakes().is_empty());
+    }
+
+    #[test]
     fn cli_signal_guard_restores_handlers_after_session_watcher_drops() {
-        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let _signal_test_lock = lock_signal_tests();
         super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
         assert!(!super::CLI_SIGNAL_HANDLERS_INSTALLED.load(std::sync::atomic::Ordering::Acquire));
 
@@ -773,7 +943,7 @@ mod tests {
 
     #[test]
     fn requested_unmount_wakes_blocked_watcher() {
-        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let _signal_test_lock = lock_signal_tests();
         let signal = super::MacFuseUnmountSignal::new();
         let (sender, receiver) = std::sync::mpsc::channel();
         let watcher = super::spawn_signal_watcher(
@@ -792,7 +962,7 @@ mod tests {
 
     #[test]
     fn unmount_requested_before_watcher_start_is_not_lost() {
-        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let _signal_test_lock = lock_signal_tests();
         let signal = super::MacFuseUnmountSignal::new();
         signal.request_unmount();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -811,7 +981,7 @@ mod tests {
 
     #[test]
     fn dropping_watcher_wakes_and_joins_its_thread() {
-        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let _signal_test_lock = lock_signal_tests();
         let exit_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let callback_exit_requested = Arc::clone(&exit_requested);
         let watcher = super::spawn_signal_watcher(
@@ -834,7 +1004,7 @@ mod tests {
 
     #[test]
     fn stale_wake_is_drained_while_watcher_stays_idle() {
-        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let _signal_test_lock = lock_signal_tests();
         super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
         let wake = super::process_signal_wake_pipe().expect("get process wake stream");
         wake.drain().expect("clear prior wake bytes");
@@ -883,26 +1053,37 @@ mod tests {
     }
 
     #[test]
-    fn process_signal_wakes_disabled_watcher() {
+    fn process_signal_wakes_every_disabled_watcher() {
         const CHILD_ENV: &str = "STUDIOFS_PROCESS_SIGNAL_BROADCAST_TEST_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
-            let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+            let _signal_test_lock = lock_signal_tests();
             let handlers = super::ProcessSignalGuard::install_for_cli()
                 .expect("install outer CLI signal handlers");
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let watcher = super::spawn_signal_watcher(
-                move || sender.send(()).expect("send watcher exit"),
+            let (first_sender, first_exit) = std::sync::mpsc::channel();
+            let (second_sender, second_exit) = std::sync::mpsc::channel();
+            let first = super::spawn_signal_watcher(
+                move || first_sender.send(()).expect("send first watcher exit"),
                 super::SignalHandling::Disabled,
                 None,
             )
-            .expect("spawn watcher");
+            .expect("spawn first watcher");
+            let second = super::spawn_signal_watcher(
+                move || second_sender.send(()).expect("send second watcher exit"),
+                super::SignalHandling::Disabled,
+                None,
+            )
+            .expect("spawn second watcher");
 
             // SAFETY: the outer process guard installed the handler; this signals only the child.
             assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-            receiver
+            first_exit
                 .recv_timeout(std::time::Duration::from_secs(2))
-                .expect("disabled watcher should wake");
-            drop(watcher);
+                .expect("first disabled watcher should wake");
+            second_exit
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("second disabled watcher should wake");
+            drop(first);
+            drop(second);
             drop(handlers);
             return;
         }
@@ -912,7 +1093,7 @@ mod tests {
         )
         .args([
             "--exact",
-            "tests::process_signal_wakes_disabled_watcher",
+            "tests::process_signal_wakes_every_disabled_watcher",
             "--nocapture",
         ])
         .env(CHILD_ENV, "1")
@@ -927,7 +1108,7 @@ mod tests {
 
     #[test]
     fn session_owned_signal_handlers_restore_on_watcher_drop() {
-        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let _signal_test_lock = lock_signal_tests();
         let watcher =
             super::spawn_signal_watcher(|| {}, super::SignalHandling::InstallForCli, None)
                 .expect("install session signal handlers");
@@ -938,7 +1119,7 @@ mod tests {
 
     #[test]
     fn concurrent_session_cannot_use_unowned_signal_handlers() {
-        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let _signal_test_lock = lock_signal_tests();
         let owner = super::spawn_signal_watcher(|| {}, super::SignalHandling::InstallForCli, None)
             .expect("install first session signal handlers");
         let duplicate =
@@ -959,7 +1140,7 @@ mod tests {
 
     #[test]
     fn second_shutdown_signal_exits_process() {
-        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let _signal_test_lock = lock_signal_tests();
         const CHILD_ENV: &str = "STUDIOFS_SECOND_SHUTDOWN_SIGNAL_TEST_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
             let _handlers = super::CliSignalHandlers::install()
@@ -3943,6 +4124,7 @@ mod tests {
 
     #[test]
     fn symlink_wait_returns_enoent_at_its_deadline() {
+        const RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-symlink-deferred-deadline",
         )
@@ -3957,22 +4139,28 @@ mod tests {
         let started = std::time::Instant::now();
         let result = runtime.block_on(async {
             tokio::time::timeout(
-                std::time::Duration::from_secs(6),
-                adapter.symlink(
+                std::time::Duration::from_secs(2),
+                adapter.symlink_with_retry_timeout(
                     parent.ino,
                     b"child-link",
                     b"target",
                     tokio_util::sync::CancellationToken::new(),
+                    RETRY_TIMEOUT,
                 ),
             )
             .await
         });
+        let elapsed = started.elapsed();
         let drain_result = deferred_runtime
             .block_on(vfs.wait_for_deferred_namespace_metadata_or_shutdown(parent.ino));
+
         let symlink_result = result.expect("symlink wait must be bounded");
         assert_eq!(symlink_result.unwrap_err(), libc::ENOENT);
-        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
-        assert!(drain_result.expect("deferred metadata drain should finish"));
+        assert!(elapsed >= RETRY_TIMEOUT);
+        assert_eq!(
+            drain_result.expect("deferred metadata drain should finish"),
+            studiofs_vfs::vfs::DeferredNamespaceWait::Settled
+        );
     }
 
     #[test]
@@ -3987,29 +4175,33 @@ mod tests {
         let runtime = callback_runtime();
         let adapter =
             super::adapter::StudioVfsAdapter::new(Arc::clone(&vfs), runtime.handle().clone());
+        let wait_entered = adapter.symlink_deferred_wait_entered_for_test();
         let cancellation = tokio_util::sync::CancellationToken::new();
         let task_cancellation = cancellation.clone();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let task = runtime.spawn(async move {
-            let _ = started_tx.send(());
             adapter
                 .symlink(parent.ino, b"child-link", b"target", task_cancellation)
                 .await
         });
-        runtime.block_on(async {
-            started_rx.await.expect("symlink task should start");
+        let entered = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), wait_entered.notified()).await
         });
+        if entered.is_err() {
+            cancellation.cancel();
+        }
+        entered.expect("symlink should wait for its deferred parent");
 
         let drain_result = deferred_runtime
             .block_on(vfs.wait_for_deferred_namespace_metadata_or_shutdown(parent.ino));
-        if !matches!(drain_result, Ok(true)) {
-            cancellation.cancel();
-        }
         let attr = runtime
             .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(1), task).await })
-            .expect("symlink should finish after notification or cancellation")
+            .expect("parent commit should wake the symlink wait")
             .expect("symlink task should join");
-        assert!(drain_result.expect("deferred parent metadata should commit"));
+
+        assert_eq!(
+            drain_result.expect("deferred parent metadata should commit"),
+            studiofs_vfs::vfs::DeferredNamespaceWait::Settled
+        );
         let attr = attr.expect("symlink should succeed under committed parent");
         assert_eq!(vfs.lookup(parent.ino, b"child-link").unwrap().ino, attr.ino);
     }

@@ -125,9 +125,15 @@ fallback. Hardlink requests are translated through the shared
 `getxattr` reads preserve the legacy `position`, size-query, `ENOATTR`, and
 `ERANGE` contract. Potentially waiting `rmdir` callbacks run as tracked blocking
 reply tasks. Symlink replies use tracked async tasks: each local metadata attempt
-runs on the blocking pool, while a deferred parent commit is awaited through VFS
-notification with a five-second deadline and request/shutdown cancellation.
-Neither wait occupies the FSKit dispatcher loop. The zero-copy negotiation and
+runs on the blocking pool, while a deferred parent is awaited through VFS
+notification with a five-second deadline and request/shutdown cancellation. The
+wait ends when any deferred operation on the parent inode settles, so a parent
+create that commits ahead of queued attribute updates retries immediately.
+Neither wait occupies the FSKit dispatcher loop. Each mount's signal watcher
+blocks on its own wake stream for stop and unmount requests, and also observes
+the process-lifetime stream written by the async-signal-safe shutdown handler;
+signal bytes stay readable while shutdown is requested, so concurrent watchers
+cannot consume one another's wakeups. The zero-copy negotiation and
 the remaining full semantic parity matrix
 remain separate follow-up work.
 

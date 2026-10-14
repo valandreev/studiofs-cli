@@ -86,7 +86,10 @@ pub use metrics::{
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
 };
 /// Public namespace helpers used by bridge and diagnostics integrations.
-pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
+pub use namespace::{
+    DeferredNamespaceProgress, DeferredNamespaceWait, KernelInvalidator, NamespaceParent,
+    NamespacePathStyle, NamespaceResolver,
+};
 pub use os_cache::{OsCacheDisposition, OsCacheOpenDecision, OsCacheParticipation, OsCacheReason};
 pub use runtime_stats_surface::{
     RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_NAME_STR,

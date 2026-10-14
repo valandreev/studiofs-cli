@@ -26,7 +26,8 @@ use studiofs_meta::engine::XATTR_CREATE_FLAG;
 use studiofs_meta::schema::ROOT_INO;
 use studiofs_meta::{DirEntry, FileType, InodeAttr, SetattrArgs, TimeSpec, UploadState};
 use studiofs_vfs::vfs::{
-    OsCacheDisposition, OsCacheOpenDecision, OsCacheParticipation, OsCacheReason,
+    DeferredNamespaceWait, OsCacheDisposition, OsCacheOpenDecision, OsCacheParticipation,
+    OsCacheReason,
 };
 use studiofs_vfs::{
     KernelInvalidator, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
@@ -96,6 +97,8 @@ pub(crate) struct StudioVfsAdapter {
     read_queue_byte_limit: u32,
     next_runtime_stats_fh: AtomicU64,
     runtime_stats_handles: Arc<ParkingMutex<HashMap<u64, Vec<u8>>>>,
+    #[cfg(test)]
+    symlink_deferred_wait_entered: Arc<tokio::sync::Notify>,
 }
 
 pub(crate) struct DirectoryHandle {
@@ -928,7 +931,15 @@ impl StudioVfsAdapter {
             read_queue_byte_limit,
             next_runtime_stats_fh: AtomicU64::new(u64::MAX / 2),
             runtime_stats_handles: Arc::new(ParkingMutex::new(HashMap::new())),
+            #[cfg(test)]
+            symlink_deferred_wait_entered: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Notified each time a symlink attempt starts waiting for its deferred parent.
+    #[cfg(test)]
+    pub(crate) fn symlink_deferred_wait_entered_for_test(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.symlink_deferred_wait_entered)
     }
 
     pub(crate) fn new_namespace_reply_cancellation(&self) -> CancellationToken {
@@ -1104,61 +1115,95 @@ impl StudioVfsAdapter {
         target: &[u8],
         cancellation: CancellationToken,
     ) -> Result<InodeAttr, i32> {
+        self.symlink_with_retry_timeout(
+            parent,
+            name,
+            target,
+            cancellation,
+            MACFUSE_SYMLINK_RETRY_TIMEOUT,
+        )
+        .await
+    }
+
+    pub(crate) async fn symlink_with_retry_timeout(
+        &self,
+        parent: u64,
+        name: &[u8],
+        target: &[u8],
+        cancellation: CancellationToken,
+        retry_timeout: Duration,
+    ) -> Result<InodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        let retry_deadline = tokio::time::Instant::now() + MACFUSE_SYMLINK_RETRY_TIMEOUT;
+        let retry_deadline = tokio::time::Instant::now() + retry_timeout;
+        let name: Arc<[u8]> = Arc::from(name);
+        let target: Arc<[u8]> = Arc::from(target);
         loop {
             if cancellation.is_cancelled() {
                 return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
             }
             let vfs = Arc::clone(&self.vfs);
-            let owned_name = name.to_vec();
-            let target = target.to_vec();
+            let attempt_name = Arc::clone(&name);
+            let attempt_target = Arc::clone(&target);
             let mount_uid = self.mount_uid;
             let mount_gid = self.mount_gid;
+            // The local metadata attempt is not cancellable once started; reply
+            // teardown drains this task before the session releases requests.
             let attempt = self.runtime_handle.spawn_blocking(move || {
-                // Capture this before the metadata lookup so a commit racing the
-                // symlink attempt still permits the final retry.
-                let deferred_parent_pending = vfs.has_deferred_namespace_metadata(parent);
-                let result = vfs.symlink(parent, &owned_name, &target, mount_uid, mount_gid);
-                (deferred_parent_pending, result)
+                // Capture this before the metadata lookup so a parent commit
+                // racing the symlink attempt is still observed by the wait.
+                let parent_progress = vfs.deferred_namespace_metadata_progress(parent);
+                let result =
+                    vfs.symlink(parent, &attempt_name, &attempt_target, mount_uid, mount_gid);
+                (parent_progress, result)
             });
-            let (deferred_parent_pending, result) = attempt.await.map_err(|_| libc::EIO)?;
-            match result {
+            let (parent_progress, result) = attempt.await.map_err(|error| {
+                warn!(
+                    parent,
+                    name = %String::from_utf8_lossy(&name),
+                    error = %error,
+                    "macFUSE symlink metadata attempt did not complete"
+                );
+                libc::EIO
+            })?;
+            let error = match result {
                 Ok(attr) => {
                     self.shared.kernel_inode_liveness.observe(attr.ino);
                     return Ok(attr);
                 }
-                Err(error) => {
-                    let errno = vfs_err_to_errno(&error);
-                    if errno == libc::ENOENT
-                        && deferred_parent_pending
-                        && tokio::time::Instant::now() < retry_deadline
-                    {
-                        debug!(
-                            parent,
-                            name = %String::from_utf8_lossy(name),
-                            "macFUSE symlink waiting for deferred parent metadata"
-                        );
-                        let wait = self
-                            .vfs
-                            .wait_for_deferred_namespace_metadata_or_shutdown(parent);
-                        let wait_result = tokio::select! {
-                            biased;
-                            () = cancellation.cancelled() => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
-                            result = tokio::time::timeout_at(retry_deadline, wait) => {
-                                result.map_err(|_| libc::ENOENT)?
-                            },
-                        };
-                        match wait_result {
-                            Ok(true) => continue,
-                            Ok(false) => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
-                            Err(wait_error) => return Err(vfs_err_to_errno(&wait_error)),
-                        }
-                    }
-                    return Err(errno);
+                Err(error) => error,
+            };
+            let errno = vfs_err_to_errno(&error);
+            let Some(parent_progress) = parent_progress.filter(|_| errno == libc::ENOENT) else {
+                return Err(errno);
+            };
+            if tokio::time::Instant::now() >= retry_deadline {
+                return Err(errno);
+            }
+            debug!(
+                parent,
+                name = %String::from_utf8_lossy(&name),
+                "macFUSE symlink waiting for deferred parent metadata"
+            );
+            #[cfg(test)]
+            self.symlink_deferred_wait_entered.notify_one();
+            let wait = self
+                .vfs
+                .wait_for_deferred_namespace_progress_or_shutdown(parent_progress);
+            let wait_result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(MACFUSE_READ_INTERRUPTED_ERRNO),
+                result = tokio::time::timeout_at(retry_deadline, wait) => {
+                    result.map_err(|_| libc::ENOENT)?
+                },
+            };
+            match wait_result {
+                Ok(DeferredNamespaceWait::Settled | DeferredNamespaceWait::Progressed) => {}
+                Ok(DeferredNamespaceWait::ShutdownStarted) => {
+                    return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
                 }
+                Err(wait_error) => return Err(vfs_err_to_errno(&wait_error)),
             }
         }
     }
@@ -4967,20 +5012,18 @@ mod tests {
         let adapter = Arc::clone(&callback_state.adapter);
         let cancellation = adapter.new_namespace_reply_cancellation();
         let reply_task = adapter.reply_tasks.track();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let wait_entered = adapter.symlink_deferred_wait_entered_for_test();
         let task = runtime.spawn(async move {
             let _reply_task = reply_task;
-            let _ = started_tx.send(());
             adapter
                 .symlink(parent.ino, b"child-link", b"target", cancellation)
                 .await
         });
-        let started = runtime.spawn(async move {
-            started_rx.await.expect("symlink task should start");
-        });
         runtime
-            .block_on(started)
-            .expect("symlink start barrier should join");
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), wait_entered.notified()).await
+            })
+            .expect("symlink should wait for its deferred parent");
 
         let sentinel = runtime.spawn_blocking(|| 7);
         let sentinel_result = runtime
@@ -5004,7 +5047,10 @@ mod tests {
                 .unwrap_err(),
             libc::EINTR
         );
-        assert!(drain_result.expect("deferred metadata drain should finish"));
+        assert_eq!(
+            drain_result.expect("deferred metadata drain should finish"),
+            studiofs_vfs::vfs::DeferredNamespaceWait::Settled
+        );
     }
 
     #[test]
