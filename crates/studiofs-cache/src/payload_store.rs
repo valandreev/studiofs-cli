@@ -2579,18 +2579,27 @@ mod tests {
     fn hot_read_into_reuses_cached_descriptors() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
-        let store = FilePayloadStore::open(layout).unwrap();
+        let store = FilePayloadStore::open_with_modes(
+            layout,
+            LocalPayloadSyncMode::Durable,
+            LocalPayloadWriteMode::Buffered,
+            LocalPayloadReadMode::Buffered,
+        )
+        .unwrap();
         store.put(700, b"abcdef").unwrap();
         let paths_before = store.read_mode_snapshot().payload_path_builds;
 
         let mut out = [0_u8; 3];
         assert_eq!(store.read_into(700, 0, &mut out), Some(3));
+        assert_eq!(&out, b"abc");
         assert_eq!(
             store.read_mode_snapshot().payload_path_builds,
             paths_before + 1
         );
         assert_eq!(store.read_into(700, 1, &mut out), Some(3));
+        assert_eq!(&out, b"bcd");
         assert_eq!(store.read_into(700, 2, &mut out), Some(3));
+        assert_eq!(&out, b"cde");
         assert_eq!(store.get(700).unwrap().as_ref(), b"abcdef");
         store.advise_will_need(700);
         assert_eq!(
