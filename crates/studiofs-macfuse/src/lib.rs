@@ -1238,7 +1238,16 @@ mod tests {
             studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-eof-bytes")
                 .expect("create VFS fixture");
         let vfs = fixture.vfs();
-        let attr = vfs
+        let full_attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"full.txt",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create full-read file");
+        let eof_attr = vfs
             .create(
                 studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
                 b"eof.txt",
@@ -1246,28 +1255,233 @@ mod tests {
                 20,
                 0o644,
             )
-            .expect("create file");
+            .expect("create EOF file");
+        const REQUEST_SIZE: u32 = 4096;
+        let previous_bytes = vec![0xA5; REQUEST_SIZE as usize];
         fixture
             .runtime()
-            .block_on(vfs.write(attr.ino, 0, b"short"))
-            .expect("seed payload");
+            .block_on(vfs.write(full_attr.ino, 0, &previous_bytes))
+            .expect("seed full-read payload");
+        fixture
+            .runtime()
+            .block_on(vfs.write(eof_attr.ino, 0, b"short"))
+            .expect("seed short EOF payload");
         vfs.reset_diagnostics_observability();
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
-        let reader = adapter
-            .open(attr.ino, libc::O_RDONLY)
-            .expect("open reader through macFUSE adapter");
+        let full_reader = adapter
+            .open(full_attr.ino, libc::O_RDONLY)
+            .expect("open full-read handle through macFUSE adapter");
+        let eof_reader = adapter
+            .open(eof_attr.ino, libc::O_RDONLY)
+            .expect("open EOF handle through macFUSE adapter");
 
-        let queued = adapter
-            .queue_read_for_test(attr.ino, reader.file_handle(), 0, 4096)
-            .expect("queue EOF-sized read");
-        let bytes = queued.wait().expect("queued read should complete");
+        let first = adapter
+            .queue_read_for_test(full_attr.ino, full_reader.file_handle(), 0, REQUEST_SIZE)
+            .expect("queue full-sized read");
+        assert_eq!(
+            first.wait().expect("full-sized read should complete"),
+            previous_bytes
+        );
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        let zeroed_after_first_read = adapter.freshly_zeroed_read_buffer_bytes_for_test();
+        let eof = adapter
+            .queue_read_for_test(eof_attr.ino, eof_reader.file_handle(), 0, REQUEST_SIZE)
+            .expect("queue EOF-sized read using the recycled buffer");
+        let bytes = eof.wait().expect("queued EOF read should complete");
 
         assert_eq!(&bytes[..], b"short");
+        let past_eof = adapter
+            .queue_read_for_test(eof_attr.ino, eof_reader.file_handle(), 5, REQUEST_SIZE)
+            .expect("queue read at EOF using the recycled buffer");
+        assert!(
+            past_eof
+                .wait()
+                .expect("EOF read should complete")
+                .is_empty()
+        );
+        assert_eq!(
+            adapter.freshly_zeroed_read_buffer_bytes_for_test(),
+            zeroed_after_first_read,
+            "EOF reads must run on the recycled storage"
+        );
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 3);
+        assert_eq!(metrics.fuse_callbacks.read.bytes, REQUEST_SIZE as u64 + 5);
+        assert_eq!(metrics.fuse_callbacks.read.errors, 0);
+    }
+
+    /// Create `name` under the contract root and seed it through `write` calls.
+    fn create_seeded_file(
+        fixture: &studiofs_vfs::contract_harness::ContractVfsFixture,
+        name: &[u8],
+        writes: &[(u64, &[u8])],
+    ) -> u64 {
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                name,
+                501,
+                20,
+                0o644,
+            )
+            .expect("create seeded file");
+        for (offset, bytes) in writes {
+            fixture
+                .runtime()
+                .block_on(vfs.write(attr.ino, *offset, bytes))
+                .expect("seed file payload");
+        }
+        attr.ino
+    }
+
+    /// Read a dense 0xA5 payload so the adapter pool holds one dirty buffer.
+    fn dirty_read_buffer_pool(
+        fixture: &studiofs_vfs::contract_harness::ContractVfsFixture,
+        adapter: &super::adapter::StudioVfsAdapter,
+        size: u32,
+    ) {
+        let dense = vec![0xA5; size as usize];
+        let ino = create_seeded_file(fixture, b"dense.bin", &[(0, &dense)]);
+        let reader = adapter
+            .open(ino, libc::O_RDONLY)
+            .expect("open dense reader through macFUSE adapter");
+        let queued = adapter
+            .queue_read_for_test(ino, reader.file_handle(), 0, size)
+            .expect("queue dense read");
+        assert_eq!(queued.wait().expect("dense read should complete"), dense);
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+    }
+
+    #[test]
+    fn read_only_adapter_queued_read_error_with_recycled_buffer_returns_errno_only() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-async-read-missing-inode",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        dirty_read_buffer_pool(&fixture, &adapter, 32);
+        let zeroed_before = adapter.freshly_zeroed_read_buffer_bytes_for_test();
+        vfs.reset_diagnostics_observability();
+
+        let queued = adapter
+            .queue_read_for_test(u64::MAX, 0, 0, 32)
+            .expect("queue read for missing inode");
+        let errno = queued
+            .wait()
+            .expect_err("missing inode read should return a VFS error");
+
+        assert_eq!(errno, libc::ENOENT);
+        assert_eq!(
+            adapter.freshly_zeroed_read_buffer_bytes_for_test(),
+            zeroed_before,
+            "the failed read must run on the recycled storage"
+        );
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
         let metrics = vfs.write_path_observability_snapshot();
         assert_eq!(metrics.fuse_callbacks.read.calls, 1);
-        assert_eq!(metrics.fuse_callbacks.read.bytes, 5);
-        assert_eq!(metrics.fuse_callbacks.read.errors, 0);
+        assert_eq!(metrics.fuse_callbacks.read.errors, 1);
+        assert_eq!(metrics.fuse_async_read.pending_reads, 0);
+        assert_eq!(metrics.fuse_async_read.failed_reads, 1);
+    }
+
+    #[test]
+    fn read_only_adapter_sparse_read_with_recycled_buffer_replies_zeroed_hole() {
+        const REQUEST_SIZE: u32 = 4096;
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-async-read-hole")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        dirty_read_buffer_pool(&fixture, &adapter, REQUEST_SIZE);
+        let zeroed_before = adapter.freshly_zeroed_read_buffer_bytes_for_test();
+        let tail_offset = u64::from(REQUEST_SIZE) - 4;
+        let sparse_ino = create_seeded_file(
+            &fixture,
+            b"sparse.bin",
+            &[(0, b"head"), (tail_offset, b"tail")],
+        );
+        let reader = adapter
+            .open(sparse_ino, libc::O_RDONLY)
+            .expect("open sparse reader through macFUSE adapter");
+
+        let bytes = adapter
+            .queue_read_for_test(sparse_ino, reader.file_handle(), 0, REQUEST_SIZE)
+            .expect("queue sparse read")
+            .wait()
+            .expect("sparse read should complete");
+
+        let mut expected = vec![0; REQUEST_SIZE as usize];
+        expected[..4].copy_from_slice(b"head");
+        expected[REQUEST_SIZE as usize - 4..].copy_from_slice(b"tail");
+        assert_eq!(bytes, expected);
+        assert_eq!(
+            adapter.freshly_zeroed_read_buffer_bytes_for_test(),
+            zeroed_before,
+            "the sparse read must run on the recycled storage"
+        );
+    }
+
+    #[test]
+    fn read_only_adapter_cancel_during_vfs_fill_recycles_buffer_without_reply() {
+        const REQUEST_SIZE: u32 = 4096;
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-async-read-cancel-in-vfs",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        dirty_read_buffer_pool(&fixture, &adapter, REQUEST_SIZE);
+        let zeroed_before = adapter.freshly_zeroed_read_buffer_bytes_for_test();
+        let short_ino = create_seeded_file(&fixture, b"short.txt", &[(0, b"short")]);
+        let reader = adapter
+            .open(short_ino, libc::O_RDONLY)
+            .expect("open short reader through macFUSE adapter");
+        vfs.reset_diagnostics_observability();
+        let reached_vfs_fill = adapter.stall_next_vfs_read_until_canceled_for_test();
+
+        let canceled = adapter
+            .queue_cancelable_read_for_test(short_ino, reader.file_handle(), 0, REQUEST_SIZE)
+            .expect("queue cancelable read");
+        fixture
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    reached_vfs_fill.notified(),
+                )
+                .await
+            })
+            .expect("read should reach the VFS fill with pooled storage");
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 0);
+        canceled.cancel();
+        let errno = canceled
+            .wait_timeout(std::time::Duration::from_secs(5))
+            .expect("canceled read should finish")
+            .expect_err("canceled read must not reply with bytes");
+
+        assert_eq!(errno, libc::EINTR);
+        assert_eq!(adapter.reusable_read_buffer_count_for_test(), 1);
+        let metrics = vfs.write_path_observability_snapshot();
+        assert_eq!(metrics.fuse_callbacks.read.calls, 0);
+        assert_eq!(metrics.fuse_async_read.pending_reads, 0);
+        assert_eq!(metrics.fuse_async_read.canceled_reads, 1);
+        let bytes = adapter
+            .queue_read_for_test(short_ino, reader.file_handle(), 0, REQUEST_SIZE)
+            .expect("queue read after cancellation")
+            .wait()
+            .expect("read after cancellation should complete");
+        assert_eq!(&bytes[..], b"short");
+        assert_eq!(
+            adapter.freshly_zeroed_read_buffer_bytes_for_test(),
+            zeroed_before,
+            "canceled and follow-up reads must reuse the recycled storage"
+        );
     }
 
     #[test]
