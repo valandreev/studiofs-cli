@@ -8,6 +8,7 @@
 //! [`PooledReadBuffer::limit_reply_len`] and must never reply with the buffer
 //! after an error or cancellation.
 
+use std::cmp::Reverse;
 use std::fmt;
 use std::mem;
 use std::ops::{Deref, DerefMut};
@@ -18,9 +19,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::Mutex as ParkingMutex;
 
 const MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
+pub(super) const MACFUSE_READ_BUFFER_POOL_MAX_RETAINED_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY: usize = 8 * 1024 * 1024;
-// Keep allocator-rounded buffers that grew slightly beyond the reusable read
-// cap, while dropping genuinely oversized requests instead of pinning them.
+// Bound each idle allocation as well as the total pool capacity.
 pub(super) const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize =
     MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY;
 /// Debug and test builds overwrite lent storage with this byte so a VFS path
@@ -30,8 +31,16 @@ pub(super) const MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY: usize =
 pub(super) const MACFUSE_READ_BUFFER_POISON: u8 = 0xdb;
 
 #[derive(Default)]
+struct PoolState {
+    buffers: Vec<Vec<u8>>,
+    retained_bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+#[derive(Default)]
 pub(super) struct ReadBufferPool {
-    buffers: ParkingMutex<Vec<Vec<u8>>>,
+    state: ParkingMutex<PoolState>,
     #[cfg(test)]
     freshly_zeroed_bytes: AtomicUsize,
 }
@@ -40,7 +49,7 @@ impl fmt::Debug for ReadBufferPool {
     // Pooled storage holds stale file data, so Debug reports only bookkeeping.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadBufferPool")
-            .field("available", &self.buffers.lock().len())
+            .field("available", &self.state.lock().buffers.len())
             .finish_non_exhaustive()
     }
 }
@@ -62,20 +71,36 @@ impl ReadBufferPool {
         }
     }
 
-    /// Reuse already-initialized storage when possible. Otherwise allocate
-    /// zeroed storage through `alloc_zeroed`, which lets the allocator skip the
-    /// memset for pages it already knows are zero and never copies stale bytes
-    /// the way growing an undersized recycled buffer would.
+    /// Reuse initialized storage from the request's size class or allocate an
+    /// exact-sized zeroed buffer.
     fn take_storage(&self, len: usize) -> Vec<u8> {
-        let mut buffers = self.buffers.lock();
-        if let Some(index) = buffers.iter().rposition(|buffer| buffer.len() >= len) {
-            return buffers.swap_remove(index);
+        if len == 0 {
+            return Vec::new();
         }
-        // Evict one undersized buffer per miss so a pool of small buffers
-        // converges toward the working-set size instead of starving large reads.
-        let evicted = buffers.pop();
-        drop(buffers);
-        drop(evicted);
+        let class_len = len
+            .checked_next_power_of_two()
+            .filter(|&class_len| class_len <= MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY)
+            .unwrap_or(len);
+        let mut state = self.state.lock();
+        if class_len <= MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY
+            && let Some(index) = state
+                .buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, buffer)| {
+                    buffer.len() >= len
+                        && buffer.len().checked_next_power_of_two() == Some(class_len)
+                })
+                .min_by_key(|(_, buffer)| buffer.capacity())
+                .map(|(index, _)| index)
+        {
+            let storage = state.buffers.remove(index);
+            state.retained_bytes -= storage.capacity();
+            state.hits += 1;
+            return storage;
+        }
+        state.misses += 1;
+        drop(state);
         #[cfg(test)]
         self.freshly_zeroed_bytes.fetch_add(len, Ordering::Relaxed);
         vec![0; len]
@@ -89,20 +114,37 @@ impl ReadBufferPool {
         {
             return;
         }
-        let mut buffers = self.buffers.lock();
-        if buffers.len() < MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS {
-            buffers.push(storage);
+        let mut state = self.state.lock();
+        state.retained_bytes += storage.capacity();
+        state.buffers.push(storage);
+        while state.buffers.len() > MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS
+            || state.retained_bytes > MACFUSE_READ_BUFFER_POOL_MAX_RETAINED_BYTES
+        {
+            let index = state
+                .buffers
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, buffer)| Reverse(buffer.capacity()))
+                .map(|(index, _)| index)
+                .expect("a retained buffer exceeds the pool budget");
+            let evicted = state.buffers.remove(index);
+            state.retained_bytes -= evicted.capacity();
         }
+    }
+
+    pub(super) fn snapshot(&self) -> (u64, u64, usize) {
+        let state = self.state.lock();
+        (state.hits, state.misses, state.retained_bytes)
     }
 
     #[cfg(test)]
     pub(super) fn available_count(&self) -> usize {
-        self.buffers.lock().len()
+        self.state.lock().buffers.len()
     }
 
     #[cfg(test)]
     pub(super) fn last_available_capacity(&self) -> Option<usize> {
-        self.buffers.lock().last().map(Vec::capacity)
+        self.state.lock().buffers.last().map(Vec::capacity)
     }
 
     #[cfg(test)]
@@ -226,15 +268,91 @@ mod tests {
     }
 
     #[test]
-    fn acquire_replaces_undersized_storage_with_zeroed_allocation() {
+    fn acquire_preserves_other_classes_and_allocates_exact_zeroed_storage() {
         let pool = Arc::new(ReadBufferPool::default());
         drop(pool.acquire(16));
 
         drop(pool.acquire(20));
 
         assert_eq!(pool.freshly_zeroed_bytes(), 36);
-        assert_eq!(pool.available_count(), 1);
+        assert_eq!(pool.available_count(), 2);
         assert_eq!(pool.last_available_capacity(), Some(20));
+    }
+
+    #[test]
+    fn acquire_reuses_only_adequate_storage_within_a_size_class() {
+        let pool = Arc::new(ReadBufferPool::default());
+        drop(pool.acquire(65));
+        let too_small = pool.acquire(100);
+        assert_eq!(too_small.storage.len(), 100);
+        drop(too_small);
+        drop(pool.acquire(120));
+
+        let reused = pool.acquire(80);
+        assert_eq!(reused.storage.len(), 100);
+        assert_eq!(pool.snapshot(), (1, 3, 65 + 120));
+    }
+
+    #[test]
+    fn small_request_does_not_reuse_a_large_buffer() {
+        let pool = Arc::new(ReadBufferPool::default());
+        drop(pool.acquire(8 * 1024 * 1024));
+
+        let small = pool.acquire(128 * 1024);
+
+        assert_eq!(small.storage.len(), 128 * 1024);
+        assert_eq!(pool.snapshot(), (0, 2, 8 * 1024 * 1024));
+    }
+
+    #[test]
+    fn recycle_evicts_largest_buffers_to_stay_within_the_retained_budget() {
+        let pool = ReadBufferPool::default();
+        let mut large_ptrs = Vec::new();
+        for _ in 0..5 {
+            let capacity = 8 * 1024 * 1024;
+            let mut storage = Vec::with_capacity(capacity);
+            storage.resize(1, 0);
+            large_ptrs.push(storage.as_ptr());
+            pool.recycle(storage);
+        }
+
+        let (_, _, retained_bytes) = pool.snapshot();
+        assert_eq!(retained_bytes, MACFUSE_READ_BUFFER_POOL_MAX_RETAINED_BYTES);
+        assert_eq!(pool.available_count(), 4);
+        assert_eq!(pool.last_available_capacity(), Some(8 * 1024 * 1024));
+        let state = pool.state.lock();
+        assert!(
+            state
+                .buffers
+                .iter()
+                .all(|buffer| buffer.as_ptr() != large_ptrs[0])
+        );
+        assert!(
+            large_ptrs[1..]
+                .iter()
+                .all(|ptr| state.buffers.iter().any(|buffer| buffer.as_ptr() == *ptr))
+        );
+    }
+
+    #[test]
+    fn empty_and_oversized_requests_are_not_retained() {
+        let pool = Arc::new(ReadBufferPool::default());
+        assert!(pool.acquire(0).is_empty());
+        drop(pool.acquire(MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY + 1));
+
+        assert_eq!(pool.snapshot(), (0, 1, 0));
+        assert_eq!(pool.available_count(), 0);
+    }
+
+    #[test]
+    fn recycle_caps_the_buffer_count() {
+        let pool = ReadBufferPool::default();
+        for _ in 0..=MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS {
+            pool.recycle(vec![0]);
+        }
+
+        assert_eq!(pool.available_count(), MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS);
+        assert_eq!(pool.snapshot().2, MACFUSE_READ_BUFFER_POOL_MAX_BUFFERS);
     }
 
     #[test]

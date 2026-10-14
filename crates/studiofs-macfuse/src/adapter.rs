@@ -49,7 +49,10 @@ mod read_buffer;
 
 #[cfg(test)]
 use read_buffer::MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY;
-use read_buffer::{MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY, PooledReadBuffer, ReadBufferPool};
+use read_buffer::{
+    MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY, MACFUSE_READ_BUFFER_POOL_MAX_RETAINED_BYTES,
+    PooledReadBuffer, ReadBufferPool,
+};
 
 const TTL_SECONDS: f64 = 1.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = crate::low_level::MACOS_FUSE_IOSIZE_BYTES;
@@ -681,7 +684,8 @@ impl AsyncReadDiagnostics {
         pending_reads
     }
 
-    fn snapshot(&self) -> VfsFuseAsyncReadSnapshot {
+    fn snapshot(&self, pool: &ReadBufferPool) -> VfsFuseAsyncReadSnapshot {
+        let (hits, misses, retained_bytes) = pool.snapshot();
         VfsFuseAsyncReadSnapshot {
             max_pending_bytes: Some(self.max_pending_bytes),
             pending_reads: self.pending_reads.load(Ordering::Relaxed),
@@ -694,12 +698,21 @@ impl AsyncReadDiagnostics {
             admission_waits: self.admission_waits.load(Ordering::Relaxed),
             admission_wait_total_ms: self.admission_wait_total_ns.load(Ordering::Relaxed) as f64
                 / 1_000_000.0,
+            read_buffer_pool_hits: hits,
+            read_buffer_pool_misses: misses,
+            read_buffer_pool_retained_bytes: retained_bytes,
+            read_buffer_pool_budget_bytes: Some(MACFUSE_READ_BUFFER_POOL_MAX_RETAINED_BYTES),
         }
     }
 
-    fn publish_snapshot_after_finish(&self, vfs: &StudioVfs, pending_reads: usize) {
+    fn publish_snapshot_after_finish(
+        &self,
+        vfs: &StudioVfs,
+        pending_reads: usize,
+        pool: &ReadBufferPool,
+    ) {
         if pending_reads == 0 || self.should_publish_snapshot() {
-            vfs.record_fuse_async_read_snapshot(self.snapshot());
+            vfs.record_fuse_async_read_snapshot(self.snapshot(pool));
         }
     }
 
@@ -763,9 +776,11 @@ impl Drop for AsyncReadTaskGuard<'_> {
             .shared
             .read_diagnostics
             .on_finished(self.size, self.outcome);
-        self.shared
-            .read_diagnostics
-            .publish_snapshot_after_finish(self.vfs, pending_reads);
+        self.shared.read_diagnostics.publish_snapshot_after_finish(
+            self.vfs,
+            pending_reads,
+            &self.shared.read_buffers,
+        );
         if let Some(flush) = self.shared.kernel_invalidations.finish_read() {
             flush.flush();
         }
@@ -1214,6 +1229,12 @@ impl StudioVfsAdapter {
                 return Err(libc::EROFS);
             }
             let fh = self.next_runtime_stats_fh.fetch_add(1, Ordering::Relaxed);
+            // Refresh idle storage accounting after replies have recycled their buffers.
+            self.vfs.record_fuse_async_read_snapshot(
+                self.shared
+                    .read_diagnostics
+                    .snapshot(&self.shared.read_buffers),
+            );
             let bytes = self.vfs.runtime_stats_file_text().into_bytes();
             self.runtime_stats_handles.lock().insert(fh, bytes);
             return Ok(OpenReply::new(fh).with_direct_io(true));
@@ -2929,6 +2950,8 @@ mod open_cache_snapshot_tests {
             .macfuse_open_cache
             .total;
 
+        drop(adapter.shared.read_buffers.acquire(128 * 1024));
+        drop(adapter.shared.read_buffers.acquire(128 * 1024));
         let open = adapter
             .open(ino, libc::O_RDONLY)
             .expect("open runtime stats");
@@ -2945,6 +2968,33 @@ mod open_cache_snapshot_tests {
         assert!(
             json.get("macfuse_open_cache").is_some(),
             "the existing macfuse_open_cache JSON section must remain present"
+        );
+        assert_eq!(json["fuse_async_read"]["read_buffer_pool_hits"], 1);
+        assert_eq!(json["fuse_async_read"]["read_buffer_pool_misses"], 1);
+        assert_eq!(
+            json["fuse_async_read"]["read_buffer_pool_retained_bytes"],
+            128 * 1024
+        );
+        assert_eq!(
+            json["fuse_async_read"]["read_buffer_pool_budget_bytes"],
+            32 * 1024 * 1024
+        );
+        let runtime = fixture.vfs().runtime_stats_snapshot();
+        assert_eq!(
+            runtime.bridge.counters["fuse_read_buffer_pool_hits"].value,
+            1
+        );
+        assert_eq!(
+            runtime.bridge.counters["fuse_read_buffer_pool_misses"].value,
+            1
+        );
+        assert_eq!(
+            runtime.bridge.gauges["fuse_read_buffer_pool_retained_bytes"].value,
+            128 * 1024
+        );
+        assert_eq!(
+            runtime.bridge.gauges["fuse_read_buffer_pool_budget_bytes"].value,
+            32 * 1024 * 1024
         );
         adapter
             .release(ino, open.file_handle())

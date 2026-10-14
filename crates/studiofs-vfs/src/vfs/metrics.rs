@@ -1178,6 +1178,14 @@ pub struct VfsFuseAsyncWriteSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct VfsFuseAsyncReadSnapshot {
+    /// Reads served from the FUSE read buffer pool.
+    pub read_buffer_pool_hits: u64,
+    /// Reads that could not use a buffer from the FUSE read buffer pool.
+    pub read_buffer_pool_misses: u64,
+    /// Bytes currently retained by the FUSE read buffer pool.
+    pub read_buffer_pool_retained_bytes: usize,
+    /// Retained-byte budget for the FUSE read buffer pool, when supported.
+    pub read_buffer_pool_budget_bytes: Option<usize>,
     /// Maximum pending read bytes admitted across the adapter.
     pub max_pending_bytes: Option<usize>,
     /// Current pending async read requests.
@@ -2428,6 +2436,31 @@ mod tests {
         assert_eq!(snapshot.barrier_timeouts, 0);
         assert_eq!(snapshot.inode_barrier_waits, 0);
         assert_eq!(snapshot.handle_barrier_waits, 0);
+    }
+
+    #[test]
+    fn fuse_async_read_snapshot_serializes_buffer_pool_metrics() {
+        let snapshot = VfsFuseAsyncReadSnapshot {
+            read_buffer_pool_hits: 7,
+            read_buffer_pool_misses: 3,
+            read_buffer_pool_retained_bytes: 8192,
+            read_buffer_pool_budget_bytes: Some(16_384),
+            ..VfsFuseAsyncReadSnapshot::default()
+        };
+
+        let serialized = serde_json::to_value(&snapshot).expect("serialize async-read snapshot");
+        assert_eq!(serialized["read_buffer_pool_hits"], 7);
+        assert_eq!(serialized["read_buffer_pool_misses"], 3);
+        assert_eq!(serialized["read_buffer_pool_retained_bytes"], 8192);
+        assert_eq!(serialized["read_buffer_pool_budget_bytes"], 16_384);
+
+        let legacy: VfsFuseAsyncReadSnapshot =
+            serde_json::from_value(serde_json::json!({"pending_reads": 2}))
+                .expect("deserialize legacy async-read snapshot");
+        assert_eq!(legacy.read_buffer_pool_hits, 0);
+        assert_eq!(legacy.read_buffer_pool_misses, 0);
+        assert_eq!(legacy.read_buffer_pool_retained_bytes, 0);
+        assert_eq!(legacy.read_buffer_pool_budget_bytes, None);
     }
 
     #[test]
