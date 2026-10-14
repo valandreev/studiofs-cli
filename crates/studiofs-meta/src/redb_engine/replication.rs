@@ -1419,11 +1419,166 @@ impl RedbMetaEngine {
         self.apply_replica_serving_state_inner(events, false, false)
     }
 
+    /// Replays this client's unflushed events on top of the serving state that already
+    /// includes them. An event whose inode the serving state tombstones was superseded by a
+    /// later local removal in the same window, so it is dropped: replaying it would
+    /// resurrect the removed inode through the base row, or leave a row the removal
+    /// cannot clear. A rename keeps its dentry move when its entry and parents are live,
+    /// but drops attr payloads for tombstoned inodes.
     pub(crate) fn apply_replica_serving_state_for_pending_replay(
         &self,
         events: &[crate::events::MetaEvent],
     ) -> MetaResult<()> {
-        self.apply_replica_serving_state_inner(events, true, true)
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self.begin_write_txn()?;
+        let live_events = {
+            let tombstones = txn
+                .open_table(INODE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut live_events = Vec::with_capacity(events.len());
+            for event in events {
+                Self::push_pending_replay_events_for_tombstones(
+                    &tombstones,
+                    event,
+                    &mut live_events,
+                )?;
+            }
+            live_events
+        };
+        Self::apply_replica_serving_state_in_txn_with(&txn, &live_events, true, true)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Appends the replay form of `event` to `out`; a superseded event appends nothing.
+    fn push_pending_replay_events_for_tombstones<'event, T: ReadableTable<u64, u8>>(
+        tombstones: &T,
+        event: &'event crate::events::MetaEvent,
+        out: &mut Vec<Cow<'event, crate::events::MetaEvent>>,
+    ) -> MetaResult<()> {
+        use crate::events::MetaEvent;
+        let tombstoned = |ino: Ino| -> MetaResult<bool> { Ok(tombstones.get(ino)?.is_some()) };
+        let single = |ino: Ino| -> MetaResult<Option<Cow<'event, MetaEvent>>> {
+            Ok((!tombstoned(ino)?).then_some(Cow::Borrowed(event)))
+        };
+        let replay = match event {
+            MetaEvent::SetAttr { attr } => single(attr.ino)?,
+            MetaEvent::RemoveAttr { ino }
+            | MetaEvent::SetXattr { ino, .. }
+            | MetaEvent::RemoveXattr { ino, .. }
+            | MetaEvent::SetAclRule { ino, .. }
+            | MetaEvent::RemoveAclRule { ino, .. }
+            | MetaEvent::SetSymlinkTarget { ino, .. }
+            | MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+            | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+            | MetaEvent::RemoveRegularFileGraph { ino } => single(*ino)?,
+            MetaEvent::AddEntry { parent, entry, .. } => {
+                (!tombstoned(*parent)? && !tombstoned(entry.ino)?).then_some(Cow::Borrowed(event))
+            }
+            MetaEvent::RemoveEntry { parent, .. } => single(*parent)?,
+            MetaEvent::RenameEntry {
+                parent,
+                new_parent,
+                entry,
+                ..
+            } => {
+                if tombstoned(*parent)? || tombstoned(*new_parent)? || tombstoned(entry.ino)? {
+                    return Ok(());
+                }
+                let superseded_attr = |attr: &Option<InodeAttr>| -> MetaResult<bool> {
+                    match attr {
+                        Some(attr) => tombstoned(attr.ino),
+                        None => Ok(false),
+                    }
+                };
+                let MetaEvent::RenameEntry {
+                    displaced_set_attr,
+                    displaced_remove_attr_ino,
+                    moved_dir_attr,
+                    old_parent_attr,
+                    new_parent_attr,
+                    ..
+                } = event
+                else {
+                    unreachable!("matched RenameEntry above");
+                };
+                let drop_displaced_set = superseded_attr(displaced_set_attr.as_ref())?;
+                let drop_displaced_remove = match displaced_remove_attr_ino {
+                    Some(ino) => tombstoned(*ino)?,
+                    None => false,
+                };
+                let drop_moved_dir = superseded_attr(moved_dir_attr.as_ref())?;
+                let drop_old_parent = superseded_attr(old_parent_attr.as_ref())?;
+                let drop_new_parent = superseded_attr(new_parent_attr.as_ref())?;
+                if !(drop_displaced_set
+                    || drop_displaced_remove
+                    || drop_moved_dir
+                    || drop_old_parent
+                    || drop_new_parent)
+                {
+                    out.push(Cow::Borrowed(event));
+                    Self::push_destination_entry_replay(event, out);
+                    return Ok(());
+                }
+                let mut sanitized = event.clone();
+                if let MetaEvent::RenameEntry {
+                    displaced_set_attr,
+                    displaced_remove_attr_ino,
+                    moved_dir_attr,
+                    old_parent_attr,
+                    new_parent_attr,
+                    ..
+                } = &mut sanitized
+                {
+                    if drop_displaced_set {
+                        **displaced_set_attr = None;
+                    }
+                    if drop_displaced_remove {
+                        *displaced_remove_attr_ino = None;
+                    }
+                    if drop_moved_dir {
+                        **moved_dir_attr = None;
+                    }
+                    if drop_old_parent {
+                        **old_parent_attr = None;
+                    }
+                    if drop_new_parent {
+                        **new_parent_attr = None;
+                    }
+                }
+                out.push(Cow::Owned(sanitized));
+                Self::push_destination_entry_replay(event, out);
+                return Ok(());
+            }
+            _ => Some(Cow::Borrowed(event)),
+        };
+        out.extend(replay);
+        Ok(())
+    }
+
+    /// A replayed live rename also sets its destination name to the moved entry, as the
+    /// local rename did. The serving rename arm only sets it when the base tables agree.
+    fn push_destination_entry_replay<'event>(
+        event: &'event crate::events::MetaEvent,
+        out: &mut Vec<Cow<'event, crate::events::MetaEvent>>,
+    ) {
+        if let crate::events::MetaEvent::RenameEntry {
+            new_parent,
+            new_name,
+            entry,
+            ..
+        } = event
+        {
+            out.push(Cow::Owned(crate::events::MetaEvent::AddEntry {
+                parent: *new_parent,
+                name: new_name.clone(),
+                entry: entry.clone(),
+            }));
+        }
     }
 
     fn apply_replica_serving_state_inner(

@@ -4,8 +4,8 @@ use super::*;
 use crate::contract_harness::{ContractVfsFixture, ContractVfsOp};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
 use studiofs_cache::CachedStoreWriterConfig;
@@ -1478,6 +1478,37 @@ struct RecordingKernelInvalidator {
     attr_seen: parking_lot::Mutex<Vec<Ino>>,
     entries_seen: parking_lot::Mutex<Vec<(Ino, Vec<u8>)>>,
     reset_requested: AtomicBool,
+}
+
+struct SizeObservingKernelInvalidator {
+    vfs: Weak<StudioVfs>,
+    attr_sizes_seen: parking_lot::Mutex<Vec<(Ino, Option<u64>)>>,
+}
+
+impl SizeObservingKernelInvalidator {
+    fn new(vfs: &Arc<StudioVfs>) -> Self {
+        Self {
+            vfs: Arc::downgrade(vfs),
+            attr_sizes_seen: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn attr_sizes_seen(&self) -> Vec<(Ino, Option<u64>)> {
+        self.attr_sizes_seen.lock().clone()
+    }
+}
+
+impl KernelInvalidator for SizeObservingKernelInvalidator {
+    fn inval_inode(&self, _ino: Ino) {}
+
+    fn inval_inode_attrs(&self, ino: Ino) {
+        let size = self
+            .vfs
+            .upgrade()
+            .and_then(|vfs| vfs.getattr(ino).ok())
+            .map(|attr| attr.size);
+        self.attr_sizes_seen.lock().push((ino, size));
+    }
 }
 
 struct AlwaysFailKernelInvalidator;
@@ -19796,7 +19827,7 @@ fn release_fh_invalidates_kernel_attrs_after_dirty_last_handle_close() {
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        let invalidator = Arc::new(SizeObservingKernelInvalidator::new(&vfs));
         vfs.set_kernel_invalidator(invalidator.clone());
 
         vfs.write_fh_with_deferred_materialize(
@@ -19809,15 +19840,67 @@ fn release_fh_invalidates_kernel_attrs_after_dirty_last_handle_close() {
         .await
         .unwrap();
         assert!(
-            invalidator.attr_snapshot().is_empty(),
+            invalidator.attr_sizes_seen().is_empty(),
             "write should not invalidate kernel attrs while the handle is active"
         );
 
         let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
         assert!(outcome.closed_last_handle);
+        assert_eq!(
+            invalidator.attr_sizes_seen(),
+            vec![(
+                ino,
+                Some(b"release should drop stale kernel attrs".len() as u64)
+            )],
+            "last-handle release must invalidate after the final size is visible"
+        );
+    });
+}
+
+#[test]
+fn release_fh_invalidates_attrs_after_local_state_was_flushed_while_writer_open() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "release-invalidates-clean-attrs");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"release-invalidates-clean-attrs.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let invalidator = Arc::new(SizeObservingKernelInvalidator::new(&vfs));
+        vfs.set_kernel_invalidator(invalidator.clone());
+        let payload = b"release must invalidate after an earlier local flush";
+
+        vfs.write_fh_with_deferred_materialize(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
         assert!(
-            invalidator.attr_snapshot().contains(&ino),
-            "last-handle release should evict stale kernel attrs after local dirty writes"
+            invalidator.attr_sizes_seen().is_empty(),
+            "write should not invalidate kernel attrs while the handle is active"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "flush should finish local materialization before the last-handle release"
+        );
+        assert_eq!(meta.get_attr(ino).unwrap().size, payload.len() as u64);
+        assert!(
+            invalidator.attr_sizes_seen().is_empty(),
+            "the active writer should keep the kernel notification deferred after flush"
+        );
+
+        let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+        assert!(outcome.closed_last_handle);
+        assert!(
+            !outcome.flushed_local_dirty_state,
+            "release should take the clean path after the explicit flush"
+        );
+        assert_eq!(
+            invalidator.attr_sizes_seen(),
+            vec![(ino, Some(payload.len() as u64))],
+            "last-handle release must deliver the deferred notification at the committed size"
         );
     });
 }
@@ -21112,6 +21195,137 @@ fn deferred_release_materializes_writer_stack_tail_before_reopened_read() {
         assert_eq!(read as usize, payload.len());
         assert_eq!(actual, payload);
         vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn deferred_last_handle_release_invalidates_attrs_after_visible_size_is_current() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-release-attr-size");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"deferred-release-attr-size.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        assert_eq!(vfs.getattr_async(ino).await.unwrap().size, 0);
+
+        let invalidator = Arc::new(SizeObservingKernelInvalidator::new(&vfs));
+        vfs.set_kernel_invalidator(invalidator.clone());
+        let (materializer, materializer_guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(ino)
+            .expect("test should hold materialization until release is queued");
+
+        let writer = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = vec![0xE7; vfs.block_size as usize + 123];
+        vfs.write_fh_with_deferred_materialize(
+            writer,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.get_attr(ino).unwrap().size, 0);
+        // A commit notification queued while the writer is open must drain after materialization too.
+        vfs.invalidate_kernel_inode_attrs([ino]);
+        assert!(invalidator.attr_sizes_seen().is_empty());
+
+        let outcome = vfs.release_fh_with_deferred_last_handle_barrier(writer, rt.handle());
+        assert!(outcome.closed_last_handle);
+        assert!(
+            invalidator.attr_sizes_seen().is_empty(),
+            "release must not notify before local materialization completes"
+        );
+
+        drop(materializer_guard);
+        drop(materializer);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.wait_for_deferred_release_inflight(ino),
+        )
+        .await
+        .expect("deferred release should finish after materialization");
+
+        assert_eq!(
+            vfs.getattr_async(ino).await.unwrap().size,
+            payload.len() as u64
+        );
+        assert_eq!(
+            invalidator.attr_sizes_seen(),
+            vec![(ino, Some(payload.len() as u64))],
+            "kernel attrs should be invalidated only after the final visible size is installed"
+        );
+
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        let mut actual = vec![0; payload.len()];
+        let read = vfs.read_into_fh(reader, ino, 0, &mut actual).await.unwrap();
+        assert_eq!(read as usize, payload.len());
+        assert_eq!(actual, payload);
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn release_fh_cancelled_while_waiting_for_materialization_still_invalidates_attrs() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "release-cancel-attr-flush");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"release-cancel-attr-flush.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let invalidator = Arc::new(SizeObservingKernelInvalidator::new(&vfs));
+        vfs.set_kernel_invalidator(invalidator.clone());
+        let (materializer, materializer_guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(ino)
+            .expect("test should hold materialization open across the release");
+
+        let writer = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh_with_deferred_materialize(
+            writer,
+            ino,
+            0,
+            b"cancelled release still refreshes",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert!(invalidator.attr_sizes_seen().is_empty());
+
+        // One poll closes the handle and parks on the held materializer. The
+        // release is then dropped mid-flight, which must still deliver the refresh.
+        let mut release = Box::pin(vfs.release_fh_with_outcome(writer));
+        let parked = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(release.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(parked, "release must park behind the held materializer");
+        drop(release);
+
+        let seen = invalidator.attr_sizes_seen();
+        assert_eq!(
+            seen.iter()
+                .map(|(seen_ino, _)| *seen_ino)
+                .collect::<Vec<_>>(),
+            vec![ino],
+            "dropping a parked release must still invalidate kernel attrs exactly once"
+        );
+
+        drop(materializer_guard);
+        drop(materializer);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.wait_for_deferred_release_inflight(ino),
+        )
+        .await
+        .expect("no deferred release should remain after the cancelled release");
     });
 }
 

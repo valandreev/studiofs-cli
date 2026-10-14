@@ -369,6 +369,14 @@ impl StudioVfs {
                 write_path.fuse_async_write.handle_barrier_waits,
             ),
             (
+                "fuse_read_buffer_pool_hits",
+                write_path.fuse_async_read.read_buffer_pool_hits,
+            ),
+            (
+                "fuse_read_buffer_pool_misses",
+                write_path.fuse_async_read.read_buffer_pool_misses,
+            ),
+            (
                 "fuse_invalidation_coalesced",
                 write_path.fuse_invalidation.coalesced,
             ),
@@ -439,6 +447,11 @@ impl StudioVfs {
                     .unwrap_or_default() as u64,
             ),
             (
+                "fuse_read_buffer_pool_retained_bytes",
+                "bytes",
+                write_path.fuse_async_read.read_buffer_pool_retained_bytes as u64,
+            ),
+            (
                 "fuse_requested_max_read_bytes",
                 "bytes",
                 u64::from(write_path.fuse_connection.requested_max_read_bytes),
@@ -475,6 +488,14 @@ impl StudioVfs {
             ),
         ] {
             insert_gauge(&mut snapshot.bridge, name, unit, value);
+        }
+        if let Some(budget_bytes) = write_path.fuse_async_read.read_buffer_pool_budget_bytes {
+            insert_gauge(
+                &mut snapshot.bridge,
+                "fuse_read_buffer_pool_budget_bytes",
+                "bytes",
+                budget_bytes as u64,
+            );
         }
         if let Some(max_background) = write_path.fuse_connection.effective_max_background {
             insert_gauge(

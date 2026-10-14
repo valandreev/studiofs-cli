@@ -2507,3 +2507,322 @@ fn replica_serving_remove_attr_clears_regular_file_base_payload() {
         "remote remove attr must not leave base payload graph for the removed inode"
     );
 }
+
+/// Local events `[start, end)` as the pending-replay restore reads them back.
+fn local_window_events(engine: &RedbMetaEngine, start: u64) -> Vec<MetaEvent> {
+    let end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    engine.read_events_range(start, end).unwrap()
+}
+
+/// Mirrors the published base row a flushed create leaves behind. Its committed epoch is
+/// newer than the unflushed create attr, which is what makes replay take the stale-base path.
+fn publish_base_row_for_test(engine: &RedbMetaEngine, ino: Ino) {
+    let mut published = engine.get_attr(ino).unwrap();
+    published.upload_state = UploadState::Ready;
+    published.size = 4096;
+    published.committed_size = 4096;
+    published.content_epoch = 1;
+    published.committed_content_epoch = 1;
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::SetAttr { attr: published }])
+        .unwrap();
+}
+
+#[test]
+fn pending_serving_replay_treats_file_created_and_removed_in_window_as_superseded() {
+    let engine = temp_engine();
+    let name = b"pending-created-then-removed.bin";
+    let window_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let file = engine.create_file(ROOT_INO, name, 1000, 1000, 0o644).unwrap();
+    engine.unlink(ROOT_INO, name).unwrap();
+    let events = local_window_events(&engine, window_start);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, MetaEvent::RemoveAttr { ino } if *ino == file.ino)),
+        "window must contain the removal of the created inode"
+    );
+
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+
+    assert!(engine.lookup(ROOT_INO, name).is_err());
+    assert!(engine.get_attr(file.ino).is_err());
+}
+
+#[test]
+fn pending_serving_replay_skips_base_ready_attr_for_inode_removed_later_in_window() {
+    let engine = temp_engine();
+    let name = b"pending-base-then-removed.bin";
+    let window_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let file = engine.create_file(ROOT_INO, name, 1000, 1000, 0o644).unwrap();
+    publish_base_row_for_test(&engine, file.ino);
+    engine.unlink(ROOT_INO, name).unwrap();
+    let events = local_window_events(&engine, window_start);
+
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+
+    assert!(engine.lookup(ROOT_INO, name).is_err());
+    assert!(engine.get_attr(file.ino).is_err());
+}
+
+#[test]
+fn pending_serving_replay_keeps_name_reused_after_removal_in_window() {
+    let engine = temp_engine();
+    let name = b"pending-name-reused.bin";
+    let window_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let first = engine.create_file(ROOT_INO, name, 1000, 1000, 0o644).unwrap();
+    engine.unlink(ROOT_INO, name).unwrap();
+    let second = engine.create_file(ROOT_INO, name, 1000, 1000, 0o644).unwrap();
+    assert_ne!(first.ino, second.ino);
+    let events = local_window_events(&engine, window_start);
+
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+
+    assert_eq!(engine.lookup(ROOT_INO, name).unwrap().ino, second.ino);
+    assert!(engine.get_attr(first.ino).is_err());
+    assert_eq!(engine.get_attr(second.ino).unwrap().ino, second.ino);
+}
+
+#[test]
+fn pending_serving_replay_keeps_name_reused_after_published_removal_in_window() {
+    let engine = temp_engine();
+    let name = b"pending-published-name-reused.bin";
+    let window_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let first = engine.create_file(ROOT_INO, name, 1000, 1000, 0o644).unwrap();
+    publish_base_row_for_test(&engine, first.ino);
+    engine.unlink(ROOT_INO, name).unwrap();
+    let second = engine.create_file(ROOT_INO, name, 1000, 1000, 0o644).unwrap();
+    let events = local_window_events(&engine, window_start);
+
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+
+    assert_eq!(engine.lookup(ROOT_INO, name).unwrap().ino, second.ino);
+    assert!(engine.get_attr(first.ino).is_err());
+    assert_eq!(engine.get_attr(second.ino).unwrap().ino, second.ino);
+}
+
+fn inode_tombstone_present_for_test(engine: &RedbMetaEngine, ino: Ino) -> bool {
+    let txn = engine.begin_read_txn().unwrap();
+    let table = txn.open_table(INODE_TOMBSTONES_TABLE).unwrap();
+    table.get(ino).unwrap().is_some()
+}
+
+fn xattr_row_present_for_test(engine: &RedbMetaEngine, ino: Ino, name: &[u8]) -> bool {
+    let txn = engine.begin_read_txn().unwrap();
+    let table = txn.open_table(XATTRS_TABLE).unwrap();
+    let key = encode_xattr_key(ino, name);
+    table.get(key.as_slice()).unwrap().is_some()
+}
+
+fn symlink_row_present_for_test(engine: &RedbMetaEngine, ino: Ino) -> bool {
+    let txn = engine.begin_read_txn().unwrap();
+    let table = txn.open_table(SYMLINKS_TABLE).unwrap();
+    table.get(ino).unwrap().is_some()
+}
+
+/// Publishes the current attr of `ino` into the base tables, as a flushed create does.
+fn publish_current_attr_to_base_for_test(engine: &RedbMetaEngine, ino: Ino) {
+    let attr = engine.get_attr(ino).unwrap();
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::SetAttr { attr }])
+        .unwrap();
+}
+
+#[test]
+fn pending_serving_replay_drops_xattr_set_on_inode_removed_later_in_window() {
+    let engine = temp_engine();
+    let name = b"pending-xattr-then-removed.bin";
+    let xattr = b"com.apple.quarantine";
+    let window_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let file = engine.create_file(ROOT_INO, name, 1000, 1000, 0o644).unwrap();
+    publish_base_row_for_test(&engine, file.ino);
+    engine.set_xattr(file.ino, xattr, b"0083;quarantine", 0).unwrap();
+    engine.unlink(ROOT_INO, name).unwrap();
+    let events = local_window_events(&engine, window_start);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, MetaEvent::SetXattr { ino, .. } if *ino == file.ino)),
+        "window must contain the xattr set"
+    );
+
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+
+    assert!(inode_tombstone_present_for_test(&engine, file.ino));
+    assert!(engine.get_attr(file.ino).is_err());
+    assert!(!xattr_row_present_for_test(&engine, file.ino, xattr));
+    assert!(engine.lookup(ROOT_INO, name).is_err());
+}
+
+#[test]
+fn pending_serving_replay_drops_symlink_target_set_on_inode_removed_later_in_window() {
+    let engine = temp_engine();
+    let name = b"pending-symlink-then-removed";
+    let window_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let link = engine
+        .create_symlink(ROOT_INO, name, b"target/path", 1000, 1000)
+        .unwrap();
+    publish_current_attr_to_base_for_test(&engine, link.ino);
+    engine.unlink(ROOT_INO, name).unwrap();
+    let events = local_window_events(&engine, window_start);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, MetaEvent::SetSymlinkTarget { ino, .. } if *ino == link.ino)),
+        "window must contain the symlink target set"
+    );
+
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+
+    assert!(inode_tombstone_present_for_test(&engine, link.ino));
+    assert!(engine.get_attr(link.ino).is_err());
+    assert!(!symlink_row_present_for_test(&engine, link.ino));
+    assert!(engine.lookup(ROOT_INO, name).is_err());
+}
+
+#[test]
+fn pending_serving_replay_drops_moved_entry_removed_later_in_window() {
+    let engine = temp_engine();
+    let window_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let file = engine
+        .create_file(ROOT_INO, b"pending-moved-a.bin", 1000, 1000, 0o644)
+        .unwrap();
+    publish_base_row_for_test(&engine, file.ino);
+    engine
+        .rename(ROOT_INO, b"pending-moved-a.bin", ROOT_INO, b"pending-moved-b.bin")
+        .unwrap();
+    engine.unlink(ROOT_INO, b"pending-moved-b.bin").unwrap();
+    let events = local_window_events(&engine, window_start);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, MetaEvent::RenameEntry { .. })),
+        "window must contain the rename"
+    );
+
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+
+    assert!(inode_tombstone_present_for_test(&engine, file.ino));
+    assert!(engine.get_attr(file.ino).is_err());
+    assert!(engine.lookup(ROOT_INO, b"pending-moved-a.bin").is_err());
+    assert!(engine.lookup(ROOT_INO, b"pending-moved-b.bin").is_err());
+}
+
+#[test]
+fn pending_serving_replay_keeps_rename_over_when_displaced_inode_was_removed() {
+    let engine = temp_engine();
+    let window_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let displaced = engine
+        .create_file(ROOT_INO, b"pending-over-a.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let winner = engine
+        .create_file(ROOT_INO, b"pending-over-b.bin", 1000, 1000, 0o644)
+        .unwrap();
+    publish_base_row_for_test(&engine, displaced.ino);
+    engine
+        .rename(
+            ROOT_INO,
+            b"pending-over-b.bin",
+            ROOT_INO,
+            b"pending-over-a.bin",
+        )
+        .unwrap();
+    assert!(engine.get_attr(displaced.ino).is_err());
+    let events = local_window_events(&engine, window_start);
+
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+
+    assert!(inode_tombstone_present_for_test(&engine, displaced.ino));
+    assert!(engine.get_attr(displaced.ino).is_err());
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"pending-over-a.bin").unwrap().ino,
+        winner.ino
+    );
+    assert!(engine.lookup(ROOT_INO, b"pending-over-b.bin").is_err());
+}
+
+#[test]
+fn pending_serving_replay_drops_directory_moved_then_removed_in_window() {
+    let engine = temp_engine();
+    let window_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let parent = engine
+        .create_dir(ROOT_INO, b"pending-dir-parent", 1000, 1000, 0o755)
+        .unwrap();
+    let dir = engine
+        .create_dir(ROOT_INO, b"pending-dir-moved", 1000, 1000, 0o755)
+        .unwrap();
+    publish_current_attr_to_base_for_test(&engine, dir.ino);
+    engine
+        .rename(
+            ROOT_INO,
+            b"pending-dir-moved",
+            parent.ino,
+            b"pending-dir-moved",
+        )
+        .unwrap();
+    engine.rmdir(parent.ino, b"pending-dir-moved").unwrap();
+    let events = local_window_events(&engine, window_start);
+
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+
+    assert!(inode_tombstone_present_for_test(&engine, dir.ino));
+    assert!(engine.get_attr(dir.ino).is_err());
+    assert!(engine.lookup(parent.ino, b"pending-dir-moved").is_err());
+    assert!(engine.lookup(ROOT_INO, b"pending-dir-moved").is_err());
+    assert_eq!(engine.get_attr(parent.ino).unwrap().ino, parent.ino);
+}
+
+#[test]
+fn pending_serving_replay_rename_over_local_entry_resolves_to_moved_winner() {
+    let engine = temp_engine();
+    let window_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let displaced = engine
+        .create_file(ROOT_INO, b"pending-local-over-a.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let winner = engine
+        .create_file(ROOT_INO, b"pending-local-over-b.bin", 1000, 1000, 0o644)
+        .unwrap();
+    engine
+        .rename(
+            ROOT_INO,
+            b"pending-local-over-b.bin",
+            ROOT_INO,
+            b"pending-local-over-a.bin",
+        )
+        .unwrap();
+    let events = local_window_events(&engine, window_start);
+
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+
+    assert_eq!(
+        engine
+            .lookup(ROOT_INO, b"pending-local-over-a.bin")
+            .unwrap()
+            .ino,
+        winner.ino
+    );
+    assert!(engine
+        .lookup(ROOT_INO, b"pending-local-over-b.bin")
+        .is_err());
+    assert!(engine.get_attr(displaced.ino).is_err());
+}
