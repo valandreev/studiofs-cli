@@ -16079,6 +16079,154 @@ fn deferred_namespace_wait_keeps_blocking_until_all_inode_ops_complete() {
     });
 }
 
+fn poll_once<F: std::future::Future + Unpin>(future: &mut F) -> std::task::Poll<F::Output> {
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    std::pin::Pin::new(future).poll(&mut context)
+}
+
+#[test]
+fn deferred_namespace_wait_returns_when_vfs_shutdown_starts() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-wait-shutdown");
+    rt.block_on(async {
+        let ino = 1;
+        vfs.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .admit_pending_inode(ino);
+
+        let mut waiter = Box::pin(vfs.wait_for_deferred_namespace_metadata_or_shutdown(ino));
+        assert!(
+            poll_once(&mut waiter).is_pending(),
+            "waiter must be blocked on pending metadata before shutdown"
+        );
+        vfs.state.shutdown.background_shutdown_token.cancel();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("shutdown must bound the waiter")
+                .expect("shutdown is not a metadata failure"),
+            DeferredNamespaceWait::ShutdownStarted
+        );
+    });
+}
+
+#[test]
+fn deferred_namespace_wait_returns_settled_when_nothing_is_pending() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-wait-settled");
+
+    let result = rt.block_on(vfs.wait_for_deferred_namespace_metadata_or_shutdown(1));
+
+    assert_eq!(
+        result.expect("settled metadata wait should succeed"),
+        DeferredNamespaceWait::Settled
+    );
+}
+
+#[test]
+fn deferred_namespace_wait_returns_stored_commit_error() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-wait-error");
+    vfs.state
+        .namespace
+        .deferred
+        .inner
+        .lock()
+        .errors
+        .insert(1, Arc::from("metadata commit failed"));
+
+    let result = rt.block_on(vfs.wait_for_deferred_namespace_metadata_or_shutdown(1));
+
+    assert!(matches!(
+        result,
+        Err(crate::VfsError::Other(message))
+            if message.contains("deferred namespace metadata commit failed")
+    ));
+}
+
+#[test]
+fn deferred_namespace_progress_wait_returns_when_one_of_several_ops_settles() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-progress-wait");
+    rt.block_on(async {
+        let ino = 1;
+        {
+            let mut inner = vfs.state.namespace.deferred.inner.lock();
+            inner.admit_pending_inode(ino);
+            inner.admit_pending_inode(ino);
+        }
+        let progress = vfs
+            .deferred_namespace_metadata_progress(ino)
+            .expect("inode should be pending");
+        let mut waiter = Box::pin(vfs.wait_for_deferred_namespace_progress_or_shutdown(progress));
+        assert!(poll_once(&mut waiter).is_pending());
+
+        // The parent create settles while a later attribute update stays queued.
+        vfs.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .settle_pending_inode(ino);
+        vfs.state.namespace.deferred.notify.notify_waiters();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("one settled op must release the progress waiter")
+                .expect("progress wait should succeed"),
+            DeferredNamespaceWait::Progressed
+        );
+        assert!(vfs.has_deferred_namespace_metadata(ino));
+    });
+}
+
+#[test]
+fn deferred_namespace_progress_observes_settle_before_wait() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-progress-race");
+    let ino = 1;
+    {
+        let mut inner = vfs.state.namespace.deferred.inner.lock();
+        inner.admit_pending_inode(ino);
+        inner.admit_pending_inode(ino);
+    }
+    let progress = vfs
+        .deferred_namespace_metadata_progress(ino)
+        .expect("inode should be pending");
+    // A settle that lands between capture and wait must not be missed.
+    vfs.state
+        .namespace
+        .deferred
+        .inner
+        .lock()
+        .settle_pending_inode(ino);
+
+    let mut waiter = Box::pin(vfs.wait_for_deferred_namespace_progress_or_shutdown(progress));
+    let _runtime = rt.enter();
+
+    assert!(matches!(
+        poll_once(&mut waiter),
+        std::task::Poll::Ready(Ok(DeferredNamespaceWait::Progressed))
+    ));
+}
+
+#[test]
+fn deferred_namespace_progress_distinguishes_readmitted_inode() {
+    let mut inner = super::namespace::DeferredNamespaceInner::default();
+    let ino = 1;
+    inner.admit_pending_inode(ino);
+    let first = inner.pending_inode_progress(ino).expect("first admission");
+    inner.settle_pending_inode(ino);
+    inner.admit_pending_inode(ino);
+
+    assert_ne!(inner.pending_inode_progress(ino), Some(first));
+}
+
 #[test]
 fn deferred_namespace_drain_abandons_permanent_failure() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");

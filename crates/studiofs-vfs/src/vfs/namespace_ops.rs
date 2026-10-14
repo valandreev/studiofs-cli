@@ -1,4 +1,7 @@
-use super::namespace::{DeferredNamespaceInner, DeferredNamespaceKey, DeferredNamespaceOp};
+use super::namespace::{
+    DeferredNamespaceInner, DeferredNamespaceKey, DeferredNamespaceOp, DeferredNamespaceProgress,
+    DeferredNamespaceWait,
+};
 use super::{
     ATTR_CACHE_TTL, AccessLevel, Arc, ChunkId, DEFAULT_CHUNK_SIZE, DentryCacheValue,
     DirAccessEntry, DirEntry, FileSessionOperation, FileType, Ino, InodeAttr,
@@ -278,7 +281,7 @@ impl StudioVfs {
             }
             inner.attrs.insert(attr.ino, attr.clone());
             inner.errors.remove(&attr.ino);
-            *inner.pending_inodes.entry(attr.ino).or_default() += 1;
+            inner.admit_pending_inode(attr.ino);
             inner.queue.push_back(op);
             inner.admitted_operations += 1;
             inner.backlog_operations += 1;
@@ -329,14 +332,7 @@ impl StudioVfs {
                 }
                 DeferredNamespaceOp::SetAttr { .. } => {}
             }
-            let pending_count = inner.pending_inodes.get(&ino).copied().unwrap_or_default();
-            if pending_count <= 1 {
-                inner.pending_inodes.remove(&ino);
-                inner.attrs.remove(&ino);
-            } else {
-                inner.pending_inodes.insert(ino, pending_count - 1);
-            }
-            inner.settled_operations += 1;
+            inner.settle_pending_inode(ino);
             inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
             inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
         }
@@ -391,16 +387,9 @@ impl StudioVfs {
             }
             DeferredNamespaceOp::SetAttr { .. } => {}
         }
-        let pending_count = inner.pending_inodes.get(&ino).copied().unwrap_or_default();
-        if pending_count <= 1 {
-            inner.pending_inodes.remove(&ino);
-            inner.attrs.remove(&ino);
-        } else {
-            inner.pending_inodes.insert(ino, pending_count - 1);
-        }
+        inner.settle_pending_inode(ino);
         inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
         inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
-        inner.settled_operations += 1;
     }
 
     fn abandon_failed_deferred_namespace_batch(
@@ -557,6 +546,73 @@ impl StudioVfs {
                 }
             }
             notified.await;
+        }
+    }
+
+    /// Wait until no deferred namespace metadata remains pending for `ino`.
+    ///
+    /// Returns [`DeferredNamespaceWait::ShutdownStarted`] when VFS background
+    /// shutdown begins first, and a stored commit failure as an error.
+    pub async fn wait_for_deferred_namespace_metadata_or_shutdown(
+        &self,
+        ino: Ino,
+    ) -> VfsResult<DeferredNamespaceWait> {
+        let shutdown = self.state.shutdown.background_shutdown_token.clone();
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => Ok(DeferredNamespaceWait::ShutdownStarted),
+            result = self.wait_for_deferred_namespace_metadata(ino) => {
+                result.map(|()| DeferredNamespaceWait::Settled)
+            }
+        }
+    }
+
+    /// Capture deferred namespace progress for `ino`, or `None` when nothing is pending.
+    pub fn deferred_namespace_metadata_progress(
+        &self,
+        ino: Ino,
+    ) -> Option<DeferredNamespaceProgress> {
+        self.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .pending_inode_progress(ino)
+    }
+
+    /// Wait until an operation for the captured inode settles after `progress`.
+    ///
+    /// Unlike [`Self::wait_for_deferred_namespace_metadata_or_shutdown`], this
+    /// returns as soon as one operation for the inode settles, so a caller that
+    /// needs only the inode's creation does not wait for later attribute updates.
+    pub async fn wait_for_deferred_namespace_progress_or_shutdown(
+        &self,
+        progress: DeferredNamespaceProgress,
+    ) -> VfsResult<DeferredNamespaceWait> {
+        let shutdown = self.state.shutdown.background_shutdown_token.clone();
+        loop {
+            let notified = self.state.namespace.deferred.notify.notified();
+            {
+                let inner = self.state.namespace.deferred.inner.lock();
+                if let Some(error) = inner.errors.get(&progress.ino) {
+                    return Err(VfsError::Other(format!(
+                        "deferred namespace metadata commit failed for inode {}: {error}",
+                        progress.ino
+                    )));
+                }
+                match inner.pending_inode_progress(progress.ino) {
+                    None => return Ok(DeferredNamespaceWait::Settled),
+                    Some(current) if current != progress => {
+                        return Ok(DeferredNamespaceWait::Progressed);
+                    }
+                    Some(_) => {}
+                }
+            }
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return Ok(DeferredNamespaceWait::ShutdownStarted),
+                () = notified => {}
+            }
         }
     }
 

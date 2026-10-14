@@ -105,6 +105,64 @@ pub(super) struct DeferredNamespaceInner {
     pub(super) backlog_operations: usize,
     pub(super) backlog_bytes: usize,
     pub(super) locally_created_dirs: HashSet<Ino>,
+    /// `settled_operations` value at the latest admission or settle for each pending inode.
+    pub(super) inode_progress: HashMap<Ino, u64>,
+}
+
+impl DeferredNamespaceInner {
+    /// Count one more admitted deferred operation for `ino`.
+    pub(super) fn admit_pending_inode(&mut self, ino: Ino) {
+        let pending_count = self.pending_inodes.entry(ino).or_default();
+        if *pending_count == 0 {
+            self.inode_progress.insert(ino, self.settled_operations);
+        }
+        *pending_count += 1;
+    }
+
+    /// Record that one admitted operation for `ino` committed or failed permanently.
+    pub(super) fn settle_pending_inode(&mut self, ino: Ino) {
+        self.settled_operations += 1;
+        let pending_count = self.pending_inodes.get(&ino).copied().unwrap_or_default();
+        if pending_count <= 1 {
+            self.pending_inodes.remove(&ino);
+            self.attrs.remove(&ino);
+            self.inode_progress.remove(&ino);
+        } else {
+            self.pending_inodes.insert(ino, pending_count - 1);
+            self.inode_progress.insert(ino, self.settled_operations);
+        }
+    }
+
+    /// Return the progress snapshot for `ino` while it has pending deferred metadata.
+    pub(super) fn pending_inode_progress(&self, ino: Ino) -> Option<DeferredNamespaceProgress> {
+        self.pending_inodes
+            .contains_key(&ino)
+            .then(|| DeferredNamespaceProgress {
+                ino,
+                sequence: self.inode_progress.get(&ino).copied().unwrap_or_default(),
+            })
+    }
+}
+
+/// Snapshot of one inode's pending deferred namespace metadata.
+///
+/// Capture it before an operation that may observe the inode as missing, then
+/// wait with it so a settle racing that operation is not lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeferredNamespaceProgress {
+    pub(super) ino: Ino,
+    pub(super) sequence: u64,
+}
+
+/// Outcome of waiting on deferred namespace metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredNamespaceWait {
+    /// No deferred metadata operation remains pending for the inode.
+    Settled,
+    /// An operation for the inode settled, while later operations remain pending.
+    Progressed,
+    /// VFS background shutdown started before the wait completed.
+    ShutdownStarted,
 }
 
 pub(super) struct DeferredNamespaceState {
