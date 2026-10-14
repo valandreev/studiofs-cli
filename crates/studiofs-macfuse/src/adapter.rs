@@ -2086,8 +2086,9 @@ impl StudioVfsAdapter {
     /// The overlay is recorded only after the VFS `setattr` (or `getattr` for
     /// flag-only requests) succeeds; on error the existing overlay is left
     /// unchanged, and `flags = None` never touches it. Flag changes return
-    /// `EROFS` on read-only mounts. Concurrent calls for one inode are not
-    /// serialized with the VFS update, so the last overlay write wins.
+    /// `EROFS` on read-only mounts before inode lookup, including missing inodes.
+    /// Concurrent calls for one inode are not serialized with the VFS update,
+    /// so the last overlay write wins.
     pub(crate) fn setattr_with_file_flags(
         &self,
         file_handle: Option<u64>,
@@ -2361,7 +2362,7 @@ impl StudioVfsAdapter {
             self.mount_gid,
             MACFUSE_ATTR_BLOCK_SIZE,
         ));
-        if let Some(flags) = self.file_flags.get(&attr.ino).map(|entry| *entry.value()) {
+        if let Some(flags) = self.file_flags.get(&attr.ino).map(|entry| *entry) {
             assign_stat_flags(&mut stat, flags);
             if flags & MACOS_UF_HIDDEN != 0 {
                 assign_hidden_file_stat_times(&mut stat);
@@ -2383,10 +2384,13 @@ impl StudioVfsAdapter {
     /// the insert removes overlays for open-unlinked inodes and for inserts
     /// that raced with that cleanup, because removal publishes the VFS unlink
     /// before clearing the overlay.
+    /// A previously fetched attr cannot replace this post-insert lookup: unlink
+    /// may have completed between that fetch and the overlay insert.
     fn remember_file_flags(&self, ino: u64, flags: u32) {
         self.file_flags.insert(ino, flags);
         let unlinked = match self.getattr_attr(ino) {
             Ok(attr) => attr.nlink == 0,
+            // Permission and transient errors do not establish that the inode was deleted.
             Err(errno) => errno == libc::ENOENT,
         };
         if unlinked {
@@ -5005,6 +5009,14 @@ mod tests {
         let flags = adapter.getattr(attr.ino).expect("get file").st_flags;
 
         assert_eq!(flags, MACOS_UF_HIDDEN);
+        assert_eq!(
+            adapter
+                .setattr_with_file_flags(None, u64::MAX, SetattrArgs::default(), Some(0))
+                .err(),
+            Some(libc::EROFS),
+            "read-only policy is checked before inode existence"
+        );
+        assert!(!adapter.file_flags_contains_for_test(u64::MAX));
     }
 
     #[test]
@@ -5144,6 +5156,8 @@ mod tests {
     fn file_flags_other_inode_lookup_getattr_progress_while_flags_are_locked() {
         let (_fixture, adapter, attr) = file_flags_fixture_file("macfuse-file-flags-shards");
         adapter.remember_named_file_flags(attr.ino, MACOS_DS_STORE_NAME);
+        // The randomized hasher makes this bounded shard search probabilistic;
+        // failure to find a different shard fails setup rather than skipping the check.
         // Synthetic keys only need to occupy shards; they bypass liveness checks.
         for ino in 1000..1128 {
             adapter.file_flags.insert(ino, MACOS_UF_HIDDEN);
