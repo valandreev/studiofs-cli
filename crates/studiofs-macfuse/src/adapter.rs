@@ -91,6 +91,8 @@ pub(crate) struct StudioVfsAdapter {
     next_directory_handle: AtomicU64,
     shared: Arc<AdapterSharedState>,
     open_reply_serializer: FuseOpenReplySerializer,
+    // Darwin `st_flags` overlay. Shard guards are leaf locks: never hold a
+    // `Ref` across VFS calls or another `file_flags` access.
     file_flags: DashMap<u64, u32, foldhash::fast::RandomState>,
     read_queue_byte_limit: u32,
     next_runtime_stats_fh: AtomicU64,
@@ -2079,7 +2081,13 @@ impl StudioVfsAdapter {
         Ok(attr)
     }
 
-    /// Apply Darwin attribute overlays alongside the requested VFS attributes.
+    /// Apply the requested VFS attributes and the Darwin `st_flags` overlay.
+    ///
+    /// The overlay is recorded only after the VFS `setattr` (or `getattr` for
+    /// flag-only requests) succeeds; on error the existing overlay is left
+    /// unchanged, and `flags = None` never touches it. Flag changes return
+    /// `EROFS` on read-only mounts. Concurrent calls for one inode are not
+    /// serialized with the VFS update, so the last overlay write wins.
     pub(crate) fn setattr_with_file_flags(
         &self,
         file_handle: Option<u64>,
@@ -2087,13 +2095,16 @@ impl StudioVfsAdapter {
         args: SetattrArgs,
         flags: Option<u32>,
     ) -> Result<stat, i32> {
-        let attr = if setattr_args_are_empty(&args) {
+        if flags.is_some() && self.read_only {
+            return Err(libc::EROFS);
+        }
+        let attr = if args.is_empty() {
             self.getattr_attr(ino)?
         } else {
             self.setattr(file_handle, ino, args)?
         };
         if let Some(flags) = flags {
-            self.file_flags.insert(ino, flags);
+            self.remember_file_flags(ino, flags);
         }
         Ok(self.attr_to_stat(&attr))
     }
@@ -2350,7 +2361,7 @@ impl StudioVfsAdapter {
             self.mount_gid,
             MACFUSE_ATTR_BLOCK_SIZE,
         ));
-        if let Some(flags) = self.file_flags.get(&attr.ino).map(|entry| *entry) {
+        if let Some(flags) = self.file_flags.get(&attr.ino).map(|entry| *entry.value()) {
             assign_stat_flags(&mut stat, flags);
             if flags & MACOS_UF_HIDDEN != 0 {
                 assign_hidden_file_stat_times(&mut stat);
@@ -2361,7 +2372,25 @@ impl StudioVfsAdapter {
 
     fn remember_named_file_flags(&self, ino: u64, name: &[u8]) {
         if name == MACOS_DS_STORE_NAME {
-            self.file_flags.insert(ino, MACOS_UF_HIDDEN);
+            self.remember_file_flags(ino, MACOS_UF_HIDDEN);
+        }
+    }
+
+    /// Record an overlay only while the inode still has a namespace link.
+    ///
+    /// `unlink`/`rmdir`/rename-overwrite clear the overlay and close kernel
+    /// liveness, after which `forget` no longer clears it. Re-checking after
+    /// the insert removes overlays for open-unlinked inodes and for inserts
+    /// that raced with that cleanup, because removal publishes the VFS unlink
+    /// before clearing the overlay.
+    fn remember_file_flags(&self, ino: u64, flags: u32) {
+        self.file_flags.insert(ino, flags);
+        let unlinked = match self.getattr_attr(ino) {
+            Ok(attr) => attr.nlink == 0,
+            Err(errno) => errno == libc::ENOENT,
+        };
+        if unlinked {
+            self.clear_file_flags(ino);
         }
     }
 
@@ -4137,10 +4166,9 @@ macfuse_callback! {
                 return;
             }
         };
-        if setattr_args_are_empty(&args) {
+        let flags = setattr_callback_file_flags(attr, to_set);
+        if args.is_empty() {
             if setattr_mask_is_accepted_noop(to_set) {
-                let flags = (to_set == 0 || setattr_mask_has_flags(to_set))
-                    .then(|| callback_stat_flags(attr));
                 debug!(
                     ino,
                     to_set, "macFUSE setattr callback accepted unsupported metadata bits as no-op"
@@ -4177,9 +4205,11 @@ macfuse_callback! {
             // callback mask includes the header-defined file-handle bit.
             Some(unsafe { (*fi).fh })
         };
-        match state.adapter.setattr(file_handle, ino, args) {
-            Ok(attr) => {
-                let stat = state.adapter.attr_to_stat(&attr);
+        match state
+            .adapter
+            .setattr_with_file_flags(file_handle, ino, args, flags)
+        {
+            Ok(stat) => {
                 if let Some(request) = pending.take() {
                     let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
                 }
@@ -4338,15 +4368,12 @@ fn setattr_args_from_callback(attr: *const stat, to_set: libc::c_int) -> Result<
     Ok(args)
 }
 
-fn setattr_args_are_empty(args: &SetattrArgs) -> bool {
-    args.size.is_none()
-        && args.mode.is_none()
-        && args.uid.is_none()
-        && args.gid.is_none()
-        && args.atime.resolve().is_none()
-        && args.mtime.resolve().is_none()
-        && args.crtime.resolve().is_none()
-        && args.win_attrs.is_none()
+/// Darwin flags carried by the portable setattr callback.
+///
+/// An empty mask asks for no change, so it must not replace an existing
+/// overlay with whatever `st_flags` the request happens to contain.
+fn setattr_callback_file_flags(attr: *const stat, to_set: libc::c_int) -> Option<u32> {
+    setattr_mask_has_flags(to_set).then(|| callback_stat_flags(attr))
 }
 
 fn stat_time_to_nanos(seconds: libc::time_t, nanos: libc::c_long) -> Result<i64, i32> {
@@ -4849,74 +4876,143 @@ mod tests {
     use studiofs_meta::engine::XATTR_REPLACE_FLAG;
     use studiofs_vfs::contract_harness::ContractVfsFixture;
 
-    #[test]
-    fn file_flags_failed_setattr_preserves_overlay() {
-        let fixture = ContractVfsFixture::new("macfuse-flags-rejected").expect("fixture");
-        let attr = fixture
-            .vfs()
-            .create(ROOT_INO, b"flags.txt", 501, 20, 0o644)
-            .expect("create file");
-        let adapter = StudioVfsAdapter::new_with_read_only_for_test(
-            fixture.vfs(),
-            fixture.runtime().handle().clone(),
-            true,
-        );
-        adapter.remember_named_file_flags(attr.ino, MACOS_DS_STORE_NAME);
-        let error = adapter
-            .setattr_with_file_flags(None, attr.ino, SetattrArgs::size_only(1), Some(0))
-            .err();
-        assert_eq!(error, Some(libc::EROFS));
-        assert_eq!(
-            adapter
-                .getattr(attr.ino)
-                .expect("get unchanged flags")
-                .st_flags,
-            MACOS_UF_HIDDEN
-        );
-        assert_eq!(
-            adapter
-                .setattr_with_file_flags(
-                    None,
-                    u64::MAX,
-                    SetattrArgs::default(),
-                    Some(MACOS_UF_HIDDEN)
-                )
-                .err(),
-            Some(libc::ENOENT)
-        );
-        assert!(!adapter.file_flags_contains_for_test(u64::MAX));
-    }
-
-    #[test]
-    fn file_flags_noop_preserves_read_only_and_runtime_stats_behavior() {
-        let fixture = ContractVfsFixture::new("macfuse-flags-noop").expect("fixture");
-        let ino = fixture.vfs().runtime_stats_file_attr().ino;
-        let adapter = StudioVfsAdapter::new_with_read_only_for_test(
-            fixture.vfs(),
-            fixture.runtime().handle().clone(),
-            true,
-        );
-        let stat = adapter
-            .setattr_with_file_flags(None, ino, SetattrArgs::default(), Some(libc::UF_NODUMP))
-            .expect("apply no-op overlay to runtime stats");
-        assert_eq!((stat.st_ino, stat.st_flags), (ino, libc::UF_NODUMP));
-        assert_eq!(
-            adapter
-                .getattr(ino)
-                .expect("runtime stats getattr")
-                .st_flags,
-            libc::UF_NODUMP
-        );
-    }
-
-    #[test]
-    fn file_flags_successful_setattr_updates_reply_and_overlay() {
-        let fixture = ContractVfsFixture::new("macfuse-flags-applied").expect("fixture");
+    fn file_flags_fixture_file(name: &str) -> (ContractVfsFixture, StudioVfsAdapter, InodeAttr) {
+        let fixture = ContractVfsFixture::new(name).expect("create VFS fixture");
         let attr = fixture
             .vfs()
             .create(ROOT_INO, b"flags.txt", 501, 20, 0o644)
             .expect("create file");
         let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        (fixture, adapter, attr)
+    }
+
+    #[test]
+    fn file_flags_setattr_on_open_unlinked_inode_does_not_retain_overlay() {
+        let fixture = ContractVfsFixture::new("macfuse-flags-orphan").expect("fixture");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        let (attr, open) = adapter
+            .create(ROOT_INO, b"flags.txt", 0o644, libc::O_RDWR)
+            .expect("create file");
+        adapter
+            .unlink(ROOT_INO, b"flags.txt")
+            .expect("unlink open file");
+
+        let applied = adapter.setattr_with_file_flags(
+            Some(open.file_handle()),
+            attr.ino,
+            SetattrArgs::default(),
+            Some(libc::UF_NODUMP),
+        );
+
+        let retained = adapter.file_flags_contains_for_test(attr.ino);
+        adapter
+            .release(attr.ino, open.file_handle())
+            .expect("release orphan handle");
+        assert!(
+            !retained,
+            "orphan overlay would never be cleared after unlink; setattr result: {applied:?}"
+        );
+    }
+
+    #[test]
+    fn file_flags_remember_after_unlink_cleanup_does_not_retain_overlay() {
+        let (_fixture, adapter, attr) = file_flags_fixture_file("macfuse-flags-unlink-race");
+        adapter.unlink(ROOT_INO, b"flags.txt").expect("unlink file");
+
+        // Models an insert that lost the race with unlink's overlay cleanup.
+        adapter.remember_file_flags(attr.ino, MACOS_UF_HIDDEN);
+
+        assert!(!adapter.file_flags_contains_for_test(attr.ino));
+    }
+
+    #[test]
+    fn file_flags_failed_vfs_setattr_preserves_overlay() {
+        let (_fixture, adapter, attr) = file_flags_fixture_file("macfuse-flags-rejected");
+        adapter.remember_file_flags(attr.ino, MACOS_UF_HIDDEN);
+        let result = adapter.setattr_with_file_flags(
+            Some(u64::MAX),
+            attr.ino,
+            SetattrArgs::size_only(u64::MAX),
+            Some(0),
+        );
+        assert!(result.is_err(), "VFS setattr must fail: {result:?}");
+
+        let flags = adapter.getattr(attr.ino).expect("get file").st_flags;
+
+        assert_eq!(flags, MACOS_UF_HIDDEN);
+    }
+
+    #[test]
+    fn file_flags_setattr_on_missing_inode_does_not_insert_overlay() {
+        let (_fixture, adapter, _attr) = file_flags_fixture_file("macfuse-flags-missing");
+        let result =
+            adapter.setattr_with_file_flags(None, u64::MAX, SetattrArgs::default(), Some(0));
+        assert_eq!(result.err(), Some(libc::ENOENT));
+
+        assert!(!adapter.file_flags_contains_for_test(u64::MAX));
+    }
+
+    #[test]
+    fn file_flags_read_only_mount_rejects_flag_change_and_keeps_overlay() {
+        let fixture = ContractVfsFixture::new("macfuse-flags-read-only").expect("fixture");
+        let attr = fixture
+            .vfs()
+            .create(ROOT_INO, b"flags.txt", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new_with_read_only_for_test(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            true,
+        );
+        adapter.remember_file_flags(attr.ino, MACOS_UF_HIDDEN);
+        let result =
+            adapter.setattr_with_file_flags(None, attr.ino, SetattrArgs::default(), Some(0));
+        assert_eq!(result.err(), Some(libc::EROFS));
+
+        let flags = adapter.getattr(attr.ino).expect("get file").st_flags;
+
+        assert_eq!(flags, MACOS_UF_HIDDEN);
+    }
+
+    #[test]
+    fn file_flags_read_only_mount_accepts_noop_without_flags() {
+        let fixture = ContractVfsFixture::new("macfuse-flags-read-only-noop").expect("fixture");
+        let attr = fixture
+            .vfs()
+            .create(ROOT_INO, b"flags.txt", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new_with_read_only_for_test(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            true,
+        );
+
+        let result = adapter.setattr_with_file_flags(None, attr.ino, SetattrArgs::default(), None);
+
+        assert_eq!(result.map(|stat| stat.st_ino), Ok(attr.ino));
+    }
+
+    #[test]
+    fn file_flags_runtime_stats_noop_applies_overlay() {
+        let fixture = ContractVfsFixture::new("macfuse-flags-runtime-stats").expect("fixture");
+        let ino = fixture.vfs().runtime_stats_file_attr().ino;
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        adapter
+            .setattr_with_file_flags(None, ino, SetattrArgs::default(), Some(libc::UF_NODUMP))
+            .expect("apply overlay to runtime stats");
+
+        let flags = adapter
+            .getattr(ino)
+            .expect("runtime stats getattr")
+            .st_flags;
+
+        assert_eq!(flags, libc::UF_NODUMP);
+    }
+
+    #[test]
+    fn file_flags_setattr_reply_includes_new_size_and_flags() {
+        let (_fixture, adapter, attr) = file_flags_fixture_file("macfuse-flags-applied");
+
         let stat = adapter
             .setattr_with_file_flags(
                 None,
@@ -4925,36 +5021,101 @@ mod tests {
                 Some(MACOS_UF_HIDDEN | libc::UF_NODUMP),
             )
             .expect("apply size and flags");
+
         assert_eq!(
             (stat.st_size, stat.st_flags),
             (1, MACOS_UF_HIDDEN | libc::UF_NODUMP)
         );
-        let stat = adapter
+    }
+
+    #[test]
+    fn file_flags_flag_only_setattr_clears_overlay() {
+        let (_fixture, adapter, attr) = file_flags_fixture_file("macfuse-flags-cleared");
+        adapter.remember_file_flags(attr.ino, MACOS_UF_HIDDEN);
+        adapter
             .setattr_with_file_flags(None, attr.ino, SetattrArgs::default(), Some(0))
             .expect("clear flags only");
-        assert_eq!(stat.st_flags, 0);
+
+        let flags = adapter
+            .getattr(attr.ino)
+            .expect("get cleared flags")
+            .st_flags;
+
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn file_flags_setattr_without_flags_preserves_overlay() {
+        let (_fixture, adapter, attr) = file_flags_fixture_file("macfuse-flags-untouched");
+        adapter.remember_file_flags(attr.ino, MACOS_UF_HIDDEN);
+        let args = SetattrArgs {
+            mtime: TimeSpec::Set(1_000_000_000),
+            ..SetattrArgs::default()
+        };
+
+        let stat = adapter
+            .setattr_with_file_flags(None, attr.ino, args, None)
+            .expect("set mtime without flags");
+
+        assert_eq!(stat.st_flags, MACOS_UF_HIDDEN);
+    }
+
+    #[test]
+    fn file_flags_hidden_overlay_aligns_birth_and_change_times_with_mtime() {
+        let (_fixture, adapter, attr) = file_flags_fixture_file("macfuse-flags-hidden-times");
+        adapter.remember_named_file_flags(attr.ino, MACOS_DS_STORE_NAME);
+
+        let stat = adapter.getattr(attr.ino).expect("get hidden file");
+
         assert_eq!(
-            adapter
-                .getattr(attr.ino)
-                .expect("get cleared flags")
-                .st_flags,
-            0
+            (
+                stat.st_birthtime,
+                stat.st_birthtime_nsec,
+                stat.st_ctime,
+                stat.st_ctime_nsec
+            ),
+            (
+                stat.st_mtime,
+                stat.st_mtime_nsec,
+                stat.st_mtime,
+                stat.st_mtime_nsec
+            )
+        );
+    }
+
+    #[test]
+    fn setattr_callback_file_flags_ignores_empty_mask() {
+        let mut attr = minimal_stat(1);
+        attr.st_flags = libc::UF_NODUMP;
+
+        assert_eq!(setattr_callback_file_flags(&attr, 0), None);
+    }
+
+    #[test]
+    fn setattr_callback_file_flags_reads_flags_with_flags_mask() {
+        let mut attr = minimal_stat(1);
+        attr.st_flags = libc::UF_NODUMP;
+        // SAFETY: The C shim returns the header-defined FLAGS bit for this build.
+        let mask = unsafe {
+            crate::low_level::studiofs_macfuse_setattr_size_mask()
+                | crate::low_level::studiofs_macfuse_setattr_flags_mask()
+        };
+
+        assert_eq!(
+            setattr_callback_file_flags(&attr, mask),
+            Some(libc::UF_NODUMP)
         );
     }
 
     #[test]
     fn file_flags_other_inode_lookup_getattr_progress_while_flags_are_locked() {
-        let fixture =
-            ContractVfsFixture::new("macfuse-file-flags-shards").expect("create VFS fixture");
-        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
-        let attr = fixture
-            .vfs()
-            .create(ROOT_INO, b"flags.txt", 501, 20, 0o644)
-            .expect("create file");
+        let (_fixture, adapter, attr) = file_flags_fixture_file("macfuse-file-flags-shards");
         adapter.remember_named_file_flags(attr.ino, MACOS_DS_STORE_NAME);
+        // Synthetic keys only need to occupy shards; they bypass liveness checks.
         for ino in 1000..1128 {
-            adapter.remember_named_file_flags(ino, MACOS_DS_STORE_NAME);
+            adapter.file_flags.insert(ino, MACOS_UF_HIDDEN);
         }
+        // `try_get` reports whether the probe key shares the held shard.
         let held = (1000..1128)
             .find_map(|ino| {
                 let guard = adapter.file_flags.get_mut(&ino).expect("hold inode flags");
@@ -4966,39 +5127,23 @@ mod tests {
             })
             .expect("hold an inode in a different shard");
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
+        let result = std::thread::scope(|scope| {
             scope.spawn(|| {
-                let looked_up = adapter.lookup(ROOT_INO, b"flags.txt").expect("lookup file");
-                assert_eq!(looked_up.ino, attr.ino);
-                let stat = adapter.getattr(attr.ino).expect("get file attributes");
-                assert_eq!(
-                    (stat.st_birthtime, stat.st_birthtime_nsec),
-                    (stat.st_mtime, stat.st_mtime_nsec)
-                );
-                assert_eq!(
-                    (stat.st_ctime, stat.st_ctime_nsec),
-                    (stat.st_mtime, stat.st_mtime_nsec)
-                );
-                adapter.clear_file_flags(attr.ino);
-                assert!(!adapter.file_flags_contains_for_test(attr.ino));
-                adapter.remember_named_file_flags(attr.ino, MACOS_DS_STORE_NAME);
-                assert_eq!(
-                    adapter
-                        .getattr(attr.ino)
-                        .expect("get reinserted flags")
-                        .st_flags,
-                    MACOS_UF_HIDDEN
-                );
-                tx.send((stat.st_ino, stat.st_flags))
-                    .expect("send stat flags");
+                let looked_up = adapter.lookup(ROOT_INO, b"flags.txt").map(|attr| attr.ino);
+                let stat = adapter
+                    .getattr(attr.ino)
+                    .map(|stat| (stat.st_ino, stat.st_flags));
+                let _ = tx.send((looked_up, stat));
             });
             let result = rx.recv_timeout(Duration::from_secs(3));
             drop(held);
-            assert_eq!(
-                result.expect("unrelated inode stat must progress"),
-                (attr.ino, MACOS_UF_HIDDEN)
-            );
+            result
         });
+
+        assert_eq!(
+            result.expect("unrelated inode metadata must progress"),
+            (Ok(attr.ino), Ok((attr.ino, MACOS_UF_HIDDEN)))
+        );
     }
 
     #[test]
