@@ -2272,13 +2272,24 @@ impl StudioVfs {
             }
             _ => planned_read_len,
         };
+        // Pending bytes may move into metadata after preparation; claim local spans
+        // before resolving the remaining graph so that handoff cannot become a hole.
+        let resolved_slices = if prepared.context.pending_content_epoch.is_some()
+            || self.has_local_pending_regular_file_state(
+                ino,
+                prepared.context.attr.committed_content_epoch,
+            ) {
+            None
+        } else {
+            Some(prepared.resolved_slices.as_ref())
+        };
         let mut data_reader = DataReader::new(
             self,
             ino,
             offset,
             read_len as u64,
             prepared.context.pending_content_epoch,
-            Some(prepared.resolved_slices.as_ref()),
+            resolved_slices,
         );
         data_reader.allow_partial_remote_read = allow_partial_remote_read;
         let written = data_reader.read_into(buffer).await?;
@@ -5371,6 +5382,122 @@ mod tests {
                 )),
                 "prepared pending reads should keep the pending extent classification from their resolved slice snapshot: {segments:?}"
             );
+        });
+    }
+
+    #[test]
+    fn prepared_read_survives_local_overlay_publication_before_execution() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prepared-read-overlay-transition");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"prepared-read-overlay-transition.bin",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let payload = b"accepted bytes must survive prepared-read transition";
+
+            vfs.write(ino, 0, payload).await.expect("accept payload");
+            let prepared = vfs
+                .prepare_foreground_read(ino, 0, payload.len())
+                .await
+                .expect("prepare foreground read before materialization");
+            assert!(
+                prepared.resolved_slices.len() == 1
+                    && prepared.resolved_slices[0].source == ResolvedSliceSource::Hole
+                    && prepared.resolved_slices[0].range.start == 0
+                    && u64::from(prepared.resolved_slices[0].range.end) == payload.len() as u64
+                    && prepared.resolved_slices[0].payload.is_none(),
+                "new file should have one hole covering the prepared range: {:?}",
+                prepared.resolved_slices
+            );
+
+            vfs.flush(ino)
+                .await
+                .expect("materialize and commit local overlay");
+            assert!(
+                !vfs.has_pending_local_dirty_payloads_for_inode(ino),
+                "flush should remove the local dirty slice after overlay commit"
+            );
+            assert!(
+                !vfs.live_extent_records_for_inode(ino).is_empty(),
+                "flush should leave the newly committed local overlay available"
+            );
+
+            let mut out = vec![0; payload.len()];
+            let read = vfs
+                .execute_prepared_foreground_read(None, ino, 0, &mut out, &prepared, None)
+                .await
+                .expect("execute prepared read after overlay commit");
+
+            assert_eq!(read, payload.len());
+            assert_eq!(out, payload);
+        });
+    }
+
+    #[test]
+    fn prepared_published_read_uses_new_local_write_after_overlay_commit() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) =
+            make_unstarted_test_vfs(&tmp, "prepared-published-read-overlay-transition");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"prepared-published-read-overlay-transition.bin",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let original = b"original published bytes";
+            let replacement = b"replacement local bytes";
+
+            vfs.write(ino, 0, original)
+                .await
+                .expect("write initial payload");
+            vfs.flush(ino).await.expect("flush initial payload");
+            let (epoch, object_ids) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, epoch, &object_ids);
+            for op in vfs.pending_uploads_snapshot() {
+                vfs.cached_store().complete_upload(&op);
+            }
+            vfs.cancel_pending_uploads_for_inode(ino);
+
+            let prepared = vfs
+                .prepare_foreground_read(ino, 0, replacement.len())
+                .await
+                .expect("prepare read against published payload");
+            assert_eq!(prepared.context.pending_content_epoch, None);
+
+            vfs.write(ino, 0, replacement)
+                .await
+                .expect("accept replacement payload");
+            vfs.flush(ino)
+                .await
+                .expect("commit replacement as local overlay");
+            assert!(
+                !vfs.has_pending_local_dirty_payloads_for_inode(ino)
+                    && !vfs.live_extent_records_for_inode(ino).is_empty(),
+                "replacement should be represented by a locally readable pending overlay"
+            );
+
+            let mut out = vec![0; replacement.len()];
+            let read = vfs
+                .execute_prepared_foreground_read(None, ino, 0, &mut out, &prepared, None)
+                .await
+                .expect("execute pre-existing read after replacement commit");
+
+            assert_eq!(read, replacement.len());
+            assert_eq!(out, replacement);
         });
     }
 

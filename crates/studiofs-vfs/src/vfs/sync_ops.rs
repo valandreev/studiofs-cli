@@ -760,14 +760,13 @@ impl StudioVfs {
             drop(os_cache_foreground_read_lease);
             return None;
         }
-        if self.inode_has_local_dirty_state(ino) {
-            self.invalidate_kernel_inode_attrs([ino]);
-        }
-        self.flush_deferred_kernel_invalidations(ino);
+        let invalidate_kernel_attrs = self.inode_has_local_dirty_state(ino)
+            || self.state.deferred_materialize_inflight.contains(ino);
         self.debug_pending_inode_state(ino, "release_last_handle");
         Some(HandleReleaseContext {
             open_file,
             ino,
+            invalidate_kernel_attrs,
             os_cache_writer_lease,
             os_cache_foreground_read_lease,
         })
@@ -949,6 +948,7 @@ impl StudioVfs {
         let ino = context.ino;
         let action = self.take_last_handle_release_action(&context);
         let result = self.execute_last_handle_release_action(ino, action).await;
+        self.flush_deferred_kernel_invalidations(ino, context.invalidate_kernel_attrs);
         drop(context);
         result
     }
@@ -965,6 +965,7 @@ impl StudioVfs {
         let ino = context.ino;
         if let Some(action) = self.take_ignored_entry_release_action(ino) {
             let result = self.execute_last_handle_release_action(ino, action).await;
+            self.flush_deferred_kernel_invalidations(ino, context.invalidate_kernel_attrs);
             self.state.file_session.gc_if_idle(ino);
             return result;
         }
@@ -1031,6 +1032,7 @@ impl StudioVfs {
             action,
             LastHandleReleaseAction::Clean | LastHandleReleaseAction::IgnoredEntry
         ) {
+            self.flush_deferred_kernel_invalidations(ino, context.invalidate_kernel_attrs);
             if let Some((barrier, guard)) = deferred_release_barrier {
                 drop(barrier);
                 drop(guard);
@@ -1044,6 +1046,7 @@ impl StudioVfs {
         let HandleReleaseContext {
             os_cache_writer_lease,
             os_cache_foreground_read_lease,
+            invalidate_kernel_attrs,
             ..
         } = context;
         let vfs = Arc::clone(self);
@@ -1066,6 +1069,8 @@ impl StudioVfs {
                 .await;
             drop(session);
             vfs.state.file_session.gc_if_idle(ino);
+            // Refresh after local state drains, including late sticky-error outcomes.
+            vfs.flush_deferred_kernel_invalidations(ino, invalidate_kernel_attrs);
             if let Err(error) = result
                 && !vfs.suppress_deleted_inode_materialization_error(ino, &error)
             {
@@ -2153,6 +2158,8 @@ impl StudioVfs {
             self.update_pending_incarnation_size(ino, attr.size);
         }
         self.invalidate_attr_read_cache([ino]);
+        // Keep the refresh pending even if materialization drains all dirty state before close.
+        self.invalidate_kernel_inode_attrs([ino]);
         Ok(accepted.accepted_bytes)
     }
 

@@ -1317,14 +1317,20 @@ impl StudioVfsAdapter {
             #[cfg(test)]
             self.shared.open_cache_snapshots.lock().pop(&ino);
             return MacFuseOpenCachePolicy {
-                direct_io: false,
+                direct_io: true,
                 keep_cache: false,
                 write_capable: false,
             };
         };
         let keep_cache = decision.disposition() == OsCacheDisposition::Reuse;
         let policy = MacFuseOpenCachePolicy {
-            direct_io: available_memory.is_some_and(|available| attr.size > available),
+            // Unpublished local state cannot safely use the kernel's cached size or pages.
+            direct_io: !matches!(
+                decision.reason(),
+                OsCacheReason::FirstObservation
+                    | OsCacheReason::GenerationChanged
+                    | OsCacheReason::StableGeneration
+            ) || available_memory.is_some_and(|available| attr.size > available),
             keep_cache,
             write_capable: false,
         };

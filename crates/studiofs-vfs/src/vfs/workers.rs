@@ -1245,12 +1245,12 @@ impl StudioVfs {
         self.should_skip_kernel_invalidation_for_active_open(ino, true)
     }
 
-    pub(super) fn flush_deferred_kernel_invalidations(&self, ino: Ino) {
+    pub(super) fn flush_deferred_kernel_invalidations(&self, ino: Ino, invalidate_attrs: bool) {
         if self.kernel_invalidator().is_none() {
             return;
         }
         let full = self.deferred_kernel_invalidations.remove(&ino).is_some();
-        let attrs = self.deferred_kernel_inode_attrs.remove(&ino).is_some();
+        let attrs = self.deferred_kernel_inode_attrs.remove(&ino).is_some() || invalidate_attrs;
         if full {
             self.invalidate_kernel_inodes([ino]);
         } else if attrs {

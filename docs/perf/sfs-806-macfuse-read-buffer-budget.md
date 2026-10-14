@@ -57,27 +57,57 @@ actual-capacity pressure, and buffer-count limits. Adapter tests exercise queued
 EOF, sparse, error and canceled replies. Runtime stats checks assert actual
 pool counters and retained/budget gauges after a miss and a hit.
 
-## Mounted acceptance still required
+## Mounted validation and EOF repair
 
-On 2026-10-14 the execution host had macFUSE installed but no active StudioFS
-mount; the configured PostgreSQL and S3 endpoints were unreachable and the
-OrbStack daemon was unavailable. No allocation-rate or RSS improvement is
-claimed from unit tests.
+The final release binary passed both standard macFUSE devbench workloads on
+2026-10-14, with PostgreSQL/S3 available and without target debug logging.
+Each run wrote and verified 129 files / 1,090,519,040 bytes. Both the mount and
+unmount exited 0; no StudioFS mount remained active.
 
-With services restored, build and mount the changed product using the existing
-volume configuration and the macFUSE backend. The placeholder below must be
-replaced with that mount point:
+| Geometry | Elapsed | Pool hits (cumulative) | Pool misses (cumulative) | Idle retained bytes | Sampled peak RSS bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128k | 21.682 s | 106954 | 6 | 606208 | 1284063232 |
+| 4m | 20.395 s | 113973 | 8 | 3751936 | 1709408256 |
 
-    cargo build --release -p studiofs
-    target/release/studiofs devbench <macFUSE-mount> --block-size 128KB --big-file-size 1GB --small-file-count 128 --threads 4 --json-output target/perf/sfs-806-128k.json
-    target/release/studiofs devbench <macFUSE-mount> --block-size 4MB --big-file-size 1GB --small-file-count 128 --threads 4 --json-output target/perf/sfs-806-4m.json
+The pool budget was 33,554,432 bytes in both snapshots. These are consecutive
+runs in one mount, so the second row's counters include the first run. Process
+RSS includes VFS caches, dirty/staged payloads and allocator retention; these
+measurements do not establish an RSS reduction against the old implementation.
+The benchmark also reports runtime-counter reset warnings; inspect phase data
+before treating whole-run deltas as allocation rates.
 
-The workload includes writes and upload drain, followed by read phases. Run the
-same workload on the baseline and changed binary, restarting each mount, and
-retain reports. Compare read-phase deltas of pool misses/hits and process
-allocation counts, plus sampled process RSS. Confirm the retained gauge never
-exceeds 33,554,432 bytes and that repeated geometry yields hits after warm-up.
-A small-read phase after large reads must leave large buffers idle rather than
-consume them. Kernel-cached reads may bypass the pool: inspect callback and pool
-counter deltas before interpreting allocation rates. The idle budget is a code
-invariant; an RSS reduction still requires mounted measurements.
+The repair addresses three connected paths:
+
+- macFUSE now uses direct I/O when VFS reports active writers, unpublished local
+  content, or an unknown cache generation. Stable published generations retain
+  buffered reads and the existing file-size / available-memory policy.
+- Last-handle attribute invalidation runs after local materialization. Accepted
+  writes keep a refresh pending even when a flush clears dirty state before close.
+- A prepared read of unpublished content cannot retain a stale hole map after
+  local bytes move into an overlay. The data reader claims local spans first and
+  resolves current metadata for the remaining ranges.
+
+The last race was reproduced deterministically before the repair: a read
+prepared before flush returned 52 zero bytes afterward instead of the exact
+accepted payload. Two regressions cover new-file and published-file replacement
+handoffs. Additional tests cover invalidation timing and kernel cache policy.
+43 distinct focused tests passed, together with Clippy (`-D warnings`), release
+build, formatting and whitespace checks. No full suite was run.
+
+Commands (replace the mount path):
+
+```sh
+cargo build --release -p studiofs
+studiofs devbench <macFUSE-mount> --block-size 128KB --big-file-size 1GB --small-file-count 128 --threads 4 --json-output 128k.json
+studiofs devbench <macFUSE-mount> --block-size 4MB --big-file-size 1GB --small-file-count 128 --threads 4 --json-output 4m.json
+```
+
+Raw reports: `SFS-806-fixed-128k.json`, `SFS-806-fixed-4m.json` and
+`SFS-806-fixed-summary.json`. The final binary embeds the preceding commit SHA
+because the fix was validated before commit; it was built from the working diff.
+
+Separate limitation: previously exercised test volumes later failed startup
+with `inode not found` (including inode 1649267441820). Those artifacts were
+preserved, and final validation used a new isolated volume. This startup/replay
+failure remains unresolved and is not evidence of a successful remount of the
+old volumes. Pending reads now may perform additional metadata lookups.

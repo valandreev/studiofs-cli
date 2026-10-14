@@ -1604,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn buffered_adapter_read_executes_exact_kernel_requested_range() {
+    fn unpublished_adapter_read_executes_exact_kernel_requested_range() {
         const REQUEST_BYTES: usize = 4 * 1024;
         const PAYLOAD_BYTES: usize = 256 * 1024;
 
@@ -1632,10 +1632,10 @@ mod tests {
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
         let reader = adapter
             .open(attr.ino, libc::O_RDONLY)
-            .expect("open buffered reader through macFUSE adapter");
+            .expect("open unpublished reader through macFUSE adapter");
         assert!(
-            !reader.direct_io(),
-            "ordinary macFUSE data handles must use the kernel data cache"
+            reader.direct_io(),
+            "unpublished local payload must use the VFS read path"
         );
 
         let first = adapter
@@ -1674,8 +1674,41 @@ mod tests {
         );
         assert_eq!(
             metrics.fuse_async_read.peak_pending_bytes, REQUEST_BYTES,
-            "buffered read admission must account only the kernel-requested range"
+            "read admission must account only the kernel-requested range"
         );
+    }
+
+    #[test]
+    fn stable_empty_file_keeps_buffered_macfuse_reads() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-stable-empty-file-buffered-read",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"stable-empty.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create stable empty file");
+        assert_eq!(attr.upload_state, studiofs_meta::UploadState::Ready);
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open stable empty file through macFUSE adapter");
+
+        assert!(
+            !reader.direct_io(),
+            "stable published files should retain buffered macFUSE reads"
+        );
+        adapter
+            .release(attr.ino, reader.file_handle())
+            .expect("release stable read-only handle");
     }
 
     #[test]
@@ -2726,6 +2759,10 @@ mod tests {
             .open(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle while write-capable handle remains active");
         assert!(
+            read_while_writer_active.direct_io(),
+            "read-only opens during a writer epoch must keep reads on the VFS path: {read_while_writer_active:?}"
+        );
+        assert!(
             !read_while_writer_active.keep_cache(),
             "read-only open while a write-capable handle remains active must drop cache: {read_while_writer_active:?}"
         );
@@ -2849,6 +2886,10 @@ mod tests {
         assert!(
             !read_after_local_release.keep_cache(),
             "first read-only open after local-stable release should drop cache: {read_after_local_release:?}"
+        );
+        assert!(
+            read_after_local_release.direct_io(),
+            "locally materialized unpublished payload must keep reads on the VFS path: {read_after_local_release:?}"
         );
         let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
         assert_eq!(cache_decisions.clean_write_release_seeded, 0);
