@@ -337,21 +337,36 @@ OS-cached files; it does not establish power-loss durability.
 
 ### SFS-807 macFUSE Memory Sampling and Open Cache Policy
 
-These regressions check that opens do not wait for the background memory
-sample, unknown attributes and unavailable memory select direct I/O, and
-snapshot reads remain nonblocking and expire measurements correctly. The
-sampler shutdown tests also verify that teardown joins its worker:
+These regressions check the open path and the memory sampler. Opens do not
+wait for the background sample, and the first sample is published before the
+mount serves callbacks. Unknown attributes and unavailable memory select direct
+I/O, while a fresh sample keeps kernel I/O. Memory-driven direct I/O is counted
+and preserves the observed cache generation. The estimate ignores compressor
+occupancy, lock-free snapshots expire correctly, and panicking measurements are
+contained. Teardown stops and joins the worker:
 
 - `concurrent_opens_finish_while_memory_sampling_is_blocked`
+- `read_only_open_with_sampled_memory_keeps_kernel_io`
 - `read_only_open_with_missing_attr_and_memory_uses_direct_io`
 - `read_only_open_without_memory_sample_uses_direct_io`
-- `snapshot_handles_missing_zero_and_stale_measurements`
-- `reader_does_not_wait_for_snapshot_publication`
+- `read_only_open_policy_reuses_generation_attr_for_direct_io`
+- `memory_direct_io_open_preserves_generation_for_next_fitting_open`
+- `callback_state_stop_background_work_joins_memory_sampler`
+- `snapshot_without_publication_is_unavailable`
+- `snapshot_with_zero_measurement_is_unavailable`
+- `snapshot_with_failed_measurement_is_unavailable`
+- `snapshot_is_fresh_until_ttl`
+- `snapshot_expires_at_ttl`
+- `snapshot_remains_fresh_between_scheduled_samples`
+- `reclaimable_bytes_ignore_compressor_occupancy`
+- `reclaimable_bytes_saturate_instead_of_overflowing`
+- `host_memory_reports_nonzero_reclaimable_bytes` (calls the host API)
+- `sample_health_contains_panicking_measurement`
+- `started_sampler_publishes_before_returning`
 - `readers_finish_while_sample_is_blocked_and_shutdown_joins_worker`
 - `dropping_sampler_joins_worker_and_drops_sampling_closure`
-- `snapshot_remains_fresh_between_scheduled_samples`
 - `sample_wait_uses_only_the_remaining_interval`
-- `fixed_sampler_returns_snapshot_without_worker` (constant telemetry remains usable beyond production TTL)
+- `fixed_sampler_returns_estimate_without_worker` (test fixtures use constant telemetry without expiry)
 
 Run the focused macFUSE checks:
 

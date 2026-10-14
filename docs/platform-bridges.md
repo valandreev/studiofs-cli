@@ -581,26 +581,37 @@ path is unchanged. Changing the legacy name-cache policy requires revalidating
 entry notification behavior and mounted namespace convergence.
 
 macOS FUSE keeps the Unified Buffer Cache and kernel readahead enabled for
-read-only files with known attributes that fit in currently available RAM.
-Unknown attributes, files larger than available RAM, or an unavailable fresh
-memory sample force `direct_io`. This avoids cycling the same bytes through
-both StudioFS's local payload cache and UBC. `direct_io` does not bypass the
-StudioFS cache: the VFS still reads cached payloads locally and fetches from
-object storage only on a payload-cache miss. Each adapter owns a background
-memory sampler that measures RAM once per second and publishes a snapshot under
-a short write lock after the OS refresh. Opens use `std::sync::RwLock::try_read`
-and never wait for publication. Missing, zero, or samples at least two seconds
-old, and a busy or poisoned snapshot lock conservatively select direct I/O.
-Sample age starts before the OS refresh, so a slow refresh cannot make an old
-measurement fresh. The one-second cadence accounts for time spent sampling; an
-overrun starts the next sample immediately and skips missed ticks without a
-catch-up burst. Teardown stops and joins the sampler after draining callbacks;
-dropping the adapter also joins it. `novncache` keeps namespace
-lookups coherent. The mount does not pass the global `direct_io`,
-`nolocalcaches`, or `auto_cache` options; data and attribute coherence instead
-use per-handle `keep_cache` decisions plus scoped low-level inode invalidations.
-The mount also passes
-`iosize=4194304`, `max_read=4194304`, and `default_permissions`; the 4 MiB
+read-only files with known attributes that fit in memory available for file
+caching. `direct_io` is forced by unknown attributes, by files larger than that
+estimate, and by a missing fresh memory sample. This avoids cycling the same
+bytes through both StudioFS's local payload cache and UBC. `direct_io` does not
+bypass the StudioFS cache: the VFS still reads cached payloads locally and
+fetches from object storage only on a payload-cache miss. Memory-driven
+`direct_io` keeps the handle's OS-cache participation and `keep_cache` decision,
+so it does not clear the observed generation that other handles may reuse.
+
+The estimate is `free + speculative + inactive` pages from
+`host_statistics64`. Unlike `sysinfo::available_memory`, it does not subtract
+compressor pages. That subtraction saturates to zero on ordinary Macs with an
+active compressor and would disable UBC for every file. Each adapter owns a
+sampler that publishes one measurement synchronously before the mount serves
+callbacks. A background worker then refreshes it once per second. Publication
+is lock-free: two atomics written bytes-then-timestamp with release/acquire
+ordering. Opens never wait for the worker. Missing or zero samples, and samples
+at least two seconds old, select direct I/O. Sample age starts before the OS
+call, so a slow refresh cannot make an old measurement fresh. The one-second
+cadence accounts for time spent sampling; an overrun starts the next sample
+immediately and skips missed ticks without a catch-up burst. A panicking or
+failing measurement is contained and logged once per health transition. The
+`macfuse_open_cache` counters `read_only_memory_unavailable_direct_io` and
+`read_only_exceeds_memory_direct_io` make memory-driven `direct_io` visible.
+Teardown drains callbacks, then `CallbackState::stop_background_work` stops and
+joins the sampler; dropping the adapter also joins it.
+
+`novncache` keeps namespace lookups coherent. The mount does not pass the
+global `direct_io`, `nolocalcaches`, or `auto_cache` options; data and attribute
+coherence instead use per-handle `keep_cache` decisions plus scoped low-level
+inode invalidations. The mount also passes `iosize=4194304`, `max_read=4194304`, and `default_permissions`; the 4 MiB
 geometry stays aligned with regular-file `st_blksize` so macFUSE does not split
 large sequential media callbacks into smaller requests. StudioFS does not pass
 `noappledouble`: macFUSE handles that option before userspace and can hide

@@ -964,6 +964,15 @@ pub enum VfsMacFuseOpenCacheDecision {
     LocalStableWriteReleaseSeeded,
 }
 
+/// Why a read-only macFUSE open bypassed the kernel data cache for memory reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsMacFuseOpenMemoryDirectIo {
+    /// No fresh, nonzero host-memory measurement was available.
+    MemoryUnavailable,
+    /// The file is larger than the measured memory available for file caching.
+    ExceedsAvailableMemory,
+}
+
 /// macFUSE open-cache decision counters.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsMacFuseOpenCacheStats {
@@ -1002,6 +1011,15 @@ pub struct VfsMacFuseOpenCacheStats {
     /// Final write-capable releases that seeded a locally stable unpublished generation.
     #[serde(default)]
     pub local_stable_write_release_seeded: u64,
+    /// Read-only opens that used direct I/O because no fresh memory sample existed.
+    ///
+    /// Counted alongside the keep/drop decision; a steadily rising value means
+    /// host-memory telemetry is failing.
+    #[serde(default)]
+    pub read_only_memory_unavailable_direct_io: u64,
+    /// Read-only opens that used direct I/O because the file exceeded available memory.
+    #[serde(default)]
+    pub read_only_exceeds_memory_direct_io: u64,
 }
 
 /// Linux FUSE open-cache decisions grouped by kernel mode and safety reason.

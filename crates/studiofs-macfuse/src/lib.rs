@@ -328,6 +328,7 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
     // to the session loop. Drain them before Session::drop destroys the
     // session and request backing storage.
     callback_state.wait_for_reply_tasks();
+    callback_state.stop_background_work();
     drop(session);
     drop(callback_state);
     result

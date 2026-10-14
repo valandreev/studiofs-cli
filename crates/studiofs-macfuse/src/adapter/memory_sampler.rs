@@ -1,120 +1,308 @@
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex, RwLock};
+//! Background host-memory telemetry for macFUSE open cache decisions.
+//!
+//! The Linux adapter owns an equivalent sampler in
+//! `studiofs-linux-fuse/src/cache_policy.rs`; keep pacing, expiry, and
+//! publication semantics aligned when changing either one.
+
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use sysinfo::{MemoryRefreshKind, System};
+use crate::low_level::catch_callback_unwind;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// Two intervals, so one late or slow sample keeps the previous measurement
+/// usable while an older one still fails safe.
 const SAMPLE_TTL: Duration = Duration::from_secs(2);
 
 fn sample_wait(elapsed: Duration) -> Duration {
     SAMPLE_INTERVAL.saturating_sub(elapsed)
 }
 
-fn available_memory_at(snapshot: &RwLock<Option<(Instant, u64)>>, now: Instant) -> Option<u64> {
-    // Opens never wait for publication; contention uses the conservative fallback.
-    let (sampled_at, available) = {
-        let guard = snapshot.try_read().ok()?;
-        (*guard)?
-    };
-    (now.saturating_duration_since(sampled_at) < SAMPLE_TTL && available > 0).then_some(available)
+/// Page counts the kernel can hand to file data without compressing or
+/// swapping anonymous memory.
+#[derive(Clone, Copy, Debug)]
+struct ReclaimablePages {
+    free: u64,
+    speculative: u64,
+    inactive: u64,
 }
 
-/// Owns the background system-memory sampler; callback reads never wait for sampling.
-pub(super) struct SystemMemorySampler {
-    snapshot: Arc<RwLock<Option<(Instant, u64)>>>,
+/// Bytes available for kernel file caching.
+///
+/// `sysinfo` subtracts compressor pages from this sum and saturates to zero on
+/// ordinary Macs with an active compressor, which would disable kernel caching
+/// for every file. Compressed anonymous memory does not occupy the reclaimable
+/// queues, so it is not subtracted here. Purgeable pages are excluded because
+/// they are also counted in the active/inactive queues.
+fn reclaimable_bytes(pages: ReclaimablePages, page_size: u64) -> u64 {
+    pages
+        .free
+        .saturating_add(pages.speculative)
+        .saturating_add(pages.inactive)
+        .saturating_mul(page_size)
+}
+
+/// Host VM statistics through `host_statistics64`, reusing one host port.
+struct HostMemory {
+    host: libc::mach_port_t,
+    page_size: u64,
+}
+
+impl HostMemory {
+    fn new() -> Option<Self> {
+        // SAFETY: `mach_host_self` takes no arguments and returns this task's
+        // host name port; the sampler keeps it for its lifetime like `sysinfo`.
+        #[expect(
+            deprecated,
+            reason = "libc defers Mach host APIs to mach2; one host-port lookup does not justify a new dependency"
+        )]
+        let host = unsafe { libc::mach_host_self() };
+        // SAFETY: `sysconf` reads a process-wide constant and has no pointer arguments.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page_size = u64::try_from(page_size).ok().filter(|size| *size > 0)?;
+        // `MACH_PORT_NULL` is declared as `i32` while ports are `u32`.
+        (host != libc::MACH_PORT_NULL as libc::mach_port_t).then_some(Self { host, page_size })
+    }
+
+    fn sample(&self) -> Option<u64> {
+        let mut stats = MaybeUninit::<libc::vm_statistics64>::zeroed();
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        // SAFETY: `stats` is a writable `vm_statistics64` and `count` is its
+        // size in `integer_t` words; the kernel writes at most `count` words.
+        let status = unsafe {
+            libc::host_statistics64(
+                self.host,
+                libc::HOST_VM_INFO64,
+                stats.as_mut_ptr().cast(),
+                &mut count,
+            )
+        };
+        if status != libc::KERN_SUCCESS {
+            return None;
+        }
+        // SAFETY: the buffer was zero-initialized, every field is an integer,
+        // and a successful call wrote a valid prefix.
+        let stats = unsafe { stats.assume_init() };
+        Some(reclaimable_bytes(
+            ReclaimablePages {
+                free: u64::from(stats.free_count),
+                speculative: u64::from(stats.speculative_count),
+                inactive: u64::from(stats.inactive_count),
+            },
+            self.page_size,
+        ))
+    }
+}
+
+/// Lock-free published measurement.
+///
+/// The writer stores bytes before the timestamp with `Release`; a reader loads
+/// the timestamp with `Acquire` first. Seeing a timestamp therefore implies
+/// seeing its bytes or newer ones, and newer bytes behind an older timestamp
+/// only expire sooner. Readers never wait for the worker.
+struct Snapshot {
+    epoch: Instant,
+    available_bytes: AtomicU64,
+    /// Nanoseconds since `epoch` plus one; zero means never published.
+    sampled_at: AtomicU64,
+}
+
+impl Snapshot {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            available_bytes: AtomicU64::new(0),
+            sampled_at: AtomicU64::new(0),
+        }
+    }
+
+    fn nanos_since_epoch(&self, at: Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX - 1)
+    }
+
+    fn publish(&self, sampled_at: Instant, available: Option<u64>) {
+        self.available_bytes
+            .store(available.unwrap_or(0), Ordering::Relaxed);
+        self.sampled_at.store(
+            self.nanos_since_epoch(sampled_at).saturating_add(1),
+            Ordering::Release,
+        );
+    }
+
+    /// Missing, zero, and expired measurements are all unusable.
+    fn available_at(&self, now: Instant) -> Option<u64> {
+        let sampled_at = self.sampled_at.load(Ordering::Acquire).checked_sub(1)?;
+        let age = Duration::from_nanos(self.nanos_since_epoch(now).saturating_sub(sampled_at));
+        if age >= SAMPLE_TTL {
+            return None;
+        }
+        let available = self.available_bytes.load(Ordering::Relaxed);
+        (available > 0).then_some(available)
+    }
+}
+
+/// Log only health transitions so a failing source cannot flood the log.
+#[derive(Default)]
+struct SampleHealth {
+    failing: bool,
+}
+
+impl SampleHealth {
+    fn sample(&mut self, sample: &mut impl FnMut() -> Option<u64>) -> Option<u64> {
+        let mut available = None;
+        let panicked = catch_callback_unwind(|| available = sample());
+        let available = available.filter(|bytes| *bytes > 0);
+        match (available.is_some(), self.failing) {
+            (false, false) => {
+                tracing::warn!(
+                    panicked,
+                    "macFUSE memory sample unavailable; read-only opens use direct I/O"
+                );
+                self.failing = true;
+            }
+            (true, true) => {
+                tracing::info!("macFUSE memory sampling recovered");
+                self.failing = false;
+            }
+            _ => {}
+        }
+        available
+    }
+}
+
+struct Worker {
     stop: mpsc::Sender<()>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    thread: JoinHandle<()>,
+}
+
+enum Telemetry {
+    Sampled {
+        snapshot: Arc<Snapshot>,
+        worker: Mutex<Option<Worker>>,
+    },
     #[cfg(test)]
-    fixed: bool,
+    Fixed(Option<u64>),
+}
+
+/// Owns background host-memory sampling; callback reads never wait for it.
+pub(super) struct SystemMemorySampler {
+    telemetry: Telemetry,
 }
 
 impl SystemMemorySampler {
-    /// Start an owned worker that samples host RAM outside the snapshot lock.
+    /// Sample host RAM once on the caller, then keep sampling on a worker.
+    ///
+    /// The first measurement is published before the mount serves callbacks,
+    /// so early opens do not inherit a startup fallback for their lifetime.
     pub(super) fn system() -> Self {
-        let mut system = System::new();
-        Self::start(move || {
-            system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
-            let available = system.available_memory();
-            (available > 0).then_some(available)
-        })
+        match HostMemory::new() {
+            Some(host) => Self::started(move || host.sample()),
+            None => {
+                tracing::error!(
+                    "macFUSE host memory statistics are unavailable; read-only opens use direct I/O"
+                );
+                Self::started(|| None)
+            }
+        }
     }
 
-    /// Run the supplied measurement on a worker until shutdown joins it.
-    pub(super) fn start(mut sample: impl FnMut() -> Option<u64> + Send + 'static) -> Self {
-        let snapshot = Arc::new(RwLock::new(None));
+    /// Publish one synchronous measurement, then sample on the worker.
+    pub(super) fn started(sample: impl FnMut() -> Option<u64> + Send + 'static) -> Self {
+        Self::spawn(sample, true)
+    }
+
+    /// Run every measurement, including the first, on the worker.
+    #[cfg(test)]
+    pub(super) fn start(sample: impl FnMut() -> Option<u64> + Send + 'static) -> Self {
+        Self::spawn(sample, false)
+    }
+
+    fn spawn(mut sample: impl FnMut() -> Option<u64> + Send + 'static, initial: bool) -> Self {
+        let snapshot = Arc::new(Snapshot::new());
+        let mut health = SampleHealth::default();
+        let mut wait = Duration::ZERO;
+        if initial {
+            let sampled_at = Instant::now();
+            snapshot.publish(sampled_at, health.sample(&mut sample));
+            wait = sample_wait(sampled_at.elapsed());
+        }
         let (stop, stopped) = mpsc::channel();
         let worker_snapshot = Arc::clone(&snapshot);
         let worker = thread::Builder::new()
             .name("studiofs-macfuse-memory".into())
             .spawn(move || {
-                loop {
+                // Shutdown drops the sender, which also ends a pending wait.
+                while stopped.recv_timeout(wait) == Err(mpsc::RecvTimeoutError::Timeout) {
                     let sampled_at = Instant::now();
-                    let available = sample();
-                    *worker_snapshot
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = available
-                        .filter(|bytes| *bytes > 0)
-                        .map(|bytes| (sampled_at, bytes));
-                    if stopped.recv_timeout(sample_wait(sampled_at.elapsed()))
-                        != Err(mpsc::RecvTimeoutError::Timeout)
-                    {
-                        break;
-                    }
+                    worker_snapshot.publish(sampled_at, health.sample(&mut sample));
+                    wait = sample_wait(sampled_at.elapsed());
                 }
             })
-            .inspect_err(|error| tracing::warn!(%error, "macFUSE memory sampler could not start"))
-            .ok();
+            .inspect_err(|error| {
+                tracing::error!(
+                    %error,
+                    "macFUSE memory sampler could not start; read-only opens use direct I/O"
+                );
+            })
+            .ok()
+            .map(|thread| Worker { stop, thread });
         Self {
-            snapshot,
-            stop,
-            worker: Mutex::new(worker),
-            #[cfg(test)]
-            fixed: false,
+            telemetry: Telemetry::Sampled {
+                snapshot,
+                worker: Mutex::new(worker),
+            },
         }
     }
 
     /// Supply a constant test estimate without a worker or expiry.
     #[cfg(test)]
     pub(super) fn fixed(available: Option<u64>) -> Self {
-        let (stop, _) = mpsc::channel();
         Self {
-            snapshot: Arc::new(RwLock::new(
-                available
-                    .filter(|bytes| *bytes > 0)
-                    .map(|bytes| (Instant::now(), bytes)),
-            )),
-            stop,
-            worker: Mutex::new(None),
-            fixed: true,
+            telemetry: Telemetry::Fixed(available.filter(|bytes| *bytes > 0)),
         }
     }
 
-    /// Read without waiting; unusable production telemetry returns `None`.
+    /// Read without waiting; unusable telemetry returns `None`.
     pub(super) fn available_memory(&self) -> Option<u64> {
-        #[cfg(test)]
-        if self.fixed {
-            return self
-                .snapshot
-                .try_read()
-                .ok()?
-                .map(|(_, available)| available);
+        match &self.telemetry {
+            Telemetry::Sampled { snapshot, .. } => snapshot.available_at(Instant::now()),
+            #[cfg(test)]
+            Telemetry::Fixed(available) => *available,
         }
-        available_memory_at(&self.snapshot, Instant::now())
     }
 
     /// Stop sampling and join any in-flight measurement; safe to call repeatedly.
+    ///
+    /// The join waits for one host statistics call at most, which does not
+    /// block on filesystem or network state.
     pub(super) fn shutdown(&self) {
-        let _ = self.stop.send(());
-        let mut worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(worker) = worker.take()
-            && worker.join().is_err()
-        {
-            tracing::warn!("macFUSE memory sampler panicked");
+        let worker = match &self.telemetry {
+            Telemetry::Sampled { worker, .. } => worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+            #[cfg(test)]
+            Telemetry::Fixed(_) => None,
+        };
+        if let Some(Worker { stop, thread }) = worker {
+            drop(stop);
+            if thread.join().is_err() {
+                tracing::warn!("macFUSE memory sampler panicked");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_running(&self) -> bool {
+        match &self.telemetry {
+            Telemetry::Sampled { worker, .. } => worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            Telemetry::Fixed(_) => false,
         }
     }
 }
@@ -128,9 +316,10 @@ impl Drop for SystemMemorySampler {
 #[cfg(test)]
 mod tests {
     use super::{
-        SAMPLE_INTERVAL, SAMPLE_TTL, SystemMemorySampler, available_memory_at, sample_wait,
+        HostMemory, ReclaimablePages, SAMPLE_INTERVAL, SAMPLE_TTL, SampleHealth, Snapshot,
+        SystemMemorySampler, reclaimable_bytes, sample_wait,
     };
-    use std::sync::{Arc, RwLock, mpsc};
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -143,52 +332,121 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_handles_missing_zero_and_stale_measurements() {
+    fn snapshot_without_publication_is_unavailable() {
+        let snapshot = Snapshot::new();
+
+        assert_eq!(snapshot.available_at(Instant::now()), None);
+    }
+
+    #[test]
+    fn snapshot_with_zero_measurement_is_unavailable() {
+        let snapshot = Snapshot::new();
         let sampled_at = Instant::now();
-        let snapshot = RwLock::new(None);
-        assert_eq!(available_memory_at(&snapshot, sampled_at), None);
+        snapshot.publish(sampled_at, Some(0));
 
-        *snapshot.write().unwrap() = Some((sampled_at, 0));
-        assert_eq!(available_memory_at(&snapshot, sampled_at), None);
+        assert_eq!(snapshot.available_at(sampled_at), None);
+    }
 
-        *snapshot.write().unwrap() = Some((sampled_at, 4096));
+    #[test]
+    fn snapshot_with_failed_measurement_is_unavailable() {
+        let snapshot = Snapshot::new();
+        let sampled_at = Instant::now();
+        snapshot.publish(sampled_at, Some(4096));
+        snapshot.publish(sampled_at, None);
+
+        assert_eq!(snapshot.available_at(sampled_at), None);
+    }
+
+    #[test]
+    fn snapshot_is_fresh_until_ttl() {
+        let snapshot = Snapshot::new();
+        let sampled_at = Instant::now();
+        snapshot.publish(sampled_at, Some(4096));
+
         assert_eq!(
-            available_memory_at(
-                &snapshot,
-                sampled_at + SAMPLE_TTL - Duration::from_millis(1)
-            ),
+            snapshot.available_at(sampled_at + SAMPLE_TTL - Duration::from_nanos(1)),
             Some(4096)
-        );
-        assert_eq!(
-            available_memory_at(&snapshot, sampled_at + SAMPLE_TTL),
-            None
-        );
-
-        *snapshot.write().unwrap() = None;
-        assert_eq!(
-            available_memory_at(&snapshot, sampled_at + SAMPLE_TTL),
-            None
         );
     }
 
     #[test]
-    fn reader_does_not_wait_for_snapshot_publication() {
-        let snapshot = Arc::new(RwLock::new(Some((Instant::now(), 4096))));
-        let publishing = snapshot.write().unwrap();
-        let (done_tx, done_rx) = mpsc::channel();
-        let reader_snapshot = Arc::clone(&snapshot);
-        let reader = thread::spawn(move || {
-            done_tx
-                .send(available_memory_at(&reader_snapshot, Instant::now()))
-                .unwrap();
-        });
-        let result = done_rx.recv_timeout(Duration::from_secs(2));
-        drop(publishing);
-        reader.join().unwrap();
+    fn snapshot_expires_at_ttl() {
+        let snapshot = Snapshot::new();
+        let sampled_at = Instant::now();
+        snapshot.publish(sampled_at, Some(4096));
+
+        assert_eq!(snapshot.available_at(sampled_at + SAMPLE_TTL), None);
+    }
+
+    #[test]
+    fn snapshot_remains_fresh_between_scheduled_samples() {
+        let snapshot = Snapshot::new();
+        let sampled_at = Instant::now();
+        snapshot.publish(sampled_at, Some(4096));
+
         assert_eq!(
-            result.expect("reader must finish before publication unlocks"),
-            None
+            snapshot.available_at(sampled_at + SAMPLE_INTERVAL + Duration::from_millis(20)),
+            Some(4096)
         );
+    }
+
+    #[test]
+    fn reclaimable_bytes_ignore_compressor_occupancy() {
+        // Counts captured from a 16 GiB Mac where `sysinfo` reported zero:
+        // free 9412, inactive 246247, purgeable 15619, compressor 298047.
+        let pages = ReclaimablePages {
+            free: 9412,
+            speculative: 1497,
+            inactive: 246_247,
+        };
+
+        assert_eq!(
+            reclaimable_bytes(pages, 16 * 1024),
+            (9412 + 1497 + 246_247) * 16 * 1024
+        );
+    }
+
+    #[test]
+    fn reclaimable_bytes_saturate_instead_of_overflowing() {
+        let pages = ReclaimablePages {
+            free: u64::MAX,
+            speculative: 1,
+            inactive: 1,
+        };
+
+        assert_eq!(reclaimable_bytes(pages, 16 * 1024), u64::MAX);
+    }
+
+    #[test]
+    fn host_memory_reports_nonzero_reclaimable_bytes() {
+        let host = HostMemory::new().expect("host statistics port");
+
+        assert!(host.sample().is_some_and(|bytes| bytes > 0));
+    }
+
+    #[test]
+    fn sample_health_contains_panicking_measurement() {
+        let mut health = SampleHealth::default();
+        let mut calls = 0;
+        let mut sample = || {
+            calls += 1;
+            if calls == 1 {
+                panic!("injected memory sample panic");
+            }
+            Some(4096)
+        };
+
+        assert_eq!(health.sample(&mut sample), None);
+        assert!(health.failing);
+        assert_eq!(health.sample(&mut sample), Some(4096));
+        assert!(!health.failing);
+    }
+
+    #[test]
+    fn started_sampler_publishes_before_returning() {
+        let sampler = SystemMemorySampler::started(|| Some(4096));
+
+        assert_eq!(sampler.available_memory(), Some(4096));
     }
 
     #[test]
@@ -234,6 +492,7 @@ mod tests {
         assert!(results.iter().all(|result| matches!(result, Ok(None))));
         exited_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(owner_dropped_rx.try_recv(), Ok(()));
+        assert!(!sampler.is_running());
     }
 
     #[test]
@@ -251,19 +510,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_remains_fresh_between_scheduled_samples() {
-        let sampled_at = Instant::now();
-        let snapshot = RwLock::new(Some((sampled_at, 4096)));
-        assert_eq!(
-            available_memory_at(
-                &snapshot,
-                sampled_at + SAMPLE_INTERVAL + Duration::from_millis(20)
-            ),
-            Some(4096)
-        );
-    }
-
-    #[test]
     fn sample_wait_uses_only_the_remaining_interval() {
         assert_eq!(
             sample_wait(Duration::from_millis(300)),
@@ -277,11 +523,10 @@ mod tests {
     }
 
     #[test]
-    fn fixed_sampler_returns_snapshot_without_worker() {
+    fn fixed_sampler_returns_estimate_without_worker() {
         let sampler = SystemMemorySampler::fixed(Some(4096));
 
-        *sampler.snapshot.write().unwrap() = Some((Instant::now() - SAMPLE_TTL, 4096));
         assert_eq!(sampler.available_memory(), Some(4096));
-        assert!(sampler.worker.lock().unwrap().is_none());
+        assert!(!sampler.is_running());
     }
 }

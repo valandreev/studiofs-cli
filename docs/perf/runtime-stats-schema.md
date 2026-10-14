@@ -50,8 +50,13 @@ valid:
 | `fuse_invalidation` | current/peak queue depth; coalescing; unobserved skips; notification failures and latency; shutdown timeout |
 | `fuse_connection` | requested and negotiated `max_read`, `max_readahead`, `max_write`, background/congestion limits, and enabled capability flags |
 
-`macfuse_open_cache` remains unchanged for compatibility. New producers must
-add fields rather than rename or repurpose existing macOS or Linux keys.
+`macfuse_open_cache` keeps its existing keys for compatibility. It adds the
+defaultable counters `read_only_memory_unavailable_direct_io` and
+`read_only_exceeds_memory_direct_io`. They refine read-only opens that used
+`direct_io` because of host-memory telemetry. They are not part of `total`.
+A steadily rising unavailable count means the memory sampler is failing.
+New producers must add fields rather than rename or repurpose existing macOS
+or Linux keys.
 
 Latency histograms must expose `count` and `sum` so readers can compute interval
 average latency by subtracting two snapshots. Bucket upper bounds are always
