@@ -1853,11 +1853,29 @@ impl FsKitDispatcher {
                     return;
                 }
             };
-        let parent = request.header().nodeid;
+        let header = request.header();
+        let cancellation = Arc::new(CancellationToken::new());
+        if let Some(previous) = self
+            .cancellations
+            .lock()
+            .insert(header.unique, Arc::clone(&cancellation))
+        {
+            previous.cancel();
+        }
+        let cancellation_guard = CancellationGuard {
+            cancellations: Arc::clone(&self.cancellations),
+            unique: header.unique,
+            token: Arc::clone(&cancellation),
+        };
         let adapter = Arc::clone(&self.adapter);
         let task_guard = self.callback_state.track_reply_task();
-        spawn_blocking_reply_task(&self.runtime_handle, task_guard, move || {
-            match adapter.symlink(parent, &name, &target) {
+        self.runtime_handle.spawn(async move {
+            let _task_guard = task_guard;
+            let _cancellation_guard = cancellation_guard;
+            match adapter
+                .symlink(header.nodeid, &name, &target, cancellation.as_ref().clone())
+                .await
+            {
                 Ok(attr) => {
                     let _ = request
                         .reply_struct(entry_from_stat(attr.ino, adapter.attr_to_stat(&attr)));
@@ -2462,6 +2480,7 @@ pub(crate) fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()>
         mount_ready_callback,
     } = request;
     if !crate::CLI_SIGNAL_HANDLERS_INSTALLED.load(Ordering::Acquire) {
+        crate::process_signal_wake_pipe()?.drain()?;
         crate::SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     }
     let mut session = FsKitSession::mount(&mount_point, &volume_name, read_only)?;

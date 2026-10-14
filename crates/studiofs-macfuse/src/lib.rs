@@ -8,9 +8,10 @@
 //! experimental FSKit path uses `MFMount.framework` and the same VFS adapter.
 
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Mutex, OnceLock, Weak,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -109,6 +110,7 @@ pub enum SignalHandling {
 #[derive(Clone, Debug, Default)]
 pub struct MacFuseUnmountSignal {
     requested: Arc<AtomicBool>,
+    wakes: Arc<Mutex<Vec<Weak<WakePipe>>>>,
 }
 
 impl MacFuseUnmountSignal {
@@ -120,6 +122,18 @@ impl MacFuseUnmountSignal {
     /// Request the mount session to unmount.
     pub fn request_unmount(&self) {
         self.requested.store(true, Ordering::Release);
+        let mut wakes = self
+            .wakes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        wakes.retain(|wake| {
+            if let Some(wake) = wake.upgrade() {
+                wake.wake();
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Return whether unmount has been requested.
@@ -130,12 +144,128 @@ impl MacFuseUnmountSignal {
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static CLI_SIGNAL_HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
+static SIGNAL_WAKE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static PROCESS_SIGNAL_WAKE: OnceLock<Mutex<Option<Arc<WakePipe>>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct WakePipe {
+    read: OwnedFd,
+    write: OwnedFd,
+}
+
+impl WakePipe {
+    fn new() -> io::Result<Self> {
+        let mut fds = [-1; 2];
+        // SAFETY: `fds` points to two writable integers for `pipe` to initialize.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful `pipe` initialized both descriptors and ownership starts here.
+        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: successful `pipe` initialized both descriptors and ownership starts here.
+        let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        for fd in [read.as_raw_fd(), write.as_raw_fd()] {
+            // SAFETY: `fcntl` only reads or updates flags on an owned open descriptor.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags == -1
+                // SAFETY: this sets nonblocking mode on the same owned descriptor.
+                || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: set close-on-exec on the same owned descriptor.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Self { read, write })
+    }
+
+    fn wake(&self) {
+        let byte = 1_u8;
+        loop {
+            // SAFETY: the pointer references one readable byte and the descriptor remains owned.
+            let result = unsafe {
+                libc::write(
+                    self.write.as_raw_fd(),
+                    std::ptr::addr_of!(byte).cast(),
+                    std::mem::size_of_val(&byte),
+                )
+            };
+            if result >= 0 {
+                return;
+            }
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // A full nonblocking pipe is already readable, so its wake is pending.
+            return;
+        }
+    }
+
+    fn drain(&self) -> io::Result<()> {
+        let mut bytes = [0_u8; 64];
+        loop {
+            // SAFETY: `bytes` is writable for its full length and the descriptor is owned.
+            let result = unsafe {
+                libc::read(
+                    self.read.as_raw_fd(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if result > 0 {
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            if result == -1 && error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if result == -1 && error.kind() != io::ErrorKind::WouldBlock {
+                return Err(error);
+            }
+            return Ok(());
+        }
+    }
+}
+
+fn process_signal_wake_pipe() -> io::Result<Arc<WakePipe>> {
+    let slot = PROCESS_SIGNAL_WAKE.get_or_init(|| Mutex::new(None));
+    let mut pipe = slot
+        .lock()
+        .map_err(|_| io::Error::other("process signal wake pipe lock poisoned"))?;
+    if let Some(pipe) = pipe.as_ref() {
+        return Ok(Arc::clone(pipe));
+    }
+    let created = Arc::new(WakePipe::new()?);
+    *pipe = Some(Arc::clone(&created));
+    Ok(created)
+}
 
 extern "C" fn shutdown_signal_handler(sig: libc::c_int) {
     if SHUTDOWN_REQUESTED.swap(true, Ordering::AcqRel) {
         // SAFETY: POSIX `_exit` is async-signal-safe and does not run teardown.
         unsafe { libc::_exit(128 + sig) }
     }
+    // SAFETY: macOS exposes the current thread's errno through `__error`.
+    let errno = unsafe { libc::__error() };
+    // SAFETY: `errno` points to this thread's writable errno slot.
+    let saved_errno = unsafe { *errno };
+    let fd = SIGNAL_WAKE_FD.load(Ordering::Acquire);
+    if fd >= 0 {
+        let byte = 1_u8;
+        loop {
+            // SAFETY: `write` is async-signal-safe; the process-owned pipe remains open permanently.
+            let result = unsafe { libc::write(fd, std::ptr::addr_of!(byte).cast(), 1) };
+            // SAFETY: `errno` points to the current thread's errno slot.
+            if result == -1 && unsafe { *errno } == libc::EINTR {
+                continue;
+            }
+            break;
+        }
+    }
+    // SAFETY: restore the interrupted thread's errno before returning to it.
+    unsafe { *errno = saved_errno };
 }
 
 struct CliSignalHandlers {
@@ -170,7 +300,19 @@ impl CliSignalHandlers {
         {
             return Ok(None);
         }
+        let wake_pipe = match process_signal_wake_pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+        if let Err(error) = wake_pipe.drain() {
+            CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
+            return Err(error);
+        }
         SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        SIGNAL_WAKE_FD.store(wake_pipe.write.as_raw_fd(), Ordering::Release);
         // SAFETY: this explicitly mutates process-global CLI signal disposition
         // and restores the previous handlers in Drop.
         unsafe {
@@ -206,6 +348,7 @@ impl Drop for CliSignalHandlers {
             libc::signal(libc::SIGINT, self.previous_sigint);
             libc::signal(libc::SIGTERM, self.previous_sigterm);
         }
+        SIGNAL_WAKE_FD.store(-1, Ordering::Release);
         CLI_SIGNAL_HANDLERS_INSTALLED.store(false, Ordering::Release);
     }
 }
@@ -224,14 +367,14 @@ fn signal_handlers_for_policy(
 struct SignalWatcher {
     stop: Arc<AtomicBool>,
     handlers: Option<CliSignalHandlers>,
-    wake: std::thread::Thread,
+    wake: Arc<WakePipe>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for SignalWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        self.wake.unpark();
+        self.wake.wake();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -246,7 +389,20 @@ fn spawn_signal_watcher(
 ) -> io::Result<SignalWatcher> {
     let stop = Arc::new(AtomicBool::new(false));
     let handlers = signal_handlers_for_policy(signal_handling)?;
+    let process_wake = process_signal_wake_pipe()?;
+    let wake = Arc::new(WakePipe::new()?);
+    if let Some(signal) = &unmount_signal {
+        let mut signal_wakes = signal
+            .wakes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        signal_wakes.push(Arc::downgrade(&wake));
+        if signal.is_requested() {
+            wake.wake();
+        }
+    }
     let watcher_stop = Arc::clone(&stop);
+    let watcher_wake = Arc::clone(&wake);
     let thread = std::thread::Builder::new()
         .name("macfuse-signal-watcher".into())
         .spawn(move || {
@@ -256,14 +412,41 @@ fn spawn_signal_watcher(
                     .as_ref()
                     .is_some_and(MacFuseUnmountSignal::is_requested)
             {
-                std::thread::park_timeout(std::time::Duration::from_millis(100));
+                let mut descriptors = [
+                    libc::pollfd {
+                        fd: process_wake.read.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: watcher_wake.read.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: `descriptors` is a valid array for the duration of the blocking poll.
+                let result = unsafe {
+                    libc::poll(
+                        descriptors.as_mut_ptr(),
+                        descriptors.len() as libc::nfds_t,
+                        -1,
+                    )
+                };
+                if result == -1 {
+                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if descriptors[1].revents != 0 {
+                    let _ = watcher_wake.drain();
+                }
             }
             if watcher_stop.load(Ordering::Acquire) {
                 return;
             }
             request_exit();
         })?;
-    let wake = thread.thread().clone();
     Ok(SignalWatcher {
         stop,
         handlers,
@@ -307,6 +490,7 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
         )
     }?;
     if !CLI_SIGNAL_HANDLERS_INSTALLED.load(Ordering::Acquire) {
+        process_signal_wake_pipe()?.drain()?;
         SHUTDOWN_REQUESTED.store(false, Ordering::Release);
     }
     let exit_handle = session.exit_handle();
@@ -368,6 +552,8 @@ mod tests {
 
     use studiofs_meta::MetaFsOps;
     use studiofs_meta::engine::XATTR_REPLACE_FLAG;
+
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn callback_file_info_snapshot_is_independent_from_callback_pointer() {
@@ -566,6 +752,7 @@ mod tests {
 
     #[test]
     fn cli_signal_guard_restores_handlers_after_session_watcher_drops() {
+        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
         super::SHUTDOWN_REQUESTED.store(false, std::sync::atomic::Ordering::Release);
         assert!(!super::CLI_SIGNAL_HANDLERS_INSTALLED.load(std::sync::atomic::Ordering::Acquire));
 
@@ -627,7 +814,161 @@ mod tests {
     }
 
     #[test]
+    fn requested_unmount_wakes_blocked_watcher() {
+        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let signal = super::MacFuseUnmountSignal::new();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let watcher = super::spawn_signal_watcher(
+            move || sender.send(()).expect("send watcher exit"),
+            super::SignalHandling::Disabled,
+            Some(signal.clone()),
+        )
+        .expect("spawn signal watcher");
+
+        signal.request_unmount();
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("unmount request should wake the watcher");
+        drop(watcher);
+    }
+
+    #[test]
+    fn one_unmount_signal_wakes_all_registered_watchers() {
+        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let signal = super::MacFuseUnmountSignal::new();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let first_sender = sender.clone();
+        let first = super::spawn_signal_watcher(
+            move || first_sender.send(1).expect("send first watcher exit"),
+            super::SignalHandling::Disabled,
+            Some(signal.clone()),
+        )
+        .expect("spawn first watcher");
+        let second = super::spawn_signal_watcher(
+            move || sender.send(2).expect("send second watcher exit"),
+            super::SignalHandling::Disabled,
+            Some(signal.clone()),
+        )
+        .expect("spawn second watcher");
+
+        signal.request_unmount();
+        let mut exits = [
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("first watcher should wake"),
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("second watcher should wake"),
+        ];
+        exits.sort_unstable();
+        assert_eq!(exits, [1, 2]);
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn unmount_requested_before_watcher_start_is_not_lost() {
+        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let signal = super::MacFuseUnmountSignal::new();
+        signal.request_unmount();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let watcher = super::spawn_signal_watcher(
+            move || sender.send(()).expect("send watcher exit"),
+            super::SignalHandling::Disabled,
+            Some(signal),
+        )
+        .expect("spawn signal watcher");
+
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("preexisting unmount request should be observed");
+        drop(watcher);
+    }
+
+    #[test]
+    fn dropping_watcher_wakes_and_joins_its_thread() {
+        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+        let exit_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_exit_requested = Arc::clone(&exit_requested);
+        let watcher = super::spawn_signal_watcher(
+            move || callback_exit_requested.store(true, std::sync::atomic::Ordering::Release),
+            super::SignalHandling::Disabled,
+            None,
+        )
+        .expect("spawn signal watcher");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(watcher);
+            sender.send(()).expect("send completed drop");
+        });
+
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("drop should wake the watcher and join it");
+        assert!(!exit_requested.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn process_signal_wakes_all_disabled_watchers() {
+        const CHILD_ENV: &str = "STUDIOFS_PROCESS_SIGNAL_BROADCAST_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
+            let handlers = super::ProcessSignalGuard::install_for_cli()
+                .expect("install outer CLI signal handlers");
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let first_sender = sender.clone();
+            let first = super::spawn_signal_watcher(
+                move || first_sender.send(1).expect("send first watcher exit"),
+                super::SignalHandling::Disabled,
+                None,
+            )
+            .expect("spawn first watcher");
+            let second = super::spawn_signal_watcher(
+                move || sender.send(2).expect("send second watcher exit"),
+                super::SignalHandling::Disabled,
+                None,
+            )
+            .expect("spawn second watcher");
+
+            // SAFETY: the outer process guard installed the handler; this signals only the child.
+            assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+            let mut exits = [
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("first disabled watcher should wake"),
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .expect("second disabled watcher should wake"),
+            ];
+            exits.sort_unstable();
+            assert_eq!(exits, [1, 2]);
+            drop(first);
+            drop(second);
+            drop(handlers);
+            return;
+        }
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .args([
+            "--exact",
+            "tests::process_signal_wakes_all_disabled_watchers",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("run process-signal child test");
+        assert!(
+            output.status.success(),
+            "child signal test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn session_owned_signal_handlers_restore_on_watcher_drop() {
+        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
         let watcher =
             super::spawn_signal_watcher(|| {}, super::SignalHandling::InstallForCli, None)
                 .expect("install session signal handlers");
@@ -638,6 +979,7 @@ mod tests {
 
     #[test]
     fn concurrent_session_cannot_use_unowned_signal_handlers() {
+        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
         let owner = super::spawn_signal_watcher(|| {}, super::SignalHandling::InstallForCli, None)
             .expect("install first session signal handlers");
         let duplicate =
@@ -658,6 +1000,7 @@ mod tests {
 
     #[test]
     fn second_shutdown_signal_exits_process() {
+        let _signal_test_lock = SIGNAL_TEST_LOCK.lock().expect("lock signal test state");
         const CHILD_ENV: &str = "STUDIOFS_SECOND_SHUTDOWN_SIGNAL_TEST_CHILD";
         if std::env::var_os(CHILD_ENV).is_some() {
             let _handlers = super::CliSignalHandlers::install()
@@ -3584,6 +3927,171 @@ mod tests {
     }
 
     #[test]
+    fn symlink_canceled_request_does_not_create_entry() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-symlink-canceled")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let adapter = super::adapter::StudioVfsAdapter::new(
+            Arc::clone(&vfs),
+            fixture.runtime().handle().clone(),
+        );
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let result = fixture.runtime().block_on(adapter.symlink(
+            studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+            b"canceled-link",
+            b"target",
+            cancellation,
+        ));
+        assert_eq!(result.unwrap_err(), libc::EINTR);
+        assert!(matches!(
+            vfs.lookup(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"canceled-link"
+            ),
+            Err(studiofs_vfs::VfsError::Meta(
+                studiofs_meta::MetaError::EntryNotFound { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn symlink_missing_parent_returns_enoent_without_retry() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-symlink-missing-parent",
+        )
+        .expect("create VFS fixture");
+        let adapter = super::adapter::StudioVfsAdapter::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+        );
+        fixture.runtime().block_on(async {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                adapter.symlink(
+                    u64::MAX,
+                    b"link",
+                    b"target",
+                    tokio_util::sync::CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("missing parent must not enter the deferred retry wait");
+            assert_eq!(result.unwrap_err(), libc::ENOENT);
+        });
+    }
+
+    fn dormant_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build dormant runtime")
+    }
+
+    fn admit_parent_on_runtime(
+        fixture: &studiofs_vfs::contract_harness::ContractVfsFixture,
+        runtime: &tokio::runtime::Runtime,
+        name: &[u8],
+    ) -> studiofs_meta::InodeAttr {
+        fixture.runtime().block_on(async {
+            fixture
+                .vfs()
+                .mkdir_with_deferred_metadata_admission(
+                    studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                    name,
+                    501,
+                    20,
+                    0o755,
+                    runtime.handle(),
+                )
+                .expect("admit deferred parent directory")
+        })
+    }
+
+    fn callback_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .build()
+            .expect("build single-worker callback runtime")
+    }
+
+    #[test]
+    fn symlink_wait_returns_enoent_at_its_deadline() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-symlink-deferred-deadline",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let deferred_runtime = dormant_runtime();
+        let parent = admit_parent_on_runtime(&fixture, &deferred_runtime, b"pending-parent");
+        let runtime = callback_runtime();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(Arc::clone(&vfs), runtime.handle().clone());
+
+        let started = std::time::Instant::now();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(6),
+                adapter.symlink(
+                    parent.ino,
+                    b"child-link",
+                    b"target",
+                    tokio_util::sync::CancellationToken::new(),
+                ),
+            )
+            .await
+        });
+        let drain_result = deferred_runtime
+            .block_on(vfs.wait_for_deferred_namespace_metadata_or_shutdown(parent.ino));
+        let symlink_result = result.expect("symlink wait must be bounded");
+        assert_eq!(symlink_result.unwrap_err(), libc::ENOENT);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        assert!(drain_result.expect("deferred metadata drain should finish"));
+    }
+
+    #[test]
+    fn symlink_retries_when_deferred_parent_commit_notifies_waiter() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-symlink-deferred-notify",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let deferred_runtime = dormant_runtime();
+        let parent = admit_parent_on_runtime(&fixture, &deferred_runtime, b"pending-parent");
+        let runtime = callback_runtime();
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(Arc::clone(&vfs), runtime.handle().clone());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = runtime.spawn(async move {
+            let _ = started_tx.send(());
+            adapter
+                .symlink(parent.ino, b"child-link", b"target", task_cancellation)
+                .await
+        });
+        runtime.block_on(async {
+            started_rx.await.expect("symlink task should start");
+        });
+
+        let drain_result = deferred_runtime
+            .block_on(vfs.wait_for_deferred_namespace_metadata_or_shutdown(parent.ino));
+        if !matches!(drain_result, Ok(true)) {
+            cancellation.cancel();
+        }
+        let attr = runtime
+            .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(1), task).await })
+            .expect("symlink should finish after notification or cancellation")
+            .expect("symlink task should join");
+        assert!(drain_result.expect("deferred parent metadata should commit"));
+        let attr = attr.expect("symlink should succeed under committed parent");
+        assert_eq!(vfs.lookup(parent.ino, b"child-link").unwrap().ino, attr.ino);
+    }
+
+    #[test]
     fn symlink_waits_for_deferred_parent_metadata() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-symlink-deferred-parent",
@@ -3603,8 +4111,14 @@ mod tests {
         let adapter =
             super::adapter::StudioVfsAdapter::new(vfs, fixture.runtime().handle().clone());
 
-        adapter
-            .symlink(parent.ino, b"skills", b"../.agents/skills")
+        fixture
+            .runtime()
+            .block_on(adapter.symlink(
+                parent.ino,
+                b"skills",
+                b"../.agents/skills",
+                tokio_util::sync::CancellationToken::new(),
+            ))
             .expect("symlink should wait for its deferred parent");
     }
 }

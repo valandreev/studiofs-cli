@@ -123,9 +123,12 @@ explicit cache safeguards; FSKit invalidation is no longer a logging-only
 fallback. Hardlink requests are translated through the shared
 `StudioVfsAdapter` in both macFUSE operation transports. Positioned FSKit
 `getxattr` reads preserve the legacy `position`, size-query, `ENOATTR`, and
-`ERANGE` contract, while potentially waiting `rmdir` and `symlink` callbacks
-run as tracked blocking reply tasks instead of occupying the FSKit dispatcher
-loop. The zero-copy negotiation and the remaining full semantic parity matrix
+`ERANGE` contract. Potentially waiting `rmdir` callbacks run as tracked blocking
+reply tasks. Symlink replies use tracked async tasks: each local metadata attempt
+runs on the blocking pool, while a deferred parent commit is awaited through VFS
+notification with a five-second deadline and request/shutdown cancellation.
+Neither wait occupies the FSKit dispatcher loop. The zero-copy negotiation and
+the remaining full semantic parity matrix
 remain separate follow-up work.
 
 Native FSKit mount sanity is kept out of the default library gate as an

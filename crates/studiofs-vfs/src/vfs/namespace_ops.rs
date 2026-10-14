@@ -560,6 +560,19 @@ impl StudioVfs {
         }
     }
 
+    /// Wait for deferred namespace metadata for `ino`, or return `false` if shutdown starts.
+    pub async fn wait_for_deferred_namespace_metadata_or_shutdown(
+        &self,
+        ino: Ino,
+    ) -> VfsResult<bool> {
+        let shutdown = self.state.shutdown.background_shutdown_token.clone();
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => Ok(false),
+            result = self.wait_for_deferred_namespace_metadata(ino) => result.map(|()| true),
+        }
+    }
+
     pub(super) async fn wait_for_deferred_namespace_cleanup(&self, ino: Ino) -> VfsResult<()> {
         loop {
             let notified = self.state.namespace.deferred.notify.notified();

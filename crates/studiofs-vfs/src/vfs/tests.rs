@@ -16080,6 +16080,74 @@ fn deferred_namespace_wait_keeps_blocking_until_all_inode_ops_complete() {
 }
 
 #[test]
+fn deferred_namespace_wait_returns_when_vfs_shutdown_starts() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-wait-shutdown");
+    rt.block_on(async {
+        let ino = 1;
+        vfs.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .pending_inodes
+            .insert(ino, 1);
+
+        let waiter_vfs = vfs.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_vfs
+                .wait_for_deferred_namespace_metadata_or_shutdown(ino)
+                .await
+        });
+        tokio::task::yield_now().await;
+        vfs.state.shutdown.background_shutdown_token.cancel();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("shutdown must bound the waiter")
+                .expect("wait task should join")
+                .unwrap(),
+            "shutdown must release a symlink callback waiting for deferred metadata"
+        );
+    });
+}
+
+#[test]
+fn deferred_namespace_wait_observes_completion_before_wait_and_stored_error() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-wait-completed");
+    rt.block_on(async {
+        let ino = 1;
+        {
+            let mut inner = vfs.state.namespace.deferred.inner.lock();
+            inner.pending_inodes.insert(ino, 1);
+            inner.pending_inodes.remove(&ino);
+        }
+        vfs.state.namespace.deferred.notify.notify_waiters();
+        assert!(
+            vfs.wait_for_deferred_namespace_metadata_or_shutdown(ino)
+                .await
+                .expect("completed metadata wait should succeed"),
+            "a commit that wins the capture-to-wait race should permit the caller to retry"
+        );
+
+        vfs.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .errors
+            .insert(ino, Arc::from("metadata commit failed"));
+        assert!(matches!(
+            vfs.wait_for_deferred_namespace_metadata_or_shutdown(ino).await,
+            Err(crate::VfsError::Other(message))
+                if message.contains("deferred namespace metadata commit failed")
+        ));
+    });
+}
+
+#[test]
 fn deferred_namespace_drain_abandons_permanent_failure() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-abandons-failure");
