@@ -29,8 +29,5 @@ test*.txt
 /.claude/
 deslop*.txt
 .rwx/bin/
-.codebase-memory/*
-!.codebase-memory/.gitattributes
-!.codebase-memory/artifact.json
-!.codebase-memory/graph.db.zst
+.codebase-memory/
 .antigravitycli/

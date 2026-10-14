@@ -33,31 +33,32 @@ publication.
 
 ## Discovery and external references
 
-Use the Codebase Memory MCP first for code structure in project
-`E-dev-studiofs-cli`. The team-shared graph snapshot is stored under
-`.codebase-memory/`; index with `persistence=true` when intentionally refreshing
-it. The indexer rewrites the snapshot on later indexing too. Preserve those
-changes and include the latest snapshot in the task's Git delivery:
+Use the Codebase Memory MCP first for code structure. Each machine keeps its
+own persistent index in the local Codebase Memory cache, by default
+`~/.cache/codebase-memory-mcp` (on Windows,
+`%USERPROFILE%\.cache\codebase-memory-mcp`). Keep this cache outside the
+repository and on local storage, not a shared or network filesystem.
+Use `list_projects` to select the entry whose `root_path` is this checkout;
+project names can differ between machines and clone paths. Omit `name` when
+manually indexing so the local path-derived project is reused.
 
 ```text
-index_repository(repo_path="<absolute repository root>", name="E-dev-studiofs-cli", persistence=true)
+index_repository(repo_path="<absolute repository root>", persistence=false)
 ```
+
+Do not persist or commit `.codebase-memory/` artifacts. Keep `auto_index=true`,
+`auto_watch=true`, and `watcher_enabled=true` on each machine so new checkouts
+are indexed and existing indexes stay current; these settings are machine-local.
+`watcher_enabled` is read when the daemon starts, so restart the daemon after
+changing it.
 
 If the MCP tools are not exposed in the current agent session, use the local
 `codebase-memory-mcp` CLI when available and verify the project name with
 `list_projects`; otherwise continue with `rg` and direct source inspection.
 
-The graph artifact is portable across operating systems. A fresh checkout can
-import it and incrementally index that machine's working tree. Track the
-`.codebase-memory/graph.db.zst`, its `artifact.json` metadata, and the generated
-`.gitattributes` merge rule together. Changes under `.codebase-memory/` are
-shared repository state: do not discard them or leave them out of delivery as
-unrelated generated files. Commit the latest snapshot and metadata together,
-include any changed merge rule, and push the commits to GitHub so other
-machines can import the updated graph. Batch intermediate index refreshes into
-the final snapshot commit; Git retains each committed snapshot.
-Each machine still needs its own native MCP installation and client
-configuration; only the graph artifact is shared by Git.
+`.gitignore` excludes the entire `.codebase-memory/` directory. Each machine's
+first index is local; its watcher refreshes that local index after source or Git
+changes. Do not use Git as a Codebase Memory synchronization mechanism.
 
 The MCP tools:
 

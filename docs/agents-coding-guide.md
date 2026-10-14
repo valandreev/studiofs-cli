@@ -6,41 +6,43 @@ The root file is the execution contract; this guide is the implementation refere
 ## Codex task entrypoint
 
 Use the root `AGENTS.md` for instruction precedence, task boundaries, graph-first
-discovery, focused validation, and delivery rules. Codex's Codebase Memory project
-key for this repository is `E-dev-studiofs-cli`. Use `search_graph` and
-`trace_path` for structural discovery, then read the exact source with
+discovery, focused validation, and delivery rules. Use `list_projects` to select
+the Codebase Memory entry whose `root_path` matches this checkout; project names
+can differ between machines and clone paths. Use `search_graph` and `trace_path`
+for structural discovery, then read the exact source with
 `get_code_snippet`; check coverage before relying on negative or exhaustive graph
 claims. Use `rg` or PowerShell for Markdown, scripts, literals, and parse-partial or
 excluded files.
 
-The team-shared snapshot is `.codebase-memory/graph.db.zst`, with its
-`artifact.json` metadata and generated `.gitattributes` merge rule. Refresh it
-with `index_repository` using `name="E-dev-studiofs-cli"` and
-`persistence=true`. A fresh local cache can import the snapshot and reconcile
-the checkout. Upstream issue #885 documents that different absolute clone paths
-can cause a full reparse because the imported rows keep the exporting project's
-path-derived identity; do not promise an incremental warm start across machines
-until upstream fixes that limitation.
-Each machine keeps its live SQLite index in its own Codebase Memory cache; sync
-the compressed snapshot through GitHub, never the live cache or a shared network
-directory. Use the same project name on all machines. Pull the latest snapshot
-before intentionally publishing a refreshed one, and serialize snapshot commits
-so concurrent binary updates do not leave one machine's graph behind.
-The tracked merge attribute needs a local Git driver on each clone; set it once
-with `git config --local merge.ours.driver true`. If two branches both update
-the snapshot, Git keeps the current branch's copy, so pull before publishing
-and do not merge competing snapshot commits as a synchronization strategy.
-Codebase Memory currently has no supported per-project `auto_index` or
-`auto_watch` exclusion. Those runtime settings are global to a machine's local
-Codebase Memory config; `.codebase-memory.json` only configures extra file
-extensions. Do not disable them as repository setup when other projects on that
-machine rely on automatic indexing. To use the shared key, run
-`index_repository` with `name="E-dev-studiofs-cli"` after cloning or pulling the
-snapshot. Runtime settings do not travel through Git.
-The indexer rewrites the artifact during later indexes; commit refreshed copies
-on a deliberate cadence because each changed copy adds binary history to Git.
-Install the native MCP executable and configure the agent client separately on
-each OS; do not share a machine-specific executable path through Git.
+## Codebase Memory index storage
+
+Codebase Memory keeps each machine's persistent SQLite index under its local
+cache, by default `~/.cache/codebase-memory-mcp` (native Windows:
+`%USERPROFILE%\.cache\codebase-memory-mcp`). Keep the cache outside the
+checkout and on local storage; do not put it on a shared/network filesystem.
+If `CBM_CACHE_DIR` is set, use the same local path in the MCP client's
+environment and in the shell used for CLI commands.
+
+For a manual index, omit `name` so Codebase Memory reuses this machine's
+path-derived project, and set `persistence=false`:
+
+```text
+index_repository(repo_path="<absolute repository root>", persistence=false)
+```
+
+The repository ignores `.codebase-memory/` completely. Do not create or commit
+graph snapshots, metadata, or merge-driver rules there. A new machine builds its
+own index on first indexing; after that, the watcher keeps it current as the
+checkout changes. Git does not distribute or restore a machine's local index.
+
+Keep `auto_index=true`, `auto_watch=true`, and `watcher_enabled=true` in each
+machine's Codebase Memory runtime config. These options are machine-local;
+`auto_index` defaults to `false`, so set it explicitly when automatic initial
+indexing is wanted. `watcher_enabled` is read when the daemon starts; restart the
+daemon after changing it. Verify the current checkout is watched with
+`index_status` (`watch.strategy` should be `git`). Do not disable indexing or the
+watcher to avoid repository changes. The native MCP executable and client setup
+are also installed per OS.
 
 If Codebase Memory tools are missing from an agent session, check the local CLI
 with `codebase-memory-mcp cli list_projects --format json` to distinguish a
