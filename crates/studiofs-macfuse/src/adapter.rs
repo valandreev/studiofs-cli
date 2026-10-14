@@ -8,7 +8,7 @@ use std::ops::Deref;
 use std::os::raw::{c_char, c_ulong};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{
-    Arc, Condvar, LockResult, Mutex, MutexGuard, OnceLock,
+    Arc, Condvar, LockResult, Mutex, MutexGuard,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -32,7 +32,6 @@ use studiofs_vfs::{
     KernelInvalidator, LocalSyncPolicy, OpenFlags, StatFs, StudioVfs, VfsFuseAsyncReadSnapshot,
     VfsMacFuseOpenCacheDecision, VfsResult,
 };
-use sysinfo::{MemoryRefreshKind, System};
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, SemaphorePermit};
 #[cfg(test)]
@@ -45,7 +44,10 @@ use crate::low_level::{
     catch_callback_unwind, raw,
 };
 
+mod memory_sampler;
 mod read_buffer;
+
+use memory_sampler::SystemMemorySampler;
 
 #[cfg(test)]
 use read_buffer::MACFUSE_READ_BUFFER_POOL_RETAINED_CAPACITY;
@@ -55,7 +57,6 @@ const TTL_SECONDS: f64 = 1.0;
 const MACFUSE_ATTR_BLOCK_SIZE: u32 = crate::low_level::MACOS_FUSE_IOSIZE_BYTES;
 const MACFUSE_READ_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
 const MACFUSE_ASYNC_READ_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
-const MACFUSE_AVAILABLE_MEMORY_TTL: Duration = Duration::from_secs(1);
 const MACFUSE_READ_INTERRUPTED_ERRNO: i32 = libc::EINTR;
 const MACFUSE_SYMLINK_RETRY_ATTEMPTS: u16 = 200;
 const MACFUSE_SYMLINK_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -83,6 +84,7 @@ pub(crate) struct StudioVfsAdapter {
     runtime_handle: Handle,
     reply_tasks: Arc<ReplyTaskTracker>,
     read_only: bool,
+    available_memory: SystemMemorySampler,
     mount_uid: u32,
     mount_gid: u32,
     directory_handles: ParkingMutex<HashMap<u64, Arc<DirectoryHandle>>>,
@@ -869,6 +871,7 @@ impl StudioVfsAdapter {
             runtime_handle,
             reply_tasks: Arc::new(ReplyTaskTracker::default()),
             read_only,
+            available_memory: SystemMemorySampler::system(),
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             directory_handles: ParkingMutex::new(HashMap::new()),
@@ -1259,7 +1262,7 @@ impl StudioVfsAdapter {
             self.shared.open_cache_snapshots.lock().pop(&ino);
             flag_policy
         } else if flag_policy.keep_cache {
-            self.read_only_open_cache_policy(ino, fh, available_memory_bytes())
+            self.read_only_open_cache_policy(ino, fh, self.available_memory.available_memory())
         } else {
             let _ = self
                 .vfs
@@ -1296,14 +1299,14 @@ impl StudioVfsAdapter {
             #[cfg(test)]
             self.shared.open_cache_snapshots.lock().pop(&ino);
             return MacFuseOpenCachePolicy {
-                direct_io: false,
+                direct_io: available_memory.is_none(),
                 keep_cache: false,
                 write_capable: false,
             };
         };
         let keep_cache = decision.disposition() == OsCacheDisposition::Reuse;
         let policy = MacFuseOpenCachePolicy {
-            direct_io: available_memory.is_some_and(|available| attr.size > available),
+            direct_io: available_memory.is_none_or(|available| attr.size > available),
             keep_cache,
             write_capable: false,
         };
@@ -2337,6 +2340,7 @@ impl CallbackState {
 
     pub(crate) fn wait_for_reply_tasks(&self) {
         self.adapter.reply_tasks.wait_for_idle();
+        self.adapter.available_memory.shutdown();
     }
 
     #[cfg(all(test, studiofs_fskit))]
@@ -2619,47 +2623,6 @@ fn macfuse_cache_metric(
     }
 }
 
-struct AvailableMemorySnapshot {
-    system: System,
-    available: Option<u64>,
-    refreshed_at: Instant,
-}
-
-impl AvailableMemorySnapshot {
-    fn new() -> Self {
-        let mut snapshot = Self {
-            system: System::new(),
-            available: None,
-            refreshed_at: Instant::now(),
-        };
-        snapshot.refresh();
-        snapshot
-    }
-
-    fn available_memory(&mut self) -> Option<u64> {
-        if self.refreshed_at.elapsed() >= MACFUSE_AVAILABLE_MEMORY_TTL {
-            self.refresh();
-        }
-        self.available
-    }
-
-    fn refresh(&mut self) {
-        self.system
-            .refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
-        let available = self.system.available_memory();
-        self.available = (available > 0).then_some(available);
-        self.refreshed_at = Instant::now();
-    }
-}
-
-fn available_memory_bytes() -> Option<u64> {
-    static AVAILABLE_MEMORY: OnceLock<ParkingMutex<AvailableMemorySnapshot>> = OnceLock::new();
-    AVAILABLE_MEMORY
-        .get_or_init(|| ParkingMutex::new(AvailableMemorySnapshot::new()))
-        .lock()
-        .available_memory()
-}
-
 fn current_uid() -> u32 {
     // SAFETY: `geteuid` is thread-safe, takes no pointers, and has no Rust-side
     // invariants beyond the platform libc contract.
@@ -2675,11 +2638,9 @@ fn current_gid() -> u32 {
 #[cfg(test)]
 mod open_cache_snapshot_tests {
     use super::{
-        AvailableMemorySnapshot, MACFUSE_AVAILABLE_MEMORY_TTL, MacFuseOpenCacheGraphSpan,
-        MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot, MacFuseOpenCacheSnapshotKind,
-        StudioVfsAdapter,
+        MacFuseOpenCacheGraphSpan, MacFuseOpenCachePolicy, MacFuseOpenCacheSnapshot,
+        MacFuseOpenCacheSnapshotKind, StudioVfsAdapter,
     };
-    use std::time::Instant;
     use studiofs_meta::{InodeAttr, UploadState};
     use studiofs_vfs::contract_harness::{CONTRACT_ROOT_INO, ContractVfsFixture};
     use studiofs_vfs::vfs::OpenFlags;
@@ -2742,28 +2703,116 @@ mod open_cache_snapshot_tests {
     }
 
     #[test]
-    fn expired_available_memory_snapshot_is_refreshed() {
-        let mut snapshot = AvailableMemorySnapshot {
-            system: sysinfo::System::new(),
-            available: None,
-            refreshed_at: Instant::now() - MACFUSE_AVAILABLE_MEMORY_TTL,
-        };
-        let before_refresh = snapshot.refreshed_at;
+    fn concurrent_opens_finish_while_memory_sampling_is_blocked() {
+        use std::sync::mpsc;
+        use std::time::Duration;
 
-        let _ = snapshot.available_memory();
+        let fixture =
+            ContractVfsFixture::new("macfuse-open-blocked-memory").expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let inodes: Vec<_> = (0..4)
+            .map(|index| {
+                vfs.create(
+                    CONTRACT_ROOT_INO,
+                    format!("open-{index}.bin").as_bytes(),
+                    501,
+                    20,
+                    0o644,
+                )
+                .expect("create file")
+                .ino
+            })
+            .collect();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let mut adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        adapter.available_memory = super::SystemMemorySampler::start(move || {
+            entered_tx.send(()).expect("signal sampling");
+            resume_rx.recv().expect("resume sampling");
+            Some(4096)
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("sampler started");
 
-        assert!(snapshot.refreshed_at > before_refresh);
+        let results = std::thread::scope(|scope| {
+            let (done_tx, done_rx) = mpsc::channel();
+            for ino in inodes {
+                let done_tx = done_tx.clone();
+                let adapter = &adapter;
+                scope.spawn(move || {
+                    let opened = adapter.open(ino, libc::O_RDONLY).expect("open file");
+                    let direct_io = opened.direct_io();
+                    adapter
+                        .release(ino, opened.file_handle())
+                        .expect("release file");
+                    done_tx.send(direct_io).expect("signal completed open");
+                });
+            }
+            let results: Vec<_> = (0..4)
+                .map(|_| done_rx.recv_timeout(Duration::from_secs(2)))
+                .collect();
+            resume_tx.send(()).expect("resume sampler after callbacks");
+            results
+        });
+        adapter.available_memory.shutdown();
+        for result in results {
+            assert!(result.expect("open must finish before sampling resumes"));
+        }
     }
 
     #[test]
-    fn fresh_available_memory_snapshot_is_reused() {
-        let mut snapshot = AvailableMemorySnapshot {
-            system: sysinfo::System::new(),
-            available: None,
-            refreshed_at: Instant::now(),
-        };
+    fn read_only_open_with_fitting_memory_sample_keeps_kernel_io() {
+        let fixture = ContractVfsFixture::new("macfuse-open-cache-fitting-memory")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"fitting-memory.bin", 501, 20, 0o644)
+            .expect("create file");
+        vfs.setattr(attr.ino, studiofs_meta::SetattrArgs::size_only(1024))
+            .expect("set size");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open file");
+        let policy = adapter.read_only_open_cache_policy(attr.ino, fh, Some(1024));
+        adapter.release(attr.ino, fh).expect("release file");
+        assert!(!policy.direct_io);
+    }
 
-        assert_eq!(snapshot.available_memory(), None);
+    #[test]
+    fn read_only_open_with_missing_attr_and_memory_uses_direct_io() {
+        let fixture = ContractVfsFixture::new("macfuse-open-cache-missing-attr-memory")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"missing-attr.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open file");
+        let policy = adapter.read_only_open_cache_policy(u64::MAX, fh, None);
+        adapter.release(attr.ino, fh).expect("release file");
+        assert!(policy.direct_io);
+        assert!(!policy.keep_cache);
+    }
+
+    #[test]
+    fn read_only_open_without_memory_sample_uses_direct_io() {
+        let fixture = ContractVfsFixture::new("macfuse-open-cache-missing-memory")
+            .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"missing-memory.bin", 501, 20, 0o644)
+            .expect("create file");
+        let adapter = StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open file");
+        let policy = adapter.read_only_open_cache_policy(attr.ino, fh, None);
+        adapter.release(attr.ino, fh).expect("release file");
+        assert!(policy.direct_io);
     }
 
     #[test]

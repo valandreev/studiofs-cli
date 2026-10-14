@@ -582,11 +582,16 @@ entry notification behavior and mounted namespace convergence.
 
 macOS FUSE keeps the Unified Buffer Cache and kernel readahead enabled for
 read-only files that fit in currently available RAM. When a file is larger than
-available RAM, its read-only handle uses `direct_io` to avoid cycling the same
-bytes through both StudioFS's local payload cache and UBC. This does not bypass
+available RAM, or a fresh memory sample is unavailable, its read-only handle
+uses `direct_io` to avoid cycling the same bytes through both StudioFS's local payload cache and UBC. This does not bypass
 the StudioFS cache: the VFS still reads cached payloads locally and fetches from
-object storage only on a payload-cache miss. `novncache` keeps namespace lookups
-coherent. The mount does not pass the global `direct_io`, `nolocalcaches`, or
+object storage only on a payload-cache miss. Each adapter owns a background
+memory sampler that measures RAM once per second; opens only read an atomic
+snapshot. Missing, zero, or concurrently published samples, and samples at least
+two seconds old conservatively select direct I/O. Sample age starts before the OS refresh,
+so a slow refresh cannot make an old measurement fresh. Teardown stops and joins
+the sampler after draining callbacks; dropping the adapter also joins it.
+`novncache` keeps namespace lookups coherent. The mount does not pass the global `direct_io`, `nolocalcaches`, or
 `auto_cache` options; data and attribute coherence instead use per-handle
 `keep_cache` decisions plus scoped low-level inode invalidations. The mount also
 passes
