@@ -91,7 +91,7 @@ pub(crate) struct StudioVfsAdapter {
     next_directory_handle: AtomicU64,
     shared: Arc<AdapterSharedState>,
     open_reply_serializer: FuseOpenReplySerializer,
-    file_flags: ParkingMutex<HashMap<u64, u32>>,
+    file_flags: DashMap<u64, u32>,
     read_queue_byte_limit: u32,
     next_runtime_stats_fh: AtomicU64,
     runtime_stats_handles: Arc<ParkingMutex<HashMap<u64, Vec<u8>>>>,
@@ -922,7 +922,7 @@ impl StudioVfsAdapter {
                 vfs_read_stall_for_test: ParkingMutex::new(None),
             }),
             open_reply_serializer: FuseOpenReplySerializer::new(),
-            file_flags: ParkingMutex::new(HashMap::new()),
+            file_flags: DashMap::new(),
             read_queue_byte_limit,
             next_runtime_stats_fh: AtomicU64::new(u64::MAX / 2),
             runtime_stats_handles: Arc::new(ParkingMutex::new(HashMap::new())),
@@ -2328,7 +2328,7 @@ impl StudioVfsAdapter {
             self.mount_gid,
             MACFUSE_ATTR_BLOCK_SIZE,
         ));
-        if let Some(flags) = self.file_flags.lock().get(&attr.ino).copied() {
+        if let Some(flags) = self.file_flags.get(&attr.ino).map(|flags| *flags) {
             assign_stat_flags(&mut stat, flags);
             if flags & MACOS_UF_HIDDEN != 0 {
                 assign_hidden_file_stat_times(&mut stat);
@@ -2339,30 +2339,28 @@ impl StudioVfsAdapter {
 
     fn remember_callback_file_flags(&self, ino: u64, attr: *const stat, to_set: libc::c_int) {
         if to_set == 0 || setattr_mask_has_flags(to_set) {
-            self.file_flags
-                .lock()
-                .insert(ino, callback_stat_flags(attr));
+            self.file_flags.insert(ino, callback_stat_flags(attr));
         }
     }
 
     fn remember_named_file_flags(&self, ino: u64, name: &[u8]) {
         if name == MACOS_DS_STORE_NAME {
-            self.file_flags.lock().insert(ino, MACOS_UF_HIDDEN);
+            self.file_flags.insert(ino, MACOS_UF_HIDDEN);
         }
     }
 
     #[cfg(studiofs_fskit)]
     pub(crate) fn remember_fskit_file_flags(&self, ino: u64, flags: u32) {
-        self.file_flags.lock().insert(ino, flags);
+        self.file_flags.insert(ino, flags);
     }
 
     fn clear_file_flags(&self, ino: u64) {
-        self.file_flags.lock().remove(&ino);
+        self.file_flags.remove(&ino);
     }
 
     #[cfg(test)]
     pub(crate) fn file_flags_contains_for_test(&self, ino: u64) -> bool {
-        self.file_flags.lock().contains_key(&ino)
+        self.file_flags.contains_key(&ino)
     }
 
     fn dir_entry_to_stat(&self, entry: &DirEntry) -> stat {
@@ -4203,7 +4201,7 @@ macfuse_callback! {
         }
         let flags = unsafe { (*attr).flags };
         if setattr_mask_has_flags(to_set) {
-            state.adapter.file_flags.lock().insert(ino, flags);
+            state.adapter.file_flags.insert(ino, flags);
         }
         let args = match setattr_x_args_from_callback(attr, to_set) {
             Ok(args) => args,
@@ -4855,6 +4853,65 @@ mod tests {
     use super::*;
     use studiofs_meta::engine::XATTR_REPLACE_FLAG;
     use studiofs_vfs::contract_harness::ContractVfsFixture;
+
+    #[test]
+    fn file_flags_other_inode_lookup_getattr_progress_while_flags_are_locked() {
+        let fixture =
+            ContractVfsFixture::new("macfuse-file-flags-shards").expect("create VFS fixture");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        let attr = fixture
+            .vfs()
+            .create(ROOT_INO, b"flags.txt", 501, 20, 0o644)
+            .expect("create file");
+        adapter.remember_named_file_flags(attr.ino, MACOS_DS_STORE_NAME);
+        for ino in 1000..1128 {
+            adapter.remember_named_file_flags(ino, MACOS_DS_STORE_NAME);
+        }
+        let held = (1000..1128)
+            .find_map(|ino| {
+                let guard = adapter.file_flags.get_mut(&ino).expect("hold inode flags");
+                matches!(
+                    adapter.file_flags.try_get(&attr.ino),
+                    dashmap::try_result::TryResult::Present(_)
+                )
+                .then_some(guard)
+            })
+            .expect("hold an inode in a different shard");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let looked_up = adapter.lookup(ROOT_INO, b"flags.txt").expect("lookup file");
+                assert_eq!(looked_up.ino, attr.ino);
+                let stat = adapter.getattr(attr.ino).expect("get file attributes");
+                assert_eq!(
+                    (stat.st_birthtime, stat.st_birthtime_nsec),
+                    (stat.st_mtime, stat.st_mtime_nsec)
+                );
+                assert_eq!(
+                    (stat.st_ctime, stat.st_ctime_nsec),
+                    (stat.st_mtime, stat.st_mtime_nsec)
+                );
+                adapter.clear_file_flags(attr.ino);
+                assert!(!adapter.file_flags.contains_key(&attr.ino));
+                adapter.remember_named_file_flags(attr.ino, MACOS_DS_STORE_NAME);
+                assert_eq!(
+                    adapter
+                        .getattr(attr.ino)
+                        .expect("get reinserted flags")
+                        .st_flags,
+                    MACOS_UF_HIDDEN
+                );
+                tx.send((stat.st_ino, stat.st_flags))
+                    .expect("send stat flags");
+            });
+            let result = rx.recv_timeout(Duration::from_secs(3));
+            drop(held);
+            assert_eq!(
+                result.expect("unrelated inode stat must progress"),
+                (attr.ino, MACOS_UF_HIDDEN)
+            );
+        });
+    }
 
     #[test]
     fn reply_task_tracker_recovers_poison_without_losing_active_replies() {
