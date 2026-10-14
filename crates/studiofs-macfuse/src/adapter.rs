@@ -320,16 +320,10 @@ struct ReadBufferPool {
 }
 
 impl ReadBufferPool {
-    #[cfg(test)]
-    fn acquire(self: Arc<Self>, size: usize) -> PooledReadBuffer {
-        self.acquire_with_capacity(size, size)
-    }
-
-    fn acquire_with_capacity(self: Arc<Self>, len: usize, capacity: usize) -> PooledReadBuffer {
+    fn acquire(self: Arc<Self>, len: usize) -> PooledReadBuffer {
         let mut buffer = self.buffers.lock().pop().unwrap_or_default();
-        let capacity = capacity.max(len);
-        if buffer.capacity() < capacity {
-            buffer.reserve_exact(capacity - buffer.len());
+        if buffer.capacity() < len {
+            buffer.reserve_exact(len - buffer.len());
         }
         // Keep the initialized tail across replies; only new storage needs zeroing.
         if buffer.len() < len {
@@ -1614,11 +1608,7 @@ impl StudioVfsAdapter {
         }
         if state.vfs.is_runtime_stats_file_ino(request.ino) {
             let size = request.size as usize;
-            let mut out = state
-                .shared
-                .read_buffers
-                .clone()
-                .acquire_with_capacity(size, size);
+            let mut out = state.shared.read_buffers.clone().acquire(size);
             let handles = state.runtime_stats_handles.lock();
             let Some(bytes) = handles.get(&request.file_handle) else {
                 return Err(libc::EBADF);
@@ -1631,11 +1621,7 @@ impl StudioVfsAdapter {
             clamp_reusable_read_size(request.size, MACFUSE_READ_BUFFER_POOL_MAX_CAPACITY as u32);
         let size_usize = size as usize;
 
-        let mut out = state
-            .shared
-            .read_buffers
-            .clone()
-            .acquire_with_capacity(size_usize, size_usize);
+        let mut out = state.shared.read_buffers.clone().acquire(size_usize);
         if cancellation.is_cancelled() {
             return Err(MACFUSE_READ_INTERRUPTED_ERRNO);
         }
