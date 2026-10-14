@@ -586,9 +586,10 @@ available RAM, or a fresh memory sample is unavailable, its read-only handle
 uses `direct_io` to avoid cycling the same bytes through both StudioFS's local payload cache and UBC. This does not bypass
 the StudioFS cache: the VFS still reads cached payloads locally and fetches from
 object storage only on a payload-cache miss. Each adapter owns a background
-memory sampler that measures RAM once per second; opens only read an atomic
-snapshot. Missing, zero, or concurrently published samples, and samples at least
-two seconds old conservatively select direct I/O. Sample age starts before the OS refresh,
+memory sampler that measures RAM once per second and publishes a snapshot under
+a short write lock, after the OS refresh. Opens use `RwLock::try_read` and never
+wait for publication. Missing, zero, or samples at least two seconds old, and a
+busy or poisoned snapshot lock conservatively select direct I/O. Sample age starts before the OS refresh,
 so a slow refresh cannot make an old measurement fresh. Teardown stops and joins
 the sampler after draining callbacks; dropping the adapter also joins it.
 `novncache` keeps namespace lookups coherent. The mount does not pass the global `direct_io`, `nolocalcaches`, or
