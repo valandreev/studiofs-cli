@@ -488,34 +488,21 @@ impl<'a> RemoteApplyCoordinator<'a> {
         extra: &OverlayConflictSets,
     ) -> OverlayConflictSets {
         let mut merged = base.clone();
-        merged
-            .block_inodes
-            .extend(extra.block_inodes.iter().copied());
-        merged.attr_inodes.extend(extra.attr_inodes.iter().copied());
-        merged
-            .remove_attr_inodes
-            .extend(extra.remove_attr_inodes.iter().copied());
-        merged.dentry_keys.extend(extra.dentry_keys.iter().cloned());
-        merged
-            .symlink_inodes
-            .extend(extra.symlink_inodes.iter().copied());
-        merged
-            .xattr_inodes
-            .extend(extra.xattr_inodes.iter().copied());
-        merged.xattr_keys.extend(extra.xattr_keys.iter().cloned());
-        merged.acl_keys.extend(extra.acl_keys.iter().cloned());
+        Self::extend_overlay_conflicts(&mut merged, extra);
         merged
     }
 
-    fn extend_overlay_conflicts(base: &mut OverlayConflictSets, extra: OverlayConflictSets) {
-        base.block_inodes.extend(extra.block_inodes);
-        base.attr_inodes.extend(extra.attr_inodes);
-        base.remove_attr_inodes.extend(extra.remove_attr_inodes);
-        base.dentry_keys.extend(extra.dentry_keys);
-        base.symlink_inodes.extend(extra.symlink_inodes);
-        base.xattr_inodes.extend(extra.xattr_inodes);
-        base.xattr_keys.extend(extra.xattr_keys);
-        base.acl_keys.extend(extra.acl_keys);
+    fn extend_overlay_conflicts(base: &mut OverlayConflictSets, extra: &OverlayConflictSets) {
+        base.block_inodes.extend(extra.block_inodes.iter().copied());
+        base.attr_inodes.extend(extra.attr_inodes.iter().copied());
+        base.remove_attr_inodes
+            .extend(extra.remove_attr_inodes.iter().copied());
+        base.dentry_keys.extend(extra.dentry_keys.iter().cloned());
+        base.symlink_inodes
+            .extend(extra.symlink_inodes.iter().copied());
+        base.xattr_inodes.extend(extra.xattr_inodes.iter().copied());
+        base.xattr_keys.extend(extra.xattr_keys.iter().cloned());
+        base.acl_keys.extend(extra.acl_keys.iter().cloned());
     }
 
     pub(super) fn collect_replay_reconcile_inodes(
@@ -2243,7 +2230,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 applied_any |= outcome.changed;
                 Self::extend_overlay_conflicts(
                     &mut replay_protected_overlay,
-                    Self::regular_file_protection_owned_by_local_suffix(
+                    &Self::regular_file_protection_owned_by_local_suffix(
                         outcome.protected_overlay,
                         &effective_overlay,
                     ),
