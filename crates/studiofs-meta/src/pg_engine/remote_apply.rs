@@ -556,6 +556,27 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
     }
 
+    // Replay protection lasts until the matching self batch is acknowledged. When that
+    // acknowledgment already happened earlier in the page, no later self batch can clear
+    // it, so only inodes a still-unacknowledged local suffix owns keep it. Final
+    // reconciliation still re-checks live local regular-file state for the rest.
+    fn regular_file_protection_owned_by_local_suffix(
+        mut protected_overlay: OverlayConflictSets,
+        local_suffix_overlay: &OverlayConflictSets,
+    ) -> OverlayConflictSets {
+        let owned_by_local_suffix = |ino: &Ino| {
+            local_suffix_overlay.attr_inodes.contains(ino)
+                || local_suffix_overlay.block_inodes.contains(ino)
+                || local_suffix_overlay.remove_attr_inodes.contains(ino)
+        };
+        protected_overlay.attr_inodes.retain(owned_by_local_suffix);
+        protected_overlay.block_inodes.retain(owned_by_local_suffix);
+        protected_overlay
+            .remove_attr_inodes
+            .retain(owned_by_local_suffix);
+        protected_overlay
+    }
+
     pub(super) fn event_has_aux_apply_effect(event: &MetaEvent) -> bool {
         match event {
             MetaEvent::RemoveAttr { .. }
@@ -2211,7 +2232,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 applied_any |= outcome.changed;
                 replay_protected_overlay = Self::merge_overlay_conflicts(
                     &replay_protected_overlay,
-                    &outcome.protected_overlay,
+                    &Self::regular_file_protection_owned_by_local_suffix(
+                        outcome.protected_overlay,
+                        &effective_overlay,
+                    ),
                 );
             }
             if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
