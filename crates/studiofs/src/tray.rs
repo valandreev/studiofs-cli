@@ -923,18 +923,37 @@ mod supported {
         use super::*;
 
         #[test]
-        fn idle_icon_has_blue_top_and_yellow_bottom_at_pulse_peak() {
+        fn pulse_colors_at_peak() {
             assert_eq!(
                 pulse_colors(TrayPulseMode::Idle, IDLE_CYCLE / 2),
                 [[0x00, 0x57, 0xB7], [0xFF, 0xD7, 0x00]]
             );
-        }
-
-        #[test]
-        fn active_icon_keeps_both_halves_red() {
             assert_eq!(
                 pulse_colors(TrayPulseMode::Active, ACTIVE_CYCLE / 2),
                 [COLOR_ORANGE; 2]
+            );
+        }
+
+        #[test]
+        fn pulse_colors_at_trough_are_white() {
+            for mode in [TrayPulseMode::Idle, TrayPulseMode::Active] {
+                assert_eq!(pulse_colors(mode, Duration::ZERO), [COLOR_WHITE; 2]);
+            }
+        }
+
+        #[test]
+        fn tinted_rgba_splits_non_square_odd_height_at_row_boundary() {
+            let mask = IconMask {
+                width: 2,
+                height: 3,
+                alpha: Arc::new(vec![255; 6]),
+            };
+            assert_eq!(
+                mask.tinted_rgba([[10; 3], [20; 3]]),
+                vec![
+                    10, 10, 10, 255, 10, 10, 10, 255, 20, 20, 20, 255, 20, 20, 20, 255, 20, 20, 20,
+                    255, 20, 20, 20, 255,
+                ]
             );
         }
 
