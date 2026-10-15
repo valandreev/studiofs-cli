@@ -3492,3 +3492,95 @@ fn pg_event_insert_chunking_covers_all_events() {
 
     assert_eq!(chunk_sizes, vec![512, 512, 1]);
 }
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn hidden_flush_tail_is_republished_in_next_batch_and_acknowledged_after_remount() {
+    let dsn = pg_dsn().expect("PostgreSQL regression requires STUDIOFS_TEST_PG_DSN");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-hidden-flush-tail-ack");
+    seed_local(&path, &volume.format_info());
+    let options = PgOpenOptions {
+        background_poll: false,
+        ..Default::default()
+    };
+    let pg = PgMetaEngine::open_with_options(&path, options).expect("open writer");
+    let published = uploaded_pending_file(&pg, b"published.bin", 95_001);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(published.ino, published.content_epoch)
+            .unwrap()
+    );
+    // The still-uploading create is the hidden tail of the first flush.
+    let tail = pg
+        .create_file(ROOT_INO, b"hidden-tail.bin", 0, 0, 0o644)
+        .unwrap();
+    pg.request_pending_flush();
+    pg.flush_due_pending().expect("flush published prefix");
+    pg.sync_metadata().expect("acknowledge first batch");
+    let cursor_after_first_batch = pg.flushed_event_seq.load(Ordering::SeqCst);
+
+    let payload = PayloadRef::new_partial(95_002, 152);
+    pg.stage_payload_slice(tail.ino, 0, &payload).unwrap();
+    set_file_state(&pg, tail.ino, 152, 1);
+    let tail = pg.get_attr(tail.ino).unwrap();
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(
+            tail.ino,
+            tail.content_epoch,
+            payload.object_id
+        )
+        .unwrap()
+    );
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(tail.ino, tail.content_epoch)
+            .unwrap()
+    );
+    pg.request_pending_flush();
+    pg.flush_due_pending()
+        .expect("flush hidden tail publication");
+    pg.sync_metadata().expect("acknowledge second batch");
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local).unwrap(),
+        next_event_seq,
+        "every published local event must be acknowledged"
+    );
+    let head = pg.remote_metadata_head_version().unwrap();
+    pg.prepare_for_close().expect("close writer workers");
+    pg.flush_local_metadata().expect("persist local metadata");
+    drop(pg);
+
+    // A crash before the second self-ack leaves only the first batch's
+    // cursor durable, and redb repair replays the remote tail from zero.
+    {
+        let local = RedbMetaEngine::open(&path).unwrap();
+        local
+            .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, cursor_after_first_batch)
+            .unwrap();
+        local.set_counter(LOCAL_PG_VERSION_COUNTER, 0).unwrap();
+        local
+            .set_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER, 0)
+            .unwrap();
+    }
+    let reopened = PgMetaEngine::open_with_options(&path, options).expect("reopen writer");
+    for _ in 0..16 {
+        if reopened.local_version.load(Ordering::SeqCst) >= head {
+            break;
+        }
+        reopened.sync_metadata().expect("replay self batches");
+    }
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&reopened.local).unwrap(),
+        next_event_seq,
+        "replayed self batches must acknowledge the whole published journal"
+    );
+    reopened.request_pending_flush();
+    reopened.flush_due_pending().expect("flush after remount");
+    assert_eq!(
+        reopened.remote_metadata_head_version().unwrap(),
+        head,
+        "already-published events must not be republished"
+    );
+    reopened.prepare_for_close().expect("close reopened writer");
+}
