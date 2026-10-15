@@ -1214,7 +1214,8 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
     );
     // This mounted marker is written after the PG moving-head fixture. Its visibility
     // on the cold client is the ordered publication barrier for the preceding workload.
-    operations.push(timed_hotspot_helper_fs_op_with_helper(
+    // A rejected write can never become visible, so fail now instead of waiting it out.
+    operations.push(required_record(timed_hotspot_helper_fs_op_with_helper(
         context,
         started,
         operations.len() + 1,
@@ -1225,7 +1226,7 @@ pub(in crate::scenario) fn run_large_history_cold_bootstrap_body(
         LARGE_HISTORY_CONVERGENCE_TIMEOUT,
         Some(&final_marker_payload),
         None,
-    )?);
+    )?)?);
     let final_deadline = Instant::now() + LARGE_HISTORY_CONVERGENCE_TIMEOUT;
     wait_for_mounted_initial_payloads_until_with_probe_timeout(
         &clients,
