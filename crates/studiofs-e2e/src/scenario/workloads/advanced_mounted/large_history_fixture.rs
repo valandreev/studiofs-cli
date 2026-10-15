@@ -25,8 +25,6 @@ pub(in crate::scenario) const FIXTURE_SHARD_COUNT: usize = 64;
 const FIXTURE_FILES_PER_SHARD: usize = LARGE_HISTORY_FIXTURE_FILE_COUNT / FIXTURE_SHARD_COUNT;
 const FIXTURE_FIRST_FILE_INO: u64 = FIXTURE_FIRST_SHARD_INO + FIXTURE_SHARD_COUNT as u64;
 pub(in crate::scenario) const FIXTURE_FILES_DIRECTORY_NAME: &str = "fixture-files";
-const FIXTURE_UID: u32 = 1000;
-const FIXTURE_GID: u32 = 1000;
 const FIXTURE_DIRECTORY_MODE: u16 = 0o755;
 const FIXTURE_FILE_MODE: u16 = 0o644;
 const FIXTURE_FILE_SIZE: u64 = 1;
@@ -596,6 +594,7 @@ fn build_fixture_events(
     fixture_root: &str,
 ) -> Result<(Vec<MetaEvent>, Vec<FixtureEvent>, usize), ScenarioError> {
     let file_count = LARGE_HISTORY_FIXTURE_FILE_COUNT;
+    let (fixture_uid, fixture_gid) = fixture_owner();
     let replay_event_count = configured_replay_event_count()?;
     let checkpoint_event_count = LARGE_HISTORY_INITIAL_MUTATION_COUNT
         .checked_sub(replay_event_count)
@@ -609,8 +608,8 @@ fn build_fixture_events(
     let mut root_attr = InodeAttr::new_dir(
         ROOT_INO,
         0,
-        FIXTURE_UID,
-        FIXTURE_GID,
+        fixture_uid,
+        fixture_gid,
         FIXTURE_DIRECTORY_MODE,
     );
     set_fixture_times(&mut root_attr, FIXTURE_TIME_NANOS);
@@ -618,8 +617,8 @@ fn build_fixture_events(
     let mut directory_attr = InodeAttr::new_dir(
         FIXTURE_DIRECTORY_INO,
         ROOT_INO,
-        FIXTURE_UID,
-        FIXTURE_GID,
+        fixture_uid,
+        fixture_gid,
         FIXTURE_DIRECTORY_MODE,
     );
     set_fixture_times(&mut directory_attr, FIXTURE_TIME_NANOS);
@@ -638,8 +637,8 @@ fn build_fixture_events(
     let mut files_directory_attr = InodeAttr::new_dir(
         FIXTURE_FILES_DIRECTORY_INO,
         FIXTURE_DIRECTORY_INO,
-        FIXTURE_UID,
-        FIXTURE_GID,
+        fixture_uid,
+        fixture_gid,
         FIXTURE_DIRECTORY_MODE,
     );
     set_fixture_times(&mut files_directory_attr, FIXTURE_TIME_NANOS);
@@ -660,8 +659,8 @@ fn build_fixture_events(
         let mut attr = InodeAttr::new_dir(
             ino,
             FIXTURE_FILES_DIRECTORY_INO,
-            FIXTURE_UID,
-            FIXTURE_GID,
+            fixture_uid,
+            fixture_gid,
             FIXTURE_DIRECTORY_MODE,
         );
         set_fixture_times(&mut attr, FIXTURE_TIME_NANOS);
@@ -688,7 +687,7 @@ fn build_fixture_events(
         let shard_index = index / FIXTURE_FILES_PER_SHARD;
         let shard_ino = FIXTURE_FIRST_SHARD_INO + shard_index as u64;
         let mut attr =
-            InodeAttr::new_file(ino, shard_ino, FIXTURE_UID, FIXTURE_GID, FIXTURE_FILE_MODE);
+            InodeAttr::new_file(ino, shard_ino, fixture_uid, fixture_gid, FIXTURE_FILE_MODE);
         attr.size = FIXTURE_FILE_SIZE;
         attr.committed_size = FIXTURE_FILE_SIZE;
         set_fixture_times(&mut attr, FIXTURE_TIME_NANOS);
@@ -744,6 +743,7 @@ fn build_fixture_events(
 }
 
 fn build_moving_head_events(first_batch_version: i64) -> Result<Vec<FixtureEvent>, ScenarioError> {
+    let (fixture_uid, fixture_gid) = fixture_owner();
     let mut events = Vec::with_capacity(LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT);
     for event_index in 0..LARGE_HISTORY_MOVING_HEAD_MUTATION_COUNT {
         let file_index = event_index % LARGE_HISTORY_FIXTURE_FILE_COUNT;
@@ -757,7 +757,7 @@ fn build_moving_head_events(first_batch_version: i64) -> Result<Vec<FixtureEvent
         let shard_index = file_index / FIXTURE_FILES_PER_SHARD;
         let shard_ino = FIXTURE_FIRST_SHARD_INO + shard_index as u64;
         let mut attr =
-            InodeAttr::new_file(ino, shard_ino, FIXTURE_UID, FIXTURE_GID, FIXTURE_FILE_MODE);
+            InodeAttr::new_file(ino, shard_ino, fixture_uid, fixture_gid, FIXTURE_FILE_MODE);
         attr.size = FIXTURE_FILE_SIZE;
         attr.committed_size = FIXTURE_FILE_SIZE;
         let delta = i64::try_from(
@@ -874,6 +874,22 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
 
+/// Own fixture inodes as the user that runs the mounted clients.
+///
+/// Mounts with kernel permission checks (macFUSE `default_permissions`) deny
+/// creating entries below a `0755` directory owned by another UID, so a fixed
+/// fixture owner breaks the mounted writes that follow the PG fixture.
+#[cfg(unix)]
+fn fixture_owner() -> (u32, u32) {
+    // SAFETY: getuid/getgid only read the current process credentials.
+    unsafe { (libc::getuid(), libc::getgid()) }
+}
+
+#[cfg(not(unix))]
+fn fixture_owner() -> (u32, u32) {
+    (1000, 1000)
+}
+
 fn set_fixture_times(attr: &mut InodeAttr, timestamp: i64) {
     attr.mtime = timestamp;
     attr.ctime = timestamp;
@@ -954,6 +970,27 @@ mod tests {
             child_ino(&checkpoint_events, last_shard, "file-04095.bin"),
             FIXTURE_FIRST_FILE_INO + 4095
         );
+    }
+
+    #[test]
+    fn fixture_inodes_are_owned_by_the_mounting_user() {
+        let (checkpoint_events, _, _) =
+            build_fixture_events("fixture-root").expect("fixture events");
+        let fixture_root = child_ino(&checkpoint_events, ROOT_INO, "fixture-root");
+        #[cfg(unix)]
+        // SAFETY: getuid/getgid only read the current process credentials.
+        let mounting_user = unsafe { (libc::getuid(), libc::getgid()) };
+        #[cfg(not(unix))]
+        let mounting_user = fixture_owner();
+
+        let mut saw_fixture_root = false;
+        for event in &checkpoint_events {
+            if let MetaEvent::SetAttr { attr } = event {
+                assert_eq!((attr.uid, attr.gid), mounting_user, "inode {}", attr.ino);
+                saw_fixture_root |= attr.ino == fixture_root;
+            }
+        }
+        assert!(saw_fixture_root);
     }
 
     #[test]

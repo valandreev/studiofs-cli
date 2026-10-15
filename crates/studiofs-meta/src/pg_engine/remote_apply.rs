@@ -488,23 +488,21 @@ impl<'a> RemoteApplyCoordinator<'a> {
         extra: &OverlayConflictSets,
     ) -> OverlayConflictSets {
         let mut merged = base.clone();
+        Self::extend_overlay_conflicts(&mut merged, extra);
         merged
-            .block_inodes
-            .extend(extra.block_inodes.iter().copied());
-        merged.attr_inodes.extend(extra.attr_inodes.iter().copied());
-        merged
-            .remove_attr_inodes
+    }
+
+    fn extend_overlay_conflicts(base: &mut OverlayConflictSets, extra: &OverlayConflictSets) {
+        base.block_inodes.extend(extra.block_inodes.iter().copied());
+        base.attr_inodes.extend(extra.attr_inodes.iter().copied());
+        base.remove_attr_inodes
             .extend(extra.remove_attr_inodes.iter().copied());
-        merged.dentry_keys.extend(extra.dentry_keys.iter().cloned());
-        merged
-            .symlink_inodes
+        base.dentry_keys.extend(extra.dentry_keys.iter().cloned());
+        base.symlink_inodes
             .extend(extra.symlink_inodes.iter().copied());
-        merged
-            .xattr_inodes
-            .extend(extra.xattr_inodes.iter().copied());
-        merged.xattr_keys.extend(extra.xattr_keys.iter().cloned());
-        merged.acl_keys.extend(extra.acl_keys.iter().cloned());
-        merged
+        base.xattr_inodes.extend(extra.xattr_inodes.iter().copied());
+        base.xattr_keys.extend(extra.xattr_keys.iter().cloned());
+        base.acl_keys.extend(extra.acl_keys.iter().cloned());
     }
 
     pub(super) fn collect_replay_reconcile_inodes(
@@ -554,6 +552,27 @@ impl<'a> RemoteApplyCoordinator<'a> {
             replay_protected_overlay.block_inodes.remove(&ino);
             replay_protected_overlay.remove_attr_inodes.remove(&ino);
         }
+    }
+
+    // Replay protection lasts until the matching self batch is acknowledged. When that
+    // acknowledgment already happened earlier in the page, no later self batch can clear
+    // it, so only inodes a still-unacknowledged local suffix owns keep it. Final
+    // reconciliation still re-checks live local regular-file state for the rest.
+    fn regular_file_protection_owned_by_local_suffix(
+        mut protected_overlay: OverlayConflictSets,
+        local_suffix_overlay: &OverlayConflictSets,
+    ) -> OverlayConflictSets {
+        let owned_by_local_suffix = |ino: &Ino| {
+            local_suffix_overlay.attr_inodes.contains(ino)
+                || local_suffix_overlay.block_inodes.contains(ino)
+                || local_suffix_overlay.remove_attr_inodes.contains(ino)
+        };
+        protected_overlay.attr_inodes.retain(owned_by_local_suffix);
+        protected_overlay.block_inodes.retain(owned_by_local_suffix);
+        protected_overlay
+            .remove_attr_inodes
+            .retain(owned_by_local_suffix);
+        protected_overlay
     }
 
     pub(super) fn event_has_aux_apply_effect(event: &MetaEvent) -> bool {
@@ -2209,9 +2228,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     protected_base_inodes,
                 )?;
                 applied_any |= outcome.changed;
-                replay_protected_overlay = Self::merge_overlay_conflicts(
-                    &replay_protected_overlay,
-                    &outcome.protected_overlay,
+                Self::extend_overlay_conflicts(
+                    &mut replay_protected_overlay,
+                    &Self::regular_file_protection_owned_by_local_suffix(
+                        outcome.protected_overlay,
+                        &effective_overlay,
+                    ),
                 );
             }
             if batch.events.iter().any(MetaEvent::is_namespace_mutation) {

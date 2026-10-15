@@ -1837,6 +1837,185 @@ fn self_batch_reconcile_uses_overlay_after_ack_for_dentries() {
 }
 
 #[test]
+fn self_replay_ack_before_foreign_append_releases_repair_restored_protection() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let self_start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let file = create_published_small_file(&pg, ROOT_INO, b"repaired-acked-append.txt", 77_201);
+    let self_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("self end");
+    let self_events = pg
+        .local
+        .read_events_range(self_start, self_end)
+        .expect("read self events");
+    let self_batch = RemoteApplyCoordinator::project_local_batch(&self_events);
+    let published = pg.get_attr(file.ino).expect("published attr");
+    assert_eq!(published.upload_state, UploadState::Ready);
+
+    // Startup after redb repair restores the unacknowledged local journal into the
+    // serving tables, including overlay rows for content the self batch already published.
+    let restored_overlay = fixture_payload_slices(
+        0,
+        Some(&PayloadRef::new_partial(77_201, 64)),
+        PayloadRefState::Uploaded,
+    )
+    .expect("build restored overlay");
+    pg.local
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr {
+                attr: published.clone(),
+            },
+            MetaEvent::SetRegularFileOverlaySlices {
+                ino: file.ino,
+                chunk_slices: restored_overlay,
+            },
+        ])
+        .expect("restore repaired local overlay");
+    assert!(
+        pg.local
+            .has_local_regular_file_overlay(file.ino)
+            .expect("check restored overlay"),
+        "repair setup must leave a local overlay for the foreign replay pass"
+    );
+
+    // Another client appends after the self publish: Updating, then the appended range
+    // and the final Ready attr in the same batch.
+    let mut updating = published.clone();
+    updating.content_epoch = published.content_epoch + 1;
+    updating.upload_state = UploadState::Updating;
+    updating.mtime = published.mtime + 1;
+    updating.ctime = updating.mtime;
+    let mut ready = updating.clone();
+    ready.size = 100;
+    ready.committed_size = 100;
+    ready.committed_content_epoch = ready.content_epoch;
+    ready.upload_state = UploadState::Ready;
+    let mut existing = SliceRecord::new(
+        SliceId(0),
+        SliceOrder(0),
+        SliceRange::new(0, 64).expect("existing slice range"),
+        PayloadRef::new_partial(77_201, 64),
+    );
+    existing.payload_state = PayloadRefState::Published;
+    let mut appended = SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(64, 100).expect("appended slice range"),
+        PayloadRef::new_partial(77_202, 36),
+    );
+    appended.payload_state = PayloadRefState::Published;
+    let foreign_events = vec![
+        MetaEvent::SetAttr { attr: updating },
+        MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: vec![(ChunkId(0), vec![existing, appended])],
+        },
+        MetaEvent::SetAttr {
+            attr: ready.clone(),
+        },
+    ];
+
+    RemoteApplyCoordinator::new(&pg.local)
+        .apply_decoded_batches(
+            vec![
+                DecodedReplayBatch {
+                    batch_version: 1,
+                    events: self_batch.events,
+                    is_self_batch: true,
+                },
+                DecodedReplayBatch {
+                    batch_version: 2,
+                    events: foreign_events,
+                    is_self_batch: false,
+                },
+            ],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq: self_start,
+                next_event_seq: self_end,
+                initial_overlay: self_batch.overlay,
+            },
+        )
+        .expect("replay self and foreign batches");
+
+    let served = pg.get_attr(file.ino).expect("served attr");
+    assert_eq!(
+        (
+            served.upload_state,
+            served.size,
+            served.content_epoch,
+            served.committed_content_epoch
+        ),
+        (
+            UploadState::Ready,
+            ready.size,
+            ready.content_epoch,
+            ready.committed_content_epoch
+        ),
+        "an acknowledged self publish must not keep the foreign append out of serving state"
+    );
+}
+
+#[test]
+fn older_foreign_attr_stays_out_of_serving_while_recent_flush_is_unacknowledged() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"recent-flush-owned.txt", 77_211);
+    let journal_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("journal end");
+    let published = pg.get_attr(file.ino).expect("published attr");
+    assert_eq!(published.upload_state, UploadState::Ready);
+    let restored_overlay = fixture_payload_slices(
+        0,
+        Some(&PayloadRef::new_partial(77_211, 64)),
+        PayloadRefState::Uploaded,
+    )
+    .expect("build restored overlay");
+    pg.local
+        .apply_replica_serving_state(&[MetaEvent::SetRegularFileOverlaySlices {
+            ino: file.ino,
+            chunk_slices: restored_overlay,
+        }])
+        .expect("restore local overlay");
+
+    // The page ends before the recent flush's self batch, so only that flush owns the inode.
+    let mut older_foreign = published.clone();
+    older_foreign.content_epoch = published.content_epoch + 1;
+    older_foreign.upload_state = UploadState::Updating;
+    let mut recent_flush_overlay = OverlayConflictSets::default();
+    recent_flush_overlay.attr_inodes.insert(file.ino);
+    recent_flush_overlay.block_inodes.insert(file.ino);
+
+    RemoteApplyCoordinator::new(&pg.local)
+        .apply_decoded_batches(
+            vec![DecodedReplayBatch {
+                batch_version: 1,
+                events: vec![MetaEvent::SetAttr {
+                    attr: older_foreign,
+                }],
+                is_self_batch: false,
+            }],
+            Some(&RecentFlush {
+                batch_version: 2,
+                overlay: recent_flush_overlay,
+            }),
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq: journal_end,
+                next_event_seq: journal_end,
+                initial_overlay: OverlayConflictSets::default(),
+            },
+        )
+        .expect("replay foreign batch before recent flush");
+
+    let served = pg.get_attr(file.ino).expect("served attr");
+    assert_eq!(
+        (served.upload_state, served.content_epoch),
+        (published.upload_state, published.content_epoch),
+        "an unacknowledged recent flush must keep an older foreign attr out of serving state"
+    );
+}
+
+#[test]
 fn self_replay_ack_clears_stale_foreign_regular_file_protection_after_repair() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = create_published_small_file(&pg, ROOT_INO, b"repaired-self-publish.bin", 77_101);

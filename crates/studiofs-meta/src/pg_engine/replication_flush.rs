@@ -945,9 +945,14 @@ impl PgMetaEngine {
             }
             Err(error) => return Err(error),
         };
+        // A hidden suffix after the projected prefix was not published. Leave it
+        // selectable so the next batch starts at the self-ack boundary.
+        let published_ranges = published_prefix.as_deref().unwrap_or(&selected.ranges);
         self.mark_local_event_ranges_published_with_prefix(
-            &selected.ranges,
-            published_prefix.map(|ranges| (batch_version, ranges)),
+            published_ranges,
+            published_prefix
+                .clone()
+                .map(|ranges| (batch_version, ranges)),
         )?;
         // The replay pass acknowledges only the local prefix represented by the
         // projected batch. The remaining local-only suffix must stay replayable.
