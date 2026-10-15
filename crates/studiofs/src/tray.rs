@@ -59,7 +59,8 @@ mod supported {
     ));
     const ICON_PADDING_DIVISOR: u32 = 16;
     const COLOR_BLACK: [u8; 3] = [0x11, 0x13, 0x17];
-    const COLOR_BLUE: [u8; 3] = [0x00, 0xC8, 0x00];
+    const COLOR_BLUE: [u8; 3] = [0x00, 0x57, 0xB7];
+    const COLOR_YELLOW: [u8; 3] = [0xFF, 0xD7, 0x00];
     const COLOR_ORANGE: [u8; 3] = [0xFF, 0x00, 0x00];
     const COLOR_WHITE: [u8; 3] = [0xF7, 0xF7, 0xF3];
     const ANIMATION_TICK: Duration = Duration::from_millis(100);
@@ -167,12 +168,18 @@ mod supported {
             normalized
         }
 
-        fn tinted_icon(&self, color: [u8; 3]) -> Result<Icon, tray_icon::BadIcon> {
+        fn tinted_rgba(&self, colors: [[u8; 3]; 2]) -> Vec<u8> {
             let mut rgba = Vec::with_capacity(self.alpha.len() * 4);
-            for &alpha in self.alpha.iter() {
+            let midpoint = (self.height / 2) as usize * self.width as usize;
+            for (index, &alpha) in self.alpha.iter().enumerate() {
+                let color = colors[usize::from(index >= midpoint)];
                 rgba.extend_from_slice(&[color[0], color[1], color[2], alpha]);
             }
-            Icon::from_rgba(rgba, self.width, self.height)
+            rgba
+        }
+
+        fn tinted_icon(&self, colors: [[u8; 3]; 2]) -> Result<Icon, tray_icon::BadIcon> {
+            Icon::from_rgba(self.tinted_rgba(colors), self.width, self.height)
         }
     }
 
@@ -182,7 +189,7 @@ mod supported {
         volume_name: String,
         mode: TrayPulseMode,
         mode_started_at: Instant,
-        last_color: Option<[u8; 3]>,
+        last_colors: Option<[[u8; 3]; 2]>,
         pending_upload_bytes: Option<u64>,
         #[cfg(target_os = "macos")]
         tooltip: MacTrayTooltip,
@@ -200,7 +207,7 @@ mod supported {
                 volume_name,
                 mode: TrayPulseMode::Booting,
                 mode_started_at: Instant::now(),
-                last_color: None,
+                last_colors: None,
                 pending_upload_bytes: None,
                 #[cfg(target_os = "macos")]
                 tooltip: MacTrayTooltip::new(),
@@ -212,7 +219,7 @@ mod supported {
         }
 
         fn create_tray(&mut self, event_loop: &ActiveEventLoop) {
-            let icon = match self.icon_mask.tinted_icon(COLOR_BLACK) {
+            let icon = match self.icon_mask.tinted_icon([COLOR_BLACK; 2]) {
                 Ok(icon) => icon,
                 Err(error) => {
                     tracing::warn!(error = %error, "failed to build boot tray icon");
@@ -228,7 +235,7 @@ mod supported {
             {
                 Ok(tray_icon) => {
                     self.tray_icon = Some(tray_icon);
-                    self.last_color = Some(COLOR_BLACK);
+                    self.last_colors = Some([COLOR_BLACK; 2]);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -284,7 +291,7 @@ mod supported {
             if mode_changed {
                 self.mode = activity.mode;
                 self.mode_started_at = Instant::now();
-                self.last_color = None;
+                self.last_colors = None;
             }
             self.pending_upload_bytes = activity.pending_upload_bytes;
             if let Some(tray_icon) = self.tray_icon.as_ref() {
@@ -309,12 +316,12 @@ mod supported {
                 return;
             };
 
-            let color = pulse_color(self.mode, self.mode_started_at.elapsed());
-            if self.last_color == Some(color) {
+            let colors = pulse_colors(self.mode, self.mode_started_at.elapsed());
+            if self.last_colors == Some(colors) {
                 return;
             }
 
-            let icon = match self.icon_mask.tinted_icon(color) {
+            let icon = match self.icon_mask.tinted_icon(colors) {
                 Ok(icon) => icon,
                 Err(error) => {
                     tracing::debug!(error = %error, "failed to build tinted tray frame");
@@ -327,7 +334,7 @@ mod supported {
                 return;
             }
 
-            self.last_color = Some(color);
+            self.last_colors = Some(colors);
         }
 
         #[cfg(target_os = "macos")]
@@ -868,18 +875,24 @@ mod supported {
         found.then_some((min_x, min_y, max_x, max_y))
     }
 
-    fn pulse_color(mode: TrayPulseMode, elapsed: Duration) -> [u8; 3] {
+    fn pulse_colors(mode: TrayPulseMode, elapsed: Duration) -> [[u8; 3]; 2] {
         match mode {
-            TrayPulseMode::Booting => COLOR_BLACK,
-            TrayPulseMode::Unavailable => COLOR_WHITE,
+            TrayPulseMode::Booting => [COLOR_BLACK; 2],
+            TrayPulseMode::Unavailable => [COLOR_WHITE; 2],
             TrayPulseMode::Idle => {
-                blend_color(COLOR_WHITE, COLOR_BLUE, breathe_factor(elapsed, IDLE_CYCLE))
+                let factor = breathe_factor(elapsed, IDLE_CYCLE);
+                [
+                    blend_color(COLOR_WHITE, COLOR_BLUE, factor),
+                    blend_color(COLOR_WHITE, COLOR_YELLOW, factor),
+                ]
             }
-            TrayPulseMode::Active => blend_color(
-                COLOR_WHITE,
-                COLOR_ORANGE,
-                breathe_factor(elapsed, ACTIVE_CYCLE),
-            ),
+            TrayPulseMode::Active => {
+                [blend_color(
+                    COLOR_WHITE,
+                    COLOR_ORANGE,
+                    breathe_factor(elapsed, ACTIVE_CYCLE),
+                ); 2]
+            }
         }
     }
 
@@ -908,6 +921,37 @@ mod supported {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn idle_icon_has_blue_top_and_yellow_bottom_at_pulse_peak() {
+            assert_eq!(
+                pulse_colors(TrayPulseMode::Idle, IDLE_CYCLE / 2),
+                [[0x00, 0x57, 0xB7], [0xFF, 0xD7, 0x00]]
+            );
+        }
+
+        #[test]
+        fn active_icon_keeps_both_halves_red() {
+            assert_eq!(
+                pulse_colors(TrayPulseMode::Active, ACTIVE_CYCLE / 2),
+                [COLOR_ORANGE; 2]
+            );
+        }
+
+        #[test]
+        fn tinted_rgba_splits_rows_sharply_and_preserves_alpha() {
+            let mask = IconMask {
+                width: 2,
+                height: 2,
+                alpha: Arc::new(vec![0, 64, 128, 255]),
+            };
+            assert_eq!(
+                mask.tinted_rgba([[0, 87, 183], [255, 215, 0]]),
+                vec![
+                    0, 87, 183, 0, 0, 87, 183, 64, 255, 215, 0, 128, 255, 215, 0, 255
+                ]
+            );
+        }
 
         #[test]
         fn activity_mode_is_active_for_pending_uploads() {
@@ -1046,7 +1090,7 @@ mod supported {
                 alpha: Arc::new(vec![0, 255]),
             };
             let icon = mask
-                .tinted_icon(COLOR_ORANGE)
+                .tinted_icon([COLOR_ORANGE; 2])
                 .expect("build icon from synthetic mask");
             let debug = format!("{icon:?}");
             assert!(debug.contains("Icon"));
