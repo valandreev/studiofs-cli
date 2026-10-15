@@ -983,16 +983,14 @@ mod tests {
         #[cfg(not(unix))]
         let mounting_user = fixture_owner();
 
-        let owners = checkpoint_events
-            .iter()
-            .filter_map(|event| match event {
-                MetaEvent::SetAttr { attr } => Some((attr.ino, (attr.uid, attr.gid))),
-                _ => None,
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        assert_eq!(owners.get(&fixture_root), Some(&mounting_user));
-        assert!(owners.values().all(|owner| *owner == mounting_user));
+        let mut saw_fixture_root = false;
+        for event in &checkpoint_events {
+            if let MetaEvent::SetAttr { attr } = event {
+                assert_eq!((attr.uid, attr.gid), mounting_user, "inode {}", attr.ino);
+                saw_fixture_root |= attr.ino == fixture_root;
+            }
+        }
+        assert!(saw_fixture_root);
     }
 
     #[test]
