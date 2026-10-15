@@ -3519,6 +3519,7 @@ fn hidden_flush_tail_is_republished_in_next_batch_and_acknowledged_after_remount
     pg.flush_due_pending().expect("flush published prefix");
     pg.sync_metadata().expect("acknowledge first batch");
     let cursor_after_first_batch = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let head_after_first_batch = pg.remote_metadata_head_version().unwrap();
 
     let payload = PayloadRef::new_partial(95_002, 152);
     pg.stage_payload_slice(tail.ino, 0, &payload).unwrap();
@@ -3547,6 +3548,10 @@ fn hidden_flush_tail_is_republished_in_next_batch_and_acknowledged_after_remount
         "every published local event must be acknowledged"
     );
     let head = pg.remote_metadata_head_version().unwrap();
+    assert!(
+        head > head_after_first_batch,
+        "the hidden tail must be published by the next batch"
+    );
     pg.prepare_for_close().expect("close writer workers");
     pg.flush_local_metadata().expect("persist local metadata");
     drop(pg);
