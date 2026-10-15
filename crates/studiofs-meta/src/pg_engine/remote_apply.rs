@@ -507,6 +507,17 @@ impl<'a> RemoteApplyCoordinator<'a> {
         merged
     }
 
+    fn extend_overlay_conflicts(base: &mut OverlayConflictSets, extra: OverlayConflictSets) {
+        base.block_inodes.extend(extra.block_inodes);
+        base.attr_inodes.extend(extra.attr_inodes);
+        base.remove_attr_inodes.extend(extra.remove_attr_inodes);
+        base.dentry_keys.extend(extra.dentry_keys);
+        base.symlink_inodes.extend(extra.symlink_inodes);
+        base.xattr_inodes.extend(extra.xattr_inodes);
+        base.xattr_keys.extend(extra.xattr_keys);
+        base.acl_keys.extend(extra.acl_keys);
+    }
+
     pub(super) fn collect_replay_reconcile_inodes(
         candidates: &mut HashSet<Ino>,
         batch_events: &[MetaEvent],
@@ -2230,9 +2241,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     protected_base_inodes,
                 )?;
                 applied_any |= outcome.changed;
-                replay_protected_overlay = Self::merge_overlay_conflicts(
-                    &replay_protected_overlay,
-                    &Self::regular_file_protection_owned_by_local_suffix(
+                Self::extend_overlay_conflicts(
+                    &mut replay_protected_overlay,
+                    Self::regular_file_protection_owned_by_local_suffix(
                         outcome.protected_overlay,
                         &effective_overlay,
                     ),
