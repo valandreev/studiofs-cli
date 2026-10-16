@@ -280,6 +280,16 @@ pub(in crate::scenario) fn planned_advanced_mounted_operations(
                 "append_old_handle",
                 "open-handles/unlink-target.txt",
             ),
+            (
+                "client-a",
+                "rename_over_open_handle",
+                "open-handles/local-rename-target.txt",
+            ),
+            (
+                "client-b",
+                "local_rename_peer_visible",
+                "open-handles/local-rename-target.txt",
+            ),
         ],
         AdvancedMountedKind::SparseRange => &[
             ("client-a", "write_range", "sparse/shared.bin@0"),

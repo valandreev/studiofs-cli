@@ -2843,6 +2843,15 @@ impl StudioVfs {
             };
 
             namespace_mutations.record_removal(parent, name, [unlinked_attr.ino]);
+            if let Some(dirty_attr) = self
+                .state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .get_mut(&unlinked_attr.ino)
+            {
+                dirty_attr.nlink = unlinked_attr.nlink;
+            }
             self.invalidate_attr_read_cache([unlinked_attr.ino]);
             if unlinked_attr.nlink > 0 {
                 self.state.namespace.attr_read_cache.lock().put(
@@ -3281,7 +3290,7 @@ impl StudioVfs {
                 )
                 .await;
         }
-        let displaced_target_will_retire = if replace_if_exists
+        if replace_if_exists
             && let Ok(target_entry) = meta.lookup(new_parent, new_name)
             && target_entry.ino != source_entry.ino
         {
@@ -3296,11 +3305,7 @@ impl StudioVfs {
                 "VFS rename checking displaced target lock"
             );
             self.enforce_no_known_foreign_hard_lock(target_entry.ino)?;
-            let target_attr = meta.get_attr(target_entry.ino)?;
-            target_attr.kind == FileType::Directory || target_attr.nlink <= 1
-        } else {
-            false
-        };
+        }
         debug!(
             parent,
             name = %name_display,
@@ -3311,7 +3316,10 @@ impl StudioVfs {
             "VFS rename calling metadata rename_atomic"
         );
         let rename_result =
-            meta.rename_atomic(parent, name, new_parent, new_name, replace_if_exists)?;
+            meta.rename_atomic(parent, name, new_parent, new_name, replace_if_exists, true)?;
+        if !rename_result.namespace_changed {
+            return Ok(());
+        }
         debug!(
             parent,
             name = %name_display,
@@ -3319,7 +3327,7 @@ impl StudioVfs {
             new_parent,
             new_name = %new_name_display,
             moved_ino = rename_result.moved_ino,
-            displaced_ino = ?rename_result.displaced_ino,
+            displaced_ino = ?rename_result.displaced.as_ref().map(|attr| attr.ino),
             elapsed_ms = rename_started.elapsed().as_millis(),
             "VFS rename metadata rename_atomic returned"
         );
@@ -3332,47 +3340,45 @@ impl StudioVfs {
         );
         self.bump_acl_namespace_epoch();
 
-        if let Some(ino) = rename_result.displaced_ino {
-            if displaced_target_will_retire {
-                self.retire_os_cache_inode(ino);
+        if let Some(attr) = &rename_result.displaced {
+            let ino = attr.ino;
+            if let Some(dirty_attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
+                dirty_attr.nlink = attr.nlink;
             }
-            debug!(
-                parent,
-                name = %name_display,
-                new_parent,
-                new_name = %new_name_display,
-                displaced_ino = ino,
-                elapsed_ms = rename_started.elapsed().as_millis(),
-                "VFS rename collecting displaced target storage usage"
-            );
-            let displaced_usage = meta.get_regular_file_graph_object_usage(ino)?;
-            let total_bytes = displaced_usage
-                .iter()
-                .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
-            let displaced_object_ids = displaced_usage
-                .into_iter()
-                .map(|(object_id, _)| object_id)
-                .collect();
-
-            debug!(
-                parent,
-                name = %name_display,
-                new_parent,
-                new_name = %new_name_display,
-                displaced_ino = ino,
-                total_bytes,
-                elapsed_ms = rename_started.elapsed().as_millis(),
-                "VFS rename cleaning displaced target storage"
-            );
-            self.cleanup_deleted_inode_storage_deferred_cache_eviction(
-                &meta,
-                ino,
-                total_bytes,
-                "rename overwrite",
-                displaced_object_ids,
-            )?;
-            self.bump_directory_generation(ino);
-            self.dentry_cache_invalidate_parent(ino);
+            self.invalidate_attr_read_cache([ino]);
+            if attr.nlink == 0 {
+                self.retire_os_cache_inode(ino);
+                self.mark_inode_deleted_for_uploads(ino);
+                if attr.kind == FileType::Directory {
+                    self.cleanup_deleted_inode_storage_deferred_cache_eviction(
+                        &meta,
+                        ino,
+                        0,
+                        "rename overwrite",
+                        Vec::new(),
+                    )?;
+                } else if !self.handle_table.mark_orphan_if_open(ino) {
+                    // A last close may already be draining writer state; share its gate.
+                    self.wait_for_deferred_materialization_inflight(ino).await;
+                    let session = self
+                        .state
+                        .file_session
+                        .enter_op(ino, FileSessionOperation::Release)
+                        .await;
+                    let cleanup = self.collect_orphan_deleted_inode_cleanup(ino).await?;
+                    // Atomic-save renames must not wait for local payload eviction.
+                    self.finalize_deleted_inode_runtime_cleanup_deferred_cache_eviction(
+                        ino,
+                        cleanup.removed_ids,
+                    );
+                    drop(session);
+                    self.state.file_session.gc_if_idle(ino);
+                }
+            }
+            if attr.kind == FileType::Directory {
+                self.bump_directory_generation(ino);
+                self.dentry_cache_invalidate_parent(ino);
+            }
         }
 
         meta.request_eager_flush();
@@ -3382,7 +3388,7 @@ impl StudioVfs {
             new_parent,
             new_name = %new_name_display,
             moved_ino = rename_result.moved_ino,
-            displaced_ino = ?rename_result.displaced_ino,
+            displaced_ino = ?rename_result.displaced.as_ref().map(|attr| attr.ino),
             elapsed_ms = rename_started.elapsed().as_millis(),
             "VFS rename completed"
         );
@@ -3811,7 +3817,7 @@ mod tests {
             .fetch_add(4, std::sync::atomic::Ordering::Relaxed);
         vfs.refresh_inode_incarnation_state_from_attr(live.ino, &dirty_attr);
 
-        meta.rename_atomic(ROOT_INO, name, ROOT_INO, moved_name, true)
+        meta.rename_atomic(ROOT_INO, name, ROOT_INO, moved_name, true, false)
             .expect("move expected inode to a live binding");
         let replacement = meta
             .create_file(ROOT_INO, name, 0, 0, 0o644)

@@ -1513,6 +1513,9 @@ pub trait MetaFsOps: Send + Sync + MetaInodes {
     /// When `replace_if_exists` is false, test destination existence inside the
     /// mutation transaction and return [`MetaError::EntryExists`] without
     /// changing either entry, inode attributes, or replication events.
+    /// When `retain_displaced_inode` is true, retain a final-link file and record
+    /// deferred deletion in the same transaction. The caller must reclaim it
+    /// once no open handles remain; surviving links always retain their inode.
     fn rename_atomic(
         &self,
         parent: Ino,
@@ -1520,11 +1523,12 @@ pub trait MetaFsOps: Send + Sync + MetaInodes {
         new_parent: Ino,
         new_name: &[u8],
         replace_if_exists: bool,
+        retain_displaced_inode: bool,
     ) -> MetaResult<RenameAtomicResult>;
 
     /// Rename a file or directory, replacing an existing destination when present.
     fn rename(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8]) -> MetaResult<()> {
-        self.rename_atomic(parent, name, new_parent, new_name, true)?;
+        self.rename_atomic(parent, name, new_parent, new_name, true, false)?;
         Ok(())
     }
 

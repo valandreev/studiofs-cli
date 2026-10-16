@@ -267,7 +267,124 @@ pub(in crate::scenario) fn run_open_handle_operations(
         &unlink_target,
         Ok(()),
     ));
+
+    // Same-client rename over a file this client still holds open (SFS-856).
+    let local_target = open_handle_isolated_path(isolation, OPEN_HANDLE_LOCAL_RENAME_TARGET);
+    let local_source = open_handle_isolated_path(isolation, OPEN_HANDLE_LOCAL_RENAME_SOURCE);
+    let displaced_payload = isolation.payload(
+        "local_rename_displaced",
+        &local_target,
+        "displaced while open
+",
+    );
+    let replacement_payload = isolation.payload(
+        "local_rename_replacement",
+        &local_source,
+        "replacement after rename
+",
+    );
+    operations.push(required_record(fs_op(
+        started,
+        5,
+        &clients[0],
+        "rename_over_open_handle",
+        &local_target,
+        || {
+            rename_over_open_handle_with_readback(
+                clients[0].mount_point.join(&local_target),
+                clients[0].mount_point.join(&local_source),
+                &displaced_payload,
+                &replacement_payload,
+            )
+            .map_err(scenario_error_to_io)
+        },
+    ))?);
+    operations.push(required_op(
+        started,
+        6,
+        &clients[1],
+        "local_rename_peer_visible",
+        &local_target,
+        wait_for_mounted_initial_payloads_until(
+            std::slice::from_ref(&clients[1]),
+            &[(local_target.as_str(), replacement_payload.as_slice())],
+            Instant::now() + initial_convergence_timeout,
+            poll_interval,
+            "open handle local rename",
+        ),
+    )?);
     Ok(operations)
+}
+
+/// Renames `source` over `target` while this client holds `target` open, then
+/// requires the old handle to keep the displaced bytes and the name to serve
+/// the replacement. WinFSP without POSIX rename semantics rejects replacing an
+/// open file, so on Windows the rejection must leave both files intact and the
+/// rename is retried over the closed target.
+fn rename_over_open_handle_with_readback(
+    target: PathBuf,
+    source: PathBuf,
+    displaced: &[u8],
+    replacement: &[u8],
+) -> Result<(), ScenarioError> {
+    write_mounted_file_with_readback(
+        target.clone(),
+        displaced,
+        "open handle local rename target",
+        false,
+    )?;
+    write_mounted_file_with_readback(
+        source.clone(),
+        replacement,
+        "open handle local rename source",
+        false,
+    )?;
+    let renamed_target = target.clone();
+    let old_handle_bytes = run_bounded_mounted_io(
+        format!("open handle local rename over {}", target.display()),
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        move || {
+            let mut handle = fs::File::open(&renamed_target)?;
+            let renamed_while_open = fs::rename(&source, &renamed_target);
+            let mut bytes = Vec::new();
+            handle.read_to_end(&mut bytes)?;
+            drop(handle);
+            match renamed_while_open {
+                Ok(()) if !cfg!(windows) => {}
+                Err(error) if cfg!(windows) && error.kind() == io::ErrorKind::PermissionDenied => {
+                    fs::rename(&source, &renamed_target)?;
+                }
+                Ok(()) => {
+                    return Err(io::Error::other(
+                        "WinFSP unexpectedly replaced an open file; update this oracle",
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+            Ok(bytes)
+        },
+    )?;
+    if old_handle_bytes != displaced {
+        return Err(ScenarioError::Io(io::Error::other(format!(
+            "open handle lost displaced bytes after local rename over {}: expected {} bytes, read {}",
+            target.display(),
+            displaced.len(),
+            old_handle_bytes.len()
+        ))));
+    }
+    let readback = wait_for_mounted_payload_readback(
+        &target,
+        replacement,
+        MOUNTED_WRITE_READBACK_TIMEOUT,
+        MOUNTED_WRITE_READBACK_POLL_INTERVAL,
+    )?;
+    if readback != replacement {
+        return Err(ScenarioError::Io(io::Error::other(format!(
+            "local rename target {} does not serve the replacement bytes",
+            target.display()
+        ))));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

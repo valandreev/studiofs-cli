@@ -218,9 +218,17 @@ impl MetaFsOps for PgMetaEngine {
         new_parent: Ino,
         new_name: &[u8],
         replace_if_exists: bool,
+        retain_displaced_inode: bool,
     ) -> MetaResult<RenameAtomicResult> {
         self.mutate(|local| {
-            local.rename_atomic(parent, name, new_parent, new_name, replace_if_exists)
+            local.rename_atomic(
+                parent,
+                name,
+                new_parent,
+                new_name,
+                replace_if_exists,
+                retain_displaced_inode,
+            )
         })
     }
 

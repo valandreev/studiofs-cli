@@ -256,6 +256,8 @@ impl StudioVfs {
         let local_payload_backend = self.local_payload_backend.clone();
         let state = self.state.clone();
         let cleanup = move || {
+            #[cfg(test)]
+            state.upload.pause_deleted_inode_eviction_for_test();
             let mut forced_pinned = 0;
             for &object_id in &object_ids {
                 if cached_store.is_pinned(object_id) {
@@ -371,6 +373,8 @@ impl StudioVfs {
             self.clear_access_tracking(ino);
             return;
         }
+        #[cfg(test)]
+        self.state.upload.pause_deleted_inode_eviction_for_test();
 
         // L1.5 — dirty memory buffer: drain blocks buffered post-flush.
         self.clear_pending_payloads_for_inode(ino);

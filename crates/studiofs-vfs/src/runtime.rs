@@ -431,6 +431,7 @@ impl<M: ?Sized + MetaFsOps> MetaFsOps for RuntimeMetaHandle<M> {
             new_parent: Ino,
             new_name: &[u8],
             replace_if_exists: bool,
+            retain_displaced_inode: bool,
         ) -> MetaResult<RenameAtomicResult>
     );
     forward_method!(

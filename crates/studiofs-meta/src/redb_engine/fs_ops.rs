@@ -918,6 +918,7 @@ impl MetaFsOps for RedbMetaEngine {
         new_parent: Ino,
         new_name: &[u8],
         replace_if_exists: bool,
+        retain_displaced_inode: bool,
     ) -> MetaResult<RenameAtomicResult> {
         let txn = self.begin_write_txn()?;
         let src_entry = Self::lookup_merged_in_write_txn(&txn, parent, name)?.ok_or_else(|| {
@@ -931,6 +932,16 @@ impl MetaFsOps for RedbMetaEngine {
             return Err(MetaError::EntryExists {
                 parent: new_parent,
                 name: String::from_utf8_lossy(new_name).to_string(),
+            });
+        }
+        if dst_entry_opt
+            .as_ref()
+            .is_some_and(|dst| dst.ino == src_entry.ino)
+        {
+            return Ok(RenameAtomicResult {
+                moved_ino: src_entry.ino,
+                namespace_changed: false,
+                displaced: None,
             });
         }
         if let Some(dst_entry) = &dst_entry_opt
@@ -955,48 +966,50 @@ impl MetaFsOps for RedbMetaEngine {
         } else {
             None
         };
-        let displaced_attr_seed = match &dst_entry_opt {
-            Some(dst_entry) if dst_entry.kind != FileType::Directory => {
-                Some(Self::get_attr_merged_in_write_txn(&txn, dst_entry.ino)?)
-            }
-            _ => None,
-        };
-
-        let displaced_ino: Option<Ino>;
-        let mut displaced_attr_event: Option<crate::events::MetaEvent> = None;
+        let mut displaced = None;
+        let mut displaced_set_attr = None;
+        let mut displaced_remove_attr_ino = None;
         let mut moved_dir_attr = moved_dir_seed;
         let mut old_parent_attr = old_parent_seed;
         let mut new_parent_attr = new_parent_seed;
         {
             Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
-            displaced_ino = if let Some(dst_entry) = dst_entry_opt.clone() {
+            if let Some(dst_entry) = &dst_entry_opt {
+                let mut attr = Self::get_attr_merged_in_write_txn(&txn, dst_entry.ino)?;
                 if dst_entry.kind == FileType::Directory {
+                    attr.nlink = 0;
                     Self::remove_inode_overlay_in_txn(&txn, dst_entry.ino)?;
                     Self::clear_inode_overlay_aux_in_txn(&txn, dst_entry.ino)?;
+                    displaced_remove_attr_ino = Some(dst_entry.ino);
                 } else {
-                    if let Some(mut attr) = displaced_attr_seed.clone() {
-                        attr.nlink = attr.nlink.saturating_sub(1);
+                    attr.nlink = attr.nlink.saturating_sub(1);
+                    if attr.nlink == 0 && !retain_displaced_inode {
+                        Self::remove_inode_overlay_in_txn(&txn, dst_entry.ino)?;
+                        Self::clear_inode_overlay_aux_in_txn_with_options(
+                            &txn,
+                            dst_entry.ino,
+                            attr.kind != FileType::RegularFile,
+                        )?;
+                        displaced_remove_attr_ino = Some(dst_entry.ino);
+                    } else {
+                        Self::set_inode_in_txn(&txn, &attr)?;
                         if attr.nlink == 0 {
-                            Self::remove_inode_overlay_in_txn(&txn, dst_entry.ino)?;
-                            Self::clear_inode_overlay_aux_in_txn_with_options(
-                                &txn,
-                                dst_entry.ino,
-                                attr.kind != FileType::RegularFile,
+                            NamespaceDeleteTxn::new(&txn).record_deferred_delete(
+                                &NamespaceDeleteSpec::new_unlink_open_handle(new_parent, new_name),
+                                attr.ino,
                             )?;
-                            displaced_attr_event =
-                                Some(crate::events::MetaEvent::RemoveAttr { ino: dst_entry.ino });
+                        }
+                        if attr.nlink == 0 && attr.committed_content_epoch == 0 {
+                            // Peers never saw a published body; retire it there like unlink.
+                            displaced_remove_attr_ino = Some(dst_entry.ino);
                         } else {
-                            Self::set_inode_in_txn(&txn, &attr)?;
-                            displaced_attr_event =
-                                Some(crate::events::MetaEvent::SetAttr { attr: attr.clone() });
+                            displaced_set_attr = Some(attr.clone());
                         }
                     }
                 }
                 Self::remove_dentry_overlay_in_txn(&txn, new_parent, new_name)?;
-                Some(dst_entry.ino)
-            } else {
-                None
-            };
+                displaced = Some(attr);
+            }
 
             Self::set_dentry_in_txn(&txn, new_parent, new_name, &src_entry)?;
 
@@ -1020,14 +1033,6 @@ impl MetaFsOps for RedbMetaEngine {
                 }
             }
 
-            let displaced_set_attr = match &displaced_attr_event {
-                Some(crate::events::MetaEvent::SetAttr { attr }) => Some(attr.clone()),
-                _ => None,
-            };
-            let displaced_remove_attr_ino = match &displaced_attr_event {
-                Some(crate::events::MetaEvent::RemoveAttr { ino }) => Some(*ino),
-                _ => None,
-            };
             Self::append_event_in_txn(
                 &txn,
                 &crate::events::MetaEvent::RenameEntry {
@@ -1057,7 +1062,8 @@ impl MetaFsOps for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(RenameAtomicResult {
             moved_ino: src_entry.ino,
-            displaced_ino,
+            namespace_changed: true,
+            displaced,
         })
     }
 
