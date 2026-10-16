@@ -307,6 +307,38 @@ fn serving_checkpoint_export_rejects_malformed_dentry_values() {
             .contains("checkpoint dentry projection decode failed"),
         "export must identify the failed projection: {error}"
     );
+    let message = error.to_string();
+    assert!(message.contains(&format!("parent {ROOT_INO}")));
+    assert!(!message.contains("corrupt-checkpoint-entry"));
+    assert_eq!(message.matches("serialization error:").count(), 1);
+}
+
+#[test]
+fn serving_checkpoint_export_rejects_malformed_dentry_keys() {
+    for len in 0..8 {
+        let engine = temp_engine();
+        let bytes = encode(&DirEntryValue {
+            ino: ROOT_INO,
+            kind: FileType::Directory,
+        })
+        .unwrap();
+        let txn = engine.begin_write_txn().unwrap();
+        {
+            let mut dentries = txn.open_table(DENTRIES_TABLE).unwrap();
+            dentries
+                .insert(&b"invalid"[..len], bytes.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert!(
+            matches!(
+                engine.export_serving_checkpoint_bytes(),
+                Err(MetaError::Storage(_))
+            ),
+            "a {len}-byte dentry key must fail export"
+        );
+    }
 }
 
 #[test]
@@ -343,9 +375,12 @@ fn serving_checkpoint_export_preserves_names_and_filters_drafts() {
         (directory.ino, b"published-file".as_slice(), published.ino),
     ] {
         let expected_key = encode_dentry_key(parent, name);
-        assert!(checkpoint.dentries.iter().any(|(key, bytes)| {
-            key == &expected_key && decode::<DirEntryValue>(bytes).unwrap().ino == ino
-        }));
+        let (_, bytes) = checkpoint
+            .dentries
+            .iter()
+            .find(|(key, _)| key == &expected_key)
+            .expect("checkpoint must contain the expected dentry");
+        assert_eq!(decode::<DirEntryValue>(bytes).unwrap().ino, ino);
     }
     assert!(!checkpoint.inodes.iter().any(|(ino, _)| *ino == draft.ino));
 }
