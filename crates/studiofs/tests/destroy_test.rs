@@ -9,10 +9,12 @@
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use studiofs_data::{DataStore, DataStoreConfig, DataStoreCryptoConfig};
 use studiofs_meta::engine::MetaError;
 use studiofs_meta::{
@@ -149,6 +151,15 @@ fn output_text(output: &Output) -> String {
     text
 }
 
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn ensure_pg_schema(dsn: &str) {
     let rt = tokio::runtime::Runtime::new().expect("build runtime");
     rt.block_on(async {
@@ -239,7 +250,7 @@ fn pg_volume_exists(dsn: &str, volume_id: i64) -> bool {
     })
 }
 
-fn make_datastore(env: &TestEnv, name: &str) -> DataStore {
+fn make_datastore(env: &TestEnv, name: &str, uuid: &str) -> DataStore {
     let cfg = DataStoreConfig {
         endpoint: env.s3_endpoint.clone(),
         bucket: env.s3_bucket.clone(),
@@ -248,7 +259,7 @@ fn make_datastore(env: &TestEnv, name: &str) -> DataStore {
         region: env.s3_region.clone(),
         volume_name: name.to_string(),
         data_prefix: format!("{name}/objects/"),
-        volume_uuid: Uuid::new_v4().to_string(),
+        volume_uuid: uuid.to_string(),
         crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0xA5; ENCRYPTION_KEY_LENGTH])),
     };
     DataStore::new(&cfg).expect("create datastore")
@@ -354,7 +365,7 @@ fn build_infra_fixture(prefix: &str) -> InfraFixture {
 
     let (pg_volume_id, pg_uuid) = insert_pg_volume(&studio_dsn, &name);
 
-    let store = make_datastore(env, &name);
+    let store = make_datastore(env, &name, &pg_uuid);
     let marker_key = format!("{name}/objects/destroy-marker.txt");
     rt.block_on(store.put_by_key(&marker_key, Bytes::from_static(b"marker")))
         .expect("write S3 destroy fixture marker");
@@ -611,7 +622,7 @@ fn destroy_fails_cleanly_with_incorrect_s3_permissions() {
         "local DB should remain after destroy exits early due to consistency check failure"
     );
 
-    let store = make_datastore(&fixture.env, &fixture.name);
+    let store = make_datastore(&fixture.env, &fixture.name, &fixture.pg_uuid);
     let rt = tokio::runtime::Runtime::new().expect("build runtime");
     let marker_exists = rt
         .block_on(store.exists(&fixture.marker_key))
@@ -655,7 +666,7 @@ fn destroy_local_only_removes_local_state_and_keeps_remote() {
         "--local destroy should remove local metadata/cache"
     );
 
-    let store = make_datastore(&fixture.env, &fixture.name);
+    let store = make_datastore(&fixture.env, &fixture.name, &fixture.pg_uuid);
     let rt = tokio::runtime::Runtime::new().expect("build runtime");
     let marker_exists = rt
         .block_on(store.exists(&fixture.marker_key))
@@ -695,7 +706,7 @@ fn destroy_full_removes_local_s3_and_postgres_state() {
         "full destroy should remove local metadata/cache"
     );
 
-    let store = make_datastore(&fixture.env, &fixture.name);
+    let store = make_datastore(&fixture.env, &fixture.name, &fixture.pg_uuid);
     let rt = tokio::runtime::Runtime::new().expect("build runtime");
     let marker_exists = rt
         .block_on(store.exists(&fixture.marker_key))
@@ -707,5 +718,111 @@ fn destroy_full_removes_local_s3_and_postgres_state() {
     assert!(
         !pg_volume_exists(&fixture.pg_dsn, fixture.pg_volume_id),
         "full destroy should delete postgres volume metadata"
+    );
+}
+
+#[test]
+#[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
+fn destroy_full_refuses_active_local_metadata_before_deleting_remote_state() {
+    let fixture = build_infra_fixture("destroy-full-active-local");
+    create_local_metadata(
+        &fixture.meta_dir,
+        &fixture.name,
+        &fixture.pg_dsn,
+        fixture.pg_volume_id,
+        &fixture.env,
+        &fixture.pg_uuid,
+    );
+    let db_path = fixture.meta_dir.join(format!("{}.db", fixture.name));
+    assert!(db_path.exists(), "local DB should exist before destroy");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_studiofs"));
+    command
+        .arg("destroy")
+        .arg(&fixture.name)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    set_home_env(&mut command, fixture.home_dir.path());
+    let mut child = ChildGuard(command.spawn().expect("spawn studiofs destroy"));
+    let stdout = child.0.stdout.take().expect("take child stdout");
+    let (output_tx, output_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut buffer = [0; 512];
+        loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) if output_tx.send(buffer[..read].to_vec()).is_err() => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let prompt_deadline = Instant::now() + Duration::from_secs(15);
+    let mut output = Vec::new();
+    while !String::from_utf8_lossy(&output).contains("Do you want to proceed? [y/N]: ") {
+        let remaining = prompt_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "child did not flush the confirmation prompt"
+        );
+        output.extend(
+            output_rx
+                .recv_timeout(remaining)
+                .expect("receive flushed confirmation prompt before timeout"),
+        );
+    }
+
+    let _active_meta = RedbMetaEngine::open(&db_path).expect("open active local metadata");
+    let mut stdin = child.0.stdin.take().expect("take child stdin");
+    write!(stdin, "y\n{}\n", fixture.name).expect("confirm destroy prompts");
+    drop(stdin);
+
+    let child_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = child_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "destroy child exceeded its lifetime bound"
+        );
+        match output_rx.recv_timeout(remaining) {
+            Ok(chunk) => output.extend(chunk),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("destroy child did not exit before its lifetime bound")
+            }
+        }
+    }
+    reader.join().expect("join child stdout reader");
+    let status = child.0.wait().expect("wait for destroy child");
+    let output = String::from_utf8_lossy(&output);
+
+    assert!(
+        !status.success(),
+        "destroy should refuse active local metadata: {output}"
+    );
+    assert!(
+        !output.contains("Deleting data from S3 and metadata backends..."),
+        "destroy must fail before remote deletion starts: {output}"
+    );
+    assert!(
+        db_path.exists(),
+        "local DB should remain after refused destroy"
+    );
+
+    let store = make_datastore(&fixture.env, &fixture.name, &fixture.pg_uuid);
+    let rt = tokio::runtime::Runtime::new().expect("build runtime");
+    let marker = rt
+        .block_on(store.get_by_key(&fixture.marker_key))
+        .expect("read S3 marker after refused destroy");
+    assert_eq!(
+        marker.to_bytes(),
+        Bytes::from_static(b"marker"),
+        "S3 marker content should remain unchanged"
+    );
+    assert!(
+        pg_volume_exists(&fixture.pg_dsn, fixture.pg_volume_id),
+        "PostgreSQL volume row should remain after refused destroy"
     );
 }

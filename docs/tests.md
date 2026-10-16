@@ -132,6 +132,22 @@ The optional HTTPS S3 fixture is excluded because the disposable RustFS service
 is plain HTTP. Mounted FUSE/WinFSP smoke gates and the remaining ignored S3 tests
 stay separate.
 
+### SFS-858 Local Ownership During Full Destroy
+
+The process regression waits for the destroy confirmation prompt, opens the same
+local database in the test process, then confirms full destroy. It checks that
+destroy fails before remote deletion, the S3 marker bytes are unchanged, and the
+PostgreSQL volume row remains. It requires the S3/PostgreSQL environment above
+and an existing test bucket:
+
+```bash
+cargo test -p studiofs --test destroy_test destroy_full_refuses_active_local_metadata_before_deleting_remote_state -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test destroy_test destroy_local_only_refuses_active_local_metadata -- --exact
+```
+
+This proves exclusion against another process using the same local database;
+it does not prove that remote peers are quiescent.
+
 ### SFS-638 Shutdown and Upload-Idle Regressions
 
 Run these focused regressions when changing shutdown ownership, shutdown error
