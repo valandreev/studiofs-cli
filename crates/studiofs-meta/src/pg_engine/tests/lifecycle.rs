@@ -6026,6 +6026,122 @@ fn checkpoint_source_event_seq_uses_captured_redb_counter() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_checkpoint_rejects_malformed_dentry_without_replacing_published_descriptor() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _lag = set_test_env(PG_CHECKPOINT_MAX_VERSION_LAG_ENV_VAR, "1");
+    let _bytes = set_test_env(PG_CHECKPOINT_MAX_EVENT_BYTES_ENV_VAR, "9223372036854775807");
+    let _age = set_test_env(PG_CHECKPOINT_MAX_AGE_SECS_ENV_VAR, "3600");
+
+    let volume = PgTestVolume::new(&dsn, "pg-checkpoint-malformed-dentry");
+    let (_publisher_dir, publisher) = open_pg_publisher(&volume);
+    let read_descriptor = || {
+        run_async(with_pg_test_client(&dsn, |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT checkpoint_version, row_to_json(descriptor)::text FROM (SELECT metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation, total_event_payload_bytes, checkpoint_total_event_bytes, checkpoint_updated_at::text FROM metadata_state WHERE vol = $1) AS descriptor",
+                    &[&volume.volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<_, MetaError>((row.get::<_, i64>(0), row.get::<_, String>(1)))
+        }))
+        .expect("read checkpoint descriptor and covered cut")
+    };
+
+    let advance_remote_head = |version: i64| {
+        run_async(with_pg_test_client(&dsn, |client| async move {
+            client
+                .execute(
+                    "UPDATE metadata_state SET version = $2, total_event_payload_bytes = $2 WHERE vol = $1",
+                    &[&volume.volume_id, &version],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(), MetaError>(())
+        }))
+    };
+
+    advance_remote_head(10_000).expect("advance remote head for initial checkpoint");
+    publisher
+        .local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 10_000)
+        .expect("persist initial checkpoint version");
+    publisher.local_version.store(10_000, Ordering::Release);
+    publisher.observe_checkpoint_freshness();
+
+    let owner = publisher.current_client_id().expect("checkpoint owner");
+    let initial_lease = publisher
+        .try_claim_checkpoint_lease(&owner, Duration::from_secs(60))
+        .expect("claim initial checkpoint lease")
+        .expect("initial checkpoint lease should be available");
+    let initial_cut = publisher
+        .capture_checkpoint_source_cut()
+        .expect("capture initial checkpoint source cut")
+        .expect("initial checkpoint source should be eligible");
+    assert!(
+        publisher
+            .build_and_publish_checkpoint(&owner, initial_lease, initial_cut)
+            .expect("publish initial checkpoint")
+    );
+    publisher
+        .release_checkpoint_lease(&owner, initial_lease)
+        .expect("release initial checkpoint lease");
+    advance_remote_head(20_000).expect("advance remote head beyond published checkpoint");
+    let prior_descriptor_and_cut = read_descriptor();
+    assert_eq!(prior_descriptor_and_cut.0, 10_000);
+    publisher
+        .local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 20_000)
+        .expect("persist malformed checkpoint version");
+    publisher.local_version.store(20_000, Ordering::Release);
+    {
+        let txn = publisher
+            .local
+            .begin_write_txn()
+            .expect("begin raw dentry write");
+        let dentry_table: redb::TableDefinition<&[u8], &[u8]> =
+            redb::TableDefinition::new("dentries");
+        txn.open_table(dentry_table)
+            .expect("open dentry table")
+            .insert(
+                crate::redb_engine::layout::encode_dentry_key(
+                    ROOT_INO,
+                    b"malformed-checkpoint-entry",
+                )
+                .as_slice(),
+                b"".as_slice(),
+            )
+            .expect("insert malformed dentry value");
+        txn.commit().expect("commit malformed dentry value");
+    }
+    publisher.observe_checkpoint_freshness();
+
+    let failing_lease = publisher
+        .try_claim_checkpoint_lease(&owner, Duration::from_secs(60))
+        .expect("claim failing checkpoint lease")
+        .expect("failing checkpoint lease should be available");
+    let failing_cut = publisher
+        .capture_checkpoint_source_cut()
+        .expect("capture malformed checkpoint source cut")
+        .expect("malformed checkpoint source should be eligible");
+    let error = publisher
+        .build_and_publish_checkpoint(&owner, failing_lease, failing_cut)
+        .expect_err("malformed dentry must fail checkpoint export");
+    assert!(matches!(error, MetaError::Serialization(_)), "{error}");
+    publisher
+        .release_checkpoint_lease(&owner, failing_lease)
+        .expect("release failing checkpoint lease");
+
+    assert!(
+        read_descriptor() == prior_descriptor_and_cut,
+        "checkpoint descriptor and covered-cut metadata must remain unchanged after failed export"
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_checkpoint_publishes_captured_cut_while_local_writes_continue_and_replays_tail() {
     let Some(dsn) = pg_dsn() else {
         return;

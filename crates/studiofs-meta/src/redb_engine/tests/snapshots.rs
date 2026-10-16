@@ -289,6 +289,103 @@ fn remote_snapshot_export_ignores_invalid_local_dentry_mutation_rows() {
 }
 
 #[test]
+fn serving_checkpoint_export_rejects_malformed_dentry_values() {
+    let engine = temp_engine();
+    let key = encode_dentry_key(ROOT_INO, b"corrupt-checkpoint-entry");
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut dentries = txn.open_table(DENTRIES_TABLE).unwrap();
+        dentries.insert(key.as_slice(), b"".as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let error = engine.export_serving_checkpoint_bytes().unwrap_err();
+    assert!(matches!(error, MetaError::Serialization(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("checkpoint dentry projection decode failed"),
+        "export must identify the failed projection: {error}"
+    );
+    let message = error.to_string();
+    assert!(message.contains(&format!("parent {ROOT_INO}")));
+    assert!(!message.contains("corrupt-checkpoint-entry"));
+    assert_eq!(message.matches("serialization error:").count(), 1);
+}
+
+#[test]
+fn serving_checkpoint_export_rejects_malformed_dentry_keys() {
+    for len in 0..8 {
+        let engine = temp_engine();
+        let bytes = encode(&DirEntryValue {
+            ino: ROOT_INO,
+            kind: FileType::Directory,
+        })
+        .unwrap();
+        let txn = engine.begin_write_txn().unwrap();
+        {
+            let mut dentries = txn.open_table(DENTRIES_TABLE).unwrap();
+            dentries
+                .insert(&b"invalid"[..len], bytes.as_slice())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert!(
+            matches!(
+                engine.export_serving_checkpoint_bytes(),
+                Err(MetaError::Storage(_))
+            ),
+            "a {len}-byte dentry key must fail export"
+        );
+    }
+}
+
+#[test]
+fn serving_checkpoint_export_preserves_names_and_filters_drafts() {
+    let engine = temp_engine();
+    let directory = engine
+        .create_dir(ROOT_INO, b"ordinary-directory", 0, 0, 0o755)
+        .unwrap();
+    let draft = engine
+        .create_file(ROOT_INO, b"hidden-draft", 0, 0, 0o644)
+        .unwrap();
+    let published = engine
+        .create_file(directory.ino, b"published-file", 0, 0, 0o644)
+        .unwrap();
+    engine
+        .stage_payload_slice(published.ino, 0, &PayloadRef::new_partial(90_001, 4096))
+        .unwrap();
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(published.ino, 0, 90_001)
+            .unwrap()
+    );
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(published.ino, 0)
+            .unwrap()
+    );
+
+    let bytes = engine.export_serving_checkpoint_bytes().unwrap();
+    let checkpoint = crate::snapshot::ServingCheckpoint::decode(&bytes).unwrap();
+    assert_eq!(checkpoint.dentries.len(), 2);
+    for (parent, name, ino) in [
+        (ROOT_INO, b"ordinary-directory".as_slice(), directory.ino),
+        (directory.ino, b"published-file".as_slice(), published.ino),
+    ] {
+        let expected_key = encode_dentry_key(parent, name);
+        let (_, bytes) = checkpoint
+            .dentries
+            .iter()
+            .find(|(key, _)| key == &expected_key)
+            .expect("checkpoint must contain the expected dentry");
+        assert_eq!(decode::<DirEntryValue>(bytes).unwrap().ino, ino);
+    }
+    assert!(!checkpoint.inodes.iter().any(|(ino, _)| *ino == draft.ino));
+}
+
+#[test]
 fn serving_checkpoint_read_snapshot_exports_only_the_captured_state() {
     let engine = temp_engine();
     for name in [b"checkpoint-before-a".as_slice(), b"checkpoint-before-b"] {
