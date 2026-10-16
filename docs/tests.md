@@ -1063,6 +1063,8 @@ SFS-863 focused Windows capability and independent VFS ACL regressions:
 
 ```powershell
 cargo test -p studiofs-winfsp --lib parse_mount_options -- --nocapture
+cargo test -p studiofs-winfsp --lib apply_volume_params_forces_persistent_acls_disabled -- --nocapture
+cargo test -p studiofs-winfsp --lib parse_bool_env -- --nocapture
 cargo test -p studiofs-vfs --test vfs_test acl_ -- --nocapture --test-threads=1
 ```
 

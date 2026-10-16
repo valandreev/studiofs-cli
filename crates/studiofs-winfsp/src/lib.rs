@@ -1189,6 +1189,7 @@ mod tests {
         remove_test_mount_option_env("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
         remove_test_mount_option_env("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
         remove_test_mount_option_env("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
+        remove_test_mount_option_env("STUDIOFS_WINFSP_PERSISTENT_ACLS");
 
         let opts = parse_mount_options("  StudioFS  ").expect("options");
         let adaptive_timeouts = WinfspMetadataCachePolicy::Adaptive.timeouts();
@@ -1224,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_mount_options_defaults_to_non_persistent_acls() {
+    fn apply_volume_params_forces_persistent_acls_disabled() {
         remove_test_mount_option_env("STUDIOFS_WINFSP_PERSISTENT_ACLS");
 
         let opts = parse_mount_options("StudioFS").expect("options");
@@ -1243,6 +1244,34 @@ mod tests {
         );
 
         remove_test_mount_option_env("STUDIOFS_WINFSP_PERSISTENT_ACLS");
+    }
+
+    #[test]
+    fn parse_mount_options_allows_explicit_disabled_persistent_acls() {
+        set_test_mount_option_env("STUDIOFS_WINFSP_PERSISTENT_ACLS", "0");
+        assert!(parse_mount_options("StudioFS").is_ok());
+        remove_test_mount_option_env("STUDIOFS_WINFSP_PERSISTENT_ACLS");
+    }
+
+    #[test]
+    fn parse_bool_env_accepts_supported_tokens() {
+        let key = "STUDIOFS_WINFSP_PERSISTENT_ACLS";
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("on", true),
+            (" TRUE ", true),
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            ("off", false),
+            (" OFF ", false),
+        ] {
+            set_test_mount_option_env(key, value);
+            assert_eq!(super::parse_bool_env(key, !expected), expected, "{value:?}");
+        }
+        remove_test_mount_option_env(key);
     }
 
     #[test]
