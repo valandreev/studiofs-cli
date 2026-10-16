@@ -259,7 +259,7 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
     // local-only mode defers its writable open (and any redb repair) until here.
     let local_meta_owner = studiofs_meta::RedbMetaEngine::open(&db_path).inspect_err(|_| {
         eprintln!(
-            "Could not acquire exclusive local metadata ownership. If another local process is using this database, unmount the volume or close that process before retrying."
+            "Failed to open the local metadata database for exclusive use (see the error below). If another local process is using this database, unmount the volume or close that process before retrying."
         );
     })?;
 
