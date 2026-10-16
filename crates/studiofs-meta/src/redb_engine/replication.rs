@@ -644,10 +644,8 @@ impl RedbMetaEngine {
         let mut dentries = Vec::with_capacity(snapshot.dentries.len());
         for (key, bytes) in snapshot.dentries.drain(..) {
             check()?;
-            let entry: DirEntryValue = decode(&bytes).map_err(|error| {
-                MetaError::Serialization(format!(
-                    "checkpoint dentry projection decode failed: {error}"
-                ))
+            let entry: DirEntryValue = decode(&bytes).map_err(|e| {
+                MetaError::Serialization(format!("checkpoint dentry projection decode failed: {e}"))
             })?;
             if !hidden_regular_inodes.contains(&entry.ino) {
                 dentries.push((key, bytes));

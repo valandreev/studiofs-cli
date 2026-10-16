@@ -337,23 +337,16 @@ fn serving_checkpoint_export_preserves_names_and_filters_drafts() {
 
     let bytes = engine.export_serving_checkpoint_bytes().unwrap();
     let checkpoint = crate::snapshot::ServingCheckpoint::decode(&bytes).unwrap();
-    let names: Vec<_> = checkpoint
-        .dentries
-        .iter()
-        .map(|(key, bytes)| {
-            let entry: DirEntryValue = decode(bytes).unwrap();
-            (key.clone(), entry.ino)
-        })
-        .collect();
-    assert_eq!(names.len(), 2);
-    assert!(names.contains(&(
-        encode_dentry_key(ROOT_INO, b"ordinary-directory"),
-        directory.ino
-    )));
-    assert!(names.contains(&(
-        encode_dentry_key(directory.ino, b"published-file"),
-        published.ino
-    )));
+    assert_eq!(checkpoint.dentries.len(), 2);
+    for (parent, name, ino) in [
+        (ROOT_INO, b"ordinary-directory".as_slice(), directory.ino),
+        (directory.ino, b"published-file".as_slice(), published.ino),
+    ] {
+        let expected_key = encode_dentry_key(parent, name);
+        assert!(checkpoint.dentries.iter().any(|(key, bytes)| {
+            key == &expected_key && decode::<DirEntryValue>(bytes).unwrap().ino == ino
+        }));
+    }
     assert!(!checkpoint.inodes.iter().any(|(ino, _)| *ino == draft.ino));
 }
 

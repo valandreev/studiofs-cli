@@ -6040,39 +6040,30 @@ fn pg_checkpoint_rejects_malformed_dentry_without_replacing_published_descriptor
         run_async(with_pg_test_client(&dsn, |client| async move {
             let row = client
                 .query_one(
-                    "SELECT metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation, total_event_payload_bytes, checkpoint_total_event_bytes, checkpoint_updated_at::text FROM metadata_state WHERE vol = $1",
+                    "SELECT checkpoint_version, row_to_json(descriptor)::text FROM (SELECT metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation, total_event_payload_bytes, checkpoint_total_event_bytes, checkpoint_updated_at::text FROM metadata_state WHERE vol = $1) AS descriptor",
                     &[&volume.volume_id],
                 )
                 .await
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
-            Ok::<_, MetaError>((
-                row.get::<_, i16>(0),
-                row.get::<_, i64>(1),
-                row.get::<_, i64>(2),
-                row.get::<_, Vec<u8>>(3),
-                row.get::<_, Vec<u8>>(4),
-                row.get::<_, Vec<u8>>(5),
-                row.get::<_, String>(6),
-                row.get::<_, i64>(7),
-                row.get::<_, i64>(8),
-                row.get::<_, i64>(9),
-                row.get::<_, String>(10),
-            ))
+            Ok::<_, MetaError>((row.get::<_, i64>(0), row.get::<_, String>(1)))
         }))
         .expect("read checkpoint descriptor and covered cut")
     };
 
-    run_async(with_pg_test_client(&dsn, |client| async move {
-        client
-            .execute(
-                "UPDATE metadata_state SET version = 10000, total_event_payload_bytes = 10000 WHERE vol = $1",
-                &[&volume.volume_id],
-            )
-            .await
-            .map_err(|error| MetaError::Storage(error.to_string()))?;
-        Ok::<(), MetaError>(())
-    }))
-    .expect("advance remote head for initial checkpoint");
+    let advance_remote_head = |version: i64| {
+        run_async(with_pg_test_client(&dsn, |client| async move {
+            client
+                .execute(
+                    "UPDATE metadata_state SET version = $2, total_event_payload_bytes = $2 WHERE vol = $1",
+                    &[&volume.volume_id, &version],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok::<(), MetaError>(())
+        }))
+    };
+
+    advance_remote_head(10_000).expect("advance remote head for initial checkpoint");
     publisher
         .local
         .set_counter(LOCAL_PG_VERSION_COUNTER, 10_000)
@@ -6097,19 +6088,9 @@ fn pg_checkpoint_rejects_malformed_dentry_without_replacing_published_descriptor
     publisher
         .release_checkpoint_lease(&owner, initial_lease)
         .expect("release initial checkpoint lease");
-    run_async(with_pg_test_client(&dsn, |client| async move {
-        client
-            .execute(
-                "UPDATE metadata_state SET version = 20000, total_event_payload_bytes = 20000 WHERE vol = $1",
-                &[&volume.volume_id],
-            )
-            .await
-            .map_err(|error| MetaError::Storage(error.to_string()))?;
-        Ok::<(), MetaError>(())
-    }))
-    .expect("advance remote head beyond published checkpoint");
+    advance_remote_head(20_000).expect("advance remote head beyond published checkpoint");
     let prior_descriptor_and_cut = read_descriptor();
-    assert_eq!(prior_descriptor_and_cut.2, 10_000);
+    assert_eq!(prior_descriptor_and_cut.0, 10_000);
     publisher
         .local
         .set_counter(LOCAL_PG_VERSION_COUNTER, 20_000)
