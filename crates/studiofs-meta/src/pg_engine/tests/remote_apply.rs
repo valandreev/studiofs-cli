@@ -752,6 +752,56 @@ fn test_pg_remote_rename_overwrite_converges_to_source_inode() {
 }
 
 #[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn test_pg_retained_rename_over_unpublished_draft_leaves_no_peer_inode() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+
+    let dir_a = studiofs_test_support::workspace_target_tempdir("test-");
+    let dir_b = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_a = dir_a.path().join("meta-a.redb");
+    let db_b = dir_b.path().join("meta-b.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-rename-retained-draft");
+    let info = volume.format_info();
+    seed_local(&db_a, &info);
+    seed_local(&db_b, &info);
+
+    let a = PgMetaEngine::open(&db_a).expect("open a");
+    let b = PgMetaEngine::open(&db_b).expect("open b");
+
+    let src = create_published_small_file(&a, ROOT_INO, b"src.txt", 50_306);
+    let draft = a
+        .create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
+        .expect("create unpublished draft on a");
+    a.flush_metadata().expect("flush seed files");
+    assert!(wait_visible(
+        &b,
+        ROOT_INO,
+        b"src.txt",
+        Duration::from_secs(10)
+    ));
+
+    // VFS retains the displaced inode while handles may still be open.
+    a.rename_atomic(ROOT_INO, b"src.txt", ROOT_INO, b"draft.txt", true, true)
+        .expect("retained rename over draft on a");
+    a.flush_metadata().expect("flush rename");
+
+    assert!(wait_until(Duration::from_secs(10), || {
+        let _ = b.sync_metadata();
+        b.lookup(ROOT_INO, b"draft.txt")
+            .map(|entry| entry.ino == src.ino)
+            .unwrap_or(false)
+    }));
+    assert!(
+        b.get_attr(draft.ino).is_err(),
+        "peer must not keep an unnamed inode for a never-published draft"
+    );
+    assert_eq!(
+        a.get_attr(draft.ino).expect("writer retains draft").nlink,
+        0
+    );
+}
+
+#[test]
 fn remote_apply_coordinator_does_not_capture_pg_engine_state() {
     let source = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
