@@ -1673,6 +1673,15 @@ struct UploadState {
     upload_fallback_read_max_ns: AtomicU64,
     /// Dynamic slot cost adjusted from foreground-read pressure on the Local-First path.
     upload_cache_io_foreground_cost: AtomicU32,
+    /// One-shot test pause at the start of deleted-inode payload eviction.
+    #[cfg(test)]
+    deleted_inode_eviction_pause: std::sync::Mutex<Option<DeletedInodeEvictionPause>>,
+}
+
+#[cfg(test)]
+struct DeletedInodeEvictionPause {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 struct UploadCompletionBatch {
@@ -1860,6 +1869,19 @@ fn derive_upload_cache_io_foreground_cost_step(upload_cache_io_slots: usize) -> 
 }
 
 impl UploadState {
+    #[cfg(test)]
+    fn pause_deleted_inode_eviction_for_test(&self) {
+        let hook = self
+            .deleted_inode_eviction_pause
+            .lock()
+            .expect("eviction pause hook poisoned")
+            .take();
+        if let Some(hook) = hook {
+            let _ = hook.entered.send(());
+            let _ = hook.release.recv_timeout(Duration::from_secs(10));
+        }
+    }
+
     fn new(upload_cache_io_foreground_cost: u32) -> Self {
         Self {
             deleted_inodes: OrderedMutex::new(std::collections::HashSet::new(), LockTier::Upload),
@@ -1909,6 +1931,8 @@ impl UploadState {
             upload_fallback_read_ns: AtomicU64::new(0),
             upload_fallback_read_max_ns: AtomicU64::new(0),
             upload_cache_io_foreground_cost: AtomicU32::new(upload_cache_io_foreground_cost),
+            #[cfg(test)]
+            deleted_inode_eviction_pause: std::sync::Mutex::new(None),
         }
     }
 }

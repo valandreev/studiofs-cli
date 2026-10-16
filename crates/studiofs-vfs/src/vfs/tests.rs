@@ -1172,6 +1172,76 @@ fn sfs856_rename_overwrite_preserves_displaced_open_handle_data() {
 }
 
 #[test]
+fn sfs856_rename_overwrite_of_closed_file_does_not_wait_for_cache_eviction() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs856-rename-deferred-eviction");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let displaced = vfs
+            .create(ROOT_INO, b"target.txt", 0, 0, 0o644)
+            .expect("create target");
+        let fh = vfs
+            .open_file(displaced.ino, OpenFlags::RDWR, false)
+            .expect("open target");
+        vfs.write_fh(fh, displaced.ino, 0, b"target bytes")
+            .await
+            .expect("write target");
+        vfs.fsync_fh(fh).await.expect("fsync target");
+        vfs.release_fh(fh).await.expect("close target");
+        assert!(
+            !meta
+                .get_regular_file_graph_object_usage(displaced.ino)
+                .expect("read target graph")
+                .is_empty(),
+            "the closed target must own payload objects to evict"
+        );
+        let source = vfs
+            .create(ROOT_INO, b"source.txt", 0, 0, 0o644)
+            .expect("create source");
+        vfs.write(source.ino, 0, b"source bytes")
+            .await
+            .expect("write source");
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *vfs.state
+            .upload
+            .deleted_inode_eviction_pause
+            .lock()
+            .unwrap() = Some(super::DeletedInodeEvictionPause {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        let (renamed_tx, renamed_rx) = std::sync::mpsc::channel::<()>();
+        // Hold eviction paused and observe whether rename can still return.
+        let observer = std::thread::spawn(move || {
+            entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("displaced inode eviction should start");
+            let returned_while_paused = renamed_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+            let _ = release_tx.send(());
+            returned_while_paused
+        });
+
+        vfs.rename(ROOT_INO, b"source.txt", ROOT_INO, b"target.txt", true)
+            .expect("rename over closed target");
+        let _ = renamed_tx.send(());
+
+        assert!(
+            observer.join().expect("join eviction observer"),
+            "rename overwrite must not wait for displaced-inode cache eviction"
+        );
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"target.txt")
+                .expect("replacement")
+                .ino,
+            source.ino
+        );
+        assert!(vfs.getattr(displaced.ino).is_err());
+    });
+}
+
+#[test]
 fn sfs856_rename_overwrite_keeps_displaced_inode_reachable_by_hardlink() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs856-rename-hardlink");
