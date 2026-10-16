@@ -610,29 +610,38 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
     drop(primed_engine);
 
     // ── 7. Report success ─────────────────────────────────────────────────────
-    print_success_summary(&format_info, &db_path);
+    info!("volume {name:?} initialized successfully");
+    write_success_summary(&mut std::io::stdout().lock(), &format_info, &db_path)?;
     Ok(())
 }
 
-fn print_success_summary(format_info: &FormatInfo, db_path: &Path) {
+fn write_success_summary(
+    output: &mut impl Write,
+    format_info: &FormatInfo,
+    db_path: &Path,
+) -> std::io::Result<()> {
     let name = &format_info.name;
-    info!("volume {name:?} initialized successfully");
-    println!("✓ Volume '{}' initialized", name);
-    println!("  UUID:       {}", format_info.uuid);
-    println!(
+    writeln!(output, "✓ Volume '{}' initialized", name)?;
+    writeln!(output, "  UUID:       {}", format_info.uuid)?;
+    writeln!(
+        output,
         "  Block size: {} bytes ({} MiB)",
         format_info.block_size,
         format_info.block_size / (1024 * 1024)
-    );
-    println!("  Data endpoint: {}", format_info.endpoint);
-    println!("  Data bucket:   {}", format_info.bucket);
+    )?;
+    writeln!(output, "  Data endpoint: {}", format_info.endpoint)?;
+    writeln!(output, "  Data bucket:   {}", format_info.bucket)?;
     if let Some(pg) = &format_info.metadata.postgres {
-        println!("  Metadata backend: Postgres");
-        println!("  Volume ID: {}", pg.volume_id);
+        writeln!(output, "  Metadata backend: Postgres")?;
+        writeln!(output, "  Volume ID: {}", pg.volume_id)?;
     }
-    println!("  Metadata:   {:?}", db_path);
-    println!();
-    println!("Run `studiofs mount {} <mount-point>` to mount.", name);
+    writeln!(output, "  Metadata:   {:?}", db_path)?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Run `studiofs mount {} <mount-point>` to mount.",
+        name
+    )
 }
 
 #[cfg(test)]
@@ -642,9 +651,13 @@ mod tests {
 
     #[test]
     fn init_success_summary_omits_postgres_credentials() {
-        const CHILD_DSN: &str = "STUDIOFS_INIT_SUMMARY_TEST_DSN";
         const PASSWORD: &str = "SFS859_SYNTHETIC_PASSWORD";
-        if let Ok(dsn) = std::env::var(CHILD_DSN) {
+        for dsn in [
+            format!("postgres://synthetic-user:{PASSWORD}@db.example.invalid/studiofs"),
+            format!(
+                "host=db.example.invalid user=synthetic-user password='{PASSWORD}' dbname=studiofs"
+            ),
+        ] {
             let format_info = FormatInfo {
                 format_version: CURRENT_FORMAT_VERSION,
                 name: "summary-volume".into(),
@@ -666,39 +679,16 @@ mod tests {
                 encryption: EncryptionConfig::new([0; ENCRYPTION_KEY_LENGTH]),
                 block_size: DEFAULT_BLOCK_SIZE,
             };
-            print_success_summary(&format_info, Path::new("summary-volume.db"));
-            return;
-        }
-
-        for dsn in [
-            format!("postgres://synthetic-user:{PASSWORD}@db.example.invalid/studiofs"),
-            format!(
-                "host=db.example.invalid user=synthetic-user password='{PASSWORD}' dbname=studiofs"
-            ),
-        ] {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "cli::init::tests::init_success_summary_omits_postgres_credentials",
-                    "--nocapture",
-                ])
-                .env(CHILD_DSN, dsn)
-                .output()
-                .expect("capture init success summary");
-            assert!(output.status.success(), "summary subprocess failed");
-            let stdout = String::from_utf8(output.stdout).unwrap();
-            let stderr = String::from_utf8(output.stderr).unwrap();
-            assert!(stdout.contains("Volume 'summary-volume' initialized"));
-            assert!(stdout.contains("summary-uuid"));
-            assert!(stdout.contains("Metadata backend: Postgres"));
-            assert!(stdout.contains("Volume ID: 42"));
-            for stream in [&stdout, &stderr] {
-                assert!(!stream.contains(PASSWORD), "password leaked in summary");
-                assert!(!stream.contains("synthetic-user"), "user leaked in summary");
-                assert!(
-                    !stream.contains("db.example.invalid"),
-                    "DSN leaked in summary"
-                );
+            let mut output = Vec::new();
+            write_success_summary(&mut output, &format_info, Path::new("summary-volume.db"))
+                .expect("write init success summary");
+            let summary = String::from_utf8(output).unwrap();
+            assert!(summary.contains("Volume 'summary-volume' initialized"));
+            assert!(summary.contains("summary-uuid"));
+            assert!(summary.contains("Metadata backend: Postgres"));
+            assert!(summary.contains("Volume ID: 42"));
+            for marker in [PASSWORD, "synthetic-user", "db.example.invalid"] {
+                assert!(!summary.contains(marker), "DSN leaked in summary");
             }
         }
     }
