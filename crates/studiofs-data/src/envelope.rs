@@ -247,7 +247,7 @@ impl SfecHeaderLayout {
             .checked_add(self.algorithm.tag_len())
     }
 
-    fn expected_ciphertext_len(&self) -> Result<usize, SfecError> {
+    pub(crate) fn expected_ciphertext_len(&self) -> Result<usize, SfecError> {
         if self.frame_count == 0 {
             return Ok(0);
         }
