@@ -9,7 +9,7 @@ use clap::Args;
 use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use studiofs_data::{
     DataStore, DataStoreConfig, DataStoreCryptoConfig, normalize_s3_endpoint_transport,
 };
@@ -122,7 +122,7 @@ impl InitRunRequest {
     }
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 #[command(about = "Initialize a new filesystem volume")]
 #[command(long_about = "\
 Initialize a new filesystem volume by validating S3 object storage, creating \
@@ -209,6 +209,14 @@ pub(crate) struct InitArgs {
     /// Deprecated option. Metadata is PostgreSQL-only now.
     #[arg(long, hide = true)]
     metadata_region: Option<String>,
+}
+
+impl std::fmt::Debug for InitArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitArgs")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl InitArgs {
@@ -611,31 +619,159 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
 
     // ── 7. Report success ─────────────────────────────────────────────────────
     info!("volume {name:?} initialized successfully");
-    println!("✓ Volume '{}' initialized", name);
-    println!("  UUID:       {}", format_info.uuid);
-    println!(
-        "  Block size: {} bytes ({} MiB)",
-        actual_block_size,
-        actual_block_size / (1024 * 1024)
-    );
-    println!("  Data endpoint: {}", object_store.endpoint);
-    println!("  Data bucket:   {}", object_store.bucket);
-    if let Some(pg) = &format_info.metadata.postgres {
-        println!("  Metadata backend: Postgres");
-        println!("  Postgres: {}", pg.url);
-        println!("  Volume ID: {}", pg.volume_id);
-    }
-    println!("  Metadata:   {:?}", db_path);
-    println!();
-    println!("Run `studiofs mount {} <mount-point>` to mount.", name);
-
+    write_success_summary(&mut std::io::stdout().lock(), &format_info, &db_path)?;
     Ok(())
+}
+
+fn write_success_summary(
+    output: &mut impl Write,
+    format_info: &FormatInfo,
+    db_path: &Path,
+) -> std::io::Result<()> {
+    let name = &format_info.name;
+    writeln!(output, "✓ Volume '{}' initialized", name)?;
+    writeln!(output, "  UUID:       {}", format_info.uuid)?;
+    writeln!(
+        output,
+        "  Block size: {} bytes ({} MiB)",
+        format_info.block_size,
+        format_info.block_size / (1024 * 1024)
+    )?;
+    writeln!(output, "  Data endpoint: {}", format_info.endpoint)?;
+    writeln!(output, "  Data bucket:   {}", format_info.bucket)?;
+    if let Some(pg) = &format_info.metadata.postgres {
+        writeln!(output, "  Metadata backend: Postgres")?;
+        writeln!(output, "  Volume ID: {}", pg.volume_id)?;
+    }
+    writeln!(output, "  Metadata:   {:?}", db_path)?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Run `studiofs mount {} <mount-point>` to mount.",
+        name
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    #[test]
+    fn init_success_summary_omits_postgres_credentials() {
+        const PASSWORD: &str = "SFS859_SYNTHETIC_PASSWORD";
+        for dsn in [
+            format!("postgres://synthetic-user:{PASSWORD}@db.example.invalid/studiofs"),
+            format!(
+                "host=db.example.invalid user=synthetic-user password='{PASSWORD}' dbname=studiofs"
+            ),
+        ] {
+            let format_info = FormatInfo {
+                format_version: CURRENT_FORMAT_VERSION,
+                name: "summary-volume".into(),
+                uuid: "summary-uuid".into(),
+                endpoint: "https://s3.example.invalid".into(),
+                bucket: "summary-bucket".into(),
+                access_key: "synthetic-access-key".into(),
+                secret_key: "synthetic-secret-key".into(),
+                region: "us-east-1".into(),
+                data_prefix: "summary-volume/objects/".into(),
+                metadata: MetadataConfig {
+                    backend: MetadataBackend::Postgres,
+                    remote: None,
+                    postgres: Some(PostgresConfig {
+                        url: dsn,
+                        volume_id: 42,
+                    }),
+                },
+                encryption: EncryptionConfig::new([0; ENCRYPTION_KEY_LENGTH]),
+                block_size: DEFAULT_BLOCK_SIZE,
+            };
+            let mut output = Vec::new();
+            write_success_summary(&mut output, &format_info, Path::new("summary-volume.db"))
+                .expect("write init success summary");
+            let summary = String::from_utf8(output).unwrap();
+            assert!(summary.contains("Volume 'summary-volume' initialized"));
+            assert!(summary.contains("summary-uuid"));
+            assert!(summary.contains("Metadata backend: Postgres"));
+            assert!(summary.contains("Volume ID: 42"));
+            for marker in [
+                PASSWORD,
+                "synthetic-user",
+                "db.example.invalid",
+                "synthetic-access-key",
+                "synthetic-secret-key",
+            ] {
+                assert!(!summary.contains(marker), "DSN leaked in summary");
+            }
+        }
+    }
+
+    #[test]
+    fn init_debug_omits_credentials_and_deprecated_metadata_options() {
+        const MARKERS: &[&str] = &[
+            "synthetic-url-user",
+            "synthetic-url-password",
+            "synthetic-keyword-user",
+            "synthetic-keyword-password",
+            "synthetic-access-key",
+            "synthetic-secret-key",
+            "synthetic-metadata-endpoint",
+            "synthetic-metadata-bucket",
+            "synthetic-metadata-access-key",
+            "synthetic-metadata-secret-key",
+            "synthetic-metadata-region",
+        ];
+
+        for dsn in [
+            "postgres://synthetic-url-user:synthetic-url-password@db.example.invalid/studiofs",
+            "host=db.example.invalid user=synthetic-keyword-user password=synthetic-keyword-password dbname=studiofs",
+        ] {
+            let cli = crate::cli::parse_for_test(&[
+                "init",
+                "debug-volume",
+                "--endpoint",
+                "https://s3.example.invalid",
+                "--bucket",
+                "debug-bucket",
+                "--access-key",
+                "synthetic-access-key",
+                "--secret-key",
+                "synthetic-secret-key",
+                "--meta",
+                dsn,
+                "--metadata-endpoint",
+                "synthetic-metadata-endpoint",
+                "--metadata-bucket",
+                "synthetic-metadata-bucket",
+                "--metadata-access-key",
+                "synthetic-metadata-access-key",
+                "--metadata-secret-key",
+                "synthetic-metadata-secret-key",
+                "--metadata-region",
+                "synthetic-metadata-region",
+            ])
+            .unwrap();
+            let crate::cli::Commands::Init(args) = &cli.command else {
+                panic!("expected init command");
+            };
+
+            let args_debug = format!("{args:?}");
+            let command_debug = format!("{:?}", cli.command);
+            assert!(args_debug.contains("debug-volume"));
+            assert!(command_debug.contains("debug-volume"));
+            for marker in MARKERS {
+                assert!(
+                    !args_debug.contains(marker),
+                    "InitArgs Debug leaked {marker}"
+                );
+                assert!(
+                    !command_debug.contains(marker),
+                    "Commands Debug leaked {marker}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn init_parses_required_runtime_args() {
