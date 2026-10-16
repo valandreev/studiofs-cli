@@ -729,7 +729,11 @@ impl FetchScheduler {
                 let ds = &self.data_store;
                 async move {
                     let key = format!("__studiofs_warmup_{i}__");
-                    ds.get_by_key(&key).await
+                    // Warmup probes expect NotFound; use the bounded regular API so no
+                    // unbounded full-read remains on the foreground fetch path.
+                    ds.get_payload_by_key_with_stats(&key)
+                        .await
+                        .map(|(data, _)| data)
                 }
             })
             .collect();
@@ -1066,7 +1070,9 @@ impl FetchScheduler {
                         .get_payload_range_by_key_with_stats(key, range.clone())
                         .await
                         .map(|(payload, stats)| (opendal::Buffer::from(payload), stats)),
-                    None => self.data_store.get_by_key_with_stats(key).await,
+                    // Regular full fetch: bound encrypted body to fragment+envelope geometry.
+                    // Snapshot artifacts use the generic full-read API elsewhere.
+                    None => self.data_store.get_payload_by_key_with_stats(key).await,
                 }
             })
             .await;
@@ -1967,6 +1973,44 @@ mod tests {
             }
         ));
         assert!(cached_store.get(target_object_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_full_fetch_fails_without_cache_population() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (scheduler, raw, cached_store, config) =
+            make_encrypted_fetch_scheduler(&tmp, "oversized-bound");
+        let object_id = 0x3552;
+        let key = fragment_key(&config, object_id, 0);
+        let accepted = put_encrypted_fragment(
+            &scheduler,
+            &raw,
+            &key,
+            Bytes::from_static(b"oversized bound plaintext"),
+        )
+        .await
+        .to_vec();
+        let mut oversized = accepted.clone();
+        oversized.resize(accepted.len() + 1024 * 1024, 0);
+        raw.write(&key, Bytes::from(oversized))
+            .await
+            .expect("write oversized ciphertext");
+
+        let error = scheduler
+            .fetch_block(object_id, std::slice::from_ref(&key))
+            .await
+            .expect_err("oversized encrypted body should fail");
+        assert!(
+            matches!(
+                &error,
+                FetchError::Exhausted {
+                    attempts: 1,
+                    source: DataError::Crypto(_),
+                }
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert!(cached_store.get(object_id).is_none());
     }
 
     #[tokio::test]

@@ -754,6 +754,62 @@ impl DataStore {
         ))
     }
 
+    /// Download a regular STFS fragment with a bound on the encrypted response body.
+    ///
+    /// Accepts at most `CLOUD_FRAGMENT_SIZE` payload bytes plus the STFS header;
+    /// actual encrypted bytes must fit the SFEC prefix's header/frame geometry.
+    /// Snapshot artifacts and other larger objects must use the generic full-read API.
+    pub async fn get_payload_by_key_with_stats(
+        &self,
+        key: &str,
+    ) -> DataResult<(Buffer, RemoteObjectReadStats)> {
+        debug!(key, "downloading bounded regular payload");
+        // No chunk/prefetch option: each buffer is checked before requesting the next one.
+        let mut stream = self.op.reader(key).await?.into_stream(..).await?;
+        let mut prefix = Vec::with_capacity(SFEC_HEADER_FIXED_LEN);
+        let mut buffers = Vec::new();
+        let mut encrypted_len = 0usize;
+        let mut limit = SFEC_HEADER_FIXED_LEN;
+        while let Some(buffer) = stream.next().await {
+            let buffer = buffer?;
+            if prefix.len() < SFEC_HEADER_FIXED_LEN {
+                let needed = (SFEC_HEADER_FIXED_LEN - prefix.len()).min(buffer.len());
+                prefix.extend_from_slice(&buffer.slice(..needed).to_bytes());
+                if prefix.len() == SFEC_HEADER_FIXED_LEN {
+                    let layout = SfecHeaderLayout::from_prefix(&prefix)
+                        .map_err(crypto::CryptoError::from)?;
+                    if layout.plaintext_len()
+                        > (crate::object::CLOUD_FRAGMENT_SIZE + ObjectHeader::SIZE) as u64
+                    {
+                        return Err(
+                            crypto::CryptoError::from(SfecError::ObjectLengthOverflow).into()
+                        );
+                    }
+                    limit = layout
+                        .expected_ciphertext_len()
+                        .and_then(|len| {
+                            len.checked_add(layout.header_len())
+                                .ok_or(SfecError::ObjectLengthOverflow)
+                        })
+                        .map_err(crypto::CryptoError::from)?;
+                }
+            }
+            if buffer.len() > limit - encrypted_len {
+                return Err(crypto::CryptoError::from(SfecError::TrailingMalformedData).into());
+            }
+            encrypted_len += buffer.len();
+            buffers.push(buffer);
+        }
+        let plaintext = self
+            .decrypt_payload(key, buffers.into_iter().flatten().collect())
+            .await?;
+        let stats = RemoteObjectReadStats {
+            encrypted_bytes: encrypted_len as u64,
+            plaintext_bytes: plaintext.len() as u64,
+        };
+        Ok((plaintext, stats))
+    }
+
     /// Read a payload range by opening only the SFEC frames that cover it.
     ///
     /// Frame zero is also authenticated to validate the STFS header. No complete
@@ -1043,6 +1099,203 @@ mod tests {
     use opendal::services::Memory;
     use std::thread;
     use studiofs_meta::EncryptionConfig;
+
+    #[derive(Debug, Clone)]
+    struct FullPayloadLayer {
+        body: Bytes,
+        advertised_size: Option<u64>,
+        consumed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct FullPayloadAccess<A> {
+        inner: A,
+        response: FullPayloadLayer,
+    }
+
+    struct FullPayloadReader {
+        body: Bytes,
+        consumed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl opendal::raw::oio::Read for FullPayloadReader {
+        async fn read(&mut self) -> opendal::Result<Buffer> {
+            // Split even the fixed prefix across reads, then bound each yielded buffer.
+            let chunk = self.body.split_to(self.body.len().min(17));
+            self.consumed
+                .fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(chunk.into())
+        }
+    }
+
+    impl<A: Access> Layer<A> for FullPayloadLayer {
+        type LayeredAccess = FullPayloadAccess<A>;
+
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            FullPayloadAccess {
+                inner,
+                response: self.clone(),
+            }
+        }
+    }
+
+    impl<A: Access> LayeredAccess for FullPayloadAccess<A> {
+        type Inner = A;
+        type Reader = FullPayloadReader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = A::Deleter;
+
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+
+        async fn read(&self, _: &str, _: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
+            Ok((
+                RpRead::new().with_size(self.response.advertised_size),
+                FullPayloadReader {
+                    body: self.response.body.clone(),
+                    consumed: self.response.consumed.clone(),
+                },
+            ))
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(RpWrite, Self::Writer)> {
+            self.inner.write(path, args).await
+        }
+
+        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
+            self.inner.list(path, args).await
+        }
+
+        async fn delete(&self) -> opendal::Result<(RpDelete, Self::Deleter)> {
+            self.inner.delete().await
+        }
+    }
+
+    #[tokio::test]
+    async fn full_payload_stops_consuming_oversized_response_despite_advertised_size() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let config = encrypted_test_config();
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&config, raw.clone()).unwrap();
+        let key = "unit-volume/objects/full-payload-oversized";
+        store
+            .put_by_key(key, Bytes::from_static(b"valid plaintext"))
+            .await
+            .unwrap();
+        let encrypted = raw.read(key).await.unwrap().to_bytes();
+        let accepted_len = encrypted.len();
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let segmented = raw.clone().layer(FullPayloadLayer {
+            body: encrypted.clone(),
+            advertised_size: Some(accepted_len as u64),
+            consumed: consumed.clone(),
+        });
+        let segmented = DataStore::with_operator_for_test(&config, segmented).unwrap();
+        let (plaintext, stats) = segmented.get_payload_by_key_with_stats(key).await.unwrap();
+        assert_eq!(plaintext.to_bytes(), Bytes::from_static(b"valid plaintext"));
+        assert_eq!(stats.encrypted_bytes, accepted_len as u64);
+        assert_eq!(consumed.load(Ordering::SeqCst), accepted_len);
+        let mut oversized = encrypted.to_vec();
+        oversized.resize(accepted_len + 1024 * 1024, 0);
+        for advertised_size in [
+            None,
+            Some(accepted_len as u64),
+            Some(oversized.len() as u64),
+        ] {
+            let consumed = Arc::new(AtomicUsize::new(0));
+            let fake = raw.clone().layer(FullPayloadLayer {
+                body: Bytes::copy_from_slice(&oversized),
+                advertised_size,
+                consumed: consumed.clone(),
+            });
+            let store = DataStore::with_operator_for_test(&config, fake).unwrap();
+            let error = store.get_payload_by_key_with_stats(key).await.unwrap_err();
+            assert!(matches!(error, DataError::Crypto(_)));
+            assert!(!error.is_retryable());
+            let actual = consumed.load(Ordering::SeqCst);
+            assert!(
+                actual <= accepted_len + 17,
+                "consumed {actual} of {} bytes",
+                oversized.len()
+            );
+            assert!(actual < oversized.len());
+        }
+    }
+
+    #[tokio::test]
+    async fn full_payload_round_trips_supported_fragment_boundary() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store =
+            DataStore::with_operator_for_test(&encrypted_test_config(), raw.clone()).unwrap();
+        let key = "unit-volume/objects/full-payload-boundary";
+        for size in [0, crate::object::CLOUD_FRAGMENT_SIZE] {
+            let payload = Bytes::from(vec![0x5a; size]);
+            let object = create_object_buffer(payload.clone()).unwrap();
+            let plaintext_len = object.len();
+            let write_stats = store.put_by_key_with_stats(key, object).await.unwrap();
+            let (object, stats) = store.get_payload_by_key_with_stats(key).await.unwrap();
+            assert_eq!(read_object(object).unwrap(), payload);
+            assert_eq!(stats.encrypted_bytes, write_stats.encrypted_bytes);
+            assert_eq!(stats.plaintext_bytes, plaintext_len as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn full_payload_rejects_excessive_geometry_but_snapshot_keeps_generic_allowance() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use studiofs_meta::snapshot::SnapshotId;
+
+        let config = encrypted_test_config();
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&config, raw.clone()).unwrap();
+        let key = SnapshotArtifactKey::final_artifact(
+            &config.data_prefix,
+            7,
+            &config.volume_uuid,
+            &SnapshotId::parse("unit-volume.2026-10-16T12-00-00.000Z").unwrap(),
+        )
+        .unwrap();
+        let payload = Bytes::from(vec![
+            0x5a;
+            crate::object::CLOUD_FRAGMENT_SIZE
+                + ObjectHeader::SIZE
+                + 1
+        ]);
+        store
+            .put_snapshot_artifact(&key, payload.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_snapshot_artifact(&key).await.unwrap().to_bytes(),
+            payload
+        );
+        let encrypted = raw.read(key.as_str()).await.unwrap().to_bytes();
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let fake = raw.layer(FullPayloadLayer {
+            body: encrypted.clone(),
+            advertised_size: Some(40),
+            consumed: consumed.clone(),
+        });
+        let store = DataStore::with_operator_for_test(&config, fake).unwrap();
+        let error = store
+            .get_payload_by_key_with_stats(key.as_str())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DataError::Crypto(crypto::CryptoError::ObjectLengthOverflow)
+        ));
+        assert!(!error.is_retryable());
+        assert_eq!(consumed.load(Ordering::SeqCst), 51);
+        assert!(consumed.load(Ordering::SeqCst) < encrypted.len());
+    }
 
     #[tokio::test]
     async fn payload_range_reads_bound_transfer_and_preserve_frame_boundaries() {

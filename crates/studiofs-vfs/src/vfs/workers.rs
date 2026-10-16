@@ -2534,11 +2534,11 @@ impl StudioVfs {
                         let proof = run_with_timeout_or_cancel(
                             &shutdown,
                             REMOTE_OBJECT_IO_TIMEOUT,
-                            data_store.get_by_key(&claim.entry.object_key),
+                            data_store.get_payload_by_key_with_stats(&claim.entry.object_key),
                         )
                         .await;
                         let outcome = match proof {
-                            TimeoutOrCancel::Completed(Ok(remote_payload)) => {
+                            TimeoutOrCancel::Completed(Ok((remote_payload, _))) => {
                                 let remote_bytes = remote_payload.to_bytes();
                                 let remote_sha256: [u8; 32] = Sha256::digest(&remote_bytes).into();
                                 if remote_bytes.len() as u64 == claim.entry.expected_byte_length
