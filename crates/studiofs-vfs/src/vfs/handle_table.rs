@@ -236,6 +236,21 @@ impl HandleTable {
         self.orphans.lock().insert(ino);
     }
 
+    /// Route a still-open inode to orphan cleanup without racing its last close.
+    pub(super) fn mark_orphan_if_open(&self, ino: Ino) -> bool {
+        let handles = self.handles.read();
+        if handles
+            .counts
+            .get(&ino)
+            .is_some_and(|counts| counts.open > 0)
+        {
+            self.orphans.lock().insert(ino);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Check if inode is an orphan and remove the mark. Returns true if it was.
     ///
     /// This is transient last-handle release routing, not durable cleanup-retry
@@ -464,5 +479,24 @@ mod tests {
         ht.close(handle.fh)
             .expect("read-only append handle should close");
         assert_eq!(ht.write_open_count(10), 0);
+    }
+
+    #[test]
+    fn mark_orphan_if_open_routes_only_before_last_handle_closes() {
+        let ht = HandleTable::new();
+        let handle = ht.open(42, OpenFlags::RDWR, None, false);
+
+        assert!(ht.mark_orphan_if_open(42));
+        assert!(
+            ht.take_orphan(42),
+            "open inode should route to orphan cleanup"
+        );
+        ht.close(handle.fh).expect("close final handle");
+
+        assert!(!ht.mark_orphan_if_open(42));
+        assert!(
+            !ht.take_orphan(42),
+            "closed inode must not leave an orphan marker"
+        );
     }
 }

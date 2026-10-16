@@ -8722,10 +8722,10 @@ fn deferred_create_rejects_pending_local_name_matching_base() {
     let canonical = ROOT_INO + 11_200;
     replay_foreign_page(&pg, 1, create_dir_events(canonical, ROOT_INO, b"shared"));
     pg.local
-        .rename_atomic(ROOT_INO, b"shared", ROOT_INO, b"temporary", false)
+        .rename_atomic(ROOT_INO, b"shared", ROOT_INO, b"temporary", false, false)
         .unwrap();
     pg.local
-        .rename_atomic(ROOT_INO, b"temporary", ROOT_INO, b"shared", false)
+        .rename_atomic(ROOT_INO, b"temporary", ROOT_INO, b"shared", false, false)
         .unwrap();
 
     let error = pg

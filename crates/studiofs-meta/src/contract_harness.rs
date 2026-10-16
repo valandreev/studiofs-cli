@@ -471,7 +471,7 @@ impl ContractCoreFixture {
                 new_parent,
                 new_name,
             } => meta
-                .rename_atomic(parent, &name, new_parent, &new_name, true)
+                .rename_atomic(parent, &name, new_parent, &new_name, true, false)
                 .map(ContractCoreOpOutcome::Renamed),
             ContractCoreOp::Unlink { parent, name } => meta
                 .unlink(parent, &name)

@@ -2051,12 +2051,15 @@ pub struct DirEntry {
 }
 
 /// Result of an atomic rename operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenameAtomicResult {
     /// Inode that was moved to the destination path.
     pub moved_ino: Ino,
-    /// Inode displaced at the destination path, if any.
-    pub displaced_ino: Option<Ino>,
+    /// False when both names already refer to the same inode.
+    pub namespace_changed: bool,
+    /// Displaced inode attributes after removing the destination name, if any.
+    /// A directory is reported with zero links because replacement removes it.
+    pub displaced: Option<InodeAttr>,
 }
 
 // =============================================================================

@@ -256,6 +256,7 @@ where
         _new_parent: Ino,
         _new_name: &[u8],
         _replace_if_exists: bool,
+        _retain_displaced_inode: bool,
     ) -> MetaResult<RenameAtomicResult> {
         Err(read_only_error(parent))
     }

@@ -355,7 +355,7 @@ fn local_metadata_churn_redb_growth_workload() {
                     source_name.as_bytes(),
                     temporary_dir.ino,
                     renamed_name.as_bytes(),
-                    true,
+                    true, false,
                 )
                 .expect("rename within churn directory");
             let moved_name = format!("moved-{cycle:04}-{slot:06}");
@@ -365,7 +365,7 @@ fn local_metadata_churn_redb_growth_workload() {
                     renamed_name.as_bytes(),
                     right.ino,
                     moved_name.as_bytes(),
-                    true,
+                    true, false,
                 )
                 .expect("rename across churn directories");
             engine

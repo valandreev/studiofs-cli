@@ -18,7 +18,7 @@ use studiofs_meta::schema::{
 };
 use studiofs_meta::{
     FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, MetaGc, MetaNamespace,
-    MetaReplication, RedbMetaEngine,
+    MetaRecovery, MetaReplication, RedbMetaEngine,
 };
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
@@ -980,6 +980,374 @@ fn os_cache_rename_overwrite_retires_only_truly_displaced_inode() {
         assert!(
             vfs.os_cache.lock().has_generation(surviving.ino),
             "displaced name must not retire an inode still reachable by another hardlink"
+        );
+    });
+}
+
+#[test]
+fn sfs856_rename_overwrite_preserves_displaced_open_handle_data() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs856-rename-open-handle");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        for (name, sync_before_rename) in [("buffered", false), ("fsynced", true)] {
+            let target_name = format!("{name}-target.txt");
+            let source_name = format!("{name}-source.txt");
+            let old_bytes = format!("{name} target bytes").into_bytes();
+            let appended_bytes = b" after rename";
+            let replacement_bytes = format!("{name} source bytes").into_bytes();
+            let displaced = vfs
+                .create(ROOT_INO, target_name.as_bytes(), 0, 0, 0o644)
+                .expect("create target");
+            let displaced_fh = vfs
+                .open_file(displaced.ino, OpenFlags::RDWR, false)
+                .expect("open first target handle");
+            let second_fh = vfs
+                .open_file(displaced.ino, OpenFlags::RDWR, false)
+                .expect("open second target handle");
+            vfs.write_fh(displaced_fh, displaced.ino, 0, &old_bytes)
+                .await
+                .expect("write target");
+            if sync_before_rename {
+                vfs.fsync_fh(displaced_fh)
+                    .await
+                    .expect("fsync target before rename");
+                assert!(
+                    !meta
+                        .lookup_regular_file_slices(displaced.ino, 0, old_bytes.len() as u64)
+                        .expect("read fsynced payload graph")
+                        .is_empty(),
+                    "fsync should persist the displaced inode payload graph"
+                );
+            }
+
+            let source = vfs
+                .create(ROOT_INO, source_name.as_bytes(), 0, 0, 0o644)
+                .expect("create replacement source");
+            vfs.write(source.ino, 0, &replacement_bytes)
+                .await
+                .expect("write replacement source");
+            vfs.rename(
+                ROOT_INO,
+                source_name.as_bytes(),
+                ROOT_INO,
+                target_name.as_bytes(),
+                true,
+            )
+            .expect("rename over open target");
+
+            let replacement = vfs
+                .lookup(ROOT_INO, target_name.as_bytes())
+                .expect("replacement name");
+            assert_eq!(replacement.ino, source.ino);
+            assert!(
+                meta.list_deferred_deletes()
+                    .expect("read deferred-delete journal")
+                    .iter()
+                    .any(|record| record.ino == displaced.ino),
+                "the displaced inode must remain in the deferred-delete journal while handles are open"
+            );
+            if sync_before_rename {
+                assert!(
+                    !meta
+                        .lookup_regular_file_slices(displaced.ino, 0, old_bytes.len() as u64)
+                        .expect("read displaced payload graph after rename")
+                        .is_empty(),
+                    "rename must retain the fsynced displaced payload graph"
+                );
+            }
+            let mut readback = vec![0; old_bytes.len()];
+            assert_eq!(
+                vfs.read_into_fh(displaced_fh, displaced.ino, 0, &mut readback)
+                    .await
+                    .expect("read displaced open handle"),
+                old_bytes.len() as u32
+            );
+            assert_eq!(readback, old_bytes);
+
+            vfs.write_fh(
+                displaced_fh,
+                displaced.ino,
+                old_bytes.len() as u64,
+                appended_bytes,
+            )
+            .await
+            .expect("write through displaced open handle");
+            let expected_old_bytes = [old_bytes.as_slice(), appended_bytes].concat();
+            let mut readback = vec![0; expected_old_bytes.len()];
+            assert_eq!(
+                vfs.read_into_fh(displaced_fh, displaced.ino, 0, &mut readback)
+                    .await
+                    .expect("read updated displaced open handle"),
+                expected_old_bytes.len() as u32
+            );
+            assert_eq!(readback, expected_old_bytes);
+            assert_eq!(
+                vfs.read(replacement.ino, 0, replacement_bytes.len() as u32)
+                    .await
+                    .expect("read replacement inode"),
+                replacement_bytes
+            );
+            assert!(vfs.inode_has_local_dirty_state(displaced.ino));
+
+            vfs.release_fh(displaced_fh)
+                .await
+                .expect("release first displaced handle");
+            let mut readback = vec![0; expected_old_bytes.len()];
+            assert_eq!(
+                vfs.read_into_fh(second_fh, displaced.ino, 0, &mut readback)
+                    .await
+                    .expect("read second displaced handle after first release"),
+                expected_old_bytes.len() as u32
+            );
+            assert_eq!(readback, expected_old_bytes);
+            assert!(
+                meta.list_deferred_deletes()
+                    .expect("read deferred-delete journal after first release")
+                    .iter()
+                    .any(|record| record.ino == displaced.ino),
+                "the deferred-delete record must survive until the last handle closes"
+            );
+            vfs.release_fh(second_fh)
+                .await
+                .expect("release final displaced handle");
+            assert!(
+                !meta
+                    .list_deferred_deletes()
+                    .expect("read deferred-delete journal after cleanup")
+                    .iter()
+                    .any(|record| record.ino == displaced.ino)
+            );
+            assert!(vfs.getattr(displaced.ino).is_err());
+            assert!(!vfs.inode_has_local_dirty_state(displaced.ino));
+            assert!(
+                meta.get_regular_file_graph_object_usage(displaced.ino)
+                    .expect("read graph after displaced inode cleanup")
+                    .is_empty()
+            );
+        }
+    });
+}
+
+#[test]
+fn sfs856_rename_overwrite_keeps_displaced_inode_reachable_by_hardlink() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs856-rename-hardlink");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        for (name, keep_open_handle, sync_before_rename) in [
+            ("closed-buffered", false, false),
+            ("closed-fsynced", false, true),
+            ("open-buffered", true, false),
+            ("open-fsynced", true, true),
+        ] {
+            let target_name = format!("{name}-target.txt");
+            let alias_name = format!("{name}-alias.txt");
+            let source_name = format!("{name}-source.txt");
+            let old_bytes = format!("{name} original inode bytes").into_bytes();
+            let replacement_bytes = format!("{name} replacement inode bytes").into_bytes();
+            let displaced = vfs
+                .create(ROOT_INO, target_name.as_bytes(), 0, 0, 0o644)
+                .expect("create target");
+            let seed_fh = if keep_open_handle || sync_before_rename {
+                Some(
+                    vfs.open_file(displaced.ino, OpenFlags::RDWR, false)
+                        .expect("open target seed handle"),
+                )
+            } else {
+                None
+            };
+            if let Some(fh) = seed_fh {
+                vfs.write_fh(fh, displaced.ino, 0, &old_bytes)
+                    .await
+                    .expect("write target through seed handle");
+            } else {
+                vfs.write(displaced.ino, 0, &old_bytes)
+                    .await
+                    .expect("write buffered target without a handle");
+            }
+            if sync_before_rename {
+                vfs.fsync_fh(seed_fh.expect("fsync case opens a seed handle"))
+                    .await
+                    .expect("fsync target before rename");
+                assert!(
+                    !meta
+                        .lookup_regular_file_slices(displaced.ino, 0, old_bytes.len() as u64)
+                        .expect("read fsynced target graph")
+                        .is_empty(),
+                    "fsync should persist the target payload graph"
+                );
+            }
+            vfs.link(displaced.ino, ROOT_INO, alias_name.as_bytes())
+                .expect("create surviving hardlink");
+            if !keep_open_handle && let Some(fh) = seed_fh {
+                vfs.release_fh(fh)
+                    .await
+                    .expect("release seed handle before rename");
+            }
+
+            let source = vfs
+                .create(ROOT_INO, source_name.as_bytes(), 0, 0, 0o644)
+                .expect("create replacement source");
+            vfs.write(source.ino, 0, &replacement_bytes)
+                .await
+                .expect("write replacement source");
+            vfs.rename(
+                ROOT_INO,
+                source_name.as_bytes(),
+                ROOT_INO,
+                target_name.as_bytes(),
+                true,
+            )
+            .expect("rename over one hardlink");
+
+            let replacement = vfs
+                .lookup(ROOT_INO, target_name.as_bytes())
+                .expect("replacement name");
+            assert_eq!(replacement.ino, source.ino);
+            assert_eq!(
+                vfs.read(replacement.ino, 0, replacement_bytes.len() as u32)
+                    .await
+                    .expect("read replacement name"),
+                replacement_bytes
+            );
+            let alias = vfs
+                .lookup(ROOT_INO, alias_name.as_bytes())
+                .expect("surviving alias");
+            assert_eq!(alias.ino, displaced.ino);
+            assert_eq!(alias.nlink, 1);
+            if sync_before_rename {
+                assert!(
+                    !meta
+                        .lookup_regular_file_slices(displaced.ino, 0, old_bytes.len() as u64)
+                        .expect("read surviving fsynced payload graph")
+                        .is_empty(),
+                    "rename must retain the graph reachable through the surviving hardlink"
+                );
+            }
+            assert_eq!(
+                vfs.read(alias.ino, 0, old_bytes.len() as u32)
+                    .await
+                    .expect("read displaced inode through surviving hardlink"),
+                old_bytes
+            );
+            if keep_open_handle {
+                let fh = seed_fh.expect("open case retains its seed handle");
+                let mut readback = vec![0; old_bytes.len()];
+                assert_eq!(
+                    vfs.read_into_fh(fh, displaced.ino, 0, &mut readback)
+                        .await
+                        .expect("read displaced open handle"),
+                    old_bytes.len() as u32
+                );
+                assert_eq!(readback, old_bytes);
+                vfs.release_fh(fh)
+                    .await
+                    .expect("release while hardlink survives");
+                assert_eq!(
+                    vfs.read(displaced.ino, 0, old_bytes.len() as u32)
+                        .await
+                        .expect("read hardlink after handle release"),
+                    old_bytes
+                );
+            }
+
+            vfs.unlink(ROOT_INO, alias_name.as_bytes())
+                .expect("unlink final hardlink");
+            assert!(vfs.getattr(displaced.ino).is_err());
+            assert!(!vfs.inode_has_local_dirty_state(displaced.ino));
+            assert!(
+                meta.get_regular_file_graph_object_usage(displaced.ino)
+                    .expect("read graph after hardlink cleanup")
+                    .is_empty()
+            );
+        }
+    });
+}
+
+#[test]
+fn sfs856_rename_onto_same_inode_keeps_both_names_and_bytes() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs856-same-inode-rename");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let payload = b"buffered hardlink payload";
+        let source_name = b"same-inode-source";
+        let alias_name = b"same-inode-alias";
+        let source = vfs
+            .create(ROOT_INO, source_name, 0, 0, 0o644)
+            .expect("create source");
+        vfs.write(source.ino, 0, payload)
+            .await
+            .expect("buffer payload");
+        vfs.link(source.ino, ROOT_INO, alias_name)
+            .expect("create hardlink");
+
+        vfs.rename(ROOT_INO, source_name, ROOT_INO, alias_name, true)
+            .expect("rename onto same-inode hardlink");
+
+        let source_after = vfs.lookup(ROOT_INO, source_name).expect("source name");
+        let alias_after = vfs.lookup(ROOT_INO, alias_name).expect("alias name");
+        assert_eq!(source_after.ino, source.ino);
+        assert_eq!(alias_after.ino, source.ino);
+        assert_eq!(vfs.getattr(source.ino).expect("inode attr").nlink, 2);
+        assert_eq!(
+            vfs.read(source.ino, 0, payload.len() as u32)
+                .await
+                .expect("read buffered payload")
+                .as_ref(),
+            payload.as_slice()
+        );
+    });
+}
+
+#[test]
+fn sfs856_final_unlink_preserves_open_inode_until_last_handle_closes() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs856-final-unlink");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let name = b"sfs856-final-unlink.txt";
+        let bytes = b"retained through both open handles";
+        let attr = vfs.create(ROOT_INO, name, 0, 0, 0o644).expect("create");
+        let first = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        vfs.write_fh(first, attr.ino, 0, bytes)
+            .await
+            .expect("write payload");
+        let second = vfs
+            .open_file(attr.ino, OpenFlags::RDONLY, false)
+            .expect("open second handle");
+
+        vfs.unlink(ROOT_INO, name).expect("final unlink");
+        let mut readback = vec![0; bytes.len()];
+        assert_eq!(
+            vfs.read_into_fh(first, attr.ino, 0, &mut readback)
+                .await
+                .expect("read first handle after unlink"),
+            bytes.len() as u32
+        );
+        assert_eq!(readback, bytes);
+        vfs.release_fh(first).await.expect("release first handle");
+        assert!(vfs.inode_has_local_dirty_state(attr.ino));
+
+        readback.fill(0);
+        assert_eq!(
+            vfs.read_into_fh(second, attr.ino, 0, &mut readback)
+                .await
+                .expect("read final handle after first release"),
+            bytes.len() as u32
+        );
+        assert_eq!(readback, bytes);
+        vfs.release_fh(second).await.expect("release final handle");
+
+        assert!(vfs.getattr(attr.ino).is_err());
+        assert!(!vfs.inode_has_local_dirty_state(attr.ino));
+        assert!(
+            meta.get_regular_file_graph_object_usage(attr.ino)
+                .expect("read graph after final unlink cleanup")
+                .is_empty()
         );
     });
 }
