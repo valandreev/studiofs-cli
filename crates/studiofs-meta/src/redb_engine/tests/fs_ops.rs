@@ -757,6 +757,62 @@ fn test_rename_no_replace_does_not_overwrite_concurrently_created_destination() 
 }
 
 #[test]
+fn rename_no_replace_rejects_same_path_and_same_inode_alias_without_changes() {
+    let engine = temp_engine();
+    let source = engine
+        .create_file(ROOT_INO, b"source", 0, 0, 0o644)
+        .unwrap();
+    engine.link(source.ino, ROOT_INO, b"alias").unwrap();
+    let attr_before = engine.get_attr(source.ino).unwrap();
+    let next_event_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    for destination in [b"source".as_slice(), b"alias".as_slice()] {
+        assert!(matches!(
+            engine.rename_atomic(ROOT_INO, b"source", ROOT_INO, destination, false, false),
+            Err(MetaError::EntryExists { .. })
+        ));
+        assert_eq!(engine.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
+        assert_eq!(engine.lookup(ROOT_INO, b"alias").unwrap().ino, source.ino);
+        assert_eq!(engine.get_attr(source.ino).unwrap(), attr_before);
+        assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), next_event_before);
+    }
+}
+
+#[test]
+fn rename_over_empty_directory_removes_displaced_inode_from_replica_base() {
+    let writer = temp_engine();
+    let replica = temp_engine();
+    let start = writer.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let source = writer.create_dir(ROOT_INO, b"source", 0, 0, 0o755).unwrap();
+    let destination = writer.create_dir(ROOT_INO, b"destination", 0, 0, 0o755).unwrap();
+    let before_rename = writer.get_counter(NEXT_EVENT_SEQ).unwrap();
+    replica
+        .apply_replica_events_to_base(&writer.read_events_range(start, before_rename).unwrap())
+        .unwrap();
+    {
+        let txn = replica.begin_read_txn().unwrap();
+        let inodes = txn.open_table(BASE_INODES_TABLE).unwrap();
+        assert!(inodes.get(destination.ino).unwrap().is_some());
+    }
+
+    writer.rename_atomic(ROOT_INO, b"source", ROOT_INO, b"destination", true, true).unwrap();
+    let end = writer.get_counter(NEXT_EVENT_SEQ).unwrap();
+    replica
+        .apply_replica_events_to_base(&writer.read_events_range(before_rename, end).unwrap())
+        .unwrap();
+
+    let txn = replica.begin_read_txn().unwrap();
+    let inodes = txn.open_table(BASE_INODES_TABLE).unwrap();
+    assert!(inodes.get(source.ino).unwrap().is_some());
+    assert!(inodes.get(destination.ino).unwrap().is_none());
+    let dentries = txn.open_table(BASE_DENTRIES_TABLE).unwrap();
+    assert!(dentries.get(encode_dentry_key(ROOT_INO, b"source").as_slice()).unwrap().is_none());
+    let key = encode_dentry_key(ROOT_INO, b"destination");
+    let entry = dentries.get(key.as_slice()).unwrap().unwrap();
+    assert_eq!(decode::<DirEntryValue>(entry.value()).unwrap().ino, source.ino);
+}
+
+#[test]
 fn test_rename_overwrite_empty_dir() {
     let engine = temp_engine();
     let file = engine

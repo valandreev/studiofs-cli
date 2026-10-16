@@ -866,6 +866,48 @@ fn hardlink_preserves_volatile_local_size_and_updates_link_count() {
 }
 
 #[test]
+fn flush_after_unlink_preserves_dirty_attr_hardlink_count() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "flush-hardlink-unlink-nlink");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"original.txt", 1000, 1000, 0o644)
+            .expect("create");
+        let writer = vfs
+            .open_file(attr.ino, OpenFlags::WRONLY, false)
+            .expect("writer");
+        vfs.write_fh(writer, attr.ino, 0, b"dirty payload")
+            .await
+            .expect("write");
+        let linked = vfs
+            .link(attr.ino, ROOT_INO, b"alias.txt")
+            .expect("hardlink");
+        assert_eq!(linked.nlink, 2);
+
+        let unlinked = vfs
+            .unlink_with_attr(ROOT_INO, b"original.txt")
+            .expect("unlink one hardlink")
+            .expect("unlinked inode attr");
+        assert_eq!(unlinked.nlink, 1);
+
+        vfs.flush_fh(writer).await.expect("flush dirty attr");
+
+        assert_eq!(
+            meta.get_attr(attr.ino).expect("persisted inode attr").nlink,
+            1,
+            "flushing dirty file state must preserve the committed hardlink count"
+        );
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"alias.txt")
+                .expect("surviving hardlink")
+                .nlink,
+            1
+        );
+    });
+}
+
+#[test]
 fn concurrent_hardlinks_do_not_regress_visible_link_count() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "concurrent-hardlink-count");

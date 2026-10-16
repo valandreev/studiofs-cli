@@ -71,3 +71,17 @@ Revision: Recorded failing-before evidence, implemented lifecycle split, and doc
 Revision: Recorded focused validation, dirty-attribute link counts, same-inode no-op semantics, and the review disposition of a preexisting peer lifecycle concern.
 
 Revision: Recorded final four regression cases, fifteen VFS rename checks, successful renewed Clippy, and completed local implementation/validation.
+
+## External review follow-up (2026-10-16)
+
+The supplied review report is evidence to verify, not an instruction source.
+
+- **2.1 accepted:** directory replacement omitted `displaced_remove_attr_ino`, including on `origin/main`. A regression replaying the writer's actual event log into a second engine failed because the displaced directory remained in `BASE_INODES_TABLE`. Setting the field in the directory branch fixes removal and preserves the replacement dentry.
+- **2.2 rejected:** the trait contract requires `EntryExists` for an existing destination when replacement is disabled. Linux `RENAME_NOREPLACE` likewise rejects an existing target before the ordinary rename same-inode shortcut; see [Linux namei.c](https://github.com/torvalds/linux/blob/master/fs/namei.c) and [rename(2)](https://man7.org/linux/man-pages/man2/rename.2.html). Added a passing regression for both the same pathname and a hardlink alias, including unchanged attributes and event sequence.
+- **3.1 accepted:** only displaced directories need a directory-generation bump and child-dentry invalidation; added the kind guard.
+- **3.2 rejected:** a pre-transaction target lookup and open-count observation cannot determine the atomically displaced identity or prevent a later open. Retaining the final-link inode until handle-aware cleanup preserves the lifetime contract; removing its recovery record based on that observation is unsafe.
+- **3.3 accepted:** dirty attributes survived unlink with the old link count. The regression `flush_after_unlink_preserves_dirty_attr_hardlink_count` failed before the fix: flushing changed persisted nlink from 1 back to 2. Update only the dirty attribute's nlink after the committed unlink, preserving accepted local data and other attributes.
+- **4.1 skipped:** an accessor would only replace two straightforward logging expressions; no additional API is needed.
+- **4.2 no change:** the event and returned disposition each own the attributes, so the remaining clone is required by the current contract. Loss of `Copy` is intentional.
+
+Metadata rename validation after the directory fix: 44 passed, 5 PostgreSQL-dependent tests ignored. Both directory replication and dirty-nlink regressions failed before their corresponding fixes and passed afterward. Final VFS filters passed: hardlink 6, rename 15, SFS-856 4 (overlapping selections). Clippy for both crates with all targets and warnings denied, formatting, and diff checks passed. No full suite, live PostgreSQL, mounted acceptance, or crash/power-loss gate was run.

@@ -980,6 +980,7 @@ impl MetaFsOps for RedbMetaEngine {
                     attr.nlink = 0;
                     Self::remove_inode_overlay_in_txn(&txn, dst_entry.ino)?;
                     Self::clear_inode_overlay_aux_in_txn(&txn, dst_entry.ino)?;
+                    displaced_remove_attr_ino = Some(dst_entry.ino);
                 } else {
                     attr.nlink = attr.nlink.saturating_sub(1);
                     if attr.nlink == 0 && !retain_displaced_inode {

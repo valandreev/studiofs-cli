@@ -2843,6 +2843,15 @@ impl StudioVfs {
             };
 
             namespace_mutations.record_removal(parent, name, [unlinked_attr.ino]);
+            if let Some(dirty_attr) = self
+                .state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .get_mut(&unlinked_attr.ino)
+            {
+                dirty_attr.nlink = unlinked_attr.nlink;
+            }
             self.invalidate_attr_read_cache([unlinked_attr.ino]);
             if unlinked_attr.nlink > 0 {
                 self.state.namespace.attr_read_cache.lock().put(
@@ -3361,8 +3370,10 @@ impl StudioVfs {
                     self.state.file_session.gc_if_idle(ino);
                 }
             }
-            self.bump_directory_generation(ino);
-            self.dentry_cache_invalidate_parent(ino);
+            if attr.kind == FileType::Directory {
+                self.bump_directory_generation(ino);
+                self.dentry_cache_invalidate_parent(ino);
+            }
         }
 
         meta.request_eager_flush();
