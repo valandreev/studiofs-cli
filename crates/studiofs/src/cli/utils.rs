@@ -47,9 +47,14 @@ fn normalize_client_root(root: PathBuf) -> Result<PathBuf> {
 
 pub(crate) fn validate_volume_name(name: &str) -> Result<()> {
     // Enforce the same component boundary on every host, including Windows aliases.
-    if name.is_empty() || name.ends_with(['.', ' ']) || name.contains(['/', '\\', ':', '\0']) {
+    if name.is_empty()
+        || name.len() > 255
+        || name.ends_with(['.', ' '])
+        || name.contains(['/', '\\', ':'])
+        || name.chars().any(char::is_control)
+    {
         anyhow::bail!(
-            "invalid volume name: use one directory name without separators, colons, NUL, or a trailing dot or space"
+            "invalid volume name: use one directory name (up to 255 UTF-8 bytes) without separators, colons, control characters, or a trailing dot or space"
         );
     }
     Ok(())
@@ -666,6 +671,29 @@ pub fn format_throughput(bytes_per_sec: f64) -> String {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn volume_name_rejects_control_characters() {
+        for name in [
+            "line\nbreak",
+            "carriage\rreturn",
+            "tab\tname",
+            "escape\u{1b}[31m",
+            "c1\u{85}",
+        ] {
+            assert!(validate_volume_name(name).is_err(), "accepted {name:?}");
+        }
+    }
+
+    #[test]
+    fn volume_name_enforces_snapshot_byte_limit_without_normalizing_unicode() {
+        for name in ["a".repeat(255), format!("{}a", "é".repeat(127))] {
+            assert!(validate_volume_name(&name).is_ok());
+        }
+        for name in ["a".repeat(256), "é".repeat(128)] {
+            assert!(validate_volume_name(&name).is_err());
+        }
+    }
 
     #[test]
     fn metadata_path_rejects_unsafe_volume_names() {

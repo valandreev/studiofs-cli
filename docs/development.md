@@ -191,9 +191,12 @@ their `redb` metadata databases, mount records, logs, and default cache roots do
 not overlap.
 
 Volume names are single directory names. Spaces within names and Unicode are
-preserved verbatim. CLI metadata paths reject empty names, `.` and `..`, `/`,
-`\`, `:`, NUL, and trailing dots or spaces on every platform; the latter can
-alias other directories on Windows. Names are rejected rather than normalized.
+preserved verbatim. CLI metadata paths reject empty names, names exceeding 255
+UTF-8 bytes, `.` and `..`, `/`, `\`, `:`, control characters, and trailing dots
+or spaces on every platform; the latter can alias other directories on Windows.
+Names are rejected rather than normalized. Host filesystem restrictions also
+apply, including Windows reserved device names such as `CON` and `NUL` and
+component length limits for the derived `<name>.db` filename.
 
 Snapshot recovery uses the same client root to discover exactly one current
 PostgreSQL-backed volume. After a manual snapshot reaches `Ready`, mount its

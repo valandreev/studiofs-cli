@@ -3,7 +3,7 @@
 use std::fs;
 use std::process::{Command, Output, Stdio};
 
-const COMMANDS: &[&str] = &["init", "discover", "mount", "destroy"];
+const COMMANDS: &[&str] = &["init", "discover", "mount", "smount", "status", "destroy"];
 
 const INVALID_VOLUME_NAMES: &[&str] = &[
     "",
@@ -21,6 +21,9 @@ const INVALID_VOLUME_NAMES: &[&str] = &[
     "trailing.",
     "trailing ",
     ".. ",
+    "line\nbreak",
+    "tab\tcharacter",
+    "escape\x1bcharacter",
 ];
 
 const VALID_VOLUME_NAMES: &[&str] = &["name with spaces", "том"];
@@ -52,6 +55,14 @@ fn run_cli(root: &std::path::Path, command: &str, name: &str) -> Output {
         }
         "mount" => {
             cmd.arg(name).arg("Z:").arg("--detach");
+        }
+        "smount" => {
+            cmd.arg(name)
+                .arg("myvolume.2026-08-12T14-07-09.482Z")
+                .arg("Z:");
+        }
+        "status" => {
+            cmd.arg(name);
         }
         "destroy" => {
             cmd.arg(name);
@@ -103,7 +114,9 @@ fn command_dispatch_rejects_unsafe_volume_names_before_side_effects_or_prompts()
             );
             assert!(
                 !text.contains("Do you want to proceed?")
-                    && !text.contains("To confirm, please type the volume name"),
+                    && !text.contains("To confirm, please type the volume name")
+                    && !text.contains("Windows one-time setup")
+                    && !text.contains("Administrator approval"),
                 "{command} prompted before rejecting {name:?}: {text}"
             );
             assert_eq!(
@@ -161,7 +174,9 @@ fn existing_metadata_and_absolute_targets_are_unchanged_for_parent_and_absolute_
             );
             assert!(
                 !text.contains("Do you want to proceed?")
-                    && !text.contains("To confirm, please type the volume name"),
+                    && !text.contains("To confirm, please type the volume name")
+                    && !text.contains("Windows one-time setup")
+                    && !text.contains("Administrator approval"),
                 "{command} prompted before rejecting {name:?}: {text}"
             );
             assert_eq!(
@@ -201,14 +216,30 @@ fn existing_metadata_and_absolute_targets_are_unchanged_for_parent_and_absolute_
 fn ordinary_space_and_unicode_volume_names_pass_name_validation() {
     for &name in VALID_VOLUME_NAMES {
         for command in COMMANDS {
+            if *command == "smount" {
+                // Valid snapshot mounts can request system setup; exercise early rejection only.
+                continue;
+            }
+
             let client_root = studiofs_test_support::workspace_target_tempdir("volume-name-valid-");
             let output = run_cli(client_root.path(), command, name);
             let text = output_text(&output);
 
-            assert!(
-                !output.status.success(),
-                "{command} unexpectedly completed without local or remote setup for {name:?}: {text}"
-            );
+            if *command == "status" {
+                assert!(
+                    output.status.success(),
+                    "status did not report the missing volume for valid name {name:?}: {text}"
+                );
+                assert!(
+                    text.contains("not found"),
+                    "status did not report missing metadata for valid name {name:?}: {text}"
+                );
+            } else {
+                assert!(
+                    !output.status.success(),
+                    "{command} unexpectedly completed without local or remote setup for {name:?}: {text}"
+                );
+            }
             assert!(
                 !text.contains("invalid volume name"),
                 "{command} rejected valid volume name {name:?}: {text}"
