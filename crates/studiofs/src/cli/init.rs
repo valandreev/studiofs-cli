@@ -122,7 +122,7 @@ impl InitRunRequest {
     }
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 #[command(about = "Initialize a new filesystem volume")]
 #[command(long_about = "\
 Initialize a new filesystem volume by validating S3 object storage, creating \
@@ -209,6 +209,14 @@ pub(crate) struct InitArgs {
     /// Deprecated option. Metadata is PostgreSQL-only now.
     #[arg(long, hide = true)]
     metadata_region: Option<String>,
+}
+
+impl std::fmt::Debug for InitArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitArgs")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 impl InitArgs {
@@ -687,8 +695,80 @@ mod tests {
             assert!(summary.contains("summary-uuid"));
             assert!(summary.contains("Metadata backend: Postgres"));
             assert!(summary.contains("Volume ID: 42"));
-            for marker in [PASSWORD, "synthetic-user", "db.example.invalid"] {
+            for marker in [
+                PASSWORD,
+                "synthetic-user",
+                "db.example.invalid",
+                "synthetic-access-key",
+                "synthetic-secret-key",
+            ] {
                 assert!(!summary.contains(marker), "DSN leaked in summary");
+            }
+        }
+    }
+
+    #[test]
+    fn init_debug_omits_credentials_and_deprecated_metadata_options() {
+        const MARKERS: &[&str] = &[
+            "synthetic-url-user",
+            "synthetic-url-password",
+            "synthetic-keyword-user",
+            "synthetic-keyword-password",
+            "synthetic-access-key",
+            "synthetic-secret-key",
+            "synthetic-metadata-endpoint",
+            "synthetic-metadata-bucket",
+            "synthetic-metadata-access-key",
+            "synthetic-metadata-secret-key",
+            "synthetic-metadata-region",
+        ];
+
+        for dsn in [
+            "postgres://synthetic-url-user:synthetic-url-password@db.example.invalid/studiofs",
+            "host=db.example.invalid user=synthetic-keyword-user password=synthetic-keyword-password dbname=studiofs",
+        ] {
+            let cli = crate::cli::parse_for_test(&[
+                "init",
+                "debug-volume",
+                "--endpoint",
+                "https://s3.example.invalid",
+                "--bucket",
+                "debug-bucket",
+                "--access-key",
+                "synthetic-access-key",
+                "--secret-key",
+                "synthetic-secret-key",
+                "--meta",
+                dsn,
+                "--metadata-endpoint",
+                "synthetic-metadata-endpoint",
+                "--metadata-bucket",
+                "synthetic-metadata-bucket",
+                "--metadata-access-key",
+                "synthetic-metadata-access-key",
+                "--metadata-secret-key",
+                "synthetic-metadata-secret-key",
+                "--metadata-region",
+                "synthetic-metadata-region",
+            ])
+            .unwrap();
+            let crate::cli::Commands::Init(args) = &cli.command else {
+                panic!("expected init command");
+            };
+
+            let args_debug = format!("{args:?}");
+            let command_debug = format!("{:?}", cli.command);
+            assert!(args_debug.contains("debug-volume"));
+            assert!(command_debug.contains("debug-volume"));
+            for marker in MARKERS {
+                assert!(
+                    !args_debug.contains(marker),
+                    "InitArgs Debug leaked {marker}"
+                );
+                assert!(
+                    !command_debug.contains(marker),
+                    "Commands Debug leaked {marker}"
+                );
             }
         }
     }

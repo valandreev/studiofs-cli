@@ -769,7 +769,6 @@ pub fn run(
 
     if let Some(pg) = &format_info.metadata.postgres {
         println!("\n  Meta backend: Postgres");
-        println!("  Postgres URL:  {}", pg.url);
         println!("  Postgres vol:  {}", pg.volume_id);
         if let Some(remote_size) = remote_size {
             println!("  Postgres size: {}", format_bytes(remote_size));
