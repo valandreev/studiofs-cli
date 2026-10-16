@@ -177,7 +177,18 @@ fn resolve_volume_candidate(
     client_root: &Path,
     volume_name: &str,
 ) -> Result<Option<ResolvedVolume>> {
-    let path = crate::cli::utils::default_meta_dir_in_client_root(client_root, volume_name)
+    if let Err(error) = crate::cli::utils::validate_volume_name(volume_name) {
+        // A legacy database under a now-invalid name must block auto-resolution, not vanish.
+        let legacy_db = client_root
+            .join("meta")
+            .join(volume_name)
+            .join(format!("{volume_name}.db"));
+        if legacy_db.is_file() {
+            return Err(snapshot_context_error(&legacy_db, error));
+        }
+        return Ok(None);
+    }
+    let path = crate::cli::utils::default_meta_dir_in_client_root(client_root, volume_name)?
         .join(format!("{volume_name}.db"));
     if !path.is_file() {
         return Ok(None);
@@ -428,7 +439,7 @@ fn build_worker(volume: &ResolvedVolume) -> Result<Arc<SnapshotWorker>> {
     let materializer_root = crate::cli::utils::default_meta_dir_in_client_root(
         &client_root,
         &volume.context.volume_name,
-    )
+    )?
     .join("cache")
     .join("snapshot-v2")
     .join("materializer");
@@ -607,8 +618,78 @@ fn snapshot_context_error(path: &Path, error: impl std::fmt::Display) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::super::parse_for_test;
-    use super::{format_catalog_error, format_duration};
+    use super::{format_catalog_error, format_duration, resolve_volume_candidate};
+    use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn invalid_volume_names_are_not_snapshot_candidates() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-candidate-");
+
+        for volume_name in ["junk:", "junk."] {
+            assert!(
+                resolve_volume_candidate(root.path(), volume_name)
+                    .expect("invalid volume names are not candidates")
+                    .is_none(),
+                "unexpected candidate for {volume_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn legacy_database_with_invalid_volume_name_blocks_resolution() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-candidate-");
+        let db_path = root
+            .path()
+            .join("meta")
+            .join("proj:2025")
+            .join("proj:2025.db");
+        fs::create_dir_all(db_path.parent().unwrap()).expect("create legacy volume directory");
+        fs::write(&db_path, b"legacy").expect("write legacy database");
+
+        let error = match resolve_volume_candidate(root.path(), "proj:2025") {
+            Err(error) => error,
+            Ok(_) => panic!("legacy database under an invalid name must not be skipped"),
+        };
+        assert!(
+            format!("{error:#}").contains("invalid volume name"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn valid_volume_directories_without_databases_are_not_snapshot_candidates() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-candidate-");
+        let meta_root = root.path().join("meta");
+
+        for volume_name in [".git", ".cache", "valid"] {
+            fs::create_dir_all(meta_root.join(volume_name)).expect("create candidate directory");
+            assert!(
+                resolve_volume_candidate(root.path(), volume_name)
+                    .expect("directory without a database is not a candidate")
+                    .is_none(),
+                "unexpected candidate for {volume_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_database_for_valid_volume_remains_an_error() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-candidate-");
+        let db_path = root.path().join("meta").join("valid").join("valid.db");
+        fs::create_dir_all(db_path.parent().unwrap()).expect("create volume metadata directory");
+        fs::write(&db_path, b"not a redb database").expect("write corrupt database");
+
+        let error = match resolve_volume_candidate(root.path(), "valid") {
+            Err(error) => error,
+            Ok(_) => panic!("corrupt metadata for a valid candidate must fail closed"),
+        };
+        assert!(
+            error.to_string().contains("corrupt or unsupported"),
+            "unexpected error: {error:#}"
+        );
+    }
 
     #[test]
     fn snapshot_parser_accepts_the_canonical_forms() {

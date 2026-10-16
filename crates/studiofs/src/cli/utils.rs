@@ -45,8 +45,27 @@ fn normalize_client_root(root: PathBuf) -> Result<PathBuf> {
         .with_context(|| format!("resolve {CLIENT_ROOT_ENV} '{}'", root.display()))
 }
 
-pub(crate) fn default_meta_dir_in_client_root(client_root: &Path, volume_name: &str) -> PathBuf {
-    client_root.join("meta").join(volume_name)
+pub(crate) fn validate_volume_name(name: &str) -> Result<()> {
+    // Enforce the same component boundary on every host, including Windows aliases.
+    if name.is_empty()
+        || name.len() > 255
+        || name.ends_with(['.', ' '])
+        || name.contains(['/', '\\', ':'])
+        || name.chars().any(char::is_control)
+    {
+        anyhow::bail!(
+            "invalid volume name: use one directory name (up to 255 UTF-8 bytes) without separators, colons, control characters, or a trailing dot or space"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn default_meta_dir_in_client_root(
+    client_root: &Path,
+    volume_name: &str,
+) -> Result<PathBuf> {
+    validate_volume_name(volume_name)?;
+    Ok(client_root.join("meta").join(volume_name))
 }
 
 fn mounts_dir_in_client_root(client_root: &Path) -> PathBuf {
@@ -67,10 +86,7 @@ fn mount_record_path_in_mounts_dir(
 }
 
 pub fn get_default_meta_dir(volume_name: &str) -> Result<PathBuf> {
-    Ok(default_meta_dir_in_client_root(
-        &get_client_root()?,
-        volume_name,
-    ))
+    default_meta_dir_in_client_root(&get_client_root()?, volume_name)
 }
 
 // ─── Mount / PID management ─────────────────────────────────────────────────
@@ -657,13 +673,84 @@ mod tests {
     use std::ffi::OsString;
 
     #[test]
+    fn volume_name_rejects_control_characters() {
+        for name in [
+            "line\nbreak",
+            "carriage\rreturn",
+            "tab\tname",
+            "escape\u{1b}[31m",
+            "c1\u{85}",
+        ] {
+            assert!(validate_volume_name(name).is_err(), "accepted {name:?}");
+        }
+    }
+
+    #[test]
+    fn volume_name_enforces_snapshot_byte_limit_without_normalizing_unicode() {
+        for name in ["a".repeat(255), format!("{}a", "é".repeat(127))] {
+            assert!(validate_volume_name(&name).is_ok());
+        }
+        for name in ["a".repeat(256), "é".repeat(128)] {
+            assert!(validate_volume_name(&name).is_err());
+        }
+    }
+
+    #[test]
+    fn metadata_path_rejects_unsafe_volume_names() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "/tmp/outside",
+            "../outside",
+            "a/b",
+            "a\\b",
+            r"C:\outside",
+            "C:outside",
+            r"\outside",
+            r"\\server\share",
+            r"\\?\C:\outside",
+            r"\\.\C:",
+            "volume:stream",
+            "bad\0name",
+            ".. ",
+            ". ",
+            "volume.",
+            "volume ",
+        ] {
+            assert!(
+                default_meta_dir_in_client_root(Path::new("client-root"), name).is_err(),
+                "accepted {name:?}"
+            );
+            assert!(get_default_meta_dir(name).is_err(), "accepted {name:?}");
+        }
+    }
+
+    #[test]
+    fn metadata_path_preserves_valid_volume_names() {
+        let root = Path::new("client-root");
+        for name in [
+            "projectfs",
+            "My volume",
+            "Том даних",
+            "映像 データ",
+            " a",
+            "a..b",
+        ] {
+            let path = default_meta_dir_in_client_root(root, name).expect("valid name");
+            assert_eq!(path, root.join("meta").join(name));
+            assert_eq!(path.file_name(), Some(std::ffi::OsStr::new(name)));
+        }
+    }
+
+    #[test]
     fn client_root_absent_preserves_home_studiofs_metadata_layout() {
         let home = home::home_dir().expect("home dir");
         let expected_root =
             std::path::absolute(home.join(".studiofs")).expect("absolute default client root");
 
         let root = get_client_root_with(|_| None).expect("default client root");
-        let meta_dir = default_meta_dir_in_client_root(&root, "projectfs");
+        let meta_dir = default_meta_dir_in_client_root(&root, "projectfs").expect("valid name");
 
         assert_eq!(root, expected_root);
         assert_eq!(meta_dir, expected_root.join("meta").join("projectfs"));
@@ -691,7 +778,7 @@ mod tests {
         let mounts_dir = mounts_dir_in_client_root(&root);
 
         assert_eq!(
-            default_meta_dir_in_client_root(&root, "projectfs"),
+            default_meta_dir_in_client_root(&root, "projectfs").expect("valid name"),
             root.join("meta").join("projectfs")
         );
         assert_eq!(mounts_dir, root.join("mounts"));

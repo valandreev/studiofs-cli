@@ -200,14 +200,16 @@ impl MountArgs {
     }
 
     pub(crate) fn dispatch_with_auto_tray(self) -> anyhow::Result<()> {
+        super::utils::validate_volume_name(&self.name)?;
         crate::tray::dispatch_mount_with_auto_tray(self)
     }
 
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        let command = MountCommand::from_args(self)?;
         #[cfg(windows)]
         super::winfsp_bootstrap::ensure_mountmgr_bootstrap()?;
 
-        MountSession::prepare(MountCommand::from_args(self)?)?.launch()
+        MountSession::prepare(command)?.launch()
     }
 }
 

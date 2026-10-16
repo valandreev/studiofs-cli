@@ -30,15 +30,15 @@ pub(crate) struct SmountArgs {
 
 impl SmountArgs {
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
-        #[cfg(windows)]
-        crate::cli::winfsp_bootstrap::ensure_mountmgr_bootstrap()?;
-
         let command = crate::cli::mount::MountCommand::from_snapshot_args(
             self.volume,
             self.snapshot_id,
             self.mount_point,
             self.cache_dir,
         )?;
+        #[cfg(windows)]
+        crate::cli::winfsp_bootstrap::ensure_mountmgr_bootstrap()?;
+
         crate::cli::mount::MountSession::prepare_snapshot(command)?.launch()
     }
 }
