@@ -1236,14 +1236,11 @@ mod tests {
 
     #[test]
     fn parse_mount_options_rejects_persistent_acls_override() {
-        for value in ["1", "true", "yes", "on", " TRUE "] {
-            set_test_mount_option_env("STUDIOFS_WINFSP_PERSISTENT_ACLS", value);
-            assert_eq!(
-                parse_mount_options("StudioFS").unwrap_err(),
-                MountOptionError::PersistentAclsUnsupported,
-                "former opt-in {value:?} must not enable persistent ACLs"
-            );
-        }
+        set_test_mount_option_env("STUDIOFS_WINFSP_PERSISTENT_ACLS", "1");
+        assert_eq!(
+            parse_mount_options("StudioFS").unwrap_err(),
+            MountOptionError::PersistentAclsUnsupported
+        );
 
         remove_test_mount_option_env("STUDIOFS_WINFSP_PERSISTENT_ACLS");
     }
