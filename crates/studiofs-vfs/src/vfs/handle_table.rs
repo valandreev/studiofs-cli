@@ -239,16 +239,14 @@ impl HandleTable {
     /// Route a still-open inode to orphan cleanup without racing its last close.
     pub(super) fn mark_orphan_if_open(&self, ino: Ino) -> bool {
         let handles = self.handles.read();
-        if handles
+        let is_open = handles
             .counts
             .get(&ino)
-            .is_some_and(|counts| counts.open > 0)
-        {
+            .is_some_and(|counts| counts.open > 0);
+        if is_open {
             self.orphans.lock().insert(ino);
-            true
-        } else {
-            false
         }
+        is_open
     }
 
     /// Check if inode is an orphan and remove the mark. Returns true if it was.

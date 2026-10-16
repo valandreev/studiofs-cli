@@ -966,22 +966,16 @@ impl MetaFsOps for RedbMetaEngine {
         } else {
             None
         };
-        let displaced_attr_seed = match &dst_entry_opt {
-            Some(dst_entry) => Some(Self::get_attr_merged_in_write_txn(&txn, dst_entry.ino)?),
-            _ => None,
-        };
-
         let mut displaced = None;
-        let mut displaced_attr_event: Option<crate::events::MetaEvent> = None;
+        let mut displaced_set_attr = None;
+        let mut displaced_remove_attr_ino = None;
         let mut moved_dir_attr = moved_dir_seed;
         let mut old_parent_attr = old_parent_seed;
         let mut new_parent_attr = new_parent_seed;
         {
             Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
-            if let Some(dst_entry) = dst_entry_opt.clone() {
-                let mut attr = displaced_attr_seed
-                    .clone()
-                    .ok_or(MetaError::InodeNotFound(dst_entry.ino))?;
+            if let Some(dst_entry) = &dst_entry_opt {
+                let mut attr = Self::get_attr_merged_in_write_txn(&txn, dst_entry.ino)?;
                 if dst_entry.kind == FileType::Directory {
                     attr.nlink = 0;
                     Self::remove_inode_overlay_in_txn(&txn, dst_entry.ino)?;
@@ -995,8 +989,7 @@ impl MetaFsOps for RedbMetaEngine {
                             dst_entry.ino,
                             attr.kind != FileType::RegularFile,
                         )?;
-                        displaced_attr_event =
-                            Some(crate::events::MetaEvent::RemoveAttr { ino: dst_entry.ino });
+                        displaced_remove_attr_ino = Some(dst_entry.ino);
                     } else {
                         Self::set_inode_in_txn(&txn, &attr)?;
                         if attr.nlink == 0 {
@@ -1005,8 +998,7 @@ impl MetaFsOps for RedbMetaEngine {
                                 attr.ino,
                             )?;
                         }
-                        displaced_attr_event =
-                            Some(crate::events::MetaEvent::SetAttr { attr: attr.clone() });
+                        displaced_set_attr = Some(attr.clone());
                     }
                 }
                 Self::remove_dentry_overlay_in_txn(&txn, new_parent, new_name)?;
@@ -1035,14 +1027,6 @@ impl MetaFsOps for RedbMetaEngine {
                 }
             }
 
-            let displaced_set_attr = match &displaced_attr_event {
-                Some(crate::events::MetaEvent::SetAttr { attr }) => Some(attr.clone()),
-                _ => None,
-            };
-            let displaced_remove_attr_ino = match &displaced_attr_event {
-                Some(crate::events::MetaEvent::RemoveAttr { ino }) => Some(*ino),
-                _ => None,
-            };
             Self::append_event_in_txn(
                 &txn,
                 &crate::events::MetaEvent::RenameEntry {
