@@ -2403,6 +2403,7 @@ struct MountLifecycleRecord {
 /// Mount-record statuses that prove native mount readiness.
 const MOUNT_LIFECYCLE_READY_STATUSES: &[&str] = &["mounted", "live", "degraded"];
 /// Only `live` grants new mutations; fresh clients stay read-only before it.
+#[cfg(any(not(windows), test))]
 const MOUNT_LIFECYCLE_WRITABLE_STATUSES: &[&str] = &["live"];
 
 fn mount_lifecycle_is_ready(
