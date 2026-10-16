@@ -1137,6 +1137,47 @@ fn rename_retains_final_displaced_inode_and_deferred_delete_atomically() {
 }
 
 #[test]
+fn rename_retained_displaced_inode_replicates_removal_only_when_never_published() {
+    for published in [false, true] {
+        let engine = temp_engine();
+        engine.create_file(ROOT_INO, b"source", 0, 0, 0o644).unwrap();
+        let mut target = engine.create_file(ROOT_INO, b"target", 0, 0, 0o644).unwrap();
+        if published {
+            target.committed_content_epoch = 1;
+            target.content_epoch = 1;
+            engine.set_attr(&target).unwrap();
+        }
+        let start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+        engine.rename_atomic(ROOT_INO, b"source", ROOT_INO, b"target", true, true).unwrap();
+
+        let end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+        let events = engine.read_events_range(start, end).unwrap();
+        let (set_attr, remove_ino) = events
+            .iter()
+            .find_map(|event| match event {
+                crate::events::MetaEvent::RenameEntry {
+                    displaced_set_attr,
+                    displaced_remove_attr_ino,
+                    ..
+                } => Some((
+                    displaced_set_attr.as_ref().as_ref().map(|attr| attr.ino),
+                    *displaced_remove_attr_ino,
+                )),
+                _ => None,
+            })
+            .expect("rename should append RenameEntry");
+        if published {
+            assert_eq!((set_attr, remove_ino), (Some(target.ino), None));
+        } else {
+            assert_eq!((set_attr, remove_ino), (None, Some(target.ino)));
+        }
+        // Local retention is independent of what peers are told.
+        assert_eq!(engine.get_attr(target.ino).unwrap().nlink, 0);
+    }
+}
+
+#[test]
 fn rename_onto_own_hardlink_preserves_both_names_and_link_count() {
     let engine = temp_engine();
     let source = engine

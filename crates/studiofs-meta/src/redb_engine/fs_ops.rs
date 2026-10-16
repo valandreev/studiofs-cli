@@ -999,7 +999,12 @@ impl MetaFsOps for RedbMetaEngine {
                                 attr.ino,
                             )?;
                         }
-                        displaced_set_attr = Some(attr.clone());
+                        if attr.nlink == 0 && attr.committed_content_epoch == 0 {
+                            // Peers never saw a published body; retire it there like unlink.
+                            displaced_remove_attr_ino = Some(dst_entry.ino);
+                        } else {
+                            displaced_set_attr = Some(attr.clone());
+                        }
                     }
                 }
                 Self::remove_dentry_overlay_in_txn(&txn, new_parent, new_name)?;

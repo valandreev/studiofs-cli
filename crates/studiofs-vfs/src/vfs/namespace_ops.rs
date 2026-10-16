@@ -3365,7 +3365,12 @@ impl StudioVfs {
                         .file_session
                         .enter_op(ino, FileSessionOperation::Release)
                         .await;
-                    self.cleanup_orphan_on_last_handle_close(ino).await?;
+                    let cleanup = self.collect_orphan_deleted_inode_cleanup(ino).await?;
+                    // Atomic-save renames must not wait for local payload eviction.
+                    self.finalize_deleted_inode_runtime_cleanup_deferred_cache_eviction(
+                        ino,
+                        cleanup.removed_ids,
+                    );
                     drop(session);
                     self.state.file_session.gc_if_idle(ino);
                 }

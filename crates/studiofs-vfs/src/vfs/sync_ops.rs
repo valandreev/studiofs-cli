@@ -779,10 +779,7 @@ impl StudioVfs {
         })
     }
 
-    pub(super) async fn cleanup_orphan_on_last_handle_close(
-        &self,
-        ino: Ino,
-    ) -> VfsResult<ReleaseFhOutcome> {
+    async fn cleanup_orphan_on_last_handle_close(&self, ino: Ino) -> VfsResult<ReleaseFhOutcome> {
         if self.release_ignored_entry(ino) {
             return Ok(ReleaseFhOutcome {
                 closed_last_handle: true,
