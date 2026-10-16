@@ -565,13 +565,9 @@ impl MetaGc for RedbMetaEngine {
             rows,
             |_| true,
         );
-        let mut deletions = Vec::new();
-        for row in rows.take(limit) {
-            let (object_id, timestamp) = row?;
-            deletions.push((object_id.value(), timestamp.value()));
-        }
-
-        Ok(deletions)
+        rows.take(limit)
+            .map(|row| row.map(|(object_id, timestamp)| (object_id.value(), timestamp.value())))
+            .collect()
     }
 
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {

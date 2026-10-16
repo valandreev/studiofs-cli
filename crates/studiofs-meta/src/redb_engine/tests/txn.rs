@@ -500,13 +500,7 @@ fn remove_attr_cleanup_scans_propagate_row_read_errors() {
         let engine = temp_engine();
         let txn = engine.begin_write_txn().unwrap();
         match scan {
-            RedbRowReadScan::RemoveAttrAuxXattrs => {
-                let mut table = txn.open_table(BASE_XATTRS_TABLE).unwrap();
-                for key in &xattr_keys {
-                    table.insert(key.as_slice(), b"value".as_slice()).unwrap();
-                }
-            }
-            RedbRowReadScan::RemoveAttrBaseXattrs => {
+            RedbRowReadScan::RemoveAttrAuxXattrs | RedbRowReadScan::RemoveAttrBaseXattrs => {
                 let mut table = txn.open_table(BASE_XATTRS_TABLE).unwrap();
                 for key in &xattr_keys {
                     table.insert(key.as_slice(), b"value".as_slice()).unwrap();
