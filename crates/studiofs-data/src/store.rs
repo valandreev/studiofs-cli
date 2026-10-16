@@ -763,6 +763,7 @@ impl DataStore {
         &self,
         key: &str,
     ) -> DataResult<(Buffer, RemoteObjectReadStats)> {
+        debug!(key, "downloading bounded regular payload");
         // No chunk/prefetch option: each buffer is checked before requesting the next one.
         let mut stream = self.op.reader(key).await?.into_stream(..).await?;
         let mut prefix = Vec::with_capacity(SFEC_HEADER_FIXED_LEN);
@@ -780,7 +781,9 @@ impl DataStore {
                     if layout.plaintext_len()
                         > (crate::object::CLOUD_FRAGMENT_SIZE + ObjectHeader::SIZE) as u64
                     {
-                        return Err(crypto::CryptoError::from(SfecError::InvalidRange).into());
+                        return Err(
+                            crypto::CryptoError::from(SfecError::ObjectLengthOverflow).into()
+                        );
                     }
                     limit = layout
                         .expected_ciphertext_len()
@@ -1287,9 +1290,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            DataError::Crypto(crypto::CryptoError::MalformedEnvelope(
-                SfecError::InvalidRange
-            ))
+            DataError::Crypto(crypto::CryptoError::ObjectLengthOverflow)
         ));
         assert!(!error.is_retryable());
         assert_eq!(consumed.load(Ordering::SeqCst), 51);

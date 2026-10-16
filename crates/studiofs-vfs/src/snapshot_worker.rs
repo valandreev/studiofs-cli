@@ -344,9 +344,16 @@ impl DataStoreSnapshotPayloadReader {
         let mut lengths = vec![0_usize; CLOUD_FRAGMENT_COUNT];
         let fragments = stream::iter(keys.into_iter().enumerate().map(
             |(fragment_index, key)| async move {
-                let object = self.data_store.get_by_key(&key).await.map_err(|error| {
-                    DataStoreSnapshotArtifactStore::map_data_error("read snapshot payload", error)
-                })?;
+                let (object, _) = self
+                    .data_store
+                    .get_payload_by_key_with_stats(&key)
+                    .await
+                    .map_err(|error| {
+                        DataStoreSnapshotArtifactStore::map_data_error(
+                            "read snapshot payload",
+                            error,
+                        )
+                    })?;
                 let fragment = read_object(object).map_err(|_| {
                     SnapshotPortError::permanent(
                         "payload_object",
