@@ -177,7 +177,15 @@ fn resolve_volume_candidate(
     client_root: &Path,
     volume_name: &str,
 ) -> Result<Option<ResolvedVolume>> {
-    if crate::cli::utils::validate_volume_name(volume_name).is_err() {
+    if let Err(error) = crate::cli::utils::validate_volume_name(volume_name) {
+        // A legacy database under a now-invalid name must block auto-resolution, not vanish.
+        let legacy_db = client_root
+            .join("meta")
+            .join(volume_name)
+            .join(format!("{volume_name}.db"));
+        if legacy_db.is_file() {
+            return Err(snapshot_context_error(&legacy_db, error));
+        }
         return Ok(None);
     }
     let path = crate::cli::utils::default_meta_dir_in_client_root(client_root, volume_name)?
@@ -626,6 +634,28 @@ mod tests {
                 "unexpected candidate for {volume_name:?}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn legacy_database_with_invalid_volume_name_blocks_resolution() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-candidate-");
+        let db_path = root
+            .path()
+            .join("meta")
+            .join("proj:2025")
+            .join("proj:2025.db");
+        fs::create_dir_all(db_path.parent().unwrap()).expect("create legacy volume directory");
+        fs::write(&db_path, b"legacy").expect("write legacy database");
+
+        let error = match resolve_volume_candidate(root.path(), "proj:2025") {
+            Err(error) => error,
+            Ok(_) => panic!("legacy database under an invalid name must not be skipped"),
+        };
+        assert!(
+            format!("{error:#}").contains("invalid volume name"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[test]
