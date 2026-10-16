@@ -555,15 +555,19 @@ impl MetaGc for RedbMetaEngine {
             .open_table(PENDING_DELETIONS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-        let deletions: Vec<(u64, i64)> = table
+        let rows = table
             .iter()
             .map_err(|e| MetaError::Storage(e.to_string()))?
-            .take(limit)
-            .filter_map(|r| r.ok())
-            .map(|(k, v)| (k.value(), v.value()))
-            .collect();
-
-        Ok(deletions)
+            .map(|row| row.map_err(MetaError::from));
+        #[cfg(test)]
+        let rows = super::inject_redb_row_read_error(
+            super::RedbRowReadScan::PendingDeletions,
+            rows,
+            |_| true,
+        );
+        rows.take(limit)
+            .map(|row| row.map(|(object_id, timestamp)| (object_id.value(), timestamp.value())))
+            .collect()
     }
 
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {

@@ -1,5 +1,27 @@
 use super::*;
 
+fn collect_prefix_keys<V: redb::Value + 'static>(
+    table: &impl ReadableTable<&'static [u8], V>,
+    prefix: &[u8],
+    #[cfg(test)] scan: super::RedbRowReadScan,
+) -> MetaResult<Vec<Vec<u8>>> {
+    let rows = table
+        .range(prefix..)?
+        .map(|row| row.map_err(MetaError::from));
+    #[cfg(test)]
+    let rows =
+        super::inject_redb_row_read_error(scan, rows, |(key, _)| key.value().starts_with(prefix));
+    let mut keys = Vec::new();
+    for row in rows {
+        let (key, _) = row?;
+        if !key.value().starts_with(prefix) {
+            break;
+        }
+        keys.push(key.value().to_vec());
+    }
+    Ok(keys)
+}
+
 #[derive(Default)]
 pub(super) struct LocalDentryMutationReducer {
     states: HashMap<Vec<u8>, LocalDentryMutation>,
@@ -1035,19 +1057,12 @@ impl RedbMetaEngine {
                         .open_table(BASE_XATTRS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let prefix = xattr_prefix(*ino);
-                    let keys_to_remove: Vec<Vec<u8>> = {
-                        let range = xattrs
-                            .range(prefix.as_ref()..)
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                        range
-                            .take_while(|r| {
-                                r.as_ref()
-                                    .map(|(k, _)| k.value().starts_with(&prefix))
-                                    .unwrap_or(false)
-                            })
-                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                            .collect()
-                    };
+                    let keys_to_remove = collect_prefix_keys(
+                        &xattrs,
+                        &prefix,
+                        #[cfg(test)]
+                        super::RedbRowReadScan::RemoveAttrAuxXattrs,
+                    )?;
                     for key in keys_to_remove {
                         xattrs.remove(key.as_slice())?;
                     }
@@ -1221,19 +1236,12 @@ impl RedbMetaEngine {
                         .open_table(BASE_XATTRS_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let prefix = xattr_prefix(*ino);
-                    let keys_to_remove: Vec<Vec<u8>> = {
-                        let range = xattrs
-                            .range(prefix.as_ref()..)
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                        range
-                            .take_while(|r| {
-                                r.as_ref()
-                                    .map(|(k, _)| k.value().starts_with(&prefix))
-                                    .unwrap_or(false)
-                            })
-                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                            .collect()
-                    };
+                    let keys_to_remove = collect_prefix_keys(
+                        &xattrs,
+                        &prefix,
+                        #[cfg(test)]
+                        super::RedbRowReadScan::RemoveAttrBaseXattrs,
+                    )?;
                     for key in keys_to_remove {
                         xattrs.remove(key.as_slice())?;
                     }
@@ -1242,19 +1250,12 @@ impl RedbMetaEngine {
                         .open_table(BASE_ACL_RULES_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
                     let prefix = acl_rule_prefix(*ino);
-                    let keys_to_remove: Vec<Vec<u8>> = {
-                        let range = acl
-                            .range(prefix.as_ref()..)
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                        range
-                            .take_while(|r| {
-                                r.as_ref()
-                                    .map(|(k, _)| k.value().starts_with(&prefix))
-                                    .unwrap_or(false)
-                            })
-                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                            .collect()
-                    };
+                    let keys_to_remove = collect_prefix_keys(
+                        &acl,
+                        &prefix,
+                        #[cfg(test)]
+                        super::RedbRowReadScan::RemoveAttrBaseAclRules,
+                    )?;
                     for key in keys_to_remove {
                         acl.remove(key.as_slice())?;
                     }
@@ -1741,19 +1742,12 @@ impl RedbMetaEngine {
                     let mut acl_rules = txn
                         .open_table(ACL_RULES_TABLE)
                         .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let acl_rule_keys: Vec<Vec<u8>> = {
-                        let range = acl_rules
-                            .range(prefix.as_ref()..)
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                        range
-                            .take_while(|r| {
-                                r.as_ref()
-                                    .map(|(k, _)| k.value().starts_with(&prefix))
-                                    .unwrap_or(false)
-                            })
-                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                            .collect()
-                    };
+                    let acl_rule_keys = collect_prefix_keys(
+                        &acl_rules,
+                        &prefix,
+                        #[cfg(test)]
+                        super::RedbRowReadScan::RemoveAttrServingAclRules,
+                    )?;
                     for key in acl_rule_keys {
                         acl_rules.remove(key.as_slice())?;
                     }
