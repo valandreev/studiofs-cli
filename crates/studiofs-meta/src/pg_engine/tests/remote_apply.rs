@@ -133,6 +133,96 @@ fn failed_replay_page_does_not_persist_state_or_cursor() {
 }
 
 #[test]
+fn cleanup_row_read_failure_rolls_back_replay_page_and_cursor() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let ino = ROOT_INO + 710;
+    let attr = InodeAttr::new_dir(ino, ROOT_INO, 0, 0, 0o755);
+    let context = |last_seq| RemoteReplayApplyContext {
+        last_seq,
+        current_namespace_version: pg.namespace_version.load(Ordering::SeqCst),
+        flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
+        next_event_seq: pg.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+        initial_overlay: OverlayConflictSets::default(),
+    };
+    let mut seed = vec![MetaEvent::SetAttr { attr: attr.clone() }];
+    for name in [b"user.a", b"user.b"] {
+        seed.push(MetaEvent::SetXattr {
+            ino,
+            name: name.to_vec(),
+            value: b"retained".to_vec(),
+            flags: 0,
+        });
+    }
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: seed,
+            is_self_batch: false,
+        }],
+        None,
+        context(0),
+    )
+    .unwrap();
+    let namespace_version = pg.namespace_version.load(Ordering::SeqCst);
+    let namespace_counter = pg
+        .local
+        .get_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER)
+        .unwrap();
+    let earlier_ino = ino + 1;
+    let removal = || {
+        vec![DecodedReplayBatch {
+            batch_version: 2,
+            events: vec![
+                MetaEvent::SetAttr {
+                    attr: InodeAttr::new_dir(earlier_ino, ROOT_INO, 0, 0, 0o755),
+                },
+                MetaEvent::RemoveAttr { ino },
+            ],
+            is_self_batch: false,
+        }]
+    };
+
+    crate::redb_engine::inject_redb_row_read_error_after(
+        crate::redb_engine::RedbRowReadScan::RemoveAttrBaseXattrs,
+        1,
+    );
+    let result = pg.apply_replay_page_atomically(removal(), None, context(1));
+
+    assert!(
+        matches!(result, Err(MetaError::Storage(message)) if message == "injected redb row read error")
+    );
+    assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 1);
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER)
+            .unwrap(),
+        namespace_counter
+    );
+    assert_eq!(pg.local_version.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        pg.namespace_version.load(Ordering::SeqCst),
+        namespace_version
+    );
+    assert_eq!(pg.local.get_attr(ino).unwrap(), attr);
+    assert!(pg.local.get_attr(earlier_ino).is_err());
+    for name in [b"user.a", b"user.b"] {
+        assert_eq!(
+            pg.local.get_xattr(ino, name).unwrap(),
+            Some(b"retained".to_vec())
+        );
+    }
+
+    pg.apply_replay_page_atomically(removal(), None, context(1))
+        .unwrap();
+    assert_eq!(pg.local.get_counter(LOCAL_PG_VERSION_COUNTER).unwrap(), 2);
+    assert!(pg.local.get_attr(ino).is_err());
+    assert!(pg.local.get_attr(earlier_ino).is_ok());
+    for name in [b"user.a", b"user.b"] {
+        assert_eq!(pg.local.get_xattr(ino, name).unwrap(), None);
+    }
+}
+
+#[test]
 fn expired_replay_page_deadline_rolls_back_without_advancing_cursor() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let ino = ROOT_INO + 704;

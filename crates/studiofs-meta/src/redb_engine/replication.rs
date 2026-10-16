@@ -1039,14 +1039,21 @@ impl RedbMetaEngine {
                         let range = xattrs
                             .range(prefix.as_ref()..)
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
-                        range
-                            .take_while(|r| {
-                                r.as_ref()
-                                    .map(|(k, _)| k.value().starts_with(&prefix))
-                                    .unwrap_or(false)
-                            })
-                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                            .collect()
+                        #[cfg(test)]
+                        let range = super::inject_redb_row_read_error(
+                            super::RedbRowReadScan::RemoveAttrAuxXattrs,
+                            range.map(|row| row.map_err(MetaError::from)),
+                            |(key, _)| key.value().starts_with(&prefix),
+                        );
+                        let mut keys = Vec::new();
+                        for row in range {
+                            let (key, _) = row?;
+                            if !key.value().starts_with(&prefix) {
+                                break;
+                            }
+                            keys.push(key.value().to_vec());
+                        }
+                        keys
                     };
                     for key in keys_to_remove {
                         xattrs.remove(key.as_slice())?;
@@ -1225,14 +1232,21 @@ impl RedbMetaEngine {
                         let range = xattrs
                             .range(prefix.as_ref()..)
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
-                        range
-                            .take_while(|r| {
-                                r.as_ref()
-                                    .map(|(k, _)| k.value().starts_with(&prefix))
-                                    .unwrap_or(false)
-                            })
-                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                            .collect()
+                        #[cfg(test)]
+                        let range = super::inject_redb_row_read_error(
+                            super::RedbRowReadScan::RemoveAttrBaseXattrs,
+                            range.map(|row| row.map_err(MetaError::from)),
+                            |(key, _)| key.value().starts_with(&prefix),
+                        );
+                        let mut keys = Vec::new();
+                        for row in range {
+                            let (key, _) = row?;
+                            if !key.value().starts_with(&prefix) {
+                                break;
+                            }
+                            keys.push(key.value().to_vec());
+                        }
+                        keys
                     };
                     for key in keys_to_remove {
                         xattrs.remove(key.as_slice())?;
@@ -1246,14 +1260,21 @@ impl RedbMetaEngine {
                         let range = acl
                             .range(prefix.as_ref()..)
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
-                        range
-                            .take_while(|r| {
-                                r.as_ref()
-                                    .map(|(k, _)| k.value().starts_with(&prefix))
-                                    .unwrap_or(false)
-                            })
-                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                            .collect()
+                        #[cfg(test)]
+                        let range = super::inject_redb_row_read_error(
+                            super::RedbRowReadScan::RemoveAttrBaseAclRules,
+                            range.map(|row| row.map_err(MetaError::from)),
+                            |(key, _)| key.value().starts_with(&prefix),
+                        );
+                        let mut keys = Vec::new();
+                        for row in range {
+                            let (key, _) = row?;
+                            if !key.value().starts_with(&prefix) {
+                                break;
+                            }
+                            keys.push(key.value().to_vec());
+                        }
+                        keys
                     };
                     for key in keys_to_remove {
                         acl.remove(key.as_slice())?;
@@ -1745,14 +1766,21 @@ impl RedbMetaEngine {
                         let range = acl_rules
                             .range(prefix.as_ref()..)
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
-                        range
-                            .take_while(|r| {
-                                r.as_ref()
-                                    .map(|(k, _)| k.value().starts_with(&prefix))
-                                    .unwrap_or(false)
-                            })
-                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                            .collect()
+                        #[cfg(test)]
+                        let range = super::inject_redb_row_read_error(
+                            super::RedbRowReadScan::RemoveAttrServingAclRules,
+                            range.map(|row| row.map_err(MetaError::from)),
+                            |(key, _)| key.value().starts_with(&prefix),
+                        );
+                        let mut keys = Vec::new();
+                        for row in range {
+                            let (key, _) = row?;
+                            if !key.value().starts_with(&prefix) {
+                                break;
+                            }
+                            keys.push(key.value().to_vec());
+                        }
+                        keys
                     };
                     for key in acl_rule_keys {
                         acl_rules.remove(key.as_slice())?;

@@ -555,13 +555,21 @@ impl MetaGc for RedbMetaEngine {
             .open_table(PENDING_DELETIONS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-        let deletions: Vec<(u64, i64)> = table
+        let rows = table
             .iter()
             .map_err(|e| MetaError::Storage(e.to_string()))?
-            .take(limit)
-            .filter_map(|r| r.ok())
-            .map(|(k, v)| (k.value(), v.value()))
-            .collect();
+            .map(|row| row.map_err(MetaError::from));
+        #[cfg(test)]
+        let rows = super::inject_redb_row_read_error(
+            super::RedbRowReadScan::PendingDeletions,
+            rows,
+            |_| true,
+        );
+        let mut deletions = Vec::new();
+        for row in rows.take(limit) {
+            let (object_id, timestamp) = row?;
+            deletions.push((object_id.value(), timestamp.value()));
+        }
 
         Ok(deletions)
     }

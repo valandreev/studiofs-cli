@@ -478,6 +478,163 @@ fn replica_removal_error_aborts_prior_metadata_writes() {
 }
 
 #[test]
+fn remove_attr_cleanup_scans_propagate_row_read_errors() {
+    use crate::redb_engine::{RedbRowReadScan, inject_redb_row_read_error_after};
+
+    let ino = ROOT_INO + 8_601;
+    let xattr_keys = [
+        encode_xattr_key(ino, b"user.first"),
+        encode_xattr_key(ino, b"user.second"),
+    ];
+    let scenarios = [
+        (RedbRowReadScan::RemoveAttrAuxXattrs, "aux xattrs"),
+        (RedbRowReadScan::RemoveAttrBaseXattrs, "base xattrs"),
+        (RedbRowReadScan::RemoveAttrBaseAclRules, "base ACL rules"),
+        (
+            RedbRowReadScan::RemoveAttrServingAclRules,
+            "serving ACL rules",
+        ),
+    ];
+
+    for (scan, label) in scenarios {
+        let engine = temp_engine();
+        let txn = engine.begin_write_txn().unwrap();
+        match scan {
+            RedbRowReadScan::RemoveAttrAuxXattrs => {
+                let mut table = txn.open_table(BASE_XATTRS_TABLE).unwrap();
+                for key in &xattr_keys {
+                    table.insert(key.as_slice(), b"value".as_slice()).unwrap();
+                }
+            }
+            RedbRowReadScan::RemoveAttrBaseXattrs => {
+                let mut table = txn.open_table(BASE_XATTRS_TABLE).unwrap();
+                for key in &xattr_keys {
+                    table.insert(key.as_slice(), b"value".as_slice()).unwrap();
+                }
+            }
+            RedbRowReadScan::RemoveAttrBaseAclRules
+            | RedbRowReadScan::RemoveAttrServingAclRules => {
+                let table_def = if scan == RedbRowReadScan::RemoveAttrBaseAclRules {
+                    BASE_ACL_RULES_TABLE
+                } else {
+                    ACL_RULES_TABLE
+                };
+                let mut table = txn.open_table(table_def).unwrap();
+                for principal in ["principal.first", "principal.second"] {
+                    let key = encode_acl_rule_key(ino, principal);
+                    table.insert(key.as_slice(), 1).unwrap();
+                }
+            }
+            RedbRowReadScan::PendingDeletions => unreachable!(),
+        }
+        txn.commit().unwrap();
+
+        inject_redb_row_read_error_after(scan, 1);
+        let result = match scan {
+            RedbRowReadScan::RemoveAttrAuxXattrs => {
+                engine.apply_replica_aux_state(&[MetaEvent::RemoveAttr { ino }])
+            }
+            RedbRowReadScan::RemoveAttrBaseXattrs | RedbRowReadScan::RemoveAttrBaseAclRules => {
+                engine.apply_replica_events_to_base(&[MetaEvent::RemoveAttr { ino }])
+            }
+            RedbRowReadScan::RemoveAttrServingAclRules => {
+                engine.apply_replica_serving_state(&[MetaEvent::RemoveAttr { ino }])
+            }
+            RedbRowReadScan::PendingDeletions => unreachable!(),
+        };
+
+        assert!(
+            matches!(&result, Err(MetaError::Storage(message)) if message == "injected redb row read error"),
+            "{label}: {result:?}"
+        );
+        let read = engine.begin_read_txn().unwrap();
+        match scan {
+            RedbRowReadScan::RemoveAttrAuxXattrs | RedbRowReadScan::RemoveAttrBaseXattrs => {
+                let table = read.open_table(BASE_XATTRS_TABLE).unwrap();
+                for key in &xattr_keys {
+                    assert!(table.get(key.as_slice()).unwrap().is_some(), "{label}");
+                }
+            }
+            RedbRowReadScan::RemoveAttrBaseAclRules
+            | RedbRowReadScan::RemoveAttrServingAclRules => {
+                let table_def = if scan == RedbRowReadScan::RemoveAttrBaseAclRules {
+                    BASE_ACL_RULES_TABLE
+                } else {
+                    ACL_RULES_TABLE
+                };
+                let table = read.open_table(table_def).unwrap();
+                for principal in ["principal.first", "principal.second"] {
+                    let key = encode_acl_rule_key(ino, principal);
+                    assert!(table.get(key.as_slice()).unwrap().is_some(), "{label}");
+                }
+            }
+            RedbRowReadScan::PendingDeletions => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn pending_deletion_scan_propagates_row_read_error_after_first_row() {
+    use crate::redb_engine::{RedbRowReadScan, inject_redb_row_read_error_after};
+
+    let engine = temp_engine();
+    engine.add_pending_deletions(&[(1, 10), (2, 20)]).unwrap();
+
+    inject_redb_row_read_error_after(RedbRowReadScan::PendingDeletions, 1);
+    let result = engine.get_pending_deletions_limited(10);
+
+    assert!(
+        matches!(&result, Err(MetaError::Storage(message)) if message == "injected redb row read error"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn base_remove_attr_stops_at_first_xattr_outside_inode_prefix() {
+    let engine = temp_engine();
+    let ino = ROOT_INO + 8_602;
+    let adjacent_ino = ino + 1;
+    let removed_key = encode_xattr_key(ino, b"user.color");
+    let retained_key = encode_xattr_key(adjacent_ino, b"user.color");
+    let retained_acl_key = encode_acl_rule_key(adjacent_ino, "principal.adjacent");
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut table = txn.open_table(BASE_XATTRS_TABLE).unwrap();
+        table
+            .insert(removed_key.as_slice(), b"red".as_slice())
+            .unwrap();
+        table
+            .insert(retained_key.as_slice(), b"blue".as_slice())
+            .unwrap();
+    }
+    txn.open_table(BASE_ACL_RULES_TABLE)
+        .unwrap()
+        .insert(retained_acl_key.as_slice(), 1)
+        .unwrap();
+    txn.commit().unwrap();
+
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::RemoveAttr { ino }])
+        .unwrap();
+
+    let read = engine.begin_read_txn().unwrap();
+    let table = read.open_table(BASE_XATTRS_TABLE).unwrap();
+    assert!(table.get(removed_key.as_slice()).unwrap().is_none());
+    assert_eq!(
+        table.get(retained_key.as_slice()).unwrap().unwrap().value(),
+        b"blue"
+    );
+    assert!(
+        read.open_table(BASE_ACL_RULES_TABLE)
+            .unwrap()
+            .get(retained_acl_key.as_slice())
+            .unwrap()
+            .is_some(),
+        "cleanup must stop before the adjacent inode's ACL prefix"
+    );
+}
+
+#[test]
 fn acl_rule_removal_error_aborts_tombstone_and_event_writes() {
     let (engine, backend, key) = acl_removal_fault_fixture(ACL_RULES_TABLE);
 

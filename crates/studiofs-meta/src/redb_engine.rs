@@ -37,6 +37,57 @@ impl From<redb::StorageError> for MetaError {
     }
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RedbRowReadScan {
+    RemoveAttrAuxXattrs,
+    RemoveAttrBaseXattrs,
+    RemoveAttrBaseAclRules,
+    RemoveAttrServingAclRules,
+    PendingDeletions,
+}
+
+#[cfg(test)]
+thread_local! {
+    static REDB_ROW_READ_ERROR: RefCell<Option<(RedbRowReadScan, usize)>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_redb_row_read_error_after(scan: RedbRowReadScan, matching_rows: usize) {
+    REDB_ROW_READ_ERROR.with(|fault| *fault.borrow_mut() = Some((scan, matching_rows)));
+}
+
+#[cfg(test)]
+pub(crate) fn inject_redb_row_read_error<T>(
+    scan: RedbRowReadScan,
+    mut rows: impl Iterator<Item = MetaResult<T>>,
+    mut matches: impl FnMut(&T) -> bool,
+) -> impl Iterator<Item = MetaResult<T>> {
+    let after = REDB_ROW_READ_ERROR.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if fault.is_some_and(|(target, _)| target == scan) {
+            fault.take().map(|(_, after)| after)
+        } else {
+            None
+        }
+    });
+    let mut matched = 0;
+    let mut injected = false;
+    std::iter::from_fn(move || {
+        if !injected && after.is_some_and(|after| matched >= after) {
+            injected = true;
+            return Some(Err(MetaError::Storage(
+                "injected redb row read error".to_owned(),
+            )));
+        }
+        let row = rows.next()?;
+        if row.as_ref().is_ok_and(&mut matches) {
+            matched += 1;
+        }
+        Some(row)
+    })
+}
+
 static VOLATILE_DURABILITY_WARN: Once = Once::new();
 const REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS: u64 = 1_000;
 // ponytail: page scans still block new writes; cache for five seconds and move sampling off-read-path if measured scans remain costly.
