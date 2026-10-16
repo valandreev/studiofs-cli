@@ -1059,6 +1059,19 @@ runtime that is already shutting down.
 
 ## Platform Bridge Smoke Tests
 
+SFS-863 focused Windows capability and independent VFS ACL regressions:
+
+```powershell
+cargo test -p studiofs-winfsp --lib parse_mount_options -- --nocapture
+cargo test -p studiofs-winfsp --lib apply_volume_params_forces_persistent_acls_disabled -- --nocapture
+cargo test -p studiofs-winfsp --lib parse_bool_env -- --nocapture
+cargo test -p studiofs-vfs --test vfs_test acl_ -- --nocapture --test-threads=1
+```
+
+The option tests verify that persistent ACL advertisement stays disabled and
+former opt-in values are rejected. They do not replace native WinFSP acceptance:
+check the mounted volume capability and security callbacks on a Windows host.
+
 The bridge mount/unmount smoke tests are intentionally `#[ignore]` because they
 require host platform support (WinFSP driver/runtime). Enable them only when
 validating platform bridge changes:

@@ -216,10 +216,18 @@ fixed or upgraded.
 | Flush/purge on cleanup | Disabled by default to preserve read-cache pages across close/reopen cycles. Override: `STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP=1` |
 | Case sensitive | Yes |
 | Unicode on disk | Yes |
-| Persistent ACLs | Yes |
+| Persistent ACLs | No (always disabled) |
 | Reparse points | Yes |
 | Volume serial | `0x5354_4644` ("STFD") |
 | Filesystem name | "StudioFS" |
+
+Windows per-file security descriptors are not persisted: the descriptor passed
+to `Create` is ignored, security queries use a context-wide descriptor, and
+`SetSecurity` is unsupported. A true value for
+`STUDIOFS_WINFSP_PERSISTENT_ACLS` now rejects mount startup; the capability is
+always disabled. VFS per-inode ACL enforcement for the configured mount
+principal is independent and unchanged. Full Windows per-file ACL persistence
+is future work scoped separately.
 
 `STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for local payload I/O.
 The metadata timeout fields are mount-time WinFSP parameters. SFS-677 health
