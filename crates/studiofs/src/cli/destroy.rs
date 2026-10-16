@@ -254,14 +254,14 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         return Ok(());
     }
 
-    // Acquire writable local metadata ownership only after confirmation. This
-    // refuses deletion while a mount owns the database and defers redb repair
-    // until the user has committed to destroying the local state.
-    let local_meta_owner = if mode == DestroyMode::LocalOnly {
-        Some(studiofs_meta::RedbMetaEngine::open(&db_path)?)
-    } else {
-        None
-    };
+    println!("Acquiring exclusive local metadata ownership; remote peers are not stopped.");
+    // Hold the same-database mount exclusion through remote cleanup. Only
+    // local-only mode defers its writable open (and any redb repair) until here.
+    let local_meta_owner = studiofs_meta::RedbMetaEngine::open(&db_path).inspect_err(|_| {
+        eprintln!(
+            "Failed to open the local metadata database for exclusive use (see the error below). If another local process is using this database, unmount the volume or close that process before retrying."
+        );
+    })?;
 
     if mode.should_remove_remote() {
         let format_info = format_info.as_ref().ok_or(MetaError::NotFormatted)?;
@@ -271,9 +271,9 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
     }
 
     // 5. Delete metadata directory
-    drop(local_meta_owner);
     println!("Deleting local metadata files...");
     if meta_dir.exists() {
+        drop(local_meta_owner);
         std::fs::remove_dir_all(meta_dir)?;
     }
 

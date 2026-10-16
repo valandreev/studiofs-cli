@@ -450,6 +450,8 @@ studiofs destroy <name> --local
 
 Notes:
 - `destroy` removes StudioFS local metadata files for the volume.
+- After confirmation, both modes acquire exclusive ownership of this client's local metadata database. If a local mount holds it (already active, or acquired during confirmation), destroy fails before deleting remote objects or shared metadata. Full destroy retains ownership throughout remote cleanup and releases it immediately before removing the local metadata directory.
+- This excludes mounts using the same local database; it does not stop remote peers. Unmount other clients before full destroy.
 - Custom local data cache directories are not auto-detected; remove them manually after destroy (the command prints the volume UUID for this).
 
 ### `dump`
