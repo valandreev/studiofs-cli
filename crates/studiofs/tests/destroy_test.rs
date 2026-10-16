@@ -476,6 +476,11 @@ fn destroy_local_only_refuses_active_local_metadata() {
         output_text(&output)
     );
     assert!(
+        output_text(&output).contains("unmount the volume or close that process"),
+        "ownership conflict should explain how to release the local database: {}",
+        output_text(&output)
+    );
+    assert!(
         meta_dir.exists(),
         "--local destroy should keep metadata while another engine owns it"
     );
@@ -736,13 +741,24 @@ fn destroy_full_refuses_active_local_metadata_before_deleting_remote_state() {
     let db_path = fixture.meta_dir.join(format!("{}.db", fixture.name));
     assert!(db_path.exists(), "local DB should exist before destroy");
 
+    let stderr = tempfile::NamedTempFile::new_in(fixture.home_dir.path())
+        .expect("create child stderr capture");
+    let diagnostics = |stdout: &[u8]| {
+        format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(stdout),
+            std::fs::read_to_string(stderr.path()).expect("read child stderr")
+        )
+    };
     let mut command = Command::new(env!("CARGO_BIN_EXE_studiofs"));
     command
         .arg("destroy")
         .arg(&fixture.name)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(
+            stderr.reopen().expect("open child stderr capture"),
+        ));
     set_home_env(&mut command, fixture.home_dir.path());
     let mut child = ChildGuard(command.spawn().expect("spawn studiofs destroy"));
     let stdout = child.0.stdout.take().expect("take child stdout");
@@ -765,13 +781,24 @@ fn destroy_full_refuses_active_local_metadata_before_deleting_remote_state() {
         let remaining = prompt_deadline.saturating_duration_since(Instant::now());
         assert!(
             !remaining.is_zero(),
-            "child did not flush the confirmation prompt"
+            "child did not flush the confirmation prompt: {}",
+            diagnostics(&output)
         );
-        output.extend(
-            output_rx
-                .recv_timeout(remaining)
-                .expect("receive flushed confirmation prompt before timeout"),
-        );
+        match output_rx.recv_timeout(remaining) {
+            Ok(chunk) => output.extend(chunk),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!(
+                    "child timed out before confirmation prompt: {}",
+                    diagnostics(&output)
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "child closed stdout before confirmation prompt: {}",
+                    diagnostics(&output)
+                )
+            }
+        }
     }
 
     let _active_meta = RedbMetaEngine::open(&db_path).expect("open active local metadata");
@@ -784,23 +811,31 @@ fn destroy_full_refuses_active_local_metadata_before_deleting_remote_state() {
         let remaining = child_deadline.saturating_duration_since(Instant::now());
         assert!(
             !remaining.is_zero(),
-            "destroy child exceeded its lifetime bound"
+            "destroy child exceeded its lifetime bound: {}",
+            diagnostics(&output)
         );
         match output_rx.recv_timeout(remaining) {
             Ok(chunk) => output.extend(chunk),
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                panic!("destroy child did not exit before its lifetime bound")
+                panic!(
+                    "destroy child did not exit before its lifetime bound: {}",
+                    diagnostics(&output)
+                )
             }
         }
     }
     reader.join().expect("join child stdout reader");
     let status = child.0.wait().expect("wait for destroy child");
-    let output = String::from_utf8_lossy(&output);
+    let output = diagnostics(&output);
 
     assert!(
         !status.success(),
         "destroy should refuse active local metadata: {output}"
+    );
+    assert!(
+        output.contains("unmount the volume or close that process"),
+        "destroy should report local ownership failure: {output}"
     );
     assert!(
         !output.contains("Deleting data from S3 and metadata backends..."),
