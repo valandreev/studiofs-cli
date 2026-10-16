@@ -190,6 +190,11 @@ Use a different `STUDIOFS_CLIENT_ROOT` for each local client on the same host so
 their `redb` metadata databases, mount records, logs, and default cache roots do
 not overlap.
 
+Volume names are single directory names. Spaces within names and Unicode are
+preserved verbatim. CLI metadata paths reject empty names, `.` and `..`, `/`,
+`\`, `:`, NUL, and trailing dots or spaces on every platform; the latter can
+alias other directories on Windows. Names are rejected rather than normalized.
+
 Snapshot recovery uses the same client root to discover exactly one current
 PostgreSQL-backed volume. After a manual snapshot reaches `Ready`, mount its
 immutable view with the explicit read-only command:

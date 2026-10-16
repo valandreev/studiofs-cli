@@ -177,7 +177,7 @@ fn resolve_volume_candidate(
     client_root: &Path,
     volume_name: &str,
 ) -> Result<Option<ResolvedVolume>> {
-    let path = crate::cli::utils::default_meta_dir_in_client_root(client_root, volume_name)
+    let path = crate::cli::utils::default_meta_dir_in_client_root(client_root, volume_name)?
         .join(format!("{volume_name}.db"));
     if !path.is_file() {
         return Ok(None);
@@ -428,7 +428,7 @@ fn build_worker(volume: &ResolvedVolume) -> Result<Arc<SnapshotWorker>> {
     let materializer_root = crate::cli::utils::default_meta_dir_in_client_root(
         &client_root,
         &volume.context.volume_name,
-    )
+    )?
     .join("cache")
     .join("snapshot-v2")
     .join("materializer");
