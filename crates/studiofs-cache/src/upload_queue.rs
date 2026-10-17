@@ -92,6 +92,9 @@ struct PendingState {
     // Freeze each sweep's upper ID so continuous arrivals cannot postpone older retries.
     claim_inode_cursor: Option<(Ino, Ino)>,
     claim_object_cursors: BTreeMap<Ino, (u64, u64)>,
+    // Mirror of the caller's insert-only tombstones; `canceled_dirty` is the subset with dirty IDs.
+    canceled_inodes: HashSet<Ino>,
+    canceled_dirty: BTreeSet<Ino>,
     wakeup_coalesced: u64,
 }
 
@@ -150,6 +153,8 @@ impl UploadQueue {
                 deadlines: BTreeSet::new(),
                 claim_inode_cursor: None,
                 claim_object_cursors: BTreeMap::new(),
+                canceled_inodes: HashSet::new(),
+                canceled_dirty: BTreeSet::new(),
                 wakeup_coalesced: 0,
             }),
             idle_notify,
@@ -378,6 +383,7 @@ impl UploadQueue {
 
     /// Claims at most `max_items` due uploads, or canceled uploads regardless of deadline.
     /// Unclaimed operations remain authoritative and do not require another wakeup.
+    /// `canceled_inodes` must be insert-only; it is re-read only when it grows.
     pub fn claim_pending(
         &self,
         max_items: usize,
@@ -390,20 +396,27 @@ impl UploadQueue {
         if max_items == 0 {
             return claimed;
         }
-        // Inspect pending inodes, not the potentially much larger deletion history.
-        if !canceled_inodes.is_empty() {
-            claimed.extend(
-                state
-                    .dirty_by_inode
-                    .iter()
-                    .filter(|(ino, _)| canceled_inodes.contains(*ino))
-                    .flat_map(|(_, objects)| objects)
-                    .take(max_items)
-                    .map(|object_id| state.by_object[object_id].clone()),
-            );
-            for op in &claimed {
+        // Sync only new tombstones so steady-state claims cost O(claimed), not O(backlog).
+        if canceled_inodes.len() > state.canceled_inodes.len() {
+            for &ino in canceled_inodes {
+                if state.canceled_inodes.insert(ino) && state.dirty_by_inode.contains_key(&ino) {
+                    state.canceled_dirty.insert(ino);
+                }
+            }
+        }
+        while claimed.len() < max_items {
+            let Some(&ino) = state.canceled_dirty.first() else {
+                break;
+            };
+            let page: Vec<_> = state.dirty_by_inode[&ino]
+                .iter()
+                .take(max_items - claimed.len())
+                .map(|object_id| state.by_object[object_id].clone())
+                .collect();
+            for op in &page {
                 Self::unmark_dirty(&mut state, op);
             }
+            claimed.extend(page);
         }
         if claimed.len() == max_items {
             return claimed;
@@ -516,6 +529,9 @@ impl UploadQueue {
             .or_default()
             .insert(op.object_id);
         state.deadlines.insert(Self::deadline_key(op));
+        if state.canceled_inodes.contains(&op.ino) {
+            state.canceled_dirty.insert(op.ino);
+        }
     }
 
     fn unmark_dirty(state: &mut PendingState, op: &PendingUpload) {
@@ -524,6 +540,7 @@ impl UploadQueue {
             entry.get_mut().remove(&op.object_id);
             if entry.get().is_empty() {
                 entry.remove();
+                state.canceled_dirty.remove(&op.ino);
             }
         }
         if let Entry::Occupied(mut entry) = state.due_by_inode.entry(op.ino) {
@@ -1413,6 +1430,36 @@ mod tests {
         assert!(queue.pending_state.lock().claim_inode_cursor.is_none());
         assert!(queue.pending_state.lock().claim_object_cursors.is_empty());
         assert_eq!(queue.next_pending_upload_deadline(0), None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_index_tracks_only_tombstoned_inodes_with_unclaimed_work() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, _rx) = UploadQueue::new(dir.path());
+        for ino in 1..=64 {
+            queue.submit(ino, 0, ino, 1);
+        }
+        // Tombstones for inodes without pending work must not be revisited by later claims.
+        let mut canceled: HashSet<Ino> = (1_000..2_000).collect();
+        assert_eq!(queue.claim_pending(1, u64::MAX, 0, &canceled)[0].ino, 1);
+        assert!(queue.pending_state.lock().canceled_dirty.is_empty());
+
+        // New future work on an already-mirrored tombstone is canceled before it is due.
+        queue.submit(1_500, 0, 100, 1);
+        let mut op = queue
+            .snapshot_pending()
+            .into_iter()
+            .find(|op| op.ino == 1_500)
+            .unwrap();
+        op.not_before_unix_ms = u64::MAX;
+        assert!(queue.requeue(op));
+        assert_eq!(queue.claim_pending(1, 0, 0, &canceled)[0].ino, 1_500);
+        assert!(queue.pending_state.lock().canceled_dirty.is_empty());
+
+        // A grown tombstone set is merged and its pending work is claimed first.
+        canceled.insert(64);
+        assert_eq!(queue.claim_pending(1, 0, 0, &canceled)[0].ino, 64);
+        assert!(queue.pending_state.lock().canceled_dirty.is_empty());
     }
 
     #[tokio::test]
