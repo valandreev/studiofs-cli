@@ -2451,6 +2451,10 @@ impl UploadLifecycleWorker {
     ) {
         let deleted_inodes = {
             let deleted_inodes = self.vfs.state.upload.deleted_inodes.lock();
+            debug_assert!(
+                deleted_inodes.len() >= *swept_deleted_inode_count,
+                "upload deletion tombstones must only be inserted"
+            );
             if deleted_inodes.len() == *swept_deleted_inode_count {
                 return;
             }
