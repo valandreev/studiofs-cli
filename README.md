@@ -8,28 +8,32 @@
 StudioFS is an open-source, self-hostable virtual filesystem designed for
 computer graphics, animation, VFX, and post-production studios. It lets teams
 access and edit heavy source assets (4K, RAW, proxies, geometry, caches)
-directly from cloud or remote storage without waiting for full downloads or
-background sync jobs.
+through a local mount, fetching remote payloads on demand and publishing local
+changes in the background.
 
-- **Real-time access to heavy media**
+- **Mounted access to heavy media**
   Work directly with proxies, 4K, RAW footage, and other large assets from the
-  cloud as if they were stored on a local fast SSD.
+  cloud through filesystem reads. Cold reads still depend on network and
+  object-storage latency; cached reads use local resources.
 
-- **A single source of truth**
-  Say goodbye to duplicate files, broken links, and version chaos. The entire team sees the exact same workspace, always in sync.
+- **A shared workspace with eventual convergence**
+  Clients exchange ordered metadata changes through PostgreSQL. Local edits
+  become visible to peers after payload upload, metadata publication, and peer
+  replay; clients can temporarily see different versions.
 
-- **Seamless DCC integration**
-  Work in your existing tools: DaVinci Resolve, Flame, Fusion, Nuke, After
-  Effects, Maya, Houdini, and Blender. A StudioFS volume mounts like a regular
-  drive, so you can keep your current pipeline without custom plugins.
+- **Filesystem access for existing tools**
+  A StudioFS volume mounts through the operating system's filesystem bridge.
+  Applications can use ordinary file paths without a StudioFS-specific plugin;
+  compatibility with individual DCC applications requires workload validation.
 
-- **Built for performance with Rust**
-  Engineered from the ground up in Rust to guarantee memory safety, zero-overhead performance, and rock-solid stability under the heaviest multi-gigabyte editing workloads.
+- **Built with Rust**
+  A Rust workspace implements the filesystem core, local cache, replication,
+  and platform bridges. Mounted benchmarks measure workload-specific performance.
 
 - **Self-hosted and open**
   Unlike proprietary SaaS alternatives, StudioFS is **100% open-source and
   self-hosted**, giving you control over your storage, metadata, and
-  infrastructure. No hidden telemetry included.
+  infrastructure.
 
 - **Cat logo**
   Because infrastructure is better with a little personality. 🐱
@@ -52,24 +56,28 @@ then upload changed files back to shared storage.
 
 StudioFS is designed to remove that loop:
 
-- **Instant start**
-  StudioFS fetches only the file bytes that are actually needed. An artist opens
-  a project and can start working with video, geometry, or cache files without a
-  full local copy first.
+- **On-demand reads**
+  StudioFS can read a file without downloading the whole file first. Fetches
+  operate on payload fragments or authenticated frame ranges, and readahead can
+  fetch more than the application's requested bytes.
 
 - **Background upload**
   Saves are accepted locally first, so the artist can keep working. StudioFS then
   uploads the new data to S3-compatible storage in the background.
 
 - **Freedom of deployment**
-  Run the system on your own infrastructure with any S3-compatible storage
+  Run the system on your own infrastructure with an S3-compatible storage
   backend, such as AWS S3, RustFS, or Backblaze B2, plus PostgreSQL for shared
   metadata coordination.
 
-- **Security and end-to-end encryption**
-  Encryption support is in development. The intended model is to store source
-  assets in encrypted form in S3-compatible storage and decrypt them on local
-  workstations, while keeping key management simple for studio administrators.
+- **Remote payload encryption at rest**
+  StudioFS encrypts remote payload fragments with XChaCha20-Poly1305 and
+  decrypts them on clients. Volume keys are managed automatically in metadata;
+  local caches and metadata remain plaintext. This protects the object-storage
+  boundary, not a compromised metadata service or workstation. Transport
+  encryption is configured separately; see the
+  [encryption-at-rest contract](docs/encryption-at-rest-contract.md) and
+  [transport contract](docs/transport-encryption-contract.md).
 
 ## How It Works
 
@@ -77,7 +85,7 @@ StudioFS combines S3-compatible object storage with local caching and
 PostgreSQL-backed metadata coordination:
 
 - **Cloud storage holds the assets**
-  Heavy media and project data are stored as immutable objects in
+  Published file payloads are stored as immutable encrypted fragments in
   S3-compatible storage.
 
 - **PostgreSQL coordinates the team**
@@ -86,40 +94,49 @@ PostgreSQL-backed metadata coordination:
   metadata updates.
 
 - **Local cache keeps active work fast**
-  StudioFS caches only the regular-file byte ranges that are actually accessed.
-  This range-oriented, on-demand cache reduces disk usage, lowers network
-  traffic, and hides most remote-storage latency.
+  StudioFS caches fetched payloads and stages locally written data. Reads may
+  fetch complete fragments, use authenticated partial reads, or trigger
+  prefetch; cache usage is not limited to the exact bytes requested by an app.
 
 - **Local-first runtime keeps the mount responsive**
   Interactive filesystem operations use local state first. Metadata lives in the
   embedded `redb` database, written data becomes visible locally immediately,
   and background workers upload payloads and replicate metadata through
-  PostgreSQL.
+  PostgreSQL. Shared file-lock coordination is an explicit exception that may
+  require foreground PostgreSQL access.
 
 ## Technical Foundation
 
-StudioFS mounts S3-compatible object storage as a local cross-platform drive, using PostgreSQL for shared metadata storage and replication between clients. 
+StudioFS mounts S3-compatible object storage as a local cross-platform drive,
+using PostgreSQL for shared metadata storage and replication between clients.
 
 It is built around a local-first runtime model:
+
 - foreground filesystem operations work from local state,
 - file payloads are stored in immutable S3 objects,
 - shared metadata converges through PostgreSQL background sync,
-- RAM and disk cache tiers hide most remote latency.
+- RAM and disk caches reduce repeated remote reads.
 
 ## Current Architecture
 
 ```
-studiofs (CLI)
-  ├── studiofs-meta       local metadata + PostgreSQL delta sync
-  ├── studiofs-data       S3 object I/O + object format
-  ├── studiofs-cache      local payload backend + upload queue
-  ├── studiofs-vfs        filesystem core
-  ├── studiofs-macfuse    macOS bridge
-  ├── studiofs-winfsp     Windows bridge
-  └── studiofs-e2e        real mounted E2E runner
+StudioFS workspace
+  ├── studiofs              CLI and runtime assembly
+  ├── studiofs-meta         local metadata + PostgreSQL delta sync
+  ├── studiofs-data         S3 object I/O + object format
+  ├── studiofs-cache        local payload backend + upload queue
+  ├── studiofs-vfs          filesystem core
+  ├── studiofs-bridge       shared platform-neutral bridge helpers
+  ├── studiofs-linux-fuse   Linux libfuse3 low-level bridge
+  ├── studiofs-macfuse      macOS macFUSE bridge (legacy or opt-in FSKit)
+  ├── studiofs-winfsp       Windows bridge
+  ├── studiofs-e2e          real mounted E2E runner
+  ├── studiofs-scenario     shared scenario model and simulation
+  └── studiofs-test-support shared test helpers
 ```
 
 Key points:
+
 - PostgreSQL is the shared metadata backend.
 - Local metadata lives in `redb`; PostgreSQL is used for bootstrap, checkpoints, and ordered delta replication.
 - Writes become readable locally before remote upload/metadata publish fully completes.
@@ -131,35 +148,53 @@ Key points:
 - S3-compatible data path via Apache OpenDAL
 - Local-first metadata path with eventual multi-client convergence
 - Local payload backend + upload queue
-- Append-only ingress and crash recovery for accepted local writes
-- Cross-platform mounts: WinFSP on Windows, FUSE on Linux/macOS
+- Chunk/slice writer buffers, local staging, and recovery of locally persisted state
+- Cross-platform mounts: WinFSP on Windows, libfuse3 on Linux, macFUSE on macOS
+  (legacy backend by default, opt-in FSKit backend)
 - Background upload, janitor, and metadata sync workers
 - Snapshot v2 PostgreSQL control plane with retained, version-bounded sources
 - Snapshot source replay is thin: serving checkpoints and bounded event ranges
   are retained without replicating a full local snapshot through normal metadata
   state or event payloads
 
+Local acceptance, local durability, and peer visibility are separate boundaries.
+Successful `write` makes bytes readable on the writing mount but can leave them
+only in memory. Ordinary flush and final release can return before the local
+metadata commit. `fsync` drains local state; Durable cache mode syncs payloads
+for local crash recovery, while Fast mode does not force payload fsync/dirsync.
+None of these operations waits for peer publication. See the
+[mounted-IO contract](docs/juicefs-local-first-rust-contract.md) for the exact
+durability and recovery rules.
+
 ## Quick Start
 
-Initialize a new volume:
+Install the platform mount prerequisites first: libfuse3 on Linux, macFUSE on
+macOS, or WinFSP on Windows. See [development setup](docs/development.md).
+
+Initialize a new volume (Bash example, with local S3-compatible storage and
+PostgreSQL already running; replace these development credentials as needed):
 
 ```bash
 studiofs init myvolume \
-  --endpoint http://127.0.0.1:9000 \ ## needs local minio/rustfs running
+  --endpoint http://127.0.0.1:9000 \
   --bucket studiofs-test \
   --access-key studiofs \
   --secret-key studiofs123 \
-  --meta postgres://studiofs:studiofs@127.0.0.1:5432 ## needs local postgres running
+  --meta postgres://studiofs:studiofs@127.0.0.1:5432
 ```
 
 Mount it:
 
 ```bash
 studiofs mount myvolume Z:
-studiofs mount myvolume /mnt/studio
+studiofs mount myvolume /mnt/studio/myvolume
 ```
 
-Windows and macOS use the standard Local-First runtime path for mounts.
+Choose the command for your platform: a drive letter on Windows or a directory
+on Linux/macOS. A directory base path that does not end in the volume name has
+the volume name appended automatically.
+
+Linux, macOS, and Windows use the shared local-first runtime path for mounts.
 Foreground I/O follows normal buffered read/write flow while upload and
 file-version publication continue asynchronously in the background.
 
@@ -177,23 +212,32 @@ studiofs mount myvolume Y:
 | `init` | Create a new volume and register it in PostgreSQL |
 | `discover` | Bootstrap a new client from an existing PostgreSQL-backed volume |
 | `mount` | Mount a volume as a local filesystem |
+| `smount` | Mount a Ready snapshot as a read-only filesystem |
 | `umount` | Unmount an active mountpoint |
-| `status` | Show local/runtime volume status |
-| `janitor` | Scan and clean orphaned remote objects |
-| `fsck` | Scan/repair metadata inconsistencies (dangling entries, orphans, undo state) |
-| `dump` | Export a PostgreSQL metadata dump for a volume (after sync) |
+| `status` | Show volume status, PostgreSQL binding, and local/runtime counters |
+| `settings` | Show or update persistent client settings and runtime tuning |
+| `snapshot` | Create, list, inspect, delete, and schedule whole-volume snapshots |
+| `janitor` | Scan and delete orphaned remote objects; `--dry-run` only reports candidates |
+| `fsck` | Check and optionally repair dangling entries, orphan inodes, link counts, and pending/deferred state |
+| `dump` | Sync local metadata to PostgreSQL, then export a metadata dump |
 | `load` | Import a metadata dump into PostgreSQL |
 | `perf` | Watch live runtime stats from a mounted StudioFS volume |
 | `bench` | Run the fixed public mounted filesystem benchmark |
 | `devbench` | Run a configurable developer mounted filesystem benchmark |
-| `destroy` | Remove a volume locally or locally + remotely |
+| `test` | Collect a mounted write-path test report |
+| `destroy` | Permanently remove local metadata and remote data/metadata; `--local` keeps remote state |
 
 Run `studiofs --help` or `studiofs <command> --help` for full usage.
 
-Size inputs used by CLI flags and runtime `STUDIOFS_*_BYTES` environment
-variables accept `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `EB` suffixes (binary
-units, `1KB = 1024B`) and fractional values like `1.5GB` (rounded down to
-bytes).
+CLI size options such as `--cache-size` and `--read-buffer` accept `B`, `KB`,
+`MB`, `GB`, `TB`, `PB`, `EB` suffixes in binary units (`1KB = 1024B`) and
+fractional values such as `1.5GB`. The shared parser truncates fractional bytes;
+`--read-buffer` then rounds up to whole MiB. The same size syntax applies to
+these mount environment overrides: `STUDIOFS_WRITER_PAGE_SIZE_BYTES`,
+`STUDIOFS_XATTR_MAX_BYTES`, `STUDIOFS_DENTRY_CACHE_BYTES`,
+`STUDIOFS_PATH_SHORTCUT_CACHE_BYTES`, and `STUDIOFS_ATTR_READ_CACHE_BYTES`.
+Other byte-count variables, including PostgreSQL sync/checkpoint limits, may
+require integer bytes; see [configuration](docs/configuration.md).
 
 Benchmark and statistics tooling uses the mounted filesystem path. Use
 `studiofs perf` for live runtime counters, `studiofs bench` for the fixed public
@@ -204,7 +248,8 @@ the comparison methodology and known limits.
 
 ## Development
 
-Build:
+Build (Rust 1.95 or newer; see the platform dependencies in
+[development setup](docs/development.md)):
 
 ```bash
 cargo build --release
@@ -213,7 +258,7 @@ cargo build --release
 Checks:
 
 ```bash
-cargo fmt --all
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -W missing-docs
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
@@ -223,14 +268,16 @@ Workspace lint policy is inherited from the root `[workspace.lints]` tables.
 Member crates opt in with `[lints] workspace = true`; keep new shared lints
 low-noise and stage broad hygiene migrations separately.
 
-Fast test suite:
+Workspace tests (excluding ignored tests; some tests require local services):
 
 ```bash
 cargo test --workspace --all-targets -- --nocapture
 ```
 
-CI verification is manual-only: RWX covers Linux quality/Linux lanes, and
-GitHub Actions remains available for hosted macOS and Windows lanes. See
+The main RWX Linux lanes and hosted macOS/Windows verification workflow are
+manually triggered. The focused
+[payload-read regression workflow](.github/workflows/payload-read-regression.yml)
+also runs automatically on matching pull requests. See
 [`.github/workflows/rust.yml`](.github/workflows/rust.yml),
 [`docs/development.md`](docs/development.md), and
 [`docs/contributing.md`](docs/contributing.md) for the full verification
@@ -239,7 +286,7 @@ platform-specific changes. macOS and Windows jobs include explicit named steps
 for their backend crates (`studiofs-macfuse` on macOS, `studiofs-winfsp` on
 Windows) so regressions in platform-specific code are immediately attributable
 in the CI log. Linux mounts use the `studiofs-linux-fuse` libfuse3 low-level
-bridge and have explicit Ubuntu/Rocky mounted validation gates.
+bridge. RWX mounted E2E targets run on Ubuntu; the Rocky lane runs workspace tests.
 
 Infra-heavy ignored suite:
 
@@ -247,13 +294,17 @@ Infra-heavy ignored suite:
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
-Real mounted E2E runner skeleton:
+Real mounted E2E runner (build the product binary first and select a scenario
+from `list`):
 
 ```bash
+cargo build -p studiofs
 cargo run -p studiofs-e2e -- list
-cargo run -p studiofs-e2e -- run --scenario X-Y,Z --studiofs-bin <PATH TO studiofs BINARY>
+cargo run -p studiofs-e2e -- run --scenario basic-multi-client-smoke --studiofs-bin target/debug/studiofs
 cargo run -p studiofs-e2e -- clean
 ```
+
+On Windows, use `target/debug/studiofs.exe` for `--studiofs-bin`.
 
 The E2E runner starts `docker/compose.e2e.yml` by default. The compose stack
 contains PostgreSQL 18, RustFS, and a Toxiproxy placeholder, waits for healthy
@@ -272,6 +323,7 @@ cp .env.example .env
 ```
 
 Useful test/runtime variables include:
+
 - `STUDIOFS_S3_ENDPOINT`
 - `STUDIOFS_S3_ACCESS_KEY`
 - `STUDIOFS_S3_SECRET_KEY`
@@ -285,6 +337,7 @@ Project docs live in [docs/](docs/):
 - [docs/roadmap.md](docs/roadmap.md) - future development plans
 - [docs/examples.md](docs/examples.md) - usage variants and examples
 - [docs/architecture.md](docs/architecture.md) - current system design and data flow
+- [docs/juicefs-local-first-rust-contract.md](docs/juicefs-local-first-rust-contract.md) - canonical mounted-IO and local durability contract
 - [docs/configuration.md](docs/configuration.md) - CLI commands, flags, env vars
 - [docs/development.md](docs/development.md) - local setup, build, and test workflow
 - [docs/contributing.md](docs/contributing.md) - verification matrix, CI ownership, platform-specific code rules
@@ -296,6 +349,8 @@ Project docs live in [docs/](docs/):
 - [docs/cache.md](docs/cache.md) - local cache backend, staged writeback, and upload flow
 - [docs/vfs.md](docs/vfs.md) - filesystem runtime behavior
 - [docs/data-layer.md](docs/data-layer.md) - S3 object I/O and format details
+- [docs/encryption-at-rest-contract.md](docs/encryption-at-rest-contract.md) - remote payload encryption and plaintext local boundaries
+- [docs/transport-encryption-contract.md](docs/transport-encryption-contract.md) - S3 and PostgreSQL transport policy
 - [docs/platform-bridges.md](docs/platform-bridges.md) - WinFSP and FUSE integration
 
 ## Credits and Inspiration
