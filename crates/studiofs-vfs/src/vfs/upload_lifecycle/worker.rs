@@ -2382,14 +2382,11 @@ impl UploadLifecycleWorker {
         delayed: &mut DelayedUploads,
         op: PendingUpload,
     ) {
-        let deleted_inodes = self.vfs.state.upload.deleted_inodes.lock();
-        let deleted = deleted_inodes.contains(&op.ino);
-        if !deleted {
+        if self.queued_upload_deleted_before_dispatch(op.ino) {
+            self.cancel_deleted_queued_upload(op);
+        } else {
             Self::enqueue_pending_upload(ready, delayed, op, self.vfs.upload_delay);
-            return;
         }
-        drop(deleted_inodes);
-        self.cancel_deleted_queued_upload(op);
     }
 
     fn promote_ready_uploads(ready: &mut ReadyUploads, delayed: &mut DelayedUploads) {
