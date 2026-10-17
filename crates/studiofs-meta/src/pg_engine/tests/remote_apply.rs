@@ -1160,6 +1160,53 @@ fn project_local_batch_hides_brand_new_empty_regular_file_namespace() {
 }
 
 #[test]
+fn project_local_batch_exposes_empty_file_published_after_rewrite_in_draft_window() {
+    // AJA restart: create, write, truncate to 0, then publish the empty epoch in one window.
+    let draft = InodeAttr::new_file(ROOT_INO + 12, ROOT_INO, 0, 0, 0o644);
+    let mut rewriting = draft.clone();
+    rewriting.content_epoch = 2;
+    rewriting.upload_state = UploadState::Uploading;
+    let mut published = rewriting.clone();
+    published.committed_content_epoch = 2;
+    published.upload_state = UploadState::Ready;
+    let add_entry = MetaEvent::AddEntry {
+        parent: ROOT_INO,
+        name: b"ajadisktest.dat".to_vec(),
+        entry: DirEntryValue {
+            ino: draft.ino,
+            kind: FileType::RegularFile,
+        },
+    };
+
+    let projected = RemoteApplyCoordinator::project_local_batch(&[
+        MetaEvent::SetAttr { attr: draft },
+        add_entry.clone(),
+        MetaEvent::SetAttr { attr: rewriting },
+        add_entry.clone(),
+        MetaEvent::PublishRegularFileBaseSlices {
+            ino: published.ino,
+            chunk_slices: vec![(ChunkId(0), Vec::new())],
+        },
+        MetaEvent::SetAttr {
+            attr: published.clone(),
+        },
+    ]);
+
+    assert!(
+        projected.events.contains(&add_entry),
+        "a published empty rewrite must carry its namespace binding to PG: {:?}",
+        projected.events
+    );
+    assert!(
+        projected
+            .events
+            .contains(&MetaEvent::SetAttr { attr: published }),
+        "a published empty rewrite must expose its committed attr: {:?}",
+        projected.events
+    );
+}
+
+#[test]
 fn remote_snapshot_hides_uncommitted_regular_file_namespace() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let draft = pg
@@ -2930,6 +2977,138 @@ fn recent_flush_dentry_reconcile_applies_deferred_foreign_base_entry() {
             .expect("remote slot visible after reconcile")
             .ino,
         remote_ino
+    );
+}
+
+#[test]
+fn dentry_reconcile_preserves_unpublished_local_payload_after_self_ack() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+
+    let local_start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    let local_file = pg
+        .create_file(ROOT_INO, b"pending-local-payload.bin", 0, 0, 0o644)
+        .expect("create local file");
+    pg.create_dir(ROOT_INO, b"self-ack-anchor", 0, 0, 0o755)
+        .expect("create visible self-ack anchor");
+    let key = encode_dentry_key(ROOT_INO, b"pending-local-payload.bin");
+    let create_end = pg
+        .local
+        .get_counter(NEXT_EVENT_SEQ)
+        .expect("create event end");
+    let local_events = pg
+        .local
+        .read_events_range(local_start, create_end)
+        .expect("read create events");
+    let local_projection = RemoteApplyCoordinator::project_local_batch(&local_events);
+    assert!(
+        !local_projection.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == local_file.ino)
+        ),
+        "self-ack before publication must filter the draft AddEntry"
+    );
+    apply_visible_self_batch(&pg, &local_projection.events)
+        .expect("apply filtered pre-publication self batch");
+    acknowledge_local_prefix_from_self_batch(&pg, &local_projection.events)
+        .expect("ack pre-publication local prefix");
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        create_end,
+        "self-ack should retire the local-only namespace prefix"
+    );
+
+    set_file_state(&pg, local_file.ino, 4096, 1);
+    pg.stage_payload_slice(local_file.ino, 0, &PayloadRef::new_partial(91_101, 4096))
+        .expect("stage local-only payload");
+
+    let overlay_after_ack = pg.local_overlay_conflicts().expect("overlay after ack");
+    assert!(
+        !overlay_after_ack.dentry_keys.contains(&key),
+        "self-ack should clear the flushed dentry key from the local event overlay"
+    );
+    assert!(
+        RemoteApplyCoordinator::new(&pg.local)
+            .local_regular_file_state_needs_foreign_protection(local_file.ino)
+            .expect("check unpublished inode protection"),
+        "the staged local payload should remain protected until publication"
+    );
+
+    assert!(
+        !RemoteApplyCoordinator::new(&pg.local)
+            .reconcile_serving_dentries_from_base_with_overlay(
+                &HashSet::from([key.clone()]),
+                &overlay_after_ack,
+            )
+            .expect("reconcile dentry"),
+        "reconcile should leave a locally protected dentry untouched"
+    );
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"pending-local-payload.bin")
+            .expect("unpublished local file must remain visible")
+            .ino,
+        local_file.ino,
+        "dentry reconcile must preserve the name while its local payload is unpublished"
+    );
+
+    mark_overlay_objects_uploaded(&pg, local_file.ino, 1, &[91_101]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(local_file.ino, 1)
+            .expect("publish local payload"),
+        "uploaded local payload should publish"
+    );
+    let publish_end = pg
+        .local
+        .get_counter(NEXT_EVENT_SEQ)
+        .expect("publish event end");
+    let publish_events = pg
+        .local
+        .read_events_range(create_end, publish_end)
+        .expect("read publish events");
+    let publish_projection = RemoteApplyCoordinator::project_local_batch(&publish_events);
+    assert!(
+        publish_projection.events.iter().any(
+            |event| matches!(event, MetaEvent::AddEntry { entry, .. } if entry.ino == local_file.ino)
+        ),
+        "publication must project an AddEntry for the retained local binding"
+    );
+    apply_visible_self_batch(&pg, &publish_projection.events).expect("apply published self batch");
+    acknowledge_local_prefix_from_self_batch(&pg, &publish_projection.events)
+        .expect("ack published self batch");
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        publish_end,
+        "published self-ack should advance through the publication events"
+    );
+    assert!(
+        !pg.local_overlay_conflicts()
+            .expect("overlay after publication")
+            .dentry_keys
+            .contains(&key),
+        "published binding should no longer depend on the local event overlay"
+    );
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"pending-local-payload.bin")
+            .expect("name retained after payload publication")
+            .ino,
+        local_file.ino,
+        "published local name should remain visible after self-ack"
+    );
+
+    let overlay_after_publish = pg.local_overlay_conflicts().expect("overlay after publish");
+    assert!(
+        RemoteApplyCoordinator::new(&pg.local)
+            .reconcile_serving_dentries_from_base_with_overlay(
+                &HashSet::from([key]),
+                &overlay_after_publish,
+            )
+            .expect("reconcile published dentry"),
+        "deferred reconciliation should apply the now-published base binding"
+    );
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"pending-local-payload.bin")
+            .expect("published base dentry should remain visible")
+            .ino,
+        local_file.ino,
+        "reconciliation after publication must retain the current name"
     );
 }
 

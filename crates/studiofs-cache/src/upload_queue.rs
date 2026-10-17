@@ -1156,10 +1156,20 @@ mod tests {
         assert_eq!(queued.object_file_offset, 4096);
         assert_eq!(queued.content_epoch, 2);
 
+        assert!(
+            !queue.requeue(current.clone()),
+            "a canceled old worker must not requeue over its rebased queue owner"
+        );
+        assert!(
+            !queue.cancel(&current),
+            "a canceled old worker must not remove its rebased queue owner"
+        );
+
         let pending = queue.snapshot_pending();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].offset, 4096);
         assert_eq!(pending[0].content_epoch, 2);
+        assert_eq!(pending[0], rebased);
         assert!(!queue.complete(&current));
         assert!(queue.complete(&rebased));
     }

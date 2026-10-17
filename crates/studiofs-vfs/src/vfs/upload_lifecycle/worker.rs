@@ -493,6 +493,18 @@ where
                     return UploadOutcome::CancelledDeleted;
                 }
 
+                // A superseding write can cancel this worker while local payload
+                // I/O is in flight. If that I/O then fails, the error belongs to
+                // the obsolete operation and must not poison the inode's writes.
+                if upload_cancel_token.is_cancelled() {
+                    if self.coordinator.requeue_upload(op.clone()) {
+                        self.shutdown.record_requeue();
+                        return UploadOutcome::Requeued;
+                    }
+                    self.shutdown.record_canceled_stale();
+                    return UploadOutcome::CancelledStale;
+                }
+
                 if let Err(state_error) = self.local_payloads.mark_upload_failed(op.object_id) {
                     warn!(
                         object_id = op.object_id,
@@ -2660,6 +2672,66 @@ mod tests {
         FakePolicy,
     >;
 
+    #[derive(Clone)]
+    struct GatedVfsUploadLocalPayloadPort {
+        inner: VfsUploadLocalPayloadPort,
+        read_entered: Arc<tokio::sync::Notify>,
+        release_read: Arc<tokio::sync::Notify>,
+    }
+
+    impl UploadLocalPayloadPort for GatedVfsUploadLocalPayloadPort {
+        fn mark_uploading(&self, object_id: u64) -> VfsResult<()> {
+            self.inner.mark_uploading(object_id)
+        }
+
+        fn mark_upload_failed(&self, object_id: u64) -> VfsResult<()> {
+            self.inner.mark_upload_failed(object_id)
+        }
+
+        async fn prepare_local_priority_read(&self, object_id: u64) -> VfsResult<()> {
+            self.inner.prepare_local_priority_read(object_id).await
+        }
+
+        async fn read_for_upload(
+            &self,
+            object_id: u64,
+            payload_len: u64,
+        ) -> VfsResult<Option<Bytes>> {
+            self.read_entered.notify_one();
+            self.release_read.notified().await;
+            self.inner.read_for_upload(object_id, payload_len).await
+        }
+
+        async fn remove(&self, object_id: u64) -> VfsResult<()> {
+            self.inner.remove(object_id).await
+        }
+
+        async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()> {
+            self.inner.mark_uploaded(object_id).await
+        }
+
+        async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()> {
+            self.inner.remove_upload_hot(object_id).await
+        }
+
+        async fn remove_upload_stage(&self, object_id: u64) -> VfsResult<()> {
+            self.inner.remove_upload_stage(object_id).await
+        }
+
+        fn open_handle_count(&self, ino: Ino) -> usize {
+            self.inner.open_handle_count(ino)
+        }
+
+        fn record_deferred_deleted_local_payload(&self, ino: Ino, object_id: u64) {
+            self.inner
+                .record_deferred_deleted_local_payload(ino, object_id);
+        }
+
+        fn clear_pending_eviction(&self, object_id: u64) -> bool {
+            self.inner.clear_pending_eviction(object_id)
+        }
+    }
+
     #[test]
     fn active_upload_worker_guard_decrements_on_drop() {
         let active_workers = AtomicUsize::new(0);
@@ -2854,6 +2926,8 @@ mod tests {
     struct FakeLocalPayloads {
         trace: FakeUploadTrace,
         upload_reads: Arc<Mutex<HashMap<u64, Option<Bytes>>>>,
+        fail_read_for_upload: Arc<AtomicBool>,
+        cancel_token_during_read: Arc<Mutex<Option<CancellationToken>>>,
         removed: Arc<Mutex<Vec<u64>>>,
         upload_hot_removed: Arc<Mutex<Vec<u64>>>,
         upload_stage_removed: Arc<Mutex<Vec<u64>>>,
@@ -2891,6 +2965,14 @@ mod tests {
             object_id: u64,
             _payload_len: u64,
         ) -> VfsResult<Option<Bytes>> {
+            if let Some(token) = self.cancel_token_during_read.lock().take() {
+                token.cancel();
+            }
+            if self.fail_read_for_upload.swap(false, Ordering::Relaxed) {
+                return Err(VfsError::Other(
+                    "injected upload payload read failure".into(),
+                ));
+            }
             Ok(self
                 .upload_reads
                 .lock()
@@ -3860,6 +3942,105 @@ mod tests {
         assert!(coordinator.cancelled.lock().is_empty());
         assert!(local_payloads.failed.lock().is_empty());
         assert!(policy.sticky_errors.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_upload_ignores_read_error_after_supersede_cancellation() {
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        local_payloads
+            .fail_read_for_upload
+            .store(true, Ordering::Relaxed);
+        *local_payloads.cancel_token_during_read.lock() =
+            Some(shutdown.upload_cancel_token.clone());
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(coordinator.completed.lock().is_empty());
+        assert!(coordinator.cancelled.lock().is_empty());
+        assert!(local_payloads.failed.lock().is_empty());
+        assert!(policy.sticky_errors.lock().is_empty());
+    }
+
+    #[test]
+    fn process_upload_does_not_poison_inode_when_cancel_cleanup_removes_staged_payload() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "cancel-removes-stage-during-read");
+
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"cancel-removes-stage-during-read.bin", 0, 0, 0o644)
+                .expect("create test file");
+            let ino = attr.ino;
+            vfs.write(ino, 0, b"payload bytes")
+                .await
+                .expect("write local payload");
+            vfs.flush(ino).await.expect("stage upload payload");
+            let op = vfs
+                .pending_uploads_snapshot_for_inode(ino)
+                .into_iter()
+                .next()
+                .expect("flush queues an upload");
+            let object_id = op.object_id;
+
+            let read_entered = Arc::new(tokio::sync::Notify::new());
+            let release_read = Arc::new(tokio::sync::Notify::new());
+            let processor = UploadProcessor {
+                coordinator: VfsCachedStorePort { vfs: vfs.clone() },
+                local_payloads: GatedVfsUploadLocalPayloadPort {
+                    inner: VfsUploadLocalPayloadPort { vfs: vfs.clone() },
+                    read_entered: read_entered.clone(),
+                    release_read: release_read.clone(),
+                },
+                meta: VfsUploadMetaPort { vfs: vfs.clone() },
+                remote: FakeRemote::default(),
+                shutdown: VfsUploadShutdownPort { vfs: vfs.clone() },
+                policy: VfsUploadPolicyPort { vfs: vfs.clone() },
+                block_size: vfs.block_size,
+                upload_requeue_base: Duration::ZERO,
+                upload_requeue_max: Duration::ZERO,
+            };
+            let upload = tokio::spawn(async move { processor.process_upload(op.clone()).await });
+            tokio::time::timeout(Duration::from_secs(2), read_entered.notified())
+                .await
+                .expect("worker reached the local payload read");
+
+            // Exercise the real queue/token cancellation and local payload cleanup
+            // while the worker is poised to read the staged object.
+            vfs.cancel_pending_uploads_for_inode(ino);
+            vfs.cached_store().remove_hot_upload(object_id);
+            vfs.cached_store()
+                .remove_staged_upload(object_id)
+                .expect("remove staged payload");
+            vfs.cached_store()
+                .remove(object_id)
+                .expect("remove local payload");
+            release_read.notify_one();
+
+            let outcome = tokio::time::timeout(Duration::from_secs(2), upload)
+                .await
+                .expect("upload cancellation completes")
+                .expect("upload processor task");
+            assert_eq!(outcome, UploadOutcome::CancelledStale);
+            assert_eq!(vfs.cached_store().pending_upload_count(), 0);
+            assert!(
+                !vfs.state
+                    .upload
+                    .upload_sticky_errors
+                    .lock()
+                    .contains_key(&ino),
+                "superseded payload cleanup must not publish a sticky inode error"
+            );
+        });
     }
 
     #[tokio::test]

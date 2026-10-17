@@ -223,7 +223,7 @@ pub(super) fn decode_inode_prefix(key: &[u8], key_kind: &str) -> MetaResult<Ino>
 }
 
 /// Decode a dentry key back to (parent_ino, name).
-pub(super) fn decode_dentry_key(key: &[u8]) -> MetaResult<(Ino, &[u8])> {
+pub(crate) fn decode_dentry_key(key: &[u8]) -> MetaResult<(Ino, &[u8])> {
     let parent = decode_inode_prefix(key, "dentry")?;
     let name = key
         .get(8..)
