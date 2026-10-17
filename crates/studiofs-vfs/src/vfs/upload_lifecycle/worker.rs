@@ -2310,6 +2310,7 @@ impl UploadLifecycleWorker {
             if self.vfs.uploader_shutdown_requested() {
                 break;
             }
+            Self::reap_ready_workers(&mut workers);
             if self.fill_pending_upload_window(
                 &mut ready,
                 &mut delayed,
@@ -2317,16 +2318,37 @@ impl UploadLifecycleWorker {
                 scheduling_window,
             ) > 0
             {
-                // A page can be entirely canceled; keep draining without another wakeup.
-                tokio::task::yield_now().await;
+                // Cancellation-only pages must drain cooperatively without another wakeup.
+                if ready.is_empty() {
+                    tokio::task::yield_now().await;
+                }
                 continue;
             }
-            if inbound_closed && ready.is_empty() && delayed.is_empty() && workers.is_empty() {
+            let next_pending_deadline = if ready.is_empty()
+                && Self::queued_upload_count(&ready, &delayed) + workers.len() < scheduling_window
+            {
+                self.vfs
+                    .cached_store
+                    .next_pending_upload_deadline(self.vfs.upload_delay)
+            } else {
+                None
+            };
+            if inbound_closed
+                && ready.is_empty()
+                && delayed.is_empty()
+                && workers.is_empty()
+                && next_pending_deadline.is_none()
+            {
                 break;
             }
 
             let next_delayed_wait = if ready.is_empty() {
                 Self::next_delayed_wait(&delayed)
+                    .into_iter()
+                    .chain(next_pending_deadline.map(|deadline| {
+                        Duration::from_millis(deadline.saturating_sub(now_unix_millis()))
+                    }))
+                    .min()
             } else {
                 None
             };
@@ -2402,7 +2424,14 @@ impl UploadLifecycleWorker {
         if capacity == 0 {
             return 0;
         }
-        let page = self.vfs.cached_store.claim_pending_uploads(capacity);
+        let page = {
+            let deleted_inodes = self.vfs.state.upload.deleted_inodes.lock();
+            self.vfs.cached_store.claim_pending_uploads(
+                capacity,
+                self.vfs.upload_delay,
+                &deleted_inodes,
+            )
+        };
         let claimed = page.len();
         for op in page {
             self.enqueue_or_cancel_deleted_pending_upload(ready, delayed, op);
@@ -4418,6 +4447,104 @@ mod tests {
     }
 
     #[test]
+    fn pending_upload_window_leaves_future_retries_in_cache_and_admits_fresh_work() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "window-retry-admission");
+        for object_id in 1..=40 {
+            vfs.cached_store().submit_upload(7_001, 0, object_id, 1);
+        }
+        for mut op in vfs.pending_uploads_snapshot() {
+            op.not_before_unix_ms = u64::MAX;
+            op.retry_count = 1;
+            assert!(vfs.cached_store().requeue_upload(op));
+        }
+        vfs.cached_store().submit_upload(7_002, 0, 41, 1);
+        let worker = UploadLifecycleWorker::new(vfs.clone());
+        let mut ready = ReadyUploads::default();
+        let mut delayed = DelayedUploads::default();
+        worker.fill_pending_upload_window(&mut ready, &mut delayed, 0, 8);
+        assert_eq!(ready.pop_front().map(|op| op.object_id), Some(41));
+        assert!(
+            delayed.is_empty(),
+            "future retries must not consume the window"
+        );
+        assert_eq!(vfs.cached_store().pending_upload_count(), 41);
+
+        vfs.mark_inode_deleted_for_uploads(7_001);
+        while worker.fill_pending_upload_window(&mut ready, &mut delayed, 0, 8) > 0 {}
+        assert_eq!(vfs.cached_store().pending_upload_count(), 1);
+        assert!(!vfs.cached_store().has_pending_uploads_for_ino(7_001));
+    }
+
+    #[test]
+    fn upload_worker_dispatches_fresh_work_while_future_retries_wait_in_cache() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "retry-fresh-dispatch");
+        for object_id in 1..=40 {
+            vfs.cached_store().submit_upload(7_001, 0, object_id, 1);
+        }
+        for mut op in vfs.pending_uploads_snapshot() {
+            op.not_before_unix_ms = u64::MAX;
+            assert!(vfs.cached_store().requeue_upload(op));
+        }
+        vfs.cached_store().submit_upload(7_002, 0, 41, 1);
+        let channels = vfs.startup.claim_channels_for_start().unwrap().unwrap();
+        drop(channels.prefetch_rx);
+        rt.block_on(async {
+            let worker =
+                tokio::spawn(UploadLifecycleWorker::new(vfs.clone()).run(channels.upload_rx));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while vfs.cached_store().has_pending_uploads_for_ino(7_002) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect(
+                "fresh missing-inode upload should dispatch and cancel without waiting for retries",
+            );
+            assert_eq!(vfs.cached_store().pending_upload_count(), 40);
+            vfs.mark_inode_deleted_for_uploads(7_001);
+            assert!(vfs.wait_for_uploads_idle(Duration::from_secs(2)).await);
+            vfs.request_uploader_shutdown();
+            tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn upload_worker_drains_future_retry_at_deadline_without_channel_wakeup() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "retry-deadline-wakeup");
+        vfs.cached_store().submit_upload(7_001, 0, 1, 1);
+        let mut op = vfs.pending_uploads_snapshot().pop().unwrap();
+        let deadline = now_unix_millis().saturating_add(150);
+        op.not_before_unix_ms = deadline;
+        assert!(vfs.cached_store().requeue_upload(op));
+        let mut channels = vfs.startup.claim_channels_for_start().unwrap().unwrap();
+        channels
+            .upload_rx
+            .try_recv()
+            .expect("consume the coalesced wakeup");
+        drop(channels.prefetch_rx);
+        rt.block_on(async {
+            let worker =
+                tokio::spawn(UploadLifecycleWorker::new(vfs.clone()).run(channels.upload_rx));
+            assert!(vfs.wait_for_uploads_idle(Duration::from_secs(2)).await);
+            assert!(
+                now_unix_millis() >= deadline,
+                "retry must not dispatch early"
+            );
+            vfs.request_uploader_shutdown();
+            tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
     fn pending_upload_window_bounds_ready_delayed_and_active_descriptors() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "bounded-upload-window");
@@ -4478,7 +4605,7 @@ mod tests {
         }
         let mut retry = vfs
             .cached_store()
-            .claim_pending_uploads(1)
+            .claim_pending_uploads(1, Duration::ZERO, &HashSet::new())
             .pop()
             .expect("retry item");
         retry.retry_count = 2;
