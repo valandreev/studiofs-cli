@@ -2573,7 +2573,7 @@ impl AsyncFileSystemContext for StudioFsContext {
                     Ok(n)
                 }
                 Err(e) => {
-                    warn!(ino, fh, offset, requested = buffer.len(), error = %e, "WinFSP read failed");
+                    debug!(ino, fh, offset, requested = buffer.len(), error = %e, "WinFSP read failed");
                     Err(vfs_to_winfsp_err(e))
                 }
             }
