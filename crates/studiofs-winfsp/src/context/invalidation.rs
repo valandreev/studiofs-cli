@@ -88,6 +88,10 @@ impl PreparedWinfspNotifications {
             published: false,
         }
     }
+
+    pub(super) fn mark_published(&mut self) {
+        self.published = true;
+    }
 }
 
 impl Deref for PreparedWinfspNotifications {
@@ -303,6 +307,11 @@ impl WinfspInvalidationQueue {
         self.state.lock().pending_since
     }
 
+    #[cfg(test)]
+    pub(super) fn set_pending_since_for_test(&self, since: Instant) {
+        self.state.lock().pending_since = Some(since);
+    }
+
     fn record_failed_notification(&self) {
         let mut state = self.state.lock();
         state.delivery.failed_notifications = state.delivery.failed_notifications.saturating_add(1);
@@ -323,7 +332,7 @@ impl WinfspInvalidationQueue {
         batch: &InvalidationBatch,
         generation_complete: bool,
     ) -> InvalidationAcceptance {
-        let (targets, acceptance) = self.resolve_batch(batch);
+        let (targets, acceptance, writer_deferred) = self.resolve_batch(batch);
         let mut state = self.state.lock();
         if state.closed {
             state.delivery.failed_batches = state.delivery.failed_batches.saturating_add(1);
@@ -347,6 +356,13 @@ impl WinfspInvalidationQueue {
             }
             InvalidationAcceptance::Queued => (),
         }
+        // Writer deferral is retryable and leaves the generation uncovered,
+        // but it is not a delivery failure when the target was retained.
+        let acceptance = if writer_deferred {
+            InvalidationAcceptance::Failed
+        } else {
+            acceptance
+        };
         let mut changed = false;
         for (key, target) in targets {
             state.path_overrides.insert(key.clone(), target);
@@ -375,9 +391,10 @@ impl WinfspInvalidationQueue {
     ) -> (
         Vec<(NotificationKey, WinfspInvalidationOverride)>,
         InvalidationAcceptance,
+        bool,
     ) {
         let Some(vfs) = self.metrics_vfs.upgrade() else {
-            return (Vec::new(), InvalidationAcceptance::Failed);
+            return (Vec::new(), InvalidationAcceptance::Failed, false);
         };
         let mut acceptance = InvalidationAcceptance::Queued;
         let mut targets = Vec::new();
@@ -504,10 +521,7 @@ impl WinfspInvalidationQueue {
                 acceptance = failure;
             }
         }
-        if writer_deferred {
-            acceptance = InvalidationAcceptance::Failed;
-        }
-        (targets, acceptance)
+        (targets, acceptance, writer_deferred)
     }
 
     pub(crate) fn push_deleted_path(&self, ino: Ino, path: String, kind: FileType) {
@@ -530,6 +544,9 @@ impl WinfspInvalidationQueue {
             state.delivery.failed_notifications =
                 state.delivery.failed_notifications.saturating_add(1);
             return false;
+        }
+        if let (Some(current), Some(since)) = (state.pending_since.as_mut(), preserved_since) {
+            *current = (*current).min(since);
         }
         if state.pending.contains(&key) {
             state.coalesced = state.coalesced.saturating_add(1);
@@ -797,10 +814,13 @@ impl KernelInvalidator for WinfspKernelInvalidator {
 
     fn invalidation_delivery_failure_count(&self) -> u64 {
         let delivery = self.queue.delivery_snapshot();
+        // NotifyBegin rejection is retried by `PreparedWinfspNotifications::drop`;
+        // pending delivery age accounts for work that remains outstanding. A
+        // transient retry must not become a permanent coherence failure after
+        // the requeued notification is later submitted.
         delivery
             .failed_batches
             .saturating_add(delivery.failed_notifications)
-            .saturating_add(delivery.retried_batches)
     }
     fn inval_inode(&self, ino: u64) {
         self.queue.push(ino);
@@ -914,6 +934,6 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
             .delivery
             .submitted_notifications
             .saturating_add(submitted);
-        notifications.published = true;
+        notifications.mark_published();
     }
 }

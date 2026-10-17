@@ -1,7 +1,9 @@
 use super::LocalEventRange;
 use crate::engine::{MetaError, MetaResult};
 use crate::events::{MetaEvent, decode_event_with_type};
-use crate::redb_engine::layout::{encode_acl_rule_key, encode_dentry_key, encode_xattr_key};
+use crate::redb_engine::layout::{
+    decode_dentry_key, encode_acl_rule_key, encode_dentry_key, encode_xattr_key,
+};
 use crate::redb_engine::{RedbMetaEngine, RedbWriteTransaction};
 use crate::schema::{DEFAULT_CHUNK_SIZE, chunk_start_offset};
 use crate::types::*;
@@ -236,7 +238,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 let state = states.entry(attr.ino).or_default();
                 state.committed |= attr.committed_content_epoch > 0;
                 state.unready |= !Self::regular_file_attr_is_ready_for_serving(attr);
-                state.empty_draft |= attr.is_unpublished_empty_draft();
+                // Latest attr wins: a draft rewritten and published in one window is no longer empty.
+                state.empty_draft = attr.is_unpublished_empty_draft();
                 (attr.ino, state.hidden())
             }
             MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
@@ -2119,8 +2122,22 @@ impl<'a> RemoteApplyCoordinator<'a> {
         if dentry_keys.is_empty() {
             return Ok(false);
         }
-        self.local
-            .reconcile_serving_dentries_from_base(dentry_keys, &overlay.dentry_keys)
+        let txn = self.local.begin_write_txn()?;
+        match self.reconcile_serving_dentries_from_base_with_overlay_in_txn(
+            &txn,
+            dentry_keys,
+            overlay,
+        ) {
+            Ok(changed) => {
+                txn.commit()
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+                Ok(changed)
+            }
+            Err(error) => {
+                let _ = txn.abort();
+                Err(error)
+            }
+        }
     }
 
     fn reconcile_serving_dentries_from_base_with_overlay_in_txn(
@@ -2132,10 +2149,25 @@ impl<'a> RemoteApplyCoordinator<'a> {
         if dentry_keys.is_empty() {
             return Ok(false);
         }
+        let mut protected_dentry_keys = overlay.dentry_keys.clone();
+        for key in dentry_keys {
+            if protected_dentry_keys.contains(key) {
+                continue;
+            }
+            let (parent, name) = decode_dentry_key(key)?;
+            let Some(entry) = RedbMetaEngine::lookup_merged_in_write_txn(txn, parent, name)? else {
+                continue;
+            };
+            if entry.kind == FileType::RegularFile
+                && RedbMetaEngine::has_local_regular_file_overlay_in_write_txn(txn, entry.ino)?
+            {
+                protected_dentry_keys.insert(key.clone());
+            }
+        }
         RedbMetaEngine::reconcile_serving_dentries_from_base_in_txn(
             txn,
             dentry_keys,
-            &overlay.dentry_keys,
+            &protected_dentry_keys,
         )
     }
 

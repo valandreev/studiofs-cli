@@ -538,6 +538,39 @@ mod tests {
     }
 
     #[test]
+    fn transient_delivery_retry_recovers_cache_gate_and_keeps_real_failures_fail_closed() {
+        let budget = CoherenceHealthBudget {
+            max_apply_lag: 2,
+            max_delivery_age_ms: 100,
+        };
+        let mut tracker = CoherenceHealthTracker::new(budget);
+        tracker.note_sync_started();
+        tracker.note_sync_success(Some(1), Some(1), true, 2);
+        assert!(tracker.allows_cache());
+
+        // WinFSP retries NotifyBegin-rejected batches and reports no delivery
+        // failure for that transient event. The outstanding age remains within
+        // budget and clears when the retry is submitted.
+        tracker.note_delivery_failure_count(0);
+        tracker.note_delivery_age(Some(25), 3);
+        tracker.note_delivery_age(None, 4);
+        assert!(tracker.allows_cache());
+        assert_eq!(tracker.snapshot().budget, budget);
+
+        // A genuine post-admission failure still revokes cache admission.
+        tracker.note_delivery_failure_count(1);
+        assert_eq!(tracker.snapshot().state, CoherenceHealthState::Degraded);
+        assert!(!tracker.allows_cache());
+        assert_eq!(tracker.snapshot().budget, budget);
+
+        tracker.note_sync_started();
+        tracker.note_sync_success(Some(2), Some(2), true, 5);
+        tracker.note_coverage_confirmed(Some(2), 6);
+        assert!(tracker.allows_cache());
+        assert_eq!(tracker.snapshot().budget, budget);
+    }
+
+    #[test]
     fn unsupported_semantic_coverage_cannot_heal_from_an_empty_sync() {
         let mut tracker = CoherenceHealthTracker::new(CoherenceHealthBudget::default());
         tracker.note_sync_started();

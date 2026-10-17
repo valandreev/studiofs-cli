@@ -991,10 +991,10 @@ impl MountedWriterStack {
         }
     }
 
+    /// Retire buffered writer state while preserving ownership of still-open handles.
     pub(super) fn clear_inode(&self, ino: Ino) {
         let file = {
             let mut shard = self.shards[Self::inode_shard_index(ino)].lock();
-            shard.handle_counts_by_ino.remove(&ino);
             shard.dirty_inodes.remove(&ino);
             shard.files.remove(&ino)
         };
@@ -2049,6 +2049,36 @@ mod tests {
         assert_eq!(stack.total_dirty_bytes(), 0);
         stack.mark_closed(99);
         assert!(!stack.has_dirty_writers(7));
+    }
+
+    #[test]
+    fn writer_stack_inode_reset_keeps_new_handle_until_its_close() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+
+        stack
+            .write_bytes(write_spec(99, 7, 0, 300), Bytes::from_static(b"old"))
+            .expect("write old incarnation");
+        stack.clear_inode(7);
+
+        stack
+            .write_bytes(
+                WriterWriteSpec {
+                    content_epoch: 10,
+                    ..write_spec(100, 7, 0, 400)
+                },
+                Bytes::from_static(b"new!"),
+            )
+            .expect("write new incarnation");
+        stack.finish_inode(7).expect("materialize new incarnation");
+        assert_eq!(stack.visible_len(7), Some(4));
+
+        // Closing the pre-reset handle must not consume the new handle's
+        // ownership count and make its clean writer state appear unowned.
+        stack.mark_closed(99);
+        assert_eq!(stack.visible_len(7), Some(4));
+
+        stack.mark_closed(100);
+        assert_eq!(stack.visible_len(7), None);
     }
 
     #[test]

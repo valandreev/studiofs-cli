@@ -1021,6 +1021,7 @@ fn note_critical_vfs_error(error: &studiofs_vfs::VfsError) {
 /// Map VfsError to WinFSP NTSTATUS error.
 fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
     note_critical_vfs_error(&e);
+    debug!(error = %e, "mapping VFS error to WinFSP status");
     match classify_vfs_error(&e) {
         BridgeVfsErrorKind::NotFound => winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND),
         BridgeVfsErrorKind::AlreadyExists => winfsp::FspError::from(STATUS_OBJECT_NAME_COLLISION),
@@ -2571,7 +2572,10 @@ impl AsyncFileSystemContext for StudioFsContext {
                     trace!(ino, fh, offset, n, open_flags = open_flags.bits(), "read");
                     Ok(n)
                 }
-                Err(e) => Err(vfs_to_winfsp_err(e)),
+                Err(e) => {
+                    debug!(ino, fh, offset, requested = buffer.len(), error = %e, "WinFSP read failed");
+                    Err(vfs_to_winfsp_err(e))
+                }
             }
         }
     }
@@ -6681,34 +6685,39 @@ mod tests {
             .expect("writer");
         vfs.unlink(ROOT_INO, b"old").expect("unlink");
         let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        let batch = InvalidationBatch {
+            generation: 8,
+            intents: vec![InvalidationIntent::Entry {
+                parent: ROOT_INO,
+                name: b"old".to_vec(),
+                ancestors: Some(vec![]),
+                ino: Some(file.ino),
+            }],
+        };
         assert_eq!(
-            invalidator.invalidate_batch(
-                &InvalidationBatch {
-                    generation: 8,
-                    intents: vec![InvalidationIntent::Entry {
-                        parent: ROOT_INO,
-                        name: b"old".to_vec(),
-                        ancestors: Some(vec![]),
-                        ino: Some(file.ino)
-                    },]
-                },
-                true
-            ),
+            invalidator.invalidate_batch(&batch, true),
             InvalidationAcceptance::Failed
         );
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 0);
+        assert_eq!(queue.delivery_snapshot().queued_generation, None);
         assert!(ctx.should_notify().is_none());
         assert!(!queue.is_empty());
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 0);
         ctx.spawn_wait({
             let vfs = vfs.clone();
             async move { vfs.release_fh(fh).await }
         })
         .expect("release");
+        assert_eq!(
+            invalidator.invalidate_batch(&batch, true),
+            InvalidationAcceptance::Queued
+        );
+        assert_eq!(queue.delivery_snapshot().queued_generation, Some(8));
         let prepared = ctx.should_notify().expect("old path retained for release");
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared[0].ino, file.ino);
         assert_eq!(prepared[0].path, r"\old");
         assert_eq!(prepared[0].info.action, FILE_ACTION_REMOVED);
-        assert_eq!(queue.delivery_snapshot().queued_generation, None);
     }
 
     #[test]
@@ -6981,13 +6990,20 @@ mod tests {
     fn semantic_unresolved_parent_reports_partial_coverage() {
         use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
         use studiofs_vfs::coherence::InvalidationAcceptance;
-        let (_tmp, _vfs, _ctx, queue) = make_test_context("semantic-unresolved");
+        let (_tmp, vfs, ctx, queue) = make_test_context("semantic-unresolved");
+        let file = vfs
+            .create(ROOT_INO, b"writer", 0, 0, 0o644)
+            .expect("create writer");
+        let fh = vfs
+            .open_file(file.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
         let invalidator = WinfspKernelInvalidator::new(queue.clone());
         assert_eq!(
             invalidator.invalidate_batch(
                 &InvalidationBatch {
                     generation: 1,
                     intents: vec![
+                        InvalidationIntent::Content { ino: file.ino },
                         InvalidationIntent::Entry {
                             parent: ROOT_INO,
                             name: b"valid".to_vec(),
@@ -7006,9 +7022,15 @@ mod tests {
             ),
             InvalidationAcceptance::Failed
         );
-        assert_eq!(queue.drain(), vec![0]);
+        assert_eq!(queue.drain(), vec![0, file.ino]);
         assert_eq!(queue.delivery_snapshot().failed_batches, 1);
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 1);
         assert_eq!(queue.delivery_snapshot().queued_generation, None);
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release writer");
     }
 
     #[test]
@@ -7092,6 +7114,32 @@ mod tests {
     }
 
     #[test]
+    fn notification_retry_keeps_oldest_age_when_new_work_arrives_in_flight() {
+        for same_path in [false, true] {
+            let (_tmp, _vfs, ctx, queue) = make_test_context("notify-retry-oldest-age");
+            queue.push_deleted_path(42, r"\old".to_string(), FileType::RegularFile);
+            let oldest = std::time::Instant::now() - Duration::from_secs(60);
+            queue.set_pending_since_for_test(oldest);
+            let prepared = ctx.should_notify().expect("prepare oldest notification");
+            let (ino, path) = if same_path {
+                (42, r"\old")
+            } else {
+                (43, r"\new")
+            };
+            queue.push_deleted_path(ino, path.to_string(), FileType::RegularFile);
+            assert!(queue.pending_since_for_test().expect("new pending age") > oldest);
+
+            drop(prepared);
+
+            assert_eq!(
+                queue.pending_since_for_test(),
+                Some(oldest),
+                "retry must retain the oldest age even when new work already occupies the queue"
+            );
+        }
+    }
+
+    #[test]
     fn deleted_paths_for_same_inode_survive_coalescing_and_retry() {
         let (_tmp, _vfs, ctx, queue) = make_test_context("notify-distinct-paths");
         queue.push_deleted_path(42, r"\old.txt".to_string(), FileType::RegularFile);
@@ -7123,6 +7171,8 @@ mod tests {
     #[test]
     fn unsubmitted_notification_batch_is_requeued_for_retry() {
         let (_tmp, vfs, ctx, queue) = make_test_context("notify_retry");
+        assert!(wait_until(Duration::from_secs(1), || vfs.coherence_allows_os_cache()));
+        let initial_budget = vfs.coherence_health_snapshot().budget;
         let file = vfs
             .create(ROOT_INO, b"retry-gone.txt", 0, 0, 0o644)
             .expect("create");
@@ -7132,19 +7182,33 @@ mod tests {
             r"\retry-gone.txt".to_string(),
             FileType::RegularFile,
         );
+        vfs.unlink(ROOT_INO, b"retry-gone.txt")
+            .expect("remove inode before notification retry");
         let prepared = ctx.should_notify().expect("pending notification batch");
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].path, r"\retry-gone.txt");
+        assert_eq!(prepared[0].info.action, FILE_ACTION_REMOVED);
         drop(prepared);
+        assert!(queue.pending_delivery_age_ms().is_some());
         let invalidator = WinfspKernelInvalidator::new(queue.clone());
-        assert_eq!(invalidator.invalidation_delivery_failure_count(), 1);
+        assert_eq!(
+            invalidator.invalidation_delivery_failure_count(),
+            0,
+            "a removed-path NotifyBegin retry is still queued work, not a failed delivery"
+        );
 
-        let retry = ctx
+        let mut retry = ctx
             .should_notify()
-            .expect("unsubmitted batch should be retried");
+            .expect("unsubmitted removed-path batch should be retried");
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0].path, r"\retry-gone.txt");
         assert_eq!(retry[0].info.action, FILE_ACTION_REMOVED);
+        retry.mark_published();
         drop(retry);
-        assert_eq!(queue.drain(), vec![file.ino]);
+        assert_eq!(queue.pending_delivery_age_ms(), None);
+        assert_eq!(invalidator.invalidation_delivery_failure_count(), 0);
+        assert!(vfs.coherence_allows_os_cache());
+        assert_eq!(vfs.coherence_health_snapshot().budget, initial_budget);
         assert!(queue.wait_for_quiescence(Duration::from_secs(1)));
     }
 
