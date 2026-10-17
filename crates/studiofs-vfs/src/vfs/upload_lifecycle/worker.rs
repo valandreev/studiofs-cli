@@ -41,6 +41,13 @@ struct ReadyUploads {
 
 type DelayedUploads = BTreeMap<u64, VecDeque<PendingUpload>>;
 
+#[cfg(test)]
+#[derive(Default)]
+struct DeletionSweepWork {
+    tombstones_copied: usize,
+    delayed_ops_inspected: usize,
+}
+
 impl ReadyUploads {
     fn push_back(&mut self, op: PendingUpload) {
         let ino = op.ino;
@@ -2226,16 +2233,31 @@ impl UploadLifecycleWorker {
 
         let mut ready = ReadyUploads::default();
         let mut delayed = DelayedUploads::default();
+        let mut swept_deleted_inode_count = 0;
+        #[cfg(test)]
+        let mut deletion_sweep_work = DeletionSweepWork::default();
         let mut dispatched_since_yield = 0u32;
         let mut inbound_closed = false;
         loop {
             Self::reap_ready_workers(&mut workers);
             Self::promote_ready_uploads(&mut ready, &mut delayed);
-            self.drop_deleted_queued_uploads(&mut ready, &mut delayed);
+            self.drop_deleted_queued_uploads(
+                &mut ready,
+                &mut delayed,
+                &mut swept_deleted_inode_count,
+                #[cfg(test)]
+                &mut deletion_sweep_work,
+            );
 
             while !ready.is_empty() {
                 Self::reap_ready_workers(&mut workers);
-                self.drop_deleted_queued_uploads(&mut ready, &mut delayed);
+                self.drop_deleted_queued_uploads(
+                    &mut ready,
+                    &mut delayed,
+                    &mut swept_deleted_inode_count,
+                    #[cfg(test)]
+                    &mut deletion_sweep_work,
+                );
                 let Some(permit) = permits.clone().try_acquire_owned().ok() else {
                     break;
                 };
@@ -2271,7 +2293,13 @@ impl UploadLifecycleWorker {
                     tokio::task::yield_now().await;
                     Self::reap_ready_workers(&mut workers);
                     Self::promote_ready_uploads(&mut ready, &mut delayed);
-                    self.drop_deleted_queued_uploads(&mut ready, &mut delayed);
+                    self.drop_deleted_queued_uploads(
+                        &mut ready,
+                        &mut delayed,
+                        &mut swept_deleted_inode_count,
+                        #[cfg(test)]
+                        &mut deletion_sweep_work,
+                    );
                 }
             }
 
@@ -2309,11 +2337,10 @@ impl UploadLifecycleWorker {
                     match inbound {
                         Some(()) => {
                             for op in self.vfs.cached_store.claim_pending_uploads() {
-                                Self::enqueue_pending_upload(
+                                self.enqueue_or_cancel_deleted_pending_upload(
                                     &mut ready,
                                     &mut delayed,
                                     op,
-                                    self.vfs.upload_delay,
                                 );
                             }
                         }
@@ -2349,6 +2376,22 @@ impl UploadLifecycleWorker {
         }
     }
 
+    fn enqueue_or_cancel_deleted_pending_upload(
+        &self,
+        ready: &mut ReadyUploads,
+        delayed: &mut DelayedUploads,
+        op: PendingUpload,
+    ) {
+        let deleted_inodes = self.vfs.state.upload.deleted_inodes.lock();
+        let deleted = deleted_inodes.contains(&op.ino);
+        if !deleted {
+            Self::enqueue_pending_upload(ready, delayed, op, self.vfs.upload_delay);
+            return;
+        }
+        drop(deleted_inodes);
+        self.cancel_deleted_queued_upload(op);
+    }
+
     fn promote_ready_uploads(ready: &mut ReadyUploads, delayed: &mut DelayedUploads) {
         while let Some((&not_before_unix_ms, _)) = delayed.first_key_value() {
             if not_before_unix_ms > now_unix_millis() {
@@ -2367,6 +2410,7 @@ impl UploadLifecycleWorker {
         ready: &mut ReadyUploads,
         delayed: &mut DelayedUploads,
         deleted_inodes: &HashSet<Ino>,
+        #[cfg(test)] work: &mut DeletionSweepWork,
     ) -> Vec<PendingUpload> {
         if deleted_inodes.is_empty() {
             return Vec::new();
@@ -2375,6 +2419,10 @@ impl UploadLifecycleWorker {
         let mut removed = ready.remove_inodes(deleted_inodes);
         let mut empty_delays = Vec::new();
         for (not_before_unix_ms, queue) in delayed.iter_mut() {
+            #[cfg(test)]
+            {
+                work.delayed_ops_inspected += queue.len();
+            }
             let mut retained = VecDeque::with_capacity(queue.len());
             while let Some(op) = queue.pop_front() {
                 if deleted_inodes.contains(&op.ino) {
@@ -2394,9 +2442,33 @@ impl UploadLifecycleWorker {
         removed
     }
 
-    fn drop_deleted_queued_uploads(&self, ready: &mut ReadyUploads, delayed: &mut DelayedUploads) {
-        let deleted_inodes = self.vfs.state.upload.deleted_inodes.lock().clone();
-        let removed = Self::remove_deleted_uploads_from_queues(ready, delayed, &deleted_inodes);
+    fn drop_deleted_queued_uploads(
+        &self,
+        ready: &mut ReadyUploads,
+        delayed: &mut DelayedUploads,
+        swept_deleted_inode_count: &mut usize,
+        #[cfg(test)] work: &mut DeletionSweepWork,
+    ) {
+        let deleted_inodes = {
+            let deleted_inodes = self.vfs.state.upload.deleted_inodes.lock();
+            if deleted_inodes.len() == *swept_deleted_inode_count {
+                return;
+            }
+            // Tombstones are lifetime-protected and only inserted, so their set length is monotonic.
+            *swept_deleted_inode_count = deleted_inodes.len();
+            #[cfg(test)]
+            {
+                work.tombstones_copied += deleted_inodes.len();
+            }
+            deleted_inodes.clone()
+        };
+        let removed = Self::remove_deleted_uploads_from_queues(
+            ready,
+            delayed,
+            &deleted_inodes,
+            #[cfg(test)]
+            work,
+        );
         for op in removed {
             self.cancel_deleted_queued_upload(op);
         }
@@ -4745,6 +4817,7 @@ mod tests {
             &mut ready,
             &mut delayed,
             &HashSet::from([make_pending_upload().ino]),
+            &mut DeletionSweepWork::default(),
         );
 
         let mut removed_ids: Vec<_> = removed.into_iter().map(|op| op.object_id).collect();
@@ -4761,6 +4834,141 @@ mod tests {
         assert_eq!(retained_op.object_id, retained.object_id);
         assert!(ready.is_empty());
         assert!(delayed.is_empty());
+    }
+
+    #[test]
+    fn deletion_sweep_skips_unchanged_ready_only_dispatch_burst() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deletion-sweep-ready-burst");
+        let worker = UploadLifecycleWorker::new(vfs.clone());
+        let mut ready = ReadyUploads::default();
+        let mut delayed = DelayedUploads::default();
+        let mut swept_count = 0;
+        let mut work = DeletionSweepWork::default();
+        let valid_ino = make_pending_upload().ino;
+        for ino in 50_000..50_128 {
+            vfs.state.upload.deleted_inodes.lock().insert(ino);
+        }
+        for object_id in 1..=128 {
+            let mut op = make_pending_upload();
+            op.object_id = object_id;
+            op.ino = valid_ino;
+            ready.push_back(op);
+        }
+        worker.drop_deleted_queued_uploads(&mut ready, &mut delayed, &mut swept_count, &mut work);
+        assert_eq!(work.tombstones_copied, 128);
+        work = DeletionSweepWork::default();
+
+        for _ in 0..128 {
+            worker.drop_deleted_queued_uploads(
+                &mut ready,
+                &mut delayed,
+                &mut swept_count,
+                &mut work,
+            );
+            assert!(ready.pop_front().is_some());
+        }
+
+        assert_eq!(work.tombstones_copied, 0);
+        assert_eq!(work.delayed_ops_inspected, 0);
+        assert!(ready.is_empty());
+        assert!(delayed.is_empty());
+        assert_eq!(vfs.state.upload.deleted_inodes.lock().len(), 128);
+    }
+
+    #[test]
+    fn deletion_sweep_skips_unchanged_delayed_retry_burst_and_visits_later_tombstone() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deletion-sweep-delayed-burst");
+        let worker = UploadLifecycleWorker::new(vfs.clone());
+        let mut ready = ReadyUploads::default();
+        let mut delayed = DelayedUploads::default();
+        let delayed_ino = make_pending_upload().ino + 1;
+        for object_id in 1..=128 {
+            let mut op = make_pending_upload();
+            op.object_id = object_id;
+            op.ino = delayed_ino;
+            op.not_before_unix_ms = now_unix_millis()
+                .saturating_add(60_000)
+                .saturating_add(object_id);
+            op.retry_count = 1;
+            delayed
+                .entry(op.not_before_unix_ms)
+                .or_default()
+                .push_back(op);
+        }
+        let mut swept_count = 0;
+        let mut work = DeletionSweepWork::default();
+        let valid_ino = make_pending_upload().ino + 2;
+        for ino in 50_000..50_128 {
+            vfs.state.upload.deleted_inodes.lock().insert(ino);
+        }
+        for object_id in 201..=328 {
+            let mut op = make_pending_upload();
+            op.object_id = object_id;
+            op.ino = valid_ino;
+            ready.push_back(op);
+        }
+        worker.drop_deleted_queued_uploads(&mut ready, &mut delayed, &mut swept_count, &mut work);
+        assert_eq!(work.tombstones_copied, 128);
+        assert_eq!(work.delayed_ops_inspected, 128);
+        work = DeletionSweepWork::default();
+
+        for _ in 0..128 {
+            worker.drop_deleted_queued_uploads(
+                &mut ready,
+                &mut delayed,
+                &mut swept_count,
+                &mut work,
+            );
+            assert!(ready.pop_front().is_some());
+        }
+        assert_eq!(work.tombstones_copied, 0);
+        assert_eq!(work.delayed_ops_inspected, 0);
+        assert_eq!(delayed.len(), 128);
+
+        vfs.state.upload.deleted_inodes.lock().insert(delayed_ino);
+        worker.drop_deleted_queued_uploads(&mut ready, &mut delayed, &mut swept_count, &mut work);
+        assert_eq!(work.tombstones_copied, 129);
+        assert_eq!(work.delayed_ops_inspected, 128);
+        assert!(delayed.is_empty());
+    }
+
+    #[test]
+    fn late_deleted_upload_is_cancelled_before_queue_admission() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "late-deleted-upload");
+        let worker = UploadLifecycleWorker::new(vfs.clone());
+        let mut ready = ReadyUploads::default();
+        let mut delayed = DelayedUploads::default();
+        let mut deleted_op = make_pending_upload();
+        let deleted_ino = deleted_op.ino;
+        vfs.state.upload.deleted_inodes.lock().insert(deleted_ino);
+        let mut swept_count = 0;
+        let mut work = DeletionSweepWork::default();
+        worker.drop_deleted_queued_uploads(&mut ready, &mut delayed, &mut swept_count, &mut work);
+        vfs.maybe_clear_deleted_inode_marker(deleted_ino);
+        deleted_op.not_before_unix_ms = now_unix_millis().saturating_add(60_000);
+
+        worker.enqueue_or_cancel_deleted_pending_upload(&mut ready, &mut delayed, deleted_op);
+        worker.drop_deleted_queued_uploads(&mut ready, &mut delayed, &mut swept_count, &mut work);
+
+        assert!(ready.is_empty());
+        assert!(delayed.is_empty());
+        assert_eq!(
+            vfs.state
+                .upload
+                .upload_canceled_deleted
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            vfs.state
+                .upload
+                .deleted_inodes
+                .lock()
+                .contains(&deleted_ino)
+        );
     }
 
     #[test]
