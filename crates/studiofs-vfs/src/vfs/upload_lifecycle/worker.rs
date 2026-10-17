@@ -2349,9 +2349,8 @@ impl UploadLifecycleWorker {
                     }
                 }
                 inbound = rx.recv(), if !inbound_closed => {
-                    match inbound {
-                        Some(()) => {}
-                        None => inbound_closed = true,
+                    if inbound.is_none() {
+                        inbound_closed = true;
                     }
                 }
                 _ = self.vfs.state.upload.deleted_uploads_notify.notified() => {}
@@ -2384,8 +2383,12 @@ impl UploadLifecycleWorker {
     }
 
     fn queued_upload_count(ready: &ReadyUploads, delayed: &DelayedUploads) -> usize {
-        ready.per_inode.values().map(VecDeque::len).sum::<usize>()
-            + delayed.values().map(VecDeque::len).sum::<usize>()
+        ready
+            .per_inode
+            .values()
+            .chain(delayed.values())
+            .map(VecDeque::len)
+            .sum()
     }
 
     fn fill_pending_upload_window(
@@ -4463,65 +4466,6 @@ mod tests {
         assert_eq!(completed.len(), 129);
         assert_eq!(vfs.cached_store().pending_upload_count(), 0);
         assert_eq!(delayed[&u64::MAX].front(), Some(&retry));
-    }
-
-    #[test]
-    #[ignore = "manual host-memory measurement; requires SFS865_BACKLOG, MODE and RELEASE_FILE"]
-    fn pending_upload_window_measurement() {
-        use std::io::Write;
-
-        let backlog: u64 = std::env::var("SFS865_BACKLOG")
-            .expect("backlog")
-            .parse()
-            .expect("integer backlog");
-        let mode = std::env::var("SFS865_MODE").expect("legacy or bounded mode");
-        let release = std::env::var("SFS865_RELEASE_FILE").expect("measurement release file");
-        assert!(matches!(mode.as_str(), "legacy" | "bounded"));
-        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "upload-window-measurement");
-        let worker = UploadLifecycleWorker::new(vfs.clone());
-        let window = vfs
-            .upload_worker_count
-            .max(1)
-            .min(vfs.upload_scheduler.max_concurrency_hint())
-            .saturating_mul(2);
-        for object_id in 1..=backlog {
-            vfs.cached_store().submit_upload(7_001, 0, object_id, 1);
-        }
-        let mut ready = ReadyUploads::default();
-        let mut delayed = DelayedUploads::default();
-        if mode == "legacy" {
-            for op in vfs.cached_store().claim_pending_uploads(usize::MAX) {
-                worker.enqueue_or_cancel_deleted_pending_upload(&mut ready, &mut delayed, op);
-            }
-        } else {
-            worker.fill_pending_upload_window(&mut ready, &mut delayed, 0, window);
-        }
-        let peak = UploadLifecycleWorker::queued_upload_count(&ready, &delayed);
-        assert_eq!(
-            peak,
-            if mode == "legacy" {
-                backlog as usize
-            } else {
-                window.min(backlog as usize)
-            }
-        );
-        println!(
-            "SFS865_READY pid={} backlog={backlog} mode={mode} peak_descriptors={peak} descriptor_bytes={} window={window}",
-            std::process::id(),
-            peak * std::mem::size_of::<PendingUpload>()
-        );
-        std::io::stdout().flush().expect("flush measurement marker");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !std::path::Path::new(&release).exists() {
-            assert!(
-                Instant::now() < deadline,
-                "host memory sampler did not release fixture"
-            );
-            // Manual sampling holds the populated fixture; this is not a scheduler race test.
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        std::hint::black_box((&ready, &delayed, &vfs));
     }
 
     #[test]

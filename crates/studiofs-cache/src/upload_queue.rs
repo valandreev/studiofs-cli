@@ -385,12 +385,7 @@ impl UploadQueue {
                         .next()
                         .map(|&object_id| (object_id, sweep_end))
                 })
-                .or_else(|| {
-                    Some((
-                        state.dirty_objects.first().copied()?,
-                        state.dirty_objects.last().copied()?,
-                    ))
-                });
+                .or_else(|| Some((*state.dirty_objects.first()?, *state.dirty_objects.last()?)));
             let Some((object_id, sweep_end)) = next else {
                 break;
             };
