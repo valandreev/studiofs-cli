@@ -2227,6 +2227,7 @@ impl UploadLifecycleWorker {
             .max(1)
             .min(self.vfs.upload_scheduler.max_concurrency_hint());
         let permits = Arc::new(Semaphore::new(worker_count));
+        let scheduling_window = worker_count.saturating_mul(2);
         let mut workers = JoinSet::new();
         debug!(
             upload_worker_count = worker_count,
@@ -2309,6 +2310,17 @@ impl UploadLifecycleWorker {
             if self.vfs.uploader_shutdown_requested() {
                 break;
             }
+            if self.fill_pending_upload_window(
+                &mut ready,
+                &mut delayed,
+                workers.len(),
+                scheduling_window,
+            ) > 0
+            {
+                // A page can be entirely canceled; keep draining without another wakeup.
+                tokio::task::yield_now().await;
+                continue;
+            }
             if inbound_closed && ready.is_empty() && delayed.is_empty() && workers.is_empty() {
                 break;
             }
@@ -2338,15 +2350,7 @@ impl UploadLifecycleWorker {
                 }
                 inbound = rx.recv(), if !inbound_closed => {
                     match inbound {
-                        Some(()) => {
-                            for op in self.vfs.cached_store.claim_pending_uploads() {
-                                self.enqueue_or_cancel_deleted_pending_upload(
-                                    &mut ready,
-                                    &mut delayed,
-                                    op,
-                                );
-                            }
-                        }
+                        Some(()) => {}
                         None => inbound_closed = true,
                     }
                 }
@@ -2377,6 +2381,30 @@ impl UploadLifecycleWorker {
         } else {
             ready.push_back(op);
         }
+    }
+
+    fn queued_upload_count(ready: &ReadyUploads, delayed: &DelayedUploads) -> usize {
+        ready.per_inode.values().map(VecDeque::len).sum::<usize>()
+            + delayed.values().map(VecDeque::len).sum::<usize>()
+    }
+
+    fn fill_pending_upload_window(
+        &self,
+        ready: &mut ReadyUploads,
+        delayed: &mut DelayedUploads,
+        active: usize,
+        window: usize,
+    ) -> usize {
+        let capacity = window.saturating_sub(Self::queued_upload_count(ready, delayed) + active);
+        if capacity == 0 {
+            return 0;
+        }
+        let page = self.vfs.cached_store.claim_pending_uploads(capacity);
+        let claimed = page.len();
+        for op in page {
+            self.enqueue_or_cancel_deleted_pending_upload(ready, delayed, op);
+        }
+        claimed
     }
 
     fn enqueue_or_cancel_deleted_pending_upload(
@@ -4353,14 +4381,14 @@ mod tests {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "coalesced-worker-burst");
         let ino = 7_001;
-        for object_id in 1..=4 {
+        for object_id in 1..=1024 {
             vfs.cached_store()
                 .submit_upload(ino, object_id * 4096, object_id, 1);
         }
         vfs.mark_inode_deleted_for_uploads(ino);
         let metrics = vfs.cached_store().cache_pipeline_metrics();
         assert_eq!(metrics.upload_queue.ingress_depth, 1);
-        assert_eq!(metrics.upload_queue.ingress_coalesced, 3);
+        assert_eq!(metrics.upload_queue.ingress_coalesced, 1023);
 
         let channels = vfs
             .startup
@@ -4383,6 +4411,153 @@ mod tests {
                 .expect("upload worker task should not panic");
         });
 
+        assert_eq!(vfs.cached_store().pending_upload_count(), 0);
+    }
+
+    #[test]
+    fn pending_upload_window_bounds_ready_delayed_and_active_descriptors() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "bounded-upload-window");
+        let worker = UploadLifecycleWorker::new(vfs.clone());
+        let mut ready = ReadyUploads::default();
+        let mut delayed = DelayedUploads::default();
+        for object_id in 1..=129 {
+            vfs.cached_store().submit_upload(7_001, 0, object_id, 1);
+        }
+        let retry = PendingUpload {
+            not_before_unix_ms: u64::MAX,
+            retry_count: 3,
+            ..make_pending_upload()
+        };
+        UploadLifecycleWorker::enqueue_pending_upload(
+            &mut ready,
+            &mut delayed,
+            retry.clone(),
+            Duration::ZERO,
+        );
+        let window = 8;
+        let active = 2;
+        assert_eq!(
+            worker.fill_pending_upload_window(&mut ready, &mut delayed, active, window),
+            5
+        );
+        assert_eq!(
+            UploadLifecycleWorker::queued_upload_count(&ready, &delayed) + active,
+            window
+        );
+        assert_eq!(
+            worker.fill_pending_upload_window(&mut ready, &mut delayed, active, window),
+            0
+        );
+        assert_eq!(delayed[&u64::MAX].front(), Some(&retry));
+
+        let mut completed = HashSet::new();
+        while let Some(op) = ready.pop_front() {
+            assert!(completed.insert(op.object_id));
+            vfs.cached_store().complete_upload(&op);
+            worker.fill_pending_upload_window(&mut ready, &mut delayed, active, window);
+            assert!(
+                UploadLifecycleWorker::queued_upload_count(&ready, &delayed) + active <= window
+            );
+        }
+        assert_eq!(completed.len(), 129);
+        assert_eq!(vfs.cached_store().pending_upload_count(), 0);
+        assert_eq!(delayed[&u64::MAX].front(), Some(&retry));
+    }
+
+    #[test]
+    #[ignore = "manual host-memory measurement; requires SFS865_BACKLOG, MODE and RELEASE_FILE"]
+    fn pending_upload_window_measurement() {
+        use std::io::Write;
+
+        let backlog: u64 = std::env::var("SFS865_BACKLOG")
+            .expect("backlog")
+            .parse()
+            .expect("integer backlog");
+        let mode = std::env::var("SFS865_MODE").expect("legacy or bounded mode");
+        let release = std::env::var("SFS865_RELEASE_FILE").expect("measurement release file");
+        assert!(matches!(mode.as_str(), "legacy" | "bounded"));
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "upload-window-measurement");
+        let worker = UploadLifecycleWorker::new(vfs.clone());
+        let window = vfs
+            .upload_worker_count
+            .max(1)
+            .min(vfs.upload_scheduler.max_concurrency_hint())
+            .saturating_mul(2);
+        for object_id in 1..=backlog {
+            vfs.cached_store().submit_upload(7_001, 0, object_id, 1);
+        }
+        let mut ready = ReadyUploads::default();
+        let mut delayed = DelayedUploads::default();
+        if mode == "legacy" {
+            for op in vfs.cached_store().claim_pending_uploads(usize::MAX) {
+                worker.enqueue_or_cancel_deleted_pending_upload(&mut ready, &mut delayed, op);
+            }
+        } else {
+            worker.fill_pending_upload_window(&mut ready, &mut delayed, 0, window);
+        }
+        let peak = UploadLifecycleWorker::queued_upload_count(&ready, &delayed);
+        assert_eq!(
+            peak,
+            if mode == "legacy" {
+                backlog as usize
+            } else {
+                window.min(backlog as usize)
+            }
+        );
+        println!(
+            "SFS865_READY pid={} backlog={backlog} mode={mode} peak_descriptors={peak} descriptor_bytes={} window={window}",
+            std::process::id(),
+            peak * std::mem::size_of::<PendingUpload>()
+        );
+        std::io::stdout().flush().expect("flush measurement marker");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !std::path::Path::new(&release).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "host memory sampler did not release fixture"
+            );
+            // Manual sampling holds the populated fixture; this is not a scheduler race test.
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::hint::black_box((&ready, &delayed, &vfs));
+    }
+
+    #[test]
+    fn upload_worker_refills_after_task_completion_with_retries_and_deletions() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "paged-worker-retry-delete");
+        for object_id in 1..=129 {
+            let ino = if object_id % 3 == 0 { 7_001 } else { 7_002 };
+            vfs.cached_store().submit_upload(ino, 0, object_id, 1);
+        }
+        let mut retry = vfs
+            .cached_store()
+            .claim_pending_uploads(1)
+            .pop()
+            .expect("retry item");
+        retry.retry_count = 2;
+        retry.not_before_unix_ms = now_unix_millis().saturating_add(100);
+        assert!(vfs.cached_store().requeue_upload(retry));
+        vfs.mark_inode_deleted_for_uploads(7_001);
+        let channels = vfs
+            .startup
+            .claim_channels_for_start()
+            .expect("claim startup channels")
+            .expect("unstarted channels");
+        drop(channels.prefetch_rx);
+        rt.block_on(async {
+            let worker =
+                tokio::spawn(UploadLifecycleWorker::new(vfs.clone()).run(channels.upload_rx));
+            // Missing inode 7002 is canceled by an active task; 7001 is canceled before dispatch.
+            assert!(vfs.wait_for_uploads_idle(Duration::from_secs(5)).await);
+            vfs.request_uploader_shutdown();
+            tokio::time::timeout(Duration::from_secs(2), worker)
+                .await
+                .expect("worker should stop")
+                .expect("worker should not panic");
+        });
         assert_eq!(vfs.cached_store().pending_upload_count(), 0);
     }
 

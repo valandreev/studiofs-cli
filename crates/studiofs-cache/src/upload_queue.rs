@@ -6,6 +6,7 @@
 
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::ops::Bound::{Excluded, Included};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,6 +85,8 @@ struct PendingState {
     by_object: BTreeMap<u64, PendingUpload>,
     by_inode: BTreeMap<Ino, BTreeSet<u64>>,
     dirty_objects: BTreeSet<u64>,
+    // Freeze each sweep's upper ID so new arrivals cannot postpone older retries.
+    claim_cursor: Option<(u64, u64)>,
     wakeup_coalesced: u64,
 }
 
@@ -138,6 +141,7 @@ impl UploadQueue {
                 by_object: BTreeMap::new(),
                 by_inode: BTreeMap::new(),
                 dirty_objects: BTreeSet::new(),
+                claim_cursor: None,
                 wakeup_coalesced: 0,
             }),
             idle_notify,
@@ -364,12 +368,34 @@ impl UploadQueue {
         self.pending_state.lock().by_object.len()
     }
 
-    /// Claim current pending uploads after a worker wakeup.
-    pub fn claim_pending(&self) -> Vec<PendingUpload> {
+    /// Claims up to `max_items` dirty uploads after a worker wakeup.
+    ///
+    /// Remaining dirty uploads stay queued for later calls; a partial claim
+    /// does not emit another wakeup.
+    pub fn claim_pending(&self, max_items: usize) -> Vec<PendingUpload> {
         let mut state = self.pending_state.lock();
-        let dirty_objects = std::mem::take(&mut state.dirty_objects);
-        let mut claimed = Vec::with_capacity(dirty_objects.len());
-        for object_id in dirty_objects {
+        let mut claimed = Vec::with_capacity(max_items.min(state.dirty_objects.len()));
+        while claimed.len() < max_items {
+            let next = state
+                .claim_cursor
+                .and_then(|(cursor, sweep_end)| {
+                    state
+                        .dirty_objects
+                        .range((Excluded(cursor), Included(sweep_end)))
+                        .next()
+                        .map(|&object_id| (object_id, sweep_end))
+                })
+                .or_else(|| {
+                    Some((
+                        state.dirty_objects.first().copied()?,
+                        state.dirty_objects.last().copied()?,
+                    ))
+                });
+            let Some((object_id, sweep_end)) = next else {
+                break;
+            };
+            state.dirty_objects.remove(&object_id);
+            state.claim_cursor = Some((object_id, sweep_end));
             if let Some(op) = state.by_object.get(&object_id) {
                 claimed.push(op.clone());
             }
@@ -606,12 +632,13 @@ mod tests {
 
     async fn recv_claimed(queue: &UploadQueue, rx: &mut mpsc::Receiver<()>) -> Vec<PendingUpload> {
         rx.recv().await.expect("upload wakeup");
-        queue.claim_pending()
+        queue.claim_pending(usize::MAX)
     }
 
     async fn recv_one(queue: &UploadQueue, rx: &mut mpsc::Receiver<()>) -> PendingUpload {
-        recv_claimed(queue, rx)
-            .await
+        rx.recv().await.expect("upload wakeup");
+        queue
+            .claim_pending(1)
             .into_iter()
             .next()
             .expect("claimed upload")
@@ -1121,8 +1148,147 @@ mod tests {
         assert_eq!(queue.pending_count(), 4);
 
         rx.recv().await.expect("coalesced wakeup");
-        let claimed = queue.claim_pending();
+        let claimed = queue.claim_pending(usize::MAX);
         assert_eq!(claimed.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn bounded_claim_preserves_the_next_page_and_zero_limit() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        for object_id in 1..=4 {
+            queue.submit(7, object_id * 4096, object_id, 1);
+        }
+        rx.recv().await.expect("coalesced wakeup");
+
+        assert!(queue.claim_pending(0).is_empty());
+        let first_page = queue.claim_pending(2);
+        assert_eq!(
+            first_page.iter().map(|op| op.object_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let second_page = queue.claim_pending(2);
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|op| op.object_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(queue.claim_pending(1).is_empty());
+        for op in first_page.iter().chain(&second_page) {
+            assert!(queue.complete(op));
+        }
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_claim_advances_past_requeued_low_ids() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        for object_id in 1..=4 {
+            queue.submit(7, object_id * 4096, object_id, 1);
+        }
+        rx.recv().await.expect("coalesced wakeup");
+
+        let first_page = queue.claim_pending(2);
+        assert_eq!(
+            first_page.iter().map(|op| op.object_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        for op in &first_page {
+            assert!(queue.requeue(op.clone()));
+        }
+
+        let second_page = queue.claim_pending(2);
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|op| op.object_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        let wrapped_page = queue.claim_pending(2);
+        assert_eq!(
+            wrapped_page
+                .iter()
+                .map(|op| op.object_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        for op in second_page.iter().chain(&wrapped_page) {
+            assert!(queue.complete(op));
+        }
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_claim_finishes_frozen_sweep_before_newer_ids() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(7, 0, 1, 1);
+        queue.submit(7, 4096, 2, 1);
+        rx.recv().await.expect("initial wakeup");
+
+        let first = queue.claim_pending(1).pop().expect("first item");
+        assert_eq!(first.object_id, 1);
+        assert!(queue.requeue(first));
+
+        queue.submit(7, 8192, 3, 1);
+        let second = queue.claim_pending(1).pop().expect("second item");
+        assert_eq!(second.object_id, 2);
+
+        queue.submit(7, 12_288, 4, 1);
+        let wrapped = queue.claim_pending(1).pop().expect("wrapped item");
+        assert_eq!(wrapped.object_id, 1);
+
+        for op in queue.snapshot_pending() {
+            assert!(queue.complete(&op));
+        }
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_claim_returns_authoritative_updates_and_retries_and_skips_deletions() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(7, 0, 41, 1);
+        queue.submit(7, 8, 42, 1);
+        queue.submit(7, 16, 43, 1);
+        rx.recv().await.expect("initial wakeup");
+
+        let first = queue.claim_pending(1).pop().expect("first page item");
+        assert_eq!(first.object_id, 41);
+        let deleted = queue
+            .snapshot_pending()
+            .into_iter()
+            .find(|op| op.object_id == 43)
+            .expect("pending operation to cancel");
+        assert!(queue.cancel(&deleted));
+        queue.submit(7, 8, 42, 2);
+
+        let updated = queue.claim_pending(2);
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].object_id, 42);
+        assert_eq!(updated[0].content_epoch, 2);
+
+        let mut retry = updated[0].clone();
+        retry.retry_count = 3;
+        let retry_not_before_unix_ms = now_unix_ms().saturating_add(1_000);
+        retry.not_before_unix_ms = retry_not_before_unix_ms;
+        assert!(queue.requeue(retry));
+        rx.recv().await.expect("retry wakeup");
+        let retried = queue.claim_pending(1).pop().expect("retried upload");
+        assert_eq!(retried.object_id, 42);
+        assert_eq!(retried.retry_count, 3);
+        assert_eq!(retried.not_before_unix_ms, retry_not_before_unix_ms);
+        assert!(queue.complete(&first));
+        assert!(queue.complete(&retried));
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[tokio::test]
@@ -1132,15 +1298,21 @@ mod tests {
 
         queue.submit(7, 0, 41, 1);
         rx.recv().await.expect("initial wakeup");
-        let first = queue.claim_pending().pop().expect("initial claim");
+        let first = queue
+            .claim_pending(usize::MAX)
+            .pop()
+            .expect("initial claim");
 
         queue.submit(7, 0, 41, 2);
         rx.recv().await.expect("updated wakeup");
-        let updated = queue.claim_pending().pop().expect("updated claim");
+        let updated = queue
+            .claim_pending(usize::MAX)
+            .pop()
+            .expect("updated claim");
 
         assert_eq!(first.content_epoch, 1);
         assert_eq!(updated.content_epoch, 2);
-        assert!(queue.claim_pending().is_empty());
+        assert!(queue.claim_pending(usize::MAX).is_empty());
     }
 
     #[tokio::test]
@@ -1153,11 +1325,11 @@ mod tests {
         queue.submit(7, 16, 43, 1);
         rx.recv().await.expect("initial wakeup");
 
-        assert_eq!(queue.claim_pending().len(), 3);
+        assert_eq!(queue.claim_pending(usize::MAX).len(), 3);
 
         queue.submit(7, 8, 42, 2);
         rx.recv().await.expect("updated wakeup");
-        let updated = queue.claim_pending();
+        let updated = queue.claim_pending(usize::MAX);
 
         assert_eq!(updated.len(), 1);
         assert_eq!(updated[0].object_id, 42);

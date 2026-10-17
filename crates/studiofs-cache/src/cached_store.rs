@@ -1049,9 +1049,12 @@ impl CachedStore {
         self.upload_queue.pending_count()
     }
 
-    /// Claims current pending uploads after the upload worker consumes a wakeup.
-    pub fn claim_pending_uploads(&self) -> Vec<PendingUpload> {
-        self.upload_queue.claim_pending()
+    /// Claims up to `max_items` dirty uploads after the upload worker consumes a wakeup.
+    ///
+    /// Remaining dirty uploads stay queued for later calls; a partial claim
+    /// does not emit another wakeup.
+    pub fn claim_pending_uploads(&self, max_items: usize) -> Vec<PendingUpload> {
+        self.upload_queue.claim_pending(max_items)
     }
 
     /// Returns whether `op` still matches the authoritative pending upload.
@@ -1813,7 +1816,7 @@ mod tests {
     async fn recv_one(store: &CachedStore, rx: &mut mpsc::Receiver<()>) -> PendingUpload {
         rx.recv().await.expect("upload wakeup");
         store
-            .claim_pending_uploads()
+            .claim_pending_uploads(1)
             .into_iter()
             .next()
             .expect("claimed upload")
@@ -1822,7 +1825,7 @@ mod tests {
     fn try_recv_one(store: &CachedStore, rx: &mut mpsc::Receiver<()>) -> PendingUpload {
         rx.try_recv().expect("upload wakeup");
         store
-            .claim_pending_uploads()
+            .claim_pending_uploads(1)
             .into_iter()
             .next()
             .expect("claimed upload")

@@ -191,6 +191,14 @@ Completion or cancellation releases that pin only when the operation matches
 the current entry. Closed-channel rollback preserves any prior owner, and
 dirty lifecycle state remains protected independently of runtime pins.
 
+The uploader claims pending descriptors in bounded pages. Ready, delayed and
+active uploads share a scheduling window of twice the effective worker count;
+the remaining accepted operations stay in the pending index. The worker refills
+free slots after dispatch or completion and keeps draining canceled pages
+without requiring another external wakeup. Paging preserves retry deadlines
+and the existing cancellation and pin-ownership rules. Claims rotate through
+object IDs so repeatedly requeued retries cannot monopolize the window.
+
 Writer pending-upload bytes count each accepted staged object once. Accepted
 updates replace that object's byte contribution; ignored and closed-channel
 submissions preserve prior accounting. Staged submission and terminal removal
