@@ -5,7 +5,8 @@
 //! startup replay is reconstructed from the local backend + metadata mapping.
 
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map::Entry};
+use std::ops::Bound::{Excluded, Included};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,7 +84,17 @@ struct ClosedDispatchHook {
 struct PendingState {
     by_object: BTreeMap<u64, PendingUpload>,
     by_inode: BTreeMap<Ino, BTreeSet<u64>>,
-    dirty_objects: BTreeSet<u64>,
+    // Dirty IDs permit cancellation before due; deadline and due indexes partition them.
+    dirty_by_inode: BTreeMap<Ino, BTreeSet<u64>>,
+    due_by_inode: BTreeMap<Ino, BTreeSet<u64>>,
+    // false keys use creation time plus initial delay; true keys use retry deadlines.
+    deadlines: BTreeSet<(bool, u64, Ino, u64)>,
+    // Freeze each sweep's upper ID so continuous arrivals cannot postpone older retries.
+    claim_inode_cursor: Option<(Ino, Ino)>,
+    claim_object_cursors: BTreeMap<Ino, (u64, u64)>,
+    // Mirror of the caller's insert-only tombstones; `canceled_dirty` is the subset with dirty IDs.
+    canceled_inodes: HashSet<Ino>,
+    canceled_dirty: BTreeSet<Ino>,
     wakeup_coalesced: u64,
 }
 
@@ -137,7 +148,13 @@ impl UploadQueue {
             pending_state: Mutex::new(PendingState {
                 by_object: BTreeMap::new(),
                 by_inode: BTreeMap::new(),
-                dirty_objects: BTreeSet::new(),
+                dirty_by_inode: BTreeMap::new(),
+                due_by_inode: BTreeMap::new(),
+                deadlines: BTreeSet::new(),
+                claim_inode_cursor: None,
+                claim_object_cursors: BTreeMap::new(),
+                canceled_inodes: HashSet::new(),
+                canceled_dirty: BTreeSet::new(),
                 wakeup_coalesced: 0,
             }),
             idle_notify,
@@ -364,17 +381,179 @@ impl UploadQueue {
         self.pending_state.lock().by_object.len()
     }
 
-    /// Claim current pending uploads after a worker wakeup.
-    pub fn claim_pending(&self) -> Vec<PendingUpload> {
+    /// Claims at most `max_items` due uploads, or canceled uploads regardless of deadline.
+    /// Unclaimed operations remain authoritative and do not require another wakeup.
+    /// `canceled_inodes` must be insert-only; it is re-read only when it grows.
+    pub fn claim_pending(
+        &self,
+        max_items: usize,
+        now_unix_ms: u64,
+        initial_delay_ms: u64,
+        canceled_inodes: &HashSet<Ino>,
+    ) -> Vec<PendingUpload> {
         let mut state = self.pending_state.lock();
-        let dirty_objects = std::mem::take(&mut state.dirty_objects);
-        let mut claimed = Vec::with_capacity(dirty_objects.len());
-        for object_id in dirty_objects {
-            if let Some(op) = state.by_object.get(&object_id) {
-                claimed.push(op.clone());
+        let mut claimed = Vec::with_capacity(max_items.min(state.by_object.len()));
+        if max_items == 0 {
+            return claimed;
+        }
+        // Sync only new tombstones so steady-state claims cost O(claimed), not O(backlog).
+        if canceled_inodes.len() > state.canceled_inodes.len() {
+            for &ino in canceled_inodes {
+                if state.canceled_inodes.insert(ino) && state.dirty_by_inode.contains_key(&ino) {
+                    state.canceled_dirty.insert(ino);
+                }
             }
         }
+        while claimed.len() < max_items {
+            let Some(&ino) = state.canceled_dirty.first() else {
+                break;
+            };
+            let page: Vec<_> = state.dirty_by_inode[&ino]
+                .iter()
+                .take(max_items - claimed.len())
+                .map(|object_id| state.by_object[object_id].clone())
+                .collect();
+            for op in &page {
+                Self::unmark_dirty(&mut state, op);
+            }
+            claimed.extend(page);
+        }
+        if claimed.len() == max_items {
+            return claimed;
+        }
+        Self::promote_due(&mut state, now_unix_ms, initial_delay_ms);
+        while claimed.len() < max_items {
+            let next = state
+                .claim_inode_cursor
+                .and_then(|(cursor, end)| {
+                    state
+                        .due_by_inode
+                        .range((Excluded(cursor), Included(end)))
+                        .next()
+                        .map(|(&ino, _)| (ino, end))
+                })
+                .or_else(|| {
+                    Some((
+                        *state.due_by_inode.first_key_value()?.0,
+                        *state.due_by_inode.last_key_value()?.0,
+                    ))
+                });
+            let Some((ino, inode_end)) = next else { break };
+            let objects = &state.due_by_inode[&ino];
+            let next = state
+                .claim_object_cursors
+                .get(&ino)
+                .and_then(|&(cursor, end)| {
+                    objects
+                        .range((Excluded(cursor), Included(end)))
+                        .next()
+                        .map(|&id| (id, end))
+                })
+                .or_else(|| Some((*objects.first()?, *objects.last()?)));
+            let Some((object_id, object_end)) = next else {
+                break;
+            };
+            state.claim_inode_cursor = Some((ino, inode_end));
+            state
+                .claim_object_cursors
+                .insert(ino, (object_id, object_end));
+            let op = state.by_object[&object_id].clone();
+            Self::unmark_dirty(&mut state, &op);
+            claimed.push(op);
+        }
         claimed
+    }
+
+    /// Earliest effective deadline among unclaimed uploads, without a backlog scan.
+    /// Returns zero when promoted IDs are already eligible for admission.
+    pub fn next_pending_upload_deadline(&self, initial_delay_ms: u64) -> Option<u64> {
+        let state = self.pending_state.lock();
+        if !state.due_by_inode.is_empty() {
+            return Some(0);
+        }
+        let initial = state
+            .deadlines
+            .range((false, 0, 0, 0)..=(false, u64::MAX, u64::MAX, u64::MAX))
+            .next()
+            .map(|(_, created, _, _)| created.saturating_add(initial_delay_ms));
+        let retry = state
+            .deadlines
+            .range((true, 0, 0, 0)..=(true, u64::MAX, u64::MAX, u64::MAX))
+            .next()
+            .map(|(_, deadline, _, _)| *deadline);
+        initial.into_iter().chain(retry).min()
+    }
+
+    fn promote_due(state: &mut PendingState, now: u64, initial_delay_ms: u64) {
+        for retry in [false, true] {
+            loop {
+                let next = state
+                    .deadlines
+                    .range((retry, 0, 0, 0)..=(retry, u64::MAX, u64::MAX, u64::MAX))
+                    .next()
+                    .copied();
+                let Some(key @ (_, timestamp, ino, object_id)) = next else {
+                    break;
+                };
+                let deadline = if retry {
+                    timestamp
+                } else {
+                    timestamp.saturating_add(initial_delay_ms)
+                };
+                if deadline > now {
+                    break;
+                }
+                state.deadlines.remove(&key);
+                state.due_by_inode.entry(ino).or_default().insert(object_id);
+            }
+        }
+    }
+
+    fn deadline_key(op: &PendingUpload) -> (bool, u64, Ino, u64) {
+        (
+            op.not_before_unix_ms != 0,
+            if op.not_before_unix_ms == 0 {
+                op.created_unix_ms
+            } else {
+                op.not_before_unix_ms
+            },
+            op.ino,
+            op.object_id,
+        )
+    }
+
+    fn mark_dirty(state: &mut PendingState, op: &PendingUpload) {
+        state
+            .dirty_by_inode
+            .entry(op.ino)
+            .or_default()
+            .insert(op.object_id);
+        state.deadlines.insert(Self::deadline_key(op));
+        if state.canceled_inodes.contains(&op.ino) {
+            state.canceled_dirty.insert(op.ino);
+        }
+    }
+
+    fn unmark_dirty(state: &mut PendingState, op: &PendingUpload) {
+        state.deadlines.remove(&Self::deadline_key(op));
+        if let Entry::Occupied(mut entry) = state.dirty_by_inode.entry(op.ino) {
+            entry.get_mut().remove(&op.object_id);
+            if entry.get().is_empty() {
+                entry.remove();
+                state.canceled_dirty.remove(&op.ino);
+            }
+        }
+        if let Entry::Occupied(mut entry) = state.due_by_inode.entry(op.ino) {
+            entry.get_mut().remove(&op.object_id);
+            if entry.get().is_empty() {
+                entry.remove();
+                state.claim_object_cursors.remove(&op.ino);
+            }
+        }
+        if state.due_by_inode.is_empty() {
+            state.claim_inode_cursor = None;
+            state.claim_object_cursors.clear();
+        }
     }
 
     /// Returns whether `op` still matches the authoritative pending operation.
@@ -463,7 +642,8 @@ impl UploadQueue {
                 && op.content_epoch > current.content_epoch
             {
                 let previous = std::mem::replace(current, op.clone());
-                state.dirty_objects.insert(op.object_id);
+                Self::unmark_dirty(state, &previous);
+                Self::mark_dirty(state, op);
                 return PendingSubmit::Updated(previous);
             }
             return PendingSubmit::Ignored;
@@ -472,7 +652,7 @@ impl UploadQueue {
         let ino = op.ino;
         state.by_object.insert(op.object_id, op.clone());
         state.by_inode.entry(ino).or_default().insert(op.object_id);
-        state.dirty_objects.insert(op.object_id);
+        Self::mark_dirty(state, op);
         PendingSubmit::New
     }
 
@@ -527,7 +707,7 @@ impl UploadQueue {
         }
         let removed = entry.remove();
         Self::remove_inode_index_entry(state, removed.ino, op.object_id);
-        state.dirty_objects.remove(&op.object_id);
+        Self::unmark_dirty(state, &removed);
         let became_idle = state.by_object.is_empty();
         (true, became_idle)
     }
@@ -544,7 +724,8 @@ impl UploadQueue {
             return None;
         }
         let previous = std::mem::replace(current, op.clone());
-        state.dirty_objects.insert(op.object_id);
+        Self::unmark_dirty(state, &previous);
+        Self::mark_dirty(state, op);
         Some(previous)
     }
 
@@ -565,7 +746,8 @@ impl UploadQueue {
             return None;
         }
         let previous = std::mem::replace(current, replacement.clone());
-        state.dirty_objects.insert(expected.object_id);
+        Self::unmark_dirty(state, &previous);
+        Self::mark_dirty(state, replacement);
         Some(previous)
     }
 
@@ -578,7 +760,9 @@ impl UploadQueue {
             return;
         };
         if current == failed_op {
-            *current = previous;
+            *current = previous.clone();
+            Self::unmark_dirty(state, failed_op);
+            Self::mark_dirty(state, &previous);
         }
     }
 
@@ -592,7 +776,7 @@ impl UploadQueue {
     }
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -606,12 +790,13 @@ mod tests {
 
     async fn recv_claimed(queue: &UploadQueue, rx: &mut mpsc::Receiver<()>) -> Vec<PendingUpload> {
         rx.recv().await.expect("upload wakeup");
-        queue.claim_pending()
+        queue.claim_pending(usize::MAX, u64::MAX, 0, &HashSet::new())
     }
 
     async fn recv_one(queue: &UploadQueue, rx: &mut mpsc::Receiver<()>) -> PendingUpload {
-        recv_claimed(queue, rx)
-            .await
+        rx.recv().await.expect("upload wakeup");
+        queue
+            .claim_pending(1, u64::MAX, 0, &HashSet::new())
             .into_iter()
             .next()
             .expect("claimed upload")
@@ -1121,8 +1306,339 @@ mod tests {
         assert_eq!(queue.pending_count(), 4);
 
         rx.recv().await.expect("coalesced wakeup");
-        let claimed = queue.claim_pending();
+        let claimed = queue.claim_pending(usize::MAX, u64::MAX, 0, &HashSet::new());
         assert_eq!(claimed.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn due_claim_preserves_initial_delay_retry_deadlines_and_overflow() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, _rx) = UploadQueue::new(dir.path());
+        for object_id in 1..=3 {
+            queue.submit(7, 0, object_id, 1);
+        }
+        for mut op in queue.snapshot_pending() {
+            op.created_unix_ms = 100;
+            op.not_before_unix_ms = match op.object_id {
+                1 => 0,
+                2 => 150,
+                _ => u64::MAX,
+            };
+            assert!(queue.requeue(op));
+        }
+        let canceled = HashSet::new();
+        assert_eq!(queue.next_pending_upload_deadline(100), Some(150));
+        assert!(queue.claim_pending(8, 149, 100, &canceled).is_empty());
+        assert_eq!(queue.claim_pending(8, 150, 100, &canceled)[0].object_id, 2);
+        assert_eq!(queue.next_pending_upload_deadline(100), Some(200));
+        assert!(queue.claim_pending(8, 199, 100, &canceled).is_empty());
+        assert_eq!(queue.claim_pending(8, 200, 100, &canceled)[0].object_id, 1);
+        assert_eq!(queue.next_pending_upload_deadline(100), Some(u64::MAX));
+        assert_eq!(
+            queue.pending_count(),
+            3,
+            "claiming retains authoritative owners"
+        );
+        assert_eq!(
+            queue.claim_pending(8, u64::MAX, 100, &canceled)[0].object_id,
+            3
+        );
+        assert_eq!(queue.next_pending_upload_deadline(100), None);
+
+        queue.submit(8, 0, 4, 1);
+        assert!(
+            queue
+                .claim_pending(1, u64::MAX - 1, u64::MAX, &canceled)
+                .is_empty()
+        );
+        assert_eq!(queue.next_pending_upload_deadline(u64::MAX), Some(u64::MAX));
+        assert_eq!(
+            queue.claim_pending(1, u64::MAX, u64::MAX, &canceled)[0].object_id,
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_claim_rotates_inodes_and_preserves_each_object_sweep() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, _rx) = UploadQueue::new(dir.path());
+        for object_id in 1..=1005 {
+            queue.submit(if object_id <= 1000 { 7 } else { 8 }, 0, object_id, 1);
+        }
+        let first = queue.claim_pending(4, u64::MAX, 0, &HashSet::new());
+        assert_eq!(
+            first.iter().map(|op| op.object_id).collect::<Vec<_>>(),
+            vec![1, 1001, 2, 1002]
+        );
+        assert!(queue.requeue(first[0].clone()));
+        assert!(queue.requeue(first[1].clone()));
+        queue.submit(9, 0, 2001, 1);
+        let next = queue.claim_pending(3, u64::MAX, 0, &HashSet::new());
+        assert_eq!(
+            next.iter().map(|op| op.object_id).collect::<Vec<_>>(),
+            vec![3, 1003, 2001]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_inode_sweep_wraps_despite_continuously_higher_arrivals() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, _rx) = UploadQueue::new(dir.path());
+        queue.submit(7, 0, 1, 1);
+        queue.submit(8, 0, 2, 1);
+        let first = queue
+            .claim_pending(1, u64::MAX, 0, &HashSet::new())
+            .pop()
+            .unwrap();
+        assert!(queue.requeue(first));
+        queue.submit(9, 0, 3, 1);
+        assert_eq!(
+            queue.claim_pending(1, u64::MAX, 0, &HashSet::new())[0].ino,
+            8
+        );
+        queue.submit(10, 0, 4, 1);
+        assert_eq!(
+            queue.claim_pending(1, u64::MAX, 0, &HashSet::new())[0].ino,
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn future_cancellation_is_bounded_and_empty_claim_resets_cursors() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, _rx) = UploadQueue::new(dir.path());
+        for object_id in 1..=40 {
+            queue.submit(7, 0, object_id, 1);
+        }
+        for mut op in queue.snapshot_pending() {
+            op.not_before_unix_ms = u64::MAX;
+            assert!(queue.requeue(op));
+        }
+        assert!(queue.claim_pending(8, 100, 0, &HashSet::new()).is_empty());
+        let canceled = HashSet::from([7]);
+        let page = queue.claim_pending(8, 100, 0, &canceled);
+        assert_eq!(page.len(), 8);
+        assert_eq!(queue.next_pending_upload_deadline(0), Some(u64::MAX));
+        for op in page {
+            assert!(queue.cancel(&op));
+        }
+        let rest = queue.claim_pending(usize::MAX, 100, 0, &canceled);
+        assert_eq!(rest.len(), 32);
+        for op in rest {
+            assert!(queue.cancel(&op));
+        }
+        assert!(queue.pending_state.lock().claim_inode_cursor.is_none());
+        assert!(queue.pending_state.lock().claim_object_cursors.is_empty());
+        assert_eq!(queue.next_pending_upload_deadline(0), None);
+    }
+
+    #[tokio::test]
+    async fn cancellation_index_tracks_only_tombstoned_inodes_with_unclaimed_work() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, _rx) = UploadQueue::new(dir.path());
+        for ino in 1..=64 {
+            queue.submit(ino, 0, ino, 1);
+        }
+        // Tombstones for inodes without pending work must not be revisited by later claims.
+        let mut canceled: HashSet<Ino> = (1_000..2_000).collect();
+        assert_eq!(queue.claim_pending(1, u64::MAX, 0, &canceled)[0].ino, 1);
+        assert!(queue.pending_state.lock().canceled_dirty.is_empty());
+
+        // New future work on an already-mirrored tombstone is canceled before it is due.
+        queue.submit(1_500, 0, 100, 1);
+        let mut op = queue
+            .snapshot_pending()
+            .into_iter()
+            .find(|op| op.ino == 1_500)
+            .unwrap();
+        op.not_before_unix_ms = u64::MAX;
+        assert!(queue.requeue(op));
+        assert_eq!(queue.claim_pending(1, 0, 0, &canceled)[0].ino, 1_500);
+        assert!(queue.pending_state.lock().canceled_dirty.is_empty());
+
+        // A grown tombstone set is merged and its pending work is claimed first.
+        canceled.insert(64);
+        assert_eq!(queue.claim_pending(1, 0, 0, &canceled)[0].ino, 64);
+        assert!(queue.pending_state.lock().canceled_dirty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closed_requeue_restores_deadline_index_for_the_previous_owner() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, rx) = UploadQueue::new(dir.path());
+        queue.submit(7, 0, 1, 1);
+        let mut op = queue.snapshot_pending().pop().unwrap();
+        op.not_before_unix_ms = 1000;
+        assert!(queue.requeue(op.clone()));
+        drop(rx);
+        let mut failed = op.clone();
+        failed.not_before_unix_ms = 2000;
+        assert!(!queue.requeue(failed));
+        assert_eq!(queue.next_pending_upload_deadline(0), Some(1000));
+        assert!(queue.claim_pending(1, 999, 0, &HashSet::new()).is_empty());
+        assert_eq!(queue.claim_pending(1, 1000, 0, &HashSet::new()), vec![op]);
+    }
+
+    #[tokio::test]
+    async fn bounded_claim_preserves_the_next_page_and_zero_limit() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        for object_id in 1..=4 {
+            queue.submit(7, object_id * 4096, object_id, 1);
+        }
+        rx.recv().await.expect("coalesced wakeup");
+
+        assert!(
+            queue
+                .claim_pending(0, u64::MAX, 0, &HashSet::new())
+                .is_empty()
+        );
+        let first_page = queue.claim_pending(2, u64::MAX, 0, &HashSet::new());
+        assert_eq!(
+            first_page.iter().map(|op| op.object_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let second_page = queue.claim_pending(2, u64::MAX, 0, &HashSet::new());
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|op| op.object_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(
+            queue
+                .claim_pending(1, u64::MAX, 0, &HashSet::new())
+                .is_empty()
+        );
+        for op in first_page.iter().chain(&second_page) {
+            assert!(queue.complete(op));
+        }
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_claim_advances_past_requeued_low_ids() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        for object_id in 1..=4 {
+            queue.submit(7, object_id * 4096, object_id, 1);
+        }
+        rx.recv().await.expect("coalesced wakeup");
+
+        let first_page = queue.claim_pending(2, u64::MAX, 0, &HashSet::new());
+        assert_eq!(
+            first_page.iter().map(|op| op.object_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        for op in &first_page {
+            assert!(queue.requeue(op.clone()));
+        }
+
+        let second_page = queue.claim_pending(2, u64::MAX, 0, &HashSet::new());
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|op| op.object_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        let wrapped_page = queue.claim_pending(2, u64::MAX, 0, &HashSet::new());
+        assert_eq!(
+            wrapped_page
+                .iter()
+                .map(|op| op.object_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        for op in second_page.iter().chain(&wrapped_page) {
+            assert!(queue.complete(op));
+        }
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_claim_finishes_frozen_sweep_before_newer_ids() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(7, 0, 1, 1);
+        queue.submit(7, 4096, 2, 1);
+        rx.recv().await.expect("initial wakeup");
+
+        let first = queue
+            .claim_pending(1, u64::MAX, 0, &HashSet::new())
+            .pop()
+            .expect("first item");
+        assert_eq!(first.object_id, 1);
+        assert!(queue.requeue(first));
+
+        queue.submit(7, 8192, 3, 1);
+        let second = queue
+            .claim_pending(1, u64::MAX, 0, &HashSet::new())
+            .pop()
+            .expect("second item");
+        assert_eq!(second.object_id, 2);
+
+        queue.submit(7, 12_288, 4, 1);
+        let wrapped = queue
+            .claim_pending(1, u64::MAX, 0, &HashSet::new())
+            .pop()
+            .expect("wrapped item");
+        assert_eq!(wrapped.object_id, 1);
+
+        for op in queue.snapshot_pending() {
+            assert!(queue.complete(&op));
+        }
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_claim_returns_authoritative_updates_and_retries_and_skips_deletions() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(7, 0, 41, 1);
+        queue.submit(7, 8, 42, 1);
+        queue.submit(7, 16, 43, 1);
+        rx.recv().await.expect("initial wakeup");
+
+        let first = queue
+            .claim_pending(1, u64::MAX, 0, &HashSet::new())
+            .pop()
+            .expect("first page item");
+        assert_eq!(first.object_id, 41);
+        let deleted = queue
+            .snapshot_pending()
+            .into_iter()
+            .find(|op| op.object_id == 43)
+            .expect("pending operation to cancel");
+        assert!(queue.cancel(&deleted));
+        queue.submit(7, 8, 42, 2);
+
+        let updated = queue.claim_pending(2, u64::MAX, 0, &HashSet::new());
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].object_id, 42);
+        assert_eq!(updated[0].content_epoch, 2);
+
+        let mut retry = updated[0].clone();
+        retry.retry_count = 3;
+        let retry_not_before_unix_ms = now_unix_ms().saturating_add(1_000);
+        retry.not_before_unix_ms = retry_not_before_unix_ms;
+        assert!(queue.requeue(retry));
+        rx.recv().await.expect("retry wakeup");
+        let retried = queue
+            .claim_pending(1, u64::MAX, 0, &HashSet::new())
+            .pop()
+            .expect("retried upload");
+        assert_eq!(retried.object_id, 42);
+        assert_eq!(retried.retry_count, 3);
+        assert_eq!(retried.not_before_unix_ms, retry_not_before_unix_ms);
+        assert!(queue.complete(&first));
+        assert!(queue.complete(&retried));
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[tokio::test]
@@ -1132,15 +1648,25 @@ mod tests {
 
         queue.submit(7, 0, 41, 1);
         rx.recv().await.expect("initial wakeup");
-        let first = queue.claim_pending().pop().expect("initial claim");
+        let first = queue
+            .claim_pending(usize::MAX, u64::MAX, 0, &HashSet::new())
+            .pop()
+            .expect("initial claim");
 
         queue.submit(7, 0, 41, 2);
         rx.recv().await.expect("updated wakeup");
-        let updated = queue.claim_pending().pop().expect("updated claim");
+        let updated = queue
+            .claim_pending(usize::MAX, u64::MAX, 0, &HashSet::new())
+            .pop()
+            .expect("updated claim");
 
         assert_eq!(first.content_epoch, 1);
         assert_eq!(updated.content_epoch, 2);
-        assert!(queue.claim_pending().is_empty());
+        assert!(
+            queue
+                .claim_pending(usize::MAX, u64::MAX, 0, &HashSet::new())
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1153,11 +1679,16 @@ mod tests {
         queue.submit(7, 16, 43, 1);
         rx.recv().await.expect("initial wakeup");
 
-        assert_eq!(queue.claim_pending().len(), 3);
+        assert_eq!(
+            queue
+                .claim_pending(usize::MAX, u64::MAX, 0, &HashSet::new())
+                .len(),
+            3
+        );
 
         queue.submit(7, 8, 42, 2);
         rx.recv().await.expect("updated wakeup");
-        let updated = queue.claim_pending();
+        let updated = queue.claim_pending(usize::MAX, u64::MAX, 0, &HashSet::new());
 
         assert_eq!(updated.len(), 1);
         assert_eq!(updated[0].object_id, 42);

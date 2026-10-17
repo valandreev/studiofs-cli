@@ -5,7 +5,7 @@
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use crate::local::{
 };
 use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
 use crate::runtime::LocalPayloadLayout;
-use crate::upload_queue::{PendingUpload, UploadQueue, UploadSubmitOutcome};
+use crate::upload_queue::{PendingUpload, UploadQueue, UploadSubmitOutcome, now_unix_ms};
 use crate::upload_stage::{UploadStageStore, UploadStageStoreError};
 
 /// Stable identifier for cached payload objects.
@@ -1049,9 +1049,29 @@ impl CachedStore {
         self.upload_queue.pending_count()
     }
 
-    /// Claims current pending uploads after the upload worker consumes a wakeup.
-    pub fn claim_pending_uploads(&self) -> Vec<PendingUpload> {
-        self.upload_queue.claim_pending()
+    /// Claims up to `max_items` due uploads, including delayed cancellations.
+    ///
+    /// Remaining dirty uploads stay queued for later calls; a partial claim
+    /// does not emit another wakeup.
+    pub fn claim_pending_uploads(
+        &self,
+        max_items: usize,
+        initial_delay: Duration,
+        canceled_inodes: &HashSet<u64>,
+    ) -> Vec<PendingUpload> {
+        self.upload_queue.claim_pending(
+            max_items,
+            now_unix_ms(),
+            initial_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+            canceled_inodes,
+        )
+    }
+
+    /// Earliest effective deadline of unclaimed uploads.
+    pub fn next_pending_upload_deadline(&self, initial_delay: Duration) -> Option<u64> {
+        self.upload_queue.next_pending_upload_deadline(
+            initial_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+        )
     }
 
     /// Returns whether `op` still matches the authoritative pending upload.
@@ -1813,7 +1833,7 @@ mod tests {
     async fn recv_one(store: &CachedStore, rx: &mut mpsc::Receiver<()>) -> PendingUpload {
         rx.recv().await.expect("upload wakeup");
         store
-            .claim_pending_uploads()
+            .claim_pending_uploads(1, Duration::ZERO, &HashSet::new())
             .into_iter()
             .next()
             .expect("claimed upload")
@@ -1822,7 +1842,7 @@ mod tests {
     fn try_recv_one(store: &CachedStore, rx: &mut mpsc::Receiver<()>) -> PendingUpload {
         rx.try_recv().expect("upload wakeup");
         store
-            .claim_pending_uploads()
+            .claim_pending_uploads(1, Duration::ZERO, &HashSet::new())
             .into_iter()
             .next()
             .expect("claimed upload")

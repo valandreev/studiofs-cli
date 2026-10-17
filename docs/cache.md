@@ -191,6 +191,19 @@ Completion or cancellation releases that pin only when the operation matches
 the current entry. Closed-channel rollback preserves any prior owner, and
 dirty lifecycle state remains protected independently of runtime pins.
 
+The uploader claims due pending descriptors in bounded pages. Ready, delayed
+and active uploads share a scheduling window of twice the effective worker
+count. Future retries and initial upload delays remain in the authoritative
+pending index until due, leaving window slots available for fresh ready work.
+The worker refills free slots after dispatch or completion and wakes at the
+earliest pending deadline without requiring another external channel wakeup.
+Deleted inodes bypass deadline eligibility so cancellation still drains in
+bounded pages. Admission rotates across inodes and through object IDs within
+each inode; a frozen sweep boundary prevents continuous arrivals or requeued
+low IDs from starving earlier work. Paging preserves cancellation and pin
+ownership. Normal ready refills dispatch directly; cancellation-only pages
+yield cooperatively.
+
 Writer pending-upload bytes count each accepted staged object once. Accepted
 updates replace that object's byte contribution; ignored and closed-channel
 submissions preserve prior accounting. Staged submission and terminal removal
