@@ -94,12 +94,15 @@ impl ReadyUploads {
         }
 
         let mut removed = Vec::new();
-        for ino in inos {
-            if let Some(mut queue) = self.per_inode.remove(ino) {
+        self.per_inode.retain(|ino, queue| {
+            if inos.contains(ino) {
                 removed.extend(queue.drain(..));
                 self.ready_set.remove(ino);
+                false
+            } else {
+                true
             }
-        }
+        });
         if !removed.is_empty() {
             self.ready_inodes.retain(|ino| !inos.contains(ino));
         }
@@ -4998,6 +5001,50 @@ mod tests {
             foreground_upload_reread_pacing_delay(true, 4usize * 1024 * 1024),
             Duration::from_nanos(3_906_250)
         );
+    }
+
+    #[test]
+    fn ready_uploads_remove_deleted_inodes_preserves_rotation() {
+        let mut ready = ReadyUploads::default();
+        for (ino, object_id) in [(10, 101), (10, 102), (20, 201), (20, 202), (30, 301)] {
+            let mut op = make_pending_upload();
+            op.ino = ino;
+            op.object_id = object_id;
+            ready.push_back(op);
+        }
+        assert_eq!(
+            ready.pop_front().expect("first ready upload").object_id,
+            101
+        );
+        let mut deleted: HashSet<_> = (50_000..50_128).collect();
+        assert!(ready.remove_inodes(&deleted).is_empty());
+        deleted.insert(20);
+
+        let removed = ready.remove_inodes(&deleted);
+
+        assert_eq!(
+            removed
+                .into_iter()
+                .map(|op| op.object_id)
+                .collect::<Vec<_>>(),
+            vec![201, 202]
+        );
+        assert!(!ready.ready_set.contains(&20));
+        assert!(!ready.per_inode.contains_key(&20));
+        assert_eq!(
+            ready.pop_front().expect("next surviving inode").object_id,
+            301
+        );
+        assert_eq!(
+            ready
+                .pop_front()
+                .expect("rotated surviving inode")
+                .object_id,
+            102
+        );
+        assert!(ready.pop_front().is_none());
+        assert!(ready.ready_set.is_empty());
+        assert!(ready.is_empty());
     }
 
     #[test]
