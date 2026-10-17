@@ -51,6 +51,29 @@ cargo test -p studiofs --test architecture_vocabulary_test active_docs_drop_supe
 3. Selected live S3 and combined S3/PostgreSQL regressions, run automatically in RWX.
 4. Other ignored integration tests that need RustFS/S3, mounted filesystems, or multiple processes.
 
+### SFS-864 upload deletion dispatch
+
+Run the focused uploader tests and the release-mode bounded-work checks:
+
+```powershell
+cargo test -p studiofs-vfs --lib vfs::upload_lifecycle::worker::tests:: -- --nocapture
+cargo test -p studiofs-vfs --release --lib deletion_sweep -- --nocapture
+cargo test -p studiofs-vfs --lib unlink_immediate_cleanup_removes_pending_upload_payload_artifacts -- --nocapture
+```
+
+The deletion-sweep tests count copied markers and inspected delayed entries
+while dispatching a known ready burst, including zero initial delay. These
+checks establish bounded algorithmic work, not measured latency or throughput.
+With 128 retained markers and 128 ready dispatches, the unchanged-state checks
+expect zero additional marker copies and delayed-entry inspections. A newly
+inserted marker still triggers a full cleanup of the current queues; the
+source-derived marker-copy and delayed-filter cost is `O(D + Q)` per observed
+deletion-state change, rather than per dispatch, for `D` retained markers and
+`Q` queued delayed items.
+The uploader retains deletion markers for the VFS lifetime and rejects late
+admission of work for an already-deleted inode. No mount or remote service is
+required for these checks.
+
 ### PostgreSQL CI gate
 
 The automatic Linux gate in `.rwx/ci.yml` starts an ephemeral `postgres:18-alpine`
