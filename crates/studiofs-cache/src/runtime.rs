@@ -703,22 +703,18 @@ impl LocalPayloadBackendRuntime {
         let mut eligible = Vec::with_capacity(object_ids.len());
         let mut removed_bytes = 0_u64;
         for &object_id in object_ids {
-            let entry = self.index.get_entry(object_id)?;
-            if self.is_runtime_pinned(object_id)
-                || !entry.as_ref().is_some_and(|entry| {
-                    entry.evictable
-                        && entry.lifecycle == LocalPayloadLifecycleState::Uploaded
-                        && entry.upload_state == LocalPayloadUploadState::None
-                        && (!downloaded_only || entry.origin == LocalPayloadOrigin::Downloaded)
-                })
-            {
+            let Some(entry) = self.index.get_entry(object_id)?.filter(|entry| {
+                !self.is_runtime_pinned(object_id)
+                    && entry.evictable
+                    && entry.lifecycle == LocalPayloadLifecycleState::Uploaded
+                    && entry.upload_state == LocalPayloadUploadState::None
+                    && (!downloaded_only || entry.origin == LocalPayloadOrigin::Downloaded)
+            }) else {
                 self.eviction_scan_skipped_non_evictable
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
-            }
-            if let Some(entry) = entry {
-                removed_bytes = removed_bytes.saturating_add(entry.payload_len);
-            }
+            };
+            removed_bytes = removed_bytes.saturating_add(entry.payload_len);
             eligible.push(object_id);
         }
         if eligible.is_empty() {

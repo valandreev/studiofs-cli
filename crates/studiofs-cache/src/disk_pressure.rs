@@ -84,7 +84,7 @@ impl LocalPayloadBackendRuntime {
         }
         state.last_attempt = Some(now);
         state.reclaimed_payload_bytes = 0;
-        let mut sample = match checked_sample(&mut sampler, &self.layout.runtime_root) {
+        let mut sample = match sampler(&self.layout.runtime_root) {
             Ok(sample) => sample,
             Err(error) => {
                 state.outcome = "sampling_failed";
@@ -162,7 +162,7 @@ impl LocalPayloadBackendRuntime {
         }
         if state.reclaimed_payload_bytes > 0 {
             // Unlink/index accounting is not evidence of released physical space.
-            match checked_sample(&mut sampler, &self.layout.runtime_root) {
+            match sampler(&self.layout.runtime_root) {
                 Ok(after) => {
                     sample = after;
                     state.last_sample = Some((now, sample));
@@ -208,20 +208,6 @@ impl LocalPayloadBackendRuntime {
         }
         Ok(())
     }
-}
-
-fn checked_sample(
-    sampler: &mut impl FnMut(&Path) -> io::Result<platform::FilesystemSpace>,
-    path: &Path,
-) -> io::Result<platform::FilesystemSpace> {
-    let sample = sampler(path)?;
-    if sample.total_bytes == 0 || sample.available_bytes > sample.total_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid filesystem capacity sample",
-        ));
-    }
-    Ok(sample)
 }
 
 #[cfg(test)]

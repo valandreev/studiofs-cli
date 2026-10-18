@@ -48,16 +48,10 @@ fn checked_filesystem_space(available_bytes: u64, total_bytes: u64) -> io::Resul
 fn filesystem_space_impl(path: &Path) -> io::Result<FilesystemSpace> {
     use std::os::windows::ffi::OsStrExt;
 
-    if path.as_os_str().encode_wide().any(|unit| unit == 0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "filesystem path contains an interior NUL",
-        ));
-    }
-    // Resolve junctions so the volume query sees the actual target volume root.
+    // Resolve junctions so the volume query sees the actual target volume root;
+    // `canonicalize` rejects interior NULs with `InvalidInput`.
     let canonical = path.canonicalize()?;
-    let mut canonical_wide: Vec<_> = canonical.as_os_str().encode_wide().collect();
-    canonical_wide.push(0);
+    let canonical_wide: Vec<_> = canonical.as_os_str().encode_wide().chain(Some(0)).collect();
 
     #[link(name = "kernel32")]
     #[expect(

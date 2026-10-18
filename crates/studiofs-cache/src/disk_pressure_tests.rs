@@ -84,19 +84,18 @@ fn active_reader_finishes_after_physical_eviction_removes_its_cached_file() {
 
 #[test]
 fn invalid_samples_preserve_payloads_and_remain_rate_limited() {
-    for invalid in [space(0, 0), space(2, 1)] {
-        let (_temp, backend) = backend();
-        backend.put(1, b"keep", true).unwrap();
-        let now = Instant::now();
-        backend
-            .run_disk_pressure_maintenance(now, |_| Ok(invalid))
-            .unwrap();
-        backend
-            .run_disk_pressure_maintenance(now, |_| panic!("invalid sample must cool down"))
-            .unwrap();
-        assert!(backend.contains(1));
-        assert_eq!(backend.physical_space_status().outcome, "sampling_failed");
-    }
+    // `filesystem_space` rejects inconsistent totals with `InvalidData`.
+    let (_temp, backend) = backend();
+    backend.put(1, b"keep", true).unwrap();
+    let now = Instant::now();
+    backend
+        .run_disk_pressure_maintenance(now, |_| Err(io::ErrorKind::InvalidData.into()))
+        .unwrap();
+    backend
+        .run_disk_pressure_maintenance(now, |_| panic!("invalid sample must cool down"))
+        .unwrap();
+    assert!(backend.contains(1));
+    assert_eq!(backend.physical_space_status().outcome, "sampling_failed");
     assert_eq!(percent_ceil(u64::MAX, 10), 1_844_674_407_370_955_162);
 }
 
