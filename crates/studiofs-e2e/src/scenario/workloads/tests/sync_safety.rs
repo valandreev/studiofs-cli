@@ -36,6 +36,7 @@ fn sync_safety_sample_match_requires_exact_count_and_known_reason() {
     let samples = serde_json::Value::Array(sample_values);
 
     assert!(samples_match(&samples, is_metadata_wait));
+    assert!(samples_match(&samples, is_dirty_paused_work));
     let metadata_with_upload = serde_json::json!({
         "sync_safety": {
             "state": "unknown",
@@ -54,8 +55,7 @@ fn sync_safety_sample_match_requires_exact_count_and_known_reason() {
     });
     assert!(!samples_match(
         &serde_json::Value::Array(vec![unknown.clone(); SYNC_SAFETY_STABLE_SAMPLES]),
-        |snapshot| snapshot["state"] == "syncing"
-            && has_any_reason(snapshot, &["pending_writes", "uploading"]),
+        is_dirty_paused_work,
     ));
     assert!(!samples_match(
         &serde_json::Value::Array(vec![unknown; SYNC_SAFETY_STABLE_SAMPLES]),
@@ -75,11 +75,15 @@ fn sync_safety_sample_match_requires_exact_count_and_known_reason() {
         &serde_json::Value::Array(vec![safe_with_blocker; SYNC_SAFETY_STABLE_SAMPLES]),
         is_metadata_wait,
     ));
+    let safe_dirty_reason = serde_json::json!({
+        "state": "safe",
+        "reasons": ["metadata_sync_pending"],
+    });
+    assert!(!is_dirty_paused_work(&safe_dirty_reason));
     let missing = serde_json::json!({ "sync_safety": {} });
     assert!(!samples_match(
         &serde_json::Value::Array(vec![missing; SYNC_SAFETY_STABLE_SAMPLES]),
-        |snapshot| snapshot["state"] == "syncing"
-            && has_any_reason(snapshot, &["pending_writes", "uploading"]),
+        is_dirty_paused_work,
     ));
     assert!(!samples_match(
         &serde_json::Value::Array(vec![sample; SYNC_SAFETY_STABLE_SAMPLES - 1]),

@@ -4,7 +4,6 @@ use super::*;
 
 pub(in crate::scenario) const MOUNTED_SYNC_SAFETY_TWO_CLIENT: &str =
     "mounted-sync-safety-two-client-acceptance";
-const SYNC_SAFETY_CLIENTS: &[&str] = &["client-a", "client-b"];
 const SYNC_SAFETY_FILE: &str = "studiofs-e2e-sync-safety.txt";
 const SYNC_SAFETY_PAYLOAD: &[u8] = b"accepted while remote publication is paused\n";
 const SYNC_SAFETY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -39,10 +38,7 @@ impl Scenario for MountedSyncSafetyTwoClient {
         let mut clients_mounted = false;
         let result = (|| {
             controller.bootstrap_volume(VolumeBootstrapOptions {
-                client_names: SYNC_SAFETY_CLIENTS
-                    .iter()
-                    .map(|name| (*name).to_string())
-                    .collect(),
+                client_names: vec!["client-a".into(), "client-b".into()],
                 clean_existing_local_metadata: true,
             })?;
             clients_mounted = true;
@@ -68,35 +64,13 @@ impl Scenario for MountedSyncSafetyTwoClient {
             let dirty_snapshot = wait_for_sync_safety_state(
                 &controller,
                 "client-a",
-                |snapshot| {
-                    is_syncing_or_unknown(snapshot)
-                        && has_any_reason(
-                            snapshot,
-                            &[
-                                "pending_writes",
-                                "uploading",
-                                "publishing_metadata",
-                                "metadata_sync_pending",
-                            ],
-                        )
-                },
+                is_dirty_paused_work,
                 "sync-safety did not report known pending work while S3 and PostgreSQL were paused",
             )?;
             let dirty_samples = collect_sync_safety_samples(
                 &controller,
                 "client-a",
-                |snapshot| {
-                    is_syncing_or_unknown(snapshot)
-                        && has_any_reason(
-                            snapshot,
-                            &[
-                                "pending_writes",
-                                "uploading",
-                                "publishing_metadata",
-                                "metadata_sync_pending",
-                            ],
-                        )
-                },
+                is_dirty_paused_work,
                 "sync-safety lost its known blocker before remote publication resumed",
             )?;
             let dirty_read = wait_for_mounted_payload_readback(
@@ -198,30 +172,10 @@ impl Scenario for MountedSyncSafetyTwoClient {
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
         let summary_path = context.scenario_dir.join("sync-safety-summary.json");
         let summary: serde_json::Value = serde_json::from_slice(&fs::read(&summary_path)?)?;
-        if !is_syncing_or_unknown(&summary["dirty_while_publication_paused"]["sync_safety"])
-            || !has_any_reason(
-                &summary["dirty_while_publication_paused"]["sync_safety"],
-                &[
-                    "pending_writes",
-                    "uploading",
-                    "publishing_metadata",
-                    "metadata_sync_pending",
-                ],
-            )
+        if !is_dirty_paused_work(&summary["dirty_while_publication_paused"]["sync_safety"])
             || !is_metadata_wait(&summary["metadata_publication_wait"]["sync_safety"])
             || summary["safe_after_peer_convergence"]["sync_safety"]["state"] != "safe"
-            || !samples_match(&summary["dirty_state_samples"], |snapshot| {
-                is_syncing_or_unknown(snapshot)
-                    && has_any_reason(
-                        snapshot,
-                        &[
-                            "pending_writes",
-                            "uploading",
-                            "publishing_metadata",
-                            "metadata_sync_pending",
-                        ],
-                    )
-            })
+            || !samples_match(&summary["dirty_state_samples"], is_dirty_paused_work)
             || !samples_match(&summary["metadata_wait_samples"], is_metadata_wait)
             || !samples_match(&summary["safe_state_samples"], |snapshot| {
                 snapshot["state"] == "safe"
@@ -325,6 +279,19 @@ fn is_metadata_wait(snapshot: &serde_json::Value) -> bool {
     is_syncing_or_unknown(snapshot)
         && has_any_reason(snapshot, &["metadata_sync_pending", "publishing_metadata"])
         && !has_reason(snapshot, "uploading")
+}
+
+fn is_dirty_paused_work(snapshot: &serde_json::Value) -> bool {
+    is_syncing_or_unknown(snapshot)
+        && has_any_reason(
+            snapshot,
+            &[
+                "pending_writes",
+                "uploading",
+                "publishing_metadata",
+                "metadata_sync_pending",
+            ],
+        )
 }
 
 fn samples_match(

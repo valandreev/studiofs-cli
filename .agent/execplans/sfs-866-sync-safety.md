@@ -33,6 +33,10 @@ The initial empty local journal uses exclusive end 1 with an uninitialized store
 
 Additional handoff review found that epoch finalization removes its queue ticket before creating the publication journal event, and delayed retries temporarily own no queue ticket. Retain an owned publication activity lease from before dequeue through finalization and any delayed retry until requeue. Upload workers likewise retain a generation lease through queue removal and publication scheduling. The tray renders known blocking reasons red even when overlapping work makes the completion proof unknown.
 
+Follow-up shrink review: accept `then_some`, combine unavailable conditions, sample the shutdown error once, inline the two client names and share the paused-work predicate. Retain the pre-`set_activity` age check because that method updates native tooltips before rendering. Retain `active_after`: admission increments `active` before `generation`, so equal generation samples do not imply a zero final active count. Preserve `InvalidData` for malformed diagnostics; `io::Error::other` would change the error category.
+
+Follow-up validation: 23 tray tests plus four VFS and two E2E sync-safety tests passed. Scoped Clippy for `studiofs-vfs`, `studiofs`, and `studiofs-e2e` with all targets and warnings denied, `cargo fmt --all -- --check`, and `git diff --check` passed. Production code shrank by 39 lines. Full suites and mounted acceptance were not rerun for these simplifications; the earlier mounted evidence remains separate.
+
 ## Outcomes & Retrospective
 
 The shared proof, diagnostics transport, tray behavior and user documentation are implemented. All 37 focused tests, Windows mounted acceptance, scoped Clippy, formatting and whitespace checks passed. Implementation commit fe0ed05b is pushed and Linear SFS-866 is In Review with validation evidence. No PR was created.

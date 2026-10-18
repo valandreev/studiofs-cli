@@ -4470,20 +4470,17 @@ impl StudioVfs {
             lifecycle_after,
             PgSyncLifecycle::Live | PgSyncLifecycle::Degraded
         );
-        if !stable {
+        if !stable || !lifecycle_stable || !lifecycle_allows_sync_proof {
             reasons.push(VfsSyncSafetyReason::StatusUnavailable);
         }
-        if !lifecycle_stable || !lifecycle_allows_sync_proof {
-            reasons.push(VfsSyncSafetyReason::StatusUnavailable);
-        }
-        if upload_failed || self.deferred_namespace_shutdown_error().is_some() {
+        let sync_failed = upload_failed || self.deferred_namespace_shutdown_error().is_some();
+        if sync_failed {
             reasons.push(VfsSyncSafetyReason::SyncFailed);
         }
         if ack_after.is_some_and(|ack| !ack.is_acknowledged()) {
             reasons.push(VfsSyncSafetyReason::MetadataSyncPending);
         }
 
-        let sync_failed = upload_failed || self.deferred_namespace_shutdown_error().is_some();
         let state = classify_sync_safety_state(
             stable,
             lifecycle_before,

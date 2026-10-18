@@ -838,11 +838,8 @@ mod supported {
                 .iter()
                 .any(|reason| *reason != studiofs_vfs::VfsSyncSafetyReason::StatusUnavailable)
         {
-            let pending_upload_bytes = if pending_uploads > 0 {
-                Some(snapshot.upload.pending_upload_bytes)
-            } else {
-                None
-            };
+            let pending_upload_bytes =
+                (pending_uploads > 0).then_some(snapshot.upload.pending_upload_bytes);
             TrayActivity {
                 mode: TrayPulseMode::Active,
                 pending_upload_bytes,
