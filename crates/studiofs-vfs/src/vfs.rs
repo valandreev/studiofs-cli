@@ -4423,10 +4423,15 @@ impl StudioVfs {
         if writer_or_staged_work {
             reasons.push(VfsSyncSafetyReason::PendingWrites);
         }
-        if self.local_payload_backend.dirty_object_count() != 0
-            && !reasons.contains(&VfsSyncSafetyReason::Uploading)
-        {
-            reasons.push(VfsSyncSafetyReason::Uploading);
+        match self.local_payload_backend.try_dirty_object_count() {
+            Some(0) => {}
+            Some(_) => {
+                if !reasons.contains(&VfsSyncSafetyReason::Uploading) {
+                    reasons.push(VfsSyncSafetyReason::Uploading);
+                }
+            }
+            // An unreadable payload index cannot prove there is nothing to upload.
+            None => reasons.push(VfsSyncSafetyReason::StatusUnavailable),
         }
         let (lifecycle_after, ack_after) = self.meta.run_sync_maintenance(|meta| {
             (
@@ -4472,7 +4477,9 @@ impl StudioVfs {
             lifecycle_after,
             PgSyncLifecycle::Live | PgSyncLifecycle::Degraded
         );
-        if !stable || !lifecycle_stable || !lifecycle_allows_sync_proof {
+        if (!stable || !lifecycle_stable || !lifecycle_allows_sync_proof)
+            && !reasons.contains(&VfsSyncSafetyReason::StatusUnavailable)
+        {
             reasons.push(VfsSyncSafetyReason::StatusUnavailable);
         }
         let sync_failed = upload_failed || self.deferred_namespace_shutdown_error().is_some();

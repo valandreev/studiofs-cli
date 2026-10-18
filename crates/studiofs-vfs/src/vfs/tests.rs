@@ -172,6 +172,43 @@ fn sync_safety_inode_write_owns_activity_while_waiting_for_session() {
 }
 
 #[test]
+fn sync_safety_writer_stack_materialization_owns_activity() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sync-safety-materialize");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"materialize.bin", 0, 0, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        vfs.write_fh(fh, attr.ino, 0, b"pending")
+            .await
+            .expect("write into writer stack");
+        let generation = vfs
+            .state
+            .sync_safety_activity
+            .generation
+            .load(Ordering::Acquire);
+        let materialized = vfs
+            .materialize_writer_stack_for_inode(attr.ino)
+            .await
+            .expect("materialize writer stack");
+        assert!(materialized > 0, "write must leave writer-stack bytes");
+        assert!(
+            vfs.state
+                .sync_safety_activity
+                .generation
+                .load(Ordering::Acquire)
+                > generation,
+            "materialization hides dirty bytes between counters and must hold a lease"
+        );
+        vfs.release_fh(fh).await.expect("release writer");
+    });
+}
+
+#[test]
 fn sync_safety_snapshot_reports_upload_publication_and_active_handoffs() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sync-safety-downstream-owners");

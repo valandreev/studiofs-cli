@@ -2297,6 +2297,8 @@ impl StudioVfs {
     ///
     /// Returns the number of bytes materialized in this pass.
     pub(super) async fn materialize_writer_stack_for_inode(&self, ino: Ino) -> VfsResult<usize> {
+        // Dirty bytes leave the writer stack before they reach local-dirty counters.
+        let _sync_safety_activity = self.state.sync_safety_activity.begin();
         let object_count = self
             .state
             .writer_stack
@@ -2333,6 +2335,8 @@ impl StudioVfs {
         ino: Ino,
         min_idle: Duration,
     ) -> VfsResult<usize> {
+        // Dirty bytes leave the writer stack before they reach local-dirty counters.
+        let _sync_safety_activity = self.state.sync_safety_activity.begin();
         let object_count = self
             .state
             .writer_stack
@@ -2370,6 +2374,8 @@ impl StudioVfs {
         &self,
         ino: Ino,
     ) -> VfsResult<usize> {
+        // Dirty bytes leave the writer stack before they reach local-dirty counters.
+        let _sync_safety_activity = self.state.sync_safety_activity.begin();
         let object_count = self
             .state
             .writer_stack

@@ -1495,6 +1495,15 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         }
     }
 
+    fn try_dirty_object_count(&self) -> Option<usize> {
+        self.index
+            .dirty_object_count()
+            .inspect_err(|error| {
+                warn!(error = ?error, "local payload runtime index dirty count lookup failed");
+            })
+            .ok()
+    }
+
     fn lifecycle_state(&self, object_id: u64) -> LocalPayloadLifecycleState {
         match self.index.get_entry(object_id) {
             Ok(Some(entry)) => {
