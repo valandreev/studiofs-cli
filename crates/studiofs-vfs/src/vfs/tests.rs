@@ -122,6 +122,56 @@ fn sync_safety_snapshot_reports_dirty_writer_and_persisted_slice_owners() {
 }
 
 #[test]
+fn sync_safety_inode_write_owns_activity_while_waiting_for_session() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sync-safety-inode-write");
+    let attr = meta
+        .create_file(ROOT_INO, b"inode-write.txt", 0, 0, 0o644)
+        .expect("create clean inode");
+    rt.block_on(async {
+        let session = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Write)
+            .await;
+        let generation = vfs
+            .state
+            .sync_safety_activity
+            .generation
+            .load(Ordering::Acquire);
+        let mut write = Box::pin(vfs.write(attr.ino, 0, b"pending"));
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        assert_eq!(vfs.file_session_stats().queued_ops, 1);
+        assert!(vfs.state.namespace.dirty_attrs.lock().is_empty());
+        assert_eq!(vfs.ingress_stats().dirty_mem_bytes, 0);
+        assert_eq!(
+            vfs.state
+                .sync_safety_activity
+                .active
+                .load(Ordering::Acquire),
+            1,
+            "inode write must retain its activity lease before acquiring the session"
+        );
+        drop(write);
+        assert_eq!(
+            vfs.state
+                .sync_safety_activity
+                .active
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            vfs.state
+                .sync_safety_activity
+                .generation
+                .load(Ordering::Acquire)
+                > generation
+        );
+        drop(session);
+    });
+}
+
+#[test]
 fn sync_safety_snapshot_reports_upload_publication_and_active_handoffs() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sync-safety-downstream-owners");
@@ -144,8 +194,21 @@ fn sync_safety_snapshot_reports_upload_publication_and_active_handoffs() {
             object_id: 9002,
             result_tx,
         });
+    vfs.local_payload_backend()
+        .put(9003, b"staged upload", false)
+        .expect("stage dirty payload alongside completion work");
+    assert_ne!(vfs.local_payload_backend.dirty_object_count(), 0);
 
     let downstream_snapshot = vfs.sync_safety_snapshot();
+    assert_eq!(
+        downstream_snapshot
+            .reasons
+            .iter()
+            .filter(|reason| **reason == VfsSyncSafetyReason::Uploading)
+            .count(),
+        1,
+        "multiple upload owners must report one reason"
+    );
     assert_ne!(downstream_snapshot.state, VfsSyncSafetyState::Safe);
     assert!(
         downstream_snapshot

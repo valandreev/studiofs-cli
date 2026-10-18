@@ -319,7 +319,7 @@ mod supported {
         }
 
         fn render_frame(&mut self) {
-            if self.mode == TrayPulseMode::Idle
+            if matches!(self.mode, TrayPulseMode::Idle | TrayPulseMode::Active)
                 && self.last_activity_at.elapsed() > DIAGNOSTICS_MAX_AGE
             {
                 self.set_activity(TrayActivity {
@@ -1089,23 +1089,47 @@ mod supported {
 
         #[cfg(not(target_os = "macos"))]
         #[test]
-        fn idle_flag_expires_when_monitor_stops_delivering_heartbeats() {
+        fn activity_flag_expires_when_monitor_stops_delivering_heartbeats() {
             let mask = IconMask {
                 width: 1,
                 height: 1,
                 alpha: Arc::new(vec![255]),
             };
+            for activity in [
+                TrayActivity {
+                    mode: TrayPulseMode::Idle,
+                    pending_upload_bytes: None,
+                },
+                TrayActivity {
+                    mode: TrayPulseMode::Active,
+                    pending_upload_bytes: Some(42),
+                },
+            ] {
+                let mut app = TrayApp::new(mask.clone(), "test".to_string());
+                app.set_activity(activity);
+                app.last_activity_at =
+                    Instant::now() - DIAGNOSTICS_MAX_AGE - Duration::from_millis(1);
+                app.render_frame();
+
+                assert_eq!(app.mode, TrayPulseMode::Unavailable);
+                assert_eq!(app.pending_upload_bytes, None);
+                let tooltip = app.tooltip_for(app.mode, app.pending_upload_bytes);
+                assert!(!tooltip.contains("safe to shut down"));
+                assert!(!tooltip.contains("uploads pending/retrying"));
+            }
+
             let mut app = TrayApp::new(mask, "test".to_string());
             app.set_activity(TrayActivity {
-                mode: TrayPulseMode::Idle,
-                pending_upload_bytes: None,
+                mode: TrayPulseMode::Active,
+                pending_upload_bytes: Some(42),
             });
-            app.last_activity_at = Instant::now() - DIAGNOSTICS_MAX_AGE - Duration::from_millis(1);
             app.render_frame();
-            assert_eq!(app.mode, TrayPulseMode::Unavailable);
+
+            assert_eq!(app.mode, TrayPulseMode::Active);
+            assert_eq!(app.pending_upload_bytes, Some(42));
             assert!(
-                !app.tooltip_for(app.mode, None)
-                    .contains("safe to shut down")
+                app.tooltip_for(app.mode, app.pending_upload_bytes)
+                    .contains("uploads pending/retrying; 42B remaining")
             );
         }
 

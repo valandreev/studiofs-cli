@@ -4423,7 +4423,9 @@ impl StudioVfs {
         if writer_or_staged_work {
             reasons.push(VfsSyncSafetyReason::PendingWrites);
         }
-        if self.local_payload_backend.dirty_object_count() != 0 {
+        if self.local_payload_backend.dirty_object_count() != 0
+            && !reasons.contains(&VfsSyncSafetyReason::Uploading)
+        {
             reasons.push(VfsSyncSafetyReason::Uploading);
         }
         let (lifecycle_after, ack_after) = self.meta.run_sync_maintenance(|meta| {
@@ -4477,7 +4479,9 @@ impl StudioVfs {
         if sync_failed {
             reasons.push(VfsSyncSafetyReason::SyncFailed);
         }
-        if ack_after.is_some_and(|ack| !ack.is_acknowledged()) {
+        if ack_after.is_some_and(|ack| !ack.is_acknowledged())
+            && !reasons.contains(&VfsSyncSafetyReason::MetadataSyncPending)
+        {
             reasons.push(VfsSyncSafetyReason::MetadataSyncPending);
         }
 

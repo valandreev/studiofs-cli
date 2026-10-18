@@ -22,9 +22,11 @@ filesystem's shutdown barriers. Local crash recovery from cache is a separate,
 weaker guarantee than this indicator's remote synchronization guarantee.
 
 The tray polls mount-local diagnostics every 300 ms, with a one-second request
-timeout. Safe observations expire after two seconds without a fresh heartbeat.
-The icon animation itself performs no PostgreSQL or S3 requests. The same
-runtime contract and color mapping serve Windows, macOS and Linux.
+timeout. Reported activity expires after two seconds without a fresh heartbeat,
+including active upload estimates. Startup remains in its starting state during
+the five-second diagnostics grace period. The icon animation itself performs no
+PostgreSQL or S3 requests. The same runtime contract and color mapping serve
+Windows, macOS and Linux.
 
 The runtime checks the durable acknowledgement of its own local metadata
 journal, not a moving global peer head. It reads that boundary before and after
