@@ -1,5 +1,6 @@
 use super::*;
 use crate::redb_engine::layout::{encode_dentry_key, encode_xattr_key};
+use crate::{LocalOutboundAckSnapshot, ReadOnlyMetaEngine};
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -1098,6 +1099,118 @@ fn replication_backlog_reports_pending_and_inflight_ops() {
     assert_eq!(backlog.pending_ops, 7);
     assert_eq!(backlog.inflight_ops, 3);
     assert_eq!(backlog.total_ops(), 10);
+}
+
+#[test]
+fn empty_local_redb_uses_first_event_sequence_as_acknowledged_base() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let local = RedbMetaEngine::open(dir.path().join("meta.redb")).expect("open empty redb");
+
+    let (local_event_end, durable_cursor) = local
+        .local_outbound_ack_positions()
+        .expect("read local event positions from one redb snapshot");
+    assert_eq!(local_event_end, 1);
+    assert_eq!(durable_cursor, 1);
+    assert!(local.local_outbound_ack_snapshot().is_none());
+    assert!(
+        LocalOutboundAckSnapshot {
+            local_event_end,
+            durable_cursor,
+            pending_ops: 0,
+            inflight_ops: 0,
+        }
+        .is_acknowledged()
+    );
+}
+
+#[test]
+fn read_only_wrapper_preserves_pg_outbound_ack_snapshot() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let expected = pg.local_outbound_ack_snapshot().unwrap();
+    let read_only = ReadOnlyMetaEngine::new(Arc::new(pg));
+
+    assert_eq!(read_only.local_outbound_ack_snapshot(), Some(expected));
+}
+
+#[test]
+fn outbound_ack_snapshot_detects_unacknowledged_journal_without_queued_ops() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.create_dir(ROOT_INO, b"snapshot-unacked", 0, 0, 0o755)
+        .expect("create local directory");
+    {
+        let mut state = pg.pending_state.lock().expect("pending state");
+        PgMetaEngine::clear_pending_state(&mut state);
+    }
+    pg.inflight_replication_ops.store(0, Ordering::SeqCst);
+
+    let snapshot = pg
+        .local_outbound_ack_snapshot()
+        .expect("PostgreSQL-backed engine reports local ack state");
+    assert_eq!(snapshot.pending_ops, 0);
+    assert_eq!(snapshot.inflight_ops, 0);
+    assert!(!snapshot.is_acknowledged());
+    assert!(snapshot.durable_cursor < snapshot.local_event_end);
+}
+
+#[test]
+fn local_only_journal_events_can_advance_the_ack_snapshot() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"snapshot-local-only", 0, 0, 0o644)
+        .expect("create unpublished file");
+    pg.unlink(ROOT_INO, b"snapshot-local-only")
+        .expect("unlink unpublished file");
+    pg.restore_pending_state_from_local_log()
+        .expect("retire local-only journal events");
+
+    let snapshot = pg.local_outbound_ack_snapshot().unwrap();
+    assert_eq!(snapshot.pending_ops, 0);
+    assert!(snapshot.is_acknowledged());
+    assert!(matches!(
+        pg.local.get_attr(file.ino),
+        Err(MetaError::InodeNotFound(_))
+    ));
+}
+
+#[test]
+fn peer_remote_head_progress_does_not_ack_local_journal() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.create_dir(ROOT_INO, b"snapshot-peer-progress", 0, 0, 0o755)
+        .expect("create local directory");
+    let local_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.local_version
+        .store(i64::try_from(local_end + 10).unwrap(), Ordering::SeqCst);
+
+    let snapshot = pg.local_outbound_ack_snapshot().unwrap();
+    assert!(!snapshot.is_acknowledged());
+    assert_eq!(snapshot.local_event_end, local_end);
+}
+
+#[test]
+fn outbound_ack_snapshot_tracks_durable_ack_across_reopen() {
+    let (dir, pg) = temp_pg_engine_for_unit();
+    pg.create_dir(ROOT_INO, b"snapshot-acknowledged", 0, 0, 0o755)
+        .expect("create local directory");
+    let event_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.persist_flushed_event_seq(event_end)
+        .expect("persist acknowledged exclusive event end");
+    let before_close = pg.local_outbound_ack_snapshot().unwrap();
+    assert!(before_close.is_acknowledged());
+    drop(pg);
+
+    let reopened = PgMetaEngine::open_with_options(
+        dir.path().join("meta.redb"),
+        PgOpenOptions {
+            background_poll: false,
+            defer_remote_startup_probes: true,
+            ..Default::default()
+        },
+    )
+    .expect("reopen local metadata");
+    let after_reopen = reopened.local_outbound_ack_snapshot().unwrap();
+    assert!(after_reopen.is_acknowledged());
+    assert_eq!(after_reopen.local_event_end, event_end);
+    assert_eq!(after_reopen.durable_cursor, event_end);
 }
 
 #[test]
@@ -3542,6 +3655,11 @@ fn hidden_flush_tail_is_republished_in_next_batch_and_acknowledged_after_remount
         .expect("flush hidden tail publication");
     pg.sync_metadata().expect("acknowledge second batch");
     let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let committed_snapshot = pg
+        .local_outbound_ack_snapshot()
+        .expect("read local outbound acknowledgment");
+    assert!(committed_snapshot.is_acknowledged());
+    assert_eq!(committed_snapshot.local_event_end, next_event_seq);
     assert_eq!(
         PgMetaEngine::load_persisted_flushed_event_seq(&pg.local).unwrap(),
         next_event_seq,
@@ -3569,6 +3687,11 @@ fn hidden_flush_tail_is_republished_in_next_batch_and_acknowledged_after_remount
             .unwrap();
     }
     let reopened = PgMetaEngine::open_with_options(&path, options).expect("reopen writer");
+    let reopened_snapshot = reopened
+        .local_outbound_ack_snapshot()
+        .expect("read reopened outbound acknowledgment");
+    assert!(!reopened_snapshot.is_acknowledged());
+    assert_eq!(reopened_snapshot.local_event_end, next_event_seq);
     for _ in 0..16 {
         if reopened.local_version.load(Ordering::SeqCst) >= head {
             break;
@@ -3579,6 +3702,12 @@ fn hidden_flush_tail_is_republished_in_next_batch_and_acknowledged_after_remount
         PgMetaEngine::load_persisted_flushed_event_seq(&reopened.local).unwrap(),
         next_event_seq,
         "replayed self batches must acknowledge the whole published journal"
+    );
+    assert!(
+        reopened
+            .local_outbound_ack_snapshot()
+            .expect("read replayed outbound acknowledgment")
+            .is_acknowledged()
     );
     reopened.request_pending_flush();
     reopened.flush_due_pending().expect("flush after remount");

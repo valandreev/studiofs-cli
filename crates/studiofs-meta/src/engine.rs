@@ -489,6 +489,32 @@ pub struct MetadataReplicationBacklog {
     pub inflight_ops: u32,
 }
 
+/// Snapshot of one local metadata journal boundary and its durable replication
+/// acknowledgment state.
+///
+/// `local_event_end` and `durable_cursor` are exclusive sequence positions.
+/// The journal can contain local-only events; retiring those events advances
+/// the same cursor without creating outbound PostgreSQL work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalOutboundAckSnapshot {
+    /// Exclusive end of the local event journal when this snapshot was taken.
+    pub local_event_end: u64,
+    /// First local event sequence not yet durably acknowledged as complete.
+    pub durable_cursor: u64,
+    /// Local operations queued for remote publication.
+    pub pending_ops: u32,
+    /// Local operations currently being published or self-acknowledged.
+    pub inflight_ops: u32,
+}
+
+impl LocalOutboundAckSnapshot {
+    /// Whether the durable cursor has reached this snapshot's exclusive end.
+    /// Later local mutations do not affect this result.
+    pub fn is_acknowledged(self) -> bool {
+        self.durable_cursor >= self.local_event_end
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 /// Best-effort counters for push-plus-poll metadata invalidation.
 pub struct MetadataInvalidationDiagnostics {
@@ -1937,6 +1963,12 @@ pub trait MetaReplication: Send + Sync {
 
     /// Best-effort count of local metadata mutations not yet durably pushed to remote.
     fn replication_backlog(&self) -> MetadataReplicationBacklog;
+
+    /// Snapshot the durable acknowledgment boundary for this engine's local
+    /// outbound journal. `None` means this backend cannot report the state.
+    fn local_outbound_ack_snapshot(&self) -> Option<LocalOutboundAckSnapshot> {
+        None
+    }
 
     /// Best-effort local metadata authority status for deciding whether new
     /// mutations should still be accepted.

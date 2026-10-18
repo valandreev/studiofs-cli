@@ -2282,6 +2282,53 @@ pub struct VfsSynchronizationStateSnapshot {
     pub pg_sync: PgSyncDiagnostics,
 }
 
+/// Fail-closed state of this mount's locally accepted outbound work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VfsSyncSafetyState {
+    /// The VFS cannot currently prove whether all local work is synchronized.
+    #[default]
+    Unknown,
+    /// Locally accepted work is still waiting for upload or publication.
+    Syncing,
+    /// The current observation proves that all locally accepted work is durable remotely.
+    Safe,
+}
+
+/// Reason why a sync-safety observation is not safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VfsSyncSafetyReason {
+    /// Foreground writer or local dirty payload state remains.
+    PendingWrites,
+    /// An upload is queued, scheduled, retrying, or in flight.
+    Uploading,
+    /// Uploaded data still awaits file-version publication.
+    PublishingMetadata,
+    /// Local metadata has not crossed the durable remote-acknowledgement cursor.
+    MetadataSyncPending,
+    /// The VFS could not obtain trustworthy local synchronization evidence.
+    StatusUnavailable,
+    /// A retained local upload or publication error prevents completion proof.
+    SyncFailed,
+}
+
+/// Cheap observation of whether this mount's own accepted work is fully synchronized.
+///
+/// `Safe` is an observation, not a barrier against new writes after this snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VfsSyncSafetySnapshot {
+    /// Current fail-closed classification.
+    #[serde(default)]
+    pub state: VfsSyncSafetyState,
+    /// Latest local event generation included in the metadata durability proof.
+    #[serde(default)]
+    pub generation: u64,
+    /// Reasons the observation is still syncing or unknown.
+    #[serde(default)]
+    pub reasons: Vec<VfsSyncSafetyReason>,
+}
+
 /// Runtime event emitted by metrics stream.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VfsRuntimeEvent {
@@ -2303,6 +2350,30 @@ pub struct VfsRuntimeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_safety_snapshot_defaults_unknown_and_serializes_state_names() {
+        let snapshot = VfsSyncSafetySnapshot::default();
+        assert_eq!(snapshot.state, VfsSyncSafetyState::Unknown);
+        assert!(snapshot.reasons.is_empty());
+
+        let serialized = serde_json::to_value(VfsSyncSafetySnapshot {
+            state: VfsSyncSafetyState::Syncing,
+            generation: 17,
+            reasons: vec![
+                VfsSyncSafetyReason::PublishingMetadata,
+                VfsSyncSafetyReason::MetadataSyncPending,
+            ],
+        })
+        .expect("serialize sync-safety snapshot");
+
+        assert_eq!(serialized["state"], "syncing");
+        assert_eq!(serialized["generation"], 17);
+        assert_eq!(
+            serialized["reasons"],
+            serde_json::json!(["publishing_metadata", "metadata_sync_pending"])
+        );
+    }
 
     #[test]
     fn dirty_pressure_serializes_slice_counts_for_mounted_reports() {

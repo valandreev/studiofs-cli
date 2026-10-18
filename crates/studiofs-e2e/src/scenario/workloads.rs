@@ -261,6 +261,7 @@ mod faults;
 mod namespace_collision;
 mod smoke_outage;
 mod snapshot_v2;
+mod sync_safety;
 #[cfg(test)]
 mod test_fixtures;
 mod worker_concurrency;
@@ -277,6 +278,7 @@ pub(super) use faults::*;
 pub(super) use namespace_collision::*;
 pub(super) use smoke_outage::*;
 pub(super) use snapshot_v2::*;
+pub(super) use sync_safety::*;
 #[cfg(test)]
 pub(super) use test_fixtures::*;
 pub(super) use worker_concurrency::WorkerConcurrency;

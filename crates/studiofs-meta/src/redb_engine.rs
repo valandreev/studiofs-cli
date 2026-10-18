@@ -897,6 +897,29 @@ impl RedbMetaEngine {
         })
     }
 
+    /// Read the exclusive local event-log end and durable PG acknowledgment
+    /// cursor from one redb MVCC snapshot.
+    pub(crate) fn local_outbound_ack_positions(&self) -> MetaResult<(u64, u64)> {
+        let txn = self.begin_read_txn()?;
+        let local_event_end =
+            Self::read_counter_from_read_txn(&txn, crate::schema::counters::NEXT_EVENT_SEQ)?.max(1);
+        let durable_cursor = Self::read_counter_from_read_txn(
+            &txn,
+            crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ,
+        )?;
+        let pruned_through = Self::read_counter_from_read_txn(
+            &txn,
+            crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ,
+        )?;
+        let durable_cursor = if pruned_through == 0 {
+            durable_cursor
+        } else {
+            durable_cursor.max(pruned_through.saturating_add(1))
+        }
+        .max(1);
+        Ok((local_event_end, durable_cursor))
+    }
+
     pub(crate) fn begin_write_txn(&self) -> MetaResult<RedbWriteTransaction<'_>> {
         #[cfg(test)]
         test_support::WRITE_TXN_ATTEMPT.with(|sender| {

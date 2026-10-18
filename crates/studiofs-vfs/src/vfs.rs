@@ -74,10 +74,11 @@ pub use metrics::{
     VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsLinuxFuseOpenCacheStats,
     VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsMacFuseOpenMemoryDirectIo,
     VfsNamespaceCacheSnapshot, VfsNamespaceCreateObservabilityStats, VfsPortableAllocatorStats,
-    VfsReadPathStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot,
-    VfsUploadStats, VfsWritePathBackpressureStats, VfsWritePathBurstStats,
-    VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats,
-    VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsReadPathStats, VfsRuntimeEvent, VfsSyncSafetyReason, VfsSyncSafetySnapshot,
+    VfsSyncSafetyState, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
     VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
     VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
     VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
@@ -183,7 +184,6 @@ use studiofs_data::object::{
 };
 use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 
-#[cfg(test)]
 use studiofs_meta::engine::PgSyncLifecycle;
 use studiofs_meta::engine::{
     MetadataAuthorityStatus, PgSyncDiagnostics, PgSyncStatus, PgSyncWriteAuthorityReason,
@@ -3370,6 +3370,7 @@ impl VfsState {
             read: ReadState::new(cfg.foreground_read_speedometer_shards),
             file_lock: FileLockState::new(),
             shutdown: ShutdownState::new(),
+            sync_safety_activity: Arc::new(SyncSafetyActivity::default()),
             metrics: MetricsState::new(),
             fuse_async_write_diagnostics: Mutex::new(FuseAsyncWriteDiagnostics::default()),
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
@@ -3442,6 +3443,7 @@ struct VfsState {
     read: ReadState,
     file_lock: FileLockState,
     shutdown: ShutdownState,
+    sync_safety_activity: Arc<SyncSafetyActivity>,
     metrics: MetricsState,
     fuse_async_write_diagnostics: Mutex<FuseAsyncWriteDiagnostics>,
     fuse_async_read_snapshot: Mutex<VfsFuseAsyncReadSnapshot>,
@@ -3462,6 +3464,104 @@ struct VfsState {
     /// Foreground flush/fsync paths wait on this before reporting success so a
     /// close-deferred metadata commit cannot race an immediate explicit sync.
     deferred_release_inflight: DeferredInodeGate,
+}
+
+#[derive(Default)]
+struct SyncSafetyActivity {
+    generation: AtomicU64,
+    active: AtomicUsize,
+    publishing: AtomicUsize,
+    uploading: AtomicUsize,
+}
+
+impl SyncSafetyActivity {
+    fn begin(self: &Arc<Self>) -> SyncSafetyActivityGuard {
+        self.begin_kind(SyncSafetyActivityKind::General)
+    }
+
+    fn begin_publishing(self: &Arc<Self>) -> SyncSafetyActivityGuard {
+        self.begin_kind(SyncSafetyActivityKind::Publishing)
+    }
+
+    fn begin_uploading(self: &Arc<Self>) -> SyncSafetyActivityGuard {
+        self.begin_kind(SyncSafetyActivityKind::Uploading)
+    }
+
+    fn begin_kind(self: &Arc<Self>, kind: SyncSafetyActivityKind) -> SyncSafetyActivityGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        match kind {
+            SyncSafetyActivityKind::General => {}
+            SyncSafetyActivityKind::Publishing => {
+                self.publishing.fetch_add(1, Ordering::AcqRel);
+            }
+            SyncSafetyActivityKind::Uploading => {
+                self.uploading.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        SyncSafetyActivityGuard {
+            activity: Arc::clone(self),
+            kind,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SyncSafetyActivityKind {
+    General,
+    Publishing,
+    Uploading,
+}
+
+struct SyncSafetyActivityGuard {
+    activity: Arc<SyncSafetyActivity>,
+    kind: SyncSafetyActivityKind,
+}
+
+impl Drop for SyncSafetyActivityGuard {
+    fn drop(&mut self) {
+        self.activity.generation.fetch_add(1, Ordering::AcqRel);
+        match self.kind {
+            SyncSafetyActivityKind::General => {}
+            SyncSafetyActivityKind::Publishing => {
+                self.activity.publishing.fetch_sub(1, Ordering::AcqRel);
+            }
+            SyncSafetyActivityKind::Uploading => {
+                self.activity.uploading.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.activity.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn classify_sync_safety_state(
+    stable: bool,
+    lifecycle_before: PgSyncLifecycle,
+    lifecycle_after: PgSyncLifecycle,
+    ack_available: bool,
+    ack_is_acknowledged: bool,
+    has_blocking_reasons: bool,
+    sync_failed: bool,
+) -> VfsSyncSafetyState {
+    if !stable
+        || lifecycle_before != lifecycle_after
+        || !matches!(
+            lifecycle_after,
+            PgSyncLifecycle::Live | PgSyncLifecycle::Degraded
+        )
+        || !ack_available
+        || sync_failed
+    {
+        VfsSyncSafetyState::Unknown
+    } else if has_blocking_reasons || !ack_is_acknowledged {
+        VfsSyncSafetyState::Syncing
+    } else if lifecycle_after == PgSyncLifecycle::Live {
+        VfsSyncSafetyState::Safe
+    } else {
+        // Degraded is allowed to report known outstanding local work while
+        // offline, but cannot establish a clean, fully synchronized state.
+        VfsSyncSafetyState::Unknown
+    }
 }
 
 #[derive(Clone, Default)]
@@ -4208,6 +4308,196 @@ impl StudioVfs {
             inflight_metadata_ops: metadata_backlog.inflight_ops,
             coherence: self.coherence_health_snapshot(),
             pg_sync: self.sync_diagnostics(),
+        }
+    }
+
+    /// Observe whether this mount's own accepted work is durably synchronized.
+    ///
+    /// This is a local, non-blocking diagnostic snapshot. It does not perform
+    /// object-storage or PostgreSQL calls and is not a barrier against writes
+    /// admitted after the observation.
+    pub fn sync_safety_snapshot(&self) -> VfsSyncSafetySnapshot {
+        let generation_before = self
+            .state
+            .sync_safety_activity
+            .generation
+            .load(Ordering::Acquire);
+        let active_before = self
+            .state
+            .sync_safety_activity
+            .active
+            .load(Ordering::Acquire);
+        let publishing_before = self
+            .state
+            .sync_safety_activity
+            .publishing
+            .load(Ordering::Acquire);
+        let uploading_before = self
+            .state
+            .sync_safety_activity
+            .uploading
+            .load(Ordering::Acquire);
+        let (lifecycle_before, ack_before) = self.meta.run_sync_maintenance(|meta| {
+            (
+                meta.pg_sync_status().lifecycle,
+                meta.local_outbound_ack_snapshot(),
+            )
+        });
+
+        let mut reasons = Vec::new();
+        let completion_batch = self.state.upload.upload_completion_batch.try_lock();
+        let completion_batch_has_pending = completion_batch
+            .as_ref()
+            .is_ok_and(|batch| !batch.pending.is_empty());
+        let pending_publications = !self
+            .state
+            .upload
+            .pending_epoch_finalizations
+            .lock()
+            .is_empty();
+        let upload_failed = !self.state.upload.upload_sticky_errors.lock().is_empty();
+        let upload_runtime_active = self
+            .state
+            .upload
+            .active_upload_workers
+            .load(Ordering::Acquire)
+            != 0
+            || self
+                .state
+                .upload
+                .upload_completion_draining
+                .load(Ordering::Acquire);
+        let upload_work = self.pending_upload_count() != 0
+            || self.upload_scheduler.in_flight() != 0
+            || upload_runtime_active
+            || completion_batch_has_pending;
+        if upload_work || uploading_before != 0 {
+            reasons.push(VfsSyncSafetyReason::Uploading);
+        }
+        if pending_publications || publishing_before != 0 {
+            reasons.push(VfsSyncSafetyReason::PublishingMetadata);
+        }
+        if ack_before.is_some_and(|ack| ack.pending_ops != 0 || ack.inflight_ops != 0) {
+            reasons.push(VfsSyncSafetyReason::MetadataSyncPending);
+        }
+
+        // Read upstream dirty owners only after downstream publication/upload
+        // owners. The cross-sample checks below reject overlapping handoffs.
+        let ingress = self.ingress_stats();
+        let (pending_slice_count, pending_persisted_slice_count) =
+            self.pending_local_dirty_slice_counts();
+        let dirty_attrs = !self.state.namespace.dirty_attrs.lock().is_empty();
+        let deferred_namespace = {
+            let deferred = self.state.namespace.deferred.inner.lock();
+            deferred.backlog_operations != 0 || !deferred.pending_inodes.is_empty()
+        };
+        let deferred_materialization = !self
+            .state
+            .deferred_materialize_inflight
+            .entries
+            .lock()
+            .is_empty()
+            || !self
+                .state
+                .deferred_materialize_reschedule_needed
+                .lock()
+                .is_empty();
+        let deferred_release = !self
+            .state
+            .deferred_release_inflight
+            .entries
+            .lock()
+            .is_empty();
+        let writer_or_staged_work = ingress.dirty_mem_blocks != 0
+            || ingress.dirty_mem_bytes != 0
+            || self.state.writer_stack.total_dirty_bytes() != 0
+            || self.total_pending_local_dirty_bytes() != 0
+            || pending_slice_count != 0
+            || self.total_pending_persisted_local_dirty_slice_bytes() != 0
+            || pending_persisted_slice_count != 0
+            || dirty_attrs
+            || deferred_namespace
+            || deferred_materialization
+            || deferred_release;
+
+        if writer_or_staged_work {
+            reasons.push(VfsSyncSafetyReason::PendingWrites);
+        }
+        if self.local_payload_backend.dirty_object_count() != 0 {
+            reasons.push(VfsSyncSafetyReason::Uploading);
+        }
+        let (lifecycle_after, ack_after) = self.meta.run_sync_maintenance(|meta| {
+            (
+                meta.pg_sync_status().lifecycle,
+                meta.local_outbound_ack_snapshot(),
+            )
+        });
+        let generation_after = self
+            .state
+            .sync_safety_activity
+            .generation
+            .load(Ordering::Acquire);
+        let active_after = self
+            .state
+            .sync_safety_activity
+            .active
+            .load(Ordering::Acquire);
+        let publishing_after = self
+            .state
+            .sync_safety_activity
+            .publishing
+            .load(Ordering::Acquire);
+        let uploading_after = self
+            .state
+            .sync_safety_activity
+            .uploading
+            .load(Ordering::Acquire);
+        if publishing_after != 0 && !reasons.contains(&VfsSyncSafetyReason::PublishingMetadata) {
+            reasons.push(VfsSyncSafetyReason::PublishingMetadata);
+        }
+        if uploading_after != 0 && !reasons.contains(&VfsSyncSafetyReason::Uploading) {
+            reasons.push(VfsSyncSafetyReason::Uploading);
+        }
+        let ack_is_stable =
+            matches!((ack_before, ack_after), (Some(before), Some(after)) if before == after);
+        let stable = generation_before == generation_after
+            && active_before == 0
+            && active_after == 0
+            && ack_is_stable
+            && completion_batch.is_ok();
+        let lifecycle_stable = lifecycle_before == lifecycle_after;
+        let lifecycle_allows_sync_proof = matches!(
+            lifecycle_after,
+            PgSyncLifecycle::Live | PgSyncLifecycle::Degraded
+        );
+        if !stable {
+            reasons.push(VfsSyncSafetyReason::StatusUnavailable);
+        }
+        if !lifecycle_stable || !lifecycle_allows_sync_proof {
+            reasons.push(VfsSyncSafetyReason::StatusUnavailable);
+        }
+        if upload_failed || self.deferred_namespace_shutdown_error().is_some() {
+            reasons.push(VfsSyncSafetyReason::SyncFailed);
+        }
+        if ack_after.is_some_and(|ack| !ack.is_acknowledged()) {
+            reasons.push(VfsSyncSafetyReason::MetadataSyncPending);
+        }
+
+        let sync_failed = upload_failed || self.deferred_namespace_shutdown_error().is_some();
+        let state = classify_sync_safety_state(
+            stable,
+            lifecycle_before,
+            lifecycle_after,
+            ack_after.is_some(),
+            ack_after.is_some_and(studiofs_meta::LocalOutboundAckSnapshot::is_acknowledged),
+            !reasons.is_empty(),
+            sync_failed,
+        );
+
+        VfsSyncSafetySnapshot {
+            state,
+            generation: ack_after.map_or(0, |ack| ack.local_event_end),
+            reasons,
         }
     }
 
@@ -6195,6 +6485,14 @@ impl StudioVfs {
             self.debug_pending_inode_state(ino, "epoch_finalization_dequeued");
         }
         next
+    }
+
+    fn pop_epoch_finalization_for_sync_safety(
+        &self,
+    ) -> Option<(Ino, u64, SyncSafetyActivityGuard)> {
+        let activity = self.state.sync_safety_activity.begin_publishing();
+        self.pop_epoch_finalization()
+            .map(|(ino, content_epoch)| (ino, content_epoch, activity))
     }
 
     fn record_live_extents(&self, extents: &[(Ino, u32, u64, u64)]) {

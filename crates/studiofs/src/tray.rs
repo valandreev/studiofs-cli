@@ -67,6 +67,7 @@ mod supported {
     const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(300);
     const DIAGNOSTICS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
     const DIAGNOSTICS_STARTUP_GRACE: Duration = Duration::from_secs(5);
+    const DIAGNOSTICS_MAX_AGE: Duration = Duration::from_secs(2);
     const IDLE_CYCLE: Duration = Duration::from_millis(4400);
     const ACTIVE_CYCLE: Duration = Duration::from_millis(1200);
 
@@ -87,7 +88,7 @@ mod supported {
     #[derive(Debug, Clone, Copy)]
     enum TrayUserEvent {
         Tick,
-        Activity(TrayActivity),
+        Activity(TrayActivity, Instant),
         MountFinished,
         #[cfg(target_os = "macos")]
         HoverChanged(Option<tray_icon::Rect>),
@@ -191,6 +192,7 @@ mod supported {
         mode_started_at: Instant,
         last_colors: Option<[[u8; 3]; 2]>,
         pending_upload_bytes: Option<u64>,
+        last_activity_at: Instant,
         #[cfg(target_os = "macos")]
         tooltip: MacTrayTooltip,
         #[cfg(target_os = "macos")]
@@ -209,6 +211,7 @@ mod supported {
                 mode_started_at: Instant::now(),
                 last_colors: None,
                 pending_upload_bytes: None,
+                last_activity_at: Instant::now(),
                 #[cfg(target_os = "macos")]
                 tooltip: MacTrayTooltip::new(),
                 #[cfg(target_os = "macos")]
@@ -252,7 +255,7 @@ mod supported {
                 && let Some(pending_upload_bytes) = pending_upload_bytes
             {
                 return format!(
-                    "StudioFS {}: sync in progress. {} remaining",
+                    "StudioFS {}: uploads pending/retrying; {} remaining",
                     self.volume_name,
                     format_upload_pipeline_pending_uploads(pending_upload_bytes),
                 );
@@ -264,16 +267,19 @@ mod supported {
                 }
                 TrayPulseMode::Unavailable => {
                     format!(
-                        "StudioFS {}: mounted; live status unavailable",
+                        "StudioFS {}: sync completion unverified; status unavailable",
                         self.volume_name
                     )
                 }
                 TrayPulseMode::Idle => {
-                    format!("StudioFS {}: safe to shut down", self.volume_name)
+                    format!(
+                        "StudioFS {}: changes synchronized; safe to shut down",
+                        self.volume_name
+                    )
                 }
                 TrayPulseMode::Active => {
                     format!(
-                        "StudioFS {}: uploads or metadata sync in progress",
+                        "StudioFS {}: syncing data / publishing metadata; retrying if offline",
                         self.volume_name
                     )
                 }
@@ -281,6 +287,7 @@ mod supported {
         }
 
         fn set_activity(&mut self, activity: TrayActivity) {
+            self.last_activity_at = Instant::now();
             let mode_changed = self.mode != activity.mode;
             let active_uploads_changed = activity.mode == TrayPulseMode::Active
                 && self.pending_upload_bytes != activity.pending_upload_bytes;
@@ -312,6 +319,14 @@ mod supported {
         }
 
         fn render_frame(&mut self) {
+            if self.mode == TrayPulseMode::Idle
+                && self.last_activity_at.elapsed() > DIAGNOSTICS_MAX_AGE
+            {
+                self.set_activity(TrayActivity {
+                    mode: TrayPulseMode::Unavailable,
+                    pending_upload_bytes: None,
+                });
+            }
             let Some(tray_icon) = self.tray_icon.as_ref() else {
                 return;
             };
@@ -547,8 +562,17 @@ mod supported {
         fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TrayUserEvent) {
             match event {
                 TrayUserEvent::Tick => self.render_frame(),
-                TrayUserEvent::Activity(activity) => {
+                TrayUserEvent::Activity(activity, observed_at) => {
+                    let activity = if observed_at.elapsed() > DIAGNOSTICS_MAX_AGE {
+                        TrayActivity {
+                            mode: TrayPulseMode::Unavailable,
+                            pending_upload_bytes: None,
+                        }
+                    } else {
+                        activity
+                    };
                     self.set_activity(activity);
+                    self.last_activity_at = observed_at;
                     self.render_frame();
                 }
                 #[cfg(target_os = "macos")]
@@ -731,10 +755,6 @@ mod supported {
             .spawn(move || {
                 let mut discovery: Option<LocalDiagnosticsDiscovery> = None;
                 let monitor_started_at = Instant::now();
-                let mut last_activity = TrayActivity {
-                    mode: TrayPulseMode::Booting,
-                    pending_upload_bytes: None,
-                };
 
                 while !stop.load(Ordering::Acquire) {
                     if discovery.is_none() {
@@ -746,14 +766,12 @@ mod supported {
                         .and_then(current_activity_status)
                         .unwrap_or_else(|| fallback_activity(monitor_started_at));
 
-                    if next_activity != last_activity {
-                        last_activity = next_activity;
-                        if proxy
-                            .send_event(TrayUserEvent::Activity(next_activity))
-                            .is_err()
-                        {
-                            break;
-                        }
+                    // Send a heartbeat even when unchanged so the UI can expire a stuck monitor.
+                    if proxy
+                        .send_event(TrayUserEvent::Activity(next_activity, Instant::now()))
+                        .is_err()
+                    {
+                        break;
                     }
 
                     std::thread::sleep(DIAGNOSTICS_POLL_INTERVAL);
@@ -796,13 +814,30 @@ mod supported {
     }
 
     fn activity_status(snapshot: &DiagnosticsRuntimeSnapshot) -> TrayActivity {
+        activity_status_at(
+            snapshot,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis() as u64),
+        )
+    }
+
+    fn activity_status_at(snapshot: &DiagnosticsRuntimeSnapshot, now_unix_ms: u64) -> TrayActivity {
         let pending_metadata_ops = snapshot
             .synchronization
             .state
             .pending_metadata_ops
             .saturating_add(snapshot.synchronization.state.inflight_metadata_ops);
         let pending_uploads = snapshot.upload.pending_uploads;
-        if pending_uploads > 0 || (pending_metadata_ops != 0 && pending_metadata_ops >= 10) {
+        if pending_uploads > 0
+            || pending_metadata_ops > 0
+            || snapshot.sync_safety.state == studiofs_vfs::VfsSyncSafetyState::Syncing
+            || snapshot
+                .sync_safety
+                .reasons
+                .iter()
+                .any(|reason| *reason != studiofs_vfs::VfsSyncSafetyReason::StatusUnavailable)
+        {
             let pending_upload_bytes = if pending_uploads > 0 {
                 Some(snapshot.upload.pending_upload_bytes)
             } else {
@@ -812,9 +847,19 @@ mod supported {
                 mode: TrayPulseMode::Active,
                 pending_upload_bytes,
             }
-        } else {
+        } else if snapshot.sync_safety.state == studiofs_vfs::VfsSyncSafetyState::Safe
+            && snapshot.generated_unix_ms != 0
+            && now_unix_ms
+                .checked_sub(snapshot.generated_unix_ms)
+                .is_some_and(|age| age <= DIAGNOSTICS_MAX_AGE.as_millis() as u64)
+        {
             TrayActivity {
                 mode: TrayPulseMode::Idle,
+                pending_upload_bytes: None,
+            }
+        } else {
+            TrayActivity {
+                mode: TrayPulseMode::Unavailable,
                 pending_upload_bytes: None,
             }
         }
@@ -987,24 +1032,84 @@ mod supported {
         }
 
         #[test]
-        fn activity_mode_is_idle_for_small_metadata_backlog() {
-            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
-            snapshot.synchronization.state.pending_metadata_ops = 9;
-            assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Idle);
+        fn activity_mode_is_active_for_small_metadata_backlog() {
+            for count in [1, 2, 9] {
+                let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+                snapshot.synchronization.state.pending_metadata_ops = count;
+                assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
+            }
         }
 
         #[test]
         fn activity_mode_is_active_for_inflight_metadata_ops() {
             let mut snapshot = DiagnosticsRuntimeSnapshot::default();
-            snapshot.synchronization.state.pending_metadata_ops = 4;
-            snapshot.synchronization.state.inflight_metadata_ops = 6;
+            snapshot.synchronization.state.inflight_metadata_ops = 1;
             assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
         }
 
         #[test]
         fn activity_mode_is_idle_when_synchronized() {
-            let snapshot = DiagnosticsRuntimeSnapshot::default();
-            assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Idle);
+            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            snapshot.sync_safety.state = studiofs_vfs::VfsSyncSafetyState::Safe;
+            snapshot.generated_unix_ms = 10_000;
+            assert_eq!(
+                activity_status_at(&snapshot, 10_001).mode,
+                TrayPulseMode::Idle
+            );
+        }
+
+        #[test]
+        fn activity_mode_never_trusts_missing_stale_or_future_telemetry() {
+            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            assert_eq!(
+                activity_status_at(&snapshot, 10_000).mode,
+                TrayPulseMode::Unavailable
+            );
+            snapshot.sync_safety.state = studiofs_vfs::VfsSyncSafetyState::Safe;
+            for timestamp in [0, 7_999, 10_001] {
+                snapshot.generated_unix_ms = timestamp;
+                assert_eq!(
+                    activity_status_at(&snapshot, 10_000).mode,
+                    TrayPulseMode::Unavailable
+                );
+            }
+        }
+
+        #[test]
+        fn activity_mode_is_active_until_authoritative_completion() {
+            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            snapshot.sync_safety.state = studiofs_vfs::VfsSyncSafetyState::Syncing;
+            assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
+        }
+
+        #[test]
+        fn activity_mode_keeps_known_publication_work_red_during_unstable_snapshot() {
+            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            snapshot.sync_safety.reasons =
+                vec![studiofs_vfs::VfsSyncSafetyReason::PublishingMetadata];
+            assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        #[test]
+        fn idle_flag_expires_when_monitor_stops_delivering_heartbeats() {
+            let mask = IconMask {
+                width: 1,
+                height: 1,
+                alpha: Arc::new(vec![255]),
+            };
+            let mut app = TrayApp::new(mask, "test".to_string());
+            app.set_activity(TrayActivity {
+                mode: TrayPulseMode::Idle,
+                pending_upload_bytes: None,
+            });
+            app.last_activity_at = Instant::now() - DIAGNOSTICS_MAX_AGE - Duration::from_millis(1);
+            app.render_frame();
+            assert_eq!(app.mode, TrayPulseMode::Unavailable);
+            assert!(
+                !app.tooltip_for(app.mode, None)
+                    .contains("safe to shut down")
+            );
         }
 
         #[test]
@@ -1036,8 +1141,10 @@ mod supported {
 
         #[test]
         fn activity_status_shows_no_pending_bytes_when_idle() {
-            let snapshot = DiagnosticsRuntimeSnapshot::default();
-            let activity = activity_status(&snapshot);
+            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            snapshot.sync_safety.state = studiofs_vfs::VfsSyncSafetyState::Safe;
+            snapshot.generated_unix_ms = 10_000;
+            let activity = activity_status_at(&snapshot, 10_001);
             assert_eq!(activity.mode, TrayPulseMode::Idle);
             assert_eq!(activity.pending_upload_bytes, None);
         }

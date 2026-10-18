@@ -339,6 +339,7 @@ Project docs live in [docs/](docs/):
 - [docs/architecture.md](docs/architecture.md) - current system design and data flow
 - [docs/juicefs-local-first-rust-contract.md](docs/juicefs-local-first-rust-contract.md) - canonical mounted-IO and local durability contract
 - [docs/configuration.md](docs/configuration.md) - CLI commands, flags, env vars
+- [docs/tray.md](docs/tray.md) - tray colors, remote synchronization and shutdown status
 - [docs/development.md](docs/development.md) - local setup, build, and test workflow
 - [docs/contributing.md](docs/contributing.md) - verification matrix, CI ownership, platform-specific code rules
 - [docs/tests.md](docs/tests.md) - test matrix and infra expectations

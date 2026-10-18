@@ -46,11 +46,11 @@ use std::sync::Arc;
 
 pub use async_engine::{SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{
-    BootstrapCheckpointDescriptor, CheckpointDescriptorFailure, LocalStorageCompactionResult,
-    LocalStorageCompactionSkipReason, LocalStorageDiagnostics, MetaAcl, MetaEngine, MetaEngineCore,
-    MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaPayloadObjects,
-    MetaRecovery, MetaReplication, MetaResult, MetaSymlink, MetaXattr,
-    MetadataBatchWriteObservability, MetadataCheckpointFreshnessDiagnostics,
+    BootstrapCheckpointDescriptor, CheckpointDescriptorFailure, LocalOutboundAckSnapshot,
+    LocalStorageCompactionResult, LocalStorageCompactionSkipReason, LocalStorageDiagnostics,
+    MetaAcl, MetaEngine, MetaEngineCore, MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes,
+    MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult, MetaSymlink,
+    MetaXattr, MetadataBatchWriteObservability, MetadataCheckpointFreshnessDiagnostics,
     MetadataCheckpointRefreshReason, MetadataCoherenceProgress, MetadataWriteObservability,
     MetadataWriteStageTiming, NamespaceMutation, PgSyncDiagnostics, PgSyncFailure, PgSyncLifecycle,
     PgSyncPageDiagnostics, PgSyncStatus, PgSyncWriteAuthorityReason, RegularFileOverlayMutation,

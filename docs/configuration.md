@@ -152,6 +152,10 @@ finite-history recovery rules.
 
 ### `mount`
 
+The `--tray` indicator certifies remote synchronization only after the mount's
+accepted work has been uploaded and its metadata durably acknowledged. See the
+[tray indicator manual](tray.md) for colors, unavailable status and shutdown limits.
+
 ```bash
 studiofs mount <name> [<mount-point>] \
   [--cache-dir <path>] \

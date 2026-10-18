@@ -47,6 +47,8 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             SnapshotV2Scenario::new(SnapshotV2Kind::MaterializerTakeover).definition(),
             WorkerConcurrency.definition(),
             ConcurrentMkdirMerge.definition(),
+            // Keep this acceptance outside the long-standing numbered scenario range.
+            MountedSyncSafetyTwoClient.definition(),
         ]
     })
 }
@@ -65,6 +67,7 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         RUSTFS_OUTAGE_MULTI_CLIENT_RECOVERY | "rustfs-outage" | "s3-outage" => {
             Some(Box::new(RustfsOutageMultiClientRecovery))
         }
+        MOUNTED_SYNC_SAFETY_TWO_CLIENT => Some(Box::new(MountedSyncSafetyTwoClient)),
         MOUNTED_CLIENT_CRASH_RESTART_RECOVERY | "client-crash-restart" | "crash-restart" => {
             Some(Box::new(MountedClientCrashRestartRecovery))
         }

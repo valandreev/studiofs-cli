@@ -1431,6 +1431,10 @@ impl<'a> LocalDirtyFlushSession<'a> {
         local_sync_policy: LocalSyncPolicy,
         count_foreground_barrier: bool,
     ) -> VfsResult<()> {
+        // Keep a VFS-owned activity lease across the dirty-state -> persisted
+        // metadata/upload handoff. Diagnostics must not observe the source
+        // slice removed before its downstream owner becomes visible.
+        let _sync_safety_activity = self.vfs.state.sync_safety_activity.begin();
         if count_foreground_barrier {
             self.vfs
                 .state

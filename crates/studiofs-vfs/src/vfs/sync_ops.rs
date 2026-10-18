@@ -1650,6 +1650,7 @@ impl StudioVfs {
         data: &[u8],
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
+        let _sync_safety_activity = self.state.sync_safety_activity.begin();
         // `session` is wrapped in Option so we can release it early for opportunistic writes
         // before local-disk materialization. Durability-required writes hold the gate through
         // all I/O to maintain ordering guarantees with concurrent flushes on the same inode.
@@ -1817,6 +1818,7 @@ impl StudioVfs {
         data: VfsWritePayload<'_>,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
+        let _sync_safety_activity = self.state.sync_safety_activity.begin();
         // ── Hard backpressure safety valve ───────────────────────────────
         // If background materialization falls behind and dirty memory is
         // dangerously high, fall back to the fully-synchronous path so we

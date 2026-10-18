@@ -511,6 +511,22 @@ fn runtime_snapshot_request_returns_structured_sections() {
 }
 
 #[test]
+fn legacy_runtime_snapshot_cannot_certify_sync_completion() {
+    let mut encoded = serde_json::to_value(DiagnosticsRuntimeSnapshot::default())
+        .expect("serialize runtime snapshot");
+    encoded
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("sync_safety");
+    let decoded: DiagnosticsRuntimeSnapshot =
+        serde_json::from_value(encoded).expect("legacy runtime snapshot remains readable");
+    assert_eq!(
+        decoded.sync_safety.state,
+        studiofs_vfs::VfsSyncSafetyState::Unknown
+    );
+}
+
+#[test]
 fn diagnostics_runtime_snapshot_round_trips_coherence_health() {
     let snapshot = DiagnosticsRuntimeSnapshot {
         coherence: CoherenceHealthSnapshot {
