@@ -4,11 +4,198 @@
 use parking_lot::Mutex;
 #[cfg(windows)]
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 #[cfg(windows)]
 use std::sync::LazyLock;
+
+/// Filesystem space visible to the current process at `path`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FilesystemSpace {
+    pub(crate) available_bytes: u64,
+    pub(crate) total_bytes: u64,
+}
+
+/// Return available space and physical filesystem capacity (`f_bavail` on Unix, quota-aware on Windows).
+pub(crate) fn filesystem_space(path: &Path) -> io::Result<FilesystemSpace> {
+    #[cfg(test)]
+    FILESYSTEM_SPACE_QUERIES.with(|calls| calls.set(calls.get() + 1));
+    filesystem_space_impl(path)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static FILESYSTEM_SPACE_QUERIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn checked_filesystem_space(available_bytes: u64, total_bytes: u64) -> io::Result<FilesystemSpace> {
+    if total_bytes == 0 || available_bytes > total_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "filesystem returned inconsistent space totals",
+        ));
+    }
+    Ok(FilesystemSpace {
+        available_bytes,
+        total_bytes,
+    })
+}
+
+#[cfg(windows)]
+fn filesystem_space_impl(path: &Path) -> io::Result<FilesystemSpace> {
+    use std::os::windows::ffi::OsStrExt;
+
+    if path.as_os_str().encode_wide().any(|unit| unit == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "filesystem path contains an interior NUL",
+        ));
+    }
+    // Resolve junctions so the volume query sees the actual target volume root.
+    let canonical = path.canonicalize()?;
+    let mut canonical_wide: Vec<_> = canonical.as_os_str().encode_wide().collect();
+    canonical_wide.push(0);
+
+    #[link(name = "kernel32")]
+    #[expect(
+        unsafe_code,
+        reason = "Declares the Windows volume-root and physical-space queries."
+    )]
+    unsafe extern "system" {
+        #[link_name = "GetVolumePathNameW"]
+        fn get_volume_path_name_w(
+            file_name: *const u16,
+            volume_path_name: *mut u16,
+            buffer_length: u32,
+        ) -> i32;
+        #[link_name = "GetDiskSpaceInformationW"]
+        fn get_disk_space_information_w(
+            root_path: *const u16,
+            disk_space_info: *mut WindowsDiskSpaceInformation,
+        ) -> i32;
+    }
+
+    let mut volume_path = [0_u16; WINDOWS_VOLUME_PATH_BUFFER_U16];
+    let buffer_len = u32::try_from(volume_path.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "volume path buffer too large"))?;
+    // SAFETY: `canonical_wide` is NUL-terminated UTF-16 and `volume_path`
+    // points to writable storage for `buffer_len` units through the call.
+    #[expect(
+        unsafe_code,
+        reason = "Resolves the volume root for a validated canonical path."
+    )]
+    let has_root = unsafe {
+        get_volume_path_name_w(
+            canonical_wide.as_ptr(),
+            volume_path.as_mut_ptr(),
+            buffer_len,
+        )
+    };
+    if has_root == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut info = std::mem::MaybeUninit::<WindowsDiskSpaceInformation>::uninit();
+    // SAFETY: `volume_path` is a NUL-terminated volume root from the
+    // successful call above and `info` points to writable struct storage.
+    #[expect(
+        unsafe_code,
+        reason = "Queries physical volume space for a resolved volume root."
+    )]
+    let status = unsafe { get_disk_space_information_w(volume_path.as_ptr(), info.as_mut_ptr()) };
+    if status != 0 {
+        return Err(io::Error::other(format!(
+            "GetDiskSpaceInformationW failed (HRESULT 0x{status:08X})"
+        )));
+    }
+    // SAFETY: S_OK means the API initialized the output structure.
+    #[expect(
+        unsafe_code,
+        reason = "Reads the disk-space structure initialized by S_OK."
+    )]
+    let info = unsafe { info.assume_init() };
+    windows_disk_space_to_filesystem_space(&info)
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct WindowsDiskSpaceInformation {
+    actual_total_allocation_units: u64,
+    actual_available_allocation_units: u64,
+    _actual_pool_unavailable_allocation_units: u64,
+    caller_total_allocation_units: u64,
+    caller_available_allocation_units: u64,
+    _caller_pool_unavailable_allocation_units: u64,
+    _used_allocation_units: u64,
+    _total_reserved_allocation_units: u64,
+    _volume_storage_reserve_allocation_units: u64,
+    _available_committed_allocation_units: u64,
+    _pool_available_allocation_units: u64,
+    sectors_per_allocation_unit: u32,
+    bytes_per_sector: u32,
+}
+
+#[cfg(windows)]
+fn windows_disk_space_to_filesystem_space(
+    info: &WindowsDiskSpaceInformation,
+) -> io::Result<FilesystemSpace> {
+    let unit_bytes =
+        u128::from(info.sectors_per_allocation_unit) * u128::from(info.bytes_per_sector);
+    let total_bytes = u64::try_from(u128::from(info.actual_total_allocation_units) * unit_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "filesystem size overflow"))?;
+    let available_units = info
+        .caller_available_allocation_units
+        .min(info.actual_available_allocation_units);
+    let available_bytes = u64::try_from(u128::from(available_units) * unit_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "available space overflow"))?;
+    checked_filesystem_space(available_bytes, total_bytes)
+}
+
+#[cfg(unix)]
+fn filesystem_space_impl(path: &Path) -> io::Result<FilesystemSpace> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "filesystem path contains an interior NUL",
+        )
+    })?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stats` points to writable storage
+    // for the `statvfs` result for the duration of the call.
+    #[expect(
+        unsafe_code,
+        reason = "Queries filesystem space for a validated Unix path."
+    )]
+    let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: statvfs returned success, so it initialized the output structure.
+    #[expect(
+        unsafe_code,
+        reason = "Reads the statvfs structure initialized by a successful call."
+    )]
+    let stats = unsafe { stats.assume_init() };
+    let block_size = u128::from(stats.f_frsize);
+    let total_bytes = u64::try_from(u128::from(stats.f_blocks) * block_size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "filesystem size overflow"))?;
+    let available_bytes = u64::try_from(u128::from(stats.f_bavail) * block_size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "available space overflow"))?;
+    checked_filesystem_space(available_bytes, total_bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn filesystem_space_impl(_path: &Path) -> io::Result<FilesystemSpace> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filesystem space queries are unsupported on this platform",
+    ))
+}
 
 #[cfg(all(test, any(windows, target_os = "macos")))]
 std::thread_local! {
@@ -900,6 +1087,121 @@ fn u64_to_off_t(value: u64) -> io::Result<libc::off_t> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_space_reports_sensible_values_for_nested_temp_path() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let nested = temp.path().join("nested").join("filesystem");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let space = filesystem_space(&nested).unwrap();
+
+        assert!(space.total_bytes > 0);
+        assert!(space.available_bytes <= space.total_bytes);
+    }
+
+    #[test]
+    fn filesystem_space_fails_for_invalid_paths() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let missing = temp.path().join("missing").join("nested");
+
+        assert!(filesystem_space(&missing).is_err());
+    }
+
+    #[test]
+    fn filesystem_space_rejects_inconsistent_totals() {
+        assert_eq!(
+            checked_filesystem_space(0, 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            checked_filesystem_space(2, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_space_rejects_paths_with_interior_nul() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/tmp\0invalid"));
+
+        assert_eq!(
+            filesystem_space(path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filesystem_space_rejects_paths_with_interior_nul() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let os_path = std::ffi::OsString::from_wide(&[u16::from(b'C'), 0, u16::from(b':')]);
+        let path = Path::new(&os_path);
+
+        assert_eq!(
+            filesystem_space(path).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filesystem_space_uses_physical_total_with_quota_available() {
+        let info = WindowsDiskSpaceInformation {
+            actual_total_allocation_units: 1_000,
+            actual_available_allocation_units: 800,
+            _actual_pool_unavailable_allocation_units: 0,
+            caller_total_allocation_units: 100,
+            caller_available_allocation_units: 50,
+            _caller_pool_unavailable_allocation_units: 0,
+            _used_allocation_units: 200,
+            _total_reserved_allocation_units: 0,
+            _volume_storage_reserve_allocation_units: 0,
+            _available_committed_allocation_units: 0,
+            _pool_available_allocation_units: 0,
+            sectors_per_allocation_unit: 2,
+            bytes_per_sector: 512,
+        };
+
+        let space = windows_disk_space_to_filesystem_space(&info).unwrap();
+
+        assert_eq!(space.total_bytes, 1_000 * 1_024);
+        assert_eq!(space.available_bytes, 50 * 1_024);
+        assert_ne!(
+            space.total_bytes,
+            info.caller_total_allocation_units * 1_024
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn filesystem_space_rejects_disk_space_overflow() {
+        let info = WindowsDiskSpaceInformation {
+            actual_total_allocation_units: u64::MAX,
+            actual_available_allocation_units: u64::MAX,
+            _actual_pool_unavailable_allocation_units: 0,
+            caller_total_allocation_units: u64::MAX,
+            caller_available_allocation_units: u64::MAX,
+            _caller_pool_unavailable_allocation_units: 0,
+            _used_allocation_units: 0,
+            _total_reserved_allocation_units: 0,
+            _volume_storage_reserve_allocation_units: 0,
+            _available_committed_allocation_units: 0,
+            _pool_available_allocation_units: 0,
+            sectors_per_allocation_unit: 2,
+            bytes_per_sector: 512,
+        };
+
+        assert_eq!(
+            windows_disk_space_to_filesystem_space(&info)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     #[cfg(unix)]
     #[test]
