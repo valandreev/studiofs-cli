@@ -16,6 +16,51 @@ Runtime components:
 | Local-backend contract | `local` | Backend-agnostic trait used by VFS read/write/upload paths |
 | Cached-store runtime | `cached_store`, `upload_queue`, `upload_stage` | Writer pages, staging, cached reads, pending-upload queue, upload helpers, pinning, and runtime metrics |
 
+## Physical filesystem headroom
+
+The existing mount maintenance worker checks the filesystem containing the
+configured cache root, with at least 30 seconds between attempts. Reads, writes,
+and diagnostic snapshots do not query filesystem space. This policy is separate
+from the configured cache budget's 90%/80% eviction watermarks: a small cache can
+still reclaim downloaded data when other applications fill its host filesystem.
+
+A cache payload write that fails with a full-filesystem or quota error
+(`StorageFull`/`QuotaExceeded`, e.g. `ENOSPC`, `EDQUOT`, `ERROR_DISK_FULL`) only
+sets a flag; the next maintenance tick then samples immediately instead of
+waiting out the 30-second interval. The write error is still returned unchanged.
+
+Below 10% available capacity, a pass aims toward 11% to avoid oscillation. Each
+pass examines at most 512 access-order rows and removes at most 128 objects and
+64 MiB of logical payload (one larger indivisible object may exceed that byte
+limit). A cursor continues the scan on later intervals. The existing eviction
+mutex and mutation gates serialize removals and recheck eligibility.
+
+Physical pressure removes only unpinned, uploaded, evictable payloads downloaded
+from the published remote view. Dirty, pending, staged, uploading and locally
+originated payloads remain intact, including local uploads that may still await
+metadata publication. Active readers retain their open file handles. Insufficient
+eligible cache is reported without a destructive fallback or suppression of
+normal disk-full errors.
+
+The native sampler follows the cache location, including secondary volumes and
+directory links. Windows uses actual filesystem capacity and quota-limited
+caller availability. Unix uses `statvfs` capacity and `f_bavail`, including its
+reserved-block restrictions; `statvfs` does not guarantee per-user quota reporting.
+Separate caches on one filesystem observe its shared availability independently.
+
+After a successful removal, maintenance samples again: removed logical payload
+bytes do not prove physical bytes were released. Open handles, sparse files,
+snapshots, delayed accounting and concurrent external allocations can prevent
+recovery. Both sampling failures and continued pressure wait for the next
+interval. The reserve is best-effort and cannot guarantee 10% free space.
+
+`LocalPayloadBackendRuntime::physical_space_status()` exposes the last successful
+sample's age, available/total/reserve bytes, last pass's removed logical payload
+bytes and outcome without I/O. Structured maintenance logs report recovery,
+sampling/eviction failures and pressure limited by the scan bound or protected/
+exhausted cache. Native mounted low-disk acceptance is separate from deterministic
+policy tests; the User Manual rollout update remains gated on that validation.
+
 ## Snapshot v2 Artifact Cache
 
 Snapshot v2 immutable metadata artifacts use the configured snapshot cache

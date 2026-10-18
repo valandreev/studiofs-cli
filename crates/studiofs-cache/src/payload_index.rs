@@ -185,6 +185,8 @@ pub struct EvictionCandidatePage {
     pub scanned_rows: u64,
     /// Rows skipped because they were not uploaded+evictable at scan time.
     pub skipped_non_evictable: u64,
+    /// Access-order sequence of the last scanned row, including skipped rows.
+    pub next_cursor: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -858,6 +860,24 @@ impl CacheIndex {
         start_after: Option<u64>,
         limit: usize,
     ) -> Result<EvictionCandidatePage, CacheIndexError> {
+        self.eviction_candidates_page_inner(start_after, limit, None)
+    }
+
+    /// Scan at most `limit` access-order rows for uploaded, evictable payloads.
+    pub(crate) fn eviction_candidates_scan_page(
+        &self,
+        start_after: Option<u64>,
+        limit: usize,
+    ) -> Result<EvictionCandidatePage, CacheIndexError> {
+        self.eviction_candidates_page_inner(start_after, limit, Some(limit))
+    }
+
+    fn eviction_candidates_page_inner(
+        &self,
+        start_after: Option<u64>,
+        limit: usize,
+        max_scanned_rows: Option<usize>,
+    ) -> Result<EvictionCandidatePage, CacheIndexError> {
         if limit == 0 {
             return Ok(EvictionCandidatePage::default());
         }
@@ -878,15 +898,22 @@ impl CacheIndex {
         let mut ordered = Vec::with_capacity(limit);
         let mut scanned_rows = 0_u64;
         let mut skipped_non_evictable = 0_u64;
-        let iter = access_order.range::<u64>(start..).map_err(storage_error)?;
-        for pair in iter {
-            if ordered.len() >= limit {
+        let mut next_cursor = None;
+        let mut iter = access_order.range::<u64>(start..).map_err(storage_error)?;
+        loop {
+            if ordered.len() >= limit
+                || max_scanned_rows.is_some_and(|max| scanned_rows >= max as u64)
+            {
                 break;
             }
+            let Some(pair) = iter.next() else {
+                break;
+            };
             let (order, object_id) = pair.map_err(storage_error)?;
             let order = order.value();
             let object_id = object_id.value();
             scanned_rows = scanned_rows.saturating_add(1);
+            next_cursor = Some(order);
 
             let Some(entry) = read_entry_from_payloads(&payloads, object_id)? else {
                 continue;
@@ -912,6 +939,7 @@ impl CacheIndex {
             entries: ordered,
             scanned_rows,
             skipped_non_evictable,
+            next_cursor,
         })
     }
 
@@ -2206,6 +2234,54 @@ mod tests {
                 .map(|entry| entry.object_id)
                 .collect::<Vec<_>>(),
             vec![10, 11, 12]
+        );
+    }
+
+    #[test]
+    fn eviction_candidate_scan_page_bounds_scans_and_advances_over_skipped_rows() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+
+        upsert_dirty(&index, 1, 10);
+        upsert_dirty(&index, 2, 20);
+        upsert_uploaded(&index, 3, 30);
+        index
+            .upsert(CacheIndexUpsert {
+                object_id: 4,
+                payload_key: b"payload/4.object".to_vec(),
+                payload_len: 40,
+                lifecycle: LocalPayloadLifecycleState::Uploaded,
+                origin: LocalPayloadOrigin::Downloaded,
+                upload_state: LocalPayloadUploadState::None,
+                evictable: false,
+            })
+            .unwrap();
+
+        let first = index.eviction_candidates_scan_page(None, 2).unwrap();
+        assert!(first.entries.is_empty());
+        assert!(first.scanned_rows <= 2);
+        assert_eq!(
+            first.next_cursor,
+            Some(index.get_entry(2).unwrap().unwrap().access_order)
+        );
+
+        let second = index
+            .eviction_candidates_scan_page(first.next_cursor, 2)
+            .unwrap();
+        assert!(second.scanned_rows <= 2);
+        assert_eq!(
+            second.next_cursor,
+            Some(index.get_entry(4).unwrap().unwrap().access_order)
+        );
+        assert_eq!(second.skipped_non_evictable, 1);
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.object_id)
+                .collect::<Vec<_>>(),
+            vec![3]
         );
     }
 }

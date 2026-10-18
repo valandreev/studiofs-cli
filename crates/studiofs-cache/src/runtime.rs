@@ -17,6 +17,10 @@ use bytes::Bytes;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use tracing::{debug, warn};
 
+#[path = "disk_pressure.rs"]
+mod disk_pressure;
+pub use disk_pressure::PhysicalSpaceStatus;
+
 use crate::local::{
     LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState,
     LocalPayloadObjectStats, LocalPayloadOrigin, LocalPayloadPut, LocalPayloadStorageStats,
@@ -288,6 +292,8 @@ pub struct LocalPayloadBackendRuntime {
     payload_store: FilePayloadStore,
     budget_governor: CacheBudgetGovernor,
     eviction_pass_lock: Mutex<()>,
+    disk_pressure: Mutex<disk_pressure::DiskPressureState>,
+    disk_pressure_refresh_requested: AtomicBool,
     payload_mutation_gates: [Mutex<()>; PAYLOAD_MUTATION_STRIPES],
     runtime_pinned: Mutex<HashMap<u64, usize>>,
     eviction_scan_skipped_non_evictable: AtomicU64,
@@ -461,6 +467,8 @@ impl LocalPayloadBackendRuntime {
                 .map(CacheBudgetGovernor::bounded)
                 .unwrap_or_else(CacheBudgetGovernor::unbounded),
             eviction_pass_lock: Mutex::new(()),
+            disk_pressure: Mutex::new(disk_pressure::DiskPressureState::default()),
+            disk_pressure_refresh_requested: AtomicBool::new(false),
             payload_mutation_gates: std::array::from_fn(|_| Mutex::new(())),
             runtime_pinned: Mutex::new(HashMap::new()),
             eviction_scan_skipped_non_evictable: AtomicU64::new(0),
@@ -688,26 +696,34 @@ impl LocalPayloadBackendRuntime {
         result.map_err(LocalPayloadBackendError::from)
     }
 
-    fn evict_batch_internal(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
+    fn evict_batch_internal(
+        &self,
+        object_ids: &[u64],
+        downloaded_only: bool,
+    ) -> Result<u64, LocalPayloadBackendError> {
         let _mutations = self.lock_payload_mutations(object_ids);
         let mut eligible = Vec::with_capacity(object_ids.len());
+        let mut removed_bytes = 0_u64;
         for &object_id in object_ids {
-            if self.is_runtime_pinned(object_id)
-                || !self
-                    .index
-                    .get_entry(object_id)?
-                    .is_some_and(|entry| entry.evictable)
-            {
+            let Some(entry) = self.index.get_entry(object_id)?.filter(|entry| {
+                !self.is_runtime_pinned(object_id)
+                    && entry.evictable
+                    && entry.lifecycle == LocalPayloadLifecycleState::Uploaded
+                    && entry.upload_state == LocalPayloadUploadState::None
+                    && (!downloaded_only || entry.origin == LocalPayloadOrigin::Downloaded)
+            }) else {
                 self.eviction_scan_skipped_non_evictable
                     .fetch_add(1, Ordering::Relaxed);
                 continue;
-            }
+            };
+            removed_bytes = removed_bytes.saturating_add(entry.payload_len);
             eligible.push(object_id);
         }
         if eligible.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
-        self.remove_payloads_locked(&eligible)
+        self.remove_payloads_locked(&eligible)?;
+        Ok(removed_bytes)
     }
 
     fn note_storage_state_change(&self) {
@@ -906,7 +922,7 @@ impl LocalPayloadBackendRuntime {
                 batch.push(candidate.object_id);
                 estimated_current = estimated_current.saturating_sub(candidate.payload_len);
                 if batch.len() >= EVICTION_DELETE_BATCH_SIZE {
-                    self.evict_batch_internal(&batch)?;
+                    self.evict_batch_internal(&batch, false)?;
                     batch.clear();
                 }
             }
@@ -924,7 +940,7 @@ impl LocalPayloadBackendRuntime {
                 );
             }
             if !batch.is_empty() {
-                self.evict_batch_internal(&batch)?;
+                self.evict_batch_internal(&batch, false)?;
                 batch.clear();
             }
         }
@@ -1146,7 +1162,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         let payload_commit = self
             .payload_store
             .put_with_intent(object_id, data)
-            .map_err(LocalPayloadBackendError::from)?;
+            .map_err(|error| self.note_payload_write_error(error))?;
 
         // Leave the real file/index crash boundary intact for startup recovery tests.
         #[cfg(test)]
@@ -1308,7 +1324,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         let batch_commit = self
             .payload_store
             .put_batch(&persisted_entries)
-            .map_err(LocalPayloadBackendError::from)?;
+            .map_err(|error| self.note_payload_write_error(error))?;
 
         if let Err(error) = self.index.upsert_many(&updates) {
             if let Err(rollback_error) =
@@ -1356,7 +1372,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
                 }
             }
         }
-        Ok(())
+        self.run_disk_pressure_maintenance(Instant::now(), platform::filesystem_space)
     }
 
     fn mark_uploading(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
@@ -3835,7 +3851,7 @@ mod tests {
         let before = backend
             .eviction_scan_skipped_non_evictable
             .load(Ordering::Relaxed);
-        backend.evict_batch_internal(&[30, 32]).unwrap();
+        backend.evict_batch_internal(&[30, 32], false).unwrap();
         assert_eq!(
             backend
                 .eviction_scan_skipped_non_evictable
