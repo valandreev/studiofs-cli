@@ -410,3 +410,39 @@ fn repeated_pressure_passes_observe_space_without_assuming_unlink_freed_it() {
         "each nonempty reclaim pass resamples the filesystem"
     );
 }
+
+#[test]
+fn storage_full_write_error_forces_one_early_resample() {
+    let (_temp, backend) = backend();
+    let now = Instant::now();
+    let mut calls = 0;
+    let mut healthy = |_: &Path| {
+        calls += 1;
+        Ok(space(RECOVERED_BYTES, TOTAL_BYTES))
+    };
+    backend
+        .run_disk_pressure_maintenance(now, &mut healthy)
+        .unwrap();
+
+    // Unrelated write errors keep the timer cadence.
+    let _ =
+        backend.note_payload_write_error(io::Error::from(io::ErrorKind::PermissionDenied).into());
+    backend
+        .run_disk_pressure_maintenance(now + Duration::from_secs(1), &mut healthy)
+        .unwrap();
+
+    let error =
+        backend.note_payload_write_error(io::Error::from(io::ErrorKind::StorageFull).into());
+    assert!(
+        matches!(error, LocalPayloadBackendError::Io(ref e) if e.kind() == io::ErrorKind::StorageFull)
+    );
+    backend
+        .run_disk_pressure_maintenance(now + Duration::from_secs(2), &mut healthy)
+        .unwrap();
+    // The request is consumed; the next tick returns to the interval.
+    backend
+        .run_disk_pressure_maintenance(now + Duration::from_secs(3), &mut healthy)
+        .unwrap();
+
+    assert_eq!(calls, 2);
+}

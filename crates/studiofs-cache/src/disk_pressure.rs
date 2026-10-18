@@ -66,6 +66,24 @@ impl LocalPayloadBackendRuntime {
         }
     }
 
+    /// Requests an early resample when a payload write hits a full filesystem or quota.
+    /// Sets a flag only; the next maintenance tick does the sampling.
+    pub(super) fn note_payload_write_error(
+        &self,
+        error: FilePayloadStoreError,
+    ) -> LocalPayloadBackendError {
+        if let FilePayloadStoreError::Io(io_error) = &error
+            && matches!(
+                io_error.kind(),
+                io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
+            )
+        {
+            self.disk_pressure_refresh_requested
+                .store(true, Ordering::Relaxed);
+        }
+        error.into()
+    }
+
     pub(super) fn run_disk_pressure_maintenance(
         &self,
         now: Instant,
@@ -76,9 +94,14 @@ impl LocalPayloadBackendRuntime {
             return Ok(());
         };
         let mut state = self.disk_pressure.lock();
-        if state
-            .last_attempt
-            .is_some_and(|at| now.saturating_duration_since(at) < SAMPLE_INTERVAL)
+        // Consume an early-refresh request only after taking eviction ownership.
+        let refresh_requested = self
+            .disk_pressure_refresh_requested
+            .swap(false, Ordering::Relaxed);
+        if !refresh_requested
+            && state
+                .last_attempt
+                .is_some_and(|at| now.saturating_duration_since(at) < SAMPLE_INTERVAL)
         {
             return Ok(());
         }

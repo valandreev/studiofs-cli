@@ -293,6 +293,7 @@ pub struct LocalPayloadBackendRuntime {
     budget_governor: CacheBudgetGovernor,
     eviction_pass_lock: Mutex<()>,
     disk_pressure: Mutex<disk_pressure::DiskPressureState>,
+    disk_pressure_refresh_requested: AtomicBool,
     payload_mutation_gates: [Mutex<()>; PAYLOAD_MUTATION_STRIPES],
     runtime_pinned: Mutex<HashMap<u64, usize>>,
     eviction_scan_skipped_non_evictable: AtomicU64,
@@ -467,6 +468,7 @@ impl LocalPayloadBackendRuntime {
                 .unwrap_or_else(CacheBudgetGovernor::unbounded),
             eviction_pass_lock: Mutex::new(()),
             disk_pressure: Mutex::new(disk_pressure::DiskPressureState::default()),
+            disk_pressure_refresh_requested: AtomicBool::new(false),
             payload_mutation_gates: std::array::from_fn(|_| Mutex::new(())),
             runtime_pinned: Mutex::new(HashMap::new()),
             eviction_scan_skipped_non_evictable: AtomicU64::new(0),
@@ -1160,7 +1162,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         let payload_commit = self
             .payload_store
             .put_with_intent(object_id, data)
-            .map_err(LocalPayloadBackendError::from)?;
+            .map_err(|error| self.note_payload_write_error(error))?;
 
         // Leave the real file/index crash boundary intact for startup recovery tests.
         #[cfg(test)]
@@ -1322,7 +1324,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         let batch_commit = self
             .payload_store
             .put_batch(&persisted_entries)
-            .map_err(LocalPayloadBackendError::from)?;
+            .map_err(|error| self.note_payload_write_error(error))?;
 
         if let Err(error) = self.index.upsert_many(&updates) {
             if let Err(rollback_error) =

@@ -24,6 +24,11 @@ and diagnostic snapshots do not query filesystem space. This policy is separate
 from the configured cache budget's 90%/80% eviction watermarks: a small cache can
 still reclaim downloaded data when other applications fill its host filesystem.
 
+A cache payload write that fails with a full-filesystem or quota error
+(`StorageFull`/`QuotaExceeded`, e.g. `ENOSPC`, `EDQUOT`, `ERROR_DISK_FULL`) only
+sets a flag; the next maintenance tick then samples immediately instead of
+waiting out the 30-second interval. The write error is still returned unchanged.
+
 Below 10% available capacity, a pass aims toward 11% to avoid oscillation. Each
 pass examines at most 512 access-order rows and removes at most 128 objects and
 64 MiB of logical payload (one larger indivisible object may exceed that byte
