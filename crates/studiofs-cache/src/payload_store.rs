@@ -1883,7 +1883,8 @@ mod tests {
         }
         store.put(93, b"removed").unwrap();
         let log_path = temp.path().join("removal.log");
-        // A second live dispatch prevents tracing's single-subscriber cache from using another thread's default.
+        // Dispatch::new registers globally without setting a default; keep two dispatches alive
+        // so tracing-core 0.1.36 skips its single-dispatch callsite-interest optimization.
         let _no_subscriber = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let subscriber = tracing_subscriber::fmt()
             .without_time()
