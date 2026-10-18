@@ -2277,7 +2277,11 @@ impl UploadLifecycleWorker {
                 let Some(permit) = permits.clone().try_acquire_owned().ok() else {
                     break;
                 };
+                // Begin ownership before removing the item from the ready
+                // queue so sync-safety cannot miss the queue-to-worker handoff.
+                let activity = self.vfs.state.sync_safety_activity.begin_uploading();
                 let Some(op) = ready.pop_front() else {
+                    drop(activity);
                     drop(permit);
                     break;
                 };
@@ -2301,7 +2305,7 @@ impl UploadLifecycleWorker {
                 );
                 let worker = self.clone();
                 workers.spawn(async move {
-                    worker.run_single_upload(op, permit).await;
+                    worker.run_single_upload(op, permit, activity).await;
                 });
                 dispatched_since_yield = dispatched_since_yield.saturating_add(1);
                 if dispatched_since_yield >= UPLOAD_WORKER_YIELD_EVERY_OPS {
@@ -2615,7 +2619,12 @@ impl UploadLifecycleWorker {
         }
     }
 
-    async fn run_single_upload(&self, op: PendingUpload, _permit: OwnedSemaphorePermit) {
+    async fn run_single_upload(
+        &self,
+        op: PendingUpload,
+        _permit: OwnedSemaphorePermit,
+        _activity: super::super::SyncSafetyActivityGuard,
+    ) {
         if self.vfs.uploader_shutdown_requested() {
             return;
         }

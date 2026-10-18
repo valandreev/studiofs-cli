@@ -78,7 +78,7 @@ impl StudioVfs {
     // Once this guard is held, the operation may finish even if shutdown starts.
     pub(super) fn try_mutating_operation_admission(
         &self,
-    ) -> VfsResult<tokio::sync::RwLockReadGuard<'_, ()>> {
+    ) -> VfsResult<MutatingOperationAdmission<'_>> {
         let operation = self
             .state
             .shutdown
@@ -88,7 +88,11 @@ impl StudioVfs {
         if self.shutdown_requested() {
             return Err(VfsError::Other("VFS is shutting down".to_string()));
         }
-        Ok(operation)
+        let activity = self.state.sync_safety_activity.begin();
+        Ok(MutatingOperationAdmission {
+            _shutdown_guard: operation,
+            _activity_guard: activity,
+        })
     }
 
     pub(super) fn run_sync_future<T>(
@@ -101,7 +105,7 @@ impl StudioVfs {
 
     pub(super) fn run_sync_future_with_admission<T>(
         &self,
-        _operation: &tokio::sync::RwLockReadGuard<'_, ()>,
+        _operation: &MutatingOperationAdmission<'_>,
         future: impl std::future::Future<Output = VfsResult<T>>,
     ) -> VfsResult<T> {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -231,4 +235,9 @@ impl StudioVfs {
             }
         });
     }
+}
+
+pub(super) struct MutatingOperationAdmission<'a> {
+    _shutdown_guard: tokio::sync::RwLockReadGuard<'a, ()>,
+    _activity_guard: super::SyncSafetyActivityGuard,
 }

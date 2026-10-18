@@ -423,6 +423,7 @@ impl StudioVfs {
         data: &[u8],
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
+        let _sync_safety_activity = self.state.sync_safety_activity.begin();
         let session = self
             .state
             .file_session

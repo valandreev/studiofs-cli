@@ -208,6 +208,11 @@ pub trait LocalPayloadBackend: Send + Sync {
         self.dirty_object_ids().len()
     }
 
+    /// Returns the dirty payload object count, or `None` when it cannot be read.
+    fn try_dirty_object_count(&self) -> Option<usize> {
+        Some(self.dirty_object_count())
+    }
+
     /// Returns the lifecycle state for `object_id`.
     fn lifecycle_state(&self, object_id: u64) -> LocalPayloadLifecycleState;
 

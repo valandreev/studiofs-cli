@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use studiofs_meta::engine::{
-    DeferredDeleteRecord, LocalStorageCompactionResult, LocalStorageDiagnostics,
-    MetadataAuthorityStatus, MetadataCheckpointFreshnessDiagnostics, MetadataCoherenceProgress,
-    MetadataInvalidationDiagnostics, MetadataReplicationBacklog, MetadataWriteObservability,
-    PendingCreateRecord, PgSyncDiagnostics, PgSyncStatus, UndoLogKind, UndoLogRecord,
+    DeferredDeleteRecord, LocalOutboundAckSnapshot, LocalStorageCompactionResult,
+    LocalStorageDiagnostics, MetadataAuthorityStatus, MetadataCheckpointFreshnessDiagnostics,
+    MetadataCoherenceProgress, MetadataInvalidationDiagnostics, MetadataReplicationBacklog,
+    MetadataWriteObservability, PendingCreateRecord, PgSyncDiagnostics, PgSyncStatus, UndoLogKind,
+    UndoLogRecord,
 };
 use studiofs_meta::snapshot_ports::{
     SnapshotCleanupStore, SnapshotJobStore, SnapshotPolicyStore, SnapshotSourceReader,
@@ -618,6 +619,7 @@ impl<M: ?Sized + MetaReplication> MetaReplication for RuntimeMetaHandle<M> {
     forward_method!(fn metadata_version_token(&self) -> Option<String>);
     forward_method!(fn namespace_version_token(&self) -> Option<String>);
     forward_method!(fn replication_backlog(&self) -> MetadataReplicationBacklog);
+    forward_method!(fn local_outbound_ack_snapshot(&self) -> Option<LocalOutboundAckSnapshot>);
     forward_method!(fn metadata_authority_status(&self) -> MetadataAuthorityStatus);
     forward_method!(fn pg_sync_status(&self) -> PgSyncStatus);
     forward_method!(fn pg_sync_diagnostics(&self) -> PgSyncDiagnostics);

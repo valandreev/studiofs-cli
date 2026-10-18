@@ -445,7 +445,9 @@ impl StudioVfs {
         tracing::debug!("epoch finalizer worker started");
 
         'finalizer: loop {
-            let Some((ino, content_epoch)) = self.pop_epoch_finalization() else {
+            let Some((ino, content_epoch, activity)) =
+                self.pop_epoch_finalization_for_sync_safety()
+            else {
                 tokio::select! {
                     _ = self.state.shutdown.shutdown_notify.notified() => break,
                     _ = self.state.upload.pending_epoch_finalizations_notify.notified() => {}
@@ -453,19 +455,19 @@ impl StudioVfs {
                 continue;
             };
 
-            let mut work = vec![(ino, content_epoch)];
+            let mut work = vec![(ino, content_epoch, activity)];
             while work.len() < MAX_FINALIZATIONS_IN_FLIGHT {
                 if self.shutdown_requested() {
                     break;
                 }
-                let Some(next) = self.pop_epoch_finalization() else {
+                let Some(next) = self.pop_epoch_finalization_for_sync_safety() else {
                     break;
                 };
                 work.push(next);
             }
             let shutdown_token = self.state.shutdown.background_shutdown_token.clone();
-            let results =
-                futures::future::join_all(work.into_iter().map(|(ino, content_epoch)| {
+            let results = futures::future::join_all(work.into_iter().map(
+                |(ino, content_epoch, activity)| {
                     let vfs = Arc::clone(&self);
                     let publisher = Arc::clone(&publisher);
                     let shutdown_token = shutdown_token.clone();
@@ -480,12 +482,13 @@ impl StudioVfs {
                             ),
                         )
                         .await;
-                        (ino, content_epoch, result)
+                        (ino, content_epoch, result, activity)
                     }
-                }))
-                .await;
+                },
+            ))
+            .await;
 
-            for (ino, content_epoch, finalize_result) in results {
+            for (ino, content_epoch, finalize_result, activity) in results {
                 let Some(finalize_result) = finalize_result else {
                     break 'finalizer;
                 };
@@ -520,7 +523,12 @@ impl StudioVfs {
                         if let Some(retry_delay) =
                             epoch_finalization_retry_delay(&status, self.upload_requeue_base)
                         {
-                            self.schedule_epoch_finalization_retry(ino, content_epoch, retry_delay);
+                            self.schedule_epoch_finalization_retry(
+                                ino,
+                                content_epoch,
+                                retry_delay,
+                                activity,
+                            );
                         }
                     }
                     Ok(commit::EpochFinalizeStatus::Skipped) => {
@@ -539,7 +547,12 @@ impl StudioVfs {
                         if let Some(retry_delay) =
                             epoch_finalization_retry_delay(&status, self.upload_requeue_base)
                         {
-                            self.schedule_epoch_finalization_retry(ino, content_epoch, retry_delay);
+                            self.schedule_epoch_finalization_retry(
+                                ino,
+                                content_epoch,
+                                retry_delay,
+                                activity,
+                            );
                         }
                     }
                     Err(err) => {
@@ -599,6 +612,7 @@ impl StudioVfs {
                             ino,
                             content_epoch,
                             self.upload_requeue_base,
+                            activity,
                         );
                     }
                 }
@@ -611,6 +625,7 @@ impl StudioVfs {
         ino: Ino,
         content_epoch: u64,
         delay: Duration,
+        activity: SyncSafetyActivityGuard,
     ) {
         if self.shutdown_requested() {
             return;
@@ -618,6 +633,7 @@ impl StudioVfs {
         let vfs = self.clone();
         let shutdown = self.state.shutdown.background_shutdown_token.clone();
         self.spawn_background_task(async move {
+            let _activity = activity;
             if vfs.shutdown_requested() {
                 return;
             }
@@ -3317,7 +3333,28 @@ mod tests {
                 .await
                 .expect("write local data");
 
-            vfs.schedule_epoch_finalization_retry(attr.ino, 1, Duration::from_secs(60));
+            vfs.state.upload.pending_epoch_finalizations.lock().clear();
+            vfs.schedule_epoch_finalization_retry(
+                attr.ino,
+                1,
+                Duration::from_secs(60),
+                vfs.state.sync_safety_activity.begin_publishing(),
+            );
+            assert!(
+                vfs.state
+                    .upload
+                    .pending_epoch_finalizations
+                    .lock()
+                    .is_empty(),
+                "the retry is intentionally still in its delay before requeue"
+            );
+            let snapshot = vfs.sync_safety_snapshot();
+            assert_ne!(snapshot.state, VfsSyncSafetyState::Safe);
+            assert!(
+                snapshot
+                    .reasons
+                    .contains(&VfsSyncSafetyReason::PublishingMetadata)
+            );
             assert_eq!(
                 vfs.state.shutdown.background_tasks.lock().len(),
                 1,

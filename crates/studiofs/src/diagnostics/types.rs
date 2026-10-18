@@ -94,6 +94,9 @@ pub(crate) struct DiagnosticsRuntimeSnapshot {
     pub zeroio: VfsZeroIoRuntimeSnapshot,
     pub cache: DiagnosticsCacheSnapshot,
     pub synchronization: DiagnosticsSynchronizationSnapshot,
+    /// Mount-owned proof of outbound remote durability; absent legacy telemetry is unknown.
+    #[serde(default)]
+    pub sync_safety: studiofs_vfs::VfsSyncSafetySnapshot,
     /// Canonical mount-local replication and invalidation coherence health.
     ///
     /// `synchronization.state.coherence` is retained as a compatibility mirror
@@ -108,6 +111,7 @@ impl DiagnosticsRuntimeSnapshot {
         Self {
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,
+            sync_safety: studiofs_vfs::VfsSyncSafetySnapshot::default(),
             process: DiagnosticsProcessSnapshot::default(),
             ingress: health.ingress,
             write_path: health.write_path,

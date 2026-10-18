@@ -551,6 +551,10 @@ where
         MetadataReplicationBacklog::default()
     }
 
+    fn local_outbound_ack_snapshot(&self) -> Option<LocalOutboundAckSnapshot> {
+        self.inner.local_outbound_ack_snapshot()
+    }
+
     fn metadata_authority_status(&self) -> MetadataAuthorityStatus {
         MetadataAuthorityStatus::read_only()
     }

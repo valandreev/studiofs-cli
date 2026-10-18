@@ -1096,6 +1096,39 @@ impl<E: ClientProcessExecutor> MultiClientController<E> {
         Ok(output)
     }
 
+    /// Reads the mounted runtime diagnostics snapshot for a named client.
+    pub fn runtime_snapshot(
+        &self,
+        client: &str,
+    ) -> Result<serde_json::Value, ClientControllerError> {
+        let index = self.client_index(client)?;
+        let spec = self.client(index)?;
+        let command = self.command(
+            index,
+            "diagnostics-attach",
+            vec![
+                "internal".to_string(),
+                "diagnostics-attach".to_string(),
+                spec.mount_point.display().to_string(),
+            ],
+        )?;
+        let output = self.executor.run(&command)?;
+        ensure_success(&command, &output)?;
+        let payload: serde_json::Value = serde_json::from_str(&output.stdout).map_err(|error| {
+            ClientControllerError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
+        })?;
+        payload
+            .get("runtime_snapshot")
+            .filter(|snapshot| !snapshot.is_null())
+            .cloned()
+            .ok_or_else(|| {
+                ClientControllerError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "diagnostics attach returned no runtime_snapshot",
+                ))
+            })
+    }
+
     /// Restarts (unmount then mount) a named client.
     pub fn restart(&mut self, client: &str) -> Result<(), ClientControllerError> {
         let index = self.client_index(client)?;

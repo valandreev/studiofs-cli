@@ -1650,6 +1650,7 @@ impl StudioVfs {
         data: &[u8],
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
+        let _sync_safety_activity = self.state.sync_safety_activity.begin();
         // `session` is wrapped in Option so we can release it early for opportunistic writes
         // before local-disk materialization. Durability-required writes hold the gate through
         // all I/O to maintain ordering guarantees with concurrent flushes on the same inode.
@@ -1817,6 +1818,7 @@ impl StudioVfs {
         data: VfsWritePayload<'_>,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
+        let _sync_safety_activity = self.state.sync_safety_activity.begin();
         // ── Hard backpressure safety valve ───────────────────────────────
         // If background materialization falls behind and dirty memory is
         // dangerously high, fall back to the fully-synchronous path so we
@@ -2295,6 +2297,8 @@ impl StudioVfs {
     ///
     /// Returns the number of bytes materialized in this pass.
     pub(super) async fn materialize_writer_stack_for_inode(&self, ino: Ino) -> VfsResult<usize> {
+        // Dirty bytes leave the writer stack before they reach local-dirty counters.
+        let _sync_safety_activity = self.state.sync_safety_activity.begin();
         let object_count = self
             .state
             .writer_stack
@@ -2331,6 +2335,8 @@ impl StudioVfs {
         ino: Ino,
         min_idle: Duration,
     ) -> VfsResult<usize> {
+        // Dirty bytes leave the writer stack before they reach local-dirty counters.
+        let _sync_safety_activity = self.state.sync_safety_activity.begin();
         let object_count = self
             .state
             .writer_stack
@@ -2368,6 +2374,8 @@ impl StudioVfs {
         &self,
         ino: Ino,
     ) -> VfsResult<usize> {
+        // Dirty bytes leave the writer stack before they reach local-dirty counters.
+        let _sync_safety_activity = self.state.sync_safety_activity.begin();
         let object_count = self
             .state
             .writer_stack

@@ -24,6 +24,281 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
+#[test]
+fn sync_safety_never_reports_safe_before_pg_startup_reaches_live() {
+    for lifecycle in [
+        PgSyncLifecycle::LocalReady,
+        PgSyncLifecycle::CatchingUp,
+        PgSyncLifecycle::TargetReached,
+        PgSyncLifecycle::AllocatorPending,
+    ] {
+        assert_eq!(
+            classify_sync_safety_state(true, lifecycle, lifecycle, true, true, false, false),
+            VfsSyncSafetyState::Unknown,
+            "startup lifecycle {lifecycle:?} must fail closed"
+        );
+    }
+
+    assert_eq!(
+        classify_sync_safety_state(
+            true,
+            PgSyncLifecycle::Degraded,
+            PgSyncLifecycle::Degraded,
+            true,
+            false,
+            true,
+            false,
+        ),
+        VfsSyncSafetyState::Syncing,
+        "an established but temporarily degraded mount reports known local work"
+    );
+    assert_eq!(
+        classify_sync_safety_state(
+            true,
+            PgSyncLifecycle::Live,
+            PgSyncLifecycle::Live,
+            true,
+            true,
+            false,
+            false,
+        ),
+        VfsSyncSafetyState::Safe
+    );
+}
+
+#[test]
+fn sync_safety_snapshot_reports_dirty_writer_and_persisted_slice_owners() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sync-safety-dirty-owners");
+    let attr = vfs
+        .create(ROOT_INO, b"sync-safety.txt", 0, 0, 0o644)
+        .expect("create file");
+    let writer = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open writer");
+
+    rt.block_on(vfs.write_fh(writer, attr.ino, 0, b"locally dirty"))
+        .expect("write locally dirty bytes");
+    let dirty_snapshot = vfs.sync_safety_snapshot();
+    assert_ne!(dirty_snapshot.state, VfsSyncSafetyState::Safe);
+    assert!(
+        dirty_snapshot
+            .reasons
+            .contains(&VfsSyncSafetyReason::PendingWrites)
+    );
+
+    let persisted_tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_persisted_rt, persisted_vfs, persisted_meta) =
+        make_unstarted_test_vfs(&persisted_tmp, "sync-safety-persisted-only");
+    let persisted_attr = persisted_meta
+        .create_file(ROOT_INO, b"persisted.txt", 0, 0, 0o644)
+        .expect("create persisted-only file");
+    assert!(
+        !persisted_vfs
+            .sync_safety_snapshot()
+            .reasons
+            .contains(&VfsSyncSafetyReason::PendingWrites)
+    );
+    persisted_vfs.install_persisted_pending_local_dirty_slice(
+        persisted_attr.ino,
+        local_dirty::PersistedPendingLocalDirtySliceSpec {
+            block_index: 1,
+            file_offset: 1024,
+            len: 512,
+            seq: 9,
+            object_id: 9001,
+            initial_object_offset: 0,
+        },
+    );
+    let persisted_snapshot = persisted_vfs.sync_safety_snapshot();
+    assert_ne!(persisted_snapshot.state, VfsSyncSafetyState::Safe);
+    assert!(
+        persisted_snapshot
+            .reasons
+            .contains(&VfsSyncSafetyReason::PendingWrites)
+    );
+
+    rt.block_on(vfs.release_fh(writer)).expect("release writer");
+}
+
+#[test]
+fn sync_safety_inode_write_owns_activity_while_waiting_for_session() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sync-safety-inode-write");
+    let attr = meta
+        .create_file(ROOT_INO, b"inode-write.txt", 0, 0, 0o644)
+        .expect("create clean inode");
+    rt.block_on(async {
+        let session = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Write)
+            .await;
+        let generation = vfs
+            .state
+            .sync_safety_activity
+            .generation
+            .load(Ordering::Acquire);
+        let mut write = Box::pin(vfs.write(attr.ino, 0, b"pending"));
+        assert!(futures::poll!(write.as_mut()).is_pending());
+        assert_eq!(vfs.file_session_stats().queued_ops, 1);
+        assert!(vfs.state.namespace.dirty_attrs.lock().is_empty());
+        assert_eq!(vfs.ingress_stats().dirty_mem_bytes, 0);
+        assert_eq!(
+            vfs.state
+                .sync_safety_activity
+                .active
+                .load(Ordering::Acquire),
+            1,
+            "inode write must retain its activity lease before acquiring the session"
+        );
+        drop(write);
+        assert_eq!(
+            vfs.state
+                .sync_safety_activity
+                .active
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            vfs.state
+                .sync_safety_activity
+                .generation
+                .load(Ordering::Acquire)
+                > generation
+        );
+        drop(session);
+    });
+}
+
+#[test]
+fn sync_safety_writer_stack_materialization_owns_activity() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sync-safety-materialize");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(ROOT_INO, b"materialize.bin", 0, 0, 0o644)
+            .expect("create file");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        vfs.write_fh(fh, attr.ino, 0, b"pending")
+            .await
+            .expect("write into writer stack");
+        let generation = vfs
+            .state
+            .sync_safety_activity
+            .generation
+            .load(Ordering::Acquire);
+        let materialized = vfs
+            .materialize_writer_stack_for_inode(attr.ino)
+            .await
+            .expect("materialize writer stack");
+        assert!(materialized > 0, "write must leave writer-stack bytes");
+        assert!(
+            vfs.state
+                .sync_safety_activity
+                .generation
+                .load(Ordering::Acquire)
+                > generation,
+            "materialization hides dirty bytes between counters and must hold a lease"
+        );
+        vfs.release_fh(fh).await.expect("release writer");
+    });
+}
+
+#[test]
+fn sync_safety_snapshot_reports_upload_publication_and_active_handoffs() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sync-safety-downstream-owners");
+
+    vfs.state
+        .upload
+        .pending_epoch_finalizations
+        .lock()
+        .insert((ROOT_INO, 1));
+    let (result_tx, _completion_result) = tokio::sync::oneshot::channel();
+    vfs.state
+        .upload
+        .upload_completion_batch
+        .try_lock()
+        .expect("lock completion batch")
+        .pending
+        .push(UploadCompletionBatchEntry {
+            ino: ROOT_INO,
+            expected_epoch: 1,
+            object_id: 9002,
+            result_tx,
+        });
+    vfs.local_payload_backend()
+        .put(9003, b"staged upload", false)
+        .expect("stage dirty payload alongside completion work");
+    assert_ne!(vfs.local_payload_backend.dirty_object_count(), 0);
+
+    let downstream_snapshot = vfs.sync_safety_snapshot();
+    assert_eq!(
+        downstream_snapshot
+            .reasons
+            .iter()
+            .filter(|reason| **reason == VfsSyncSafetyReason::Uploading)
+            .count(),
+        1,
+        "multiple upload owners must report one reason"
+    );
+    assert_ne!(downstream_snapshot.state, VfsSyncSafetyState::Safe);
+    assert!(
+        downstream_snapshot
+            .reasons
+            .contains(&VfsSyncSafetyReason::Uploading)
+    );
+    assert!(
+        downstream_snapshot
+            .reasons
+            .contains(&VfsSyncSafetyReason::PublishingMetadata)
+    );
+
+    let (_, _, publication_activity) = vfs
+        .pop_epoch_finalization_for_sync_safety()
+        .expect("queued epoch finalization has a sync-safety lease");
+    assert!(
+        vfs.state
+            .upload
+            .pending_epoch_finalizations
+            .lock()
+            .is_empty()
+    );
+    let dequeued_snapshot = vfs.sync_safety_snapshot();
+    assert_ne!(dequeued_snapshot.state, VfsSyncSafetyState::Safe);
+    assert!(
+        dequeued_snapshot
+            .reasons
+            .contains(&VfsSyncSafetyReason::PublishingMetadata)
+    );
+
+    drop(publication_activity);
+    let settled_snapshot = vfs.sync_safety_snapshot();
+    assert!(
+        !settled_snapshot
+            .reasons
+            .contains(&VfsSyncSafetyReason::PublishingMetadata)
+    );
+
+    let _activity = vfs.state.sync_safety_activity.begin_uploading();
+    let handoff_snapshot = vfs.sync_safety_snapshot();
+    assert_ne!(handoff_snapshot.state, VfsSyncSafetyState::Safe);
+    assert!(
+        handoff_snapshot
+            .reasons
+            .contains(&VfsSyncSafetyReason::Uploading)
+    );
+    assert!(
+        handoff_snapshot
+            .reasons
+            .contains(&VfsSyncSafetyReason::StatusUnavailable)
+    );
+}
+
 fn lock_order_test_namespace() -> NamespaceState {
     NamespaceState::new(8, 4096, 8, 4096, 8, 4096)
 }

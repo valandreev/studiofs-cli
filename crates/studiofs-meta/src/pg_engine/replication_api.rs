@@ -1,6 +1,6 @@
 use super::{MetadataSyncSource, PgMetaEngine, sql};
 use crate::engine::{
-    MetaError, MetaReplication, MetaResult, MetadataAuthorityStatus,
+    LocalOutboundAckSnapshot, MetaError, MetaReplication, MetaResult, MetadataAuthorityStatus,
     MetadataCheckpointFreshnessDiagnostics, MetadataCoherenceProgress,
     MetadataInvalidationDiagnostics, MetadataReplicationBacklog, PgSyncDiagnostics,
     PgSyncLifecycle, PgSyncStatus,
@@ -160,6 +160,17 @@ impl MetaReplication for PgMetaEngine {
             pending_ops,
             inflight_ops,
         }
+    }
+
+    fn local_outbound_ack_snapshot(&self) -> Option<LocalOutboundAckSnapshot> {
+        let (_position_guard, pending_state) = self.lock_local_position_and_pending_state().ok()?;
+        let (local_event_end, durable_cursor) = self.local.local_outbound_ack_positions().ok()?;
+        Some(LocalOutboundAckSnapshot {
+            local_event_end,
+            durable_cursor,
+            pending_ops: pending_state.ops,
+            inflight_ops: self.inflight_replication_ops.load(Ordering::SeqCst),
+        })
     }
 
     fn metadata_authority_status(&self) -> MetadataAuthorityStatus {

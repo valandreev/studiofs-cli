@@ -124,6 +124,7 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             synchronization: DiagnosticsSynchronizationSnapshot {
                 state: self.vfs.synchronization_state_snapshot(),
             },
+            sync_safety: self.vfs.sync_safety_snapshot(),
             coherence: health.coherence,
         }
     }
