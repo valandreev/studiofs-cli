@@ -15,7 +15,7 @@ The blue/yellow tray flag must mean this mount's accepted changes have reached r
 - [x] (2026-10-18) Six focused metadata tests passed for queue-independent acknowledgement, peer scope, local-only retirement, empty base, reopen and forwarding.
 - [x] (2026-10-18) Build product and runner, then pass the registered two-client Windows WinFSP acceptance with PostgreSQL/S3 outages and retained evidence; cleanup passed.
 - [x] (2026-10-18) Run focused Rust validation, scoped Clippy, formatting and whitespace checks; inspect the implementation and independent handoff review.
-- [ ] Commit/push and update Linear with exact evidence and limitations.
+- [x] (2026-10-18) Implementation committed as fe0ed05b and pushed; Linear updated with exact evidence and limitations and moved to In Review.
 
 ## Surprises & Discoveries
 
@@ -35,7 +35,7 @@ Additional handoff review found that epoch finalization removes its queue ticket
 
 ## Outcomes & Retrospective
 
-The shared proof, diagnostics transport, tray behavior and user documentation are implemented. All 37 focused tests, Windows mounted acceptance, scoped Clippy, formatting and whitespace checks passed. Git/Linear delivery is the remaining step.
+The shared proof, diagnostics transport, tray behavior and user documentation are implemented. All 37 focused tests, Windows mounted acceptance, scoped Clippy, formatting and whitespace checks passed. Implementation commit fe0ed05b is pushed and Linear SFS-866 is In Review with validation evidence. No PR was created.
 
 The Windows mounted acceptance now passed with rebuilt product/runner binaries. During the S3/PG pause the authoritative state was unknown with known publication/dirty/metadata blockers (mapped red by the tray). With S3 restored and PG still paused, it was syncing with metadata acknowledgement pending and no upload blocker. After PG recovery, peer content hashes matched, namespace convergence passed and repeated observations were safe. macOS/Linux native integration and full suites were not run.
 
