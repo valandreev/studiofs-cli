@@ -1883,6 +1883,8 @@ mod tests {
         }
         store.put(93, b"removed").unwrap();
         let log_path = temp.path().join("removal.log");
+        // A second live dispatch prevents tracing's single-subscriber cache from using another thread's default.
+        let _no_subscriber = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let subscriber = tracing_subscriber::fmt()
             .without_time()
             .with_ansi(false)
@@ -1890,8 +1892,16 @@ mod tests {
             .with_writer(Arc::new(File::create(&log_path).unwrap()))
             .finish();
 
+        let dispatch = tracing::Dispatch::new(subscriber);
+        // Register the shared warning from a thread without the capturing subscriber first.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| assert!(store.remove(90).is_err()))
+                .join()
+                .unwrap();
+        });
         let result =
-            tracing::subscriber::with_default(subscriber, || store.remove_batch(&[90, 91, 92, 93]));
+            tracing::dispatcher::with_default(&dispatch, || store.remove_batch(&[90, 91, 92, 93]));
         assert!(matches!(result, Err(FilePayloadStoreError::Io(_))));
         assert!(!layout.payload_object_path(93).exists());
         let log = std::fs::read_to_string(log_path).unwrap();
