@@ -48,6 +48,14 @@ changes in the background.
 
 
 
+## User Guide
+
+- [Українська — посібник користувача](docs/user-guide/uk/README.md)
+- [English — user guide](docs/user-guide/en/README.md)
+
+Chapters 01–08 are available; chapters 09–30 are planned placeholders.
+The English translation awaits separate editorial review.
+
 ## What Problem Does StudioFS Solve?
 
 In a classic remote production pipeline, artists often need to download hundreds
@@ -332,7 +340,16 @@ Useful test/runtime variables include:
 
 ## Documentation
 
-Project docs live in [docs/](docs/):
+### User documentation
+
+The practical user manual lives separately in [docs/user-guide/](docs/user-guide/README.md):
+[Українська](docs/user-guide/uk/README.md) · [English](docs/user-guide/en/README.md).
+
+### Technical contracts and developer reference
+
+The existing materials below describe implementation contracts, architecture,
+configuration reference, and development workflows. They are separate from the
+user manual; their existing paths remain stable:
 
 - [docs/roadmap.md](docs/roadmap.md) - future development plans
 - [docs/examples.md](docs/examples.md) - usage variants and examples
