@@ -336,8 +336,6 @@ fn remove_orphan_file(
         }
     };
 
-    *orphan_blocks_pending_gc += removed_ids.len();
-
     match meta.remove_attr(ino) {
         Ok(()) | Err(MetaError::InodeNotFound(_)) => *removed_orphans += 1,
         Err(err) => {
@@ -346,6 +344,7 @@ fn remove_orphan_file(
             )));
         }
     }
+    *orphan_blocks_pending_gc += removed_ids.len();
 
     Ok(())
 }
@@ -664,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_orphan_file_queues_payloads_and_updates_counters_once() {
+    fn remove_orphan_file_queues_payloads_once_and_preserves_failed_counters() {
         let TestEngine { engine, _dir } = temp_engine();
         let engine = std::sync::Arc::new(engine);
         let file = engine

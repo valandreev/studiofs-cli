@@ -862,6 +862,9 @@ the field remain decodable.
 - `fsck` orphan-file repair removes the regular-file graph and queues its unique
   object IDs for GC in one local transaction; marker-write failure preserves the
   graph for retry.
+  This applies to `remove_regular_file_graph` calls with `Some(timestamp)`.
+  Graph-only (`None`) callers in VFS cleanup and undo recovery still schedule GC
+  separately and retain a crash window between graph removal and marker writes.
 - `recover_undo_logs()` is the primary replay entry point:
   - heals dangling pending-create dentries
   - replays deferred-delete cleanup (payload objects/attrs/deferred records)
