@@ -330,6 +330,15 @@ fn write_mount_record_with_cache_and_instance(
     write_json_file_atomically(&path, &record)
 }
 
+/// Backoff before each retry of a replacement that Windows rejected because
+/// another process still holds the destination open.
+const FILE_REPLACE_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(10),
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+];
+
 pub(super) fn write_json_file_atomically(
     path: &Path,
     value: &(impl Serialize + ?Sized),
@@ -342,32 +351,33 @@ pub(super) fn write_json_file_atomically(
         .with_context(|| format!("create temporary file near '{}'", path.display()))?;
     {
         let mut writer = io::BufWriter::new(temporary.as_file_mut());
-        serde_json::to_writer_pretty(&mut writer, value)?;
-        writer.flush()?;
+        serde_json::to_writer_pretty(&mut writer, value)
+            .with_context(|| format!("serialize temporary file for '{}'", path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("flush temporary file for '{}'", path.display()))?;
     }
-    temporary.as_file().sync_all()?;
-    let mut temporary = Some(temporary);
-    for attempt in 0..5 {
-        let file = temporary
-            .take()
-            .ok_or_else(|| anyhow!("temporary replacement file was lost"))?;
-        match file.persist(path) {
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("sync temporary file for '{}'", path.display()))?;
+    let mut retry_delays = FILE_REPLACE_RETRY_DELAYS.iter();
+    loop {
+        match temporary.persist(path) {
             Ok(_) => return Ok(()),
-            Err(error) if attempt + 1 < 5 && is_retryable_file_replace_error(&error.error) => {
-                temporary = Some(error.file);
-                let delay_ms = [10, 25, 50, 100][attempt];
-                std::thread::sleep(Duration::from_millis(delay_ms));
-            }
             Err(error) => {
-                return Err(anyhow!(
-                    "replace file '{}': {}",
-                    path.display(),
-                    error.error
-                ));
+                let delay = retry_delays
+                    .next()
+                    .filter(|_| is_retryable_file_replace_error(&error.error));
+                let Some(delay) = delay else {
+                    return Err(error.error)
+                        .with_context(|| format!("replace file '{}'", path.display()));
+                };
+                temporary = error.file;
+                std::thread::sleep(*delay);
             }
         }
     }
-    Err(anyhow!("file replacement attempts exhausted"))
 }
 
 fn is_retryable_file_replace_error(error: &io::Error) -> bool {

@@ -122,6 +122,12 @@ pub enum DumpLoadError {
         .tables.join(", ")
     )]
     TargetHasAccountingState { tables: Vec<&'static str> },
+    #[error("write dump output '{}': {source:#}", .path.display())]
+    WriteOutput {
+        path: PathBuf,
+        #[source]
+        source: anyhow::Error,
+    },
     #[error("{0}")]
     Message(String),
 }
@@ -359,18 +365,26 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> DumpLoadResult<()> {
     let dump = load_remote_dump(&pg.url, pg.volume_id)?;
     validate_dump(&dump)?;
 
-    if let Some(parent) = output.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    super::utils::write_json_file_atomically(output, &dump)
-        .map_err(|err| DumpLoadError::Message(format!("{err:#}")))?;
+    write_dump_output(output, &dump)?;
 
     println!("✓ Dump created from PostgreSQL");
     println!("  Volume: {}", dump.volume.name);
     println!("  Output: {}", output.display());
     Ok(())
+}
+
+fn write_dump_output(output: &Path, dump: &MetadataDump) -> DumpLoadResult<()> {
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    super::utils::write_json_file_atomically(output, dump).map_err(|source| {
+        DumpLoadError::WriteOutput {
+            path: output.to_path_buf(),
+            source,
+        }
+    })
 }
 
 fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64> {
@@ -789,12 +803,68 @@ mod tests {
         std::fs::write(&output, serde_json::to_vec_pretty(&previous).unwrap()).unwrap();
         let dump = test_dump();
 
-        super::super::utils::write_json_file_atomically(&output, &dump).unwrap();
+        write_dump_output(&output, &dump).unwrap();
 
         let bytes = std::fs::read(&output).unwrap();
         let restored: MetadataDump = serde_json::from_slice(&bytes).unwrap();
         validate_dump(&restored).unwrap();
         assert_eq!(bytes, serde_json::to_vec_pretty(&dump).unwrap());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn dump_output_serialization_failure_preserves_previous_backup() {
+        struct FailingSerialize;
+        impl Serialize for FailingSerialize {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("injected serialization failure"))
+            }
+        }
+        let directory = studiofs_test_support::workspace_target_tempdir("sfs-870-");
+        let output = directory.path().join("dump.json");
+        let previous = serde_json::to_vec_pretty(&test_dump()).unwrap();
+        std::fs::write(&output, &previous).unwrap();
+
+        let error = super::super::utils::write_json_file_atomically(&output, &FailingSerialize)
+            .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("serialize temporary file for"),
+            "{message}"
+        );
+        assert!(
+            message.contains("injected serialization failure"),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), previous);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn dump_output_replace_failure_preserves_destination_and_reports_path() {
+        let directory = studiofs_test_support::workspace_target_tempdir("sfs-870-");
+        // A non-empty directory at the destination makes the final rename fail
+        // after the temporary file was fully written and synced.
+        let output = directory.path().join("dump.json");
+        std::fs::create_dir(&output).unwrap();
+        let previous = serde_json::to_vec_pretty(&test_dump()).unwrap();
+        std::fs::write(output.join("previous.json"), &previous).unwrap();
+
+        let error = write_dump_output(&output, &test_dump()).unwrap_err();
+
+        assert!(
+            matches!(&error, DumpLoadError::WriteOutput { path, .. } if path == &output),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("replace file"), "{message}");
+        assert!(message.contains(&output.display().to_string()), "{message}");
+        assert_eq!(
+            std::fs::read(output.join("previous.json")).unwrap(),
+            previous
+        );
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
