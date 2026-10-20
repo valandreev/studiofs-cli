@@ -80,6 +80,7 @@
 //!
 //! ```rust
 //! use studiofs_vfs::{LockTier, OrderedMutex};
+//! # let _: Option<studiofs_vfs::LockOrderGuard> = None;
 //!
 //! let namespace = OrderedMutex::new((), LockTier::Namespace);
 //! let _ns = namespace.lock();

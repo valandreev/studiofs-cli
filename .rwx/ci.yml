@@ -122,6 +122,7 @@ tasks:
       cargo test -p studiofs-vfs --test vfs_test mixed_workload_concurrent_readers_during_pending_upload_no_errors -- --exact --nocapture
       cargo test -p studiofs-vfs --test vfs_test handle_aware_read_policy_keeps_sequential_and_random_streams_separate -- --exact --nocapture
       cargo test -p studiofs-vfs --test vfs_test file_session_flush_ordering_is_deterministic -- --exact --nocapture
+      cargo test -p studiofs-vfs --doc lock_order
     env:
       RUSTFLAGS: "-Dwarnings"
 

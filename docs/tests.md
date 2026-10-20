@@ -74,6 +74,21 @@ The uploader retains deletion markers for the VFS lifetime and rejects late
 admission of work for an already-deleted inode. No mount or remote service is
 required for these checks.
 
+### Lock-order guard doctests
+
+The Ubuntu `cargo-test-local-first-offline-vfs-fast` task in `.rwx/ci.yml`
+runs the focused `LockOrderGuard` doctests:
+
+```powershell
+cargo test -p studiofs-vfs --doc lock_order
+```
+
+Expect three tests: one passing usage example that checks the public guard
+export and two `compile_fail` checks for `!Send` and `!Sync`. Verify this count
+when moving or renaming the module; a filter matching no tests still exits
+successfully. `--all-targets` excludes doctests. Rocky Linux and the manual
+macOS/Windows jobs do not run this doctest command.
+
 ### PostgreSQL CI gate
 
 The automatic Linux gate in `.rwx/ci.yml` starts an ephemeral `postgres:18-alpine`
