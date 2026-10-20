@@ -103,7 +103,7 @@ impl StudioVfs {
         let removed_ids = if metadata_already_removed {
             Vec::new()
         } else {
-            meta.remove_regular_file_graph(ino)?
+            meta.remove_regular_file_graph(ino, None)?
         };
         let cleanup_ids = if !removed_ids.is_empty() {
             removed_ids
@@ -153,7 +153,7 @@ impl StudioVfs {
                 .iter()
                 .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
 
-            let removed_ids = match engine.remove_regular_file_graph(ino) {
+            let removed_ids = match engine.remove_regular_file_graph(ino, None) {
                 Ok(ids) => ids,
                 Err(MetaError::InodeNotFound(_)) => Vec::new(),
                 Err(err) => return Err(err),

@@ -815,7 +815,7 @@ fn restore_pending_state_survives_flushed_cursor_persist_failure() {
         let mut state = pg.pending_state.lock().expect("pending state");
         PgMetaEngine::clear_pending_state(&mut state);
         pg.local
-            .remove_regular_file_graph(file.ino)
+            .remove_regular_file_graph(file.ino, None)
             .expect("remove published file graph");
         state.event_start = Some(setup_end);
     }
@@ -844,7 +844,7 @@ fn removing_regular_file_graph_does_not_create_remote_backlog() {
         .create_file(ROOT_INO, b"draft-graph-remove.txt", 0, 0, 0o644)
         .expect("create unpublished file");
 
-    pg.remove_regular_file_graph(file.ino)
+    pg.remove_regular_file_graph(file.ino, None)
         .expect("remove unpublished file graph");
 
     let state = pg.pending_state.lock().expect("pending_state");
@@ -866,7 +866,7 @@ fn removing_published_regular_file_graph_does_not_remain_local_only() {
         PgMetaEngine::clear_pending_state(&mut state);
     }
 
-    pg.remove_regular_file_graph(file.ino)
+    pg.remove_regular_file_graph(file.ino, None)
         .expect("remove published file graph");
 
     let graph_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("graph end");

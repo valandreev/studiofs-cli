@@ -2373,7 +2373,7 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
     );
 
     // 2) Simulate crash window by "losing" metadata refs while object remains in S3.
-    let removed_ids = vfs.meta().remove_regular_file_graph(ino).unwrap();
+    let removed_ids = vfs.meta().remove_regular_file_graph(ino, None).unwrap();
     assert!(
         removed_ids.contains(&object_id),
         "remove_regular_file_graph should drop the uploaded object reference"

@@ -277,9 +277,13 @@ impl MetaPayloadObjects for PgMetaEngine {
         self.local.lookup_regular_file_slices(ino, offset, length)
     }
 
-    fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+    fn remove_regular_file_graph(
+        &self,
+        ino: Ino,
+        deletion_timestamp: Option<i64>,
+    ) -> MetaResult<Vec<u64>> {
         self.mutate_with_hint(
-            |local| local.remove_regular_file_graph(ino),
+            |local| local.remove_regular_file_graph(ino, deletion_timestamp),
             |_| PendingMutationHint::Unknown,
         )
     }

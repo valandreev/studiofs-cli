@@ -724,6 +724,124 @@ fn acl_tombstone_removal_error_rolls_back_rule_update() {
     );
 }
 
+fn seed_removable_file_graph(engine: &RedbMetaEngine) -> Ino {
+    let file = engine
+        .create_file(ROOT_INO, b"gc-atomicity", 1000, 1000, 0o644)
+        .unwrap();
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(41, 4096))
+        .unwrap();
+    engine
+        .stage_payload_slice(file.ino, 1, &PayloadRef::new_partial(42, 4096))
+        .unwrap();
+    let mut base = RegularFileChunkState::default();
+    for (slice_id, object_id) in [(0, 41), (1, 43)] {
+        base.slices.insert(
+            SliceId(slice_id),
+            SliceRecord {
+                slice_id: SliceId(slice_id),
+                order: SliceOrder(slice_id),
+                range: SliceRange::new(slice_id as u32 * 4096, (slice_id as u32 + 1) * 4096)
+                    .unwrap(),
+                payload: Some(PayloadRef::new_partial(object_id, 4096)),
+                payload_state: PayloadRefState::Published,
+            },
+        );
+    }
+    base.refresh_fragmentation_metrics();
+    let txn = engine.begin_write_txn().unwrap();
+    let key = encode_regular_file_chunk_key(file.ino, ChunkId(0));
+    let encoded = encode(&base).unwrap();
+    txn.open_table(REGULAR_FILE_BASE_TABLE)
+        .unwrap()
+        .insert(key.as_slice(), encoded.as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+    file.ino
+}
+
+#[test]
+fn remove_regular_file_graph_queues_all_object_ids_with_the_graph_removal() {
+    let engine = temp_engine();
+    let ino = seed_removable_file_graph(&engine);
+
+    assert_eq!(
+        engine.remove_regular_file_graph(ino, Some(100)).unwrap(),
+        vec![41, 42, 43]
+    );
+
+    assert_eq!(
+        engine.get_pending_deletions().unwrap(),
+        vec![(41, 100), (42, 100), (43, 100)]
+    );
+    assert!(engine.get_referenced_object_ids().unwrap().is_empty());
+}
+
+#[test]
+fn remove_regular_file_graph_marker_failure_rolls_back_and_retry_queues_every_object() {
+    let backend = RemoveFaultBackend::default();
+    let engine = removal_fault_engine(&backend);
+    engine.init_root(1000, 1000).unwrap();
+    let ino = seed_removable_file_graph(&engine);
+
+    // An existing branch ensures queueing a lower object ID descends through
+    // this page, where the one-shot corruption is injected during marker insert.
+    let existing: Vec<_> = (10_000..11_100).map(|id| (id, 17)).collect();
+    engine.add_pending_deletions(&existing).unwrap();
+    let read = engine.begin_read_txn().unwrap();
+    assert!(
+        read.open_table(PENDING_DELETIONS_TABLE)
+            .unwrap()
+            .get(10_000)
+            .unwrap()
+            .is_some()
+    );
+    drop(read);
+    let branch = backend.last_branch_read.load(Ordering::SeqCst);
+    assert_ne!(
+        branch, 0,
+        "fixture must have a pending-deletions branch page"
+    );
+
+    let event_seq = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    backend.corrupt_read_at.store(branch, Ordering::SeqCst);
+    let error = engine
+        .remove_regular_file_graph(ino, Some(99))
+        .expect_err("marker insertion failure must abort graph removal");
+
+    assert_eq!(backend.corrupt_read_at.load(Ordering::SeqCst), u64::MAX);
+    assert!(
+        matches!(&error, MetaError::Storage(message) if message.contains("has order greater than the maximum")),
+        "{error:?}"
+    );
+    assert_eq!(
+        engine.get_regular_file_overlay_object_ids(ino).unwrap(),
+        vec![41, 42]
+    );
+    assert_eq!(
+        engine.get_referenced_object_ids().unwrap(),
+        [41, 42, 43].into_iter().collect()
+    );
+    assert_eq!(engine.get_pending_deletions().unwrap(), existing);
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), event_seq);
+
+    assert_eq!(
+        engine.remove_regular_file_graph(ino, Some(99)).unwrap(),
+        vec![41, 42, 43]
+    );
+    let mut expected_pending = existing;
+    expected_pending.extend([(41, 99), (42, 99), (43, 99)]);
+    expected_pending.sort_unstable();
+    assert_eq!(engine.get_pending_deletions().unwrap(), expected_pending);
+    assert!(engine.get_referenced_object_ids().unwrap().is_empty());
+    assert!(
+        engine
+            .get_regular_file_overlay_object_ids(ino)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn removal_fault_corrupts_only_first_child_order_once() {
     let backend = RemoveFaultBackend::default();

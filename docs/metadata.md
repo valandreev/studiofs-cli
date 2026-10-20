@@ -859,6 +859,9 @@ the field remain decodable.
   before mutation and clear it on completion.
 - Open-unlink uses atomic metadata mutation (`unlink_open_handle`) and persists
   deferred-delete intent in the same transaction.
+- `fsck` orphan-file repair removes the regular-file graph and queues its unique
+  object IDs for GC in one local transaction; marker-write failure preserves the
+  graph for retry.
 - `recover_undo_logs()` is the primary replay entry point:
   - heals dangling pending-create dentries
   - replays deferred-delete cleanup (payload objects/attrs/deferred records)

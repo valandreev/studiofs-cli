@@ -106,9 +106,13 @@ impl MetaPayloadObjects for RedbMetaEngine {
         Ok(merge_adjacent_spans(spans))
     }
 
-    fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+    fn remove_regular_file_graph(
+        &self,
+        ino: Ino,
+        deletion_timestamp: Option<i64>,
+    ) -> MetaResult<Vec<u64>> {
         let txn = self.begin_write_txn()?;
-        let removed_ids;
+        let removed_ids: Vec<u64>;
         {
             let mut removed_object_ids = std::collections::BTreeSet::new();
             let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
@@ -138,6 +142,10 @@ impl MetaPayloadObjects for RedbMetaEngine {
                 &txn,
                 &crate::events::MetaEvent::RemoveRegularFileGraph { ino },
             )?;
+        }
+        if let Some(timestamp) = deletion_timestamp {
+            fs_ops::NamespaceDeleteTxn::new(&txn)
+                .queue_pending_deletions_in_txn(&removed_ids, timestamp)?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
