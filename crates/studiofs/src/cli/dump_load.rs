@@ -365,7 +365,7 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> DumpLoadResult<()> {
         std::fs::create_dir_all(parent)?;
     }
     super::utils::write_json_file_atomically(output, &dump)
-        .map_err(|err| DumpLoadError::Message(err.to_string()))?;
+        .map_err(|err| DumpLoadError::Message(format!("{err:#}")))?;
 
     println!("✓ Dump created from PostgreSQL");
     println!("  Volume: {}", dump.volume.name);

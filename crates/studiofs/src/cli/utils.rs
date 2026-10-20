@@ -340,8 +340,11 @@ pub(super) fn write_json_file_atomically(
         .unwrap_or_else(|| Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("create temporary file near '{}'", path.display()))?;
-    serde_json::to_writer_pretty(temporary.as_file_mut(), value)?;
-    temporary.as_file_mut().flush()?;
+    {
+        let mut writer = io::BufWriter::new(temporary.as_file_mut());
+        serde_json::to_writer_pretty(&mut writer, value)?;
+        writer.flush()?;
+    }
     temporary.as_file().sync_all()?;
     let mut temporary = Some(temporary);
     for attempt in 0..5 {
