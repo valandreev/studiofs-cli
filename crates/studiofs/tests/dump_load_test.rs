@@ -253,6 +253,20 @@ async fn snapshot_v2_state(pg_dsn: &str, name: &str) -> (i64, i64, i64, Option<S
     (row.get(0), row.get(1), row.get(2), row.get(3))
 }
 
+async fn load_replacement_state(
+    client: &tokio_postgres::Client,
+    volume_id: i64,
+) -> (String, i32, i64, i64, i64) {
+    let row = client
+        .query_one(
+            "SELECT v.name, v.block_size, ms.version, (SELECT value FROM counters WHERE vol = v.vol AND name = 'sfs868-sentinel'), (SELECT count(*) FROM event_log WHERE vol = v.vol AND event_type = 'sfs868-sentinel') FROM volumes v JOIN metadata_state ms ON ms.vol = v.vol WHERE v.vol = $1",
+            &[&volume_id],
+        )
+        .await
+        .expect("read load replacement sentinel state");
+    (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
+}
+
 fn single_object_slice_graph(
     payload: &PayloadRef,
 ) -> Result<Vec<(ChunkId, Vec<SliceRecord>)>, MetaError> {
@@ -292,63 +306,62 @@ fn single_object_slice_graph(
     Ok(chunks.into_iter().collect())
 }
 
-async fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
+async fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) -> u64 {
     let db_path = default_meta_dir(home, disk_name).join(format!("{disk_name}.db"));
-    {
-        let meta = open_meta_engine_with_options(
-            &db_path,
-            MetaOpenOptions {
-                background_poll: false,
-                ..Default::default()
-            },
-        )
-        .expect("open meta engine");
-        let format_info = meta.get_format_info().expect("get format info");
+    let meta = open_meta_engine_with_options(
+        &db_path,
+        MetaOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open meta engine");
+    let format_info = meta.get_format_info().expect("get format info");
 
-        let file = meta
-            .create_file(ROOT_INO, b"payload.bin", 0, 0, 0o644)
-            .expect("create file");
-        let object_id = meta.next_object_id().expect("next object ID");
-        let block = PayloadRef::new_partial(object_id, payload.len() as u32);
-        let mut attr = meta.get_attr(file.ino).expect("get attr");
-        attr.size = payload.len() as u64;
-        meta.set_attr(&attr).expect("set attr");
-        let expected_epoch = attr.content_epoch;
-        meta.flush_regular_file_overlay_slices(
+    let file = meta
+        .create_file(ROOT_INO, b"payload.bin", 0, 0, 0o644)
+        .expect("create file");
+    let object_id = meta.next_object_id().expect("next object ID");
+    let block = PayloadRef::new_partial(object_id, payload.len() as u32);
+    let mut attr = meta.get_attr(file.ino).expect("get attr");
+    attr.size = payload.len() as u64;
+    meta.set_attr(&attr).expect("set attr");
+    let expected_epoch = attr.content_epoch;
+    meta.flush_regular_file_overlay_slices(
+        file.ino,
+        single_object_slice_graph(&block)
+            .expect("slice graph")
+            .as_slice(),
+    )
+    .expect("flush slice graph");
+    assert!(
+        meta.mark_regular_file_overlay_object_uploaded_if_matches(
             file.ino,
-            single_object_slice_graph(&block)
-                .expect("slice graph")
-                .as_slice(),
+            expected_epoch,
+            object_id
         )
-        .expect("flush slice graph");
-        assert!(
-            meta.mark_regular_file_overlay_object_uploaded_if_matches(
-                file.ino,
-                expected_epoch,
-                object_id
-            )
-            .expect("mark uploaded slice object")
-        );
-        assert!(
-            meta.publish_regular_file_overlay_to_base_if_matches(file.ino, expected_epoch)
-                .expect("publish slice graph")
-        );
+        .expect("mark uploaded slice object")
+    );
+    assert!(
+        meta.publish_regular_file_overlay_to_base_if_matches(file.ino, expected_epoch)
+            .expect("publish slice graph")
+    );
 
-        let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
-        put_fragmented_object(
-            &store,
-            &format_info.data_prefix,
-            object_id,
-            Bytes::copy_from_slice(payload),
-        )
-        .await
-        .expect("put object");
+    let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
+    put_fragmented_object(
+        &store,
+        &format_info.data_prefix,
+        object_id,
+        Bytes::copy_from_slice(payload),
+    )
+    .await
+    .expect("put object");
 
-        meta.flush_metadata().expect("flush metadata");
-        // The next step shells out to `studiofs dump`, which re-opens this same
-        // redb file. Ensure the local probe handle is dropped before that.
-        drop(meta);
-    }
+    meta.flush_metadata().expect("flush metadata");
+    // The next step shells out to `studiofs dump`, which re-opens this same
+    // redb file. Ensure the local probe handle is dropped before that.
+    drop(meta);
+    object_id
 }
 
 async fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: &[u8]) {
@@ -615,4 +628,252 @@ async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volume
         let root = meta.get_attr(ROOT_INO).expect("extra root inode");
         assert_eq!(root.ino, ROOT_INO);
     }
+}
+
+#[tokio::test]
+#[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
+async fn dump_load_rejects_replacing_uuid_with_reachability_or_upload_state() {
+    let env = load_test_env();
+    let raw_pg = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None)
+        .expect("STUDIOFS_TEST_PG_DSN is required for ignored S3/PostgreSQL tests");
+
+    let target = random_name("dump-load-reachability-target");
+    let bystander = random_name("dump-load-reachability-bystander");
+    let home = studiofs_test_support::workspace_target_tempdir("home-");
+    let dump_path = home.path().join(format!("{target}.dump.json"));
+
+    for disk in [&target, &bystander] {
+        let init = run_studiofs(
+            home.path(),
+            &[
+                "init",
+                disk,
+                "--endpoint",
+                &env.s3_endpoint,
+                "--bucket",
+                &env.s3_bucket,
+                "--access-key",
+                &env.s3_access_key,
+                "--secret-key",
+                &env.s3_secret_key,
+                "--region",
+                &env.s3_region,
+                "--meta",
+                &raw_pg,
+            ],
+        );
+        assert_ok(&init, "init volume");
+    }
+    let payload = b"older dump payload preserved by the saved dump";
+    let payload_object_id = seed_remote_file(home.path(), &target, payload).await;
+
+    let dump = run_studiofs(
+        home.path(),
+        &[
+            "dump",
+            &target,
+            "--path-to-dump",
+            dump_path.to_str().unwrap(),
+        ],
+    );
+    assert_ok(&dump, "dump target");
+
+    let pg_dsn = resolved_pg_dsn(&raw_pg).await;
+    let (client, connection) = tokio_postgres::connect(&pg_dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect postgres");
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let target_volume: i64 = client
+        .query_one("SELECT vol FROM volumes WHERE name = $1", &[&target])
+        .await
+        .expect("find target volume")
+        .get(0);
+    let bystander_volume: i64 = client
+        .query_one("SELECT vol FROM volumes WHERE name = $1", &[&bystander])
+        .await
+        .expect("find bystander volume")
+        .get(0);
+    let dump_version: i64 = client
+        .query_one(
+            "SELECT version FROM metadata_state WHERE vol = $1",
+            &[&target_volume],
+        )
+        .await
+        .expect("read dump version")
+        .get(0);
+
+    // Isolate each guard condition even if setup starts producing accounting
+    // state as part of payload publication.
+    for table in [
+        "snapshot_current_references",
+        "snapshot_object_reachability",
+        "snapshot_reachability_batches",
+        "snapshot_reachability_bootstrap",
+        "snapshot_payload_upload_objects",
+    ] {
+        client
+            .execute(
+                &format!("DELETE FROM {table} WHERE vol = $1"),
+                &[&target_volume],
+            )
+            .await
+            .expect("clear target accounting");
+    }
+
+    // State for another volume must not prevent replacing this UUID.
+    client
+        .execute(
+            "INSERT INTO snapshot_reachability_batches (vol, batch_version) VALUES ($1, $2)",
+            &[&bystander_volume, &dump_version],
+        )
+        .await
+        .expect("seed bystander batch marker");
+    let scoped_load = run_studiofs(
+        home.path(),
+        &[
+            "load",
+            "--path-to-dump",
+            dump_path.to_str().unwrap(),
+            "--postgresql-adress",
+            &raw_pg,
+        ],
+    );
+    assert_ok(
+        &scoped_load,
+        "load target with bystander reachability state",
+    );
+    client
+        .execute(
+            "DELETE FROM snapshot_reachability_batches WHERE vol = $1",
+            &[&bystander_volume],
+        )
+        .await
+        .expect("clear bystander batch marker");
+
+    // Make the database state observably newer than the saved dump. A failed
+    // replacement must preserve this version, counter and event row.
+    client
+        .execute(
+            "INSERT INTO counters (vol, name, value) VALUES ($1, 'sfs868-sentinel', 868)",
+            &[&target_volume],
+        )
+        .await
+        .expect("seed replacement sentinel counter");
+    let current_name = format!("{target}-newer-name");
+    client
+        .execute(
+            "UPDATE volumes SET name = $2, block_size = 65536 WHERE vol = $1",
+            &[&target_volume, &current_name],
+        )
+        .await
+        .expect("advance current volume identity fields");
+    let current_version: i64 = client
+        .query_one(
+            "UPDATE metadata_state SET version = version + 1 WHERE vol = $1 RETURNING version",
+            &[&target_volume],
+        )
+        .await
+        .expect("advance current metadata version")
+        .get(0);
+    client
+        .execute(
+            "INSERT INTO event_log (vol, batch_version, event_type, event_payload) VALUES ($1, $2, 'sfs868-sentinel', $3)",
+            &[&target_volume, &current_version, &Vec::<u8>::new()],
+        )
+        .await
+        .expect("seed replacement sentinel event");
+    let before = load_replacement_state(&client, target_volume).await;
+    assert_eq!(before, (current_name, 65536, current_version, 868, 1));
+
+    // A rollback would reuse current_version for its next batch. Any retained
+    // accounting at that version must reject the older dump.
+    for (table, insert_sql) in [
+        (
+            "snapshot_current_references",
+            format!(
+                "INSERT INTO snapshot_current_references (vol, ino, object_id) VALUES ($1, 868, {payload_object_id})"
+            ),
+        ),
+        (
+            "snapshot_object_reachability",
+            format!(
+                "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) VALUES ($1, {payload_object_id}, {current_version})"
+            ),
+        ),
+        (
+            "snapshot_reachability_batches",
+            format!(
+                "INSERT INTO snapshot_reachability_batches (vol, batch_version) VALUES ($1, {current_version})"
+            ),
+        ),
+        (
+            "snapshot_reachability_bootstrap",
+            format!(
+                "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, {current_version})"
+            ),
+        ),
+        (
+            "snapshot_payload_upload_objects",
+            format!(
+                "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, {payload_object_id}, 'published')"
+            ),
+        ),
+    ] {
+        client
+            .execute(&insert_sql, &[&target_volume])
+            .await
+            .expect("seed target accounting");
+
+        let load = run_studiofs(
+            home.path(),
+            &[
+                "load",
+                "--path-to-dump",
+                dump_path.to_str().unwrap(),
+                "--postgresql-adress",
+                &raw_pg,
+            ],
+        );
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&load.stdout),
+            String::from_utf8_lossy(&load.stderr)
+        );
+        assert!(
+            !load.status.success(),
+            "load must reject target rows in {table}; output: {output}"
+        );
+        assert!(
+            output.contains(
+                "cannot load metadata over existing reachability or payload upload state"
+            ),
+            "load should identify the blocking reachability or upload state; output: {output}"
+        );
+        assert_eq!(
+            load_replacement_state(&client, target_volume).await,
+            before,
+            "rejected load must preserve volume identity, metadata version, counter and event row for {table}"
+        );
+        let marker_count: i64 = client
+            .query_one(
+                &format!("SELECT count(*) FROM {table} WHERE vol = $1"),
+                &[&target_volume],
+            )
+            .await
+            .expect("verify target reachability marker survived rejection")
+            .get(0);
+        assert_eq!(marker_count, 1, "rejected load must preserve {table} row");
+
+        client
+            .execute(
+                &format!("DELETE FROM {table} WHERE vol = $1"),
+                &[&target_volume],
+            )
+            .await
+            .expect("clear target accounting");
+    }
+
+    conn_task.abort();
 }

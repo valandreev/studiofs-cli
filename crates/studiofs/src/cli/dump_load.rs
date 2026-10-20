@@ -382,6 +382,10 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
             let target_vol: i64 = row
                 .try_get(0)
                 .map_err(|source| postgres_operation("decode upserted volume row", source))?;
+            // Fence new FK-backed accounting rows until the replacement commits.
+            tx.query_one("SELECT vol FROM volumes WHERE vol = $1 FOR UPDATE", &[&target_vol])
+                .await
+                .map_err(|source| postgres_operation("lock load target volume", source))?;
             let format_info_bytes =
                 rebind_postgres_volume_id(&dump.metadata_state_format_info, target_vol)?;
 
@@ -397,6 +401,26 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
             if has_snapshot_v2_state {
                 return Err(DumpLoadError::Message(
                     "cannot load metadata over existing Snapshot v2 state; remove snapshots and policy first"
+                        .to_string(),
+                ));
+            }
+
+            let has_reachability_state: bool = tx
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM snapshot_current_references WHERE vol = $1)
+                         OR EXISTS (SELECT 1 FROM snapshot_object_reachability WHERE vol = $1)
+                         OR EXISTS (SELECT 1 FROM snapshot_reachability_batches WHERE vol = $1)
+                         OR EXISTS (SELECT 1 FROM snapshot_reachability_bootstrap WHERE vol = $1)
+                         OR EXISTS (SELECT 1 FROM snapshot_payload_upload_objects WHERE vol = $1)",
+                    &[&target_vol],
+                )
+                .await
+                .map_err(|source| postgres_operation("check reachability and payload upload state", source))?
+                .try_get(0)
+                .map_err(|source| postgres_operation("decode reachability and payload upload state row", source))?;
+            if has_reachability_state {
+                return Err(DumpLoadError::Message(
+                    "cannot load metadata over existing reachability or payload upload state; restore into a clean metadata database with the backed-up payloads preserved"
                         .to_string(),
                 ));
             }

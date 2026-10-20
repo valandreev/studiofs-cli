@@ -130,6 +130,7 @@ by name in the same gate:
 - `destroy_full_removes_local_s3_and_postgres_state`
 - `dump_load_restores_volume_and_discovery_reads_data`
 - `dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes`
+- `dump_load_rejects_replacing_uuid_with_reachability_or_upload_state`
 
 For local runs, start RustFS and PostgreSQL and configure the `STUDIOFS_S3_*`
 and `STUDIOFS_TEST_PG_DSN` variables as described in
@@ -149,6 +150,7 @@ cargo test -p studiofs --test destroy_test destroy_local_only_removes_local_stat
 cargo test -p studiofs --test destroy_test destroy_full_removes_local_s3_and_postgres_state -- --ignored --exact --test-threads=1 --nocapture
 cargo test -p studiofs --test dump_load_test dump_load_restores_volume_and_discovery_reads_data -- --ignored --exact --test-threads=1 --nocapture
 cargo test -p studiofs --test dump_load_test dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes -- --ignored --exact --test-threads=1 --nocapture
+cargo test -p studiofs --test dump_load_test dump_load_rejects_replacing_uuid_with_reachability_or_upload_state -- --ignored --exact --test-threads=1 --nocapture
 ```
 
 The optional HTTPS S3 fixture is excluded because the disposable RustFS service

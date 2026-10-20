@@ -235,6 +235,13 @@ studiofs mount myvolume Y:
 | `test` | Collect a mounted write-path test report |
 | `destroy` | Permanently remove local metadata and remote data/metadata; `--local` keeps remote state |
 
+`load` refuses to overwrite a volume with Snapshot v2 state, object reachability
+accounting, or payload upload/deletion history (including completed rows).
+Restore into a clean metadata database with the corresponding S3 payloads preserved.
+Stop all clients before restoring. `destroy` permanently deletes the volume,
+including its S3 payloads; a metadata dump cannot recover a destroyed volume.
+`destroy --local` keeps remote metadata and cannot clear this rejection.
+
 Run `studiofs --help` or `studiofs <command> --help` for full usage.
 
 CLI size options such as `--cache-size` and `--read-buffer` accept `B`, `KB`,
