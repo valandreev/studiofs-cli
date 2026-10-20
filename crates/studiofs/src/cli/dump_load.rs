@@ -364,7 +364,8 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> DumpLoadResult<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(output, serde_json::to_vec_pretty(&dump)?)?;
+    super::utils::write_json_file_atomically(output, &dump)
+        .map_err(|err| DumpLoadError::Message(err.to_string()))?;
 
     println!("✓ Dump created from PostgreSQL");
     println!("  Volume: {}", dump.volume.name);
@@ -777,6 +778,24 @@ mod tests {
             counters: Vec::new(),
             event_log: Vec::new(),
         }
+    }
+
+    #[test]
+    fn dump_output_replaces_previous_backup_with_valid_dump() {
+        let directory = studiofs_test_support::workspace_target_tempdir("sfs-870-");
+        let output = directory.path().join("dump.json");
+        let mut previous = test_dump();
+        previous.volume.name = "previous".to_string();
+        std::fs::write(&output, serde_json::to_vec_pretty(&previous).unwrap()).unwrap();
+        let dump = test_dump();
+
+        super::super::utils::write_json_file_atomically(&output, &dump).unwrap();
+
+        let bytes = std::fs::read(&output).unwrap();
+        let restored: MetadataDump = serde_json::from_slice(&bytes).unwrap();
+        validate_dump(&restored).unwrap();
+        assert_eq!(bytes, serde_json::to_vec_pretty(&dump).unwrap());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     fn test_event(batch_version: i64) -> DumpEvent {
