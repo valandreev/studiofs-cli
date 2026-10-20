@@ -1748,7 +1748,17 @@ mod tests {
 
         upsert_uploaded(&index, 42, 50);
         let uploaded = index.get_entry(42).unwrap().expect("new entry");
+        assert_eq!(uploaded.object_id, 42);
+        assert_eq!(uploaded.payload_key, b"payload/42.object");
+        assert_eq!(uploaded.payload_len, 50);
+        assert_eq!(uploaded.lifecycle, LocalPayloadLifecycleState::Uploaded);
+        assert_eq!(uploaded.origin, LocalPayloadOrigin::Downloaded);
+        assert_eq!(uploaded.upload_state, LocalPayloadUploadState::None);
+        assert!(uploaded.evictable);
         let updated_stats = index.stats().unwrap();
+        assert_eq!(updated_stats.current_bytes, 69);
+        assert_eq!(updated_stats.dirty_bytes, 19);
+        assert_eq!(updated_stats.evictable_bytes, 50);
         drop(index);
 
         let reopened = open_index(&database_path);

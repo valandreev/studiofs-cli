@@ -28,7 +28,8 @@ fn check_redb_fixture(version: &str, expected_writer_marker: Option<&[u8]>) {
         .unwrap_or_else(|err| panic!("failed to copy fixture {}: {err}", fixture_path.display()));
 
     let probed = RedbMetaEngine::read_format_info_readonly(&database_path).unwrap();
-    // The 4.3 fixture preserves the original 4.1 volume identity.
+    // Every metadata fixture derives from the original 4.1 volume, so the
+    // identity is the same for each redb version.
     assert_eq!(probed.name, "redb-4.1-compat");
     assert_eq!(probed.format_version, CURRENT_FORMAT_VERSION);
 
@@ -44,7 +45,7 @@ fn check_redb_fixture(version: &str, expected_writer_marker: Option<&[u8]>) {
             settings
                 .get("redb_compatibility_fixture_writer")
                 .unwrap()
-                .unwrap()
+                .expect("fixture writer marker")
                 .value(),
             marker
         );
@@ -61,6 +62,13 @@ fn check_redb_fixture(version: &str, expected_writer_marker: Option<&[u8]>) {
     let created = engine
         .create_file(ROOT_INO, b"new_under_current_redb.txt", 1000, 1000, 0o644)
         .unwrap();
+    assert_eq!(
+        engine
+            .lookup(ROOT_INO, b"new_under_current_redb.txt")
+            .unwrap()
+            .ino,
+        created.ino
+    );
     assert!(matches!(
         engine.compact_local_storage().unwrap(),
         LocalStorageCompactionResult::Compacted | LocalStorageCompactionResult::NoWork

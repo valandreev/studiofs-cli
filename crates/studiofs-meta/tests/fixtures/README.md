@@ -1,6 +1,7 @@
-# redb 4.3 compatibility fixtures
+# redb compatibility fixtures
 
-Both checked-in fixtures were produced with `redb = 4.3.0`:
+The `redb-4.1-*` fixtures here and in `studiofs-cache/tests/fixtures/` are the
+original 4.1 baselines. The 4.3 fixtures were produced with `redb = 4.3.0`:
 
 - `redb-4.3-metadata.redb` starts from the valid 4.1 format-v5 fixture and
   records a committed `redb_compatibility_fixture_writer = 4.3.0` settings row.
