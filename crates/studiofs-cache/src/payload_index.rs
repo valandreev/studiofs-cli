@@ -1714,48 +1714,54 @@ mod tests {
     }
 
     #[test]
-    fn cache_index_opens_redb_databases_and_preserves_rows() {
-        for version in ["4.1", "4.3"] {
-            let temp = studiofs_test_support::workspace_target_tempdir("test-redb-compat-cache-");
-            let database_path = temp.path().join("cache.redb");
-            let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join(format!("tests/fixtures/redb-{version}-cache-index.redb"));
-            studiofs_test_support::copy_file_contents(&fixture_path, &database_path)
-                .unwrap_or_else(|err| {
-                    panic!("failed to copy fixture {}: {err}", fixture_path.display())
-                });
+    fn cache_index_opens_redb_4_1_database_and_preserves_rows() {
+        check_cache_index_fixture("4.1");
+    }
 
-            let index = open_index(&database_path);
-            let entry = index.get_entry(41).unwrap().expect("fixture entry");
-            assert_eq!(entry.payload_key, b"payload/41.object");
-            assert_eq!(entry.payload_len, 19);
-            assert_eq!(entry.lifecycle, LocalPayloadLifecycleState::Dirty);
-            assert_eq!(entry.origin, LocalPayloadOrigin::Local);
-            assert_eq!(entry.upload_state, LocalPayloadUploadState::Pending);
+    #[test]
+    fn cache_index_opens_redb_4_3_database_and_preserves_rows() {
+        check_cache_index_fixture("4.3");
+    }
 
-            let stats = index.stats().unwrap();
-            assert_eq!(stats.current_bytes, 19);
-            assert_eq!(stats.dirty_bytes, 19);
-            assert_eq!(stats.evictable_bytes, 0);
-            assert_eq!(index.dirty_object_count().unwrap(), 1);
+    fn check_cache_index_fixture(version: &str) {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-redb-compat-cache-");
+        let database_path = temp.path().join("cache.redb");
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("tests/fixtures/redb-{version}-cache-index.redb"));
+        studiofs_test_support::copy_file_contents(&fixture_path, &database_path).unwrap_or_else(
+            |err| panic!("failed to copy fixture {}: {err}", fixture_path.display()),
+        );
 
-            upsert_uploaded(&index, 42, 50);
-            let uploaded = index.get_entry(42).unwrap().expect("new entry");
-            let updated_stats = index.stats().unwrap();
-            drop(index);
+        let index = open_index(&database_path);
+        let entry = index.get_entry(41).unwrap().expect("fixture entry");
+        assert_eq!(entry.payload_key, b"payload/41.object");
+        assert_eq!(entry.payload_len, 19);
+        assert_eq!(entry.lifecycle, LocalPayloadLifecycleState::Dirty);
+        assert_eq!(entry.origin, LocalPayloadOrigin::Local);
+        assert_eq!(entry.upload_state, LocalPayloadUploadState::Pending);
 
-            let reopened = open_index(&database_path);
-            assert_eq!(reopened.stats().unwrap(), updated_stats);
-            assert_eq!(reopened.dirty_object_count().unwrap(), 1);
-            assert!(
-                reopened.get_entry(41).unwrap() == Some(entry),
-                "redb {version}: fixture row changed"
-            );
-            assert!(
-                reopened.get_entry(42).unwrap() == Some(uploaded),
-                "redb {version}: new row changed"
-            );
-        }
+        let stats = index.stats().unwrap();
+        assert_eq!(stats.current_bytes, 19);
+        assert_eq!(stats.dirty_bytes, 19);
+        assert_eq!(stats.evictable_bytes, 0);
+        assert_eq!(index.dirty_object_count().unwrap(), 1);
+
+        upsert_uploaded(&index, 42, 50);
+        let uploaded = index.get_entry(42).unwrap().expect("new entry");
+        let updated_stats = index.stats().unwrap();
+        drop(index);
+
+        let reopened = open_index(&database_path);
+        assert_eq!(reopened.stats().unwrap(), updated_stats);
+        assert_eq!(reopened.dirty_object_count().unwrap(), 1);
+        assert!(
+            reopened.get_entry(41).unwrap() == Some(entry),
+            "redb {version}: fixture row changed"
+        );
+        assert!(
+            reopened.get_entry(42).unwrap() == Some(uploaded),
+            "redb {version}: new row changed"
+        );
     }
 
     #[test]
