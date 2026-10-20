@@ -80,6 +80,9 @@
 //!
 //! ```rust
 //! use studiofs_vfs::{LockTier, OrderedMutex};
+//! # // Keep the export compiling here so the `compile_fail` guard doctests
+//! # // cannot pass because of an unresolved import.
+//! # let _: Option<studiofs_vfs::LockOrderGuard> = None;
 //!
 //! let namespace = OrderedMutex::new((), LockTier::Namespace);
 //! let _ns = namespace.lock();

@@ -122,6 +122,15 @@ tasks:
       cargo test -p studiofs-vfs --test vfs_test mixed_workload_concurrent_readers_during_pending_upload_no_errors -- --exact --nocapture
       cargo test -p studiofs-vfs --test vfs_test handle_aware_read_policy_keeps_sequential_and_random_streams_separate -- --exact --nocapture
       cargo test -p studiofs-vfs --test vfs_test file_session_flush_ordering_is_deterministic -- --exact --nocapture
+
+      # A doctest filter that matches nothing exits successfully, so pin the count.
+      lock_order_doctests="$(cargo test -p studiofs-vfs --doc lock_order -- --list)"
+      lock_order_doctest_count="$(awk '/: test$/ { count += 1 } END { print count + 0 }' <<< "${lock_order_doctests}")"
+      if [[ "${lock_order_doctest_count}" -ne 3 ]]; then
+        echo "Lock-order doctest gate failed: expected 3 doctests, found ${lock_order_doctest_count}" >&2
+        exit 1
+      fi
+      cargo test -p studiofs-vfs --doc lock_order
     env:
       RUSTFLAGS: "-Dwarnings"
 
