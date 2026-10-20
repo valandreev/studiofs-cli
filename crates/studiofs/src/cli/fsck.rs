@@ -688,7 +688,9 @@ mod tests {
         assert!(engine.get_attr(file.ino).is_ok());
         assert!(engine.get_pending_deletions().unwrap().is_empty());
 
+        let repair_started = now_unix_secs();
         remove_orphan_file(&*engine, file.ino, &mut queued, &mut removed).unwrap();
+        let repair_finished = now_unix_secs();
 
         assert_eq!((queued, removed), (1, 1));
         assert!(matches!(
@@ -698,6 +700,10 @@ mod tests {
         let pending = engine.get_pending_deletions().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, 41);
+        assert!(
+            (repair_started..=repair_finished).contains(&pending[0].1),
+            "marker must carry the repair-time timestamp: {pending:?}"
+        );
         assert!(
             engine
                 .get_regular_file_graph_object_usage(file.ino)

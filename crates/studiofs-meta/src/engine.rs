@@ -1609,7 +1609,8 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
 
     /// Remove the regular-file graph for an inode (used when deleting).
     /// Returns the unique removed object IDs. With `Some(timestamp)`, queues
-    /// their GC deletions in the same transaction; `None` leaves GC to the caller.
+    /// their GC deletions in the same transaction, so a marker-write failure
+    /// also leaves the graph in place; `None` leaves GC to the caller.
     fn remove_regular_file_graph(
         &self,
         ino: Ino,

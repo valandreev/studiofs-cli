@@ -472,7 +472,13 @@ impl<M: ?Sized + MetaPayloadObjects> MetaPayloadObjects for RuntimeMetaHandle<M>
             length: u64,
         ) -> MetaResult<Vec<ResolvedSliceSpan>>
     );
-    forward_method!(fn remove_regular_file_graph(&self, ino: Ino, deletion_timestamp: Option<i64>) -> MetaResult<Vec<u64>>);
+    forward_method!(
+        fn remove_regular_file_graph(
+            &self,
+            ino: Ino,
+            deletion_timestamp: Option<i64>,
+        ) -> MetaResult<Vec<u64>>
+    );
     forward_method!(fn next_object_id(&self) -> MetaResult<u64>);
     forward_method!(fn next_object_ids(&self, count: u32) -> MetaResult<Vec<u64>>);
     forward_method!(
