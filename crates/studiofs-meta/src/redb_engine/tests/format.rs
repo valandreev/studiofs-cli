@@ -10,60 +10,73 @@ fn test_format_info_roundtrip() {
 }
 
 #[test]
-fn opens_redb_4_1_database_without_studiofs_format_migration() {
-    let temp = studiofs_test_support::workspace_target_tempdir("test-redb-4-1-meta-");
-    let database_path = temp.path().join("metadata.redb");
-    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/redb-4.1-metadata.redb");
-    studiofs_test_support::copy_file_contents(&fixture_path, &database_path).unwrap_or_else(|err| {
-        panic!("failed to copy fixture {}: {err}", fixture_path.display())
-    });
+fn opens_redb_databases_without_studiofs_format_migration() {
+    for version in ["4.1", "4.3"] {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-redb-compat-meta-");
+        let database_path = temp.path().join("metadata.redb");
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("tests/fixtures/redb-{version}-metadata.redb"));
+        studiofs_test_support::copy_file_contents(&fixture_path, &database_path).unwrap_or_else(
+            |err| panic!("failed to copy fixture {}: {err}", fixture_path.display()),
+        );
 
-    let probed = RedbMetaEngine::read_format_info_readonly(&database_path).unwrap();
-    assert_eq!(probed.name, "redb-4.1-compat");
-    assert_eq!(probed.format_version, CURRENT_FORMAT_VERSION);
+        let probed = RedbMetaEngine::read_format_info_readonly(&database_path).unwrap();
+        assert_eq!(probed.name, "redb-4.1-compat");
+        assert_eq!(probed.format_version, CURRENT_FORMAT_VERSION);
 
-    let engine = RedbMetaEngine::open(&database_path).unwrap();
-    let loaded = engine.get_format_info().unwrap();
-    assert_eq!(loaded.format_version, CURRENT_FORMAT_VERSION);
-    assert!(engine
-        .pending_uploaded_regular_file_recoveries()
-        .unwrap()
-        .is_empty());
-    let entry = engine.lookup(ROOT_INO, b"compat.txt").unwrap();
-    assert_eq!(entry.kind, FileType::RegularFile);
+        let engine = RedbMetaEngine::open(&database_path).unwrap();
+        assert_eq!(
+            engine.get_format_info().unwrap().format_version,
+            CURRENT_FORMAT_VERSION
+        );
+        if version == "4.3" {
+            let read = engine.begin_read_txn().unwrap();
+            let settings = read.open_table(SETTINGS_TABLE).unwrap();
+            assert_eq!(
+                settings
+                    .get("redb_compatibility_fixture_writer")
+                    .unwrap()
+                    .unwrap()
+                    .value(),
+                b"4.3.0"
+            );
+        }
+        assert!(
+            engine
+                .pending_uploaded_regular_file_recoveries()
+                .unwrap()
+                .is_empty()
+        );
+        let entry = engine.lookup(ROOT_INO, b"compat.txt").unwrap();
+        assert_eq!(entry.kind, FileType::RegularFile);
 
-    let created = engine
-        .create_file(ROOT_INO, b"new_under_4_3.txt", 1000, 1000, 0o644)
-        .unwrap();
-    assert_eq!(
-        engine.lookup(ROOT_INO, b"new_under_4_3.txt").unwrap().ino,
-        created.ino
-    );
-    assert!(matches!(
-        engine.compact_local_storage().unwrap(),
-        LocalStorageCompactionResult::Compacted | LocalStorageCompactionResult::NoWork
-    ));
+        let created = engine
+            .create_file(ROOT_INO, b"new_under_current_redb.txt", 1000, 1000, 0o644)
+            .unwrap();
+        assert!(matches!(
+            engine.compact_local_storage().unwrap(),
+            LocalStorageCompactionResult::Compacted | LocalStorageCompactionResult::NoWork
+        ));
+        engine.prepare_for_close().unwrap();
+        drop(engine);
 
-    engine.prepare_for_close().unwrap();
-    drop(engine);
-
-    let reopened = RedbMetaEngine::open(&database_path).unwrap();
-    assert_eq!(
-        reopened.get_format_info().unwrap().format_version,
-        CURRENT_FORMAT_VERSION
-    );
-    let reopened_entry = reopened.lookup(ROOT_INO, b"compat.txt").unwrap();
-    assert_eq!(reopened_entry.kind, FileType::RegularFile);
-    assert_eq!(reopened_entry.ino, entry.ino);
-    assert_eq!(
-        reopened
-            .lookup(ROOT_INO, b"new_under_4_3.txt")
-            .unwrap()
-            .ino,
-        created.ino
-    );
-    reopened.prepare_for_close().unwrap();
+        let reopened = RedbMetaEngine::open(&database_path).unwrap();
+        assert_eq!(
+            reopened.get_format_info().unwrap().format_version,
+            CURRENT_FORMAT_VERSION
+        );
+        let reopened_entry = reopened.lookup(ROOT_INO, b"compat.txt").unwrap();
+        assert_eq!(reopened_entry.kind, FileType::RegularFile);
+        assert_eq!(reopened_entry.ino, entry.ino);
+        assert_eq!(
+            reopened
+                .lookup(ROOT_INO, b"new_under_current_redb.txt")
+                .unwrap()
+                .ino,
+            created.ino
+        );
+        reopened.prepare_for_close().unwrap();
+    }
 }
 
 #[test]
