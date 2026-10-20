@@ -84,10 +84,15 @@ cargo test -p studiofs-vfs --doc lock_order
 ```
 
 Expect three tests: one passing usage example that checks the public guard
-export and two `compile_fail` checks for `!Send` and `!Sync`. Verify this count
-when moving or renaming the module; a filter matching no tests still exits
-successfully. `--all-targets` excludes doctests. Rocky Linux and the manual
-macOS/Windows jobs do not run this doctest command.
+export and two `compile_fail` checks for `!Send` and `!Sync`. A filter matching
+no tests still exits successfully, so the CI task first lists the doctests and
+fails unless exactly three match; update that count when adding, moving, or
+removing these doctests. Stable rustdoc does not check `compile_fail` error
+codes, so the usage example's export check is what keeps an unresolved import
+from satisfying the `compile_fail` cases. The unit-test
+`assert_not_impl_any!(LockOrderGuard: Send, Sync)` in `lock_order.rs` covers
+the same property under `--all-targets`, which excludes doctests. Rocky Linux
+and the manual macOS/Windows jobs do not run this doctest command.
 
 ### PostgreSQL CI gate
 
