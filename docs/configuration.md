@@ -473,6 +473,12 @@ What it does:
 
 Note:
 - PostgreSQL is treated as source of truth for dump export.
+- The output is written to a temporary file beside the destination, flushed and
+  synced, then atomically replaces the previous backup. A write or replacement
+  error preserves the previous file and removes the temporary file.
+- The destination directory must be writable. Replacement uses a new file with
+  temporary-file permissions (owner-only on Unix); it does not preserve the old
+  file's permissions or sync the parent directory for power-loss durability.
 
 ### `load`
 

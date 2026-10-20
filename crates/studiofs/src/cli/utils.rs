@@ -327,45 +327,60 @@ fn write_mount_record_with_cache_and_instance(
         sync_lifecycle: sync_lifecycle.map(str::to_string),
         diagnostics: None,
     };
-    write_mount_record_file(&path, &record)
+    write_json_file_atomically(&path, &record)
 }
 
-fn write_mount_record_file(path: &Path, record: &MountRecordInfo) -> Result<()> {
+/// Backoff before each retry of a replacement that Windows rejected because
+/// another process still holds the destination open.
+const FILE_REPLACE_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(10),
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+];
+
+pub(super) fn write_json_file_atomically(
+    path: &Path,
+    value: &(impl Serialize + ?Sized),
+) -> Result<()> {
     let parent = path
         .parent()
-        .context("mount record path has no parent directory")?;
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temporary mount record near '{}'", path.display()))?;
-    serde_json::to_writer_pretty(temporary.as_file_mut(), record)?;
-    temporary.as_file_mut().flush()?;
-    temporary.as_file().sync_all()?;
-    let mut temporary = Some(temporary);
-    for attempt in 0..5 {
-        let file = temporary
-            .take()
-            .ok_or_else(|| anyhow!("mount record replacement file was lost"))?;
-        match file.persist(path) {
+        .with_context(|| format!("create temporary file near '{}'", path.display()))?;
+    {
+        let mut writer = io::BufWriter::new(temporary.as_file_mut());
+        serde_json::to_writer_pretty(&mut writer, value)
+            .with_context(|| format!("serialize temporary file for '{}'", path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("flush temporary file for '{}'", path.display()))?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("sync temporary file for '{}'", path.display()))?;
+    let mut retry_delays = FILE_REPLACE_RETRY_DELAYS.iter();
+    loop {
+        match temporary.persist(path) {
             Ok(_) => return Ok(()),
-            Err(error)
-                if attempt + 1 < 5 && is_retryable_mount_record_replace_error(&error.error) =>
-            {
-                temporary = Some(error.file);
-                let delay_ms = [10, 25, 50, 100][attempt];
-                std::thread::sleep(Duration::from_millis(delay_ms));
-            }
             Err(error) => {
-                return Err(anyhow!(
-                    "replace mount record '{}': {}",
-                    path.display(),
-                    error.error
-                ));
+                let delay = retry_delays
+                    .next()
+                    .filter(|_| is_retryable_file_replace_error(&error.error));
+                let Some(delay) = delay else {
+                    return Err(error.error)
+                        .with_context(|| format!("replace file '{}'", path.display()));
+                };
+                temporary = error.file;
+                std::thread::sleep(*delay);
             }
         }
     }
-    Err(anyhow!("mount record replacement attempts exhausted"))
 }
 
-fn is_retryable_mount_record_replace_error(error: &io::Error) -> bool {
+fn is_retryable_file_replace_error(error: &io::Error) -> bool {
     #[cfg(windows)]
     {
         matches!(
@@ -411,7 +426,7 @@ fn update_mount_record_status_at(
     }
     record.status = status;
     record.sync_lifecycle = sync_lifecycle.map(str::to_string);
-    write_mount_record_file(path, &record).map_err(MountRecordUpdateError::Other)
+    write_json_file_atomically(path, &record).map_err(MountRecordUpdateError::Other)
 }
 
 pub(crate) fn active_mount_record_for_volume(volume: &str) -> Result<Option<MountRecordInfo>> {
@@ -585,7 +600,7 @@ pub fn write_pid_file_in(
         sync_lifecycle: None,
         diagnostics: None,
     };
-    write_mount_record_file(&path, &record)
+    write_json_file_atomically(&path, &record)
 }
 
 /// Read a PID file from the given directory.
@@ -961,7 +976,7 @@ mod tests {
             auth_token: "test-auth-token".to_string(),
         };
 
-        write_mount_record_file(
+        write_json_file_atomically(
             &path,
             &MountRecordInfo {
                 record_version: MOUNT_RECORD_VERSION,
@@ -1001,7 +1016,7 @@ mod tests {
     fn mount_record_status_update_reports_instance_change_without_rereading() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let path = tmp.path().join("mount.json");
-        write_mount_record_file(
+        write_json_file_atomically(
             &path,
             &MountRecordInfo {
                 record_version: MOUNT_RECORD_VERSION,
