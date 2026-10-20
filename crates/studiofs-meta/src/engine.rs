@@ -1608,8 +1608,14 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
     ) -> MetaResult<Vec<ResolvedSliceSpan>>;
 
     /// Remove the regular-file graph for an inode (used when deleting).
-    /// Returns the list of removed object IDs for GC.
-    fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>>;
+    /// Returns the unique removed object IDs. With `Some(timestamp)`, queues
+    /// their GC deletions in the same transaction, so a marker-write failure
+    /// also leaves the graph in place; `None` leaves GC to the caller.
+    fn remove_regular_file_graph(
+        &self,
+        ino: Ino,
+        deletion_timestamp: Option<i64>,
+    ) -> MetaResult<Vec<u64>>;
 
     /// Allocate a new sequential object ID.
     fn next_object_id(&self) -> MetaResult<u64>;

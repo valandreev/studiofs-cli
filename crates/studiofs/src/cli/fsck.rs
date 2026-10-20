@@ -326,7 +326,7 @@ fn remove_orphan_file(
     orphan_blocks_pending_gc: &mut usize,
     removed_orphans: &mut usize,
 ) -> FsckResult<()> {
-    let removed_ids = match meta.remove_regular_file_graph(ino) {
+    let removed_ids = match meta.remove_regular_file_graph(ino, Some(now_unix_secs())) {
         Ok(ids) => ids,
         Err(MetaError::InodeNotFound(_)) => Vec::new(),
         Err(err) => {
@@ -336,14 +336,6 @@ fn remove_orphan_file(
         }
     };
 
-    if !removed_ids.is_empty() {
-        let ts = now_unix_secs();
-        for object_id in &removed_ids {
-            meta.add_pending_deletion(*object_id, ts)?;
-        }
-        *orphan_blocks_pending_gc += removed_ids.len();
-    }
-
     match meta.remove_attr(ino) {
         Ok(()) | Err(MetaError::InodeNotFound(_)) => *removed_orphans += 1,
         Err(err) => {
@@ -352,6 +344,7 @@ fn remove_orphan_file(
             )));
         }
     }
+    *orphan_blocks_pending_gc += removed_ids.len();
 
     Ok(())
 }
@@ -643,7 +636,10 @@ mod tests {
     use super::*;
     use std::ops::Deref;
     use studiofs_meta::engine::{MetaFsOps, MetaInodes};
-    use studiofs_meta::{MetaNamespace, RedbMetaEngine};
+    use studiofs_meta::{
+        ChunkId, MetaGc, MetaNamespace, MetaPayloadObjects, PayloadRef, ReadOnlyMetaEngine,
+        RedbMetaEngine, SliceId, SliceOrder, SliceRange, SliceRecord,
+    };
 
     struct TestEngine {
         engine: RedbMetaEngine,
@@ -664,6 +660,59 @@ mod tests {
         let engine = RedbMetaEngine::open(&path).expect("open redb");
         engine.init_root(1000, 1000).expect("init root");
         TestEngine { engine, _dir: dir }
+    }
+
+    #[test]
+    fn remove_orphan_file_queues_payloads_once_and_preserves_failed_counters() {
+        let TestEngine { engine, _dir } = temp_engine();
+        let engine = std::sync::Arc::new(engine);
+        let file = engine
+            .create_file(ROOT_INO, b"orphan", 1000, 1000, 0o644)
+            .unwrap();
+        engine.remove_entry(ROOT_INO, b"orphan").unwrap();
+        let slice = SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).unwrap(),
+            PayloadRef::new_partial(41, 4096),
+        );
+        engine
+            .flush_regular_file_overlay_slices(file.ino, &[(ChunkId(0), vec![slice])])
+            .unwrap();
+        let mut queued = 0;
+        let mut removed = 0;
+
+        let read_only = ReadOnlyMetaEngine::new(engine.clone());
+        assert!(remove_orphan_file(&read_only, file.ino, &mut queued, &mut removed).is_err());
+        assert_eq!((queued, removed), (0, 0));
+        assert!(engine.get_attr(file.ino).is_ok());
+        assert!(engine.get_pending_deletions().unwrap().is_empty());
+
+        let repair_started = now_unix_secs();
+        remove_orphan_file(&*engine, file.ino, &mut queued, &mut removed).unwrap();
+        let repair_finished = now_unix_secs();
+
+        assert_eq!((queued, removed), (1, 1));
+        assert!(matches!(
+            engine.get_attr(file.ino),
+            Err(MetaError::InodeNotFound(_))
+        ));
+        let pending = engine.get_pending_deletions().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, 41);
+        assert!(
+            (repair_started..=repair_finished).contains(&pending[0].1),
+            "marker must carry the repair-time timestamp: {pending:?}"
+        );
+        assert!(
+            engine
+                .get_regular_file_graph_object_usage(file.ino)
+                .unwrap()
+                .is_empty()
+        );
+        remove_orphan_file(&*engine, file.ino, &mut queued, &mut removed).unwrap();
+        assert_eq!(queued, 1, "retry must not count or queue the objects twice");
+        assert_eq!(engine.get_pending_deletions().unwrap(), pending);
     }
 
     #[test]

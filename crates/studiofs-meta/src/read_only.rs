@@ -300,7 +300,11 @@ where
         self.inner.lookup_regular_file_slices(ino, offset, length)
     }
 
-    fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+    fn remove_regular_file_graph(
+        &self,
+        ino: Ino,
+        _deletion_timestamp: Option<i64>,
+    ) -> MetaResult<Vec<u64>> {
         Err(read_only_error(ino))
     }
 

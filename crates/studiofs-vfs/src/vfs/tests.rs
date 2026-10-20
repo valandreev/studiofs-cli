@@ -6214,7 +6214,7 @@ fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
         truncated_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&truncated_attr)
             .expect("stage slice-graph zero-length epoch");
-        meta.remove_regular_file_graph(attr.ino)
+        meta.remove_regular_file_graph(attr.ino, None)
             .expect("remove unpublished slice graph for zero-length truncate");
 
         assert!(
@@ -6311,7 +6311,7 @@ fn epoch_finalizer_invalidates_kernel_when_published_dirty_attr_was_visible() {
         staged_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&staged_attr)
             .expect("stage slice-graph zero-length epoch");
-        meta.remove_regular_file_graph(attr.ino)
+        meta.remove_regular_file_graph(attr.ino, None)
             .expect("remove unpublished slice graph for zero-length truncate");
 
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
@@ -6394,7 +6394,7 @@ fn epoch_finalizer_invalidates_kernel_when_newer_dirty_attr_remains_visible() {
         staged_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&staged_attr)
             .expect("stage slice-graph zero-length epoch");
-        meta.remove_regular_file_graph(attr.ino)
+        meta.remove_regular_file_graph(attr.ino, None)
             .expect("remove unpublished slice graph for zero-length truncate");
 
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
@@ -6469,7 +6469,7 @@ fn epoch_finalizer_invalidates_kernel_when_publication_advances_visible_size() {
         staged_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&staged_attr)
             .expect("stage sparse size-increase epoch");
-        meta.remove_regular_file_graph(attr.ino)
+        meta.remove_regular_file_graph(attr.ino, None)
             .expect("stage sparse graph for size-increase epoch");
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished append attr");
         assert!(
@@ -6582,7 +6582,7 @@ fn epoch_finalizer_keeps_data_cache_for_own_local_write_publication() {
         staged_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&staged_attr)
             .expect("stage local sparse publication");
-        meta.remove_regular_file_graph(attr.ino)
+        meta.remove_regular_file_graph(attr.ino, None)
             .expect("stage sparse graph for local publication");
         vfs.state.namespace.dirty_attrs.lock().remove(&attr.ino);
         vfs.state.namespace.attr_read_cache.lock().remove(attr.ino);
@@ -6777,7 +6777,7 @@ fn epoch_finalizer_refreshes_open_writer_before_followup_tail_write() {
         staged_attr.upload_state = MetaUploadState::Uploading;
         meta.set_attr(&staged_attr)
             .expect("stage sparse prefix publication");
-        meta.remove_regular_file_graph(ino)
+        meta.remove_regular_file_graph(ino, None)
             .expect("stage sparse prefix graph");
         vfs.state.namespace.dirty_attrs.lock().remove(&ino);
         vfs.state.namespace.attr_read_cache.lock().remove(ino);
@@ -10243,7 +10243,7 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
         truncated_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&truncated_attr)
             .expect("stage slice-graph zero-length epoch");
-        meta.remove_regular_file_graph(attr.ino)
+        meta.remove_regular_file_graph(attr.ino, None)
             .expect("remove unpublished slice graph for zero-length truncate");
 
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
