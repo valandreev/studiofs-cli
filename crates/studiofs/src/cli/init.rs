@@ -25,7 +25,8 @@ use uuid::Uuid;
 
 const INITIAL_METADATA_STATE_VERSION: i64 = 0;
 const ACTIVE_CRYPTO_KEY_STATE: &str = "active";
-const INIT_SCHEMA_ADVISORY_LOCK: i64 = 902_202_603;
+/// Serializes schema setup and volume row creation between `init` and `load`.
+pub(super) const INIT_SCHEMA_ADVISORY_LOCK: i64 = 902_202_603;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

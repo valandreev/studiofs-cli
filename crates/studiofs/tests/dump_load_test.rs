@@ -619,6 +619,11 @@ async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volume
 
 /// Reachability accounting and payload upload ledger tables that `load`
 /// requires to be empty for the target volume.
+///
+/// Mirrors `ACCOUNTING_TABLES` in `src/cli/dump_load.rs`; `studiofs` is a
+/// binary crate, so integration tests cannot import it. Keep both lists equal:
+/// a table dropped from the source list makes the per-table rejection test
+/// fail, but a table added there is untested until it is added here.
 const ACCOUNTING_TABLES: [&str; 5] = [
     "snapshot_current_references",
     "snapshot_object_reachability",
@@ -636,7 +641,11 @@ const NEWER_STATE_COUNTER_VALUE: i64 = 4_242;
 const NEWER_BLOCK_SIZE: i32 = 65_536;
 const ACCOUNTING_REFERENCE_INO: i64 = 4_242;
 const LOCK_WAIT_DEADLINE: Duration = Duration::from_secs(30);
-/// Transaction advisory lock taken by `apply_dump` in `src/cli/dump_load.rs`.
+/// Mirrors `INIT_SCHEMA_ADVISORY_LOCK` in `src/cli/init.rs`, which
+/// `apply_dump` takes before touching the volume row; `studiofs` is a binary
+/// crate, so integration tests cannot import it. If the values drift, `load`
+/// no longer parks on this lock and the race test fails with "load exited
+/// ... before waiting on %pg_advisory_xact_lock%" instead of passing.
 const LOAD_ADVISORY_LOCK: i64 = 902_202_603;
 
 /// Target state that a rejected load must leave untouched.

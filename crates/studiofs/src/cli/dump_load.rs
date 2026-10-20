@@ -386,7 +386,10 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 .transaction()
                 .await
                 .map_err(|source| postgres_operation("start load transaction", source))?;
-            tx.execute("SELECT pg_advisory_xact_lock($1)", &[&902_202_603_i64])
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&super::init::INIT_SCHEMA_ADVISORY_LOCK],
+            )
                 .await
                 .map_err(|source| postgres_operation("acquire load advisory lock", source))?;
 
