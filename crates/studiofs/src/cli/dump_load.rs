@@ -112,9 +112,34 @@ pub enum DumpLoadError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Validation(#[from] DumpValidationError),
+    #[error(
+        "cannot load metadata over existing Snapshot v2 state ({}); remove snapshots and policy first",
+        .tables.join(", ")
+    )]
+    TargetHasSnapshotV2State { tables: Vec<&'static str> },
+    #[error(
+        "cannot load metadata over existing reachability or payload upload state ({}); stop every client and the old metadata server, then load into a new, empty metadata database",
+        .tables.join(", ")
+    )]
+    TargetHasAccountingState { tables: Vec<&'static str> },
     #[error("{0}")]
     Message(String),
 }
+
+/// Snapshot v2 tables whose rows describe snapshots of the load target.
+const SNAPSHOT_V2_TABLES: [&str; 2] = ["snapshot_catalog", "snapshot_policies"];
+
+/// Version-keyed reachability accounting and the payload upload ledger. A dump
+/// carries none of them, so rows retained for the target would describe a
+/// different history than the restored metadata and could let GC delete live
+/// payloads.
+const ACCOUNTING_TABLES: [&str; 5] = [
+    "snapshot_current_references",
+    "snapshot_object_reachability",
+    "snapshot_reachability_batches",
+    "snapshot_reachability_bootstrap",
+    "snapshot_payload_upload_objects",
+];
 
 type DumpLoadResult<T> = std::result::Result<T, DumpLoadError>;
 
@@ -361,7 +386,10 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 .transaction()
                 .await
                 .map_err(|source| postgres_operation("start load transaction", source))?;
-            tx.execute("SELECT pg_advisory_xact_lock($1)", &[&902_202_603_i64])
+            tx.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                &[&super::init::INIT_SCHEMA_ADVISORY_LOCK],
+            )
                 .await
                 .map_err(|source| postgres_operation("acquire load advisory lock", source))?;
 
@@ -382,31 +410,30 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
             let target_vol: i64 = row
                 .try_get(0)
                 .map_err(|source| postgres_operation("decode upserted volume row", source))?;
+            // Fence new FK-backed accounting rows until the replacement commits.
+            tx.query_one("SELECT vol FROM volumes WHERE vol = $1 FOR UPDATE", &[&target_vol])
+                .await
+                .map_err(|source| postgres_operation("lock load target volume", source))?;
             let format_info_bytes =
                 rebind_postgres_volume_id(&dump.metadata_state_format_info, target_vol)?;
 
-            let has_snapshot_v2_state: bool = tx
-                .query_one(
-                    "SELECT EXISTS (SELECT 1 FROM snapshot_catalog WHERE vol = $1) OR EXISTS (SELECT 1 FROM snapshot_policies WHERE vol = $1)",
-                    &[&target_vol],
-                )
-                .await
-                .map_err(|source| postgres_operation("check snapshot v2 state", source))?
-                .try_get(0)
-                .map_err(|source| postgres_operation("decode snapshot v2 state row", source))?;
-            if has_snapshot_v2_state {
-                return Err(DumpLoadError::Message(
-                    "cannot load metadata over existing Snapshot v2 state; remove snapshots and policy first"
-                        .to_string(),
-                ));
+            let snapshot_v2_tables =
+                tables_with_volume_rows(&tx, target_vol, &SNAPSHOT_V2_TABLES).await?;
+            if !snapshot_v2_tables.is_empty() {
+                return Err(DumpLoadError::TargetHasSnapshotV2State {
+                    tables: snapshot_v2_tables,
+                });
+            }
+            let accounting_tables =
+                tables_with_volume_rows(&tx, target_vol, &ACCOUNTING_TABLES).await?;
+            if !accounting_tables.is_empty() {
+                return Err(DumpLoadError::TargetHasAccountingState {
+                    tables: accounting_tables,
+                });
             }
 
-            tx.execute("DELETE FROM snapshot_policies WHERE vol = $1", &[&target_vol])
-                .await
-                .map_err(|source| postgres_operation("clear snapshot policies", source))?;
-            tx.execute("DELETE FROM snapshot_catalog WHERE vol = $1", &[&target_vol])
-                .await
-                .map_err(|source| postgres_operation("clear snapshot catalog", source))?;
+            // The volume row lock blocks new FK-backed rows, so the guarded
+            // snapshot and accounting tables stay empty until commit.
             tx.execute("DELETE FROM counters WHERE vol = $1", &[&target_vol])
                 .await
                 .map_err(|source| postgres_operation("clear counters", source))?;
@@ -484,6 +511,39 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
         let _ = connection_task.await;
         result
     })
+}
+
+/// Returns the tables that hold at least one row for `vol`, in input order.
+async fn tables_with_volume_rows(
+    tx: &tokio_postgres::Transaction<'_>,
+    vol: i64,
+    tables: &[&'static str],
+) -> DumpLoadResult<Vec<&'static str>> {
+    // Table names are compile-time constants, never user input.
+    let probes = tables
+        .iter()
+        .map(|table| format!("EXISTS (SELECT 1 FROM {table} WHERE vol = $1)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let row = tx
+        .query_one(&format!("SELECT {probes}"), &[&vol])
+        .await
+        .map_err(|source| {
+            postgres_operation(
+                format!("check load target rows in {}", tables.join(", ")),
+                source,
+            )
+        })?;
+    let mut populated = Vec::new();
+    for (index, table) in tables.iter().enumerate() {
+        let has_rows: bool = row.try_get(index).map_err(|source| {
+            postgres_operation(format!("decode load target row check for {table}"), source)
+        })?;
+        if has_rows {
+            populated.push(*table);
+        }
+    }
+    Ok(populated)
 }
 
 fn validate_dump(dump: &MetadataDump) -> DumpLoadResult<()> {
@@ -662,6 +722,23 @@ mod tests {
             err,
             DumpLoadError::Message(message) if message.contains("unsupported dump version: 3")
         ));
+    }
+
+    #[test]
+    fn accounting_rejection_names_blocking_tables_and_migration_target() {
+        let err = DumpLoadError::TargetHasAccountingState {
+            tables: vec![
+                "snapshot_reachability_batches",
+                "snapshot_payload_upload_objects",
+            ],
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "cannot load metadata over existing reachability or payload upload state \
+             (snapshot_reachability_batches, snapshot_payload_upload_objects); stop every \
+             client and the old metadata server, then load into a new, empty metadata database"
+        );
     }
 
     fn test_dump() -> MetadataDump {
