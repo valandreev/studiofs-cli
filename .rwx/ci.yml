@@ -266,6 +266,7 @@ tasks:
       run_ignored_tests "studiofs destroy full S3 + PostgreSQL" "" true -p studiofs --test destroy_test destroy_full_removes_local_s3_and_postgres_state
       run_ignored_tests "studiofs dump/load S3 + PostgreSQL" "" true -p studiofs --test dump_load_test dump_load_restores_volume_and_discovery_reads_data
       run_ignored_tests "studiofs dump/load snapshot-v2 S3 + PostgreSQL" "" true -p studiofs --test dump_load_test dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volumes
+      run_ignored_tests "studiofs dump/load reachability replacement S3 + PostgreSQL" "" true -p studiofs --test dump_load_test dump_load_rejects_replacing_uuid_with_reachability_or_upload_state
 
     env:
       RUSTFLAGS: "-Dwarnings"

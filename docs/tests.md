@@ -122,7 +122,7 @@ The CI gate selects each listed test by exact name and verifies every
 selection is nonzero, so adding another ignored test does not silently expand
 the gate.
 
-The five tests below require both S3 and PostgreSQL and are selected explicitly
+The six tests below require both S3 and PostgreSQL and are selected explicitly
 by name in the same gate:
 
 - `destroy_fails_cleanly_with_incorrect_s3_permissions`
