@@ -235,12 +235,22 @@ studiofs mount myvolume Y:
 | `test` | Collect a mounted write-path test report |
 | `destroy` | Permanently remove local metadata and remote data/metadata; `--local` keeps remote state |
 
-`load` refuses to overwrite a volume with Snapshot v2 state, object reachability
-accounting, or payload upload/deletion history (including completed rows).
-Restore into a clean metadata database with the corresponding S3 payloads preserved.
-Stop all clients before restoring. `destroy` permanently deletes the volume,
-including its S3 payloads; a metadata dump cannot recover a destroyed volume.
-`destroy --local` keeps remote metadata and cannot clear this rejection.
+`dump` and `load` move a volume's metadata to a new PostgreSQL metadata server;
+the S3 payloads stay where they are:
+
+1. Unmount the volume on every client.
+2. Run `studiofs dump <volume> --path-to-dump <file>`.
+3. Stop the old metadata server and keep it stopped. Two metadata servers for
+   the same volume would both garbage-collect the same S3 payloads.
+4. Run `studiofs load --path-to-dump <file> --postgresql-address <new server>`.
+5. Run `studiofs discover <volume> --meta <new server>` on each client.
+
+The dump does not carry Snapshot v2 state, object reachability accounting, or
+the payload upload/deletion ledger. `load` therefore refuses a target that
+already has any of these rows for the dumped volume UUID, including completed
+upload rows, and names the blocking tables. Load into a new, empty metadata
+database. `destroy` permanently deletes the volume, including its S3 payloads,
+so a metadata dump cannot recover a destroyed volume.
 
 Run `studiofs --help` or `studiofs <command> --help` for full usage.
 

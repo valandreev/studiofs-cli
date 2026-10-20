@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
+use std::time::Duration;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys, read_object,
 };
@@ -251,20 +252,6 @@ async fn snapshot_v2_state(pg_dsn: &str, name: &str) -> (i64, i64, i64, Option<S
         .expect("count snapshot v2 rows");
     conn_task.abort();
     (row.get(0), row.get(1), row.get(2), row.get(3))
-}
-
-async fn load_replacement_state(
-    client: &tokio_postgres::Client,
-    volume_id: i64,
-) -> (String, i32, i64, i64, i64) {
-    let row = client
-        .query_one(
-            "SELECT v.name, v.block_size, ms.version, (SELECT value FROM counters WHERE vol = v.vol AND name = 'sfs868-sentinel'), (SELECT count(*) FROM event_log WHERE vol = v.vol AND event_type = 'sfs868-sentinel') FROM volumes v JOIN metadata_state ms ON ms.vol = v.vol WHERE v.vol = $1",
-            &[&volume_id],
-        )
-        .await
-        .expect("read load replacement sentinel state");
-    (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
 }
 
 fn single_object_slice_graph(
@@ -630,288 +617,559 @@ async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volume
     }
 }
 
-#[test]
-#[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
-fn dump_load_rejects_replacing_uuid_with_reachability_or_upload_state() {
-    let runtime = tokio::runtime::Runtime::new().expect("build test runtime");
-    let env = load_test_env();
-    let raw_pg = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None)
-        .expect("STUDIOFS_TEST_PG_DSN is required for ignored S3/PostgreSQL tests");
+/// Reachability accounting and payload upload ledger tables that `load`
+/// requires to be empty for the target volume.
+const ACCOUNTING_TABLES: [&str; 5] = [
+    "snapshot_current_references",
+    "snapshot_object_reachability",
+    "snapshot_reachability_batches",
+    "snapshot_reachability_bootstrap",
+    "snapshot_payload_upload_objects",
+];
 
-    let target = random_name("dump-load-reachability-target");
-    let bystander = random_name("dump-load-reachability-bystander");
-    let current_name = format!("{target}-newer-name");
-    let home = studiofs_test_support::workspace_target_tempdir("home-");
-    let dump_path = home.path().join(format!("{target}.dump.json"));
+const ACCOUNTING_REJECTION: &str =
+    "cannot load metadata over existing reachability or payload upload state";
 
-    let pg_dsn = runtime.block_on(resolved_pg_dsn(&raw_pg));
-    let (client, conn_task) = runtime.block_on(async {
-        let (client, connection) = tokio_postgres::connect(&pg_dsn, tokio_postgres::NoTls)
+/// Counter name and event type for rows that make the target newer than its dump.
+const NEWER_STATE_MARKER: &str = "load-guard-newer-state";
+const NEWER_STATE_COUNTER_VALUE: i64 = 4_242;
+const NEWER_BLOCK_SIZE: i32 = 65_536;
+const ACCOUNTING_REFERENCE_INO: i64 = 4_242;
+const LOCK_WAIT_DEADLINE: Duration = Duration::from_secs(30);
+/// Transaction advisory lock taken by `apply_dump` in `src/cli/dump_load.rs`.
+const LOAD_ADVISORY_LOCK: i64 = 902_202_603;
+
+/// Target state that a rejected load must leave untouched.
+#[derive(Debug, PartialEq, Eq)]
+struct TargetVolumeState {
+    name: String,
+    block_size: i32,
+    metadata_version: i64,
+    marker_counter: Option<i64>,
+    marker_events: i64,
+}
+
+/// Test volumes whose PostgreSQL rows and S3 payloads are removed even when a
+/// scenario panics.
+struct LoadGuardFixture {
+    env: TestEnv,
+    raw_pg: String,
+    pg_dsn: String,
+    home: tempfile::TempDir,
+    dump_path: PathBuf,
+    client: tokio_postgres::Client,
+    connection: tokio::task::JoinHandle<()>,
+    /// Every name a test volume may carry, including names set by a scenario.
+    volume_names: Vec<String>,
+    /// Payload stores captured right after `init`. A load replaces the PG
+    /// state the source client's local metadata was built from, so cleanup
+    /// cannot reopen that local metadata afterwards.
+    payload_stores: std::sync::Mutex<Vec<(String, DataStore)>>,
+}
+
+impl LoadGuardFixture {
+    async fn connect(volume_names: Vec<String>) -> Self {
+        let env = load_test_env();
+        let raw_pg = env_or_dotenv("STUDIOFS_TEST_PG_DSN", None)
+            .expect("STUDIOFS_TEST_PG_DSN is required for ignored S3/PostgreSQL tests");
+        let pg_dsn = resolved_pg_dsn(&raw_pg).await;
+        let (client, connection) = connect_pg(&pg_dsn).await;
+        let home = studiofs_test_support::workspace_target_tempdir("home-");
+        let dump_path = home.path().join("load-guard.dump.json");
+        Self {
+            env,
+            raw_pg,
+            pg_dsn,
+            home,
+            dump_path,
+            client,
+            connection,
+            volume_names,
+            payload_stores: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn init_volume(&self, name: &str) {
+        let init = run_studiofs(
+            self.home.path(),
+            &[
+                "init",
+                name,
+                "--endpoint",
+                &self.env.s3_endpoint,
+                "--bucket",
+                &self.env.s3_bucket,
+                "--access-key",
+                &self.env.s3_access_key,
+                "--secret-key",
+                &self.env.s3_secret_key,
+                "--region",
+                &self.env.s3_region,
+                "--meta",
+                &self.raw_pg,
+            ],
+        );
+        assert_ok(&init, "init volume");
+
+        let db_path = default_meta_dir(self.home.path(), name).join(format!("{name}.db"));
+        let meta = open_meta_engine_with_options(
+            &db_path,
+            MetaOpenOptions {
+                background_poll: false,
+                ..Default::default()
+            },
+        )
+        .expect("open initialized volume");
+        let format = meta.get_format_info().expect("read initialized format");
+        drop(meta);
+        let store = DataStore::new(&DataStoreConfig::from(&format)).expect("open payload store");
+        self.payload_stores
+            .lock()
+            .expect("payload store list is not poisoned")
+            .push((name.to_string(), store));
+    }
+
+    /// Publishes one payload to `name`, dumps the volume, and returns the
+    /// payload object ID.
+    async fn seed_and_dump(&self, name: &str, payload: &[u8]) -> i64 {
+        let object_id = seed_remote_file(self.home.path(), name, payload).await;
+        let dump = run_studiofs(
+            self.home.path(),
+            &["dump", name, "--path-to-dump", self.dump_path_str()],
+        );
+        assert_ok(&dump, "dump target");
+        i64::try_from(object_id).expect("payload object ID fits BIGINT")
+    }
+
+    fn dump_path_str(&self) -> &str {
+        self.dump_path.to_str().expect("dump path is UTF-8")
+    }
+
+    fn load_args(&self) -> [&str; 5] {
+        [
+            "load",
+            "--path-to-dump",
+            self.dump_path_str(),
+            "--postgresql-address",
+            &self.raw_pg,
+        ]
+    }
+
+    fn load(&self) -> Output {
+        run_studiofs(self.home.path(), &self.load_args())
+    }
+
+    fn spawn_load(&self) -> std::process::Child {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_studiofs"));
+        cmd.args(self.load_args())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        set_home_env(&mut cmd, self.home.path());
+        cmd.spawn().expect("spawn studiofs load")
+    }
+
+    async fn volume_id(&self, name: &str) -> i64 {
+        self.client
+            .query_one("SELECT vol FROM volumes WHERE name = $1", &[&name])
             .await
-            .expect("connect postgres");
-        (client, tokio::spawn(connection))
-    });
-    let mut payload_store = None;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runtime.block_on(async {
-            for disk in [&target, &bystander] {
-                let init = run_studiofs(
-                    home.path(),
-                    &[
-                        "init",
-                        disk,
-                        "--endpoint",
-                        &env.s3_endpoint,
-                        "--bucket",
-                        &env.s3_bucket,
-                        "--access-key",
-                        &env.s3_access_key,
-                        "--secret-key",
-                        &env.s3_secret_key,
-                        "--region",
-                        &env.s3_region,
-                        "--meta",
-                        &raw_pg,
-                    ],
-                );
-                assert_ok(&init, "init volume");
-            }
-            let meta_path = default_meta_dir(home.path(), &target).join(format!("{target}.db"));
-            let meta = open_meta_engine_with_options(
-                &meta_path,
-                MetaOpenOptions { background_poll: false, ..Default::default() },
-            ).expect("open target for payload cleanup");
-            let format = meta.get_format_info().expect("read cleanup format");
-            payload_store = Some(
-                DataStore::new(&DataStoreConfig::from(&format)).expect("open payload cleanup store"),
-            );
-            drop(meta);
-            let payload = b"older dump payload preserved by the saved dump";
-            let payload_object_id = seed_remote_file(home.path(), &target, payload).await;
+            .expect("find volume")
+            .get(0)
+    }
 
-            let dump = run_studiofs(
-                home.path(),
-                &[
-                    "dump",
-                    &target,
-                    "--path-to-dump",
-                    dump_path.to_str().unwrap(),
-                ],
-            );
-            assert_ok(&dump, "dump target");
+    async fn table_rows(&self, table: &str, volume_id: i64) -> i64 {
+        self.client
+            .query_one(
+                &format!("SELECT count(*) FROM {table} WHERE vol = $1"),
+                &[&volume_id],
+            )
+            .await
+            .expect("count volume rows")
+            .get(0)
+    }
 
-            let target_volume: i64 = client
-                .query_one("SELECT vol FROM volumes WHERE name = $1", &[&target])
-                .await
-                .expect("find target volume")
-                .get(0);
-            let bystander_volume: i64 = client
-                .query_one("SELECT vol FROM volumes WHERE name = $1", &[&bystander])
-                .await
-                .expect("find bystander volume")
-                .get(0);
-            let dump_version: i64 = client
-                .query_one(
-                    "SELECT version FROM metadata_state WHERE vol = $1",
-                    &[&target_volume],
+    async fn clear_accounting(&self, volume_id: i64) {
+        for table in ACCOUNTING_TABLES {
+            self.client
+                .execute(
+                    &format!("DELETE FROM {table} WHERE vol = $1"),
+                    &[&volume_id],
                 )
                 .await
-                .expect("read dump version")
-                .get(0);
+                .expect("clear volume accounting");
+        }
+    }
 
-            // Isolate each guard condition even if setup starts producing accounting
-            // state as part of payload publication.
-            for table in [
-                "snapshot_current_references",
-                "snapshot_object_reachability",
-                "snapshot_reachability_batches",
-                "snapshot_reachability_bootstrap",
-                "snapshot_payload_upload_objects",
-            ] {
-                client
-                    .execute(
-                        &format!("DELETE FROM {table} WHERE vol = $1"),
-                        &[&target_volume],
-                    )
-                    .await
-                    .expect("clear target accounting");
+    async fn seed_accounting_row(&self, table: &str, volume_id: i64, object_id: i64, version: i64) {
+        seed_accounting_row(&self.client, table, volume_id, object_id, version).await;
+    }
+
+    /// Makes the target observably newer than its dump: identity fields,
+    /// metadata version, a counter, and an event row.
+    async fn advance_past_dump(&self, volume_id: i64, newer_name: &str) -> TargetVolumeState {
+        self.client
+            .execute(
+                "INSERT INTO counters (vol, name, value) VALUES ($1, $2, $3)",
+                &[&volume_id, &NEWER_STATE_MARKER, &NEWER_STATE_COUNTER_VALUE],
+            )
+            .await
+            .expect("seed newer counter");
+        self.client
+            .execute(
+                "UPDATE volumes SET name = $2, block_size = $3 WHERE vol = $1",
+                &[&volume_id, &newer_name, &NEWER_BLOCK_SIZE],
+            )
+            .await
+            .expect("advance volume identity fields");
+        let metadata_version: i64 = self
+            .client
+            .query_one(
+                "UPDATE metadata_state SET version = version + 1 WHERE vol = $1 RETURNING version",
+                &[&volume_id],
+            )
+            .await
+            .expect("advance metadata version")
+            .get(0);
+        self.client
+            .execute(
+                "INSERT INTO event_log (vol, batch_version, event_type, event_payload) VALUES ($1, $2, $3, $4)",
+                &[&volume_id, &metadata_version, &NEWER_STATE_MARKER, &Vec::<u8>::new()],
+            )
+            .await
+            .expect("seed newer event");
+
+        let state = self.target_state(volume_id).await;
+        assert_eq!(
+            state,
+            TargetVolumeState {
+                name: newer_name.to_string(),
+                block_size: NEWER_BLOCK_SIZE,
+                metadata_version,
+                marker_counter: Some(NEWER_STATE_COUNTER_VALUE),
+                marker_events: 1,
             }
+        );
+        state
+    }
 
-            // State for another volume must not prevent replacing this UUID.
+    async fn target_state(&self, volume_id: i64) -> TargetVolumeState {
+        let row = self
+            .client
+            .query_one(
+                "SELECT v.name, v.block_size, ms.version, (SELECT value FROM counters WHERE vol = v.vol AND name = $2), (SELECT count(*) FROM event_log WHERE vol = v.vol AND event_type = $2) FROM volumes v JOIN metadata_state ms ON ms.vol = v.vol WHERE v.vol = $1",
+                &[&volume_id, &NEWER_STATE_MARKER],
+            )
+            .await
+            .expect("read target volume state");
+        TargetVolumeState {
+            name: row.get(0),
+            block_size: row.get(1),
+            metadata_version: row.get(2),
+            marker_counter: row.get(3),
+            marker_events: row.get(4),
+        }
+    }
+
+    /// Waits until another backend blocks on a lock while running a statement
+    /// that matches `query_pattern`, or fails if `load` exits first or the
+    /// deadline passes.
+    async fn wait_for_load_lock_wait(&self, load: &mut std::process::Child, query_pattern: &str) {
+        let deadline = tokio::time::Instant::now() + LOCK_WAIT_DEADLINE;
+        loop {
+            let waiting: bool = self
+                .client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query LIKE $1)",
+                    &[&query_pattern],
+                )
+                .await
+                .expect("inspect lock waits")
+                .get(0);
+            if waiting {
+                return;
+            }
+            if let Some(status) = load.try_wait().expect("poll load process") {
+                panic!("load exited with {status} before waiting on {query_pattern}");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "load did not wait on {query_pattern} within {LOCK_WAIT_DEADLINE:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Removes test volumes from PostgreSQL and S3 and returns every failure.
+    async fn cleanup(self) -> Vec<String> {
+        let mut failures = Vec::new();
+        let payload_stores = self
+            .payload_stores
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (name, store) in payload_stores {
+            if let Err(error) = store.delete_volume_data().await {
+                failures.push(format!("delete payloads of {name}: {error}"));
+            }
+        }
+        if let Err(error) = self
+            .client
+            .execute(
+                "DELETE FROM volumes WHERE name = ANY($1::TEXT[])",
+                &[&self.volume_names],
+            )
+            .await
+        {
+            failures.push(format!("delete test volumes: {error}"));
+        }
+        drop(self.client);
+        self.connection.abort();
+        let _ = self.connection.await;
+        failures
+    }
+}
+
+async fn connect_pg(pg_dsn: &str) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
+    let (client, connection) = tokio_postgres::connect(pg_dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect postgres");
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    (client, connection)
+}
+
+async fn seed_accounting_row(
+    client: &tokio_postgres::Client,
+    table: &str,
+    volume_id: i64,
+    object_id: i64,
+    version: i64,
+) {
+    let inserted = match table {
+        "snapshot_current_references" => {
+            client
+                .execute(
+                    "INSERT INTO snapshot_current_references (vol, ino, object_id) VALUES ($1, $2, $3)",
+                    &[&volume_id, &ACCOUNTING_REFERENCE_INO, &object_id],
+                )
+                .await
+        }
+        "snapshot_object_reachability" => {
+            client
+                .execute(
+                    "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) VALUES ($1, $2, $3)",
+                    &[&volume_id, &object_id, &version],
+                )
+                .await
+        }
+        "snapshot_reachability_batches" => {
             client
                 .execute(
                     "INSERT INTO snapshot_reachability_batches (vol, batch_version) VALUES ($1, $2)",
-                    &[&bystander_volume, &dump_version],
+                    &[&volume_id, &version],
                 )
                 .await
-                .expect("seed bystander batch marker");
-            let scoped_load = run_studiofs(
-                home.path(),
-                &[
-                    "load",
-                    "--path-to-dump",
-                    dump_path.to_str().unwrap(),
-                    "--postgresql-address",
-                    &raw_pg,
-                ],
-            );
-            assert_ok(
-                &scoped_load,
-                "load target with bystander reachability state",
-            );
+        }
+        "snapshot_reachability_bootstrap" => {
             client
                 .execute(
-                    "DELETE FROM snapshot_reachability_batches WHERE vol = $1",
-                    &[&bystander_volume],
+                    "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, $2)",
+                    &[&volume_id, &version],
                 )
                 .await
-                .expect("clear bystander batch marker");
-
-            // Make the database state observably newer than the saved dump. A failed
-            // replacement must preserve this version, counter and event row.
+        }
+        "snapshot_payload_upload_objects" => {
             client
                 .execute(
-                    "INSERT INTO counters (vol, name, value) VALUES ($1, 'sfs868-sentinel', 868)",
-                    &[&target_volume],
+                    "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, $2, 'published')",
+                    &[&volume_id, &object_id],
                 )
                 .await
-                .expect("seed replacement sentinel counter");
-            client
-                .execute(
-                    "UPDATE volumes SET name = $2, block_size = 65536 WHERE vol = $1",
-                    &[&target_volume, &current_name],
-                )
-                .await
-                .expect("advance current volume identity fields");
-            let current_version: i64 = client
-                .query_one(
-                    "UPDATE metadata_state SET version = version + 1 WHERE vol = $1 RETURNING version",
-                    &[&target_volume],
-                )
-                .await
-                .expect("advance current metadata version")
-                .get(0);
-            client
-                .execute(
-                    "INSERT INTO event_log (vol, batch_version, event_type, event_payload) VALUES ($1, $2, 'sfs868-sentinel', $3)",
-                    &[&target_volume, &current_version, &Vec::<u8>::new()],
-                )
-                .await
-                .expect("seed replacement sentinel event");
-            let before = load_replacement_state(&client, target_volume).await;
-            assert_eq!(before, (current_name.clone(), 65536, current_version, 868, 1));
+        }
+        other => panic!("unknown accounting table {other}"),
+    };
+    assert_eq!(
+        inserted.expect("seed accounting row"),
+        1,
+        "seed one {table} row"
+    );
+}
 
-            // A rollback would reuse current_version for its next batch. Any retained
-            // accounting at that version must reject the older dump.
-            for (table, insert_sql) in [
-                (
-                    "snapshot_current_references",
-                    format!(
-                        "INSERT INTO snapshot_current_references (vol, ino, object_id) VALUES ($1, 868, {payload_object_id})"
-                    ),
-                ),
-                (
-                    "snapshot_object_reachability",
-                    format!(
-                        "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) VALUES ($1, {payload_object_id}, {current_version})"
-                    ),
-                ),
-                (
-                    "snapshot_reachability_batches",
-                    format!(
-                        "INSERT INTO snapshot_reachability_batches (vol, batch_version) VALUES ($1, {current_version})"
-                    ),
-                ),
-                (
-                    "snapshot_reachability_bootstrap",
-                    format!(
-                        "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, {current_version})"
-                    ),
-                ),
-                (
-                    "snapshot_payload_upload_objects",
-                    format!(
-                        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, {payload_object_id}, 'published')"
-                    ),
-                ),
-            ] {
-                client
-                    .execute(&insert_sql, &[&target_volume])
-                    .await
-                    .expect("seed target accounting");
+fn combined_output(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
 
-                let load = run_studiofs(
-                    home.path(),
-                    &[
-                        "load",
-                        "--path-to-dump",
-                        dump_path.to_str().unwrap(),
-                        "--postgresql-address",
-                        &raw_pg,
-                    ],
-                );
-                let output = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&load.stdout),
-                    String::from_utf8_lossy(&load.stderr)
-                );
-                assert!(
-                    !load.status.success(),
-                    "load must reject target rows in {table}; output: {output}"
-                );
-                assert!(
-                    output.contains(
-                        "cannot load metadata over existing reachability or payload upload state"
-                    ),
-                    "load should identify the blocking reachability or upload state; output: {output}"
-                );
-                assert_eq!(
-                    load_replacement_state(&client, target_volume).await,
-                    before,
-                    "rejected load must preserve volume identity, metadata version, counter and event row for {table}"
-                );
-                let marker_count: i64 = client
-                    .query_one(
-                        &format!("SELECT count(*) FROM {table} WHERE vol = $1"),
-                        &[&target_volume],
-                    )
-                    .await
-                    .expect("verify target reachability marker survived rejection")
-                    .get(0);
-                assert_eq!(marker_count, 1, "rejected load must preserve {table} row");
-
-                client
-                    .execute(
-                        &format!("DELETE FROM {table} WHERE vol = $1"),
-                        &[&target_volume],
-                    )
-                    .await
-                    .expect("clear target accounting");
-            }
-
-    })
+/// Runs `scenario` and then cleans the fixture's volumes, re-raising a
+/// scenario panic only after cleanup.
+fn run_load_guard_test(volume_names: Vec<String>, scenario: impl AsyncFnOnce(&LoadGuardFixture)) {
+    let runtime = tokio::runtime::Runtime::new().expect("build test runtime");
+    let fixture = runtime.block_on(LoadGuardFixture::connect(volume_names));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(scenario(&fixture));
     }));
-    // Clean both services even when an assertion or a CLI setup step panics.
-    let (payload_cleanup, metadata_cleanup) = runtime.block_on(async {
-        let payload_cleanup = if let Some(store) = payload_store {
-            store.delete_volume_data().await
-        } else {
-            Ok(())
-        };
-        let metadata_cleanup = client
-            .execute(
-                "DELETE FROM volumes WHERE name = ANY($1::TEXT[])",
-                &[&vec![target, bystander, current_name]],
-            )
-            .await;
-        drop(client);
-        conn_task.abort();
-        let _ = conn_task.await;
-        (payload_cleanup, metadata_cleanup)
-    });
-    if let Err(panic) = result {
+    let cleanup_failures = runtime.block_on(fixture.cleanup());
+    if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
-    payload_cleanup.expect("clean test payloads");
-    metadata_cleanup.expect("clean test volumes");
+    assert!(
+        cleanup_failures.is_empty(),
+        "clean test volumes: {cleanup_failures:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
+fn dump_load_into_new_metadata_server_ignores_other_volume_accounting() {
+    let target = random_name("dump-load-guard-target");
+    let bystander = random_name("dump-load-guard-bystander");
+    run_load_guard_test(vec![target.clone(), bystander.clone()], async |fixture| {
+        let payload = b"payload read back after migrating metadata";
+        fixture.init_volume(&target);
+        fixture.init_volume(&bystander);
+        let object_id = fixture.seed_and_dump(&target, payload).await;
+
+        // The new metadata server has no row for the dumped UUID; dropping
+        // the source row cascades its accounting away.
+        delete_volume_by_name(&fixture.pg_dsn, &target).await;
+        let bystander_volume = fixture.volume_id(&bystander).await;
+        for table in ACCOUNTING_TABLES {
+            fixture
+                .seed_accounting_row(table, bystander_volume, object_id, 1)
+                .await;
+        }
+
+        assert_ok(&fixture.load(), "load next to another volume's accounting");
+        for table in ACCOUNTING_TABLES {
+            assert_eq!(
+                fixture.table_rows(table, bystander_volume).await,
+                1,
+                "load must keep the other volume's {table} row"
+            );
+        }
+
+        let verify_home = studiofs_test_support::workspace_target_tempdir("verify-home-");
+        let discover = run_studiofs(
+            verify_home.path(),
+            &["discover", &target, "--meta", &fixture.raw_pg],
+        );
+        assert_ok(&discover, "discover loaded target");
+        verify_payload_from_discovered(verify_home.path(), &target, payload).await;
+    });
+}
+
+#[test]
+#[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
+fn dump_load_rejects_replacing_uuid_with_reachability_or_upload_state() {
+    let target = random_name("dump-load-guard-target");
+    let newer_name = format!("{target}-newer");
+    run_load_guard_test(vec![target.clone(), newer_name.clone()], async |fixture| {
+        fixture.init_volume(&target);
+        let object_id = fixture
+            .seed_and_dump(&target, b"payload referenced by the older dump")
+            .await;
+        let target_volume = fixture.volume_id(&target).await;
+        // Seed one table at a time so each rejection proves its own guard.
+        fixture.clear_accounting(target_volume).await;
+        let newer = fixture.advance_past_dump(target_volume, &newer_name).await;
+
+        for table in ACCOUNTING_TABLES {
+            // A rollback would reuse the newer version for its next batch.
+            fixture
+                .seed_accounting_row(table, target_volume, object_id, newer.metadata_version)
+                .await;
+
+            let load = fixture.load();
+            let output = combined_output(&load);
+            assert!(
+                !load.status.success(),
+                "load must reject target rows in {table}; output: {output}"
+            );
+            assert!(
+                output.contains(&format!("{ACCOUNTING_REJECTION} ({table})")),
+                "load should name {table} as the blocking state; output: {output}"
+            );
+            assert_eq!(
+                fixture.target_state(target_volume).await,
+                newer,
+                "rejected load must preserve the newer target state for {table}"
+            );
+            assert_eq!(
+                fixture.table_rows(table, target_volume).await,
+                1,
+                "rejected load must preserve the {table} row"
+            );
+            fixture.clear_accounting(target_volume).await;
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires RustFS/S3 + PostgreSQL test env (STUDIOFS_S3_*, STUDIOFS_TEST_PG_DSN)"]
+fn dump_load_rejects_accounting_row_committed_while_load_waits() {
+    let target = random_name("dump-load-guard-target");
+    run_load_guard_test(vec![target.clone()], async |fixture| {
+        fixture.init_volume(&target);
+        let object_id = fixture
+            .seed_and_dump(&target, b"payload raced by an accounting writer")
+            .await;
+        let target_volume = fixture.volume_id(&target).await;
+        fixture.clear_accounting(target_volume).await;
+
+        // Hold the load's advisory lock so `load` finishes its schema DDL and
+        // then parks before touching the volume row.
+        let (gate, gate_connection) = connect_pg(&fixture.pg_dsn).await;
+        gate.batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock({LOAD_ADVISORY_LOCK})"
+        ))
+        .await
+        .expect("hold load advisory lock");
+        let mut load = fixture.spawn_load();
+        fixture
+            .wait_for_load_lock_wait(&mut load, "%pg_advisory_xact_lock%")
+            .await;
+
+        // An uncommitted FK-backed insert holds KEY SHARE on the volume row,
+        // which only the load's explicit FOR UPDATE conflicts with.
+        let (writer, writer_connection) = connect_pg(&fixture.pg_dsn).await;
+        writer.batch_execute("BEGIN").await.expect("begin writer");
+        seed_accounting_row(
+            &writer,
+            "snapshot_reachability_batches",
+            target_volume,
+            object_id,
+            1,
+        )
+        .await;
+        gate.batch_execute("COMMIT")
+            .await
+            .expect("release load advisory lock");
+        fixture
+            .wait_for_load_lock_wait(&mut load, "%FROM volumes%FOR UPDATE%")
+            .await;
+        writer.batch_execute("COMMIT").await.expect("commit writer");
+        for (client, connection) in [(gate, gate_connection), (writer, writer_connection)] {
+            drop(client);
+            connection.abort();
+            let _ = connection.await;
+        }
+
+        let load = tokio::task::spawn_blocking(move || load.wait_with_output())
+            .await
+            .expect("join load waiter")
+            .expect("wait for load");
+        let output = combined_output(&load);
+        assert!(
+            !load.status.success(),
+            "load must see the row committed while it waited; output: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "{ACCOUNTING_REJECTION} (snapshot_reachability_batches)"
+            )),
+            "load should name the raced table; output: {output}"
+        );
+    });
 }
