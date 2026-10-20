@@ -1715,10 +1715,19 @@ mod tests {
 
     #[test]
     fn cache_index_opens_redb_4_1_database_and_preserves_rows() {
-        let temp = studiofs_test_support::workspace_target_tempdir("test-redb-4-1-cache-");
+        check_cache_index_fixture("4.1");
+    }
+
+    #[test]
+    fn cache_index_opens_redb_4_3_database_and_preserves_rows() {
+        check_cache_index_fixture("4.3");
+    }
+
+    fn check_cache_index_fixture(version: &str) {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-redb-compat-cache-");
         let database_path = temp.path().join("cache.redb");
-        let fixture_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redb-4.1-cache-index.redb");
+        let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("tests/fixtures/redb-{version}-cache-index.redb"));
         studiofs_test_support::copy_file_contents(&fixture_path, &database_path).unwrap_or_else(
             |err| panic!("failed to copy fixture {}: {err}", fixture_path.display()),
         );
@@ -1738,29 +1747,31 @@ mod tests {
         assert_eq!(index.dirty_object_count().unwrap(), 1);
 
         upsert_uploaded(&index, 42, 50);
+        let uploaded = index.get_entry(42).unwrap().expect("new entry");
+        assert_eq!(uploaded.object_id, 42);
+        assert_eq!(uploaded.payload_key, b"payload/42.object");
+        assert_eq!(uploaded.payload_len, 50);
+        assert_eq!(uploaded.lifecycle, LocalPayloadLifecycleState::Uploaded);
+        assert_eq!(uploaded.origin, LocalPayloadOrigin::Downloaded);
+        assert_eq!(uploaded.upload_state, LocalPayloadUploadState::None);
+        assert!(uploaded.evictable);
         let updated_stats = index.stats().unwrap();
         assert_eq!(updated_stats.current_bytes, 69);
         assert_eq!(updated_stats.dirty_bytes, 19);
         assert_eq!(updated_stats.evictable_bytes, 50);
-        assert!(index.get_entry(42).unwrap().is_some());
-
         drop(index);
 
         let reopened = open_index(&database_path);
         assert_eq!(reopened.stats().unwrap(), updated_stats);
         assert_eq!(reopened.dirty_object_count().unwrap(), 1);
         assert!(
-            reopened.get_entry(41).unwrap().as_ref() == Some(&entry),
-            "reopened entry 41 differs from the fixture row"
+            reopened.get_entry(41).unwrap() == Some(entry),
+            "redb {version}: fixture row changed"
         );
-        let entry_42 = reopened.get_entry(42).unwrap().expect("reopened entry 42");
-        assert_eq!(entry_42.object_id, 42);
-        assert_eq!(entry_42.payload_key, b"payload/42.object");
-        assert_eq!(entry_42.payload_len, 50);
-        assert_eq!(entry_42.lifecycle, LocalPayloadLifecycleState::Uploaded);
-        assert_eq!(entry_42.origin, LocalPayloadOrigin::Downloaded);
-        assert_eq!(entry_42.upload_state, LocalPayloadUploadState::None);
-        assert!(entry_42.evictable);
+        assert!(
+            reopened.get_entry(42).unwrap() == Some(uploaded),
+            "redb {version}: new row changed"
+        );
     }
 
     #[test]

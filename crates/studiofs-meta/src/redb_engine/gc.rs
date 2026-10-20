@@ -360,7 +360,7 @@ impl RedbMetaEngine {
             && let Ok(db) = db.try_read()
             && let Ok(transaction) = db.begin_write()
         {
-            // redb 4.3 exposes page stats only on WriteTransaction; reuse this scan for five seconds.
+            // redb (through 4.4) exposes page stats only on WriteTransaction; reuse this scan for five seconds.
             let stats = transaction.stats().ok().map(|stats| LocalStoragePageStats {
                 allocated_pages: stats.allocated_pages(),
                 leaf_pages: stats.leaf_pages(),

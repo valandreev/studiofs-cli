@@ -81,7 +81,7 @@ fn set_helpers_clear_preexisting_tombstones() {
     );
 }
 
-// redb 4.3 branch-page discriminant from tree_store/btree_base.rs.
+// redb 4.3/4.4 branch-page discriminant from tree_store/btree_base.rs.
 const BRANCH_PAGE_TYPE: u8 = 2;
 
 #[derive(Clone, Debug, Default)]
@@ -101,7 +101,7 @@ impl StorageBackend for RemoveFaultBackend {
         if out.first() == Some(&BRANCH_PAGE_TYPE) {
             self.last_branch_read.store(offset, Ordering::SeqCst);
             if self.corrupt_read_at.load(Ordering::SeqCst) == offset {
-                // redb 4.3 branch layout: 8-byte header, per-child 16-byte
+                // redb 4.3/4.4 branch layout: 8-byte header, per-child 16-byte
                 // checksums, then 8-byte pointers. Give child 0 an invalid
                 // page order, as in redb's corrupted_btree_descent regression.
                 // Only the read buffer changes; stored bytes remain intact.
@@ -728,7 +728,7 @@ fn acl_tombstone_removal_error_rolls_back_rule_update() {
 fn removal_fault_corrupts_only_first_child_order_once() {
     let backend = RemoveFaultBackend::default();
     let offset = 8;
-    // redb 4.3 branch: one key, two child checksums and pointers, then key data.
+    // redb 4.3/4.4 branch: one key, two child checksums and pointers, then key data.
     let mut stored = [0; 61];
     stored[0] = BRANCH_PAGE_TYPE;
     stored[2] = 1;
@@ -803,7 +803,7 @@ fn table_removal_error_aborts_metadata_write_transaction() {
 
     // Discover the symlink branch from an actual lookup, so the fault cannot
     // land in open_table's metadata lookup or in an unrelated table.
-    // redb 4.3 lookup and removal of this first key follow the same branch.
+    // redb 4.3/4.4 lookup and removal of this first key follow the same branch.
     let read = db.begin_read().unwrap();
     assert_eq!(
         read.open_table(SYMLINKS_TABLE)

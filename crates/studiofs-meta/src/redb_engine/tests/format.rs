@@ -11,40 +11,68 @@ fn test_format_info_roundtrip() {
 
 #[test]
 fn opens_redb_4_1_database_without_studiofs_format_migration() {
-    let temp = studiofs_test_support::workspace_target_tempdir("test-redb-4-1-meta-");
+    check_redb_fixture("4.1", None);
+}
+
+#[test]
+fn opens_redb_4_3_database_without_studiofs_format_migration() {
+    check_redb_fixture("4.3", Some(b"4.3.0"));
+}
+
+fn check_redb_fixture(version: &str, expected_writer_marker: Option<&[u8]>) {
+    let temp = studiofs_test_support::workspace_target_tempdir("test-redb-compat-meta-");
     let database_path = temp.path().join("metadata.redb");
     let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/redb-4.1-metadata.redb");
-    studiofs_test_support::copy_file_contents(&fixture_path, &database_path).unwrap_or_else(|err| {
-        panic!("failed to copy fixture {}: {err}", fixture_path.display())
-    });
+        .join(format!("tests/fixtures/redb-{version}-metadata.redb"));
+    studiofs_test_support::copy_file_contents(&fixture_path, &database_path)
+        .unwrap_or_else(|err| panic!("failed to copy fixture {}: {err}", fixture_path.display()));
 
     let probed = RedbMetaEngine::read_format_info_readonly(&database_path).unwrap();
+    // Every metadata fixture derives from the original 4.1 volume, so the
+    // identity is the same for each redb version.
     assert_eq!(probed.name, "redb-4.1-compat");
     assert_eq!(probed.format_version, CURRENT_FORMAT_VERSION);
 
     let engine = RedbMetaEngine::open(&database_path).unwrap();
-    let loaded = engine.get_format_info().unwrap();
-    assert_eq!(loaded.format_version, CURRENT_FORMAT_VERSION);
-    assert!(engine
-        .pending_uploaded_regular_file_recoveries()
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        engine.get_format_info().unwrap().format_version,
+        CURRENT_FORMAT_VERSION
+    );
+    if let Some(marker) = expected_writer_marker {
+        let read = engine.begin_read_txn().unwrap();
+        let settings = read.open_table(SETTINGS_TABLE).unwrap();
+        assert_eq!(
+            settings
+                .get("redb_compatibility_fixture_writer")
+                .unwrap()
+                .expect("fixture writer marker")
+                .value(),
+            marker
+        );
+    }
+    assert!(
+        engine
+            .pending_uploaded_regular_file_recoveries()
+            .unwrap()
+            .is_empty()
+    );
     let entry = engine.lookup(ROOT_INO, b"compat.txt").unwrap();
     assert_eq!(entry.kind, FileType::RegularFile);
 
     let created = engine
-        .create_file(ROOT_INO, b"new_under_4_3.txt", 1000, 1000, 0o644)
+        .create_file(ROOT_INO, b"new_under_current_redb.txt", 1000, 1000, 0o644)
         .unwrap();
     assert_eq!(
-        engine.lookup(ROOT_INO, b"new_under_4_3.txt").unwrap().ino,
+        engine
+            .lookup(ROOT_INO, b"new_under_current_redb.txt")
+            .unwrap()
+            .ino,
         created.ino
     );
     assert!(matches!(
         engine.compact_local_storage().unwrap(),
         LocalStorageCompactionResult::Compacted | LocalStorageCompactionResult::NoWork
     ));
-
     engine.prepare_for_close().unwrap();
     drop(engine);
 
@@ -58,7 +86,7 @@ fn opens_redb_4_1_database_without_studiofs_format_migration() {
     assert_eq!(reopened_entry.ino, entry.ino);
     assert_eq!(
         reopened
-            .lookup(ROOT_INO, b"new_under_4_3.txt")
+            .lookup(ROOT_INO, b"new_under_current_redb.txt")
             .unwrap()
             .ino,
         created.ino

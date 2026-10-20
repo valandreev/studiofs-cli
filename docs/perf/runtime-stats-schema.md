@@ -168,8 +168,8 @@ redb counter table.
 Physical file bytes and redb page statistics describe different things: the
 file may contain free or reusable pages, and redb stored bytes are not a count
 of logical StudioFS rows. The redb page gauges are best-effort and cached; a
-successful sample is reused for five seconds. redb 4.3 exposes them through
-`WriteTransaction::stats()`, so StudioFS refreshes them only when the shared
+successful sample is reused for five seconds. redb (through 4.4) exposes them
+through `WriteTransaction::stats()`, so StudioFS refreshes them only when the shared
 metadata writer mutex and nonblocking database read lock are available. After
 the sample expires, diagnostics reads attempt a refresh; if either gate or the
 refresh lock is busy, the previous sample is returned, even if stale. Page
