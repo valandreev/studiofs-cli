@@ -64,6 +64,40 @@ fn detects_divergence_lost_durable_write_resurrection_and_tree_errors() {
 }
 
 #[test]
+fn remote_object_reachability_requires_remote_presence() {
+    let mut snapshot = LogicalSnapshot::new(vec![ClientLogicalSnapshot {
+        client: "peer".to_string(),
+        entries: vec![LogicalEntry::file(
+            "file.txt",
+            "inode-file",
+            Some(ObjectRef::remote("object-a")),
+            None,
+            None,
+        )],
+    }]);
+
+    for (present_remote, protected) in [(false, true), (false, false), (true, false), (true, true)]
+    {
+        snapshot.objects = vec![ObjectLifecycle {
+            object_id: "object-a".to_string(),
+            present_remote,
+            protected,
+        }];
+
+        let report = validate_logical_invariants(&snapshot);
+
+        assert_eq!(
+            report.passed, present_remote,
+            "present_remote={present_remote}, protected={protected}: {report:?}"
+        );
+        assert_eq!(
+            report.violations.first().map(|v| v.invariant.as_str()),
+            (!present_remote).then_some("valid_object_reachability")
+        );
+    }
+}
+
+#[test]
 fn allows_explicit_hard_link_model_to_share_an_inode_across_paths() {
     let snapshot = LogicalSnapshot {
         schema_version: 1,

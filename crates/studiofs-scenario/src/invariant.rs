@@ -561,16 +561,14 @@ fn validate_object_reachability(
             let Some(object_ref) = &entry.object else {
                 continue;
             };
-            let lifecycle = objects.get(object_ref.object_id.as_str());
-            let reachable = match object_ref.location {
-                ObjectLocation::Local => true,
-                ObjectLocation::Remote => lifecycle
-                    .is_some_and(|lifecycle| lifecycle.present_remote || lifecycle.protected),
-            };
+            let reachable = matches!(object_ref.location, ObjectLocation::Local)
+                || objects
+                    .get(object_ref.object_id.as_str())
+                    .is_some_and(|lifecycle| lifecycle.present_remote);
             if !reachable {
                 violations.push(violation(
                     "valid_object_reachability",
-                    "referenced remote object is not present or protected",
+                    "referenced remote object is not present in remote storage",
                     Some(&client.client),
                     Some(&entry.path),
                     entry.logical_id.as_deref(),
