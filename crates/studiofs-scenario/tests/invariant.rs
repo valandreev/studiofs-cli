@@ -76,6 +76,11 @@ fn remote_object_reachability_requires_remote_presence() {
         )],
     }]);
 
+    let report = validate_logical_invariants(&snapshot);
+    assert!(!report.passed);
+    assert_eq!(report.violations.len(), 1);
+    assert_eq!(report.violations[0].invariant, "valid_object_reachability");
+
     for (present_remote, protected) in [(false, true), (false, false), (true, false), (true, true)]
     {
         snapshot.objects = vec![ObjectLifecycle {
@@ -90,9 +95,13 @@ fn remote_object_reachability_requires_remote_presence() {
             report.passed, present_remote,
             "present_remote={present_remote}, protected={protected}: {report:?}"
         );
+        assert_eq!(report.violations.len(), usize::from(!present_remote));
         assert_eq!(
-            report.violations.first().map(|v| v.invariant.as_str()),
-            (!present_remote).then_some("valid_object_reachability")
+            report
+                .violations
+                .first()
+                .map(|v| (v.invariant.as_str(), v.object_id.as_deref())),
+            (!present_remote).then_some(("valid_object_reachability", Some("object-a")))
         );
     }
 }

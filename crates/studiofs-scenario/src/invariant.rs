@@ -561,10 +561,12 @@ fn validate_object_reachability(
             let Some(object_ref) = &entry.object else {
                 continue;
             };
-            let reachable = matches!(object_ref.location, ObjectLocation::Local)
-                || objects
+            let reachable = match object_ref.location {
+                ObjectLocation::Local => true,
+                ObjectLocation::Remote => objects
                     .get(object_ref.object_id.as_str())
-                    .is_some_and(|lifecycle| lifecycle.present_remote);
+                    .is_some_and(|lifecycle| lifecycle.present_remote),
+            };
             if !reachable {
                 violations.push(violation(
                     "valid_object_reachability",
