@@ -63,8 +63,7 @@ fn detects_divergence_lost_durable_write_resurrection_and_tree_errors() {
     assert!(invariants.contains(&"idempotent_replication_replay"));
 }
 
-#[test]
-fn remote_object_reachability_requires_remote_presence() {
+fn peer_snapshot_with_remote_ref(objects: Vec<ObjectLifecycle>) -> LogicalSnapshot {
     let mut snapshot = LogicalSnapshot::new(vec![ClientLogicalSnapshot {
         client: "peer".to_string(),
         entries: vec![LogicalEntry::file(
@@ -75,33 +74,62 @@ fn remote_object_reachability_requires_remote_presence() {
             None,
         )],
     }]);
+    snapshot.objects = objects;
+    snapshot
+}
 
-    let report = validate_logical_invariants(&snapshot);
-    assert!(!report.passed);
-    assert_eq!(report.violations.len(), 1);
-    assert_eq!(report.violations[0].invariant, "valid_object_reachability");
+fn reachability_violations(snapshot: &LogicalSnapshot) -> Vec<(String, Option<String>)> {
+    validate_logical_invariants(snapshot)
+        .violations
+        .into_iter()
+        .map(|violation| (violation.invariant, violation.object_id))
+        .collect()
+}
 
-    for (present_remote, protected) in [(false, true), (false, false), (true, false), (true, true)]
-    {
-        snapshot.objects = vec![ObjectLifecycle {
-            object_id: "object-a".to_string(),
-            present_remote,
-            protected,
-        }];
+fn lifecycle(present_remote: bool, protected: bool) -> ObjectLifecycle {
+    ObjectLifecycle {
+        object_id: "object-a".to_string(),
+        present_remote,
+        protected,
+    }
+}
 
-        let report = validate_logical_invariants(&snapshot);
+fn unreachable_object_a() -> Vec<(String, Option<String>)> {
+    vec![(
+        "valid_object_reachability".to_string(),
+        Some("object-a".to_string()),
+    )]
+}
+
+#[test]
+fn remote_object_reachability_rejects_unknown_object() {
+    let snapshot = peer_snapshot_with_remote_ref(Vec::new());
+
+    assert_eq!(reachability_violations(&snapshot), unreachable_object_a());
+}
+
+#[test]
+fn remote_object_reachability_rejects_absent_object_even_when_protected() {
+    for protected in [false, true] {
+        let snapshot = peer_snapshot_with_remote_ref(vec![lifecycle(false, protected)]);
 
         assert_eq!(
-            report.passed, present_remote,
-            "present_remote={present_remote}, protected={protected}: {report:?}"
+            reachability_violations(&snapshot),
+            unreachable_object_a(),
+            "protected={protected}"
         );
-        assert_eq!(report.violations.len(), usize::from(!present_remote));
+    }
+}
+
+#[test]
+fn remote_object_reachability_accepts_present_object() {
+    for protected in [false, true] {
+        let snapshot = peer_snapshot_with_remote_ref(vec![lifecycle(true, protected)]);
+
         assert_eq!(
-            report
-                .violations
-                .first()
-                .map(|v| (v.invariant.as_str(), v.object_id.as_deref())),
-            (!present_remote).then_some(("valid_object_reachability", Some("object-a")))
+            reachability_violations(&snapshot),
+            Vec::new(),
+            "protected={protected}"
         );
     }
 }

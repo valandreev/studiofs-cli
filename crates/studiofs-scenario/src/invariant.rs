@@ -226,13 +226,16 @@ pub enum ObjectLocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Struct $name.
+/// Simulated object-store state for one object referenced by a snapshot.
 pub struct ObjectLifecycle {
-    /// Field $name.
+    /// Object identifier shared with [`ObjectRef::object_id`].
     pub object_id: String,
-    /// Field $name.
+    /// Whether the object's bytes exist in remote storage. This is the only
+    /// condition that makes an [`ObjectLocation::Remote`] reference reachable.
     pub present_remote: bool,
-    /// Field $name.
+    /// Whether the object is held back from deletion (local payload, pending
+    /// upload, or published ID). Protection does not make bytes available to
+    /// peers, so it never satisfies remote reachability.
     pub protected: bool,
 }
 
