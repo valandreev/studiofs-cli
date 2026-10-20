@@ -226,13 +226,16 @@ pub enum ObjectLocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// Struct $name.
+/// Simulated object-store state for one object referenced by a snapshot.
 pub struct ObjectLifecycle {
-    /// Field $name.
+    /// Object identifier shared with [`ObjectRef::object_id`].
     pub object_id: String,
-    /// Field $name.
+    /// Whether the object's bytes exist in remote storage. This is the only
+    /// condition that makes an [`ObjectLocation::Remote`] reference reachable.
     pub present_remote: bool,
-    /// Field $name.
+    /// Whether the object is held back from deletion (local payload, pending
+    /// upload, or published ID). Protection does not make bytes available to
+    /// peers, so it never satisfies remote reachability.
     pub protected: bool,
 }
 
@@ -561,16 +564,16 @@ fn validate_object_reachability(
             let Some(object_ref) = &entry.object else {
                 continue;
             };
-            let lifecycle = objects.get(object_ref.object_id.as_str());
             let reachable = match object_ref.location {
                 ObjectLocation::Local => true,
-                ObjectLocation::Remote => lifecycle
-                    .is_some_and(|lifecycle| lifecycle.present_remote || lifecycle.protected),
+                ObjectLocation::Remote => objects
+                    .get(object_ref.object_id.as_str())
+                    .is_some_and(|lifecycle| lifecycle.present_remote),
             };
             if !reachable {
                 violations.push(violation(
                     "valid_object_reachability",
-                    "referenced remote object is not present or protected",
+                    "referenced remote object is not present in remote storage",
                     Some(&client.client),
                     Some(&entry.path),
                     entry.logical_id.as_deref(),

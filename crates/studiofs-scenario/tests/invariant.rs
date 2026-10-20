@@ -63,6 +63,77 @@ fn detects_divergence_lost_durable_write_resurrection_and_tree_errors() {
     assert!(invariants.contains(&"idempotent_replication_replay"));
 }
 
+fn peer_snapshot_with_remote_ref(objects: Vec<ObjectLifecycle>) -> LogicalSnapshot {
+    let mut snapshot = LogicalSnapshot::new(vec![ClientLogicalSnapshot {
+        client: "peer".to_string(),
+        entries: vec![LogicalEntry::file(
+            "file.txt",
+            "inode-file",
+            Some(ObjectRef::remote("object-a")),
+            None,
+            None,
+        )],
+    }]);
+    snapshot.objects = objects;
+    snapshot
+}
+
+fn reachability_violations(snapshot: &LogicalSnapshot) -> Vec<(String, Option<String>)> {
+    validate_logical_invariants(snapshot)
+        .violations
+        .into_iter()
+        .map(|violation| (violation.invariant, violation.object_id))
+        .collect()
+}
+
+fn lifecycle(present_remote: bool, protected: bool) -> ObjectLifecycle {
+    ObjectLifecycle {
+        object_id: "object-a".to_string(),
+        present_remote,
+        protected,
+    }
+}
+
+fn unreachable_object_a() -> Vec<(String, Option<String>)> {
+    vec![(
+        "valid_object_reachability".to_string(),
+        Some("object-a".to_string()),
+    )]
+}
+
+#[test]
+fn remote_object_reachability_rejects_unknown_object() {
+    let snapshot = peer_snapshot_with_remote_ref(Vec::new());
+
+    assert_eq!(reachability_violations(&snapshot), unreachable_object_a());
+}
+
+#[test]
+fn remote_object_reachability_rejects_absent_object_even_when_protected() {
+    for protected in [false, true] {
+        let snapshot = peer_snapshot_with_remote_ref(vec![lifecycle(false, protected)]);
+
+        assert_eq!(
+            reachability_violations(&snapshot),
+            unreachable_object_a(),
+            "protected={protected}"
+        );
+    }
+}
+
+#[test]
+fn remote_object_reachability_accepts_present_object() {
+    for protected in [false, true] {
+        let snapshot = peer_snapshot_with_remote_ref(vec![lifecycle(true, protected)]);
+
+        assert_eq!(
+            reachability_violations(&snapshot),
+            Vec::new(),
+            "protected={protected}"
+        );
+    }
+}
+
 #[test]
 fn allows_explicit_hard_link_model_to_share_an_inode_across_paths() {
     let snapshot = LogicalSnapshot {
