@@ -1600,7 +1600,10 @@ impl StudioVfs {
                 "debug target read_into_fh before file-session gate"
             );
         }
-        self.wait_for_deferred_release_inflight(ino).await;
+        // Reads do not wait for a deferred last-handle release: until its exclusive
+        // Release session starts, the closed writer's local state stays readable
+        // through the dirty overlay, and the session gate orders reads against the
+        // release action itself.
         let session = self
             .state
             .file_session

@@ -3498,6 +3498,56 @@ fn read_into_fh_reads_dirty_overlay_while_materialize_is_active() {
 }
 
 #[test]
+fn read_after_writer_close_does_not_wait_for_deferred_release_materialization() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-after-deferred-release");
+    let runtime = rt.handle().clone();
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"read-after-deferred-release.bin", 0, 0, 0o644)
+            .unwrap();
+        let writer = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(writer, attr.ino, 0, b"closed-writer-overlay")
+            .await
+            .unwrap();
+
+        // Hold materialization so the deferred last-handle release stays in flight,
+        // as it does while a large write backlog drains to the local payload store.
+        let materialize = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Materialize)
+            .await;
+        let release = vfs.release_fh_with_deferred_last_handle_barrier(writer, &runtime);
+        assert!(release.closed_last_handle);
+        assert!(
+            vfs.state.deferred_release_inflight.contains(attr.ino),
+            "test setup should keep the deferred release barrier registered"
+        );
+
+        let reader = vfs.open_file(attr.ino, OpenFlags::RDONLY, false).unwrap();
+        let mut out = [0; 21];
+        let read = tokio::time::timeout(Duration::from_millis(500), async {
+            vfs.read_into_fh(reader, attr.ino, 0, &mut out).await
+        })
+        .await
+        .expect("read should not queue behind deferred release materialization")
+        .expect("dirty overlay read after writer close should succeed");
+        assert_eq!(read as usize, out.len());
+        assert_eq!(&out, b"closed-writer-overlay");
+
+        drop(materialize);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.wait_for_deferred_release_inflight(attr.ino),
+        )
+        .await
+        .expect("deferred release should drain once materialization resumes");
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
 fn opportunistic_write_does_not_wait_for_background_materialize_session() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "write-during-materialize");
