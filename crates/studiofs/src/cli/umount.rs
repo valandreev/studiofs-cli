@@ -66,12 +66,12 @@ fn run_with(
     );
 
     #[cfg(windows)]
-    unmount_windows(mount_point, pid)?;
+    unmount_windows(mount_point, pid, is_mount_active)?;
     #[cfg(unix)]
     unmount_unix(mount_point, pid, is_mount_active)?;
 
     #[cfg(windows)]
-    if is_mount_active(mount_point)? {
+    if !wait_for_mount_inactive(mount_point, is_mount_active)? {
         anyhow::bail!(
             "mount process {pid} exited but the lifecycle lock is still held; leaving mount record intact"
         );
@@ -98,12 +98,34 @@ pub fn run(mount_point: &str) -> Result<()> {
 // ─── Windows ─────────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
-fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
-    unmount_windows_with_timeout(mount_point, pid, 15_000)
+fn unmount_windows(mount_point: &str, pid: u32, is_mount_active: IsMountActiveFn) -> Result<()> {
+    unmount_windows_with_timeout(mount_point, pid, 15_000, is_mount_active)
+}
+
+/// Windows releases a dead process's file locks asynchronously, so poll briefly after exit.
+#[cfg(windows)]
+fn wait_for_mount_inactive(mount_point: &str, is_mount_active: IsMountActiveFn) -> Result<bool> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if !is_mount_active(mount_point)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[cfg(windows)]
-fn unmount_windows_with_timeout(mount_point: &str, pid: u32, exit_timeout_ms: u32) -> Result<()> {
+fn unmount_windows_with_timeout(
+    mount_point: &str,
+    pid: u32,
+    exit_timeout_ms: u32,
+    is_mount_active: IsMountActiveFn,
+) -> Result<()> {
     use anyhow::Context;
     use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 
@@ -132,6 +154,11 @@ fn unmount_windows_with_timeout(mount_point: &str, pid: u32, exit_timeout_ms: u3
     }
     // SAFETY: OpenProcess returned a valid, uniquely owned kernel handle.
     let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    // The open handle pins the PID; if the lock is already free, the mount exited and the PID
+    // may belong to an unrelated process, so never signal or terminate it.
+    if !is_mount_active(mount_point)? {
+        return Ok(());
+    }
     let wide: Vec<u16> = super::utils::shutdown_event_name(mount_point)
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -994,7 +1021,7 @@ mod tests {
         fn missing_event_forces_termination_and_confirms_exit() {
             let mp = format!("umount-{}", uuid::Uuid::new_v4());
             let (mut child, _event) = waiting_child(&format!("{mp}-child"));
-            let result = unmount_windows_with_timeout(&mp, child.0.id(), 100);
+            let result = unmount_windows_with_timeout(&mp, child.0.id(), 100, test_mount_active);
             let exited = child.0.try_wait().unwrap();
             assert!(result.is_ok(), "{result:?}");
             assert_eq!(exited.unwrap().code(), Some(1));
@@ -1002,7 +1029,43 @@ mod tests {
 
         #[test]
         fn nonexistent_process_is_already_gone() {
-            assert!(unmount_windows("__test_gone_umount__", u32::MAX).is_ok());
+            assert!(unmount_windows("__test_gone_umount__", u32::MAX, test_mount_active).is_ok());
+        }
+
+        #[test]
+        fn released_lock_after_open_leaves_reused_pid_running() {
+            let mp = format!("umount-{}", uuid::Uuid::new_v4());
+            let (mut child, _event) = waiting_child(&mp);
+            let result =
+                unmount_windows_with_timeout(&mp, child.0.id(), 100, test_mount_not_active);
+            assert!(result.is_ok(), "{result:?}");
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
+
+        fn test_mount_releases_after_exit(_mount_point: &str) -> Result<bool> {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static CHECKS: AtomicUsize = AtomicUsize::new(0);
+            // Held for preflight and the first post-exit check, then released.
+            Ok(CHECKS.fetch_add(1, Ordering::SeqCst) < 2)
+        }
+
+        #[test]
+        fn delayed_lock_release_after_exit_still_removes_record() {
+            let _guard = pid_test_lock();
+            let mp = "__test_delayed_lock_release__";
+            *pid_state() = TestPidState {
+                value: Some((u32::MAX, mp.into(), "test".into())),
+                removed: false,
+            };
+            let result = run_with(
+                mp,
+                test_read_pid_file,
+                test_remove_pid_file,
+                test_process_running,
+                test_mount_releases_after_exit,
+            );
+            assert!(result.is_ok(), "{result:?}");
+            assert!(pid_state().removed);
         }
     }
 }
