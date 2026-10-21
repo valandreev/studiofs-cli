@@ -39,7 +39,7 @@ fn run_with(
     let (pid, mp, volume) = read_pid_file(mount_point)?;
 
     if !is_mount_active(mount_point)? {
-        let _ = remove_pid_file(mount_point);
+        remove_pid_file(mount_point)?;
         println!(
             "Mount for '{}' has no active lifecycle lock. Cleaned up stale state (recorded PID {}).",
             mp, pid
@@ -48,6 +48,11 @@ fn run_with(
     }
 
     if !is_process_running(pid) {
+        if !is_mount_active(mount_point)? {
+            remove_pid_file(mount_point)?;
+            println!("Mount for '{mp}' exited during unmount preflight. Cleaned up stale state.");
+            return Ok(());
+        }
         anyhow::bail!(
             "Mount for '{}' is still lock-held, but the recorded PID {} is not running or cannot be accessed. Refusing to terminate an unrelated process. Check process permissions; retry from an elevated terminal if the mount was started elevated.",
             mp,
@@ -65,8 +70,15 @@ fn run_with(
     #[cfg(unix)]
     unmount_unix(mount_point, pid, is_mount_active)?;
 
+    #[cfg(windows)]
+    if is_mount_active(mount_point)? {
+        anyhow::bail!(
+            "mount process {pid} exited but the lifecycle lock is still held; leaving mount record intact"
+        );
+    }
+
     // Clean up the persisted mount record.
-    let _ = remove_pid_file(mount_point);
+    remove_pid_file(mount_point)?;
 
     println!("✓ Successfully unmounted '{}'", mount_point);
     Ok(())
@@ -77,7 +89,7 @@ pub fn run(mount_point: &str) -> Result<()> {
     run_with(
         &mount_point,
         super::utils::read_pid_file,
-        super::utils::remove_pid_file,
+        super::utils::remove_inactive_pid_file,
         super::utils::is_process_running,
         super::utils::mount_is_active,
     )
@@ -87,15 +99,19 @@ pub fn run(mount_point: &str) -> Result<()> {
 
 #[cfg(windows)]
 fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
+    unmount_windows_with_timeout(mount_point, pid, 15_000)
+}
+
+#[cfg(windows)]
+fn unmount_windows_with_timeout(mount_point: &str, pid: u32, exit_timeout_ms: u32) -> Result<()> {
     use anyhow::Context;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 
     unsafe extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
         fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> *mut core::ffi::c_void;
         fn SetEvent(event: *mut core::ffi::c_void) -> i32;
         fn WaitForSingleObject(handle: *mut core::ffi::c_void, timeout: u32) -> u32;
-        fn TerminateProcess(process: *mut core::ffi::c_void, exit_code: u32) -> i32;
     }
     const SYNCHRONIZE: u32 = 0x00100000;
     const PROCESS_TERMINATE: u32 = 0x0001;
@@ -104,7 +120,6 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const WAIT_OBJECT_0: u32 = 0;
     const WAIT_TIMEOUT: u32 = 258;
-    const EXIT_TIMEOUT_MS: u32 = 15_000;
 
     // SAFETY: OpenProcess accepts the access mask and PID; null is checked before ownership.
     let process = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
@@ -141,7 +156,7 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
 
     let wait_for_exit = || -> Result<bool> {
         // SAFETY: The owned process handle has SYNCHRONIZE access and outlives the wait.
-        match unsafe { WaitForSingleObject(process.as_raw_handle(), EXIT_TIMEOUT_MS) } {
+        match unsafe { WaitForSingleObject(process.as_raw_handle(), exit_timeout_ms) } {
             WAIT_OBJECT_0 => Ok(true),
             WAIT_TIMEOUT => Ok(false),
             u32::MAX => {
@@ -153,15 +168,36 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
     if wait_for_exit()? {
         return Ok(());
     }
-    tracing::warn!("mount process did not exit within 15 s — force-killing");
-    // SAFETY: The owned process handle remains open and has terminate access.
-    if unsafe { TerminateProcess(process.as_raw_handle(), 1) } == 0 {
-        return Err(std::io::Error::last_os_error()).context("could not terminate mount process");
-    }
+    tracing::warn!(
+        exit_timeout_ms,
+        "mount process did not exit before timeout — force-killing"
+    );
+    terminate_windows_process(process.as_handle()).context("could not terminate mount process")?;
     if !wait_for_exit().context("could not confirm terminated mount process exit")? {
         anyhow::bail!(
-            "mount process {pid} did not exit within 15 s after termination; leaving mount record intact"
+            "mount process {pid} did not exit within {exit_timeout_ms} ms after termination; leaving mount record intact"
         );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn terminate_windows_process(
+    process: std::os::windows::io::BorrowedHandle<'_>,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    unsafe extern "system" {
+        fn TerminateProcess(process: *mut core::ffi::c_void, exit_code: u32) -> i32;
+        fn WaitForSingleObject(handle: *mut core::ffi::c_void, timeout: u32) -> u32;
+    }
+    // SAFETY: The borrowed handle remains open; Windows validates the requested access.
+    if unsafe { TerminateProcess(process.as_raw_handle(), 1) } == 0 {
+        let error = std::io::Error::last_os_error();
+        // Exit can win the race after the graceful wait times out.
+        // SAFETY: The borrowed process handle remains open for this nonblocking wait.
+        if unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } != 0 {
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -444,12 +480,21 @@ mod tests {
     #[cfg(unix)]
     static TEST_UNIX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-    fn pid_state() -> &'static Mutex<TestPidState> {
-        TEST_PID_STATE.get_or_init(|| Mutex::new(TestPidState::default()))
+    fn pid_state() -> std::sync::MutexGuard<'static, TestPidState> {
+        TEST_PID_STATE
+            .get_or_init(|| Mutex::new(TestPidState::default()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn pid_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_PID_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn test_read_pid_file(mount_point: &str) -> Result<(u32, String, String)> {
-        let state = pid_state().lock().unwrap();
+        let state = pid_state();
         state
             .value
             .clone()
@@ -457,7 +502,7 @@ mod tests {
     }
 
     fn test_remove_pid_file(_mount_point: &str) -> Result<()> {
-        let mut state = pid_state().lock().unwrap();
+        let mut state = pid_state();
         state.value = None;
         state.removed = true;
         Ok(())
@@ -469,6 +514,50 @@ mod tests {
 
     fn test_mount_not_active(_mount_point: &str) -> Result<bool> {
         Ok(false)
+    }
+
+    fn test_mount_active_once(_mount_point: &str) -> Result<bool> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CHECKS: AtomicUsize = AtomicUsize::new(0);
+        Ok(CHECKS.fetch_add(1, Ordering::SeqCst) == 0)
+    }
+
+    #[test]
+    fn process_exit_during_preflight_rechecks_the_lifecycle_lock() {
+        let _guard = pid_test_lock();
+        let mp = "__test_preflight_exit__";
+        *pid_state() = TestPidState {
+            value: Some((u32::MAX, mp.into(), "test".into())),
+            removed: false,
+        };
+        let result = run_with(
+            mp,
+            test_read_pid_file,
+            test_remove_pid_file,
+            |_| false,
+            test_mount_active_once,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert!(pid_state().removed);
+    }
+
+    #[test]
+    fn record_removal_errors_are_reported() {
+        let _guard = pid_test_lock();
+        let mp = "__test_remove_failure__";
+        *pid_state() = TestPidState {
+            value: Some((u32::MAX, mp.into(), "test".into())),
+            removed: false,
+        };
+        let result = run_with(
+            mp,
+            test_read_pid_file,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
+            test_process_running,
+            test_mount_not_active,
+        );
+        assert!(result.is_err());
+        assert!(pid_state().value.is_some());
     }
 
     #[cfg(any(unix, windows))]
@@ -552,10 +641,10 @@ mod tests {
     /// clean it up without trusting the recorded PID.
     #[test]
     fn umount_stale_pid_file_cleanup() {
-        let _guard = TEST_PID_LOCK.lock().unwrap();
+        let _guard = pid_test_lock();
         let mp = "__test_stale_umount__";
         {
-            let mut state = pid_state().lock().unwrap();
+            let mut state = pid_state();
             state.value = Some((0xFFFF_FFFE, mp.to_string(), "fakevol".to_string()));
             state.removed = false;
         }
@@ -573,7 +662,7 @@ mod tests {
             "umount of stale PID should succeed: {result:?}"
         );
 
-        let state = pid_state().lock().unwrap();
+        let state = pid_state();
         assert!(state.removed, "PID file should have been removed");
         assert!(state.value.is_none(), "PID state should be cleared");
     }
@@ -735,10 +824,68 @@ mod tests {
     mod windows_tests {
         use super::*;
         use std::os::windows::{
-            io::{FromRawHandle, OwnedHandle},
+            io::{AsHandle, FromRawHandle, OwnedHandle},
             process::CommandExt,
         };
         use std::process::{Child, Command, Stdio};
+
+        struct TestChild(Child);
+
+        impl Drop for TestChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        #[test]
+        fn termination_accepts_a_process_that_exited_at_the_timeout_boundary() {
+            let mut child = TestChild(
+                Command::new("cmd.exe")
+                    .args(["/C", "exit", "0"])
+                    .creation_flags(0x08000000)
+                    .spawn()
+                    .unwrap(),
+            );
+            assert!(child.0.wait().unwrap().success());
+            assert!(terminate_windows_process(child.0.as_handle()).is_ok());
+        }
+
+        #[test]
+        fn termination_denial_for_a_live_process_is_reported() {
+            unsafe extern "system" {
+                fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+            }
+            let mp = format!("umount-{}", uuid::Uuid::new_v4());
+            let (mut child, _event) = waiting_child(&mp);
+            // SAFETY: Open the live child with SYNCHRONIZE access only; check before ownership.
+            let handle = unsafe { OpenProcess(0x00100000, 0, child.0.id()) };
+            assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+            // SAFETY: OpenProcess returned a valid, uniquely owned kernel handle.
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+            let error = terminate_windows_process(handle.as_handle()).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(5));
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
+
+        #[test]
+        fn exited_pid_does_not_remove_a_record_whose_lock_is_still_held() {
+            let _guard = pid_test_lock();
+            let mp = "__test_held_lock_after_exit__";
+            *pid_state() = TestPidState {
+                value: Some((u32::MAX, mp.into(), "test".into())),
+                removed: false,
+            };
+            let result = run_with(
+                mp,
+                test_read_pid_file,
+                test_remove_pid_file,
+                test_process_running,
+                test_mount_active,
+            );
+            assert!(result.is_err());
+            assert!(!pid_state().removed);
+        }
 
         fn kernel_object(mount_point: &str, mutex: bool) -> OwnedHandle {
             unsafe extern "system" {
@@ -754,7 +901,7 @@ mod tests {
                     name: *const u16,
                 ) -> *mut core::ffi::c_void;
             }
-            let wide: Vec<u16> = super::super::super::utils::shutdown_event_name(mount_point)
+            let wide: Vec<u16> = crate::cli::utils::shutdown_event_name(mount_point)
                 .encode_utf16()
                 .chain(Some(0))
                 .collect();
@@ -771,25 +918,25 @@ mod tests {
             unsafe { OwnedHandle::from_raw_handle(handle) }
         }
 
-        fn waiting_child(mount_point: &str) -> (Child, OwnedHandle) {
+        fn waiting_child(mount_point: &str) -> (TestChild, OwnedHandle) {
             let event = kernel_object(mount_point, false);
             let child = Command::new("powershell.exe")
                 .args(["-NoProfile", "-NonInteractive", "-Command",
                     "$ErrorActionPreference = 'Stop'; try { $event = [System.Threading.EventWaitHandle]::OpenExisting($env:STUDIOFS_TEST_SHUTDOWN_EVENT); if (-not $event.WaitOne(30000)) { exit 2 } } catch { exit 3 }"])
-                .env("STUDIOFS_TEST_SHUTDOWN_EVENT", super::super::super::utils::shutdown_event_name(mount_point))
+                .env("STUDIOFS_TEST_SHUTDOWN_EVENT", crate::cli::utils::shutdown_event_name(mount_point))
                 .creation_flags(0x08000000) // CREATE_NO_WINDOW
                 .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-                .spawn().unwrap();
+                .spawn().map(TestChild).unwrap();
             (child, event)
         }
 
         #[test]
         fn graceful_exit_removes_record_after_child_exits() {
-            let _guard = TEST_PID_LOCK.lock().unwrap();
+            let _guard = pid_test_lock();
             let mp = format!("umount-{}", uuid::Uuid::new_v4());
             let (mut child, _event) = waiting_child(&mp);
-            *pid_state().lock().unwrap() = TestPidState {
-                value: Some((child.id(), mp.clone(), "test".into())),
+            *pid_state() = TestPidState {
+                value: Some((child.0.id(), mp.clone(), "test".into())),
                 removed: false,
             };
             let result = run_with(
@@ -797,28 +944,30 @@ mod tests {
                 test_read_pid_file,
                 test_remove_pid_file,
                 test_process_running,
-                test_mount_active,
+                |_| {
+                    Ok(crate::cli::utils::is_process_running(
+                        pid_state().value.as_ref().unwrap().0,
+                    ))
+                },
             );
-            let exited = child.try_wait().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
+            let exited = child.0.try_wait().unwrap();
             assert!(result.is_ok(), "{result:?}");
             assert!(
                 exited.unwrap().success(),
                 "child must exit through the shutdown event"
             );
-            assert!(pid_state().lock().unwrap().removed);
+            assert!(pid_state().removed);
         }
 
         #[test]
         fn native_event_error_keeps_record_and_child_running() {
-            let _guard = TEST_PID_LOCK.lock().unwrap();
+            let _guard = pid_test_lock();
             let mp = format!("umount-{}", uuid::Uuid::new_v4());
             let (mut child, _event) = waiting_child(&format!("{mp}-child"));
             // A different kernel object under the shutdown name makes OpenEventW fail.
             let _mutex = kernel_object(&mp, true);
-            *pid_state().lock().unwrap() = TestPidState {
-                value: Some((child.id(), mp.clone(), "test".into())),
+            *pid_state() = TestPidState {
+                value: Some((child.0.id(), mp.clone(), "test".into())),
                 removed: false,
             };
             let result = run_with(
@@ -828,9 +977,7 @@ mod tests {
                 test_process_running,
                 test_mount_active,
             );
-            let still_running = child.try_wait().unwrap().is_none();
-            let _ = child.kill();
-            let _ = child.wait();
+            let still_running = child.0.try_wait().unwrap().is_none();
             let error = result.unwrap_err();
             assert_eq!(
                 error
@@ -840,17 +987,15 @@ mod tests {
                 Some(6)
             );
             assert!(still_running);
-            assert!(!pid_state().lock().unwrap().removed);
+            assert!(!pid_state().removed);
         }
 
         #[test]
         fn missing_event_forces_termination_and_confirms_exit() {
             let mp = format!("umount-{}", uuid::Uuid::new_v4());
             let (mut child, _event) = waiting_child(&format!("{mp}-child"));
-            let result = unmount_windows(&mp, child.id());
-            let exited = child.try_wait().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
+            let result = unmount_windows_with_timeout(&mp, child.0.id(), 100);
+            let exited = child.0.try_wait().unwrap();
             assert!(result.is_ok(), "{result:?}");
             assert_eq!(exited.unwrap().code(), Some(1));
         }
