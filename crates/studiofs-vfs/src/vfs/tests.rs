@@ -3548,6 +3548,65 @@ fn read_after_writer_close_does_not_wait_for_deferred_release_materialization() 
 }
 
 #[test]
+fn read_only_flush_does_not_wait_for_deferred_release_materialization() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-only-flush-deferred-release");
+    let runtime = rt.handle().clone();
+    rt.block_on(async move {
+        let attr = vfs
+            .create(
+                ROOT_INO,
+                b"read-only-flush-deferred-release.bin",
+                0,
+                0,
+                0o644,
+            )
+            .unwrap();
+        let writer = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(writer, attr.ino, 0, b"closed-writer-overlay")
+            .await
+            .unwrap();
+
+        // Hold materialization so the deferred last-handle release stays in flight,
+        // as it does while a large write backlog drains to the local payload store.
+        let materialize = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Materialize)
+            .await;
+        let release = vfs.release_fh_with_deferred_last_handle_barrier(writer, &runtime);
+        assert!(release.closed_last_handle);
+        assert!(
+            vfs.state.deferred_release_inflight.contains(attr.ino),
+            "test setup should keep the deferred release barrier registered"
+        );
+
+        // macFUSE and Linux FUSE send FLUSH on every close(2), including a reader's.
+        let reader = vfs.open_file(attr.ino, OpenFlags::RDONLY, false).unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            vfs.flush_volatile_writeback_with_outcome(attr.ino, reader),
+        )
+        .await
+        .expect("read-only flush should not queue behind deferred release materialization")
+        .expect("read-only flush should succeed");
+        assert!(
+            vfs.state.deferred_release_inflight.contains(attr.ino),
+            "read-only flush must not have drained the writer's deferred release"
+        );
+
+        drop(materialize);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.wait_for_deferred_release_inflight(attr.ino),
+        )
+        .await
+        .expect("deferred release should drain once materialization resumes");
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
 fn opportunistic_write_does_not_wait_for_background_materialize_session() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "write-during-materialize");

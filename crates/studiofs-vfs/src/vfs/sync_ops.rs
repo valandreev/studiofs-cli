@@ -1107,17 +1107,27 @@ impl StudioVfs {
         ino: Ino,
         fh: u64,
     ) -> VfsResult<ExplicitFlushOutcome> {
-        let target_ino = if fh != 0 {
-            self.handle_table.get(fh).map(|open_file| open_file.ino)
+        let open_file = if fh != 0 {
+            self.handle_table.get(fh)
         } else {
             None
+        };
+        let target_ino = open_file.as_ref().map_or(ino, |open_file| open_file.ino);
+        // A read-only handle accepted no writes, so its flush (sent on every
+        // close(2)) has nothing to admit. It must not wait for a deferred
+        // last-handle release, which holds the close until an earlier writer's
+        // whole backlog materializes, nor start a materializer that the
+        // release's session would then wait on. fsync keeps the strict wait.
+        let write_capable = open_file
+            .as_ref()
+            .is_none_or(|open_file| open_file.flags.allows_write());
+        if write_capable {
+            self.wait_for_deferred_release_inflight(target_ino).await;
         }
-        .unwrap_or(ino);
-        self.wait_for_deferred_release_inflight(target_ino).await;
         self.ensure_volatile_overlay_metadata_healthy()?;
         self.ensure_deferred_namespace_metadata_healthy()?;
         let had_local_dirty_state = self.inode_has_local_dirty_state(target_ino);
-        if self.state.writer_stack.has_dirty_writers(target_ino) {
+        if write_capable && self.state.writer_stack.has_dirty_writers(target_ino) {
             self.spawn_deferred_materialization_if_needed(target_ino);
         }
         Ok(ExplicitFlushOutcome {
