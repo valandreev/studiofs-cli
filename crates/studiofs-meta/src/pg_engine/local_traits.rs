@@ -74,6 +74,10 @@ impl MetaInodes for PgMetaEngine {
     fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
         self.local.list_inode_attrs()
     }
+
+    fn list_inode_ids_after(&self, after: Option<Ino>, limit: usize) -> MetaResult<Vec<Ino>> {
+        self.local.list_inode_ids_after(after, limit)
+    }
 }
 
 impl MetaNamespace for PgMetaEngine {

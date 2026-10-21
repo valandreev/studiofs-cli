@@ -940,17 +940,27 @@ impl StudioVfs {
         self.apply_coherence_transition(|health| health.begin_global_reset(generation));
     }
 
-    fn note_coherence_coverage_confirmed(&self, covered_boundary: Option<u64>, now_unix_ms: u64) {
+    pub(super) fn note_coherence_coverage_confirmed(
+        &self,
+        covered_boundary: Option<u64>,
+        now_unix_ms: u64,
+    ) {
         self.apply_coherence_transition(|health| {
             health.note_coverage_confirmed(covered_boundary, now_unix_ms);
         });
     }
 
     fn apply_coherence_transition(&self, transition: impl FnOnce(&mut CoherenceHealthTracker)) {
+        // Sample the adapter before taking the health lock: adapters may need
+        // their own queue lock, and every promotion path must observe recovery.
+        let recovery_pending = self
+            .kernel_invalidator()
+            .is_some_and(|invalidator| invalidator.invalidation_recovery_pending());
         let (became_unsafe, entered_degraded, entered_stopped) = {
             let mut health = self.coherence_health.lock();
             let was_safe = health.allows_cache();
             let previous_state = health.snapshot().state;
+            health.note_adapter_recovery_pending(recovery_pending);
             transition(&mut health);
             let current_state = health.snapshot().state;
             (

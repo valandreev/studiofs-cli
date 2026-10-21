@@ -1336,6 +1336,15 @@ pub trait KernelInvalidator: Send + Sync {
         0
     }
 
+    /// Whether adapter recovery still has invalidation coverage work in progress.
+    ///
+    /// The `false` default is only correct for adapters with no recovery concept.
+    /// An adapter that can lose and later recover invalidations must override this
+    /// and report `true` until coverage is restored, or the VFS fails open.
+    fn invalidation_recovery_pending(&self) -> bool {
+        false
+    }
+
     /// Reset bridge-local diagnostics counters for a fresh observability interval.
     fn reset_diagnostics(&self) {}
 }

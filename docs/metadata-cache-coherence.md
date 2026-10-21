@@ -190,6 +190,29 @@ observation check before cache admission.
 
 The WinFSP adapter preserves path/action/filter identities when coalescing and
 keeps old paths during retry. Semantic enqueue and retry cannot block at capacity.
+An individual inode request rejected at capacity retains a fixed-size overflow
+marker. Timer drains refill the queue from bounded, sorted pages of local redb
+inode candidates; removed candidates are skipped during ordinary preparation.
+This conservative sweep may purge unrelated cached inodes, but needs no further
+metadata mutation or remote service. A repeated overflow at or behind the cursor
+restarts it (one ahead keeps progress) while preserving the oldest overflow age;
+shutdown cancels reconciliation. A failed page read is retried on the next tick,
+not counted as a lost notification. A transient attribute read error during
+preparation requeues the inode instead of dropping its purge. Page reads
+run outside the producer's queue lock, and existing writer protection still
+applies. No unbounded overflow list or whole-volume snapshot is retained.
+Sweep cost is proportional to the local inode count, and OS-cache admission and
+health promotion stay disabled for the whole mount until it finishes, so on large
+volumes repeated bursts can keep the mount uncached; this cost is not yet measured.
+Rejected path retries with a known inode also restart this sweep. It recovers
+current inode paths; it cannot reconstruct lost historical rename/unlink names,
+whose rejection remains an observable delivery failure. A full queue drains
+before the next timer pass can refill it, leaving slots for writer-deferred
+historical targets. Each metadata page bounds raw candidates, including tombstones,
+rather than scanning an unbounded number of deleted rows to fill a live page.
+Native notification names are counted UTF-16 without a terminator. The Rust
+`set_name` convenience method includes a NUL in the reported size, so this
+adapter uses `set_name_raw` to avoid an invalid native notification name.
 `WinfspDeliverySnapshot` reports queue acceptance, native submissions, failed and
 unsupported work, and writer deferral. A partially deferred generation cannot
 advance the fully accepted generation. Open write-capable handles
@@ -199,6 +222,19 @@ that no longer exists add no target and do not fail the generation; the old
 names are purged by their entry intents. Queued inode notifications for removed
 inodes are likewise skipped without counting as delivery failures. Existing
 inodes whose current path cannot be resolved still fail admission.
+Open unlinked non-directory inodes (`nlink == 0`) likewise have no current path
+to purge; their retained historical entry notifications remain necessary.
+Legacy inode notifications and overflow reconciliation resolve one current path
+per inode. They do not establish cache invalidation for every hardlink alias;
+semantic admission without explicit alias entry paths remains conservative for
+multiply linked files. Full hardlink-alias coverage is still a promotion gap.
+Overflow recovery reports a separate pending-coverage signal to VFS health,
+retained through prepared and requeued notification batches. Successful sync
+cannot promote health while this signal is set. Clearing it does not itself
+restore health: fresh catch-up coverage is still required. Submission remains
+asynchronous and is not proof of native kernel consumption.
+Read-only cache admission also checks the live adapter signal, so a stale health
+observation cannot admit a new cached handle during active recovery.
 
 A generation deferred for an open write-capable handle (which the adapter reports
 as `Failed`) stays incomplete without consuming retry attempts. The invalidation worker re-checks such a

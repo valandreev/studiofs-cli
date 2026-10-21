@@ -161,6 +161,7 @@ pub(crate) struct CoherenceHealthTracker {
     reconnecting: bool,
     has_sync_boundary: bool,
     coverage_gap: bool,
+    adapter_recovery_pending: bool,
     unresolved_semantic_generations: BTreeSet<u64>,
 }
 
@@ -176,6 +177,7 @@ impl CoherenceHealthTracker {
             reconnecting: false,
             has_sync_boundary: false,
             coverage_gap: false,
+            adapter_recovery_pending: false,
             unresolved_semantic_generations: BTreeSet::new(),
         }
     }
@@ -195,6 +197,7 @@ impl CoherenceHealthTracker {
     pub(crate) fn allows_cache(&self) -> bool {
         self.snapshot.state == CoherenceHealthState::Healthy
             && !self.awaiting_coverage
+            && !self.adapter_recovery_pending
             && self
                 .snapshot
                 .apply_lag
@@ -361,6 +364,17 @@ impl CoherenceHealthTracker {
         self.try_promote();
     }
 
+    /// Track adapter recovery without treating its sweep as native delivery proof.
+    pub(crate) fn note_adapter_recovery_pending(&mut self, pending: bool) {
+        if self.snapshot.state == CoherenceHealthState::Stopped
+            || self.adapter_recovery_pending == pending
+        {
+            return;
+        }
+        self.adapter_recovery_pending = pending;
+        self.degrade(CoherenceHealthReason::InvalidationIncomplete);
+    }
+
     /// Update pending delivery age, or clear it when the adapter reports no pending work.
     pub(crate) fn note_delivery_age(&mut self, age_ms: Option<u64>, now_unix_ms: u64) {
         if self.snapshot.state == CoherenceHealthState::Stopped {
@@ -416,6 +430,7 @@ impl CoherenceHealthTracker {
     fn try_promote(&mut self) {
         if self.snapshot.state == CoherenceHealthState::CatchingUp
             && !self.awaiting_coverage
+            && !self.adapter_recovery_pending
             && self.has_sync_boundary
             && self
                 .snapshot

@@ -1424,6 +1424,15 @@ pub trait MetaInodes: Send + Sync {
     /// Remove an inode's attributes.
     fn remove_attr(&self, ino: Ino) -> MetaResult<()>;
 
+    /// List raw inode IDs in ascending order after an exclusive cursor.
+    ///
+    /// Results are bounded by `limit` and may include base/local rows that are
+    /// hidden by tombstones or otherwise no longer resolve; callers must use
+    /// `get_attr` to check whether a candidate inode is still present.
+    /// Required so every backend provides bounded pagination; overflow
+    /// recovery treats any error as transient and retries.
+    fn list_inode_ids_after(&self, after: Option<Ino>, limit: usize) -> MetaResult<Vec<Ino>>;
+
     /// Enumerate existing inode attributes.
     fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
         let next = self.get_counter(counters::NEXT_INODE)?;

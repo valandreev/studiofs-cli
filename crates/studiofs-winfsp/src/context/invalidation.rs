@@ -17,6 +17,9 @@ use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use super::StudioFsContext;
 use crate::ensure_winfsp_runtime_loaded;
 
+#[cfg(test)]
+mod overflow_mount_test;
+
 pub(super) const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
 pub(super) const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x0000_0002;
 pub(super) const FILE_NOTIFY_CHANGE_ATTRIBUTES: u32 = 0x0000_0004;
@@ -55,10 +58,16 @@ fn build_notify_info_with_action(
         );
         return None;
     }
+    // set_name_raw forwards code units verbatim, so reject embedded NULs here.
+    if path.contains('\0') {
+        return None;
+    }
     let mut info = NotifyInfo::<512>::new();
     info.filter = notify_filter_for_kind(kind);
     info.action = action;
-    info.set_name(path).ok()?;
+    // Native notifications use a counted name; set_name includes a rejected NUL.
+    let name: Vec<_> = path.encode_utf16().collect();
+    info.set_name_raw(name.as_slice()).ok()?;
     Some(info)
 }
 
@@ -173,6 +182,10 @@ struct WinfspInvalidationOverride {
 #[derive(Debug, Default)]
 struct WinfspInvalidationQueueState {
     closed: bool,
+    overflow_since: Option<Instant>,
+    reconciliation_after: Option<Ino>,
+    overflow_epoch: u64,
+    recovering_overflow: bool,
     order: VecDeque<NotificationKey>,
     pending: HashSet<NotificationKey>,
     path_overrides: HashMap<NotificationKey, WinfspInvalidationOverride>,
@@ -257,16 +270,10 @@ impl WinfspInvalidationQueue {
             filter,
         };
         let mut state = self.state.lock();
-        if state.closed {
-            state.delivery.failed_notifications =
-                state.delivery.failed_notifications.saturating_add(1);
-            return;
-        }
-        if !state.pending.contains(&key)
-            && state.pending.len() == WINFSP_INVALIDATION_QUEUE_CAPACITY
-        {
-            state.delivery.failed_notifications =
-                state.delivery.failed_notifications.saturating_add(1);
+        let preserved_since = preserve_deferred_age
+            .then_some(state.deferred_since)
+            .flatten();
+        if !self.push_locked(&mut state, key.clone(), preserved_since) {
             return;
         }
         state.path_overrides.insert(
@@ -278,10 +285,6 @@ impl WinfspInvalidationQueue {
                 filter,
             },
         );
-        let preserved_since = preserve_deferred_age
-            .then_some(state.deferred_since)
-            .flatten();
-        self.push_locked(&mut state, key, preserved_since);
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
         self.record_metrics(snapshot);
@@ -292,13 +295,20 @@ impl WinfspInvalidationQueue {
         self.state.lock().delivery
     }
 
-    /// Return the age of the oldest pending or in-flight invalidation target.
+    /// Return the age of the oldest pending, in-flight, or overflow-lost invalidation target.
+    ///
+    /// A lost target stays uncovered until the overflow sweep finishes, so its age
+    /// intentionally counts against the delivery-timeout budget.
     pub fn pending_delivery_age_ms(&self) -> Option<u64> {
         let state = self.state.lock();
-        match (state.pending_since, state.deferred_since) {
-            (Some(pending), Some(deferred)) => Some(pending.min(deferred)),
-            (pending, deferred) => pending.or(deferred),
-        }
+        [
+            state.pending_since,
+            state.deferred_since,
+            state.overflow_since,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
         .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
     }
 
@@ -310,6 +320,12 @@ impl WinfspInvalidationQueue {
     #[cfg(test)]
     pub(super) fn set_pending_since_for_test(&self, since: Instant) {
         self.state.lock().pending_since = Some(since);
+    }
+
+    fn push_inode_preserving_deferred_age(&self, ino: Ino) {
+        let mut state = self.state.lock();
+        let preserved_since = state.deferred_since;
+        self.push_locked(&mut state, NotificationKey::Inode(ino), preserved_since);
     }
 
     fn record_failed_notification(&self) {
@@ -562,7 +578,76 @@ impl WinfspInvalidationQueue {
             return true;
         }
         state.delivery.failed_notifications = state.delivery.failed_notifications.saturating_add(1);
+        if matches!(
+            key,
+            NotificationKey::Inode(_) | NotificationKey::Path { ino: 1.., .. }
+        ) {
+            // Only a lost inode behind the sweep cursor restarts the sweep; keep
+            // how long the oldest lost request has been pending either way.
+            let ino = match &key {
+                NotificationKey::Inode(ino) | NotificationKey::Path { ino, .. } => *ino,
+            };
+            let since = preserved_since.unwrap_or_else(Instant::now);
+            state.overflow_since = Some(state.overflow_since.map_or(since, |old| old.min(since)));
+            state.recovering_overflow = true;
+            if state.reconciliation_after.is_some_and(|after| ino <= after) {
+                state.reconciliation_after = None;
+            }
+            // Discard an in-flight page that may predate this inode.
+            state.overflow_epoch = state.overflow_epoch.wrapping_add(1);
+        }
         false
+    }
+
+    fn refill_overflow(&self) {
+        let (epoch, after, limit) = {
+            let state = self.state.lock();
+            if state.closed || state.overflow_since.is_none() {
+                return;
+            }
+            (
+                state.overflow_epoch,
+                state.reconciliation_after,
+                WINFSP_INVALIDATION_QUEUE_CAPACITY - state.pending.len(),
+            )
+        };
+        if limit == 0 {
+            return;
+        }
+        let Some(vfs) = self.metrics_vfs.upgrade() else {
+            return;
+        };
+        // Read bounded local metadata pages outside the producer's queue lock.
+        let inodes = match vfs.meta().list_inode_ids_after(after, limit) {
+            Ok(inodes) => inodes,
+            Err(error) => {
+                // Retried on the next tick; the overflow age still reports the gap.
+                warn!(%error, "WinFSP overflow reconciliation page read failed");
+                return;
+            }
+        };
+        let mut state = self.state.lock();
+        // Another overflow can invalidate this metadata snapshot even with after=None.
+        if state.closed || state.overflow_epoch != epoch || state.reconciliation_after != after {
+            return;
+        }
+        let since = state.overflow_since;
+        for &ino in &inodes {
+            let key = NotificationKey::Inode(ino);
+            if state.pending.len() == WINFSP_INVALIDATION_QUEUE_CAPACITY
+                && !state.pending.contains(&key)
+            {
+                break;
+            }
+            self.push_locked(&mut state, key, since);
+            state.reconciliation_after = Some(ino);
+        }
+        if inodes.len() < limit
+            && (inodes.is_empty() || state.reconciliation_after == inodes.last().copied())
+        {
+            state.overflow_since = None;
+            state.reconciliation_after = None;
+        }
     }
 
     #[cfg(test)]
@@ -584,6 +669,8 @@ impl WinfspInvalidationQueue {
         &self,
         mark_notification_in_flight: bool,
     ) -> Vec<(Ino, Option<WinfspInvalidationOverride>)> {
+        // Refill before draining so deferred writers can reuse the freed slots.
+        self.refill_overflow();
         let mut state = self.state.lock();
         let mut targets = Vec::with_capacity(state.order.len());
         state.pending.clear();
@@ -604,6 +691,10 @@ impl WinfspInvalidationQueue {
                 state.notification_batches_in_flight.saturating_add(1);
         } else if !mark_notification_in_flight {
             state.deferred_since = None;
+        }
+        // An empty terminal reconciliation page leaves no batch to finish recovery.
+        if state.overflow_since.is_none() && state.notification_batches_in_flight == 0 {
+            state.recovering_overflow = false;
         }
         self.quiescent.notify_all();
         let snapshot = (!targets.is_empty()).then(|| Self::next_metrics_snapshot(&mut state));
@@ -631,7 +722,8 @@ impl WinfspInvalidationQueue {
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.state.lock().pending.is_empty()
+        let state = self.state.lock();
+        state.pending.is_empty() && state.overflow_since.is_none()
     }
 
     #[cfg(test)]
@@ -642,6 +734,8 @@ impl WinfspInvalidationQueue {
     pub(crate) fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
+        state.overflow_since = None;
+        state.recovering_overflow = false;
         self.quiescent.notify_all();
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
@@ -658,14 +752,18 @@ impl WinfspInvalidationQueue {
     pub(crate) fn wait_for_quiescence(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock();
-        while (!state.pending.is_empty() || state.notification_batches_in_flight != 0)
+        while (!state.pending.is_empty()
+            || state.overflow_since.is_some()
+            || state.notification_batches_in_flight != 0)
             && !state.closed
         {
             if self.quiescent.wait_until(&mut state, deadline).timed_out() {
                 break;
             }
         }
-        state.pending.is_empty() && state.notification_batches_in_flight == 0
+        state.pending.is_empty()
+            && state.overflow_since.is_none()
+            && state.notification_batches_in_flight == 0
     }
 
     fn finish_notification_batch(&self) {
@@ -676,6 +774,9 @@ impl WinfspInvalidationQueue {
             state.deferred_since = None;
             if state.pending.is_empty() {
                 state.pending_since = None;
+                if state.overflow_since.is_none() {
+                    state.recovering_overflow = false;
+                }
             }
         }
         self.quiescent.notify_all();
@@ -812,6 +913,10 @@ impl KernelInvalidator for WinfspKernelInvalidator {
         self.queue.pending_delivery_age_ms()
     }
 
+    fn invalidation_recovery_pending(&self) -> bool {
+        self.queue.state.lock().recovering_overflow
+    }
+
     fn invalidation_delivery_failure_count(&self) -> u64 {
         let delivery = self.queue.delivery_snapshot();
         // NotifyBegin rejection is retried by `PreparedWinfspNotifications::drop`;
@@ -849,24 +954,31 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                     path_override.filter,
                 )
             } else {
-                let Some(path) = ino_to_windows_path(&self.vfs, ino) else {
-                    if matches!(
-                        meta.get_attr(ino),
-                        Err(studiofs_meta::MetaError::InodeNotFound(_))
-                    ) {
-                        // Removed inodes have no current path to purge; their
-                        // old names are delivered as explicit path notifications.
-                        trace!(ino, "skipping notify - inode removed");
+                let attr = match meta.get_attr(ino) {
+                    Ok(attr) if attr.nlink == 0 && attr.kind != FileType::Directory => continue,
+                    Ok(attr) => attr,
+                    // Deleted candidates need no current-path purge. Historical
+                    // namespace names are retained by explicit entry notifications.
+                    Err(studiofs_meta::MetaError::InodeNotFound(_)) => continue,
+                    // A transient read error must not lose the purge; retry next tick.
+                    Err(_) => {
+                        self.invalidation_queue
+                            .push_inode_preserving_deferred_age(ino);
                         continue;
+                    }
+                };
+                let Some(path) = ino_to_windows_path(&self.vfs, ino) else {
+                    // Unlink can race the path walk after the first attribute read.
+                    match meta.get_attr(ino) {
+                        Err(studiofs_meta::MetaError::InodeNotFound(_)) => continue,
+                        Ok(attr) if attr.nlink == 0 && attr.kind != FileType::Directory => continue,
+                        _ => {}
                     }
                     trace!(ino, "skipping notify - inode no longer resolvable");
                     self.invalidation_queue.record_failed_notification();
                     continue;
                 };
-                let kind = meta
-                    .get_attr(ino)
-                    .map(|a| a.kind)
-                    .unwrap_or(FileType::RegularFile);
+                let kind = attr.kind;
                 (
                     path,
                     kind,
@@ -881,7 +993,7 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 continue;
             }
             let Some(mut info) = build_notify_info_with_action(&path, kind, action) else {
-                warn!(ino, path, "notify path too long, skipping");
+                warn!(ino, path, "notify path invalid or too long, skipping");
                 self.invalidation_queue.record_failed_notification();
                 continue;
             };
@@ -935,5 +1047,130 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
             .submitted_notifications
             .saturating_add(submitted);
         notifications.mark_published();
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+    use crate::context::tests::make_test_context;
+
+    #[test]
+    fn overflow_reconciliation_pages_restart_and_preserve_age() {
+        let (_tmp, vfs, _ctx, queue) = make_test_context("overflow-page-restart");
+        let attr = vfs
+            .create(studiofs_meta::ROOT_INO, b"overflow", 0, 0, 0o644)
+            .unwrap();
+        queue.extend(10_000..10_000 + WINFSP_INVALIDATION_QUEUE_CAPACITY as u64);
+        queue.push(attr.ino);
+        let since = Instant::now() - Duration::from_secs(5);
+        {
+            let mut state = queue.state.lock();
+            state.overflow_since = Some(since);
+            let key = state.order.pop_back().unwrap();
+            state.pending.remove(&key);
+        }
+        queue.refill_overflow();
+        {
+            let state = queue.state.lock();
+            assert_eq!(state.pending.len(), WINFSP_INVALIDATION_QUEUE_CAPACITY);
+            assert_eq!(state.reconciliation_after, Some(studiofs_meta::ROOT_INO));
+            assert_eq!(state.overflow_since, Some(since));
+        }
+        // A lost inode ahead of the cursor is still covered, so progress is kept.
+        queue.push(attr.ino);
+        {
+            let mut state = queue.state.lock();
+            assert_eq!(state.reconciliation_after, Some(studiofs_meta::ROOT_INO));
+            assert_eq!(state.overflow_since, Some(since));
+            state.reconciliation_after = Some(attr.ino);
+        }
+        // A lost inode at or behind the cursor restarts the sweep.
+        queue.push(attr.ino);
+        {
+            let state = queue.state.lock();
+            assert_eq!(state.reconciliation_after, None);
+            assert_eq!(state.overflow_since, Some(since));
+        }
+        assert_eq!(queue.drain().len(), WINFSP_INVALIDATION_QUEUE_CAPACITY);
+        assert_eq!(queue.state.lock().overflow_since, Some(since));
+        assert!(queue.pending_delivery_age_ms().unwrap() >= 5_000);
+        assert!(queue.drain().contains(&attr.ino));
+        assert!(queue.is_empty());
+        assert_eq!(queue.pending_delivery_age_ms(), None);
+    }
+
+    #[test]
+    fn overflow_recovery_remains_pending_through_native_submission_retry() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("overflow-recovery-pending");
+        let file = vfs
+            .create(studiofs_meta::ROOT_INO, b"pending", 0, 0, 0o644)
+            .unwrap();
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        queue.extend(10_000..10_000 + WINFSP_INVALIDATION_QUEUE_CAPACITY as u64);
+        queue.push(file.ino);
+        assert!(invalidator.invalidation_recovery_pending());
+        assert!(ctx.should_notify().is_none());
+        let prepared = ctx.should_notify().expect("recovered notifications");
+        assert!(queue.state.lock().overflow_since.is_none());
+        assert!(invalidator.invalidation_recovery_pending());
+        drop(prepared);
+        assert!(invalidator.invalidation_recovery_pending());
+        let mut retry = ctx.should_notify().expect("native submission retry");
+        retry.mark_published();
+        drop(retry);
+        assert!(!invalidator.invalidation_recovery_pending());
+        assert_eq!(queue.delivery_snapshot().delivered_generation, None);
+    }
+
+    #[test]
+    fn overflow_reconciliation_recovers_rejected_path_retry() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("overflow-path-retry");
+        let file = vfs
+            .create(studiofs_meta::ROOT_INO, b"retry", 0, 0, 0o644)
+            .unwrap();
+        queue.push(file.ino);
+        let prepared = ctx.should_notify().expect("prepare inode notification");
+        queue.state.lock().deferred_since = Some(Instant::now() - Duration::from_secs(5));
+        queue.extend(10_000..10_000 + WINFSP_INVALIDATION_QUEUE_CAPACITY as u64);
+        drop(prepared);
+        assert_eq!(queue.delivery_snapshot().failed_notifications, 1);
+        assert_eq!(queue.drain().len(), WINFSP_INVALIDATION_QUEUE_CAPACITY);
+        assert!(queue.pending_delivery_age_ms().unwrap() >= 5_000);
+        assert!(
+            queue.drain().contains(&file.ino),
+            "retry without another mutation"
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn overflow_reconciliation_finishes_on_empty_terminal_page() {
+        let (_tmp, _vfs, ctx, queue) = make_test_context("overflow-empty-page");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
+        {
+            let mut state = queue.state.lock();
+            state.overflow_since = Some(Instant::now());
+            state.recovering_overflow = true;
+            state.reconciliation_after = Some(u64::MAX);
+        }
+        // The production drain must clear recovery even when the final page is empty.
+        assert!(ctx.should_notify().is_none());
+        assert!(!invalidator.invalidation_recovery_pending());
+        assert!(queue.drain().is_empty());
+        assert!(queue.is_empty());
+        assert_eq!(queue.pending_delivery_age_ms(), None);
+    }
+
+    #[test]
+    fn closing_queue_cancels_overflow_reconciliation() {
+        let (_tmp, _vfs, _ctx, queue) = make_test_context("overflow-close");
+        queue.extend(10_000..10_000 + WINFSP_INVALIDATION_QUEUE_CAPACITY as u64);
+        queue.push(studiofs_meta::ROOT_INO);
+        queue.close();
+        assert_eq!(queue.drain().len(), WINFSP_INVALIDATION_QUEUE_CAPACITY);
+        assert!(queue.is_empty());
+        assert!(queue.drain().is_empty());
+        assert_eq!(queue.pending_delivery_age_ms(), None);
     }
 }

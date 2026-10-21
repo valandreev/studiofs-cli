@@ -1131,6 +1131,23 @@ $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'
 cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1
 ```
 
+### WinFSP Invalidation Queue Overflow
+
+SFS-873 has a separate local-only overflow regression. It retains an already-open
+cached read handle, deterministically rejects its inode notification at capacity,
+and verifies that reconciliation submits a purge and the same handle reloads the
+updated bytes. Use an explicitly selected unused drive:
+
+```powershell
+$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'
+$env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'
+cargo test -p studiofs-winfsp --lib winfsp_cached_handle_reloads_after_queue_overflow -- --ignored --nocapture --test-threads=1
+```
+
+The fixture uses local redb and a loopback object endpoint; PostgreSQL and remote
+object storage are not required. This focused check does not replace the mounted
+multi-client promotion gate.
+
 ### WinFSP Write-Through Slow-Cache Validation Plan
 
 SFS-307 changes should be validated on a Windows host with WinFSP installed and
