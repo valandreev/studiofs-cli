@@ -1576,7 +1576,7 @@ pub extern "C" fn studiofs_linux_fuse_opendir(
         return;
     };
     match state.getattr_attr(ino) {
-        Ok(attr) if attr.kind == FileType::Directory => match state.open_dir(ino) {
+        Ok(attr) if attr.kind == FileType::Directory => match state.open_dir(ino, attr.parent) {
             Ok(handle) => {
                 reply_dir_open(req, fi, handle);
             }
@@ -2474,9 +2474,11 @@ impl SessionState {
         file_handle(fi).filter(|fh| self.vfs.get_open_file(*fh).is_some())
     }
 
-    fn open_dir(&self, ino: u64) -> Result<NonNull<DirectoryHandle>, i32> {
+    /// `parent_ino` is captured at open, matching macFUSE; the root reports itself.
+    fn open_dir(&self, ino: u64, parent_ino: u64) -> Result<NonNull<DirectoryHandle>, i32> {
         let liveness = self.inode_liveness.open_handle(ino);
         let raw = Box::into_raw(Box::new(DirectoryHandle {
+            parent_ino: if parent_ino == 0 { ino } else { parent_ino },
             entries: Mutex::new(None),
             _liveness: liveness,
         }));
@@ -2495,7 +2497,8 @@ impl SessionState {
         let dir_attr = minimal_dir_stat(ino);
         // SAFETY: `handle` comes from `opendir` and remains owned by the
         // matching directory handle until `releasedir`.
-        let entries = unsafe { &handle.as_ref().entries };
+        let handle = unsafe { handle.as_ref() };
+        let entries = &handle.entries;
         if idx == 0 {
             // Like WinFSP's marker-less read, a rewind starts a fresh enumeration.
             *entries
@@ -2507,7 +2510,12 @@ impl SessionState {
             idx = 1;
         }
         if idx == 1 {
-            if !buffer.push(req, OsStr::new(".."), &dir_attr, 2)? {
+            if !buffer.push(
+                req,
+                OsStr::new(".."),
+                &minimal_dir_stat(handle.parent_ino),
+                2,
+            )? {
                 return Ok(());
             }
             idx = 2;
@@ -2619,6 +2627,7 @@ impl SessionState {
 }
 
 struct DirectoryHandle {
+    parent_ino: u64,
     entries: Mutex<Option<DirectorySnapshot>>,
     _liveness: FuseOpenHandleGuard,
 }
@@ -3488,7 +3497,7 @@ mod tests {
         for name in [b"a", b"b", b"c", b"d"] {
             fixture.vfs().create(dir.ino, name, 0, 0, 0o644).unwrap();
         }
-        let raw_handle = state.open_dir(dir.ino).unwrap();
+        let raw_handle = state.open_dir(dir.ino, 1).unwrap();
         // SAFETY: this test owns the handle and keeps the box alive through every read.
         let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
         fixture.vfs().mkdir(dir.ino, b"e", 0, 0, 0o755).unwrap();
@@ -3556,7 +3565,7 @@ mod tests {
             "rewinding to offset 0 must start a fresh enumeration, as on WinFSP"
         );
 
-        let fresh = state.open_dir(dir.ino).unwrap();
+        let fresh = state.open_dir(dir.ino, 1).unwrap();
         let mut buffer = state.directory_buffers.take(4096);
         state
             .readdir(std::ptr::null_mut(), dir.ino, fresh, 2, &mut buffer)
@@ -3592,7 +3601,7 @@ mod tests {
         let dir = fixture.vfs().mkdir(1, b"dir", 0, 0, 0o755).unwrap();
         fixture.vfs().create(dir.ino, b"a", 0, 0, 0o644).unwrap();
         let capture = || {
-            let raw = state.open_dir(dir.ino).unwrap();
+            let raw = state.open_dir(dir.ino, 1).unwrap();
             let mut buffer = state.directory_buffers.take(4096);
             state
                 .readdir(std::ptr::null_mut(), dir.ino, raw, 2, &mut buffer)
@@ -3647,7 +3656,7 @@ mod tests {
             default_connection_config(),
         );
         fixture.vfs().create(1, b"child", 0, 0, 0o644).unwrap();
-        let raw_handle = state.open_dir(1).unwrap();
+        let raw_handle = state.open_dir(1, 1).unwrap();
         // SAFETY: this test keeps its handle alive until all reads complete.
         let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
         for (offset, size, expected) in [
@@ -3688,6 +3697,56 @@ mod tests {
                     "offset {offset}, size {size} must not capture children"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn directory_dot_dot_reports_parent_inode() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-dir-dotdot")
+            .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let parent = fixture.vfs().mkdir(1, b"parent", 0, 0, 0o755).unwrap();
+        let child = fixture
+            .vfs()
+            .mkdir(parent.ino, b"child", 0, 0, 0o755)
+            .unwrap();
+        for (ino, expected_parent) in [(child.ino, parent.ino), (1, 1)] {
+            // Same attr source as the opendir callback.
+            let attr = state.getattr_attr(ino).unwrap();
+            let raw_handle = state.open_dir(ino, attr.parent).unwrap();
+            let dot_inodes = |offset| {
+                let mut buffer = state.directory_buffers.take(4096);
+                state
+                    .readdir(std::ptr::null_mut(), ino, raw_handle, offset, &mut buffer)
+                    .unwrap();
+                let mut bytes = buffer.as_slice();
+                let mut inodes = Vec::new();
+                while !bytes.is_empty() {
+                    let name_len = u32::from_ne_bytes(bytes[16..20].try_into().unwrap()) as usize;
+                    let name = &bytes[24..24 + name_len];
+                    if name == b"." || name == b".." {
+                        inodes.push((
+                            name.to_vec(),
+                            u64::from_ne_bytes(bytes[..8].try_into().unwrap()),
+                        ));
+                    }
+                    bytes = &bytes[(24 + name_len).next_multiple_of(8)..];
+                }
+                state.directory_buffers.put(buffer);
+                inodes
+            };
+            assert_eq!(
+                dot_inodes(0),
+                vec![(b".".to_vec(), ino), (b"..".to_vec(), expected_parent)]
+            );
+            assert_eq!(dot_inodes(1), vec![(b"..".to_vec(), expected_parent)]);
+            // SAFETY: this test exclusively owns the handle returned by open_dir.
+            drop(unsafe { Box::from_raw(raw_handle.as_ptr()) });
         }
     }
 
@@ -3843,7 +3902,7 @@ mod tests {
             default_connection_config(),
         );
         fixture.vfs().create(1, b"child", 0, 0, 0o644).unwrap();
-        let handle = state.open_dir(1).unwrap();
+        let handle = state.open_dir(1, 1).unwrap();
         // SAFETY: this test exclusively owns the handle returned by open_dir.
         let handle = unsafe { Box::from_raw(handle.as_ptr()) };
         assert!(
@@ -3869,7 +3928,7 @@ mod tests {
                 .create(dir.ino, format!("file-{index:04}").as_bytes(), 0, 0, 0o644)
                 .unwrap();
         }
-        let handle = state.open_dir(dir.ino).unwrap();
+        let handle = state.open_dir(dir.ino, 1).unwrap();
         let mut reply = state.directory_buffers.take(4096);
         state
             .readdir(std::ptr::null_mut(), dir.ino, handle, 2, &mut reply)
@@ -6579,7 +6638,9 @@ mod tests {
             .vfs()
             .mkdir(1, b"dir", 0, 0, 0o755)
             .expect("create directory");
-        let handle = state.open_dir(attr.ino).expect("open directory");
+        let handle = state
+            .open_dir(attr.ino, attr.parent)
+            .expect("open directory");
         assert!(state.inode_liveness.is_live(attr.ino));
 
         assert_eq!(
@@ -6656,7 +6717,9 @@ mod tests {
             .vfs()
             .mkdir(1, b"dir", 0, 0, 0o755)
             .expect("create directory");
-        let handle = state.open_dir(attr.ino).expect("open directory");
+        let handle = state
+            .open_dir(attr.ino, attr.parent)
+            .expect("open directory");
         // SAFETY: this test owns the pointer returned by `open_dir`.
         let handle = unsafe { Box::from_raw(handle.as_ptr()) };
 
