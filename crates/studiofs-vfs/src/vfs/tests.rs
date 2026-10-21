@@ -23287,6 +23287,39 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
 }
 
 #[test]
+fn runtime_stats_surface_reports_upload_throttle_configuration() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-upload-throttle");
+
+    let snapshot = vfs.runtime_stats_snapshot();
+    let gauges = &snapshot.upload_queue.gauges;
+
+    assert_eq!(
+        gauges["fg_read_latency_target_ns"].value,
+        vfs.upload_fg_read_latency_target_ns
+    );
+    assert_eq!(gauges["fg_read_latency_target_ns"].unit, "ns");
+    assert_eq!(
+        gauges["cache_io_slots_max"].value,
+        u64::from(vfs.upload_cache_io_slots_max)
+    );
+    assert_eq!(
+        gauges["cache_io_slots_available"].value,
+        vfs.upload_cache_io_slots.available_permits() as u64
+    );
+    assert_eq!(
+        gauges["cache_io_foreground_cost"].value,
+        u64::from(
+            vfs.state
+                .upload
+                .upload_cache_io_foreground_cost
+                .load(Ordering::Relaxed)
+        )
+    );
+    assert_eq!(gauges["scheduler_penalty_ms"].value, 0);
+}
+
+#[test]
 fn runtime_stats_surface_skips_absent_fuse_profile_knobs() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-absent-fuse-profile-knobs");

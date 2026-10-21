@@ -5,7 +5,7 @@ use studiofs_meta::{
 
 use super::{
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsSection, RuntimeStatsSnapshot,
-    StudioVfs,
+    StudioVfs, VfsForegroundReadProtectionStats,
 };
 use crate::utils::now_unix_millis;
 
@@ -768,6 +768,25 @@ impl StudioVfs {
             "count",
             upload.upload_ingress_coalesced,
         );
+        insert_foreground_read_protection(&mut snapshot, &self.foreground_read_protection_stats());
+        insert_gauge(
+            &mut snapshot.upload_queue,
+            "fg_read_latency_target_ns",
+            "ns",
+            self.upload_fg_read_latency_target_ns,
+        );
+        insert_gauge(
+            &mut snapshot.upload_queue,
+            "cache_io_slots_available",
+            "count",
+            self.upload_cache_io_slots.available_permits() as u64,
+        );
+        insert_gauge(
+            &mut snapshot.upload_queue,
+            "cache_io_slots_max",
+            "count",
+            u64::from(self.upload_cache_io_slots_max),
+        );
         insert_counter(
             &mut snapshot.object_io,
             "get_calls",
@@ -1075,6 +1094,149 @@ fn insert_local_storage_diagnostics(
     }
 }
 
+/// Export the foreground-read latency window that drives upload throttling and
+/// the throttle state it produced, so a benchmark can tell whether it engaged.
+fn insert_foreground_read_protection(
+    snapshot: &mut RuntimeStatsSnapshot,
+    stats: &VfsForegroundReadProtectionStats,
+) {
+    if let Some(p90_latency_ns) = stats.p90_latency_ns {
+        insert_gauge(
+            &mut snapshot.vfs_read,
+            "foreground_p90_latency_ns",
+            "ns",
+            p90_latency_ns,
+        );
+    }
+    for (name, unit, value) in [
+        (
+            "foreground_window_samples",
+            "count",
+            stats.speedometer_samples as u64,
+        ),
+        ("foreground_window_bytes", "bytes", stats.window_bytes),
+        (
+            "foreground_window_coverage_ms",
+            "ms",
+            stats.window_coverage_ms,
+        ),
+        (
+            "active_sequential_media_reads",
+            "count",
+            stats.active_sequential_media_reads,
+        ),
+        (
+            "active_random_interactive_reads",
+            "count",
+            stats.active_random_interactive_reads,
+        ),
+        (
+            "foreground_local_payload_read_io_max_ns",
+            "ns",
+            stats.foreground_local_payload_read_io_max_ns,
+        ),
+    ] {
+        insert_gauge(&mut snapshot.vfs_read, name, unit, value);
+    }
+    for (name, unit, value) in [
+        (
+            "foreground_local_payload_reads",
+            "count",
+            stats.foreground_local_payload_reads,
+        ),
+        (
+            "foreground_local_payload_read_bytes",
+            "bytes",
+            stats.foreground_local_payload_read_bytes,
+        ),
+        (
+            "foreground_local_payload_read_io_ns",
+            "ns",
+            stats.foreground_local_payload_read_io_ns,
+        ),
+    ] {
+        insert_counter(&mut snapshot.vfs_read, name, unit, value);
+    }
+    for (name, value) in [
+        ("active_sequential_writers", stats.active_sequential_writers),
+        ("active_random_writers", stats.active_random_writers),
+    ] {
+        insert_gauge(&mut snapshot.vfs_write, name, "count", value);
+    }
+    for (name, unit, value) in [
+        (
+            "scheduler_penalty_ms",
+            "ms",
+            stats.upload_scheduler_penalty_ms,
+        ),
+        (
+            "cache_io_foreground_cost",
+            "count",
+            u64::from(stats.upload_cache_io_foreground_cost),
+        ),
+        (
+            "dominant_upload_pressure_boost",
+            "count",
+            u64::from(stats.dominant_upload_pressure_boost),
+        ),
+        (
+            "fallback_wait_max_ns",
+            "ns",
+            stats.upload_fallback_wait_max_ns,
+        ),
+        (
+            "fallback_read_max_ns",
+            "ns",
+            stats.upload_fallback_read_max_ns,
+        ),
+    ] {
+        insert_gauge(&mut snapshot.upload_queue, name, unit, value);
+    }
+    for (name, unit, value) in [
+        (
+            "local_payload_reads",
+            "count",
+            stats.upload_local_payload_reads,
+        ),
+        (
+            "local_payload_read_bytes",
+            "bytes",
+            stats.upload_local_payload_read_bytes,
+        ),
+        ("hot_payload_reads", "count", stats.upload_hot_payload_reads),
+        (
+            "hot_payload_read_bytes",
+            "bytes",
+            stats.upload_hot_payload_read_bytes,
+        ),
+        (
+            "staged_payload_reads",
+            "count",
+            stats.upload_staged_payload_reads,
+        ),
+        (
+            "staged_payload_read_bytes",
+            "bytes",
+            stats.upload_staged_payload_read_bytes,
+        ),
+        ("fallback_rereads", "count", stats.upload_fallback_rereads),
+        (
+            "fallback_reread_bytes",
+            "bytes",
+            stats.upload_fallback_reread_bytes,
+        ),
+        (
+            "fallback_reread_cache_misses",
+            "count",
+            stats.upload_fallback_reread_cache_misses,
+        ),
+        ("fallback_wait_ns", "ns", stats.upload_fallback_wait_ns),
+        ("fallback_read_ns", "ns", stats.upload_fallback_read_ns),
+    ] {
+        insert_counter(&mut snapshot.upload_queue, name, unit, value);
+    }
+}
+
 fn insert_counter(section: &mut RuntimeStatsSection, name: &str, unit: &'static str, value: u64) {
     section.counters.insert(
         name.to_owned(),
@@ -1120,6 +1282,156 @@ fn ms_sum_to_ns(value: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scalar<'a>(
+        metrics: &'a std::collections::BTreeMap<String, RuntimeScalarMetric>,
+        name: &str,
+    ) -> &'a RuntimeScalarMetric {
+        metrics
+            .get(name)
+            .unwrap_or_else(|| panic!("missing metric {name}"))
+    }
+
+    #[test]
+    fn foreground_read_protection_runtime_stats_export_upload_throttle_state() {
+        let stats = VfsForegroundReadProtectionStats {
+            p90_latency_ns: Some(4_500_000),
+            speedometer_samples: 6,
+            window_bytes: 25_000_000,
+            window_coverage_ms: 1_400,
+            active_sequential_media_reads: 1,
+            active_sequential_writers: 2,
+            upload_local_payload_reads: 7,
+            upload_local_payload_read_bytes: 29_360_128,
+            upload_hot_payload_reads: 3,
+            upload_fallback_wait_ns: 50_000_000,
+            foreground_local_payload_reads: 11,
+            foreground_local_payload_read_io_ns: 33_000_000,
+            upload_cache_io_foreground_cost: 12,
+            upload_scheduler_penalty_ms: 48,
+            ..VfsForegroundReadProtectionStats::default()
+        };
+        let mut snapshot = RuntimeStatsSnapshot::default();
+        insert_foreground_read_protection(&mut snapshot, &stats);
+
+        for (metrics, name, unit, value) in [
+            (
+                &snapshot.vfs_read.gauges,
+                "foreground_p90_latency_ns",
+                "ns",
+                4_500_000,
+            ),
+            (
+                &snapshot.vfs_read.gauges,
+                "foreground_window_samples",
+                "count",
+                6,
+            ),
+            (
+                &snapshot.vfs_read.gauges,
+                "foreground_window_bytes",
+                "bytes",
+                25_000_000,
+            ),
+            (
+                &snapshot.vfs_read.gauges,
+                "foreground_window_coverage_ms",
+                "ms",
+                1_400,
+            ),
+            (
+                &snapshot.vfs_read.gauges,
+                "active_sequential_media_reads",
+                "count",
+                1,
+            ),
+            (
+                &snapshot.vfs_read.counters,
+                "foreground_local_payload_reads",
+                "count",
+                11,
+            ),
+            (
+                &snapshot.vfs_read.counters,
+                "foreground_local_payload_read_io_ns",
+                "ns",
+                33_000_000,
+            ),
+            (
+                &snapshot.vfs_write.gauges,
+                "active_sequential_writers",
+                "count",
+                2,
+            ),
+            (
+                &snapshot.upload_queue.gauges,
+                "scheduler_penalty_ms",
+                "ms",
+                48,
+            ),
+            (
+                &snapshot.upload_queue.gauges,
+                "cache_io_foreground_cost",
+                "count",
+                12,
+            ),
+            (
+                &snapshot.upload_queue.counters,
+                "local_payload_reads",
+                "count",
+                7,
+            ),
+            (
+                &snapshot.upload_queue.counters,
+                "local_payload_read_bytes",
+                "bytes",
+                29_360_128,
+            ),
+            (
+                &snapshot.upload_queue.counters,
+                "hot_payload_reads",
+                "count",
+                3,
+            ),
+            (
+                &snapshot.upload_queue.counters,
+                "fallback_wait_ns",
+                "ns",
+                50_000_000,
+            ),
+        ] {
+            let metric = scalar(metrics, name);
+            assert_eq!(metric.unit.as_ref(), unit, "{name}");
+            assert_eq!(metric.value, value, "{name}");
+        }
+
+        let parsed = RuntimeStatsSnapshot::parse_text(&snapshot.to_text())
+            .expect("exported foreground read protection stats should parse");
+        assert_eq!(
+            scalar(&parsed.upload_queue.gauges, "scheduler_penalty_ms").value,
+            48
+        );
+    }
+
+    #[test]
+    fn foreground_read_protection_runtime_stats_omit_p90_without_samples() {
+        let mut snapshot = RuntimeStatsSnapshot::default();
+        insert_foreground_read_protection(
+            &mut snapshot,
+            &VfsForegroundReadProtectionStats::default(),
+        );
+
+        assert!(
+            !snapshot
+                .vfs_read
+                .gauges
+                .contains_key("foreground_p90_latency_ns")
+        );
+        assert_eq!(
+            scalar(&snapshot.upload_queue.gauges, "scheduler_penalty_ms").value,
+            0
+        );
+    }
 
     #[test]
     fn local_event_prune_runtime_stats_use_documented_units() {

@@ -184,6 +184,37 @@ active stats reader does not take the exclusive database lock used by
 compaction.
 Event-sequence and physical-size metrics use separate best-effort reads.
 
+## Foreground Read Protection
+
+Upload workers back off while foreground reads are slow. The upload worker loop
+compares the p90 latency of foreground VFS reads, over the latency window, with
+`upload_queue.fg_read_latency_target_ns`; above the target it raises the
+upload admission penalty and the number of upload cache-I/O slots one upload
+reread takes. These metrics show whether that throttle engaged.
+
+| Metric | Kind / unit | Meaning |
+| --- | --- | --- |
+| `vfs_read.foreground_p90_latency_ns` | gauge / ns | p90 latency of foreground VFS reads in the latency window (`STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS`). Omitted when the window has no samples and no recent sticky value. |
+| `vfs_read.foreground_window_samples` | gauge / count | Foreground read samples in the window. |
+| `vfs_read.foreground_window_bytes` | gauge / bytes | Bytes those samples returned. |
+| `vfs_read.foreground_window_coverage_ms` | gauge / ms | Time between the oldest and newest sample in the window. |
+| `vfs_read.active_sequential_media_reads`, `vfs_read.active_random_interactive_reads` | gauge / count | Open read streams by access class. |
+| `vfs_read.foreground_local_payload_reads`, `vfs_read.foreground_local_payload_read_bytes` | counter / count, bytes | Foreground reads served by the local payload store. |
+| `vfs_read.foreground_local_payload_read_io_ns` | counter / ns | Backend I/O time of those reads. |
+| `vfs_read.foreground_local_payload_read_io_max_ns` | gauge / ns | Longest such backend I/O since mount. |
+| `vfs_write.active_sequential_writers`, `vfs_write.active_random_writers` | gauge / count | Open write streams by access class. |
+| `upload_queue.fg_read_latency_target_ns` | gauge / ns | Configured p90 target (`STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS`). |
+| `upload_queue.scheduler_penalty_ms` | gauge / ms | Current upload admission penalty; zero means the throttle is not engaged. |
+| `upload_queue.cache_io_foreground_cost` | gauge / count | Upload cache-I/O slots one reread takes while foreground I/O is active. |
+| `upload_queue.cache_io_slots_available`, `upload_queue.cache_io_slots_max` | gauge / count | Free and total upload cache-I/O slots. |
+| `upload_queue.dominant_upload_pressure_boost` | gauge / count | Penalty multiplier of the dominant foreground access class. |
+| `upload_queue.local_payload_reads`, `upload_queue.local_payload_read_bytes` | counter / count, bytes | Upload payload reads, including hot-buffer and staged reads. |
+| `upload_queue.hot_payload_reads`, `upload_queue.hot_payload_read_bytes` | counter / count, bytes | Upload reads served from the in-memory hot payload buffer. |
+| `upload_queue.staged_payload_reads`, `upload_queue.staged_payload_read_bytes` | counter / count, bytes | Upload reads served from staged payload links. |
+| `upload_queue.fallback_rereads`, `upload_queue.fallback_reread_bytes`, `upload_queue.fallback_reread_cache_misses` | counter / count, bytes | Upload rereads from the local payload store. |
+| `upload_queue.fallback_wait_ns`, `upload_queue.fallback_read_ns` | counter / ns | Time those rereads waited for upload cache-I/O slots, and spent reading. The foreground-idle yield and pacing delay before the slot wait are not counted. |
+| `upload_queue.fallback_wait_max_ns`, `upload_queue.fallback_read_max_ns` | gauge / ns | Longest such wait and read since mount. |
+
 ## Text Representation
 
 The local text representation is line-oriented and machine-readable:
