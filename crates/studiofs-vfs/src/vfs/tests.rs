@@ -3548,6 +3548,369 @@ fn read_after_writer_close_does_not_wait_for_deferred_release_materialization() 
 }
 
 #[test]
+fn read_only_flush_does_not_wait_for_deferred_release_materialization() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-only-flush-deferred-release");
+    let runtime = rt.handle().clone();
+    rt.block_on(async move {
+        let attr = vfs
+            .create(
+                ROOT_INO,
+                b"read-only-flush-deferred-release.bin",
+                0,
+                0,
+                0o644,
+            )
+            .unwrap();
+        let writer = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        // Hold materialization so the deferred last-handle release stays in flight,
+        // as it does while a large write backlog drains to the local payload store.
+        let materialize = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Materialize)
+            .await;
+        vfs.write_fh(writer, attr.ino, 0, b"closed-writer-overlay")
+            .await
+            .unwrap();
+        let release = vfs.release_fh_with_deferred_last_handle_barrier(writer, &runtime);
+        assert!(release.closed_last_handle);
+        assert!(
+            vfs.state.deferred_release_inflight.contains(attr.ino),
+            "test setup should keep the deferred release barrier registered"
+        );
+
+        // macFUSE and Linux FUSE send FLUSH on every close(2), including a reader's.
+        let reader = vfs.open_file(attr.ino, OpenFlags::RDONLY, false).unwrap();
+        let flush = tokio::time::timeout(
+            Duration::from_millis(500),
+            vfs.flush_volatile_writeback_with_outcome(attr.ino, reader),
+        )
+        .await
+        .expect("read-only flush should not queue behind deferred release materialization")
+        .expect("read-only flush should succeed");
+        assert!(!flush.flushed_local_dirty_state);
+        assert!(
+            vfs.state.deferred_release_inflight.contains(attr.ino),
+            "read-only flush must not have drained the writer's deferred release"
+        );
+
+        drop(materialize);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.wait_for_deferred_release_inflight(attr.ino),
+        )
+        .await
+        .expect("deferred release should drain once materialization resumes");
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+const RAM_READAHEAD_TEST_MIB: usize = 1024 * 1024;
+
+/// Position-dependent bytes, so a misplaced chunk copy cannot match.
+fn ram_readahead_pattern(offset: usize, len: usize) -> Vec<u8> {
+    (offset..offset + len)
+        .map(|position| ((position as u64).wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect()
+}
+
+fn make_ram_readahead_test_vfs(
+    tmp: &TempDir,
+    volume_suffix: &str,
+    depth_bytes: usize,
+) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+    make_unstarted_test_vfs_with_config(
+        tmp,
+        volume_suffix,
+        VfsConfig {
+            sequential_ram_readahead_bytes: depth_bytes,
+            sequential_ram_readahead_shared_bytes: depth_bytes,
+            ..VfsConfig::default()
+        },
+    )
+}
+
+async fn write_ram_readahead_test_file(vfs: &Arc<StudioVfs>, name: &[u8], len: usize) -> Ino {
+    let attr = vfs.create(ROOT_INO, name, 0, 0, 0o644).unwrap();
+    let writer = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+    for start in (0..len).step_by(RAM_READAHEAD_TEST_MIB) {
+        let piece = (len - start).min(RAM_READAHEAD_TEST_MIB);
+        vfs.write_fh(
+            writer,
+            attr.ino,
+            start as u64,
+            &ram_readahead_pattern(start, piece),
+        )
+        .await
+        .unwrap();
+    }
+    vfs.release_fh(writer).await.unwrap();
+    attr.ino
+}
+
+async fn read_ram_readahead_range(
+    vfs: &Arc<StudioVfs>,
+    fh: u64,
+    ino: Ino,
+    offset: usize,
+    len: usize,
+) -> Vec<u8> {
+    let mut out = vec![0; len];
+    let read = vfs
+        .read_into_fh(fh, ino, offset as u64, &mut out)
+        .await
+        .unwrap();
+    out.truncate(read as usize);
+    out
+}
+
+#[test]
+fn ram_readahead_depth_recovers_after_deferred_release() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs_with_config(
+        &tmp,
+        "ram-readahead-adaptive",
+        VfsConfig {
+            sequential_ram_readahead_bytes: 32 * RAM_READAHEAD_TEST_MIB,
+            sequential_ram_readahead_shared_bytes: 12 * RAM_READAHEAD_TEST_MIB,
+            ..VfsConfig::default()
+        },
+    );
+    let now = Instant::now();
+    assert_eq!(vfs.ram_readahead_depth_chunks_at(now), 8);
+    let (entry, permit) = vfs
+        .state
+        .deferred_release_inflight
+        .try_register(ROOT_INO)
+        .unwrap();
+    assert_eq!(vfs.ram_readahead_depth_chunks_at(now), 3);
+    drop(permit);
+    drop(entry);
+    assert_eq!(
+        vfs.ram_readahead_depth_chunks_at(now + Duration::from_secs(1)),
+        3
+    );
+    assert_eq!(
+        vfs.ram_readahead_depth_chunks_at(now + Duration::from_secs(2)),
+        8
+    );
+}
+
+#[test]
+fn ram_readahead_serves_sequential_reads_from_loaded_chunks() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-hits", 16 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let len = 24 * RAM_READAHEAD_TEST_MIB;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-hits.bin", len).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        assert!(vfs.enable_sequential_ram_readahead(reader));
+
+        // 3 MiB requests straddle the 4 MiB chunk boundaries.
+        let request = 3 * RAM_READAHEAD_TEST_MIB;
+        for offset in (0..len).step_by(request) {
+            let data = read_ram_readahead_range(&vfs, reader, ino, offset, request).await;
+            assert!(
+                data == ram_readahead_pattern(offset, request),
+                "wrong bytes at offset {offset}"
+            );
+        }
+
+        // The first two reads establish the stream; the other six are hits.
+        let stats = vfs.ram_readahead_stats();
+        assert_eq!(stats.hit_reads, 6, "{stats:?}");
+        assert_eq!(stats.hit_bytes, 6 * request as u64, "{stats:?}");
+        assert_eq!(stats.discarded_chunks, 0, "{stats:?}");
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn ram_readahead_serves_forward_overlapping_reads_from_loaded_chunks() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-overlap", 12 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let mib = RAM_READAHEAD_TEST_MIB;
+        let len = 24 * mib;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-overlap.bin", len).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        assert!(vfs.enable_sequential_ram_readahead(reader));
+
+        // UBC can round a callback past the end of an application's frame.
+        for offset in (0..=18 * mib).step_by(3 * mib) {
+            let data = read_ram_readahead_range(&vfs, reader, ino, offset, 4 * mib).await;
+            assert!(data == ram_readahead_pattern(offset, 4 * mib));
+        }
+        let stats = vfs.ram_readahead_stats();
+        assert_eq!(stats.hit_reads, 5, "{stats:?}");
+        assert_eq!(stats.discarded_chunks, 0, "{stats:?}");
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn ram_readahead_resumes_beyond_original_eof_after_append() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-append", 12 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let mib = RAM_READAHEAD_TEST_MIB;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-append.bin", 8 * mib).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        assert!(vfs.enable_sequential_ram_readahead(reader));
+        read_ram_readahead_range(&vfs, reader, ino, 0, 4 * mib).await;
+        let writer = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(
+            writer,
+            ino,
+            (8 * mib) as u64,
+            &ram_readahead_pattern(8 * mib, 16 * mib),
+        )
+        .await
+        .unwrap();
+        vfs.release_fh(writer).await.unwrap();
+
+        for offset in [4 * mib, 8 * mib, 12 * mib] {
+            let data = read_ram_readahead_range(&vfs, reader, ino, offset, 4 * mib).await;
+            assert!(data == ram_readahead_pattern(offset, 4 * mib));
+        }
+        assert_eq!(vfs.ram_readahead_stats().hit_reads, 2);
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn ram_readahead_learns_file_size_when_open_attr_is_missing() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-no-attr", 12 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let mib = RAM_READAHEAD_TEST_MIB;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-no-attr.bin", 16 * mib).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        *vfs.get_open_file(reader).unwrap().open_attr.write() = None;
+        assert!(vfs.enable_sequential_ram_readahead(reader));
+        for offset in [0, 4 * mib, 8 * mib] {
+            let data = read_ram_readahead_range(&vfs, reader, ino, offset, 4 * mib).await;
+            assert!(data == ram_readahead_pattern(offset, 4 * mib));
+        }
+        assert_eq!(vfs.ram_readahead_stats().hit_reads, 1);
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn ram_readahead_returns_new_bytes_after_another_handle_writes() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-write", 16 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let mib = RAM_READAHEAD_TEST_MIB;
+        let len = 16 * mib;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-write.bin", len).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        assert!(vfs.enable_sequential_ram_readahead(reader));
+        for offset in [0, 4 * mib, 8 * mib] {
+            let data = read_ram_readahead_range(&vfs, reader, ino, offset, 4 * mib).await;
+            assert!(data == ram_readahead_pattern(offset, 4 * mib));
+        }
+        assert_eq!(vfs.ram_readahead_stats().hit_reads, 1);
+
+        // The last chunk was scheduled ahead of the stream before this write.
+        let writer = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(writer, ino, (12 * mib) as u64, &vec![0xab; mib])
+            .await
+            .unwrap();
+
+        let data = read_ram_readahead_range(&vfs, reader, ino, 12 * mib, 4 * mib).await;
+        assert!(data[..mib].iter().all(|byte| *byte == 0xab));
+        assert!(data[mib..] == ram_readahead_pattern(13 * mib, 3 * mib));
+        vfs.release_fh(writer).await.unwrap();
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn ram_readahead_seek_discards_chunks_and_reads_requested_range() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-seek", 16 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let mib = RAM_READAHEAD_TEST_MIB;
+        let len = 16 * mib;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-seek.bin", len).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        assert!(vfs.enable_sequential_ram_readahead(reader));
+        for offset in [0, 2 * mib, 4 * mib, 2 * mib, 6 * mib, 10 * mib, 14 * mib] {
+            let data = read_ram_readahead_range(&vfs, reader, ino, offset, 2 * mib).await;
+            assert!(
+                data == ram_readahead_pattern(offset, 2 * mib),
+                "wrong bytes at offset {offset}"
+            );
+            if offset == 4 * mib {
+                assert_eq!(vfs.ram_readahead_stats().hit_reads, 1);
+            }
+        }
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn ram_readahead_returns_short_read_at_eof_from_last_chunk() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-eof", 16 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let mib = RAM_READAHEAD_TEST_MIB;
+        let len = 10 * mib + 123;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-eof.bin", len).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        assert!(vfs.enable_sequential_ram_readahead(reader));
+        for offset in [0, 4 * mib] {
+            let data = read_ram_readahead_range(&vfs, reader, ino, offset, 4 * mib).await;
+            assert!(data == ram_readahead_pattern(offset, 4 * mib));
+        }
+
+        let tail = read_ram_readahead_range(&vfs, reader, ino, 8 * mib, 4 * mib).await;
+        assert_eq!(tail.len(), 2 * mib + 123);
+        assert!(tail == ram_readahead_pattern(8 * mib, 2 * mib + 123));
+        assert_eq!(vfs.ram_readahead_stats().hit_reads, 1);
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn ram_readahead_requires_handle_opt_in_and_nonzero_depth() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-opt-in", 16 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let mib = RAM_READAHEAD_TEST_MIB;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-opt-in.bin", 16 * mib).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        for offset in (0..16 * mib).step_by(4 * mib) {
+            read_ram_readahead_range(&vfs, reader, ino, offset, 4 * mib).await;
+        }
+        assert_eq!(vfs.ram_readahead_stats().scheduled_chunks, 0);
+        vfs.release_fh(reader).await.unwrap();
+    });
+
+    let disabled_tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_ram_readahead_test_vfs(&disabled_tmp, "ram-readahead-off", 0);
+    rt.block_on(async move {
+        let attr = vfs
+            .create(ROOT_INO, b"ram-readahead-off.bin", 0, 0, 0o644)
+            .unwrap();
+        let reader = vfs.open_file(attr.ino, OpenFlags::RDONLY, false).unwrap();
+        assert!(!vfs.enable_sequential_ram_readahead(reader));
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
 fn opportunistic_write_does_not_wait_for_background_materialize_session() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "write-during-materialize");
@@ -23225,6 +23588,39 @@ fn runtime_stats_surface_reports_fuse_profile_knobs() {
         snapshot.bridge.gauges["fuse_kernel_writeback_cache"].unit,
         "count"
     );
+}
+
+#[test]
+fn runtime_stats_surface_reports_upload_throttle_configuration() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-upload-throttle");
+
+    let snapshot = vfs.runtime_stats_snapshot();
+    let gauges = &snapshot.upload_queue.gauges;
+
+    assert_eq!(
+        gauges["fg_read_latency_target_ns"].value,
+        vfs.upload_fg_read_latency_target_ns
+    );
+    assert_eq!(gauges["fg_read_latency_target_ns"].unit, "ns");
+    assert_eq!(
+        gauges["cache_io_slots_max"].value,
+        u64::from(vfs.upload_cache_io_slots_max)
+    );
+    assert_eq!(
+        gauges["cache_io_slots_available"].value,
+        vfs.upload_cache_io_slots.available_permits() as u64
+    );
+    assert_eq!(
+        gauges["cache_io_foreground_cost"].value,
+        u64::from(
+            vfs.state
+                .upload
+                .upload_cache_io_foreground_cost
+                .load(Ordering::Relaxed)
+        )
+    );
+    assert_eq!(gauges["scheduler_penalty_ms"].value, 0);
 }
 
 #[test]

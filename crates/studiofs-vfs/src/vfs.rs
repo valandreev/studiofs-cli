@@ -42,6 +42,7 @@ mod namespace_ops;
 mod os_cache;
 mod overlay;
 mod prefetch;
+mod ram_readahead;
 mod read_context;
 mod read_path;
 mod runtime_stats_surface;
@@ -4102,6 +4103,8 @@ pub struct StudioVfs {
     write_buffer_pool: BufferPool,
     /// Retains at most two initialized 4 MiB speculative read buffers.
     read_window_buffer_pool: BufferPool,
+    /// Sequential RAM read-ahead depth, memory budget, and counters.
+    ram_readahead: ram_readahead::RamReadAheadRuntime,
     /// Maximum bytes drained by one opportunistic eager-flush attempt.
     write_eager_flush_drain_chunk_bytes: usize,
     /// Bounded local payload-put concurrency for one eager drain.

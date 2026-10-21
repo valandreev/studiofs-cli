@@ -635,7 +635,13 @@ Important families supported in code:
   `STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS`
 - read/upload/fetch internals: `STUDIOFS_FETCH_*`, `STUDIOFS_UPLOAD_*`,
   `STUDIOFS_QOS_*`, `STUDIOFS_PREFETCH_*`,
-  `STUDIOFS_WRITER_PAGE_SIZE_BYTES`
+  `STUDIOFS_WRITER_PAGE_SIZE_BYTES`,
+  `STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES` (idle RAM read-ahead depth per
+  opted-in sequential handle; default 32 MiB on macOS (`0` elsewhere; `0`
+  disables it),
+  `STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES` (depth while background
+  disk work is active; default 12 MiB on macOS (`0` elsewhere; `0` disables
+  read-ahead while busy), capped at the idle depth)
 - janitor/admin policy: `STUDIOFS_JANITOR_*`, `STUDIOFS_PG_*`
 - bridge-specific knobs: `STUDIOFS_WINFSP_*`
 

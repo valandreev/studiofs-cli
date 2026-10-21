@@ -1107,21 +1107,31 @@ impl StudioVfs {
         ino: Ino,
         fh: u64,
     ) -> VfsResult<ExplicitFlushOutcome> {
-        let target_ino = if fh != 0 {
-            self.handle_table.get(fh).map(|open_file| open_file.ino)
+        let open_file = if fh != 0 {
+            self.handle_table.get(fh)
         } else {
             None
+        };
+        let target_ino = open_file.as_ref().map_or(ino, |open_file| open_file.ino);
+        // A read-only handle accepted no writes, so its flush (sent on every
+        // close(2)) has nothing to admit. It must not wait for a deferred
+        // last-handle release, which holds the close until an earlier writer's
+        // whole backlog materializes, nor start a materializer that the
+        // release's session would then wait on. fsync keeps the strict wait.
+        let write_capable = open_file
+            .as_ref()
+            .is_none_or(|open_file| open_file.flags.allows_write());
+        if write_capable {
+            self.wait_for_deferred_release_inflight(target_ino).await;
         }
-        .unwrap_or(ino);
-        self.wait_for_deferred_release_inflight(target_ino).await;
         self.ensure_volatile_overlay_metadata_healthy()?;
         self.ensure_deferred_namespace_metadata_healthy()?;
         let had_local_dirty_state = self.inode_has_local_dirty_state(target_ino);
-        if self.state.writer_stack.has_dirty_writers(target_ino) {
+        if write_capable && self.state.writer_stack.has_dirty_writers(target_ino) {
             self.spawn_deferred_materialization_if_needed(target_ino);
         }
         Ok(ExplicitFlushOutcome {
-            flushed_local_dirty_state: had_local_dirty_state,
+            flushed_local_dirty_state: write_capable && had_local_dirty_state,
         })
     }
 
@@ -1568,6 +1578,31 @@ impl StudioVfs {
     /// On success, every byte up to the returned length is overwritten, including zero-filled holes.
     /// On error, the buffer may be partially modified; its contents must not be used as a read result.
     pub async fn read_into_fh(
+        self: &Arc<Self>,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> VfsResult<u32> {
+        // RAM read-ahead chunks are looked up and awaited before this read
+        // takes its file-session permit; see `ram_readahead` for why.
+        let ram_readahead_handle = self.ram_readahead_handle(fh, ino);
+        if let Some(open_file) = &ram_readahead_handle
+            && let Some(read) = self
+                .read_from_ram_readahead(open_file, offset, buffer)
+                .await?
+        {
+            self.schedule_ram_readahead(open_file, offset, read as usize);
+            return Ok(read);
+        }
+        let result = self.read_into_fh_session(fh, ino, offset, buffer).await;
+        if let (Some(open_file), Ok(read)) = (&ram_readahead_handle, &result) {
+            self.schedule_ram_readahead(open_file, offset, *read as usize);
+        }
+        result
+    }
+
+    async fn read_into_fh_session(
         &self,
         fh: u64,
         ino: Ino,

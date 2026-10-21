@@ -305,6 +305,16 @@ where
     read_var(key).ok().and_then(|v| v.parse::<u64>().ok())
 }
 
+fn parse_env_size_bytes_with<F>(read_var: &F, key: &str) -> Option<usize>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    read_var(key)
+        .ok()
+        .and_then(|value| parse_size_bytes(&value))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+}
+
 fn parse_env_f64_with<F>(read_var: &F, key: &str) -> Option<f64>
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
@@ -698,6 +708,17 @@ where
     }
     if let Some(value) = parse_env_u32_with(&read_var, "STUDIOFS_READAHEAD_MIN_PREFETCH") {
         config.readahead_min_prefetch = Some(value);
+    }
+    // Zero is meaningful here: it disables RAM read-ahead.
+    if let Some(value) =
+        parse_env_size_bytes_with(&read_var, "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES")
+    {
+        config.sequential_ram_readahead_bytes = Some(value);
+    }
+    if let Some(value) =
+        parse_env_size_bytes_with(&read_var, "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES")
+    {
+        config.sequential_ram_readahead_shared_bytes = Some(value);
     }
     set_usize!("STUDIOFS_DIR_PREFETCH_MAX_BATCH", dir_prefetch_max_batch);
     set_usize!(
@@ -3212,6 +3233,51 @@ mod tests {
         });
 
         assert_eq!(resolved.upload_delay_ms, None);
+    }
+
+    #[test]
+    fn overlay_vfs_env_applies_sequential_ram_readahead_overrides() {
+        for (expected_key, value, expected) in [
+            ("STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES", "0", 0),
+            (
+                "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES",
+                "8MB",
+                8 * 1024 * 1024,
+            ),
+            ("STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES", " 0 ", 0),
+            (
+                "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES",
+                "8388608",
+                8 * 1024 * 1024,
+            ),
+            ("STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES", "0", 0),
+            (
+                "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES",
+                "8MB",
+                8 * 1024 * 1024,
+            ),
+            ("STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES", " 0 ", 0),
+            (
+                "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES",
+                "4194304",
+                4 * 1024 * 1024,
+            ),
+        ] {
+            let resolved = overlay_vfs_env_with(VfsConfigRaw::default(), |env_key| {
+                if env_key == expected_key {
+                    Ok(value.to_string())
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
+            });
+
+            let actual = if expected_key == "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES" {
+                resolved.sequential_ram_readahead_bytes
+            } else {
+                resolved.sequential_ram_readahead_shared_bytes
+            };
+            assert_eq!(actual, Some(expected));
+        }
     }
 
     #[test]
