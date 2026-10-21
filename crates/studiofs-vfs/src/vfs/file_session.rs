@@ -12,6 +12,7 @@ use tracing::debug;
 use super::os_cache::{
     OsCacheForegroundHandleLease, OsCacheOpenDecision, OsCacheReason, OsCacheWriterLease,
 };
+use super::ram_readahead::RamReadAheadState;
 use crate::utils::now_unix_millis;
 
 // =============================================================================
@@ -169,6 +170,7 @@ pub struct OpenFile {
     pub(super) active_open_overlay: bool,
     access_state: Arc<Mutex<HandleAccessState>>,
     read_window: Arc<Mutex<ReadWindowState>>,
+    ram_readahead: Arc<Mutex<RamReadAheadState>>,
     os_cache_state: Arc<Mutex<OsCacheHandleState>>,
 }
 
@@ -188,6 +190,7 @@ impl OpenFile {
             active_open_overlay,
             access_state: Arc::new(Mutex::new(HandleAccessState::new(fh, flags))),
             read_window: Arc::new(Mutex::new(ReadWindowState::default())),
+            ram_readahead: Arc::new(Mutex::new(RamReadAheadState::default())),
             os_cache_state: Arc::new(Mutex::new(OsCacheHandleState::default())),
         }
     }
@@ -344,6 +347,12 @@ impl OpenFile {
         let mut state = self.read_window.lock();
         state.last_end = None;
         state.window = None;
+        drop(state);
+        self.ram_readahead.lock().discard_all();
+    }
+
+    pub(super) fn ram_readahead(&self) -> &Mutex<RamReadAheadState> {
+        &self.ram_readahead
     }
 
     pub(super) fn read_ahead_owner(&self) -> ReadAheadOwner {
@@ -380,6 +389,8 @@ impl OpenFile {
         if owner == ReadAheadOwner::Kernel {
             state.last_end = None;
             state.window = None;
+            drop(state);
+            self.ram_readahead.lock().disable();
         }
         previous
     }

@@ -699,6 +699,13 @@ where
     if let Some(value) = parse_env_u32_with(&read_var, "STUDIOFS_READAHEAD_MIN_PREFETCH") {
         config.readahead_min_prefetch = Some(value);
     }
+    // Zero is meaningful here: it disables RAM read-ahead.
+    if let Some(value) =
+        parse_env_u64_any_with(&read_var, "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES")
+            .and_then(|value| usize::try_from(value).ok())
+    {
+        config.sequential_ram_readahead_bytes = Some(value);
+    }
     set_usize!("STUDIOFS_DIR_PREFETCH_MAX_BATCH", dir_prefetch_max_batch);
     set_usize!(
         "STUDIOFS_READDIR_ATTR_BATCH_CHUNK",
@@ -3212,6 +3219,18 @@ mod tests {
         });
 
         assert_eq!(resolved.upload_delay_ms, None);
+    }
+
+    #[test]
+    fn overlay_vfs_env_applies_sequential_ram_readahead_override() {
+        for (value, expected) in [("0", 0), ("8388608", 8 * 1024 * 1024)] {
+            let resolved = overlay_vfs_env_with(VfsConfigRaw::default(), |key| match key {
+                "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES" => Ok(value.to_string()),
+                _ => Err(std::env::VarError::NotPresent),
+            });
+
+            assert_eq!(resolved.sequential_ram_readahead_bytes, Some(expected));
+        }
     }
 
     #[test]

@@ -2079,6 +2079,51 @@ mod tests {
     }
 
     #[test]
+    fn direct_io_read_only_open_enables_sequential_ram_readahead() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "macfuse-direct-io-ram-readahead",
+        )
+        .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(
+                studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
+                b"direct-io-ram-readahead.bin",
+                501,
+                20,
+                0o644,
+            )
+            .expect("create file");
+        fixture
+            .runtime()
+            .block_on(vfs.write(attr.ino, 0, &[0x5a; 64 * 1024]))
+            .expect("seed unpublished payload");
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+
+        let reader = adapter
+            .open(attr.ino, libc::O_RDONLY)
+            .expect("open unpublished reader through macFUSE adapter");
+        assert!(reader.direct_io());
+        assert!(vfs.sequential_ram_readahead_enabled(reader.file_handle()));
+
+        let writer = adapter
+            .open(attr.ino, libc::O_RDWR)
+            .expect("open writer through macFUSE adapter");
+        assert!(writer.direct_io());
+        assert!(
+            !vfs.sequential_ram_readahead_enabled(writer.file_handle()),
+            "write-capable handles keep reads on the normal path"
+        );
+        adapter
+            .release(attr.ino, writer.file_handle())
+            .expect("release writer");
+        adapter
+            .release(attr.ino, reader.file_handle())
+            .expect("release reader");
+    }
+
+    #[test]
     fn unpublished_adapter_read_executes_exact_kernel_requested_range() {
         const REQUEST_BYTES: usize = 4 * 1024;
         const PAYLOAD_BYTES: usize = 256 * 1024;

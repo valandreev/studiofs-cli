@@ -5,7 +5,7 @@ use studiofs_meta::{
 
 use super::{
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsSection, RuntimeStatsSnapshot,
-    StudioVfs, VfsForegroundReadProtectionStats,
+    StudioVfs, VfsForegroundReadProtectionStats, ram_readahead::RamReadAheadStats,
 };
 use crate::utils::now_unix_millis;
 
@@ -769,6 +769,7 @@ impl StudioVfs {
             upload.upload_ingress_coalesced,
         );
         insert_foreground_read_protection(&mut snapshot, &self.foreground_read_protection_stats());
+        insert_ram_readahead(&mut snapshot.vfs_read, self.ram_readahead_stats());
         insert_gauge(
             &mut snapshot.upload_queue,
             "fg_read_latency_target_ns",
@@ -1091,6 +1092,29 @@ fn insert_local_storage_diagnostics(
         ),
     ] {
         insert_gauge(section, name, "count", u64::from(value));
+    }
+}
+
+/// Export sequential RAM read-ahead counters.
+fn insert_ram_readahead(section: &mut RuntimeStatsSection, stats: RamReadAheadStats) {
+    for (name, unit, value) in [
+        (
+            "ram_readahead_scheduled_chunks",
+            "count",
+            stats.scheduled_chunks,
+        ),
+        ("ram_readahead_loaded_bytes", "bytes", stats.loaded_bytes),
+        ("ram_readahead_hit_reads", "count", stats.hit_reads),
+        ("ram_readahead_hit_bytes", "bytes", stats.hit_bytes),
+        ("ram_readahead_wait_reads", "count", stats.wait_reads),
+        (
+            "ram_readahead_discarded_chunks",
+            "count",
+            stats.discarded_chunks,
+        ),
+        ("ram_readahead_budget_skips", "count", stats.budget_skips),
+    ] {
+        insert_counter(section, name, unit, value);
     }
 }
 

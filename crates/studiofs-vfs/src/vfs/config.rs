@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use studiofs_meta::types::Ino;
 
+use super::ram_readahead::DEFAULT_SEQUENTIAL_RAM_READAHEAD_BYTES;
 use crate::vfs::{
     DEFAULT_ATTR_READ_CACHE_BYTES, DEFAULT_ATTR_READ_CACHE_CAPACITY, DEFAULT_DENTRY_CACHE_BYTES,
     DEFAULT_DENTRY_CACHE_CAPACITY, DEFAULT_DIR_PREFETCH_MAX_BATCH,
@@ -232,6 +233,9 @@ pub struct VfsConfig {
     pub readahead_width: u32,
     /// Minimum prefetch count for sequential patterns.
     pub readahead_min_prefetch: u32,
+    /// Bytes a sequential stream on an opted-in handle reads ahead into RAM;
+    /// zero disables it. Bridges opt in handles that get no kernel read-ahead.
+    pub sequential_ram_readahead_bytes: usize,
     /// Directory prefetch batch size.
     pub dir_prefetch_max_batch: usize,
     /// Readdir attr hydration chunk size.
@@ -411,6 +415,8 @@ pub struct VfsConfigRaw {
     pub readahead_width: Option<u32>,
     /// Optional override for minimum readahead prefetch count.
     pub readahead_min_prefetch: Option<u32>,
+    /// Optional override for sequential RAM read-ahead bytes per handle.
+    pub sequential_ram_readahead_bytes: Option<usize>,
     /// Optional override for max directory prefetch batch size.
     pub dir_prefetch_max_batch: Option<usize>,
     /// Optional override for readdir attr batch chunk size.
@@ -630,6 +636,7 @@ impl VfsConfigRaw {
             prefetch_concurrency,
             readahead_width,
             readahead_min_prefetch,
+            sequential_ram_readahead_bytes,
             dir_prefetch_max_batch,
             readdir_attr_batch_chunk,
             readdir_attr_batch_max_inodes,
@@ -798,6 +805,7 @@ impl From<VfsConfig> for VfsConfigRaw {
             prefetch_concurrency: Some(cfg.prefetch_concurrency),
             readahead_width: Some(cfg.readahead_width),
             readahead_min_prefetch: Some(cfg.readahead_min_prefetch),
+            sequential_ram_readahead_bytes: Some(cfg.sequential_ram_readahead_bytes),
             dir_prefetch_max_batch: Some(cfg.dir_prefetch_max_batch),
             readdir_attr_batch_chunk: Some(cfg.readdir_attr_batch_chunk),
             readdir_attr_batch_max_inodes: Some(cfg.readdir_attr_batch_max_inodes),
@@ -878,6 +886,7 @@ impl Default for VfsConfig {
                 .max(DEFAULT_PREFETCH_CONCURRENCY_MIN),
             readahead_width: DEFAULT_READAHEAD_WIDTH,
             readahead_min_prefetch: DEFAULT_READAHEAD_MIN_PREFETCH,
+            sequential_ram_readahead_bytes: DEFAULT_SEQUENTIAL_RAM_READAHEAD_BYTES,
             dir_prefetch_max_batch: DEFAULT_DIR_PREFETCH_MAX_BATCH,
             readdir_attr_batch_chunk: DEFAULT_READDIR_ATTR_BATCH_CHUNK,
             readdir_attr_batch_max_inodes: DEFAULT_READDIR_ATTR_BATCH_MAX_INODES,

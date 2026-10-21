@@ -215,6 +215,21 @@ reread takes. These metrics show whether that throttle engaged.
 | `upload_queue.fallback_wait_ns`, `upload_queue.fallback_read_ns` | counter / ns | Time those rereads waited for upload cache-I/O slots, and spent reading. The foreground-idle yield and pacing delay before the slot wait are not counted. |
 | `upload_queue.fallback_wait_max_ns`, `upload_queue.fallback_read_max_ns` | gauge / ns | Longest such wait and read since mount. |
 
+## Sequential RAM Read-Ahead
+
+Handles that a bridge opted into sequential RAM read-ahead (macFUSE read-only
+`direct_io` handles) load 4 MiB chunks ahead of a sequential stream. The
+`vfs_read` section counts that work.
+
+| Metric | Kind / unit | Meaning |
+| --- | --- | --- |
+| `vfs_read.ram_readahead_scheduled_chunks` | counter / count | Chunk loads started. |
+| `vfs_read.ram_readahead_loaded_bytes` | counter / bytes | Bytes of chunks that were loaded and installed. |
+| `vfs_read.ram_readahead_hit_reads`, `vfs_read.ram_readahead_hit_bytes` | counter / count, bytes | Read callbacks served entirely from chunks, and the bytes they returned. |
+| `vfs_read.ram_readahead_wait_reads` | counter / count | Hits that waited for an in-flight chunk. |
+| `vfs_read.ram_readahead_discarded_chunks` | counter / count | Chunk loads whose result was dropped: the inode was invalidated, the stream moved past the chunk, or the read failed. |
+| `vfs_read.ram_readahead_budget_skips` | counter / count | Chunks not scheduled because the 256 MiB mount-wide budget was in use. |
+
 ## Text Representation
 
 The local text representation is line-oriented and machine-readable:

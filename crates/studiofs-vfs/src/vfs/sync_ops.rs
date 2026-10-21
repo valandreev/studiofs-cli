@@ -1578,6 +1578,31 @@ impl StudioVfs {
     /// On success, every byte up to the returned length is overwritten, including zero-filled holes.
     /// On error, the buffer may be partially modified; its contents must not be used as a read result.
     pub async fn read_into_fh(
+        self: &Arc<Self>,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> VfsResult<u32> {
+        // RAM read-ahead chunks are looked up and awaited before this read
+        // takes its file-session permit; see `ram_readahead` for why.
+        let ram_readahead_handle = self.ram_readahead_handle(fh, ino);
+        if let Some(open_file) = &ram_readahead_handle
+            && let Some(read) = self
+                .read_from_ram_readahead(open_file, offset, buffer)
+                .await?
+        {
+            self.schedule_ram_readahead(open_file, offset, read as usize);
+            return Ok(read);
+        }
+        let result = self.read_into_fh_session(fh, ino, offset, buffer).await;
+        if let (Some(open_file), Ok(read)) = (&ram_readahead_handle, &result) {
+            self.schedule_ram_readahead(open_file, offset, *read as usize);
+        }
+        result
+    }
+
+    async fn read_into_fh_session(
         &self,
         fh: u64,
         ino: Ino,
