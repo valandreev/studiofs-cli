@@ -6351,17 +6351,20 @@ mod tests {
     }
 
     #[test]
-    fn winfsp_invalidation_queue_drops_distinct_inode_at_capacity_without_blocking() {
-        let (_tmp, _vfs, _ctx, queue) = make_test_context("invalidation-backpressure");
+    fn winfsp_invalidation_queue_reconciles_overflow_without_blocking() {
+        let (_tmp, vfs, _ctx, queue) = make_test_context("invalidation-backpressure");
+        let attr = vfs
+            .create(ROOT_INO, b"overflow", 0, 0, 0o644)
+            .expect("create");
         let capacity = super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY;
-        for ino in 0..capacity as u64 {
+        for ino in 10_000..10_000 + capacity as u64 {
             queue.push(ino);
         }
 
         let producer_queue = Arc::clone(&queue);
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let producer = std::thread::spawn(move || {
-            producer_queue.push(capacity as u64);
+            producer_queue.push(attr.ino);
             finished_tx.send(()).expect("test producer finished");
         });
 
@@ -6374,6 +6377,15 @@ mod tests {
         producer.join().expect("test producer should join");
         assert_eq!(queue.drain().len(), capacity);
         assert_eq!(queue.delivery_snapshot().failed_notifications, 1);
+        assert!(
+            !queue.is_empty(),
+            "overflow must retain reconciliation work"
+        );
+        assert!(queue.pending_delivery_age_ms().is_some());
+        assert!(
+            queue.drain().contains(&attr.ino),
+            "retry without another mutation"
+        );
     }
 
     #[test]
@@ -6392,6 +6404,46 @@ mod tests {
         assert!(queue.order_capacity() >= capacity);
         assert_eq!(queue.drain(), vec![13, 23, 37]);
         assert!(queue.order_capacity() >= capacity);
+    }
+
+    #[test]
+    fn overflow_reconciliation_preserves_writer_deferral() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("overflow-writer-deferral");
+        let attr = vfs
+            .create(ROOT_INO, b"overflow", 0, 0, 0o644)
+            .expect("create");
+        let writer = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("writer");
+        let capacity = super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY;
+        queue.extend(10_000..10_000 + capacity as u64);
+        queue.push(attr.ino);
+        assert!(ctx.should_notify().is_none(), "filler inodes do not exist");
+        let mut prepared = ctx.should_notify().expect("root reconciliation");
+        assert!(
+            !prepared
+                .iter()
+                .any(|notification| notification.ino == attr.ino)
+        );
+        prepared.mark_published();
+        drop(prepared);
+        assert!(!queue.is_empty(), "writer target must remain deferred");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(writer).await }
+        })
+        .expect("release writer");
+        let mut prepared = ctx
+            .should_notify()
+            .expect("writer notification after release");
+        assert!(
+            prepared
+                .iter()
+                .any(|notification| notification.ino == attr.ino)
+        );
+        prepared.mark_published();
+        drop(prepared);
+        assert!(queue.is_empty());
     }
 
     #[test]
@@ -7225,6 +7277,20 @@ mod tests {
                 | FILE_NOTIFY_CHANGE_ATTRIBUTES
                 | FILE_NOTIFY_CHANGE_LAST_WRITE
         );
+    }
+
+    #[test]
+    fn build_notify_info_uses_counted_utf16_without_nul() {
+        use winfsp::filesystem::WideNameInfo;
+        let path = "\\file-🦀.txt";
+        let info = build_notify_info(path, FileType::RegularFile).expect("notify info");
+        let mut buffer = [0; 128];
+        let mut cursor = 0;
+        assert!(info.append_to_buffer(&mut buffer, &mut cursor));
+        let size = usize::from(u16::from_le_bytes([buffer[0], buffer[1]]));
+        let name_offset = std::mem::offset_of!(winfsp_sys::FSP_FSCTL_NOTIFY_INFO, FileNameBuf);
+        let expected: Vec<_> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(&buffer[name_offset..size], expected);
     }
 
     #[test]

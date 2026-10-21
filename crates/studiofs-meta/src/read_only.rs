@@ -137,6 +137,10 @@ where
         self.inner.list_inode_lifecycles()
     }
 
+    fn list_inode_ids_after(&self, after: Option<Ino>, limit: usize) -> MetaResult<Vec<Ino>> {
+        self.inner.list_inode_ids_after(after, limit)
+    }
+
     fn set_attr(&self, _attr: &InodeAttr) -> MetaResult<()> {
         Err(read_only_error(ROOT_INO))
     }

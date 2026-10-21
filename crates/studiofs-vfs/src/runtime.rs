@@ -345,6 +345,7 @@ impl<M: ?Sized + MetaInodes> MetaInodes for RuntimeMetaHandle<M> {
     forward_method!(fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()>);
     forward_method!(fn remove_attr(&self, ino: Ino) -> MetaResult<()>);
     forward_method!(fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>>);
+    forward_method!(fn list_inode_ids_after(&self, after: Option<Ino>, limit: usize) -> MetaResult<Vec<Ino>>);
 }
 
 impl<M: ?Sized + MetaNamespace> MetaNamespace for RuntimeMetaHandle<M> {

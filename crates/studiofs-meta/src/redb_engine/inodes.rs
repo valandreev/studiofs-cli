@@ -1497,6 +1497,30 @@ impl MetaInodes for RedbMetaEngine {
         Ok(())
     }
 
+    fn list_inode_ids_after(&self, after: Option<Ino>, limit: usize) -> MetaResult<Vec<Ino>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let txn = self.begin_read_txn()?;
+        let mut inos = BTreeSet::new();
+        for table_def in [BASE_INODES_TABLE, INODES_TABLE] {
+            let table = txn
+                .open_table(table_def)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let after_bound = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+            for row in table
+                .range((after_bound, std::ops::Bound::Unbounded))
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .take(limit)
+            {
+                let (ino, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                inos.insert(ino.value());
+            }
+        }
+        Ok(inos.into_iter().take(limit).collect())
+    }
+
     fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {
         let txn = self.begin_read_txn()?;
         let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
@@ -1776,6 +1800,46 @@ mod tests {
             .collect();
 
         assert_eq!(payload_ids, vec![777_201, 777_202]);
+    }
+
+    #[test]
+    fn list_inode_ids_after_pages_sparse_base_and_local_ids() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let db_path = temp.path().join("inode-id-pagination.redb");
+        let engine = RedbMetaEngine::open(&db_path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+
+        let txn = engine.begin_write_txn().unwrap();
+        {
+            let mut base = txn.open_table(BASE_INODES_TABLE).unwrap();
+            base.insert(10, &[][..]).unwrap();
+            base.insert(40, &[][..]).unwrap();
+            base.insert(u64::MAX, &[][..]).unwrap();
+        }
+        {
+            let mut local = txn.open_table(INODES_TABLE).unwrap();
+            local.insert(20, &[][..]).unwrap();
+            local.insert(40, &[][..]).unwrap();
+            local.insert(70, &[][..]).unwrap();
+        }
+        txn.commit().unwrap();
+
+        assert_eq!(
+            engine.list_inode_ids_after(None, 0).unwrap(),
+            Vec::<Ino>::new()
+        );
+        assert_eq!(
+            engine.list_inode_ids_after(None, 3).unwrap(),
+            vec![ROOT_INO, 10, 20]
+        );
+        assert_eq!(
+            engine.list_inode_ids_after(Some(20), 3).unwrap(),
+            vec![40, 70, u64::MAX]
+        );
+        assert_eq!(
+            engine.list_inode_ids_after(Some(u64::MAX), 3).unwrap(),
+            Vec::<Ino>::new()
+        );
     }
 
     #[test]

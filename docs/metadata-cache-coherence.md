@@ -190,6 +190,17 @@ observation check before cache admission.
 
 The WinFSP adapter preserves path/action/filter identities when coalescing and
 keeps old paths during retry. Semantic enqueue and retry cannot block at capacity.
+An individual inode request rejected at capacity retains a fixed-size overflow
+marker. Timer drains refill the queue from bounded, sorted pages of local redb
+inode candidates; removed candidates are skipped during ordinary preparation.
+This conservative sweep may purge unrelated cached inodes, but needs no further
+metadata mutation or remote service. Repeated overflow restarts the cursor while
+preserving the oldest overflow age; shutdown cancels reconciliation. Page reads
+run outside the producer's queue lock, and existing writer protection still
+applies. No unbounded overflow list or whole-volume snapshot is retained.
+Native notification names are counted UTF-16 without a terminator. The Rust
+`set_name` convenience method includes a NUL in the reported size, so this
+adapter uses `set_name_raw` to avoid an invalid native notification name.
 `WinfspDeliverySnapshot` reports queue acceptance, native submissions, failed and
 unsupported work, and writer deferral. A partially deferred generation cannot
 advance the fully accepted generation. Open write-capable handles

@@ -17,6 +17,9 @@ use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use super::StudioFsContext;
 use crate::ensure_winfsp_runtime_loaded;
 
+#[cfg(test)]
+mod overflow_mount_test;
+
 pub(super) const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x0000_0001;
 pub(super) const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x0000_0002;
 pub(super) const FILE_NOTIFY_CHANGE_ATTRIBUTES: u32 = 0x0000_0004;
@@ -58,7 +61,9 @@ fn build_notify_info_with_action(
     let mut info = NotifyInfo::<512>::new();
     info.filter = notify_filter_for_kind(kind);
     info.action = action;
-    info.set_name(path).ok()?;
+    // Native notifications use a counted name; set_name includes a rejected NUL.
+    let name: Vec<_> = path.encode_utf16().collect();
+    info.set_name_raw(name.as_slice()).ok()?;
     Some(info)
 }
 
@@ -173,6 +178,9 @@ struct WinfspInvalidationOverride {
 #[derive(Debug, Default)]
 struct WinfspInvalidationQueueState {
     closed: bool,
+    overflow_since: Option<Instant>,
+    reconciliation_after: Option<Ino>,
+    overflow_epoch: u64,
     order: VecDeque<NotificationKey>,
     pending: HashSet<NotificationKey>,
     path_overrides: HashMap<NotificationKey, WinfspInvalidationOverride>,
@@ -295,10 +303,14 @@ impl WinfspInvalidationQueue {
     /// Return the age of the oldest pending or in-flight invalidation target.
     pub fn pending_delivery_age_ms(&self) -> Option<u64> {
         let state = self.state.lock();
-        match (state.pending_since, state.deferred_since) {
-            (Some(pending), Some(deferred)) => Some(pending.min(deferred)),
-            (pending, deferred) => pending.or(deferred),
-        }
+        [
+            state.pending_since,
+            state.deferred_since,
+            state.overflow_since,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
         .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
     }
 
@@ -562,7 +574,66 @@ impl WinfspInvalidationQueue {
             return true;
         }
         state.delivery.failed_notifications = state.delivery.failed_notifications.saturating_add(1);
+        if matches!(key, NotificationKey::Inode(_)) {
+            // A later overflow may be behind the sweep cursor; restart without
+            // forgetting how long the oldest lost request has been pending.
+            state.overflow_since.get_or_insert_with(Instant::now);
+            state.reconciliation_after = None;
+            state.overflow_epoch = state.overflow_epoch.wrapping_add(1);
+        }
         false
+    }
+
+    fn refill_overflow(&self) {
+        let (epoch, after, limit) = {
+            let state = self.state.lock();
+            if state.closed || state.overflow_since.is_none() {
+                return;
+            }
+            (
+                state.overflow_epoch,
+                state.reconciliation_after,
+                WINFSP_INVALIDATION_QUEUE_CAPACITY - state.pending.len(),
+            )
+        };
+        if limit == 0 {
+            return;
+        }
+        let Some(vfs) = self.metrics_vfs.upgrade() else {
+            return;
+        };
+        // Read bounded local metadata pages outside the producer's queue lock.
+        let inodes = match vfs.meta().list_inode_ids_after(after, limit) {
+            Ok(inodes) => inodes,
+            Err(_) => {
+                self.record_failed_notification();
+                return;
+            }
+        };
+        let mut state = self.state.lock();
+        if state.closed || state.overflow_epoch != epoch || state.reconciliation_after != after {
+            return;
+        }
+        let since = state.overflow_since;
+        let mut accepted = 0;
+        for &ino in &inodes {
+            let key = NotificationKey::Inode(ino);
+            if state.pending.len() == WINFSP_INVALIDATION_QUEUE_CAPACITY
+                && !state.pending.contains(&key)
+            {
+                break;
+            }
+            self.push_locked(&mut state, key, since);
+            state.reconciliation_after = Some(ino);
+            accepted += 1;
+        }
+        if accepted == inodes.len() && inodes.len() < limit {
+            state.overflow_since = None;
+            state.reconciliation_after = None;
+        }
+        let snapshot = Self::next_metrics_snapshot(&mut state);
+        drop(state);
+        self.record_metrics(snapshot);
     }
 
     #[cfg(test)]
@@ -584,6 +655,8 @@ impl WinfspInvalidationQueue {
         &self,
         mark_notification_in_flight: bool,
     ) -> Vec<(Ino, Option<WinfspInvalidationOverride>)> {
+        // Refill before draining so deferred writers can reuse the freed slots.
+        self.refill_overflow();
         let mut state = self.state.lock();
         let mut targets = Vec::with_capacity(state.order.len());
         state.pending.clear();
@@ -631,7 +704,8 @@ impl WinfspInvalidationQueue {
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.state.lock().pending.is_empty()
+        let state = self.state.lock();
+        state.pending.is_empty() && state.overflow_since.is_none()
     }
 
     #[cfg(test)]
@@ -642,6 +716,7 @@ impl WinfspInvalidationQueue {
     pub(crate) fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
+        state.overflow_since = None;
         self.quiescent.notify_all();
         let snapshot = Self::next_metrics_snapshot(&mut state);
         drop(state);
@@ -658,14 +733,18 @@ impl WinfspInvalidationQueue {
     pub(crate) fn wait_for_quiescence(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock();
-        while (!state.pending.is_empty() || state.notification_batches_in_flight != 0)
+        while (!state.pending.is_empty()
+            || state.overflow_since.is_some()
+            || state.notification_batches_in_flight != 0)
             && !state.closed
         {
             if self.quiescent.wait_until(&mut state, deadline).timed_out() {
                 break;
             }
         }
-        state.pending.is_empty() && state.notification_batches_in_flight == 0
+        state.pending.is_empty()
+            && state.overflow_since.is_none()
+            && state.notification_batches_in_flight == 0
     }
 
     fn finish_notification_batch(&self) {
@@ -935,5 +1014,59 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
             .submitted_notifications
             .saturating_add(submitted);
         notifications.mark_published();
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+    use crate::context::tests::make_test_context;
+
+    #[test]
+    fn overflow_reconciliation_pages_restart_and_preserve_age() {
+        let (_tmp, vfs, _ctx, queue) = make_test_context("overflow-page-restart");
+        let attr = vfs
+            .create(studiofs_meta::ROOT_INO, b"overflow", 0, 0, 0o644)
+            .unwrap();
+        queue.extend(10_000..10_000 + WINFSP_INVALIDATION_QUEUE_CAPACITY as u64);
+        queue.push(attr.ino);
+        let since = Instant::now() - Duration::from_secs(5);
+        {
+            let mut state = queue.state.lock();
+            state.overflow_since = Some(since);
+            let key = state.order.pop_back().unwrap();
+            state.pending.remove(&key);
+        }
+        queue.refill_overflow();
+        {
+            let state = queue.state.lock();
+            assert_eq!(state.pending.len(), WINFSP_INVALIDATION_QUEUE_CAPACITY);
+            assert_eq!(state.reconciliation_after, Some(studiofs_meta::ROOT_INO));
+            assert_eq!(state.overflow_since, Some(since));
+        }
+        queue.push(attr.ino);
+        {
+            let state = queue.state.lock();
+            assert_eq!(state.reconciliation_after, None);
+            assert_eq!(state.overflow_since, Some(since));
+        }
+        assert_eq!(queue.drain().len(), WINFSP_INVALIDATION_QUEUE_CAPACITY);
+        assert_eq!(queue.state.lock().overflow_since, Some(since));
+        assert!(queue.pending_delivery_age_ms().unwrap() >= 5_000);
+        assert!(queue.drain().contains(&attr.ino));
+        assert!(queue.is_empty());
+        assert_eq!(queue.pending_delivery_age_ms(), None);
+    }
+
+    #[test]
+    fn closing_queue_cancels_overflow_reconciliation() {
+        let (_tmp, _vfs, _ctx, queue) = make_test_context("overflow-close");
+        queue.extend(10_000..10_000 + WINFSP_INVALIDATION_QUEUE_CAPACITY as u64);
+        queue.push(studiofs_meta::ROOT_INO);
+        queue.close();
+        assert_eq!(queue.drain().len(), WINFSP_INVALIDATION_QUEUE_CAPACITY);
+        assert!(queue.is_empty());
+        assert!(queue.drain().is_empty());
+        assert_eq!(queue.pending_delivery_age_ms(), None);
     }
 }
