@@ -187,13 +187,15 @@ tasks:
       ARTIFACT_DIR="${RUN_ROOT}/${RUN_ID}"
 
       echo "Starting StudioFS full real E2E run"
-      echo "scenario_selector=1-25"
+      echo "scenario_selector=1-28,mounted-sync-safety-two-client-acceptance"
       echo "run_id=${RUN_ID}"
       echo "artifact_path=${ARTIFACT_DIR}"
 
+      # Selection coverage is pinned by runner_contract::rwx_full_e2e_selects_every_registered_scenario.
       set +e
       cargo run -p studiofs-e2e -- run \
-        --scenario 1-25 \
+        --scenario 1-28 \
+        --scenario mounted-sync-safety-two-client-acceptance \
         --studiofs-bin target/debug/studiofs \
         --root "${RUN_ROOT}" \
         --run-id "${RUN_ID}" \
