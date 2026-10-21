@@ -94,14 +94,11 @@ fn winfsp_cached_handle_reloads_after_queue_overflow() {
             .expect("start WinFSP host");
 
         let drive_root = format!("{}\\", mount_point);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while std::fs::metadata(&drive_root).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "WinFSP mount did not become ready"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        assert!(
+            wait_until(Duration::from_secs(10), || std::fs::metadata(&drive_root)
+                .is_ok()),
+            "WinFSP mount did not become ready"
+        );
 
         let callbacks_before_open = vfs.write_path_observability_snapshot().winfsp_callbacks;
         let path = format!("{drive_root}overflow-cache.bin");

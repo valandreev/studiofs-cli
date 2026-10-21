@@ -16,6 +16,9 @@ in `E:/dev/studiofs-cli`; the starting worktree was clean.
 - [x] (2026-10-21) Focused tests and native mounted cached-handle check.
 - [x] (2026-10-21) Clippy for all three changed crates, formatting, final diff review.
 - [x] (2026-10-21) Implementation ready for commit/push and Linear review handoff.
+- [x] (2026-10-21) Reproduce open-unlinked candidate and rejected-path-retry defects.
+- [x] (2026-10-21) Block health promotion and live cache admission during recovery.
+- [x] (2026-10-21) Validate deep-review corrections and dispositions; ready for commit/push.
 
 ## Surprises & Discoveries
 
@@ -135,3 +138,61 @@ suites remain operator-run. The concurrent snapshot schedule was checked against
 the source; no new concurrency hook was added for this review cleanup.
 WinFSP all-target Clippy with warnings denied, rustfmt, and `git diff --check`
 also passed.
+
+## Deep-review follow-up
+
+Source report: `docs/code-reviews/sfs-873-winfsp-invalidation-overflow-review.md`,
+reviewed against `38e3a671`. Recommendations are evaluated as review input.
+
+- 2.1 confirmed by a failing regression: an open-unlinked file has `nlink == 0`
+  but still has metadata. Preparation now reads authoritative attributes first,
+  skips removed/unlinked candidates, and reuses the kind without a fallback.
+- 2.2 raw tombstone candidates are intentional: filtering before `take(limit)`
+  would violate bounded scanned work, while filtering a bounded raw page without
+  returning its scanned cursor would break progress. Deleted candidates now take
+  one authoritative lookup, without a redundant path-resolution attempt. Keep the
+  bounded raw-page API; add metadata pagination coverage with tombstones.
+  No measured multi-second latency or transaction-cost acceptance is claimed.
+- 2.3 retain refill-before-drain: the freed slots must remain available for
+  requeued historical writer targets. A full initial queue needs another timer
+  pass; repeated pages per callback are not required for eventual recovery.
+- 3.1 confirmed for legacy individual inode requests, which do not carry semantic
+  generation gaps. Add an explicit recovery signal blocking health promotion
+  until the sweep and prepared notification retries finish, followed by fresh
+  catch-up coverage. Cache admission also checks the live adapter signal because
+  health observations can lag; its focused regression failed before that check.
+  Native consumption remains unobserved. The report's claim
+  of permanent degradation without external changes overlooks fallback polling.
+- 3.2 confirmed by a failing regression: unpublished inode notifications become
+  Path retries. Shared admission now starts reconciliation for rejected known
+  inode paths too; lost historical names still remain observable failures.
+- 3.3 document current single-path hardlink limitation and promotion gap, rather
+  than add unbounded alias enumeration to a bounded recovery queue.
+- 4.1 partially addressed by reading attributes before path resolution and reusing
+  kind. Keep authoritative deletion classification instead of silently defaulting
+  failed lookups to a regular file. Further resolver/cache optimization is deferred.
+- 4.2/4.3 defer streaming merge and stack encoding: bounded existing allocations
+  have no measured bottleneck, and neither change is needed for correctness.
+- 4.4 remove duplicate admission checks by sharing `push_locked` with path retries.
+- 5 reuse the existing wait helper for mount readiness; add focused regressions
+  for the confirmed defects. Do not enforce a same-tick recovery requirement.
+
+Deep-review validation:
+
+- Metadata `list_inode_ids_after`: 2 passed, including a real deleted base inode
+  followed by a live inode across the page boundary.
+- VFS `coherence::tests`: 8 passed; adapter-recovery admission regression: 1 passed.
+- WinFSP `overflow_`: 8 passed, 1 native test ignored in that group.
+- WinFSP `invalidation`: 17 passed, 1 native test ignored; `semantic_`: 11 passed.
+- Final open-unlinked preparation regression: 1 passed. Both original preparation
+  and path-retry regressions failed before their corrections; the new admission
+  assertion likewise failed before adding the live signal check.
+- Explicit native cached-handle overflow test: 1 passed in 1.68 seconds. Artifact:
+  `target/sfs873-native-overflow-deep-review.log`.
+- Strict all-target Clippy for metadata, VFS and WinFSP, rustfmt check, and
+  `git diff --check` passed. Independent final VFS review found no further issue.
+
+No full suites, multi-client alias acceptance, throughput benchmarks, or native
+kernel acknowledgement were established. Full VFS/WinFSP suites remain operator-run:
+
+    cargo test -p studiofs-vfs -p studiofs-winfsp --lib -- --test-threads=1

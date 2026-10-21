@@ -2270,6 +2270,8 @@ struct AlwaysFailKernelInvalidator;
 
 struct AlwaysQueueKernelInvalidator;
 
+struct RecoveryPendingKernelInvalidator(AtomicBool);
+
 impl KernelInvalidator for AlwaysFailKernelInvalidator {
     fn invalidate_batch(
         &self,
@@ -2292,6 +2294,14 @@ impl KernelInvalidator for AlwaysQueueKernelInvalidator {
     }
 
     fn inval_inode(&self, _ino: Ino) {}
+}
+
+impl KernelInvalidator for RecoveryPendingKernelInvalidator {
+    fn inval_inode(&self, _ino: Ino) {}
+
+    fn invalidation_recovery_pending(&self) -> bool {
+        self.0.load(AtomicOrdering::Acquire)
+    }
 }
 
 #[test]
@@ -2960,6 +2970,38 @@ fn coherence_health_reaches_healthy_after_local_startup_sync() {
     );
     rt.block_on(vfs.shutdown(std::time::Duration::ZERO))
         .expect("shutdown VFS");
+}
+
+#[test]
+fn adapter_recovery_needs_fresh_sync_and_coverage_before_cache_admission() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("coherence-recovery-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "adapter-recovery");
+    let invalidator = Arc::new(RecoveryPendingKernelInvalidator(AtomicBool::new(false)));
+    vfs.set_kernel_invalidator(invalidator.clone());
+
+    vfs.note_coherence_sync_started();
+    vfs.note_coherence_sync_success(healthy_coherence_progress(), true, 1);
+    assert!(vfs.coherence_allows_os_cache());
+
+    invalidator.0.store(true, AtomicOrdering::Release);
+    assert!(
+        !vfs.coherence_allows_os_cache(),
+        "admission must observe recovery before the next health update"
+    );
+    vfs.note_coherence_delivery_state(2);
+    assert!(!vfs.coherence_allows_os_cache());
+
+    vfs.note_coherence_sync_started();
+    vfs.note_coherence_sync_success(healthy_coherence_progress(), true, 3);
+    assert!(!vfs.coherence_allows_os_cache());
+
+    invalidator.0.store(false, AtomicOrdering::Release);
+    vfs.note_coherence_coverage_confirmed(Some(4), 4);
+    assert!(!vfs.coherence_allows_os_cache());
+
+    vfs.note_coherence_sync_started();
+    vfs.note_coherence_sync_success(healthy_coherence_progress(), true, 5);
+    assert!(vfs.coherence_allows_os_cache());
 }
 
 impl RecordingKernelInvalidator {

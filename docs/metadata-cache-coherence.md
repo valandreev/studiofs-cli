@@ -198,6 +198,12 @@ metadata mutation or remote service. Repeated overflow restarts the cursor while
 preserving the oldest overflow age; shutdown cancels reconciliation. Page reads
 run outside the producer's queue lock, and existing writer protection still
 applies. No unbounded overflow list or whole-volume snapshot is retained.
+Rejected path retries with a known inode also restart this sweep. It recovers
+current inode paths; it cannot reconstruct lost historical rename/unlink names,
+whose rejection remains an observable delivery failure. A full queue drains
+before the next timer pass can refill it, leaving slots for writer-deferred
+historical targets. Each metadata page bounds raw candidates, including tombstones,
+rather than scanning an unbounded number of deleted rows to fill a live page.
 Native notification names are counted UTF-16 without a terminator. The Rust
 `set_name` convenience method includes a NUL in the reported size, so this
 adapter uses `set_name_raw` to avoid an invalid native notification name.
@@ -210,6 +216,19 @@ that no longer exists add no target and do not fail the generation; the old
 names are purged by their entry intents. Queued inode notifications for removed
 inodes are likewise skipped without counting as delivery failures. Existing
 inodes whose current path cannot be resolved still fail admission.
+Open unlinked non-directory inodes (`nlink == 0`) likewise have no current path
+to purge; their retained historical entry notifications remain necessary.
+Legacy inode notifications and overflow reconciliation resolve one current path
+per inode. They do not establish cache invalidation for every hardlink alias;
+semantic admission without explicit alias entry paths remains conservative for
+multiply linked files. Full hardlink-alias coverage is still a promotion gap.
+Overflow recovery reports a separate pending-coverage signal to VFS health,
+retained through prepared and requeued notification batches. Successful sync
+cannot promote health while this signal is set. Clearing it does not itself
+restore health: fresh catch-up coverage is still required. Submission remains
+asynchronous and is not proof of native kernel consumption.
+Read-only cache admission also checks the live adapter signal, so a stale health
+observation cannot admit a new cached handle during active recovery.
 
 A generation deferred for an open write-capable handle (which the adapter reports
 as `Failed`) stays incomplete without consuming retry attempts. The invalidation worker re-checks such a

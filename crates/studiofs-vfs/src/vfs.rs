@@ -4293,7 +4293,12 @@ impl StudioVfs {
 
     /// Return whether a read-only platform open may retain OS metadata cache state.
     pub fn coherence_allows_os_cache(&self) -> bool {
-        self.coherence_health.lock().allows_cache()
+        if !self.coherence_health.lock().allows_cache() {
+            return false;
+        }
+        // Health observations can lag the adapter; check recovery at admission too.
+        let invalidator = self.kernel_invalidator.read().clone();
+        !invalidator.is_some_and(|invalidator| invalidator.invalidation_recovery_pending())
     }
 
     /// Snapshot metadata replication and session synchronization state.

@@ -6410,6 +6410,32 @@ mod tests {
     }
 
     #[test]
+    fn overflow_reconciliation_skips_open_unlinked_inode() {
+        let (_tmp, vfs, ctx, queue) = make_test_context("overflow-unlinked");
+        let file = vfs.create(ROOT_INO, b"gone", 0, 0, 0o644).unwrap();
+        let handle = vfs.open_file(file.ino, OpenFlags::RDONLY, false).unwrap();
+        vfs.unlink(ROOT_INO, b"gone").unwrap();
+        assert_eq!(vfs.meta().get_attr(file.ino).unwrap().nlink, 0);
+        let capacity = super::invalidation::WINFSP_INVALIDATION_QUEUE_CAPACITY;
+        queue.extend(10_000..10_000 + capacity as u64);
+        queue.push(file.ino);
+        assert!(ctx.should_notify().is_none());
+        let failures = queue.delivery_snapshot().failed_notifications;
+        let mut prepared = ctx.should_notify().expect("root notification");
+        assert!(
+            prepared
+                .iter()
+                .all(|notification| notification.ino != file.ino)
+        );
+        prepared.mark_published();
+        drop(prepared);
+        assert_eq!(queue.delivery_snapshot().failed_notifications, failures);
+        assert!(queue.is_empty());
+        ctx.spawn_wait(async move { vfs.release_fh(handle).await })
+            .unwrap();
+    }
+
+    #[test]
     fn overflow_reconciliation_preserves_writer_deferral() {
         let (_tmp, vfs, ctx, queue) = make_test_context("overflow-writer-deferral");
         let attr = vfs

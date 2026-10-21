@@ -1336,6 +1336,11 @@ pub trait KernelInvalidator: Send + Sync {
         0
     }
 
+    /// Whether adapter recovery still has invalidation coverage work in progress.
+    fn invalidation_recovery_pending(&self) -> bool {
+        false
+    }
+
     /// Reset bridge-local diagnostics counters for a fresh observability interval.
     fn reset_diagnostics(&self) {}
 }

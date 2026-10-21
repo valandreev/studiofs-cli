@@ -1843,6 +1843,46 @@ mod tests {
     }
 
     #[test]
+    fn list_inode_ids_after_keeps_tombstoned_base_inode_as_raw_candidate() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let db_path = temp.path().join("inode-id-tombstone-pagination.redb");
+        let engine = RedbMetaEngine::open(&db_path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+
+        let dead = engine
+            .create_file(ROOT_INO, b"dead", 1000, 1000, 0o644)
+            .unwrap();
+        let live = engine
+            .create_file(ROOT_INO, b"live", 1000, 1000, 0o644)
+            .unwrap();
+        assert!(dead.ino > ROOT_INO);
+        assert!(live.ino > dead.ino);
+
+        let txn = engine.begin_write_txn().unwrap();
+        let encoded_dead = encode(&dead).unwrap();
+        txn.open_table(BASE_INODES_TABLE)
+            .unwrap()
+            .insert(dead.ino, encoded_dead.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        engine.unlink(ROOT_INO, b"dead").unwrap();
+
+        assert_eq!(
+            engine.list_inode_ids_after(None, 2).unwrap(),
+            vec![ROOT_INO, dead.ino]
+        );
+        assert_eq!(
+            engine.list_inode_ids_after(Some(dead.ino), 2).unwrap(),
+            vec![live.ino]
+        );
+        assert!(matches!(
+            engine.get_attr(dead.ino),
+            Err(MetaError::InodeNotFound(ino)) if ino == dead.ino
+        ));
+        assert_eq!(engine.get_attr(live.ino).unwrap(), live);
+    }
+
+    #[test]
     fn sync_recovery_replaces_a_previous_inode_identity() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let db_path = temp
