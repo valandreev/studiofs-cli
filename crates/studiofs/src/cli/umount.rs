@@ -1051,9 +1051,10 @@ mod tests {
 
         #[test]
         fn denied_process_open_is_reported() {
-            // The System process (PID 4) refuses PROCESS_TERMINATE to user-mode callers.
+            // The System process (PID 4) refuses PROCESS_TERMINATE to user-mode callers. An
+            // inactive lock makes an unexpectedly successful open return before any signal or kill.
             let error =
-                unmount_windows_with_timeout("__test_denied_open__", 4, 100, test_mount_active)
+                unmount_windows_with_timeout("__test_denied_open__", 4, 100, test_mount_not_active)
                     .unwrap_err();
             assert_eq!(
                 error
