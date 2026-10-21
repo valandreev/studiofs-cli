@@ -1,4 +1,4 @@
-//! Sequential RAM read-ahead for handles that get no kernel read-ahead.
+//! Sequential RAM read-ahead for bridge-opted-in handles.
 //!
 //! macFUSE delivers `F_NOCACHE` and `direct_io` reads one callback at a time,
 //! so each callback waits for one local payload read. A handle that a bridge
@@ -18,8 +18,10 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tracing::debug;
 
@@ -39,17 +41,26 @@ const RAM_READAHEAD_MIN_STREAK: u32 = 2;
 /// chunk boundary miss and the chunk read is wasted.
 const RAM_READAHEAD_MIN_DEPTH_CHUNKS: u64 = 2;
 
-/// Default per-handle read-ahead depth. Only macFUSE opts handles in today.
+/// Default idle per-handle read-ahead depth. Only macFUSE opts handles in today.
 ///
 /// Read-ahead competes with background write-back and upload rereads for the
 /// cache disk. On the reference USB disk, 12 MiB raised a 16 GB F_NOCACHE read
 /// by about 50% while the upload kept 40-70% of its rate; 32 MiB read faster
-/// but stalled the upload until the read ended.
+/// but stalled the upload until the read ended. Use 32 MiB only while idle
+/// and retain the 12 MiB depth while background disk work is pending.
 pub(super) const DEFAULT_SEQUENTIAL_RAM_READAHEAD_BYTES: usize = if cfg!(target_os = "macos") {
+    32 * 1024 * 1024
+} else {
+    0
+};
+
+pub(super) const DEFAULT_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES: usize = if cfg!(target_os = "macos")
+{
     12 * 1024 * 1024
 } else {
     0
 };
+const RAM_READAHEAD_SHARED_HOLD: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 enum RamChunkState {
@@ -121,10 +132,10 @@ struct RamChunk {
 /// Per-handle read-ahead state, owned by [`OpenFile`].
 #[derive(Debug, Default)]
 pub(super) struct RamReadAheadState {
-    /// Chunks kept ahead of the stream; zero means the handle did not opt in.
+    /// Configured idle depth at opt-in; zero means the handle did not opt in.
     depth_chunks: u64,
     generation: u64,
-    last_end: Option<u64>,
+    last_read: Option<(u64, u64)>,
     streak: u32,
     /// Last observed file size; chunks are not scheduled at or past it.
     file_size: u64,
@@ -220,19 +231,38 @@ pub(super) struct RamReadAheadStats {
 #[derive(Debug)]
 pub(super) struct RamReadAheadRuntime {
     depth_chunks: u64,
+    shared_depth_chunks: u64,
+    last_busy: Mutex<Option<Instant>>,
     budget: Arc<Semaphore>,
     buffers: BufferPool,
     counters: RamReadAheadCounters,
 }
 
 impl RamReadAheadRuntime {
-    pub(super) fn new(depth_bytes: usize) -> Self {
+    pub(super) fn new(depth_bytes: usize, shared_bytes: usize) -> Self {
         let budget_chunks = RAM_READAHEAD_BUDGET_BYTES / RAM_READAHEAD_CHUNK_BYTES;
+        let depth_chunks = Self::depth_chunks(depth_bytes);
         Self {
-            depth_chunks: Self::depth_chunks(depth_bytes),
+            depth_chunks,
+            shared_depth_chunks: Self::depth_chunks(shared_bytes).min(depth_chunks),
+            last_busy: Mutex::new(None),
             budget: Arc::new(Semaphore::new(budget_chunks)),
             buffers: BufferPool::new(RAM_READAHEAD_CHUNK_BYTES, budget_chunks),
             counters: RamReadAheadCounters::default(),
+        }
+    }
+
+    fn effective_depth_chunks(&self, busy: bool, now: Instant) -> u64 {
+        let mut last_busy = self.last_busy.lock();
+        if busy {
+            *last_busy = Some(now);
+        }
+        if last_busy
+            .is_some_and(|last| now.saturating_duration_since(last) < RAM_READAHEAD_SHARED_HOLD)
+        {
+            self.shared_depth_chunks
+        } else {
+            self.depth_chunks
         }
     }
 
@@ -259,6 +289,39 @@ impl RamReadAheadRuntime {
 }
 
 impl StudioVfs {
+    pub(super) fn ram_readahead_depth_chunks_at(&self, now: Instant) -> u64 {
+        let busy = self
+            .state
+            .upload
+            .active_upload_workers
+            .load(Ordering::Acquire)
+            != 0
+            || self.pending_upload_count() != 0
+            || self.upload_scheduler.in_flight() != 0
+            || self
+                .state
+                .deferred_materialize_inflight
+                .entries
+                .try_lock()
+                .is_none_or(|entries| !entries.is_empty())
+            || self
+                .state
+                .deferred_materialize_reschedule_needed
+                .try_lock()
+                .is_none_or(|entries| !entries.is_empty())
+            || self
+                .state
+                .deferred_release_inflight
+                .entries
+                .try_lock()
+                .is_none_or(|entries| !entries.is_empty())
+            || self
+                .local_payload_backend
+                .try_dirty_object_count()
+                .is_none_or(|count| count != 0);
+        self.ram_readahead.effective_depth_chunks(busy, now)
+    }
+
     /// Opt a handle into sequential RAM read-ahead. Returns `false` when the
     /// mount disables it or the handle is unknown.
     pub fn enable_sequential_ram_readahead(&self, fh: u64) -> bool {
@@ -383,6 +446,7 @@ impl StudioVfs {
         if self.shutdown_requested() {
             return;
         }
+        let depth_chunks = self.ram_readahead_depth_chunks_at(Instant::now());
         let mut launches = Vec::new();
         {
             let mut state = open_file.ram_readahead().lock();
@@ -390,19 +454,23 @@ impl StudioVfs {
                 return;
             }
             let end = offset.saturating_add(read as u64);
-            if state.last_end == Some(offset) {
+            // UBC may round a callback past the application's frame boundary;
+            // forward overlapping callbacks still form one continuous stream.
+            if state.last_read.is_some_and(|(last_start, last_end)| {
+                offset > last_start && offset <= last_end && end > last_end
+            }) {
                 state.streak = state.streak.saturating_add(1);
             } else {
-                if state.last_end.is_some() {
+                if state.last_read.is_some() {
                     state.discard_all();
                 }
                 state.streak = 1;
             }
-            state.last_end = Some(end);
+            state.last_read = Some((offset, end));
             while state
                 .chunks
                 .front()
-                .is_some_and(|chunk| (chunk.index + 1) * CHUNK_BYTES <= end)
+                .is_some_and(|chunk| (chunk.index + 1) * CHUNK_BYTES <= offset)
             {
                 state.chunks.pop_front();
             }
@@ -410,7 +478,17 @@ impl StudioVfs {
                 return;
             }
             let first = end / CHUNK_BYTES;
-            for index in first..first.saturating_add(state.depth_chunks) {
+            let limit = first.saturating_add(depth_chunks);
+            while state
+                .chunks
+                .back()
+                .is_some_and(|chunk| chunk.index >= limit)
+            {
+                if let Some(chunk) = state.chunks.pop_back() {
+                    chunk.slot.discard();
+                }
+            }
+            for index in first..limit {
                 if index.saturating_mul(CHUNK_BYTES) >= state.file_size {
                     break;
                 }
@@ -530,6 +608,31 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ram_readahead_depth_holds_shared_limit_after_background_work() {
+        let mib = 1024 * 1024;
+        let runtime = RamReadAheadRuntime::new(32 * mib, 12 * mib);
+        let now = Instant::now();
+        assert_eq!(runtime.effective_depth_chunks(false, now), 8);
+        assert_eq!(runtime.effective_depth_chunks(true, now), 3);
+        assert_eq!(
+            runtime.effective_depth_chunks(false, now + Duration::from_secs(1)),
+            3
+        );
+        assert_eq!(
+            runtime.effective_depth_chunks(false, now + RAM_READAHEAD_SHARED_HOLD),
+            8
+        );
+    }
+
+    #[test]
+    fn ram_readahead_shared_depth_never_exceeds_idle_limit() {
+        let runtime = RamReadAheadRuntime::new(8 * 1024 * 1024, 32 * 1024 * 1024);
+        assert_eq!(runtime.effective_depth_chunks(true, Instant::now()), 2);
+        let disabled = RamReadAheadRuntime::new(0, 12 * 1024 * 1024);
+        assert_eq!(disabled.effective_depth_chunks(true, Instant::now()), 0);
+    }
 
     #[test]
     fn ram_readahead_depth_rounds_up_to_at_least_two_chunks() {

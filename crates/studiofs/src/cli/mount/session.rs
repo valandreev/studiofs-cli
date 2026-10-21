@@ -706,6 +706,12 @@ where
     {
         config.sequential_ram_readahead_bytes = Some(value);
     }
+    if let Some(value) =
+        parse_env_u64_any_with(&read_var, "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES")
+            .and_then(|value| usize::try_from(value).ok())
+    {
+        config.sequential_ram_readahead_shared_bytes = Some(value);
+    }
     set_usize!("STUDIOFS_DIR_PREFETCH_MAX_BATCH", dir_prefetch_max_batch);
     set_usize!(
         "STUDIOFS_READDIR_ATTR_BATCH_CHUNK",
@@ -3222,14 +3228,35 @@ mod tests {
     }
 
     #[test]
-    fn overlay_vfs_env_applies_sequential_ram_readahead_override() {
-        for (value, expected) in [("0", 0), ("8388608", 8 * 1024 * 1024)] {
-            let resolved = overlay_vfs_env_with(VfsConfigRaw::default(), |key| match key {
-                "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES" => Ok(value.to_string()),
-                _ => Err(std::env::VarError::NotPresent),
+    fn overlay_vfs_env_applies_sequential_ram_readahead_overrides() {
+        for (expected_key, value, expected) in [
+            ("STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES", "0", 0),
+            (
+                "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES",
+                "8388608",
+                8 * 1024 * 1024,
+            ),
+            ("STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES", "0", 0),
+            (
+                "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES",
+                "4194304",
+                4 * 1024 * 1024,
+            ),
+        ] {
+            let resolved = overlay_vfs_env_with(VfsConfigRaw::default(), |env_key| {
+                if env_key == expected_key {
+                    Ok(value.to_string())
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
             });
 
-            assert_eq!(resolved.sequential_ram_readahead_bytes, Some(expected));
+            let actual = if expected_key == "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES" {
+                resolved.sequential_ram_readahead_bytes
+            } else {
+                resolved.sequential_ram_readahead_shared_bytes
+            };
+            assert_eq!(actual, Some(expected));
         }
     }
 

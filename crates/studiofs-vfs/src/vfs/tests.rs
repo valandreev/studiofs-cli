@@ -3625,6 +3625,7 @@ fn make_ram_readahead_test_vfs(
         volume_suffix,
         VfsConfig {
             sequential_ram_readahead_bytes: depth_bytes,
+            sequential_ram_readahead_shared_bytes: depth_bytes,
             ..VfsConfig::default()
         },
     )
@@ -3665,6 +3666,38 @@ async fn read_ram_readahead_range(
 }
 
 #[test]
+fn ram_readahead_depth_recovers_after_deferred_release() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs_with_config(
+        &tmp,
+        "ram-readahead-adaptive",
+        VfsConfig {
+            sequential_ram_readahead_bytes: 32 * RAM_READAHEAD_TEST_MIB,
+            sequential_ram_readahead_shared_bytes: 12 * RAM_READAHEAD_TEST_MIB,
+            ..VfsConfig::default()
+        },
+    );
+    let now = Instant::now();
+    assert_eq!(vfs.ram_readahead_depth_chunks_at(now), 8);
+    let (entry, permit) = vfs
+        .state
+        .deferred_release_inflight
+        .try_register(ROOT_INO)
+        .unwrap();
+    assert_eq!(vfs.ram_readahead_depth_chunks_at(now), 3);
+    drop(permit);
+    drop(entry);
+    assert_eq!(
+        vfs.ram_readahead_depth_chunks_at(now + Duration::from_secs(1)),
+        3
+    );
+    assert_eq!(
+        vfs.ram_readahead_depth_chunks_at(now + Duration::from_secs(2)),
+        8
+    );
+}
+
+#[test]
 fn ram_readahead_serves_sequential_reads_from_loaded_chunks() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) =
@@ -3689,6 +3722,30 @@ fn ram_readahead_serves_sequential_reads_from_loaded_chunks() {
         let stats = vfs.ram_readahead_stats();
         assert_eq!(stats.hit_reads, 6, "{stats:?}");
         assert_eq!(stats.hit_bytes, 6 * request as u64, "{stats:?}");
+        assert_eq!(stats.discarded_chunks, 0, "{stats:?}");
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn ram_readahead_serves_forward_overlapping_reads_from_loaded_chunks() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-overlap", 12 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let mib = RAM_READAHEAD_TEST_MIB;
+        let len = 24 * mib;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-overlap.bin", len).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        assert!(vfs.enable_sequential_ram_readahead(reader));
+
+        // UBC can round a callback past the end of an application's frame.
+        for offset in (0..=18 * mib).step_by(3 * mib) {
+            let data = read_ram_readahead_range(&vfs, reader, ino, offset, 4 * mib).await;
+            assert!(data == ram_readahead_pattern(offset, 4 * mib));
+        }
+        let stats = vfs.ram_readahead_stats();
+        assert_eq!(stats.hit_reads, 5, "{stats:?}");
         assert_eq!(stats.discarded_chunks, 0, "{stats:?}");
         vfs.release_fh(reader).await.unwrap();
     });
@@ -3736,12 +3793,15 @@ fn ram_readahead_seek_discards_chunks_and_reads_requested_range() {
         let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-seek.bin", len).await;
         let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
         assert!(vfs.enable_sequential_ram_readahead(reader));
-        for offset in [0, 4 * mib, 8 * mib, 2 * mib, 6 * mib, 10 * mib, 14 * mib] {
+        for offset in [0, 2 * mib, 4 * mib, 2 * mib, 6 * mib, 10 * mib, 14 * mib] {
             let data = read_ram_readahead_range(&vfs, reader, ino, offset, 2 * mib).await;
             assert!(
                 data == ram_readahead_pattern(offset, 2 * mib),
                 "wrong bytes at offset {offset}"
             );
+            if offset == 4 * mib {
+                assert_eq!(vfs.ram_readahead_stats().hit_reads, 1);
+            }
         }
         vfs.release_fh(reader).await.unwrap();
     });

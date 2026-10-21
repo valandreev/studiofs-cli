@@ -646,22 +646,33 @@ Write-capable handles use per-handle `direct_io`: macFUSE's buffered Apple
 copy path can otherwise replace valid large-write buffers before the low-level
 write callback. Read-only handles retain the adaptive UBC policy above.
 
-A read-only handle that gets `direct_io` has no UBC or kernel read-ahead, and
-an `F_NOCACHE` reader such as AJA System Test or NLE playback issues its
-callbacks one at a time. The adapter therefore opts such handles into VFS
+A read-only handle that gets `direct_io` has no UBC or kernel read-ahead.
+An `F_NOCACHE` reader such as AJA System Test or NLE playback bypasses UBC
+even on a cached handle and issues callbacks one at a time. The adapter cannot
+observe that per-descriptor hint, so it opts all read-only handles into VFS
 sequential RAM read-ahead (`StudioVfs::enable_sequential_ram_readahead`).
-After two contiguous reads, the VFS keeps up to
-`sequential_ram_readahead_bytes` (default 12 MiB on macOS, at least two
-chunks when enabled, `STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES`, `0` disables
-it) of 4 MiB-aligned chunks loading ahead of the stream in background tasks, bounded mount-wide
-by 256 MiB. A callback whose range is covered by loaded chunks is served by a
+After two forward reads whose ranges touch or overlap and extend the stream,
+the VFS loads 4 MiB-aligned chunks ahead in background tasks. Its idle lead is
+`sequential_ram_readahead_bytes` (default 32 MiB on macOS,
+`STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES`, `0` disables it). Chunk memory is
+bounded mount-wide by 256 MiB. A callback whose range is covered by loaded chunks is served by a
 copy; it waits for an in-flight chunk before it takes its own file-session
 `Read` permit, so it cannot deadlock against a queued writer. A chunk task
 reads through the normal foreground read path under a `Read` permit and
 installs its bytes only if no invalidation of the inode happened since it was
 scheduled; any invalidation, seek, or switch to kernel read-ahead discards all
-chunks of the handle. Write-capable handles, UBC-cached handles, and the
-Linux and WinFSP bridges do not use RAM read-ahead.
+chunks of the handle. Chunks ending at or before the next callback's start
+are released, while its overlapping tail remains available for reuse.
+Write-capable handles and the Linux and WinFSP bridges do not use RAM read-ahead.
+
+When pending/active uploads, deferred materialization/release, or dirty local
+payload objects compete for the cache disk, read-ahead uses
+`sequential_ram_readahead_shared_bytes` (default 12 MiB on macOS,
+`STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES`). It holds this shared depth
+for two seconds after the last busy observation. Shared depth is capped at
+the idle depth; zero disables new speculative loads while busy. Any nonzero
+depth rounds up to at least two chunks. Reducing depth discards queued slots
+beyond the new lead, while the same 256 MiB mount-wide budget remains in force.
 
 Read-ahead keeps several reads queued on the cache disk, and the deeper the
 queue, the more of the disk bandwidth a sequential stream takes from write-back
@@ -672,7 +683,7 @@ USB disk (976 MB/s raw), a 16 GB `F_NOCACHE` read while an upload ran measured:
 |---|---:|---:|
 | off | 560 | 86 |
 | 8 MiB | 669 | 106 |
-| 12 MiB (default) | 863 | 58 |
+| 12 MiB (shared default) | 863 | 58 |
 | 16 MiB | 929 | 39 |
 | 32 MiB | 927 | 19 |
 

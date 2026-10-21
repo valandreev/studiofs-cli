@@ -1386,9 +1386,9 @@ impl StudioVfsAdapter {
                 .prepare_os_cache_open(fh, OsCacheParticipation::Disabled);
             flag_policy
         };
-        // `direct_io` reads get no UBC or kernel read-ahead, and `F_NOCACHE`
-        // readers issue them one at a time; let the VFS read ahead into RAM.
-        if !flag_policy.write_capable && policy.direct_io {
+        // F_NOCACHE can bypass UBC even on cached handles; the VFS's
+        // sequential-read gate decides when to read ahead into RAM.
+        if !flag_policy.write_capable {
             self.vfs.enable_sequential_ram_readahead(fh);
         }
         Ok(OpenReply::new(fh)
@@ -2987,6 +2987,10 @@ mod open_cache_snapshot_tests {
         );
 
         let opened = adapter.open(attr.ino, libc::O_RDONLY).expect("open file");
+        assert!(
+            vfs.sequential_ram_readahead_enabled(opened.file_handle()),
+            "F_NOCACHE can bypass UBC on a cached read-only handle"
+        );
         adapter
             .release(attr.ino, opened.file_handle())
             .expect("release file");
