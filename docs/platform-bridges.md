@@ -651,9 +651,9 @@ an `F_NOCACHE` reader such as AJA System Test or NLE playback issues its
 callbacks one at a time. The adapter therefore opts such handles into VFS
 sequential RAM read-ahead (`StudioVfs::enable_sequential_ram_readahead`).
 After two contiguous reads, the VFS keeps up to
-`sequential_ram_readahead_bytes` (default 32 MiB on macOS,
-`STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES`, `0` disables it) of 4 MiB-aligned
-chunks loading ahead of the stream in background tasks, bounded mount-wide
+`sequential_ram_readahead_bytes` (default 12 MiB on macOS, at least two
+chunks when enabled, `STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES`, `0` disables
+it) of 4 MiB-aligned chunks loading ahead of the stream in background tasks, bounded mount-wide
 by 256 MiB. A callback whose range is covered by loaded chunks is served by a
 copy; it waits for an in-flight chunk before it takes its own file-session
 `Read` permit, so it cannot deadlock against a queued writer. A chunk task
@@ -663,13 +663,24 @@ scheduled; any invalidation, seek, or switch to kernel read-ahead discards all
 chunks of the handle. Write-capable handles, UBC-cached handles, and the
 Linux and WinFSP bridges do not use RAM read-ahead.
 
-Read-ahead keeps several reads queued on the cache disk, so a saturating
-sequential stream takes most of its bandwidth: write-back of a just-closed
-writer's backlog and upload rereads slow down until the stream stops. On the
-reference USB disk a 16 GB read rose from 560 MB/s to 1151 MB/s (927 MB/s
-while an upload ran), while backlog materialization dropped from about
-330 MB/s to about 10 MB/s with the 32 MiB default. A smaller depth, such as
-16 MiB, gives background work more of the disk.
+Read-ahead keeps several reads queued on the cache disk, and the deeper the
+queue, the more of the disk bandwidth a sequential stream takes from write-back
+of a just-closed writer's backlog and from upload rereads. On the reference
+USB disk (976 MB/s raw), a 16 GB `F_NOCACHE` read while an upload ran measured:
+
+| Depth | Read MB/s | Upload MB/s |
+|---|---:|---:|
+| off | 560 | 86 |
+| 8 MiB | 669 | 106 |
+| 12 MiB (default) | 863 | 58 |
+| 16 MiB | 929 | 39 |
+| 32 MiB | 927 | 19 |
+
+Read right after the write, 12 MiB read at 823-837 MB/s and delayed the
+upload start from about 6 s to 9-13 s after the writer closed; 32 MiB read at
+1151 MB/s but deferred the upload until the read ended.
+One chunk of depth is not useful: requests that straddle chunk boundaries
+miss, so the minimum is two chunks.
 
 The macFUSE read-reply buffer pool lends storage per request. A buffer is reused
 only for a request in the same power-of-two size class and only when it is large

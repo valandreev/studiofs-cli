@@ -35,10 +35,18 @@ const CHUNK_BYTES: u64 = RAM_READAHEAD_CHUNK_BYTES as u64;
 const RAM_READAHEAD_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// Sequential reads a handle must serve before it starts reading ahead.
 const RAM_READAHEAD_MIN_STREAK: u32 = 2;
+/// Smallest useful depth: with one chunk ahead, requests that straddle a
+/// chunk boundary miss and the chunk read is wasted.
+const RAM_READAHEAD_MIN_DEPTH_CHUNKS: u64 = 2;
 
 /// Default per-handle read-ahead depth. Only macFUSE opts handles in today.
+///
+/// Read-ahead competes with background write-back and upload rereads for the
+/// cache disk. On the reference USB disk, 12 MiB raised a 16 GB F_NOCACHE read
+/// by about 50% while the upload kept 40-70% of its rate; 32 MiB read faster
+/// but stalled the upload until the read ended.
 pub(super) const DEFAULT_SEQUENTIAL_RAM_READAHEAD_BYTES: usize = if cfg!(target_os = "macos") {
-    32 * 1024 * 1024
+    12 * 1024 * 1024
 } else {
     0
 };
@@ -221,10 +229,17 @@ impl RamReadAheadRuntime {
     pub(super) fn new(depth_bytes: usize) -> Self {
         let budget_chunks = RAM_READAHEAD_BUDGET_BYTES / RAM_READAHEAD_CHUNK_BYTES;
         Self {
-            depth_chunks: depth_bytes.div_ceil(RAM_READAHEAD_CHUNK_BYTES) as u64,
+            depth_chunks: Self::depth_chunks(depth_bytes),
             budget: Arc::new(Semaphore::new(budget_chunks)),
             buffers: BufferPool::new(RAM_READAHEAD_CHUNK_BYTES, budget_chunks),
             counters: RamReadAheadCounters::default(),
+        }
+    }
+
+    fn depth_chunks(depth_bytes: usize) -> u64 {
+        match depth_bytes.div_ceil(RAM_READAHEAD_CHUNK_BYTES) as u64 {
+            0 => 0,
+            chunks => chunks.max(RAM_READAHEAD_MIN_DEPTH_CHUNKS),
         }
     }
 
@@ -509,5 +524,21 @@ impl StudioVfs {
             .execute_prepared_foreground_read(None, ino, offset, buffer.as_mut(), &prepared, None)
             .await?;
         Ok(Some((buffer.into_bytes(written), file_size)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ram_readahead_depth_rounds_up_to_at_least_two_chunks() {
+        let mib = 1024 * 1024;
+        assert_eq!(RamReadAheadRuntime::depth_chunks(0), 0);
+        assert_eq!(RamReadAheadRuntime::depth_chunks(1), 2);
+        assert_eq!(RamReadAheadRuntime::depth_chunks(4 * mib), 2);
+        assert_eq!(RamReadAheadRuntime::depth_chunks(9 * mib), 3);
+        assert_eq!(RamReadAheadRuntime::depth_chunks(12 * mib), 3);
+        assert_eq!(RamReadAheadRuntime::depth_chunks(32 * mib), 8);
     }
 }

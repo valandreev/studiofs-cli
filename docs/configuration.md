@@ -637,7 +637,7 @@ Important families supported in code:
   `STUDIOFS_QOS_*`, `STUDIOFS_PREFETCH_*`,
   `STUDIOFS_WRITER_PAGE_SIZE_BYTES`,
   `STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES` (bytes each opted-in sequential
-  handle reads ahead into RAM; default 32 MiB on macOS, `0` disables it)
+  handle reads ahead into RAM; default 12 MiB on macOS, `0` disables it)
 - janitor/admin policy: `STUDIOFS_JANITOR_*`, `STUDIOFS_PG_*`
 - bridge-specific knobs: `STUDIOFS_WINFSP_*`
 
