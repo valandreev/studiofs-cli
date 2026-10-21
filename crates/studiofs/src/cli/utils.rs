@@ -510,10 +510,19 @@ fn parse_mount_record(data: &str, normalized_mount_point: &str) -> Result<MountR
 /// Remove PID file if it exists.
 pub fn remove_pid_file(mount_point: &str) -> Result<()> {
     let path = pid_file_path(&normalize_mount_point(mount_point))?;
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
-    Ok(())
+    remove_pid_file_path(&path)
+}
+
+pub(crate) fn remove_inactive_pid_file(mount_point: &str) -> Result<()> {
+    let path = pid_file_path(&normalize_mount_point(mount_point))?;
+    remove_pid_file_if_unlocked(&path, open_mount_lock_file(mount_point)?)
+}
+
+fn remove_pid_file_if_unlocked(path: &Path, lock_file: File) -> Result<()> {
+    let _guard = try_acquire_mount_lock_file(lock_file)?
+        .ok_or_else(|| anyhow!("mount lifecycle lock is held; leaving mount record intact"))?;
+    // Hold the lock through deletion so a new mount cannot publish its record here.
+    remove_pid_file_path(path)
 }
 
 #[cfg(windows)]
@@ -549,23 +558,30 @@ pub fn shutdown_event_name(mount_point: &str) -> String {
 pub fn is_process_running(pid: u32) -> bool {
     #[cfg(windows)]
     {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
         unsafe extern "system" {
             fn OpenProcess(
                 dwDesiredAccess: u32,
                 bInheritHandle: i32,
                 dwProcessId: u32,
             ) -> *mut core::ffi::c_void;
-            fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
+            fn WaitForSingleObject(hHandle: *mut core::ffi::c_void, dwMilliseconds: u32) -> u32;
         }
-        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const WAIT_TIMEOUT: u32 = 258;
         // SAFETY: `OpenProcess` returns a nullable handle for the PID; null means process unavailable.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
         if handle.is_null() {
             false
         } else {
-            // SAFETY: `handle` is non-null and must be closed to release OS resources.
-            unsafe { CloseHandle(handle) };
-            true
+            // SAFETY: `handle` is a valid process handle returned by OpenProcess and is owned here.
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+            // SAFETY: The owned process handle has SYNCHRONIZE access and remains open during the wait.
+            matches!(
+                unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) },
+                WAIT_TIMEOUT
+            )
         }
     }
 
@@ -624,10 +640,15 @@ pub fn read_pid_file_in(dir: &std::path::Path, mount_point: &str) -> Result<(u32
 pub fn remove_pid_file_in(dir: &std::path::Path, mount_point: &str) -> Result<()> {
     let sanitized = sanitize_mount_point(mount_point);
     let path = dir.join(format!("{sanitized}.json"));
-    if path.exists() {
-        std::fs::remove_file(&path)?;
+    remove_pid_file_path(&path)
+}
+
+fn remove_pid_file_path(path: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 /// Format a suggested cleanup command for the user based on the current OS.
@@ -1100,6 +1121,41 @@ mod tests {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         // Should not error even though no file exists
         remove_pid_file_in(tmp.path(), "Q:").unwrap();
+        remove_pid_file_in(tmp.path(), "Q:").unwrap();
+    }
+
+    #[test]
+    fn remove_pid_file_propagates_non_not_found_errors() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let path = tmp
+            .path()
+            .join(format!("{}.json", sanitize_mount_point("Q:")));
+        std::fs::create_dir(path).unwrap();
+
+        assert!(remove_pid_file_in(tmp.path(), "Q:").is_err());
+    }
+
+    #[test]
+    fn inactive_record_cleanup_preserves_a_new_mounts_record() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let path = tmp.path().join("mount.json");
+        let lock_path = tmp.path().join("mount.lock");
+        let open_lock = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap()
+        };
+        let new_mount = try_acquire_mount_lock_file(open_lock()).unwrap().unwrap();
+        std::fs::write(&path, "new mount record").unwrap();
+        assert!(remove_pid_file_if_unlocked(&path, open_lock()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new mount record");
+        drop(new_mount);
+        remove_pid_file_if_unlocked(&path, open_lock()).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
@@ -1154,5 +1210,18 @@ mod tests {
     fn bogus_pid_is_not_running() {
         // PID 0xFFFF_FFFE is extremely unlikely to be a real process.
         assert!(!is_process_running(0xFFFF_FFFE));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exited_process_with_retained_child_handle_is_not_running() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived process");
+        let pid = child.id();
+        child.wait().expect("wait for child to exit");
+
+        assert!(!is_process_running(pid));
     }
 }
