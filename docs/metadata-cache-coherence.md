@@ -198,6 +198,9 @@ metadata mutation or remote service. Repeated overflow restarts the cursor while
 preserving the oldest overflow age; shutdown cancels reconciliation. Page reads
 run outside the producer's queue lock, and existing writer protection still
 applies. No unbounded overflow list or whole-volume snapshot is retained.
+Sweep cost is proportional to the local inode count, and OS-cache admission and
+health promotion stay disabled for the whole mount until it finishes, so on large
+volumes repeated bursts can keep the mount uncached; this cost is not yet measured.
 Rejected path retries with a known inode also restart this sweep. It recovers
 current inode paths; it cannot reconstruct lost historical rename/unlink names,
 whose rejection remains an observable delivery failure. A full queue drains

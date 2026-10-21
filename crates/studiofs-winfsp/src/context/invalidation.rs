@@ -671,9 +671,10 @@ impl WinfspInvalidationQueue {
                 state.notification_batches_in_flight.saturating_add(1);
         } else if !mark_notification_in_flight {
             state.deferred_since = None;
-            if state.overflow_since.is_none() && state.notification_batches_in_flight == 0 {
-                state.recovering_overflow = false;
-            }
+        }
+        // An empty terminal reconciliation page leaves no batch to finish recovery.
+        if state.overflow_since.is_none() && state.notification_batches_in_flight == 0 {
+            state.recovering_overflow = false;
         }
         self.quiescent.notify_all();
         let snapshot = (!targets.is_empty()).then(|| Self::next_metrics_snapshot(&mut state));
@@ -1114,12 +1115,17 @@ mod overflow_tests {
 
     #[test]
     fn overflow_reconciliation_finishes_on_empty_terminal_page() {
-        let (_tmp, _vfs, _ctx, queue) = make_test_context("overflow-empty-page");
+        let (_tmp, _vfs, ctx, queue) = make_test_context("overflow-empty-page");
+        let invalidator = WinfspKernelInvalidator::new(queue.clone());
         {
             let mut state = queue.state.lock();
             state.overflow_since = Some(Instant::now());
+            state.recovering_overflow = true;
             state.reconciliation_after = Some(u64::MAX);
         }
+        // The production drain must clear recovery even when the final page is empty.
+        assert!(ctx.should_notify().is_none());
+        assert!(!invalidator.invalidation_recovery_pending());
         assert!(queue.drain().is_empty());
         assert!(queue.is_empty());
         assert_eq!(queue.pending_delivery_age_ms(), None);
