@@ -102,7 +102,9 @@ fn unmount_windows(mount_point: &str, pid: u32, is_mount_active: IsMountActiveFn
     unmount_windows_with_timeout(mount_point, pid, 15_000, is_mount_active)
 }
 
-/// Windows releases a dead process's file locks asynchronously, so poll briefly after exit.
+/// The process object is signalled before Windows tears down its handle table, and the lock-file
+/// lock is released asynchronously after that. A file lock has no waitable handle, so this polls
+/// the lock itself with a bounded deadline.
 #[cfg(windows)]
 fn wait_for_mount_inactive(mount_point: &str, is_mount_active: IsMountActiveFn) -> Result<bool> {
     use std::time::{Duration, Instant};
@@ -115,7 +117,7 @@ fn wait_for_mount_inactive(mount_point: &str, is_mount_active: IsMountActiveFn) 
         if Instant::now() >= deadline {
             return Ok(false);
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -133,15 +135,14 @@ fn unmount_windows_with_timeout(
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
         fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> *mut core::ffi::c_void;
         fn SetEvent(event: *mut core::ffi::c_void) -> i32;
-        fn WaitForSingleObject(handle: *mut core::ffi::c_void, timeout: u32) -> u32;
     }
     const SYNCHRONIZE: u32 = 0x00100000;
     const PROCESS_TERMINATE: u32 = 0x0001;
     const EVENT_MODIFY_STATE: u32 = 0x0002;
     const ERROR_INVALID_PARAMETER: i32 = 87;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
-    const WAIT_OBJECT_0: u32 = 0;
-    const WAIT_TIMEOUT: u32 = 258;
+    // A just-terminated process can take longer than a short graceful budget to be signalled.
+    const TERMINATION_CONFIRM_TIMEOUT_MS: u32 = 5_000;
 
     // SAFETY: OpenProcess accepts the access mask and PID; null is checked before ownership.
     let process = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
@@ -181,18 +182,7 @@ fn unmount_windows_with_timeout(
         }
     }
 
-    let wait_for_exit = || -> Result<bool> {
-        // SAFETY: The owned process handle has SYNCHRONIZE access and outlives the wait.
-        match unsafe { WaitForSingleObject(process.as_raw_handle(), exit_timeout_ms) } {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            u32::MAX => {
-                Err(std::io::Error::last_os_error()).context("could not wait for mount process")
-            }
-            result => anyhow::bail!("unexpected process wait result: {result:#x}"),
-        }
-    };
-    if wait_for_exit()? {
+    if wait_for_windows_process_exit(process.as_handle(), exit_timeout_ms)? {
         return Ok(());
     }
     tracing::warn!(
@@ -200,12 +190,39 @@ fn unmount_windows_with_timeout(
         "mount process did not exit before timeout — force-killing"
     );
     terminate_windows_process(process.as_handle()).context("could not terminate mount process")?;
-    if !wait_for_exit().context("could not confirm terminated mount process exit")? {
+    if !wait_for_windows_process_exit(process.as_handle(), TERMINATION_CONFIRM_TIMEOUT_MS)
+        .context("could not confirm terminated mount process exit")?
+    {
         anyhow::bail!(
-            "mount process {pid} did not exit within {exit_timeout_ms} ms after termination; leaving mount record intact"
+            "mount process {pid} did not exit within {TERMINATION_CONFIRM_TIMEOUT_MS} ms after termination; leaving mount record intact"
         );
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_windows_process_exit(
+    process: std::os::windows::io::BorrowedHandle<'_>,
+    timeout_ms: u32,
+) -> Result<bool> {
+    use anyhow::Context;
+    use std::os::windows::io::AsRawHandle;
+    unsafe extern "system" {
+        fn WaitForSingleObject(handle: *mut core::ffi::c_void, timeout: u32) -> u32;
+    }
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
+    const WAIT_FAILED: u32 = u32::MAX;
+
+    // SAFETY: The borrowed process handle remains open for the wait; Windows validates access.
+    match unsafe { WaitForSingleObject(process.as_raw_handle(), timeout_ms) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => {
+            Err(std::io::Error::last_os_error()).context("could not wait for mount process")
+        }
+        result => anyhow::bail!("unexpected process wait result: {result:#x}"),
+    }
 }
 
 #[cfg(windows)]
@@ -1030,6 +1047,43 @@ mod tests {
         #[test]
         fn nonexistent_process_is_already_gone() {
             assert!(unmount_windows("__test_gone_umount__", u32::MAX, test_mount_active).is_ok());
+        }
+
+        #[test]
+        fn denied_process_open_is_reported() {
+            // The System process (PID 4) refuses PROCESS_TERMINATE to user-mode callers.
+            let error =
+                unmount_windows_with_timeout("__test_denied_open__", 4, 100, test_mount_active)
+                    .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(5)
+            );
+        }
+
+        #[test]
+        fn failed_process_wait_is_reported() {
+            unsafe extern "system" {
+                fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+            }
+            let mp = format!("umount-{}", uuid::Uuid::new_v4());
+            let (child, _event) = waiting_child(&mp);
+            // SAFETY: PROCESS_QUERY_LIMITED_INFORMATION without SYNCHRONIZE; null is checked.
+            let handle = unsafe { OpenProcess(0x1000, 0, child.0.id()) };
+            assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+            // SAFETY: OpenProcess returned a valid, uniquely owned kernel handle.
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+            let error = wait_for_windows_process_exit(handle.as_handle(), 0).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(5)
+            );
         }
 
         #[test]
