@@ -328,6 +328,17 @@ struct FuseRenameIn {
     newdir: u64,
 }
 
+/// Darwin `fuse_rename_in` tail (`flags`, `padding`) that follows `newdir`.
+///
+/// macFUSE 5.3.x FSKit sent the eight-byte Linux layout, while macFUSE 5.5.0
+/// sends the Darwin layout; [`parse_rename_request`] accepts both.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct FuseRenameDarwinTail {
+    flags: u32,
+    padding: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct FuseLinkIn {
@@ -460,6 +471,28 @@ fn parse_two_c_strings(bytes: &[u8], offset: usize) -> Result<(&[u8], &[u8]), i3
         .ok_or(libc::EOVERFLOW)?;
     let second = parse_c_string(bytes, second_offset)?;
     Ok((first, second))
+}
+
+/// Parses a FUSE_RENAME body in either macFUSE FSKit wire layout.
+///
+/// The eight-byte layout is tried first. A Darwin body never parses as two
+/// non-empty names there: its zeroed `padding` (and zero `flags`) terminate
+/// the first name and leave the second one empty. StudioFS does not advertise
+/// `renamex_np` swap/exclusive capabilities, so non-zero Darwin flags are
+/// rejected instead of being silently treated as a plain rename.
+fn parse_rename_request(bytes: &[u8]) -> Result<(FuseRenameIn, &[u8], &[u8]), i32> {
+    let input = read_copy::<FuseRenameIn>(bytes, size_of::<FuseInHeader>())?;
+    let names_offset = size_of::<FuseInHeader>() + size_of::<FuseRenameIn>();
+    if let Ok((name, new_name)) = parse_two_c_strings(bytes, names_offset) {
+        return Ok((input, name, new_name));
+    }
+    let tail = read_copy::<FuseRenameDarwinTail>(bytes, names_offset)?;
+    if tail.flags != 0 {
+        return Err(libc::ENOTSUP);
+    }
+    let (name, new_name) =
+        parse_two_c_strings(bytes, names_offset + size_of::<FuseRenameDarwinTail>())?;
+    Ok((input, name, new_name))
 }
 
 fn checked_slice(bytes: &[u8], offset: usize, size: usize) -> Result<&[u8], i32> {
@@ -1782,18 +1815,8 @@ impl FsKitDispatcher {
     }
 
     fn rename(&self, request: FsKitRequest) {
-        let input = match request.operation::<FuseRenameIn>(size_of::<FuseInHeader>()) {
-            Ok(input) => input,
-            Err(errno) => {
-                let _ = request.reply_error(errno);
-                return;
-            }
-        };
-        let (name, new_name) = match parse_two_c_strings(
-            &request.body.bytes,
-            size_of::<FuseInHeader>() + size_of::<FuseRenameIn>(),
-        ) {
-            Ok(names) => (names.0.to_vec(), names.1.to_vec()),
+        let (input, name, new_name) = match parse_rename_request(&request.body.bytes) {
+            Ok((input, name, new_name)) => (input, name.to_vec(), new_name.to_vec()),
             Err(errno) => {
                 let _ = request.reply_error(errno);
                 return;
@@ -3035,17 +3058,52 @@ mod tests {
         bytes[..size_of::<u32>()].copy_from_slice(&len.to_ne_bytes());
 
         let body = parse_message_body(bytes).expect("parse rename body");
-        let input = read_copy::<FuseRenameIn>(&body.bytes, size_of::<FuseInHeader>())
-            .expect("parse rename input");
-        let (name, new_name) = parse_two_c_strings(
-            &body.bytes,
-            size_of::<FuseInHeader>() + size_of::<FuseRenameIn>(),
-        )
-        .expect("parse rename names");
+        let (input, name, new_name) =
+            parse_rename_request(&body.bytes).expect("parse rename request");
 
         assert_eq!(input.newdir, 77);
         assert_eq!(name, b"old");
         assert_eq!(new_name, b"new");
+    }
+
+    fn darwin_rename_body(flags: u32, old: &[u8], new: &[u8]) -> MessageBody {
+        assert_eq!(size_of::<FuseRenameDarwinTail>(), 2 * size_of::<u32>());
+        let mut bytes = vec![0_u8; size_of::<FuseInHeader>()];
+        bytes.extend_from_slice(&77_u64.to_ne_bytes());
+        bytes.extend_from_slice(&flags.to_ne_bytes());
+        bytes.extend_from_slice(&0_u32.to_ne_bytes());
+        for name in [old, new] {
+            bytes.extend_from_slice(name);
+            bytes.push(0);
+        }
+        let len = u32::try_from(bytes.len()).expect("rename body length");
+        bytes[..size_of::<u32>()].copy_from_slice(&len.to_ne_bytes());
+        parse_message_body(bytes).expect("parse rename body")
+    }
+
+    #[test]
+    fn rename_request_accepts_the_darwin_sixteen_byte_layout() {
+        // macFUSE 5.5.0 FSKit sends Darwin `fuse_rename_in` with flags/padding.
+        let body = darwin_rename_body(0, b"fskit-probe.txt", b"renamed.txt");
+
+        let (input, name, new_name) =
+            parse_rename_request(&body.bytes).expect("parse Darwin rename request");
+
+        assert_eq!(input.newdir, 77);
+        assert_eq!(name, b"fskit-probe.txt");
+        assert_eq!(new_name, b"renamed.txt");
+    }
+
+    #[test]
+    fn rename_request_rejects_unadvertised_darwin_rename_flags() {
+        for flags in [2_u32, 4, 0x0102_0304] {
+            let body = darwin_rename_body(flags, b"old", b"new");
+            assert_eq!(
+                parse_rename_request(&body.bytes).map(|_| ()),
+                Err(libc::ENOTSUP),
+                "flags {flags:#x}"
+            );
+        }
     }
 
     #[test]
