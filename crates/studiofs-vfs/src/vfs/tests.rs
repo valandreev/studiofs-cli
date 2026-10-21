@@ -2982,6 +2982,10 @@ fn adapter_recovery_needs_fresh_sync_and_coverage_before_cache_admission() {
     vfs.note_coherence_sync_started();
     vfs.note_coherence_sync_success(healthy_coherence_progress(), true, 1);
     assert!(vfs.coherence_allows_os_cache());
+    assert_eq!(
+        vfs.coherence_health_snapshot().state,
+        crate::coherence::CoherenceHealthState::Healthy
+    );
 
     invalidator.0.store(true, AtomicOrdering::Release);
     assert!(
@@ -2994,6 +2998,11 @@ fn adapter_recovery_needs_fresh_sync_and_coverage_before_cache_admission() {
     vfs.note_coherence_sync_started();
     vfs.note_coherence_sync_success(healthy_coherence_progress(), true, 3);
     assert!(!vfs.coherence_allows_os_cache());
+    // try_promote must refuse Healthy while recovery is pending.
+    assert_ne!(
+        vfs.coherence_health_snapshot().state,
+        crate::coherence::CoherenceHealthState::Healthy
+    );
 
     invalidator.0.store(false, AtomicOrdering::Release);
     vfs.note_coherence_coverage_confirmed(Some(4), 4);

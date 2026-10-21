@@ -7316,7 +7316,9 @@ mod tests {
         let mut buffer = [0; 128];
         let mut cursor = 0;
         assert!(info.append_to_buffer(&mut buffer, &mut cursor));
-        let size = usize::from(u16::from_le_bytes([buffer[0], buffer[1]]));
+        let size_offset = std::mem::offset_of!(winfsp_sys::FSP_FSCTL_NOTIFY_INFO, Size);
+        let size_bytes: [u8; 4] = buffer[size_offset..size_offset + 4].try_into().unwrap();
+        let size = u32::from_le_bytes(size_bytes) as usize;
         let name_offset = std::mem::offset_of!(winfsp_sys::FSP_FSCTL_NOTIFY_INFO, FileNameBuf);
         let expected: Vec<_> = path.encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert_eq!(&buffer[name_offset..size], expected);
@@ -7340,6 +7342,11 @@ mod tests {
             build_notify_info(&overlong, studiofs_meta::FileType::RegularFile).is_none(),
             "WinFSP notify helper should skip overlong paths"
         );
+    }
+
+    #[test]
+    fn build_notify_info_rejects_embedded_nul() {
+        assert!(build_notify_info("\\bad\0name", studiofs_meta::FileType::RegularFile).is_none());
     }
 
     fn foreign_exclusive_lock(ino: Ino) -> FileLockLease {

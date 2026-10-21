@@ -194,8 +194,11 @@ An individual inode request rejected at capacity retains a fixed-size overflow
 marker. Timer drains refill the queue from bounded, sorted pages of local redb
 inode candidates; removed candidates are skipped during ordinary preparation.
 This conservative sweep may purge unrelated cached inodes, but needs no further
-metadata mutation or remote service. Repeated overflow restarts the cursor while
-preserving the oldest overflow age; shutdown cancels reconciliation. Page reads
+metadata mutation or remote service. A repeated overflow at or behind the cursor
+restarts it (one ahead keeps progress) while preserving the oldest overflow age;
+shutdown cancels reconciliation. A failed page read is retried on the next tick,
+not counted as a lost notification. A transient attribute read error during
+preparation requeues the inode instead of dropping its purge. Page reads
 run outside the producer's queue lock, and existing writer protection still
 applies. No unbounded overflow list or whole-volume snapshot is retained.
 Sweep cost is proportional to the local inode count, and OS-cache admission and

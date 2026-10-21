@@ -1429,13 +1429,9 @@ pub trait MetaInodes: Send + Sync {
     /// Results are bounded by `limit` and may include base/local rows that are
     /// hidden by tombstones or otherwise no longer resolve; callers must use
     /// `get_attr` to check whether a candidate inode is still present.
-    /// Backends without a bounded implementation return an explicit
-    /// unsupported-operation error rather than scanning attributes unboundedly.
-    fn list_inode_ids_after(&self, _after: Option<Ino>, _limit: usize) -> MetaResult<Vec<Ino>> {
-        Err(MetaError::Storage(
-            "bounded inode ID pagination is not supported by this backend".to_string(),
-        ))
-    }
+    /// Required so every backend provides bounded pagination; overflow
+    /// recovery treats any error as transient and retries.
+    fn list_inode_ids_after(&self, after: Option<Ino>, limit: usize) -> MetaResult<Vec<Ino>>;
 
     /// Enumerate existing inode attributes.
     fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>> {

@@ -58,6 +58,10 @@ fn build_notify_info_with_action(
         );
         return None;
     }
+    // set_name_raw forwards code units verbatim, so reject embedded NULs here.
+    if path.contains('\0') {
+        return None;
+    }
     let mut info = NotifyInfo::<512>::new();
     info.filter = notify_filter_for_kind(kind);
     info.action = action;
@@ -291,7 +295,10 @@ impl WinfspInvalidationQueue {
         self.state.lock().delivery
     }
 
-    /// Return the age of the oldest pending or in-flight invalidation target.
+    /// Return the age of the oldest pending, in-flight, or overflow-lost invalidation target.
+    ///
+    /// A lost target stays uncovered until the overflow sweep finishes, so its age
+    /// intentionally counts against the delivery-timeout budget.
     pub fn pending_delivery_age_ms(&self) -> Option<u64> {
         let state = self.state.lock();
         [
@@ -313,6 +320,12 @@ impl WinfspInvalidationQueue {
     #[cfg(test)]
     pub(super) fn set_pending_since_for_test(&self, since: Instant) {
         self.state.lock().pending_since = Some(since);
+    }
+
+    fn push_inode_preserving_deferred_age(&self, ino: Ino) {
+        let mut state = self.state.lock();
+        let preserved_since = state.deferred_since;
+        self.push_locked(&mut state, NotificationKey::Inode(ino), preserved_since);
     }
 
     fn record_failed_notification(&self) {
@@ -569,12 +582,18 @@ impl WinfspInvalidationQueue {
             key,
             NotificationKey::Inode(_) | NotificationKey::Path { ino: 1.., .. }
         ) {
-            // A later overflow may be behind the sweep cursor; restart without
-            // forgetting how long the oldest lost request has been pending.
+            // Only a lost inode behind the sweep cursor restarts the sweep; keep
+            // how long the oldest lost request has been pending either way.
+            let ino = match &key {
+                NotificationKey::Inode(ino) | NotificationKey::Path { ino, .. } => *ino,
+            };
             let since = preserved_since.unwrap_or_else(Instant::now);
             state.overflow_since = Some(state.overflow_since.map_or(since, |old| old.min(since)));
             state.recovering_overflow = true;
-            state.reconciliation_after = None;
+            if state.reconciliation_after.is_some_and(|after| ino <= after) {
+                state.reconciliation_after = None;
+            }
+            // Discard an in-flight page that may predate this inode.
             state.overflow_epoch = state.overflow_epoch.wrapping_add(1);
         }
         false
@@ -601,8 +620,9 @@ impl WinfspInvalidationQueue {
         // Read bounded local metadata pages outside the producer's queue lock.
         let inodes = match vfs.meta().list_inode_ids_after(after, limit) {
             Ok(inodes) => inodes,
-            Err(_) => {
-                self.record_failed_notification();
+            Err(error) => {
+                // Retried on the next tick; the overflow age still reports the gap.
+                warn!(%error, "WinFSP overflow reconciliation page read failed");
                 return;
             }
         };
@@ -940,8 +960,10 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                     // Deleted candidates need no current-path purge. Historical
                     // namespace names are retained by explicit entry notifications.
                     Err(studiofs_meta::MetaError::InodeNotFound(_)) => continue,
+                    // A transient read error must not lose the purge; retry next tick.
                     Err(_) => {
-                        self.invalidation_queue.record_failed_notification();
+                        self.invalidation_queue
+                            .push_inode_preserving_deferred_age(ino);
                         continue;
                     }
                 };
@@ -971,7 +993,7 @@ impl NotifyingFileSystemContext<PreparedWinfspNotifications> for StudioFsContext
                 continue;
             }
             let Some(mut info) = build_notify_info_with_action(&path, kind, action) else {
-                warn!(ino, path, "notify path too long, skipping");
+                warn!(ino, path, "notify path invalid or too long, skipping");
                 self.invalidation_queue.record_failed_notification();
                 continue;
             };
@@ -1055,6 +1077,15 @@ mod overflow_tests {
             assert_eq!(state.reconciliation_after, Some(studiofs_meta::ROOT_INO));
             assert_eq!(state.overflow_since, Some(since));
         }
+        // A lost inode ahead of the cursor is still covered, so progress is kept.
+        queue.push(attr.ino);
+        {
+            let mut state = queue.state.lock();
+            assert_eq!(state.reconciliation_after, Some(studiofs_meta::ROOT_INO));
+            assert_eq!(state.overflow_since, Some(since));
+            state.reconciliation_after = Some(attr.ino);
+        }
+        // A lost inode at or behind the cursor restarts the sweep.
         queue.push(attr.ino);
         {
             let state = queue.state.lock();

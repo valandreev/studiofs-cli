@@ -159,7 +159,6 @@ fn winfsp_cached_handle_reloads_after_queue_overflow() {
         );
 
         let failed_before = queue.delivery_snapshot().failed_notifications;
-        let submitted_before = queue.delivery_snapshot().submitted_notifications;
         queue
             .extend((10_000..10_000 + WINFSP_INVALIDATION_QUEUE_CAPACITY as u64).chain([file.ino]));
         assert_eq!(
@@ -178,8 +177,9 @@ fn winfsp_cached_handle_reloads_after_queue_overflow() {
             cached_reader
                 .read_to_end(&mut observed)
                 .expect("read the same cached file handle after overflow");
+            // The reload and a new read callback prove this file's purge; the
+            // queue-wide submission counter cannot identify the target.
             if observed == updated
-                && queue.delivery_snapshot().submitted_notifications > submitted_before
                 && vfs
                     .write_path_observability_snapshot()
                     .winfsp_callbacks
@@ -204,10 +204,10 @@ fn winfsp_cached_handle_reloads_after_queue_overflow() {
     host.stop();
     host.unmount();
     drop(host);
-    runtime
-        .block_on(vfs.shutdown(Duration::from_secs(1)))
-        .expect("shut down test VFS after unmount");
+    let shutdown = runtime.block_on(vfs.shutdown(Duration::from_secs(1)));
+    // Report the test failure itself rather than a later cleanup failure.
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }
+    shutdown.expect("shut down test VFS after unmount");
 }

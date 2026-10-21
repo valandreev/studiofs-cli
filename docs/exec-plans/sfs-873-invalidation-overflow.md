@@ -141,8 +141,9 @@ also passed.
 
 ## Deep-review follow-up
 
-Source report: `docs/code-reviews/sfs-873-winfsp-invalidation-overflow-review.md`,
-reviewed against `38e3a671`. Recommendations are evaluated as review input.
+Source: a local deep-review report against `38e3a671` (kept out of the
+repository by `.gitignore`). Each finding and its disposition is recorded below,
+so this plan does not depend on that report.
 
 - 2.1 confirmed by a failing regression: an open-unlinked file has `nlink == 0`
   but still has metadata. Preparation now reads authoritative attributes first,
