@@ -227,8 +227,8 @@ Handles that a bridge opted into sequential RAM read-ahead (macFUSE read-only
 | `vfs_read.ram_readahead_loaded_bytes` | counter / bytes | Bytes of chunks that were loaded and installed. |
 | `vfs_read.ram_readahead_hit_reads`, `vfs_read.ram_readahead_hit_bytes` | counter / count, bytes | Read callbacks served entirely from chunks, and the bytes they returned. |
 | `vfs_read.ram_readahead_wait_reads` | counter / count | Hits that waited for an in-flight chunk. |
-| `vfs_read.ram_readahead_discarded_chunks` | counter / count | Chunk loads whose result was dropped: the inode was invalidated, the stream moved past the chunk, or the read failed. |
-| `vfs_read.ram_readahead_budget_skips` | counter / count | Chunks not scheduled because the 256 MiB mount-wide budget was in use. |
+| `vfs_read.ram_readahead_discarded_chunks` | counter / count | Chunk load tasks that finished without installing their result, for example because the inode changed or the read failed. Evictions of installed chunks and cancellations that never reach load completion are excluded. |
+| `vfs_read.ram_readahead_budget_skips` | counter / count | Scheduling passes that stopped because the next chunk could not acquire a slot from the 256 MiB mount-wide budget; at most one skip is counted per pass. |
 
 ## Text Representation
 

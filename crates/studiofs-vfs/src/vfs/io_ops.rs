@@ -164,6 +164,9 @@ impl StudioVfs {
         let prepared = self
             .prepare_foreground_read(ino, offset, requested_len)
             .await?;
+        if let Some(open_file) = &open_file {
+            self.observe_ram_readahead_file_size(open_file, prepared.context.attr.size);
+        }
         if let Some(path) = &debug_path {
             tracing::info!(
                 ino,

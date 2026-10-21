@@ -1131,7 +1131,7 @@ impl StudioVfs {
             self.spawn_deferred_materialization_if_needed(target_ino);
         }
         Ok(ExplicitFlushOutcome {
-            flushed_local_dirty_state: had_local_dirty_state,
+            flushed_local_dirty_state: write_capable && had_local_dirty_state,
         })
     }
 

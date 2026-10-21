@@ -305,6 +305,16 @@ where
     read_var(key).ok().and_then(|v| v.parse::<u64>().ok())
 }
 
+fn parse_env_size_bytes_with<F>(read_var: &F, key: &str) -> Option<usize>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    read_var(key)
+        .ok()
+        .and_then(|value| parse_size_bytes(&value))
+        .and_then(|bytes| usize::try_from(bytes).ok())
+}
+
 fn parse_env_f64_with<F>(read_var: &F, key: &str) -> Option<f64>
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
@@ -701,14 +711,12 @@ where
     }
     // Zero is meaningful here: it disables RAM read-ahead.
     if let Some(value) =
-        parse_env_u64_any_with(&read_var, "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES")
-            .and_then(|value| usize::try_from(value).ok())
+        parse_env_size_bytes_with(&read_var, "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES")
     {
         config.sequential_ram_readahead_bytes = Some(value);
     }
     if let Some(value) =
-        parse_env_u64_any_with(&read_var, "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES")
-            .and_then(|value| usize::try_from(value).ok())
+        parse_env_size_bytes_with(&read_var, "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES")
     {
         config.sequential_ram_readahead_shared_bytes = Some(value);
     }
@@ -3233,10 +3241,22 @@ mod tests {
             ("STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES", "0", 0),
             (
                 "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES",
+                "8MB",
+                8 * 1024 * 1024,
+            ),
+            ("STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES", " 0 ", 0),
+            (
+                "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES",
                 "8388608",
                 8 * 1024 * 1024,
             ),
             ("STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES", "0", 0),
+            (
+                "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES",
+                "8MB",
+                8 * 1024 * 1024,
+            ),
+            ("STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES", " 0 ", 0),
             (
                 "STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES",
                 "4194304",

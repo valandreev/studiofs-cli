@@ -223,7 +223,7 @@ pub(super) struct RamReadAheadStats {
     pub wait_reads: u64,
     /// Chunk loads whose result was dropped (invalidated, superseded, or failed).
     pub discarded_chunks: u64,
-    /// Chunks not scheduled because the mount-wide budget was exhausted.
+    /// Scheduling passes stopped by the mount-wide budget (at most one per pass).
     pub budget_skips: u64,
 }
 
@@ -353,9 +353,18 @@ impl StudioVfs {
     }
 
     pub(super) fn ram_readahead_handle(&self, fh: u64, ino: Ino) -> Option<OpenFile> {
+        if self.ram_readahead.depth_chunks == 0 {
+            return None;
+        }
         self.handle_table.get(fh).filter(|open_file| {
             open_file.ino == ino && open_file.ram_readahead().lock().is_enabled()
         })
+    }
+
+    pub(super) fn observe_ram_readahead_file_size(&self, open_file: &OpenFile, file_size: u64) {
+        if self.ram_readahead.depth_chunks != 0 {
+            open_file.ram_readahead().lock().file_size = file_size;
+        }
     }
 
     /// Serve a read from loaded chunks, waiting for in-flight ones. Returns
@@ -520,7 +529,10 @@ impl StudioVfs {
                 .fetch_add(1, Ordering::Relaxed);
             let vfs = Arc::clone(self);
             let open_file = open_file.clone();
+            // Capture before spawning so cancellation before the first poll resolves the slot.
+            let resolve = PendingChunkGuard(Arc::clone(&slot));
             self.spawn_background_task(async move {
+                let _resolve = resolve;
                 vfs.load_ram_readahead_chunk(open_file, index, slot, generation)
                     .await;
             });
@@ -534,7 +546,6 @@ impl StudioVfs {
         slot: Arc<RamChunkSlot>,
         generation: u64,
     ) {
-        let _resolve = PendingChunkGuard(Arc::clone(&slot));
         let ino = open_file.ino;
         let offset = index * CHUNK_BYTES;
         let session = self
@@ -546,8 +557,10 @@ impl StudioVfs {
             Ok(Some((data, file_size))) => {
                 let len = data.len() as u64;
                 let mut state = open_file.ram_readahead().lock();
-                state.file_size = file_size;
                 let installed = state.install(index, &slot, generation, data);
+                if installed {
+                    state.file_size = file_size;
+                }
                 drop(state);
                 if installed {
                     self.ram_readahead
@@ -608,6 +621,86 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_chunks_fixture(
+        label: &str,
+    ) -> (
+        crate::contract_harness::ContractVfsFixture,
+        OpenFile,
+        tokio::runtime::Runtime,
+    ) {
+        use crate::vfs::{OpenFlags, VfsConfigRaw};
+        let fixture = crate::contract_harness::ContractVfsFixture::new_with_config(
+            label,
+            VfsConfigRaw {
+                sequential_ram_readahead_bytes: Some(12 * 1024 * 1024),
+                sequential_ram_readahead_shared_bytes: Some(12 * 1024 * 1024),
+                ..VfsConfigRaw::default()
+            }
+            .validate()
+            .unwrap(),
+        )
+        .unwrap();
+        let vfs = fixture.vfs();
+        let mut attr = vfs.create(1, b"pending.bin", 0, 0, 0o644).unwrap();
+        attr.size = 16 * CHUNK_BYTES;
+        let size = attr.size;
+        let open_file = OpenFile::new(1, attr.ino, OpenFlags::RDONLY, Some(attr), false);
+        open_file.ram_readahead().lock().enable(3, size);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        {
+            let _entered = runtime.enter();
+            vfs.schedule_ram_readahead(&open_file, 0, RAM_READAHEAD_CHUNK_BYTES);
+            vfs.schedule_ram_readahead(&open_file, CHUNK_BYTES, RAM_READAHEAD_CHUNK_BYTES);
+        }
+        (fixture, open_file, runtime)
+    }
+
+    #[test]
+    fn ram_readahead_cancel_before_first_poll_resolves_pending_slot() {
+        let (fixture, open_file, runtime) = pending_chunks_fixture("ram-cancel-unpolled");
+        let slot = open_file
+            .ram_readahead()
+            .lock()
+            .slots_for(2 * CHUNK_BYTES, RAM_READAHEAD_CHUNK_BYTES)
+            .unwrap()
+            .remove(0);
+        // The current-thread runtime was never driven, so none of its tasks ran.
+        drop(runtime);
+        let (data, _) = fixture.runtime().block_on(async {
+            tokio::time::timeout(Duration::from_millis(100), slot.resolved())
+                .await
+                .expect("cancelling an unpolled chunk must unblock its reader")
+        });
+        assert!(data.is_none());
+    }
+
+    #[test]
+    fn ram_readahead_seek_discards_existing_loaded_and_pending_slots() {
+        let (fixture, open_file, runtime) = pending_chunks_fixture("ram-seek-pending");
+        let slots = open_file
+            .ram_readahead()
+            .lock()
+            .slots_for(2 * CHUNK_BYTES, 2 * RAM_READAHEAD_CHUNK_BYTES)
+            .unwrap();
+        slots[0]
+            .state
+            .send_replace(RamChunkState::Ready(Bytes::from_static(b"loaded chunk")));
+        assert!(matches!(*slots[0].state.borrow(), RamChunkState::Ready(_)));
+        assert!(matches!(*slots[1].state.borrow(), RamChunkState::Pending));
+        {
+            let _entered = runtime.enter();
+            fixture
+                .vfs()
+                .schedule_ram_readahead(&open_file, 0, RAM_READAHEAD_CHUNK_BYTES);
+        }
+        assert!(matches!(*slots[0].state.borrow(), RamChunkState::Discarded));
+        assert!(matches!(*slots[1].state.borrow(), RamChunkState::Discarded));
+        assert!(open_file.ram_readahead().lock().chunks.is_empty());
+    }
 
     #[test]
     fn ram_readahead_depth_holds_shared_limit_after_background_work() {

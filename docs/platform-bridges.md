@@ -654,10 +654,15 @@ sequential RAM read-ahead (`StudioVfs::enable_sequential_ram_readahead`).
 After two forward reads whose ranges touch or overlap and extend the stream,
 the VFS loads 4 MiB-aligned chunks ahead in background tasks. Its idle lead is
 `sequential_ram_readahead_bytes` (default 32 MiB on macOS,
-`STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES`, `0` disables it). Chunk memory is
-bounded mount-wide by 256 MiB. A callback whose range is covered by loaded chunks is served by a
-copy; it waits for an in-flight chunk before it takes its own file-session
-`Read` permit, so it cannot deadlock against a queued writer. A chunk task
+`STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES`, `0` disables it). Both read-ahead
+environment variables accept byte counts or size suffixes such as `8MB`, with
+surrounding whitespace allowed. Nonzero configured depths round up to 4 MiB
+chunks and have a minimum lead of two chunks (8 MiB). These depths bound the
+per-stream lead; the 256 MiB mount-wide budget limits total chunk memory, so
+the actual lead can be smaller near EOF or under budget pressure. A callback
+whose range is covered by loaded chunks is served by a copy; it waits for an
+in-flight chunk before it takes its own file-session `Read` permit, so it
+cannot deadlock against a queued writer. A chunk task
 reads through the normal foreground read path under a `Read` permit and
 installs its bytes only if no invalidation of the inode happened since it was
 scheduled; any invalidation, seek, or switch to kernel read-ahead discards all
@@ -670,9 +675,10 @@ payload objects compete for the cache disk, read-ahead uses
 `sequential_ram_readahead_shared_bytes` (default 12 MiB on macOS,
 `STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES`). It holds this shared depth
 for two seconds after the last busy observation. Shared depth is capped at
-the idle depth; zero disables new speculative loads while busy. Any nonzero
-depth rounds up to at least two chunks. Reducing depth discards queued slots
-beyond the new lead, while the same 256 MiB mount-wide budget remains in force.
+the idle depth; zero disables new speculative loads while busy. As with idle
+depth, the configured shared depth rounds up to 4 MiB chunks with a minimum of
+two chunks when nonzero. Reducing depth discards queued slots beyond the new
+lead.
 
 Read-ahead keeps several reads queued on the cache disk, and the deeper the
 queue, the more of the disk bandwidth a sequential stream takes from write-back

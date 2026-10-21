@@ -3563,10 +3563,6 @@ fn read_only_flush_does_not_wait_for_deferred_release_materialization() {
             )
             .unwrap();
         let writer = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
-        vfs.write_fh(writer, attr.ino, 0, b"closed-writer-overlay")
-            .await
-            .unwrap();
-
         // Hold materialization so the deferred last-handle release stays in flight,
         // as it does while a large write backlog drains to the local payload store.
         let materialize = vfs
@@ -3574,6 +3570,9 @@ fn read_only_flush_does_not_wait_for_deferred_release_materialization() {
             .file_session
             .enter_op(attr.ino, FileSessionOperation::Materialize)
             .await;
+        vfs.write_fh(writer, attr.ino, 0, b"closed-writer-overlay")
+            .await
+            .unwrap();
         let release = vfs.release_fh_with_deferred_last_handle_barrier(writer, &runtime);
         assert!(release.closed_last_handle);
         assert!(
@@ -3583,13 +3582,14 @@ fn read_only_flush_does_not_wait_for_deferred_release_materialization() {
 
         // macFUSE and Linux FUSE send FLUSH on every close(2), including a reader's.
         let reader = vfs.open_file(attr.ino, OpenFlags::RDONLY, false).unwrap();
-        tokio::time::timeout(
+        let flush = tokio::time::timeout(
             Duration::from_millis(500),
             vfs.flush_volatile_writeback_with_outcome(attr.ino, reader),
         )
         .await
         .expect("read-only flush should not queue behind deferred release materialization")
         .expect("read-only flush should succeed");
+        assert!(!flush.flushed_local_dirty_state);
         assert!(
             vfs.state.deferred_release_inflight.contains(attr.ino),
             "read-only flush must not have drained the writer's deferred release"
@@ -3747,6 +3747,57 @@ fn ram_readahead_serves_forward_overlapping_reads_from_loaded_chunks() {
         let stats = vfs.ram_readahead_stats();
         assert_eq!(stats.hit_reads, 5, "{stats:?}");
         assert_eq!(stats.discarded_chunks, 0, "{stats:?}");
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn ram_readahead_resumes_beyond_original_eof_after_append() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-append", 12 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let mib = RAM_READAHEAD_TEST_MIB;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-append.bin", 8 * mib).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        assert!(vfs.enable_sequential_ram_readahead(reader));
+        read_ram_readahead_range(&vfs, reader, ino, 0, 4 * mib).await;
+        let writer = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(
+            writer,
+            ino,
+            (8 * mib) as u64,
+            &ram_readahead_pattern(8 * mib, 16 * mib),
+        )
+        .await
+        .unwrap();
+        vfs.release_fh(writer).await.unwrap();
+
+        for offset in [4 * mib, 8 * mib, 12 * mib] {
+            let data = read_ram_readahead_range(&vfs, reader, ino, offset, 4 * mib).await;
+            assert!(data == ram_readahead_pattern(offset, 4 * mib));
+        }
+        assert_eq!(vfs.ram_readahead_stats().hit_reads, 2);
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
+fn ram_readahead_learns_file_size_when_open_attr_is_missing() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-no-attr", 12 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let mib = RAM_READAHEAD_TEST_MIB;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-no-attr.bin", 16 * mib).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        *vfs.get_open_file(reader).unwrap().open_attr.write() = None;
+        assert!(vfs.enable_sequential_ram_readahead(reader));
+        for offset in [0, 4 * mib, 8 * mib] {
+            let data = read_ram_readahead_range(&vfs, reader, ino, offset, 4 * mib).await;
+            assert!(data == ram_readahead_pattern(offset, 4 * mib));
+        }
+        assert_eq!(vfs.ram_readahead_stats().hit_reads, 1);
         vfs.release_fh(reader).await.unwrap();
     });
 }
