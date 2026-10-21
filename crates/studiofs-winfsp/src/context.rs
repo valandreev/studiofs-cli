@@ -3095,7 +3095,10 @@ mod tests {
             .calls
     }
 
-    fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() -> bool) -> bool {
+    pub(super) fn wait_until(
+        timeout: std::time::Duration,
+        mut condition: impl FnMut() -> bool,
+    ) -> bool {
         let started = std::time::Instant::now();
         while started.elapsed() < timeout {
             if condition() {

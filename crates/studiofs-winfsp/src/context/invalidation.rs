@@ -611,11 +611,11 @@ impl WinfspInvalidationQueue {
             }
         };
         let mut state = self.state.lock();
+        // Another overflow can invalidate this metadata snapshot even with after=None.
         if state.closed || state.overflow_epoch != epoch || state.reconciliation_after != after {
             return;
         }
         let since = state.overflow_since;
-        let mut accepted = 0;
         for &ino in &inodes {
             let key = NotificationKey::Inode(ino);
             if state.pending.len() == WINFSP_INVALIDATION_QUEUE_CAPACITY
@@ -625,15 +625,13 @@ impl WinfspInvalidationQueue {
             }
             self.push_locked(&mut state, key, since);
             state.reconciliation_after = Some(ino);
-            accepted += 1;
         }
-        if accepted == inodes.len() && inodes.len() < limit {
+        if inodes.len() < limit
+            && (inodes.is_empty() || state.reconciliation_after == inodes.last().copied())
+        {
             state.overflow_since = None;
             state.reconciliation_after = None;
         }
-        let snapshot = Self::next_metrics_snapshot(&mut state);
-        drop(state);
-        self.record_metrics(snapshot);
     }
 
     #[cfg(test)]
@@ -1054,6 +1052,19 @@ mod overflow_tests {
         assert_eq!(queue.state.lock().overflow_since, Some(since));
         assert!(queue.pending_delivery_age_ms().unwrap() >= 5_000);
         assert!(queue.drain().contains(&attr.ino));
+        assert!(queue.is_empty());
+        assert_eq!(queue.pending_delivery_age_ms(), None);
+    }
+
+    #[test]
+    fn overflow_reconciliation_finishes_on_empty_terminal_page() {
+        let (_tmp, _vfs, _ctx, queue) = make_test_context("overflow-empty-page");
+        {
+            let mut state = queue.state.lock();
+            state.overflow_since = Some(Instant::now());
+            state.reconciliation_after = Some(u64::MAX);
+        }
+        assert!(queue.drain().is_empty());
         assert!(queue.is_empty());
         assert_eq!(queue.pending_delivery_age_ms(), None);
     }

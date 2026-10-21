@@ -4,7 +4,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 use std::time::{Duration, Instant};
 
-use crate::context::tests::make_test_context;
+use crate::context::tests::{make_test_context, wait_until};
 use studiofs_meta::ROOT_INO;
 use studiofs_vfs::OpenFlags;
 use windows::Win32::Storage::FileSystem::GetLogicalDrives;
@@ -163,16 +163,8 @@ fn winfsp_cached_handle_reloads_after_queue_overflow() {
 
         let failed_before = queue.delivery_snapshot().failed_notifications;
         let submitted_before = queue.delivery_snapshot().submitted_notifications;
-        {
-            let mut state = queue.state.lock();
-            for ino in 10_000..10_000 + WINFSP_INVALIDATION_QUEUE_CAPACITY as u64 {
-                assert!(queue.push_locked(&mut state, NotificationKey::Inode(ino), None));
-            }
-            assert!(
-                !queue.push_locked(&mut state, NotificationKey::Inode(file.ino), None),
-                "the target invalidation must be rejected from the full queue"
-            );
-        }
+        queue
+            .extend((10_000..10_000 + WINFSP_INVALIDATION_QUEUE_CAPACITY as u64).chain([file.ino]));
         assert_eq!(
             queue.delivery_snapshot().failed_notifications,
             failed_before + 1,
@@ -221,15 +213,4 @@ fn winfsp_cached_handle_reloads_after_queue_overflow() {
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }
-}
-
-fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    while !condition() {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    true
 }

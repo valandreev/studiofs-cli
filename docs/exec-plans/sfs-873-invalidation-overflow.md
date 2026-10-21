@@ -112,3 +112,26 @@ Full suites remain operator-run, including the issue's full crate command:
 Revision: initial plan records the bounded local-page design and validation scope.
 Revision: record runtime forwarding, writer-safe refill ordering, native red/green
 evidence, and the counted-name correction required by the observed kernel behavior.
+
+## Review follow-up
+
+Removed the redundant refill metrics snapshot, reused atomic queue extension in
+the native test, and shared the existing bounded wait helper. Replaced the accepted
+counter with a last-cursor check that explicitly accepts an empty terminal page;
+without the empty-page case, a completed full page would never finish reconciliation.
+A focused regression covers this terminal state.
+
+Retained `overflow_epoch`: a short metadata page read outside the queue lock can
+become stale while its cursor remains `None`. Producers can fill the queue with
+all IDs from that old page, then reject a newly created inode. Without the epoch
+check, refill coalesces the old page and clears overflow, losing the new inode's
+purge request. Cursor equality alone cannot distinguish those snapshots.
+
+Review validation: the invalidation group passed 15 tests (native test ignored
+there), and the explicit native cached-handle test passed in 1.67 seconds; log:
+`target/sfs873-native-overflow-review.log`. The overflow group also passed six
+tests before the equivalent final spelling of the completion predicate. Full
+suites remain operator-run. The concurrent snapshot schedule was checked against
+the source; no new concurrency hook was added for this review cleanup.
+WinFSP all-target Clippy with warnings denied, rustfmt, and `git diff --check`
+also passed.
