@@ -35,7 +35,6 @@ fn run_with(
     remove_pid_file: RemovePidFn,
     is_process_running: IsRunningFn,
     is_mount_active: IsMountActiveFn,
-    unmount: impl FnOnce(&str, u32, IsMountActiveFn) -> Result<()>,
 ) -> Result<()> {
     let (pid, mp, volume) = read_pid_file(mount_point)?;
 
@@ -61,7 +60,10 @@ fn run_with(
         volume, mp, pid
     );
 
-    unmount(mount_point, pid, is_mount_active)?;
+    #[cfg(windows)]
+    unmount_windows(mount_point, pid)?;
+    #[cfg(unix)]
+    unmount_unix(mount_point, pid, is_mount_active)?;
 
     // Clean up the persisted mount record.
     let _ = remove_pid_file(mount_point);
@@ -78,184 +80,90 @@ pub fn run(mount_point: &str) -> Result<()> {
         super::utils::remove_pid_file,
         super::utils::is_process_running,
         super::utils::mount_is_active,
-        unmount_platform,
     )
 }
 
 // ─── Windows ─────────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
-trait WindowsUnmountApi {
-    type Handle;
-
-    fn open_event(&mut self, name: &[u16]) -> std::io::Result<Self::Handle>;
-    fn set_event(&mut self, event: &Self::Handle) -> std::io::Result<()>;
-    fn open_process(&mut self, pid: u32) -> std::io::Result<Self::Handle>;
-    fn wait_for_exit(
-        &mut self,
-        process: &Self::Handle,
-        timeout: std::time::Duration,
-    ) -> std::io::Result<bool>;
-    fn terminate(&mut self, process: &Self::Handle) -> std::io::Result<()>;
-}
-
-#[cfg(windows)]
 fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
-    unmount_windows_with(mount_point, pid, &mut NativeWindowsUnmountApi)
-}
-
-#[cfg(windows)]
-fn unmount_windows_with(
-    mount_point: &str,
-    pid: u32,
-    api: &mut impl WindowsUnmountApi,
-) -> Result<()> {
     use anyhow::Context;
-    use std::time::Duration;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
-    const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(15);
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+        fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> *mut core::ffi::c_void;
+        fn SetEvent(event: *mut core::ffi::c_void) -> i32;
+        fn WaitForSingleObject(handle: *mut core::ffi::c_void, timeout: u32) -> u32;
+        fn TerminateProcess(process: *mut core::ffi::c_void, exit_code: u32) -> i32;
+    }
+    const SYNCHRONIZE: u32 = 0x00100000;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const EVENT_MODIFY_STATE: u32 = 0x0002;
     const ERROR_INVALID_PARAMETER: i32 = 87;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
-    let process = match api.open_process(pid) {
-        Ok(process) => process,
-        Err(error) if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) => return Ok(()),
-        Err(error) => return Err(error).with_context(|| format!("could not open mount process {pid}; check process permissions and retry from an elevated terminal if the mount was started elevated")),
-    };
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
+    const EXIT_TIMEOUT_MS: u32 = 15_000;
 
-    let event_name = super::utils::shutdown_event_name(mount_point);
-    let wide: Vec<u16> = event_name
+    // SAFETY: OpenProcess accepts the access mask and PID; null is checked before ownership.
+    let process = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+    if process.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+            return Ok(());
+        }
+        return Err(error).with_context(|| format!("could not open mount process {pid}; check process permissions and retry from an elevated terminal if the mount was started elevated"));
+    }
+    // SAFETY: OpenProcess returned a valid, uniquely owned kernel handle.
+    let process = unsafe { OwnedHandle::from_raw_handle(process) };
+    let wide: Vec<u16> = super::utils::shutdown_event_name(mount_point)
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-
-    match api.open_event(&wide) {
-        Ok(event) => api
-            .set_event(&event)
-            .context("could not signal mount shutdown event")?,
-        Err(error) if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND) => {
-            tracing::warn!("could not open shutdown event — will attempt process termination");
+    // SAFETY: The NUL-terminated UTF-16 name remains alive for the call.
+    let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr()) };
+    if event.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_FILE_NOT_FOUND) {
+            return Err(error).context("could not open shutdown event");
         }
-        Err(error) => return Err(error).context("could not open shutdown event"),
-    }
-
-    if api
-        .wait_for_exit(&process, GRACEFUL_TIMEOUT)
-        .context("could not wait for mount process")?
-    {
-        return Ok(());
-    }
-
-    tracing::warn!("mount process did not exit within 15 s — force-killing");
-    api.terminate(&process)
-        .context("could not terminate mount process")?;
-    if api
-        .wait_for_exit(&process, GRACEFUL_TIMEOUT)
-        .context("could not confirm terminated mount process exit")?
-    {
-        Ok(())
+        tracing::warn!("could not open shutdown event — will attempt process termination");
     } else {
-        anyhow::bail!(
-            "mount process {pid} did not exit within 15 s after termination; leaving mount record intact"
-        )
-    }
-}
-
-#[cfg(windows)]
-struct NativeWindowsUnmountApi;
-
-#[cfg(windows)]
-impl WindowsUnmountApi for NativeWindowsUnmountApi {
-    type Handle = std::os::windows::io::OwnedHandle;
-
-    fn open_event(&mut self, name: &[u16]) -> std::io::Result<Self::Handle> {
-        use std::os::windows::io::FromRawHandle;
-        const EVENT_MODIFY_STATE: u32 = 0x0002;
-        unsafe extern "system" {
-            fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> *mut core::ffi::c_void;
-        }
-        // SAFETY: `name` is NUL-terminated UTF-16 and remains alive for this call.
-        let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
-        if handle.is_null() {
-            Err(std::io::Error::last_os_error())
-        } else {
-            // SAFETY: A successful OpenEventW returns a valid owned kernel handle.
-            Ok(unsafe { Self::Handle::from_raw_handle(handle) })
+        // SAFETY: OpenEventW returned a valid, uniquely owned kernel handle.
+        let event = unsafe { OwnedHandle::from_raw_handle(event) };
+        // SAFETY: The owned event handle is open and has modify access.
+        if unsafe { SetEvent(event.as_raw_handle()) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("could not signal mount shutdown event");
         }
     }
 
-    fn set_event(&mut self, event: &Self::Handle) -> std::io::Result<()> {
-        use std::os::windows::io::AsRawHandle;
-        unsafe extern "system" {
-            fn SetEvent(event: *mut core::ffi::c_void) -> i32;
-        }
-        // SAFETY: The borrowed handle is open and has event modify access.
-        if unsafe { SetEvent(event.as_raw_handle().cast()) } != 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
-
-    fn open_process(&mut self, pid: u32) -> std::io::Result<Self::Handle> {
-        use std::os::windows::io::FromRawHandle;
-        const SYNCHRONIZE: u32 = 0x00100000;
-        const PROCESS_TERMINATE: u32 = 0x0001;
-        unsafe extern "system" {
-            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
-        }
-        // SAFETY: OpenProcess accepts the requested access mask and process ID.
-        let handle = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
-        if handle.is_null() {
-            Err(std::io::Error::last_os_error())
-        } else {
-            // SAFETY: A successful OpenProcess returns a valid owned kernel handle.
-            Ok(unsafe { Self::Handle::from_raw_handle(handle) })
-        }
-    }
-
-    fn wait_for_exit(
-        &mut self,
-        process: &Self::Handle,
-        timeout: std::time::Duration,
-    ) -> std::io::Result<bool> {
-        use std::os::windows::io::AsRawHandle;
-        const WAIT_OBJECT_0: u32 = 0;
-        const WAIT_TIMEOUT: u32 = 0x00000102;
-        unsafe extern "system" {
-            fn WaitForSingleObject(handle: *mut core::ffi::c_void, timeout: u32) -> u32;
-        }
-        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-        // SAFETY: The borrowed process handle remains open for the wait.
-        match unsafe { WaitForSingleObject(process.as_raw_handle().cast(), timeout_ms) } {
+    let wait_for_exit = || -> Result<bool> {
+        // SAFETY: The owned process handle has SYNCHRONIZE access and outlives the wait.
+        match unsafe { WaitForSingleObject(process.as_raw_handle(), EXIT_TIMEOUT_MS) } {
             WAIT_OBJECT_0 => Ok(true),
             WAIT_TIMEOUT => Ok(false),
-            u32::MAX => Err(std::io::Error::last_os_error()),
-            _ => Err(std::io::Error::other("unexpected process wait result")),
+            u32::MAX => {
+                Err(std::io::Error::last_os_error()).context("could not wait for mount process")
+            }
+            result => anyhow::bail!("unexpected process wait result: {result:#x}"),
         }
+    };
+    if wait_for_exit()? {
+        return Ok(());
     }
-
-    fn terminate(&mut self, process: &Self::Handle) -> std::io::Result<()> {
-        use std::os::windows::io::AsRawHandle;
-        unsafe extern "system" {
-            fn TerminateProcess(process: *mut core::ffi::c_void, exit_code: u32) -> i32;
-        }
-        // SAFETY: The borrowed process handle remains open and has terminate access.
-        if unsafe { TerminateProcess(process.as_raw_handle().cast(), 1) } != 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+    tracing::warn!("mount process did not exit within 15 s — force-killing");
+    // SAFETY: The owned process handle remains open and has terminate access.
+    if unsafe { TerminateProcess(process.as_raw_handle(), 1) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("could not terminate mount process");
     }
-}
-
-#[cfg(windows)]
-fn unmount_platform(mount_point: &str, pid: u32, _is_mount_active: IsMountActiveFn) -> Result<()> {
-    unmount_windows(mount_point, pid)
-}
-
-#[cfg(unix)]
-fn unmount_platform(mount_point: &str, pid: u32, is_mount_active: IsMountActiveFn) -> Result<()> {
-    unmount_unix(mount_point, pid, is_mount_active)
+    if !wait_for_exit().context("could not confirm terminated mount process exit")? {
+        anyhow::bail!(
+            "mount process {pid} did not exit within 15 s after termination; leaving mount record intact"
+        );
+    }
+    Ok(())
 }
 
 // ─── Unix ────────────────────────────────────────────────────────────────────
@@ -528,7 +436,7 @@ mod tests {
     }
 
     static TEST_PID_STATE: OnceLock<Mutex<TestPidState>> = OnceLock::new();
-    static TEST_PID_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    static TEST_PID_LOCK: Mutex<()> = Mutex::new(());
     #[cfg(unix)]
     static TEST_UNIX_SIGNALS: OnceLock<Mutex<Vec<libc::c_int>>> = OnceLock::new();
     #[cfg(unix)]
@@ -561,14 +469,6 @@ mod tests {
 
     fn test_mount_not_active(_mount_point: &str) -> Result<bool> {
         Ok(false)
-    }
-
-    fn test_unmount_ok(
-        _mount_point: &str,
-        _pid: u32,
-        _is_mount_active: IsMountActiveFn,
-    ) -> Result<()> {
-        Ok(())
     }
 
     #[cfg(any(unix, windows))]
@@ -652,10 +552,7 @@ mod tests {
     /// clean it up without trusting the recorded PID.
     #[test]
     fn umount_stale_pid_file_cleanup() {
-        let _guard = TEST_PID_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = TEST_PID_LOCK.lock().unwrap();
         let mp = "__test_stale_umount__";
         {
             let mut state = pid_state().lock().unwrap();
@@ -670,7 +567,6 @@ mod tests {
             test_remove_pid_file,
             test_process_running,
             test_mount_not_active,
-            test_unmount_ok,
         );
         assert!(
             result.is_ok(),
@@ -838,252 +734,130 @@ mod tests {
     #[cfg(windows)]
     mod windows_tests {
         use super::*;
-        use std::collections::VecDeque;
-        use std::io;
-        use std::sync::{Arc, Mutex};
-        use std::time::Duration;
+        use std::os::windows::{
+            io::{FromRawHandle, OwnedHandle},
+            process::CommandExt,
+        };
+        use std::process::{Child, Command, Stdio};
 
-        struct FakeHandle {
-            name: &'static str,
-            dropped: Arc<Mutex<Vec<&'static str>>>,
-        }
-
-        impl Drop for FakeHandle {
-            fn drop(&mut self) {
-                self.dropped.lock().unwrap().push(self.name);
+        fn kernel_object(mount_point: &str, mutex: bool) -> OwnedHandle {
+            unsafe extern "system" {
+                fn CreateEventW(
+                    attrs: *const core::ffi::c_void,
+                    manual: i32,
+                    initial: i32,
+                    name: *const u16,
+                ) -> *mut core::ffi::c_void;
+                fn CreateMutexW(
+                    attrs: *const core::ffi::c_void,
+                    owner: i32,
+                    name: *const u16,
+                ) -> *mut core::ffi::c_void;
             }
-        }
-
-        struct FakeApi {
-            open_event: io::Result<()>,
-            set_event: io::Result<()>,
-            open_process: io::Result<()>,
-            waits: VecDeque<io::Result<bool>>,
-            terminate: io::Result<()>,
-            calls: Vec<&'static str>,
-            wait_timeouts: Vec<Duration>,
-            dropped: Arc<Mutex<Vec<&'static str>>>,
-        }
-
-        impl FakeApi {
-            fn new(waits: impl IntoIterator<Item = io::Result<bool>>) -> Self {
-                Self {
-                    open_event: Ok(()),
-                    set_event: Ok(()),
-                    open_process: Ok(()),
-                    waits: waits.into_iter().collect(),
-                    terminate: Ok(()),
-                    calls: Vec::new(),
-                    wait_timeouts: Vec::new(),
-                    dropped: Arc::default(),
+            let wide: Vec<u16> = super::super::super::utils::shutdown_event_name(mount_point)
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            // SAFETY: The name is NUL-terminated and null attributes select default security.
+            let handle = unsafe {
+                if mutex {
+                    CreateMutexW(std::ptr::null(), 0, wide.as_ptr())
+                } else {
+                    CreateEventW(std::ptr::null(), 1, 0, wide.as_ptr())
                 }
-            }
-
-            fn handle(&self, name: &'static str) -> FakeHandle {
-                FakeHandle {
-                    name,
-                    dropped: Arc::clone(&self.dropped),
-                }
-            }
+            };
+            assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
+            // SAFETY: Creation succeeded and this is the sole owner of the returned handle.
+            unsafe { OwnedHandle::from_raw_handle(handle) }
         }
 
-        impl WindowsUnmountApi for FakeApi {
-            type Handle = FakeHandle;
-
-            fn open_event(&mut self, _name: &[u16]) -> io::Result<Self::Handle> {
-                self.calls.push("open_event");
-                self.open_event
-                    .as_ref()
-                    .map(|()| self.handle("event"))
-                    .map_err(|error| {
-                        io::Error::from_raw_os_error(error.raw_os_error().unwrap_or(1))
-                    })
-            }
-
-            fn set_event(&mut self, _event: &Self::Handle) -> io::Result<()> {
-                self.calls.push("set_event");
-                self.set_event.as_ref().copied().map_err(|error| {
-                    io::Error::from_raw_os_error(error.raw_os_error().unwrap_or(1))
-                })
-            }
-
-            fn open_process(&mut self, _pid: u32) -> io::Result<Self::Handle> {
-                self.calls.push("open_process");
-                self.open_process
-                    .as_ref()
-                    .map(|()| self.handle("process"))
-                    .map_err(|error| {
-                        io::Error::from_raw_os_error(error.raw_os_error().unwrap_or(1))
-                    })
-            }
-
-            fn wait_for_exit(
-                &mut self,
-                _process: &Self::Handle,
-                timeout: Duration,
-            ) -> io::Result<bool> {
-                self.calls.push("wait");
-                self.wait_timeouts.push(timeout);
-                self.waits.pop_front().expect("scripted wait result")
-            }
-
-            fn terminate(&mut self, _process: &Self::Handle) -> io::Result<()> {
-                self.calls.push("terminate");
-                self.terminate.as_ref().copied().map_err(|error| {
-                    io::Error::from_raw_os_error(error.raw_os_error().unwrap_or(1))
-                })
-            }
+        fn waiting_child(mount_point: &str) -> (Child, OwnedHandle) {
+            let event = kernel_object(mount_point, false);
+            let child = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command",
+                    "$ErrorActionPreference = 'Stop'; try { $event = [System.Threading.EventWaitHandle]::OpenExisting($env:STUDIOFS_TEST_SHUTDOWN_EVENT); if (-not $event.WaitOne(30000)) { exit 2 } } catch { exit 3 }"])
+                .env("STUDIOFS_TEST_SHUTDOWN_EVENT", super::super::super::utils::shutdown_event_name(mount_point))
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+                .spawn().unwrap();
+            (child, event)
         }
 
         #[test]
-        fn graceful_exit_is_confirmed_and_handles_are_closed() {
-            let mut api = FakeApi::new([Ok(true)]);
-            assert!(unmount_windows_with("Z:", 123, &mut api).is_ok());
-            assert_eq!(
-                api.calls,
-                ["open_process", "open_event", "set_event", "wait"]
+        fn graceful_exit_removes_record_after_child_exits() {
+            let _guard = TEST_PID_LOCK.lock().unwrap();
+            let mp = format!("umount-{}", uuid::Uuid::new_v4());
+            let (mut child, _event) = waiting_child(&mp);
+            *pid_state().lock().unwrap() = TestPidState {
+                value: Some((child.id(), mp.clone(), "test".into())),
+                removed: false,
+            };
+            let result = run_with(
+                &mp,
+                test_read_pid_file,
+                test_remove_pid_file,
+                test_process_running,
+                test_mount_active,
             );
-            assert_eq!(api.wait_timeouts, [Duration::from_secs(15)]);
-            assert_eq!(*api.dropped.lock().unwrap(), ["event", "process"]);
-        }
-
-        #[test]
-        fn missing_event_falls_back_to_termination_and_waits_for_exit() {
-            let mut api = FakeApi::new([Ok(false), Ok(true)]);
-            api.open_event = Err(io::Error::from_raw_os_error(2));
-            assert!(unmount_windows_with("Z:", 123, &mut api).is_ok());
-            assert_eq!(
-                api.calls,
-                ["open_process", "open_event", "wait", "terminate", "wait"]
+            let exited = child.try_wait().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(result.is_ok(), "{result:?}");
+            assert!(
+                exited.unwrap().success(),
+                "child must exit through the shutdown event"
             );
-            assert_eq!(api.wait_timeouts, [Duration::from_secs(15); 2]);
+            assert!(pid_state().lock().unwrap().removed);
         }
 
         #[test]
-        fn process_open_error_87_means_already_gone_but_access_denied_is_error() {
-            let mut gone = FakeApi::new([]);
-            gone.open_process = Err(io::Error::from_raw_os_error(87));
-            assert!(unmount_windows_with("Z:", 123, &mut gone).is_ok());
-            assert_eq!(gone.calls, ["open_process"]);
-
-            let mut denied = FakeApi::new([]);
-            denied.open_process = Err(io::Error::from_raw_os_error(5));
-            assert!(unmount_windows_with("Z:", 123, &mut denied).is_err());
-        }
-
-        #[test]
-        fn native_signal_wait_and_termination_errors_are_reported() {
-            let mut event_denied = FakeApi::new([]);
-            event_denied.open_event = Err(io::Error::from_raw_os_error(5));
-            assert!(unmount_windows_with("Z:", 123, &mut event_denied).is_err());
-
-            let mut signal_failed = FakeApi::new([]);
-            signal_failed.set_event = Err(io::Error::from_raw_os_error(5));
-            assert!(unmount_windows_with("Z:", 123, &mut signal_failed).is_err());
-
-            let mut wait_failed = FakeApi::new([Err(io::Error::from_raw_os_error(6))]);
-            assert!(unmount_windows_with("Z:", 123, &mut wait_failed).is_err());
-
-            let mut terminate_failed = FakeApi::new([Ok(false)]);
-            terminate_failed.terminate = Err(io::Error::from_raw_os_error(5));
-            assert!(unmount_windows_with("Z:", 123, &mut terminate_failed).is_err());
-
-            let mut exit_wait_failed =
-                FakeApi::new([Ok(false), Err(io::Error::from_raw_os_error(6))]);
-            assert!(unmount_windows_with("Z:", 123, &mut exit_wait_failed).is_err());
-        }
-
-        #[test]
-        fn timeout_after_termination_is_failure_and_retains_pid_record() {
-            let mut api = FakeApi::new([Ok(false), Ok(false)]);
-            assert!(unmount_windows_with("Z:", 123, &mut api).is_err());
-            assert_eq!(
-                api.calls,
-                [
-                    "open_process",
-                    "open_event",
-                    "set_event",
-                    "wait",
-                    "terminate",
-                    "wait"
-                ]
+        fn native_event_error_keeps_record_and_child_running() {
+            let _guard = TEST_PID_LOCK.lock().unwrap();
+            let mp = format!("umount-{}", uuid::Uuid::new_v4());
+            let (mut child, _event) = waiting_child(&format!("{mp}-child"));
+            // A different kernel object under the shutdown name makes OpenEventW fail.
+            let _mutex = kernel_object(&mp, true);
+            *pid_state().lock().unwrap() = TestPidState {
+                value: Some((child.id(), mp.clone(), "test".into())),
+                removed: false,
+            };
+            let result = run_with(
+                &mp,
+                test_read_pid_file,
+                test_remove_pid_file,
+                test_process_running,
+                test_mount_active,
             );
-            assert_eq!(*api.dropped.lock().unwrap(), ["event", "process"]);
-
-            let _guard = TEST_PID_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mp = "__test_windows_failed_umount__";
-            let mut denied = FakeApi::new([]);
-            denied.open_process = Err(io::Error::from_raw_os_error(5));
-            let mut event_denied = FakeApi::new([]);
-            event_denied.open_event = Err(io::Error::from_raw_os_error(5));
-            let mut signal_failed = FakeApi::new([]);
-            signal_failed.set_event = Err(io::Error::from_raw_os_error(5));
-            let mut terminate_failed = FakeApi::new([Ok(false)]);
-            terminate_failed.terminate = Err(io::Error::from_raw_os_error(5));
-            for mut api in [
-                denied,
-                event_denied,
-                signal_failed,
-                FakeApi::new([Err(io::Error::from_raw_os_error(6))]),
-                terminate_failed,
-                FakeApi::new([Ok(false), Err(io::Error::from_raw_os_error(6))]),
-                FakeApi::new([Ok(false), Ok(false)]),
-            ] {
-                {
-                    let mut state = pid_state().lock().unwrap();
-                    state.value = Some((123, mp.to_owned(), "fakevol".to_owned()));
-                    state.removed = false;
-                }
-                let result = run_with(
-                    mp,
-                    test_read_pid_file,
-                    test_remove_pid_file,
-                    test_process_running,
-                    test_mount_active,
-                    |mp, pid, _| unmount_windows_with(mp, pid, &mut api),
-                );
-                assert!(result.is_err(), "unexpected success after {:?}", api.calls);
-                let state = pid_state().lock().unwrap();
-                assert!(!state.removed);
-                assert!(state.value.is_some());
-            }
+            let still_running = child.try_wait().unwrap().is_none();
+            let _ = child.kill();
+            let _ = child.wait();
+            let error = result.unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(6)
+            );
+            assert!(still_running);
+            assert!(!pid_state().lock().unwrap().removed);
         }
 
         #[test]
-        fn confirmed_unmount_removes_pid_record_through_run_with() {
-            let _guard = TEST_PID_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let mp = "__test_windows_successful_umount__";
-            let mut gone = FakeApi::new([]);
-            gone.open_process = Err(io::Error::from_raw_os_error(87));
-            for mut api in [
-                FakeApi::new([Ok(true)]),
-                FakeApi::new([Ok(false), Ok(true)]),
-                gone,
-            ] {
-                {
-                    let mut state = pid_state().lock().unwrap();
-                    state.value = Some((123, mp.to_owned(), "fakevol".to_owned()));
-                    state.removed = false;
-                }
-                let result = run_with(
-                    mp,
-                    test_read_pid_file,
-                    test_remove_pid_file,
-                    test_process_running,
-                    test_mount_active,
-                    |mp, pid, _| unmount_windows_with(mp, pid, &mut api),
-                );
-                assert!(result.is_ok(), "unmount failed: {result:?}");
-                let state = pid_state().lock().unwrap();
-                assert!(state.removed);
-                assert!(state.value.is_none());
-            }
+        fn missing_event_forces_termination_and_confirms_exit() {
+            let mp = format!("umount-{}", uuid::Uuid::new_v4());
+            let (mut child, _event) = waiting_child(&format!("{mp}-child"));
+            let result = unmount_windows(&mp, child.id());
+            let exited = child.try_wait().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(exited.unwrap().code(), Some(1));
+        }
+
+        #[test]
+        fn nonexistent_process_is_already_gone() {
+            assert!(unmount_windows("__test_gone_umount__", u32::MAX).is_ok());
         }
     }
 }
