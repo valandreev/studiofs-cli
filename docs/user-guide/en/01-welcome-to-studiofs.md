@@ -40,5 +40,3 @@ In the next chapter, we will briefly look at how S3, PostgreSQL, and the cache c
 ---
 
 [Contents](README.md) · [Українська](../uk/01-welcome-to-studiofs.md) · [Next →](02-how-does-this-thing-work.md)
-
-[Linear source](https://linear.app/valandreev/document/01-welcome-to-studiofs-d3339c52ea1d) · Source updated: 2026-10-17T20:17:53.593Z · Ukrainian original approved for translation.

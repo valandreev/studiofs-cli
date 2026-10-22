@@ -107,5 +107,3 @@ ls -ld /mnt/StudioFS
 ---
 
 [Зміст](README.md) · [English](../en/12-install-studiofs-on-linux.md) · [← Попередня](11-install-studiofs-on-macos.md) · [Наступна →](13-create-your-first-volume-studiofs-init.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/12-install-studiofs-on-linux-24b19f5fa67c)

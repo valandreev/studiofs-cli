@@ -98,5 +98,3 @@ An ordinary network reconnection does not require a new volume. Check the VPN, S
 ---
 
 [Contents](README.md) · [Українська](../uk/30-glossary-command-cheat-sheet-and-faq.md) · [← Previous](29-logs-diagnostics-and-asking-for-help.md)
-
-[Linear source](https://linear.app/valandreev/document/30-glossary-command-cheat-sheet-and-faq-402179a0b9a4)

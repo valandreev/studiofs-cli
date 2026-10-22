@@ -50,5 +50,3 @@ If startup reports that a WinFSP DLL is missing, check its installation, the sta
 ---
 
 [Contents](README.md) · [Українська](../uk/10-install-studiofs-on-windows.md) · [← Previous](09-check-your-infrastructure.md) · [Next →](11-install-studiofs-on-macos.md)
-
-[Linear source](https://linear.app/valandreev/document/10-install-studiofs-on-windows-4a790cf2e80d)

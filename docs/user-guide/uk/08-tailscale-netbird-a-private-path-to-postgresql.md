@@ -147,5 +147,3 @@ sudo tailscale set --accept-routes=true
 ---
 
 [Зміст](README.md) · [English](../en/08-tailscale-netbird-a-private-path-to-postgresql.md) · [← Попередня](07-postgresql-the-brain-behind-the-files.md) · [Наступна →](09-check-your-infrastructure.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/08-tailscale-netbird-a-private-path-to-postgresql-165dab39a508) · Оновлення джерела: 2026-10-19T21:08:26.630Z · Український оригінал прийнято для перенесення.

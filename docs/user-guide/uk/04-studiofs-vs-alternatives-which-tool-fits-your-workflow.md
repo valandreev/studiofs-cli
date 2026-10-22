@@ -73,5 +73,3 @@ Dropbox і Google Drive чудово підходять для обміну фа
 ---
 
 [Зміст](README.md) · [English](../en/04-studiofs-vs-alternatives-which-tool-fits-your-workflow.md) · [← Попередня](03-capabilities-limits-and-requirements.md) · [Наступна →](05-choose-your-setup.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/04-studiofs-vs-alternatives-which-tool-fits-your-workflow-aea0d7f7308d) · Оновлення джерела: 2026-10-19T20:17:49.261Z · Український оригінал прийнято для перенесення.

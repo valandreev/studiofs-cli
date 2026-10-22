@@ -112,5 +112,3 @@ Do not delete an arbitrary cache folder because its name looks similar. First ch
 ---
 
 [Contents](README.md) · [Українська](../uk/27-maintenance-and-removing-a-volume.md) · [← Previous](26-credentials-encryption-and-access.md) · [Next →](28-troubleshooting-when-the-cat-stops-purring.md)
-
-[Linear source](https://linear.app/valandreev/document/27-maintenance-and-removing-a-volume-56eef42bf8af)

@@ -40,5 +40,3 @@
 ---
 
 [Зміст](README.md) · [English](../en/01-welcome-to-studiofs.md) · [Наступна →](02-how-does-this-thing-work.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/01-welcome-to-studiofs-d3339c52ea1d) · Оновлення джерела: 2026-10-17T20:17:53.593Z · Український оригінал прийнято для перенесення.

@@ -81,5 +81,3 @@ Amazon S3 — це сервіс об’єктного зберігання да�
 ---
 
 [Зміст](README.md) · [English](../en/06-s3-a-home-for-your-files.md) · [← Попередня](05-choose-your-setup.md) · [Наступна →](07-postgresql-the-brain-behind-the-files.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/06-s3-a-home-for-your-files-99d3dc8ea8c1) · Оновлення джерела: 2026-10-19T20:18:03.120Z · Український оригінал прийнято для перенесення.

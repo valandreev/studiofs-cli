@@ -73,5 +73,3 @@ And do not confuse file-system snapshots with an independent backup, whatever pr
 ---
 
 [Contents](README.md) · [Українська](../uk/04-studiofs-vs-alternatives-which-tool-fits-your-workflow.md) · [← Previous](03-capabilities-limits-and-requirements.md) · [Next →](05-choose-your-setup.md)
-
-[Linear source](https://linear.app/valandreev/document/04-studiofs-vs-alternatives-which-tool-fits-your-workflow-aea0d7f7308d) · Source updated: 2026-10-19T20:17:49.261Z · Ukrainian original approved for translation.

@@ -135,5 +135,3 @@ Losing PostgreSQL, the required S3 objects, or key material can cost you both yo
 ---
 
 [Contents](README.md) · [Українська](../uk/24-snapshots-a-time-machine-for-your-volume.md) · [← Previous](23-deleting-files-there-is-no-magic-trash-can.md) · [Next →](25-migrating-studiofs-metadata-to-new-postgresql-server.md)
-
-[Linear source](https://linear.app/valandreev/document/24-snapshots-a-time-machine-for-your-volume-0d9aa8a05bba)

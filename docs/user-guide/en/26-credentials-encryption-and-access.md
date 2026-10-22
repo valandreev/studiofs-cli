@@ -59,5 +59,3 @@ Through an SNAT gateway, the database may see the gateway's address instead of t
 ---
 
 [Contents](README.md) · [Українська](../uk/26-credentials-encryption-and-access.md) · [← Previous](25-migrating-studiofs-metadata-to-new-postgresql-server.md) · [Next →](27-maintenance-and-removing-a-volume.md)
-
-[Linear source](https://linear.app/valandreev/document/26-credentials-encryption-and-access-226f59cf2da6)

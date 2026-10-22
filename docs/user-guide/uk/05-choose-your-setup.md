@@ -44,5 +44,3 @@
 ---
 
 [Зміст](README.md) · [English](../en/05-choose-your-setup.md) · [← Попередня](04-studiofs-vs-alternatives-which-tool-fits-your-workflow.md) · [Наступна →](06-s3-a-home-for-your-files.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/05-choose-your-setup-161edffb5f51) · Оновлення джерела: 2026-10-19T16:50:42.072Z · Український оригінал прийнято для перенесення.

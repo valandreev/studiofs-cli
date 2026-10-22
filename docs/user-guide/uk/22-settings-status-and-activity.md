@@ -130,5 +130,3 @@ StudioFS автоматично намагається показати інди
 ---
 
 [Зміст](README.md) · [English](../en/22-settings-status-and-activity.md) · [← Попередня](21-two-people-one-file-collaboration-and-conflicts.md) · [Наступна →](23-deleting-files-there-is-no-magic-trash-can.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/22-settings-status-and-activity-002ef7f12d0a)

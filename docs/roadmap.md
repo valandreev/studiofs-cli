@@ -17,9 +17,8 @@ StudioFS already has a local-first VFS, local `redb` metadata with PostgreSQL
 bootstrap and replication, persistent payload caching and background upload,
 Snapshot v2, remote encryption, platform bridges, runtime telemetry, and mounted
 benchmark/E2E tooling. These are foundations to improve, not features to rebuild.
-Frame-aligned encrypted cold reads are also implemented
-([SFS-787](https://linear.app/valandreev/issue/SFS-787)); further optimization
-requires new measurements.
+Frame-aligned encrypted cold reads are also implemented (SFS-787); further
+optimization requires new measurements.
 
 See the [architecture](architecture.md),
 [mounted I/O contract](juicefs-local-first-rust-contract.md),
@@ -30,10 +29,10 @@ See the [architecture](architecture.md),
 
 | Workstream | Focus | Canonical references and tracking |
 | --- | --- | --- |
-| Local-first correctness and recovery | Preserve same-mount visibility, local durability, background publication, and recovery under crash, disk-full, remote outages, and multi-client activity. | [I/O contract](juicefs-local-first-rust-contract.md), [validation matrix](local-first-validation-matrix.md), [PG sync contract](pg-sync-contract.md); established validation families [SFS-270](https://linear.app/valandreev/issue/SFS-270) and [SFS-402](https://linear.app/valandreev/issue/SFS-402). |
-| Platform bridges | Stabilize Windows WinFSP, legacy macFUSE, and Linux libfuse3 using native mounted evidence and application workloads. FSKit remains experimental and deferred. | [Platform bridges](platform-bridges.md), [Linux parity ADR](adr/0004-linux-mount-targets-platform-bridge-parity.md), [Linux release gate](local-first-validation-matrix.md#sfs-610-linux-platform-release-gate); completed baselines [SFS-598](https://linear.app/valandreev/issue/SFS-598) and [SFS-610](https://linear.app/valandreev/issue/SFS-610). |
-| Performance and responsiveness | Measure latency, throughput, CPU, RSS, cache behavior, and upload backlog on comparable hosts and real media workloads. | [Benchmark methodology](perf/benchmark-methodology.md), [benchmark validation](perf/benchmark-validation.md); baseline families [SFS-301](https://linear.app/valandreev/issue/SFS-301), [SFS-495](https://linear.app/valandreev/issue/SFS-495), and [SFS-612](https://linear.app/valandreev/issue/SFS-612). |
-| Public distribution | Complete licensing, provenance, dependency notices, and native driver distribution checks before public release. | [Contributing](contributing.md); active release family [SFS-848](https://linear.app/valandreev/issue/SFS-848) through [SFS-854](https://linear.app/valandreev/issue/SFS-854). |
+| Local-first correctness and recovery | Preserve same-mount visibility, local durability, background publication, and recovery under crash, disk-full, remote outages, and multi-client activity. | [I/O contract](juicefs-local-first-rust-contract.md), [validation matrix](local-first-validation-matrix.md), [PG sync contract](pg-sync-contract.md); established validation families SFS-270 and SFS-402. |
+| Platform bridges | Stabilize Windows WinFSP, legacy macFUSE, and Linux libfuse3 using native mounted evidence and application workloads. FSKit remains experimental and deferred. | [Platform bridges](platform-bridges.md), [Linux parity ADR](adr/0004-linux-mount-targets-platform-bridge-parity.md), [Linux release gate](local-first-validation-matrix.md#sfs-610-linux-platform-release-gate); completed baselines SFS-598 and SFS-610. |
+| Performance and responsiveness | Measure latency, throughput, CPU, RSS, cache behavior, and upload backlog on comparable hosts and real media workloads. | [Benchmark methodology](perf/benchmark-methodology.md), [benchmark validation](perf/benchmark-validation.md); baseline families SFS-301, SFS-495, and SFS-612. |
+| Public distribution | Complete licensing, provenance, dependency notices, and native driver distribution checks before public release. | [Contributing](contributing.md); active release family SFS-848 through SFS-854. |
 
 The validation families above include completed work. Their contracts and evidence
 remain the stabilization baseline; linking them does not reopen those issues or
@@ -56,8 +55,7 @@ imply that every platform gate has been rerun for the current revision.
 ## Migration and compatibility gates
 
 - **Current metadata boundary:** the [PG sync contract](pg-sync-contract.md)
-  ([SFS-695](https://linear.app/valandreev/issue/SFS-695) /
-  [SFS-696](https://linear.app/valandreev/issue/SFS-696)) establishes format v5.
+  (SFS-695 / SFS-696) establishes format v5.
   Legacy test-disk state is rejected; there is no automatic migration, dual-read,
   or dual-write path across that boundary. Follow documented recreate or discover
   guidance rather than assuming an in-place upgrade.
@@ -65,7 +63,7 @@ imply that every platform gate has been rerun for the current revision.
   test mixed-version operation before promising rolling upgrades. Evolve schemas
   with expand/migrate/contract changes and track schema, event, object-format,
   and capability compatibility explicitly. Versioned events
-  ([SFS-639](https://linear.app/valandreev/issue/SFS-639)) are an existing building
+  (SFS-639) are an existing building
   block, not proof that arbitrary old clients can safely write new formats.
   Preserve formats understood by supported clients; incompatible mutations need
   explicit read-only or fail-closed behavior. New negotiation cannot retrofit
@@ -75,18 +73,16 @@ imply that every platform gate has been rerun for the current revision.
   stale-mount/reboot limitation: crash/restart acceptance and full mounted parity
   require a clean-host rerun after a fix or upgrade. After that fix, revalidate
   mounted semantics and lifecycle
-  ([SFS-670](https://linear.app/valandreev/issue/SFS-670)), evaluate the planned
-  zero-copy path ([SFS-671](https://linear.app/valandreev/issue/SFS-671)), and run
+  (SFS-670), evaluate the planned zero-copy path (SFS-671), and run
   controlled benchmarks with an explicit GO/NO-GO decision
-  ([SFS-672](https://linear.app/valandreev/issue/SFS-672)). Default promotion and
-  legacy removal ([SFS-673](https://linear.app/valandreev/issue/SFS-673) /
-  [SFS-674](https://linear.app/valandreev/issue/SFS-674)) remain gated follow-ups.
+  (SFS-672). Default promotion and legacy removal (SFS-673 / SFS-674) remain
+  gated follow-ups.
   Legacy macFUSE stays the default meanwhile.
 
 ## Proposed directions after 0.2.0
 
 These groups summarize the product discussion in
-[SFS-508](https://linear.app/valandreev/issue/SFS-508). They are proposals,
+SFS-508. They are proposals,
 not approved feature scope. Their order and version assignment may change freely.
 Detailed design, user validation, and acceptance criteria belong in dedicated
 issues when a direction is selected.
@@ -99,7 +95,7 @@ issues when a direction is selected.
 - Clear sync/activity states across CLI, dashboard, and tray: local acceptance,
   local durability, upload, publication, catch-up, and degraded operation.
   Improve shutdown guidance around pending work while retaining crash recovery;
-  extend the existing tray ([SFS-86](https://linear.app/valandreev/issue/SFS-86)).
+  extend the existing tray (SFS-86).
 - Online cache resize that preserves dirty, pinned, and unpublished data and
   reports when the requested capacity cannot safely be reached.
 - Friendly installers/updates, saved mounts, optional auto-mount, and client
@@ -111,7 +107,7 @@ issues when a direction is selected.
   backlog; user-directed warmup/pinning with visible capacity costs. Build on
   the [existing cache](cache.md).
 - Project-aware prefetch through optional DCC helpers, using existing sequence
-  prefetch ([SFS-19](https://linear.app/valandreev/issue/SFS-19)); portable volume
+  prefetch (SFS-19); portable volume
   and path identities without promising automatic rewriting of application links.
 - Snapshot browse/diff and individual file restore; lock-owner/status UX,
   read-only workspace profiles, and measured creative I/O presets. Extend existing
@@ -140,7 +136,7 @@ issues when a direction is selected.
   improvements beyond the implemented baseline, and adaptive RAM/SSD placement.
 - Small-object packing only if measurements justify read, encryption, metadata,
   and garbage-collection complexity. The canceled
-  [SFS-109](https://linear.app/valandreev/issue/SFS-109) is not a commitment to
+  SFS-109 is not a commitment to
   revive chunk grouping.
 - Multi-volume runtime sharing where deployments demonstrate a need; a native
   LAN peer cache only after the simpler proxy experiment establishes value.

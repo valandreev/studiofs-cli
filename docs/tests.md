@@ -1255,7 +1255,7 @@ Set-Location E:\dev\studiofs-cli; Get-Content .env | Where-Object { $_ -match '^
 - `test_crash_recovery_replays_local_committed_block_before_metadata_flush` and
   `test_crash_recovery_replays_local_committed_block_before_remote_fetch` have shown
   non-deterministic failures during full-suite runs.
-- Current tracking issue: [SFS-30](https://linear.app/valandreev/issue/SFS-30/stabilize-crash-recovery-vfs-tests-env-isolation-deterministic-startup)
+- Current tracking issue: SFS-30
 - `--test-threads=1` can reduce noise for reproductions, but does not fully
   eliminate this flake pattern.
 

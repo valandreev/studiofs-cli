@@ -58,5 +58,3 @@ Treat the dump and DSN as sensitive data: restrict access to the JSON, and do no
 ---
 
 [Contents](README.md) · [Українська](../uk/25-migrating-studiofs-metadata-to-new-postgresql-server.md) · [← Previous](24-snapshots-a-time-machine-for-your-volume.md) · [Next →](26-credentials-encryption-and-access.md)
-
-[Linear source](https://linear.app/valandreev/document/25-backups-even-time-machines-need-insurance-87d9ae41a6eb)

@@ -52,5 +52,3 @@ In the next chapter, we will compare StudioFS with LucidLink and other solutions
 ---
 
 [Contents](README.md) · [Українська](../uk/03-capabilities-limits-and-requirements.md) · [← Previous](02-how-does-this-thing-work.md) · [Next →](04-studiofs-vs-alternatives-which-tool-fits-your-workflow.md)
-
-[Linear source](https://linear.app/valandreev/document/03-capabilities-limits-and-requirements-5008587538c8) · Source updated: 2026-10-17T22:08:06.219Z · Ukrainian original approved for translation.

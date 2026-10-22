@@ -98,5 +98,3 @@ StudioFS тримає потрібні дані близько до програ
 ---
 
 [Зміст](README.md) · [English](../en/30-glossary-command-cheat-sheet-and-faq.md) · [← Попередня](29-logs-diagnostics-and-asking-for-help.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/30-glossary-command-cheat-sheet-and-faq-402179a0b9a4)

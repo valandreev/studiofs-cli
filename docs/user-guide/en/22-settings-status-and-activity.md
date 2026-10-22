@@ -130,5 +130,3 @@ Do not try to cure an unexplained state by deleting the cache or recreating the 
 ---
 
 [Contents](README.md) · [Українська](../uk/22-settings-status-and-activity.md) · [← Previous](21-two-people-one-file-collaboration-and-conflicts.md) · [Next →](23-deleting-files-there-is-no-magic-trash-can.md)
-
-[Linear source](https://linear.app/valandreev/document/22-settings-status-and-activity-002ef7f12d0a)

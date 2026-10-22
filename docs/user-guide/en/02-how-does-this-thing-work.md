@@ -44,5 +44,3 @@ Now you know why StudioFS needs S3, PostgreSQL, and a local SSD. In the next cha
 ---
 
 [Contents](README.md) · [Українська](../uk/02-how-does-this-thing-work.md) · [← Previous](01-welcome-to-studiofs.md) · [Next →](03-capabilities-limits-and-requirements.md)
-
-[Linear source](https://linear.app/valandreev/document/02-how-does-this-thing-work-04c31d4991eb) · Source updated: 2026-10-17T20:47:34.115Z · Ukrainian original approved for translation.

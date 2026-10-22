@@ -65,5 +65,3 @@ The cache is there to make work faster. The safest way to think of it is as your
 ---
 
 [Contents](README.md) · [Українська](../uk/20-cache-why-is-the-cloud-using-my-ssd.md) · [← Previous](19-sync-bad-wi-fi-and-other-surprises.md) · [Next →](21-two-people-one-file-collaboration-and-conflicts.md)
-
-[Linear source](https://linear.app/valandreev/document/20-cache-why-is-the-cloud-using-my-ssd-6612dc14bcb2)

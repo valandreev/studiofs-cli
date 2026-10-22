@@ -52,5 +52,3 @@ StudioFS — консольна програма. Для встановленн�
 ---
 
 [Зміст](README.md) · [English](../en/03-capabilities-limits-and-requirements.md) · [← Попередня](02-how-does-this-thing-work.md) · [Наступна →](04-studiofs-vs-alternatives-which-tool-fits-your-workflow.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/03-capabilities-limits-and-requirements-5008587538c8) · Оновлення джерела: 2026-10-17T22:08:06.219Z · Український оригінал прийнято для перенесення.

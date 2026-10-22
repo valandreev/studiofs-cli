@@ -175,5 +175,3 @@ For this example, we use a VPN as the private transport. However, **Tailscale by
 ---
 
 [Contents](README.md) · [Українська](../uk/07-postgresql-the-brain-behind-the-files.md) · [← Previous](06-s3-a-home-for-your-files.md) · [Next →](08-tailscale-netbird-a-private-path-to-postgresql.md)
-
-[Linear source](https://linear.app/valandreev/document/07-postgresql-the-brain-behind-the-files-922bc87af337) · Source updated: 2026-10-19T20:16:35.184Z · Ukrainian original approved for translation.

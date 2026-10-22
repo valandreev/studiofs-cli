@@ -81,5 +81,3 @@ If macFUSE refuses to mount, revisit system permissions and restarting. If Studi
 ---
 
 [Contents](README.md) · [Українська](../uk/11-install-studiofs-on-macos.md) · [← Previous](10-install-studiofs-on-windows.md) · [Next →](12-install-studiofs-on-linux.md)
-
-[Linear source](https://linear.app/valandreev/document/11-install-studiofs-on-macos-3e23441e6bbe)
