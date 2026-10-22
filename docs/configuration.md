@@ -508,20 +508,21 @@ retains:
 
 ### Snapshot v2 operator workflow
 
-Snapshot commands resolve the one current PostgreSQL-backed volume from the
-client root and validate its name, immutable UUID, and numeric volume ID in
-PostgreSQL before reading or changing snapshot state. They never use local redb
-as catalog authority and do not accept a directory root or caller-selected
-snapshot ID for creation.
+Snapshot commands require an explicit volume name and validate that volume's
+name, immutable UUID, and numeric volume ID in PostgreSQL before reading or
+changing snapshot state. They never infer a current volume from the client root
+or use local redb as catalog authority, and do not accept a directory root or
+caller-selected snapshot ID for creation. Unknown or invalid volume names
+produce an actionable error without falling back to another volume.
 
 ```text
-studiofs snapshot create [--ttl <duration>]
-studiofs snapshot list
-studiofs snapshot inspect <snapshot-id>
-studiofs snapshot delete <snapshot-id>
-studiofs snapshot policy set --daily-at <HH:MM> [--timezone <IANA zone>] --retention <duration>
-studiofs snapshot policy show
-studiofs snapshot policy cancel
+studiofs snapshot <volume-name> create [--ttl <duration>]
+studiofs snapshot <volume-name> list
+studiofs snapshot <volume-name> inspect <snapshot-id>
+studiofs snapshot <volume-name> delete <snapshot-id>
+studiofs snapshot <volume-name> policy set --daily-at <HH:MM> [--timezone <IANA zone>] --retention <duration>
+studiofs snapshot <volume-name> policy show
+studiofs snapshot <volume-name> policy cancel
 studiofs smount <volume-name> <snapshot-id> <mount-point>
 ```
 

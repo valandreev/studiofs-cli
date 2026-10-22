@@ -198,13 +198,13 @@ Names are rejected rather than normalized. Host filesystem restrictions also
 apply, including Windows reserved device names such as `CON` and `NUL` and
 component length limits for the derived `<name>.db` filename.
 
-Snapshot recovery uses the same client root to discover exactly one current
-PostgreSQL-backed volume. After a manual snapshot reaches `Ready`, mount its
-immutable view with the explicit read-only command:
+Snapshot recovery names the PostgreSQL-backed volume explicitly. After a
+manual snapshot reaches `Ready`, mount its immutable view with the explicit
+read-only command:
 
 ```bash
-studiofs snapshot create --ttl 7d
-studiofs snapshot list
+studiofs snapshot <volume-name> create --ttl 7d
+studiofs snapshot <volume-name> list
 studiofs smount <volume-name> <snapshot-id> <mount-point>
 studiofs umount <mount-point>
 ```

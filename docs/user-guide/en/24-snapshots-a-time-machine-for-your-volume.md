@@ -13,14 +13,14 @@ The distinction we already know matters here: locally saved changes may not yet 
 
 **A snapshot does not turn saving a project with multiple files into one indivisible operation.** If the application is in the middle of rewriting its parts, the captured state may not be usable in that application.
 
-The commands below require a configured PostgreSQL-backed volume and access to that database. Creating and reading a snapshot also require access to object storage.
+The commands below require the named volume to be configured with PostgreSQL access. Creating and reading a snapshot also require access to object storage.
 
 ## Creating a checkpoint
 
 Before a major cleanup or changes to a project, run:
 
 ```bash
-studiofs snapshot create --ttl 7d
+studiofs snapshot projectfs create --ttl 7d
 ```
 
 The command registers a snapshot and waits until it becomes **`Ready`**—ready to use. Keep the identifier from the response. StudioFS assigns it; you do not need to supply your own name to this command.
@@ -30,23 +30,35 @@ The command registers a snapshot and waits until it becomes **`Ready`**—ready 
 You can create a snapshot without an automatic expiry:
 
 ```bash
-studiofs snapshot create
+studiofs snapshot projectfs create
 ```
 
 This kind of manual snapshot is kept until you explicitly delete it. “No expiry” does not mean “no cost”: historical data also takes up storage space.
 
-Pay attention to the syntax: `studiofs snapshot` commands **do not accept a volume name**. They find the current volume using the client's local service data and validate it in PostgreSQL. There must be one unambiguously identifiable PostgreSQL-backed volume in the client data root. If the command reports multiple volumes or an unavailable context, adding a name at the end will not help: resolve the client configuration first. Do not delete service databases at random.
+Every snapshot command names its target volume explicitly. For example, `studiofs snapshot projectfs create` operates only on `projectfs`; it never infers a current volume from local client data. Use the same form for `list`, `inspect`, `delete`, and `policy`:
+
+```text
+studiofs snapshot <volume-name> create [--ttl <duration>]
+studiofs snapshot <volume-name> list
+studiofs snapshot <volume-name> inspect <snapshot-id>
+studiofs snapshot <volume-name> delete <snapshot-id>
+studiofs snapshot <volume-name> policy set --daily-at <HH:MM> [--timezone <IANA zone>] --retention <duration>
+studiofs snapshot <volume-name> policy show
+studiofs snapshot <volume-name> policy cancel
+```
+
+Replace `projectfs` below with the exact configured volume name. If the name is unknown or invalid, the command reports the problem and how to correct it; it does not fall back to another volume.
 
 ## Seeing what is already there
 
 ```bash
-studiofs snapshot list
+studiofs snapshot projectfs list
 ```
 
 For a closer look, copy an identifier from the list:
 
 ```bash
-studiofs snapshot inspect projectfs.2026-08-12T14-07-09.482Z
+studiofs snapshot projectfs inspect projectfs.2026-08-12T14-07-09.482Z
 ```
 
 Here and below, `projectfs` and the identifier shown are examples. Replace them with your own values.
@@ -96,8 +108,8 @@ To recover a file, copy it from the snapshot to a separate folder on an ordinary
 You can set one daily policy for the volume. For example, create snapshots every day at 02:30 Kyiv time and retain ready snapshots for two weeks:
 
 ```bash
-studiofs snapshot policy set --daily-at 02:30 --timezone Europe/Kyiv --retention 14d
-studiofs snapshot policy show
+studiofs snapshot projectfs policy set --daily-at 02:30 --timezone Europe/Kyiv --retention 14d
+studiofs snapshot projectfs policy show
 ```
 
 Specify the time in `HH:MM` format and the timezone as an IANA name. If you omit `--timezone`, **UTC** is used, even if your computer runs on Kyiv time. `--retention` is required; automatic snapshots need a finite, positive retention period. That period also starts at `Ready`.
@@ -105,7 +117,7 @@ Specify the time in `HH:MM` format and the timezone as an IANA name. If you omit
 Running `policy set` again replaces the current policy. To disable future automatic creation:
 
 ```bash
-studiofs snapshot policy cancel
+studiofs snapshot projectfs policy cancel
 ```
 
 This does not delete snapshots that have already been created.
@@ -119,7 +131,7 @@ Clock changes have a wrinkle too: if the scheduled local time does not exist on 
 When you no longer need a snapshot, finish working with its mounted view first, then run:
 
 ```bash
-studiofs snapshot delete projectfs.2026-08-12T14-07-09.482Z
+studiofs snapshot projectfs delete projectfs.2026-08-12T14-07-09.482Z
 ```
 
 This is a deletion request that you can repeat. It does not mean that every related object instantly disappears from storage. Existing mounts may continue working for a while: they hold renewable permissions to use the snapshot, called leases. Cleanup must wait for those leases to end. TTL expiry should not be taken as a promise to free space at that exact second either.

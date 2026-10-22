@@ -41,19 +41,19 @@
 | Зберегти типовий ліміт кешу | `studiofs settings --cache-size 500GB` | Та сама глава |
 | Подивитися активність монтування | `studiofs perf Z: --count 5` | Та сама глава |
 | Відключити диск | `studiofs umount Z:` | [Безпечне відключення](17-unplug-safely-studiofs-umount.md) |
-| Створити знімок на сім діб | `studiofs snapshot create --ttl 7d` | [Знімки](24-snapshots-a-time-machine-for-your-volume.md) |
-| Переглянути знімки | `studiofs snapshot list` | Та сама глава |
-| Перевірити розклад знімків | `studiofs snapshot policy show` | Та сама глава |
+| Створити знімок на сім діб | `studiofs snapshot projectfs create --ttl 7d` | [Знімки](24-snapshots-a-time-machine-for-your-volume.md) |
+| Переглянути знімки | `studiofs snapshot projectfs list` | Та сама глава |
+| Перевірити розклад знімків | `studiofs snapshot projectfs policy show` | Та сама глава |
 | Попередньо оцінити прибирання | `studiofs janitor projectfs --dry-run` | [Обслуговування](27-maintenance-and-removing-a-volume.md) |
 
 Для знімка скопіюйте справжній ідентифікатор зі списку. Наприклад, якщо він `projectfs.2026-08-12T14-07-09.482Z`:
 
 ```powershell
-studiofs snapshot inspect projectfs.2026-08-12T14-07-09.482Z
+studiofs snapshot projectfs inspect projectfs.2026-08-12T14-07-09.482Z
 studiofs smount projectfs projectfs.2026-08-12T14-07-09.482Z Y:
 ```
 
-`Y:` має бути вільною окремою літерою. `smount` відкриває знімок лише для читання; після роботи використайте `studiofs umount Y:`. Команди `snapshot` не приймають назву тому: їм потрібен однозначно визначений локальний контекст тому з PostgreSQL. У `smount` назва тому, навпаки, потрібна.
+`Y:` має бути вільною окремою літерою. `smount` відкриває знімок лише для читання; після роботи використайте `studiofs umount Y:`. У кожній команді `snapshot` потрібно явно вказати назву тому; поточний том автоматично не визначається. Для невідомої або некоректної назви команда пояснить проблему й підкаже, що виправити. У `smount` назва тому також обов’язкова.
 
 ### Команди, перед якими варто відкрити відповідну главу
 

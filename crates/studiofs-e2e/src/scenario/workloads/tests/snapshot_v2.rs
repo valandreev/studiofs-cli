@@ -18,7 +18,10 @@ fn snapshot_v2_scenarios_are_registered_and_selectable_independently() {
 
 #[test]
 fn snapshot_v2_uses_exact_recovery_cli_forms() {
-    assert_eq!(snapshot_create_args(), ["snapshot", "create"]);
+    assert_eq!(
+        snapshot_create_args("projectfs"),
+        ["snapshot", "projectfs", "create"]
+    );
     assert_eq!(
         snapshot_mount_args(
             "projectfs",

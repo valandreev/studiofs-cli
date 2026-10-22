@@ -41,19 +41,19 @@ In the examples, `projectfs` is your volume name and `Z:` is an available Window
 | Save a default cache limit | `studiofs settings --cache-size 500GB` | The same chapter |
 | Watch mount activity | `studiofs perf Z: --count 5` | The same chapter |
 | Disconnect a drive | `studiofs umount Z:` | [Disconnecting safely](17-unplug-safely-studiofs-umount.md) |
-| Create a snapshot kept for seven days | `studiofs snapshot create --ttl 7d` | [Snapshots](24-snapshots-a-time-machine-for-your-volume.md) |
-| List snapshots | `studiofs snapshot list` | The same chapter |
-| Check the snapshot schedule | `studiofs snapshot policy show` | The same chapter |
+| Create a snapshot kept for seven days | `studiofs snapshot projectfs create --ttl 7d` | [Snapshots](24-snapshots-a-time-machine-for-your-volume.md) |
+| List snapshots | `studiofs snapshot projectfs list` | The same chapter |
+| Check the snapshot schedule | `studiofs snapshot projectfs policy show` | The same chapter |
 | Preview cleanup | `studiofs janitor projectfs --dry-run` | [Maintenance](27-maintenance-and-removing-a-volume.md) |
 
 For a snapshot, copy its actual identifier from the list. For example, if it is `projectfs.2026-08-12T14-07-09.482Z`:
 
 ```powershell
-studiofs snapshot inspect projectfs.2026-08-12T14-07-09.482Z
+studiofs snapshot projectfs inspect projectfs.2026-08-12T14-07-09.482Z
 studiofs smount projectfs projectfs.2026-08-12T14-07-09.482Z Y:
 ```
 
-`Y:` must be a separate, available drive letter. `smount` opens the snapshot read-only; when you are done, use `studiofs umount Y:`. The `snapshot` commands do not accept a volume name: they need an unambiguous local context for a PostgreSQL-backed volume. `smount`, on the other hand, does require the volume name.
+`Y:` must be a separate, available drive letter. `smount` opens the snapshot read-only; when you are done, use `studiofs umount Y:`. Every `snapshot` command requires the explicit volume name and never infers a current volume. An unknown or invalid name produces an actionable error. `smount` also requires the volume name.
 
 ### Commands worth reading about before running
 

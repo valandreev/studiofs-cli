@@ -2,8 +2,10 @@
 
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveTime;
-use clap::{Args, Subcommand};
-use std::path::Path;
+use clap::error::{ContextKind, ContextValue};
+use clap::{ArgMatches, Command};
+use clap::{Args, FromArgMatches, Subcommand};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -20,18 +22,32 @@ use studiofs_vfs::{
     SnapshotWorkerConfig, SystemSnapshotClock,
 };
 
-#[derive(Debug, Args)]
-#[command(about = "Create and recover whole-volume Snapshot v2 views")]
+#[derive(Debug)]
 pub(crate) struct SnapshotArgs {
-    #[command(subcommand)]
+    volume_name: String,
     command: SnapshotCommand,
+    log_level_override: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct SnapshotRawArgs {
+    /// Name of the PostgreSQL-backed volume to operate on.
+    #[arg(value_name = "VOLUME_NAME", allow_hyphen_values = true)]
+    volume_name: String,
+    #[arg(
+        value_name = "COMMAND_ARGUMENT",
+        num_args = 0..,
+        allow_hyphen_values = true,
+        trailing_var_arg = true
+    )]
+    command_arguments: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
 enum SnapshotCommand {
     /// Create a manual snapshot and wait until its artifact is Ready.
     Create(CreateArgs),
-    /// List snapshots for the current live volume.
+    /// List snapshots for the named volume.
     List,
     /// Inspect one snapshot by its PostgreSQL-allocated identifier.
     Inspect(InspectArgs),
@@ -39,6 +55,87 @@ enum SnapshotCommand {
     Delete(DeleteArgs),
     /// Configure, inspect, or cancel the daily automatic snapshot policy.
     Policy(PolicyArgs),
+}
+
+impl clap::Args for SnapshotArgs {
+    fn augment_args(command: Command) -> Command {
+        <SnapshotRawArgs as clap::Args>::augment_args(command)
+            .about("Create and recover whole-volume Snapshot v2 views")
+            .override_usage("studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>")
+            .disable_help_flag(true)
+            .override_help(snapshot_command_schema().render_help().to_string())
+    }
+
+    fn augment_args_for_update(command: Command) -> Command {
+        Self::augment_args(command)
+    }
+}
+
+impl FromArgMatches for SnapshotArgs {
+    fn from_arg_matches(matches: &ArgMatches) -> std::result::Result<Self, clap::Error> {
+        let raw = SnapshotRawArgs::from_arg_matches(matches)?;
+        let mut command_arguments = raw.command_arguments;
+        // Clap reserves first-token subcommand names; parse this command's tail separately.
+        // A leading flag is never a volume name: let the schema show help or reject it.
+        if raw.volume_name.starts_with('-') {
+            command_arguments.insert(0, raw.volume_name.clone());
+        }
+        let schema = snapshot_command_schema();
+        let is_command_name = schema
+            .get_subcommands()
+            .any(|command| command.get_name() == raw.volume_name);
+        let matches = schema
+            .try_get_matches_from(
+                std::iter::once("studiofs snapshot <VOLUME_NAME>")
+                    .chain(command_arguments.iter().map(String::as_str)),
+            )
+            .map_err(|mut error| {
+                // Old syntax (`snapshot list`) parses the command as the volume name.
+                if is_command_name && error.kind() != clap::error::ErrorKind::DisplayHelp {
+                    error.insert(
+                        ContextKind::Suggested,
+                        ContextValue::StyledStrs(vec![
+                            format!(
+                                "the volume name comes first: studiofs snapshot <VOLUME_NAME> {}",
+                                raw.volume_name
+                            )
+                            .into(),
+                        ]),
+                    );
+                }
+                error
+            })?;
+        let command = SnapshotCommand::from_arg_matches(&matches)?;
+        Ok(Self {
+            volume_name: raw.volume_name,
+            command,
+            log_level_override: matches.get_one::<String>("log_level").cloned(),
+        })
+    }
+
+    fn update_from_arg_matches(
+        &mut self,
+        matches: &ArgMatches,
+    ) -> std::result::Result<(), clap::Error> {
+        *self = Self::from_arg_matches(matches)?;
+        Ok(())
+    }
+}
+
+fn snapshot_command_schema() -> Command {
+    SnapshotCommand::augment_subcommands(
+        Command::new("studiofs")
+            .bin_name("studiofs snapshot <VOLUME_NAME>")
+            .about("Create and recover whole-volume Snapshot v2 views for the named volume")
+            .arg(
+                clap::Arg::new("log_level")
+                    .long("log-level")
+                    .value_name("LOG_LEVEL")
+                    .help("Log level (trace, debug, info, warn, error)")
+                    .global(true),
+            )
+            .subcommand_required(true),
+    )
 }
 
 #[derive(Debug, Args)]
@@ -88,110 +185,45 @@ struct PolicySetArgs {
 }
 
 impl SnapshotArgs {
+    pub(super) fn log_level_override(&self) -> Option<&str> {
+        self.log_level_override.as_deref()
+    }
+
     pub(crate) fn dispatch(self) -> Result<()> {
+        let client_root = crate::cli::utils::get_client_root()?;
+        let volume = resolve_volume(&client_root, &self.volume_name)?;
         let runtime = runtime()?;
         match self.command {
-            SnapshotCommand::Create(args) => create_snapshot(args.ttl, &runtime),
-            SnapshotCommand::List => list_snapshots(&runtime),
-            SnapshotCommand::Inspect(args) => inspect_snapshot(args.snapshot_id, &runtime),
-            SnapshotCommand::Delete(args) => delete_snapshot(args.snapshot_id),
+            SnapshotCommand::Create(args) => create_snapshot(&volume, args.ttl, &runtime),
+            SnapshotCommand::List => list_snapshots(&volume, &runtime),
+            SnapshotCommand::Inspect(args) => inspect_snapshot(&volume, args.snapshot_id, &runtime),
+            SnapshotCommand::Delete(args) => delete_snapshot(&volume, args.snapshot_id),
             SnapshotCommand::Policy(args) => match args.command {
-                PolicyCommand::Set(args) => set_policy(args, &runtime),
-                PolicyCommand::Show => show_policy(&runtime),
-                PolicyCommand::Cancel => cancel_policy(&runtime),
+                PolicyCommand::Set(args) => set_policy(&volume, args, &runtime),
+                PolicyCommand::Show => show_policy(&volume, &runtime),
+                PolicyCommand::Cancel => cancel_policy(&volume, &runtime),
             },
         }
     }
 }
 
 struct ResolvedVolume {
+    meta_dir: PathBuf,
     format_info: FormatInfo,
     engine: Arc<PgSnapshotBackend>,
     context: SnapshotVolumeContext,
 }
 
-fn resolve_volume() -> Result<ResolvedVolume> {
-    let client_root = crate::cli::utils::get_client_root()?;
-    let meta_root = client_root.join("meta");
-    let mut candidates = std::fs::read_dir(&meta_root)
-        .map_err(|_| anyhow!("no snapshot volume context found under '{}'; initialize a PostgreSQL-backed volume first", meta_root.display()))?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            entry
-                .file_type()
-                .ok()
-                .filter(std::fs::FileType::is_dir)
-                .and_then(|_| entry.file_name().into_string().ok())
-        })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    if candidates.is_empty() {
-        return Err(anyhow!(
-            "no snapshot volume context found under '{}'; initialize a PostgreSQL-backed volume first",
-            meta_root.display()
-        ));
-    }
-
-    let mut resolved = Vec::new();
-    let mut failures = Vec::new();
-    for volume_name in candidates {
-        match resolve_volume_candidate(&client_root, &volume_name) {
-            Ok(Some(volume)) => resolved.push(volume),
-            Ok(None) => {}
-            Err(error) => failures.push(error),
-        }
-    }
-
-    resolved.sort_by(|left, right| left.context.volume_name.cmp(&right.context.volume_name));
-    resolved.dedup_by(|left, right| left.context == right.context);
-    if !failures.is_empty() && !resolved.is_empty() {
-        return Err(anyhow!(
-            "could not unambiguously resolve a snapshot volume: {} PostgreSQL-backed candidate(s) are valid, but {} other candidate(s) failed validation; remove stale metadata or restore the unavailable volume authority",
-            resolved.len(),
-            failures.len()
-        ));
-    }
-    match resolved.len() {
-        0 => match failures.into_iter().next() {
-            Some(error) => Err(error),
-            None => Err(anyhow!(
-                "no PostgreSQL-backed snapshot volume context found under '{}'; initialize a PostgreSQL-backed volume first",
-                meta_root.display()
-            )),
-        },
-        1 => resolved
-            .pop()
-            .ok_or_else(|| anyhow!("resolved snapshot volume disappeared")),
-        _ => Err(anyhow!(
-            "multiple snapshot volume contexts found: {}; run the command with one client root containing exactly one current PostgreSQL-backed volume",
-            resolved
-                .iter()
-                .map(|volume| volume.context.volume_name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-    }
-}
-
-fn resolve_volume_candidate(
-    client_root: &Path,
-    volume_name: &str,
-) -> Result<Option<ResolvedVolume>> {
-    if let Err(error) = crate::cli::utils::validate_volume_name(volume_name) {
-        // A legacy database under a now-invalid name must block auto-resolution, not vanish.
-        let legacy_db = client_root
-            .join("meta")
-            .join(volume_name)
-            .join(format!("{volume_name}.db"));
-        if legacy_db.is_file() {
-            return Err(snapshot_context_error(&legacy_db, error));
-        }
-        return Ok(None);
-    }
-    let path = crate::cli::utils::default_meta_dir_in_client_root(client_root, volume_name)?
-        .join(format!("{volume_name}.db"));
+fn resolve_volume(client_root: &Path, volume_name: &str) -> Result<ResolvedVolume> {
+    let meta_dir = crate::cli::utils::default_meta_dir_in_client_root(client_root, volume_name)
+        .map_err(|error| {
+            anyhow!("{error}; usage: studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>")
+        })?;
+    let path = meta_dir.join(format!("{volume_name}.db"));
     if !path.is_file() {
-        return Ok(None);
+        return Err(anyhow!(
+            "no local metadata found for snapshot volume '{volume_name}'; initialize or discover this PostgreSQL-backed volume first; usage: studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>"
+        ));
     }
     let info = match mounted_format_info(volume_name)? {
         Some(info) => info,
@@ -202,8 +234,17 @@ fn resolve_volume_candidate(
             )
         })?,
     };
+    if info.name != volume_name {
+        return Err(snapshot_context_error(
+            &path,
+            "local volume identity does not match the requested volume name",
+        ));
+    }
     if info.metadata.backend != MetadataBackend::Postgres {
-        return Ok(None);
+        return Err(snapshot_context_error(
+            &path,
+            "snapshots require a PostgreSQL-backed volume",
+        ));
     }
     let postgres = info.metadata.postgres.as_ref().ok_or_else(|| {
         snapshot_context_error(&path, "PostgreSQL connection metadata is missing")
@@ -223,11 +264,12 @@ fn resolve_volume_candidate(
                 format!("PostgreSQL volume identity validation failed: {error}"),
             )
         })?;
-    Ok(Some(ResolvedVolume {
+    Ok(ResolvedVolume {
+        meta_dir,
         format_info: info,
         engine,
         context,
-    }))
+    })
 }
 
 fn mounted_format_info(volume_name: &str) -> Result<Option<FormatInfo>> {
@@ -262,19 +304,22 @@ fn runtime() -> Result<Runtime> {
     Runtime::new().context("create snapshot command runtime")
 }
 
-fn create_snapshot(ttl: Option<Duration>, runtime: &Runtime) -> Result<()> {
-    let volume = resolve_volume()?;
+fn create_snapshot(
+    volume: &ResolvedVolume,
+    ttl: Option<Duration>,
+    runtime: &Runtime,
+) -> Result<()> {
     let retention = SnapshotRetention::manual(ttl).map_err(|error| anyhow!(error.to_string()))?;
     let entry = volume
         .engine
         .create_snapshot_v2(SnapshotOrigin::Manual, retention)
         .map_err(|error| anyhow!("PostgreSQL could not register the manual snapshot: {error}"))?;
     println!("Creating manual snapshot {}...", entry.snapshot_id);
-    let worker = build_worker(&volume)?;
+    let worker = build_worker(volume)?;
     let cancel = CancellationToken::new();
     let signal_cancel = cancel.clone();
     let cancellation_requested = cancel.clone();
-    let snapshot_id = entry.snapshot_id.clone();
+    let snapshot_id = entry.snapshot_id;
     let ready = runtime.block_on(async {
         let signal_task = tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
@@ -295,12 +340,13 @@ fn create_snapshot(ttl: Option<Duration>, runtime: &Runtime) -> Result<()> {
         Err(error) => {
             if cancellation_requested.is_cancelled() {
                 return Err(anyhow!(
-                    "snapshot creation interrupted. Registration '{}' remains active in PostgreSQL; track it with 'studiofs snapshot inspect {}'",
+                    "snapshot creation interrupted. Registration '{}' remains active in PostgreSQL; track it with 'studiofs snapshot {:?} inspect {}'",
                     snapshot_id,
+                    volume.context.volume_name,
                     snapshot_id
                 ));
             }
-            let failure = snapshot_jobs(&volume)
+            let failure = snapshot_jobs(volume)
                 .ok()
                 .and_then(|jobs| runtime.block_on(jobs.load_catalog(&snapshot_id)).ok())
                 .and_then(|entry| entry.failure);
@@ -313,9 +359,8 @@ fn create_snapshot(ttl: Option<Duration>, runtime: &Runtime) -> Result<()> {
     }
 }
 
-fn list_snapshots(runtime: &Runtime) -> Result<()> {
-    let volume = resolve_volume()?;
-    let jobs = snapshot_jobs(&volume)?;
+fn list_snapshots(volume: &ResolvedVolume, runtime: &Runtime) -> Result<()> {
+    let jobs = snapshot_jobs(volume)?;
     let entries = runtime.block_on(jobs.list_catalog());
     let entries = entries.map_err(|error| anyhow!("could not list snapshots: {error}"))?;
     if entries.is_empty() {
@@ -328,15 +373,17 @@ fn list_snapshots(runtime: &Runtime) -> Result<()> {
     Ok(())
 }
 
-fn inspect_snapshot(snapshot_id: SnapshotId, runtime: &Runtime) -> Result<()> {
-    let volume = resolve_volume()?;
-    let entry = load_catalog(&volume, &snapshot_id, runtime)?;
+fn inspect_snapshot(
+    volume: &ResolvedVolume,
+    snapshot_id: SnapshotId,
+    runtime: &Runtime,
+) -> Result<()> {
+    let entry = load_catalog(volume, &snapshot_id, runtime)?;
     print_catalog(&entry);
     Ok(())
 }
 
-fn delete_snapshot(snapshot_id: SnapshotId) -> Result<()> {
-    let volume = resolve_volume()?;
+fn delete_snapshot(volume: &ResolvedVolume, snapshot_id: SnapshotId) -> Result<()> {
     let entry = volume
         .engine
         .delete_snapshot_v2(&snapshot_id)
@@ -350,8 +397,7 @@ fn delete_snapshot(snapshot_id: SnapshotId) -> Result<()> {
     Ok(())
 }
 
-fn set_policy(args: PolicySetArgs, runtime: &Runtime) -> Result<()> {
-    let volume = resolve_volume()?;
+fn set_policy(volume: &ResolvedVolume, args: PolicySetArgs, runtime: &Runtime) -> Result<()> {
     let timezone = args
         .timezone
         .unwrap_or_else(|| SnapshotDailyPolicy::DEFAULT_TIMEZONE.to_string());
@@ -376,8 +422,7 @@ fn set_policy(args: PolicySetArgs, runtime: &Runtime) -> Result<()> {
     Ok(())
 }
 
-fn show_policy(runtime: &Runtime) -> Result<()> {
-    let volume = resolve_volume()?;
+fn show_policy(volume: &ResolvedVolume, runtime: &Runtime) -> Result<()> {
     let store =
         volume.engine.clone() as Arc<dyn studiofs_meta::snapshot_ports::SnapshotPolicyStore>;
     match runtime
@@ -396,8 +441,7 @@ fn show_policy(runtime: &Runtime) -> Result<()> {
     Ok(())
 }
 
-fn cancel_policy(runtime: &Runtime) -> Result<()> {
-    let volume = resolve_volume()?;
+fn cancel_policy(volume: &ResolvedVolume, runtime: &Runtime) -> Result<()> {
     let store =
         volume.engine.clone() as Arc<dyn studiofs_meta::snapshot_ports::SnapshotPolicyStore>;
     let Some(record) = runtime
@@ -435,14 +479,11 @@ fn build_worker(volume: &ResolvedVolume) -> Result<Arc<SnapshotWorker>> {
     let worker_id =
         studiofs_meta::snapshot_ports::SnapshotWorkerId::new(format!("cli-{}", std::process::id()))
             .map_err(|error| anyhow!("snapshot worker identity is invalid: {error}"))?;
-    let client_root = crate::cli::utils::get_client_root()?;
-    let materializer_root = crate::cli::utils::default_meta_dir_in_client_root(
-        &client_root,
-        &volume.context.volume_name,
-    )?
-    .join("cache")
-    .join("snapshot-v2")
-    .join("materializer");
+    let materializer_root = volume
+        .meta_dir
+        .join("cache")
+        .join("snapshot-v2")
+        .join("materializer");
     SnapshotWorker::new(
         volume.context.clone(),
         worker_id,
@@ -610,7 +651,7 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
 
 fn snapshot_context_error(path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
     anyhow!(
-        "snapshot volume context at '{}' is unavailable: {error}; initialize or rediscover the current PostgreSQL-backed volume",
+        "snapshot volume context at '{}' is unavailable: {error}; initialize or rediscover the named PostgreSQL-backed volume; usage: studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>",
         path.display()
     )
 }
@@ -618,60 +659,53 @@ fn snapshot_context_error(path: &Path, error: impl std::fmt::Display) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::super::parse_for_test;
-    use super::{format_catalog_error, format_duration, resolve_volume_candidate};
+    use super::{SnapshotCommand, format_catalog_error, format_duration, resolve_volume};
     use std::fs;
     use std::time::Duration;
 
     #[test]
-    fn invalid_volume_names_are_not_snapshot_candidates() {
-        let root = studiofs_test_support::workspace_target_tempdir("snapshot-candidate-");
-
-        for volume_name in ["junk:", "junk."] {
+    fn invalid_volume_names_fail_before_reading_metadata() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-named-volume-");
+        for volume_name in ["", "..", "junk:", "junk.", "../outside", "slash/name"] {
+            let error = resolve_volume(root.path(), volume_name)
+                .err()
+                .expect("reject invalid name");
+            assert!(error.to_string().contains("invalid volume name"));
             assert!(
-                resolve_volume_candidate(root.path(), volume_name)
-                    .expect("invalid volume names are not candidates")
-                    .is_none(),
-                "unexpected candidate for {volume_name:?}"
+                error
+                    .to_string()
+                    .contains("studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>")
             );
         }
+        assert!(!root.path().join("meta").exists());
     }
 
     #[test]
-    #[cfg(unix)]
-    fn legacy_database_with_invalid_volume_name_blocks_resolution() {
-        let root = studiofs_test_support::workspace_target_tempdir("snapshot-candidate-");
-        let db_path = root
-            .path()
-            .join("meta")
-            .join("proj:2025")
-            .join("proj:2025.db");
-        fs::create_dir_all(db_path.parent().unwrap()).expect("create legacy volume directory");
-        fs::write(&db_path, b"legacy").expect("write legacy database");
-
-        let error = match resolve_volume_candidate(root.path(), "proj:2025") {
-            Err(error) => error,
-            Ok(_) => panic!("legacy database under an invalid name must not be skipped"),
-        };
+    fn unknown_named_volume_does_not_read_other_volumes() {
+        let root = studiofs_test_support::workspace_target_tempdir("snapshot-named-volume-");
+        for volume_name in ["alpha", "beta"] {
+            let dir = root.path().join("meta").join(volume_name);
+            fs::create_dir_all(&dir).expect("create unrelated volume directory");
+            fs::write(
+                dir.join(format!("{volume_name}.db")),
+                b"corrupt unrelated metadata",
+            )
+            .unwrap();
+        }
+        let error = resolve_volume(root.path(), "unknown")
+            .err()
+            .expect("missing named volume");
         assert!(
-            format!("{error:#}").contains("invalid volume name"),
-            "unexpected error: {error:#}"
+            error
+                .to_string()
+                .contains("no local metadata found for snapshot volume 'unknown'")
         );
-    }
-
-    #[test]
-    fn valid_volume_directories_without_databases_are_not_snapshot_candidates() {
-        let root = studiofs_test_support::workspace_target_tempdir("snapshot-candidate-");
-        let meta_root = root.path().join("meta");
-
-        for volume_name in [".git", ".cache", "valid"] {
-            fs::create_dir_all(meta_root.join(volume_name)).expect("create candidate directory");
-            assert!(
-                resolve_volume_candidate(root.path(), volume_name)
-                    .expect("directory without a database is not a candidate")
-                    .is_none(),
-                "unexpected candidate for {volume_name:?}"
-            );
-        }
+        assert!(!error.to_string().contains("corrupt"));
+        assert!(
+            error
+                .to_string()
+                .contains("studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>")
+        );
     }
 
     #[test]
@@ -681,7 +715,7 @@ mod tests {
         fs::create_dir_all(db_path.parent().unwrap()).expect("create volume metadata directory");
         fs::write(&db_path, b"not a redb database").expect("write corrupt database");
 
-        let error = match resolve_volume_candidate(root.path(), "valid") {
+        let error = match resolve_volume(root.path(), "valid") {
             Err(error) => error,
             Ok(_) => panic!("corrupt metadata for a valid candidate must fail closed"),
         };
@@ -694,13 +728,24 @@ mod tests {
     #[test]
     fn snapshot_parser_accepts_the_canonical_forms() {
         for args in [
-            &["snapshot", "create"][..],
-            &["snapshot", "create", "--ttl", "7d"],
-            &["snapshot", "list"],
-            &["snapshot", "inspect", "production.2026-08-11T20-58-31.482Z"],
-            &["snapshot", "delete", "production.2026-08-11T20-58-31.482Z"],
+            &["snapshot", "production", "create"][..],
+            &["snapshot", "production", "create", "--ttl", "7d"],
+            &["snapshot", "production", "list"],
             &[
                 "snapshot",
+                "production",
+                "inspect",
+                "production.2026-08-11T20-58-31.482Z",
+            ],
+            &[
+                "snapshot",
+                "production",
+                "delete",
+                "production.2026-08-11T20-58-31.482Z",
+            ],
+            &[
+                "snapshot",
+                "production",
                 "policy",
                 "set",
                 "--daily-at",
@@ -708,8 +753,8 @@ mod tests {
                 "--retention",
                 "7d",
             ],
-            &["snapshot", "policy", "show"],
-            &["snapshot", "policy", "cancel"],
+            &["snapshot", "production", "policy", "show"],
+            &["snapshot", "production", "policy", "cancel"],
             &[
                 "smount",
                 "production",
@@ -722,12 +767,114 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_parser_accepts_reserved_and_unicode_volume_names() {
+        for volume_name in [
+            "create",
+            "list",
+            "inspect",
+            "delete",
+            "policy",
+            "help",
+            "команда обсяг",
+        ] {
+            let super::super::Commands::Snapshot(parsed) =
+                parse_for_test(&["snapshot", volume_name, "list"])
+                    .expect("parse named snapshot command")
+                    .command
+            else {
+                panic!("expected snapshot command");
+            };
+            assert_eq!(parsed.volume_name, volume_name);
+            assert!(matches!(parsed.command, SnapshotCommand::List));
+        }
+    }
+
+    #[test]
+    fn snapshot_help_shows_the_required_volume_and_policy_commands() {
+        let help = parse_for_test(&["snapshot", "--help"])
+            .err()
+            .expect("snapshot help should exit during parsing");
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(
+            help.to_string()
+                .contains("studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>")
+        );
+        assert!(help.to_string().contains("policy"));
+
+        let nested_help = parse_for_test(&["snapshot", "volume", "policy", "--help"])
+            .err()
+            .expect("policy help should exit during parsing");
+        assert_eq!(nested_help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(nested_help.to_string().contains("set"));
+        assert!(nested_help.to_string().contains("show"));
+
+        for args in [&["snapshot", "-h"][..], &["snapshot", "--help", "list"]] {
+            let help = parse_for_test(args).err().expect("help should exit");
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn snapshot_parser_rejects_flags_in_the_volume_position() {
+        for args in [
+            &["snapshot", "--unknown-flag", "list"][..],
+            &["snapshot", "--ttl", "7d", "create"],
+        ] {
+            let error = parse_for_test(args).err().expect("flag is not a volume");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{args:?}"
+            );
+        }
+        assert!(parse_for_test(&["snapshot"]).is_err());
+    }
+
+    #[test]
+    fn old_snapshot_syntax_explains_that_the_volume_comes_first() {
+        for (args, command) in [
+            (&["snapshot", "list"][..], "list"),
+            (&["snapshot", "inspect", "abc"], "inspect"),
+            (&["snapshot", "policy", "show"], "policy"),
+        ] {
+            let error = parse_for_test(args).err().expect("old syntax is rejected");
+            assert!(
+                error.to_string().contains(&format!(
+                    "the volume name comes first: studiofs snapshot <VOLUME_NAME> {command}"
+                )),
+                "{args:?}: {error}"
+            );
+        }
+        let error = parse_for_test(&["snapshot", "production", "inspect"])
+            .err()
+            .expect("missing snapshot id");
+        assert!(!error.to_string().contains("the volume name comes first"));
+    }
+
+    #[test]
     fn snapshot_parser_rejects_forbidden_or_noncanonical_forms() {
         for args in [
-            &["snapshot", "create", "production"][..],
-            &["snapshot", "create", "--root-inode", "1"],
+            &["snapshot", "create"][..],
+            &["snapshot", "create", "--ttl", "7d"],
+            &["snapshot", "list"],
+            &["snapshot", "inspect", "production.2026-08-11T20-58-31.482Z"],
+            &["snapshot", "delete", "production.2026-08-11T20-58-31.482Z"],
+            &["snapshot", "policy", "show"],
+            &["snapshot", "policy", "cancel"],
             &[
                 "snapshot",
+                "policy",
+                "set",
+                "--daily-at",
+                "02:30",
+                "--retention",
+                "7d",
+            ],
+            &["snapshot", "create", "production"][..],
+            &["snapshot", "production", "create", "--root-inode", "1"],
+            &[
+                "snapshot",
+                "production",
                 "policy",
                 "set",
                 "--at",
@@ -737,6 +884,7 @@ mod tests {
             ],
             &[
                 "snapshot",
+                "production",
                 "policy",
                 "set",
                 "--daily-at",
@@ -744,7 +892,7 @@ mod tests {
                 "--ttl",
                 "7d",
             ],
-            &["snapshot", "policy", "restart"],
+            &["snapshot", "production", "policy", "restart"],
             &["smount", "production", "snapshot-id", "Z:", "--read-only"],
             &["smount", "production", "snapshot-id", "Z:", "--writable"],
         ] {
@@ -760,6 +908,7 @@ mod tests {
         assert!(
             parse_for_test(&[
                 "snapshot",
+                "production",
                 "policy",
                 "set",
                 "--daily-at",
@@ -772,6 +921,7 @@ mod tests {
         assert!(
             parse_for_test(&[
                 "snapshot",
+                "production",
                 "policy",
                 "set",
                 "--daily-at",
@@ -784,6 +934,7 @@ mod tests {
         assert!(
             parse_for_test(&[
                 "snapshot",
+                "production",
                 "policy",
                 "set",
                 "--daily-at",
@@ -797,7 +948,7 @@ mod tests {
         );
         for value in ["d", "-5d"] {
             assert!(
-                parse_for_test(&["snapshot", "create", "--ttl", value,]).is_err(),
+                parse_for_test(&["snapshot", "production", "create", "--ttl", value,]).is_err(),
                 "accepted malformed duration: {value}"
             );
         }

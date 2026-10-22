@@ -242,17 +242,21 @@ cargo test -p studiofs-meta captured_checkpoint_bytes_survive_serving_checkpoint
 cargo test -p studiofs-meta many_snapshots_do_not_grow_serving_checkpoint_or_event_payloads -- --ignored --nocapture
 ```
 
-### SFS-651 Snapshot CLI contract
+### SFS-651 / SFS-880 Snapshot CLI contract
 
 Run the parser and CLI-service checks for the canonical eight-form surface:
 
 ```powershell
-cargo test -p studiofs --bin studiofs snapshot_parser -- --nocapture
+cargo test -p studiofs --bin studiofs cli::snapshot::tests -- --nocapture
+cargo test -p studiofs --test snapshot_cli_test snapshot_cli_scopes_catalog_and_policy_to_the_named_volume -- --ignored --exact --nocapture --test-threads=1
 cargo check -p studiofs -p studiofs-meta -p studiofs-vfs
 ```
 
-The live resolver, PostgreSQL identity validation, Ready wait, policy CAS, and
-artifact/materializer checks require configured PostgreSQL and object storage;
+The ignored two-volume CLI regression requires only PostgreSQL configured via
+`STUDIOFS_TEST_PG_DSN` (environment or workspace `.env`). It checks named-volume
+resolution, catalog/policy isolation, and rejection of foreign snapshot IDs,
+without using object storage. The Ready wait and artifact/materializer checks
+require configured PostgreSQL and object storage;
 run those through the focused Snapshot v2 integration/E2E commands rather than
 claiming them from parser-only evidence. Do not replace these commands with a
 filter that reports `running 0 tests`.
