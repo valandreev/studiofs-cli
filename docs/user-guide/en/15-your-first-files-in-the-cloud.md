@@ -4,7 +4,7 @@ The volume is mounted. Now let us try the everyday tasks: create a folder, copy 
 
 ## Find your drive or folder
 
-Open the mounted volume in Windows File Explorer, Finder on macOS, or your Linux file manager. If you followed the examples in the previous chapter, this is `Z:\` on Windows or the `StudioFS/myvolume` folder in your home directory on macOS or Linux. If you chose another path, use that one.
+Open the mounted volume in Windows File Explorer, Finder on macOS, or your Linux file manager. If you followed the examples in the previous chapter, this is `Z:\` on Windows, `/Volumes/Studiofs/myvolume` on macOS, or `$HOME/StudioFS/myvolume` on Linux. If you chose another path, use that one.
 
 The mount must remain active. On macOS and Linux, the folder can still exist after the volume is unmounted, so its presence alone proves nothing. Check that `mount` started without an error and that its process is running. If it exited with an error, find the cause before copying files.
 

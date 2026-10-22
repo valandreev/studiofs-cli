@@ -34,7 +34,13 @@ StudioFS приймає зміни локально, а вміст файлів 
 studiofs perf Z: --section upload --section metadata --count 5
 ```
 
-На macOS або Linux підставте свою точку монтування:
+На macOS:
+
+```bash
+studiofs perf /Volumes/Studiofs/myvolume --section upload --section metadata --count 5
+```
+
+На Linux:
 
 ```bash
 studiofs perf "$HOME/StudioFS/myvolume" --section upload --section metadata --count 5
@@ -52,7 +58,13 @@ studiofs perf "$HOME/StudioFS/myvolume" --section upload --section metadata --co
 studiofs umount Z:
 ```
 
-Для папки на macOS або Linux:
+Для папки на macOS:
+
+```bash
+studiofs umount /Volumes/Studiofs/myvolume
+```
+
+Для папки на Linux:
 
 ```bash
 studiofs umount "$HOME/StudioFS/myvolume"
@@ -82,10 +94,16 @@ studiofs umount "$HOME/StudioFS/myvolume"
 studiofs mount myvolume Z:
 ```
 
-На macOS або Linux:
+На macOS:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS/myvolume"
+studiofs mount myvolume /Volumes/Studiofs
+```
+
+На Linux:
+
+```bash
+studiofs mount myvolume "$HOME/StudioFS"
 ```
 
 Підставте свою назву тому та шлях із [розділу про підключення](14-mount-your-volume-studiofs-mount.md). Після запуску дайте StudioFS відновити незавершену роботу, якщо вона залишилася. Далі можна знову відкривати проєкт — або спершу переконатися, що вчорашні зміни вже доступні колезі.

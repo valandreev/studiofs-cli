@@ -34,7 +34,13 @@ Without the indicator, you can observe activity on the mounted volume. For examp
 studiofs perf Z: --section upload --section metadata --count 5
 ```
 
-On macOS or Linux, substitute your mount point:
+On macOS:
+
+```bash
+studiofs perf /Volumes/Studiofs/myvolume --section upload --section metadata --count 5
+```
+
+On Linux:
 
 ```bash
 studiofs perf "$HOME/StudioFS/myvolume" --section upload --section metadata --count 5
@@ -52,7 +58,13 @@ The command takes the **mount point**, not the volume name. For drive `Z:` on Wi
 studiofs umount Z:
 ```
 
-For a folder on macOS or Linux:
+For a folder on macOS:
+
+```bash
+studiofs umount /Volumes/Studiofs/myvolume
+```
+
+For a folder on Linux:
 
 ```bash
 studiofs umount "$HOME/StudioFS/myvolume"
@@ -82,10 +94,16 @@ There is no need to recreate the volume or run `discover` again after a normal u
 studiofs mount myvolume Z:
 ```
 
-On macOS or Linux:
+On macOS:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS/myvolume"
+studiofs mount myvolume /Volumes/Studiofs
+```
+
+On Linux:
+
+```bash
+studiofs mount myvolume "$HOME/StudioFS"
 ```
 
 Substitute your volume name and the path from the [chapter on mounting](14-mount-your-volume-studiofs-mount.md). After startup, let StudioFS resume any unfinished work. Then you can reopen your project—or first make sure yesterday's changes are already available to your colleague.

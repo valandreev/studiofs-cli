@@ -48,13 +48,19 @@ studiofs discover myvolume --meta "postgres://studiofs:YOUR_PASSWORD@100.101.102
 studiofs mount myvolume Z:
 ```
 
-У macOS або Linux:
+У macOS:
+
+```bash
+studiofs mount myvolume /Volumes/Studiofs
+```
+
+У Linux:
 
 ```bash
 studiofs mount myvolume "$HOME/StudioFS"
 ```
 
-У Windows відкривайте `Z:\`, а в macOS чи Linux — `$HOME/StudioFS/myvolume`: до переданої батьківської папки StudioFS додає ім’я тому. Літера або шлях на другому комп’ютері можуть відрізнятися від першого — спільний том від цього не змінюється.
+У Windows відкривайте `Z:\`, у macOS — `/Volumes/Studiofs/myvolume`, а в Linux — `$HOME/StudioFS/myvolume`. StudioFS додає ім’я тому до переданої батьківської папки. Літера або шлях на другому комп’ютері можуть відрізнятися від першого — спільний том від цього не змінюється.
 
 Виконуйте `discover` і `mount` **від того самого користувача та з тим самим коренем клієнта**. За замовчуванням локальний стан лежить у `~/.studiofs`. Якщо ви встановили `STUDIOFS_CLIENT_ROOT`, обидві команди мають використовувати те саме значення. Після зміни користувача, запуску через `sudo` або зміни цієї змінної `mount` може шукати метадані зовсім в іншому місці.
 

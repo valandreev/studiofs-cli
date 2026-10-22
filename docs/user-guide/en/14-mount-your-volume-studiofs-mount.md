@@ -28,23 +28,23 @@ Open File Explorer and go to `Z:\`. A new volume may be empty—that is normal. 
 
 ## macOS and Linux: choosing a folder
 
-For your first mount, a folder in your own home directory is convenient, since you have write access there:
+On macOS, use the `/Volumes/Studiofs` directory prepared in the previous chapter:
+
+```bash
+studiofs mount myvolume /Volumes/Studiofs
+```
+
+StudioFS appends the volume name to the supplied path unless its last component already matches that name. The actual mount point will be **`/Volumes/Studiofs/myvolume`**. On Linux, use a folder in your home directory:
 
 ```bash
 studiofs mount myvolume "$HOME/StudioFS"
 ```
 
-In this example, the actual mount point is **`$HOME/StudioFS/myvolume`**. StudioFS appends the volume name to the supplied path unless its last component already matches that name. So the command with the full path:
+Both commands create a mount point using the volume name. Run the command for your system.
 
-```bash
-studiofs mount myvolume "$HOME/StudioFS/myvolume"
-```
+StudioFS tries to create the required directories itself. Choose a dedicated mount folder without your working files in it. On macOS, make sure you have write access to `/Volumes/Studiofs`; chapter 11 explains how to set it up. On Linux, use a folder your user can access.
 
-leads to the same place, rather than `myvolume/myvolume`. These are alternative examples: you only need to run one of them.
-
-StudioFS tries to create the required directories itself. Choose a dedicated mount folder without your working files in it. If the system denies access, check permissions on the parent directory; for a first attempt, your home folder is usually more convenient than the system directories `/mnt` or `/Volumes`.
-
-On macOS, open Finder, press **⌘⇧G**, and enter the full path to `StudioFS/myvolume` in your home folder. On Linux, open that folder in your file manager. The paths are similar, but the system software differs: macOS uses macFUSE, and Linux uses libfuse3. Permission settings and installation requirements also depend on the platform.
+On macOS, open Finder, press **⌘⇧G**, and enter `/Volumes/Studiofs/myvolume`. On Linux, open `$HOME/StudioFS/myvolume` in your file manager. The systems use different software: macOS uses macFUSE, and Linux uses libfuse3.
 
 ## Why has the terminal not returned to the prompt?
 
@@ -64,7 +64,13 @@ For everyday work, there is **background mode**:
 studiofs mount myvolume Z: --detach
 ```
 
-Or on macOS or Linux:
+On macOS:
+
+```bash
+studiofs mount myvolume /Volumes/Studiofs -d
+```
+
+On Linux:
 
 ```bash
 studiofs mount myvolume "$HOME/StudioFS" -d
@@ -82,7 +88,13 @@ After launch, open the drive or folder and look at its contents. In a second ter
 Get-ChildItem Z:\
 ```
 
-Or on macOS or Linux:
+On macOS:
+
+```bash
+ls -la /Volumes/Studiofs/myvolume
+```
+
+On Linux:
 
 ```bash
 ls -la "$HOME/StudioFS/myvolume"
@@ -114,7 +126,13 @@ A background mount is stopped with a separate command. On Windows:
 studiofs umount Z:
 ```
 
-On macOS or Linux, pass **the actual path, including the volume name**:
+On macOS, pass **the actual path, including the volume name**:
+
+```bash
+studiofs umount /Volumes/Studiofs/myvolume
+```
+
+On Linux:
 
 ```bash
 studiofs umount "$HOME/StudioFS/myvolume"

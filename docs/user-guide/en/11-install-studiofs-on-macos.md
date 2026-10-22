@@ -16,7 +16,7 @@ brew install --cask macfuse
 
 Installing the package and allowing its system component to run are separate steps. macOS may ask you to approve loading the extension in **System Settings → Privacy & Security**, then restart your Mac. Names and locations vary between macOS versions; follow the installer messages and the [macFUSE instructions](https://github.com/macfuse/macfuse/wiki/Getting-Started).
 
-On a Mac with Apple silicon, regular macFUSE may require permission for third-party kernel extensions through the recovery environment: **Startup Security Utility → Reduced Security → Allow user management of kernel extensions from identified developers**. This changes the computer's security policy. Follow the current macFUSE instructions for your particular system, and coordinate with your system administrator on a studio Mac. If company policy prohibits this step, do not try to bypass it with commands from a random forum.
+Regular macFUSE 5.4 was tested on macOS 27 Golden Gate and macOS 26 Tahoe. On a Mac with Apple silicon, regular macFUSE may require permission for third-party kernel extensions through the recovery environment: **Startup Security Utility → Reduced Security → Allow user management of kernel extensions from identified developers**. This changes the computer's security policy. Follow the current macFUSE instructions for your particular system, and coordinate with your system administrator on a studio Mac. If company policy prohibits this step, do not try to bypass it with commands from a random forum.
 
 ## Downloading StudioFS
 
@@ -39,16 +39,17 @@ studiofs --version
 
 ## Preparing a place to mount
 
-A mount point is a local folder through which you will see the volume's files. For your first mount using regular macFUSE, an empty folder in your home directory is a convenient choice:
+A mount point for macFUSE will be `/Volumes/Studiofs/`. Since this is a system directory, create the folder with administrator privileges and give ownership to your user:
 
 ```bash
-mkdir -p "$HOME/StudioFS/myvolume"
-ls -A "$HOME/StudioFS/myvolume"
+sudo mkdir -p /Volumes/Studiofs
+sudo chown "$(id -un):$(id -gn)" /Volumes/Studiofs
+ls -A /Volumes/Studiofs
 ```
 
-The second command should show no files. If it shows anything, choose another empty folder. Do not mount a volume over a directory containing your current project's material: mounting will hide its ordinary contents until you unmount.
+The `ls` command should show no files. If the folder already contains files, choose another mount point name. Do not mount a volume over a directory containing your current project's material: mounting will hide its ordinary contents until you unmount.
 
-In this example, the volume is called `myvolume`, and the final folder has the same name. That is deliberate: if the path you specify does not end with the volume name, StudioFS appends it automatically. Keep the cache separately on a local SSD, outside the mounted volume.
+In this example, the volume is called `myvolume`. StudioFS appends that name to `/Volumes/Studiofs/`, so the actual path will be `/Volumes/Studiofs/myvolume`. Keep the cache separately on a local SSD, outside the mounted volume.
 
 ## First run: what you can check now
 
@@ -57,7 +58,7 @@ If `studiofs --help` works, the executable starts. This is **not yet a test of m
 After creating a volume with `init` or connecting to an existing one with `discover`, the command will look like this:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS/myvolume" --foreground
+studiofs mount myvolume /Volumes/Studiofs --foreground
 ```
 
 This example assumes that the local client is already set up for the `myvolume` volume. If it is not, first follow Chapter 13 or [Chapter 16 on connecting a second computer](16-connect-a-second-computer-studiofs-discover.md). Do not create a new volume in place of the one your team invited you to join.
@@ -65,20 +66,16 @@ This example assumes that the local client is already set up for the `myvolume` 
 Leave the terminal running the mount open. In another window, you can open the folder in Finder:
 
 ```bash
-open "$HOME/StudioFS/myvolume"
+open /Volumes/Studiofs/myvolume
 ```
 
 Use test material for your first read and write checks, following Chapters 14–15. Before unmounting, close files and applications using the volume, then run:
 
 ```bash
-studiofs umount "$HOME/StudioFS/myvolume"
+studiofs umount /Volumes/Studiofs/myvolume
 ```
 
 If macFUSE refuses to mount, revisit system permissions and restarting. If StudioFS reports a missing volume or a problem accessing PostgreSQL or S3, check the relevant settings: reinstalling the driver will not fix the database password.
-
-## What next?
-
-Your Mac is prepared when StudioFS starts, macFUSE is installed with the necessary system permissions, and you have chosen an empty folder for the volume. We will test the actual mount after setting up the volume. If you do not need Linux, you can go straight to [creating your first volume](13-create-your-first-volume-studiofs-init.md).
 
 ---
 

@@ -28,23 +28,23 @@ studiofs mount myvolume Z:
 
 ## macOS і Linux: обираємо папку
 
-Для першого підключення зручно взяти папку у власному домашньому каталозі, де у вас є право запису:
+На macOS використайте каталог `/Volumes/Studiofs`, підготовлений у попередній главі:
+
+```bash
+studiofs mount myvolume /Volumes/Studiofs
+```
+
+StudioFS додає ім’я тому до переданого шляху, якщо його остання частина ще не збігається з цим ім’ям. Фактична точка буде **`/Volumes/Studiofs/myvolume`**. У Linux використайте папку у своєму домашньому каталозі:
 
 ```bash
 studiofs mount myvolume "$HOME/StudioFS"
 ```
 
-У цьому прикладі фактична точка підключення — **`$HOME/StudioFS/myvolume`**. StudioFS додає ім’я тому до переданого шляху, якщо його остання частина ще не збігається з цим ім’ям. Тому команда з повним шляхом:
+Обидві команди створюють точку монтування з назвою тому. Виконайте команду для своєї системи.
 
-```bash
-studiofs mount myvolume "$HOME/StudioFS/myvolume"
-```
+StudioFS намагається створити потрібні каталоги самостійно. Оберіть окрему папку для підключення, без ваших робочих файлів. На macOS перевірте, що маєте права запису в `/Volumes/Studiofs`; інструкцію з підготовки прав наведено в главі 11. У Linux використовуйте папку, до якої ваш користувач має доступ.
 
-веде до того самого місця, а не до `myvolume/myvolume`. Це альтернативні приклади: достатньо виконати один із них.
-
-StudioFS намагається створити потрібні каталоги самостійно. Оберіть окрему папку для підключення, без ваших робочих файлів. Якщо система відмовляє в доступі, перевірте права на батьківський каталог; для першої спроби домашня папка зазвичай зручніша за системні `/mnt` чи `/Volumes`.
-
-На macOS відкрийте Finder, натисніть **⌘⇧G** і введіть повний шлях до `StudioFS/myvolume` у вашій домашній папці. На Linux відкрийте цю папку у файловому менеджері. Шлях тут подібний, але системні засоби різні: macOS використовує macFUSE, Linux — libfuse3. Налаштування дозволів і вимоги до їхнього встановлення теж залежать від платформи.
+На macOS відкрийте Finder, натисніть **⌘⇧G** і введіть `/Volumes/Studiofs/myvolume`. На Linux відкрийте `$HOME/StudioFS/myvolume` у файловому менеджері. Системні засоби різні: macOS використовує macFUSE, Linux — libfuse3.
 
 ## Чому термінал не повернув запрошення?
 
@@ -64,7 +64,13 @@ studiofs mount myvolume Z: --foreground
 studiofs mount myvolume Z: --detach
 ```
 
-Або на macOS чи Linux:
+На macOS:
+
+```bash
+studiofs mount myvolume /Volumes/Studiofs -d
+```
+
+На Linux:
 
 ```bash
 studiofs mount myvolume "$HOME/StudioFS" -d
@@ -82,7 +88,13 @@ studiofs mount myvolume "$HOME/StudioFS" -d
 Get-ChildItem Z:\
 ```
 
-Або на macOS чи Linux:
+На macOS:
+
+```bash
+ls -la /Volumes/Studiofs/myvolume
+```
+
+На Linux:
 
 ```bash
 ls -la "$HOME/StudioFS/myvolume"
@@ -114,7 +126,13 @@ ls -la "$HOME/StudioFS/myvolume"
 studiofs umount Z:
 ```
 
-На macOS чи Linux передайте **фактичний шлях із назвою тому**:
+На macOS передайте **фактичний шлях із назвою тому**:
+
+```bash
+studiofs umount /Volumes/Studiofs/myvolume
+```
+
+На Linux:
 
 ```bash
 studiofs umount "$HOME/StudioFS/myvolume"

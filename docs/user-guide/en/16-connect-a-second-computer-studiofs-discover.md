@@ -48,13 +48,19 @@ On Windows, choose an unused drive letter:
 studiofs mount myvolume Z:
 ```
 
-On macOS or Linux:
+On macOS:
+
+```bash
+studiofs mount myvolume /Volumes/Studiofs
+```
+
+On Linux:
 
 ```bash
 studiofs mount myvolume "$HOME/StudioFS"
 ```
 
-On Windows, open `Z:\`; on macOS or Linux, open `$HOME/StudioFS/myvolume`: StudioFS appends the volume name to the parent folder you provide. The second computer can use a different drive letter or path from the first; it is still the same shared volume.
+On Windows, open `Z:\`; on macOS, open `/Volumes/Studiofs/myvolume`; on Linux, open `$HOME/StudioFS/myvolume`. StudioFS appends the volume name to the parent folder you provide. The second computer can use a different drive letter or path from the first; it is still the same shared volume.
 
 Run `discover` and `mount` **as the same user and with the same client root**. By default, local state lives in `~/.studiofs`. If you set `STUDIOFS_CLIENT_ROOT`, both commands must use the same value. Switching users, running through `sudo`, or changing this variable may cause `mount` to look for metadata somewhere else entirely.
 
