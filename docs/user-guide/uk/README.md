@@ -45,7 +45,7 @@
 
 - [23. Видалення файлів: чарівного кошика немає](23-deleting-files-there-is-no-magic-trash-can.md)
 - [24. Знімки: машина часу для вашого тому](24-snapshots-a-time-machine-for-your-volume.md)
-- [25. Перенесення метаданих StudioFS на новий сервер PostgreSQL](25-backups-even-time-machines-need-insurance.md)
+- [25. Перенесення метаданих StudioFS на новий сервер PostgreSQL](25-migrating-studiofs-metadata-to-new-postgresql-server.md)
 - [26. Облікові дані, шифрування та доступ](26-credentials-encryption-and-access.md)
 - [27. Обслуговування та видалення тому](27-maintenance-and-removing-a-volume.md)
 

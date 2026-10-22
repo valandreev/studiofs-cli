@@ -79,6 +79,6 @@
 
 ---
 
-[Зміст](README.md) · [English](../en/26-credentials-encryption-and-access.md) · [← Попередня](25-backups-even-time-machines-need-insurance.md) · [Наступна →](27-maintenance-and-removing-a-volume.md)
+[Зміст](README.md) · [English](../en/26-credentials-encryption-and-access.md) · [← Попередня](25-migrating-studiofs-metadata-to-new-postgresql-server.md) · [Наступна →](27-maintenance-and-removing-a-volume.md)
 
 [Джерело в Linear](https://linear.app/valandreev/document/26-credentials-encryption-and-access-226f59cf2da6)

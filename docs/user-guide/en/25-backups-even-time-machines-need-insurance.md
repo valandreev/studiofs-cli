@@ -78,6 +78,6 @@ Record the set used, the steps taken, any problems found, and the actual recover
 
 ---
 
-[Contents](README.md) · [Українська](../uk/25-backups-even-time-machines-need-insurance.md) · [← Previous](24-snapshots-a-time-machine-for-your-volume.md) · [Next →](26-credentials-encryption-and-access.md)
+[Contents](README.md) · [Українська: перенесення метаданих](../uk/25-migrating-studiofs-metadata-to-new-postgresql-server.md) · [← Previous](24-snapshots-a-time-machine-for-your-volume.md) · [Next →](26-credentials-encryption-and-access.md)
 
 [Linear source](https://linear.app/valandreev/document/25-backups-even-time-machines-need-insurance-87d9ae41a6eb)

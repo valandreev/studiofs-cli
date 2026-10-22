@@ -62,7 +62,7 @@ studiofs smount projectfs projectfs.2026-08-12T14-07-09.482Z Y:
 
 `studiofs destroy projectfs` — **руйнівне видалення тому**, а не відмонтування. Варіант `--local` залишає віддалені дані, але видаляє локальний стан і може знищити ще не передані зміни. Не використовуйте його як спосіб «освіжити кеш».
 
-`studiofs dump projectfs --path-to-dump ./projectfs-metadata.json` експортує частину метаданих PostgreSQL. Цей JSON не містить самих файлів і не є повною резервною копією бази чи тому. `load` змінює цільову базу; порядок застосування й межі обох команд наведено в [главі про перенесення метаданих](25-backups-even-time-machines-need-insurance.md).
+`studiofs dump projectfs --path-to-dump ./projectfs-metadata.json` експортує частину метаданих PostgreSQL. Цей JSON не містить самих файлів і не є повною резервною копією бази чи тому. `load` змінює цільову базу; порядок застосування й межі обох команд наведено в [главі про перенесення метаданих](25-migrating-studiofs-metadata-to-new-postgresql-server.md).
 
 ## Поширені запитання
 
