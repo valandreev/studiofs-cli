@@ -388,6 +388,7 @@ user manual; their existing paths remain stable:
 - [docs/encryption-at-rest-contract.md](docs/encryption-at-rest-contract.md) - remote payload encryption and plaintext local boundaries
 - [docs/transport-encryption-contract.md](docs/transport-encryption-contract.md) - S3 and PostgreSQL transport policy
 - [docs/platform-bridges.md](docs/platform-bridges.md) - WinFSP and FUSE integration
+- [docs/legal/platform-distribution.md](docs/legal/platform-distribution.md) - WinFsp, libfuse3, and macFUSE distribution terms
 
 ## Credits and Inspiration
 
