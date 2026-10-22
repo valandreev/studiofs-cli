@@ -2,11 +2,9 @@
 
 On a Mac, StudioFS starts in the terminal too. Once mounted, you will work with a folder in Finder, your editing application, or your compositor, but first you need to install two separate things: **macFUSE**, which helps macOS mount the filesystem, and **StudioFS** itself.
 
-In this chapter, we will prepare the computer and check that the program starts. We will leave volume creation and full mount setup to [Chapter 13](13-create-your-first-volume-studiofs-init.md) and [Chapter 14](14-mount-your-volume-studiofs-mount.md). Having the program installed does not mean S3 and PostgreSQL are already configured. Unfortunately, they do not administer themselves.
-
 ## macFUSE first
 
-The main StudioFS option on macOS at present is **regular macFUSE, or the legacy backend**. That is what we will use below. FSKit is a separate experimental implementation; we will discuss it at the end.
+The main StudioFS option on macOS at present is **macFUSE**. That is what we will use below.
 
 Download the installer from the [official macFUSE website](https://macfuse.github.io/) and follow its steps. If you already use Homebrew, you can install the same component with:
 
@@ -14,62 +12,21 @@ Download the installer from the [official macFUSE website](https://macfuse.githu
 brew install --cask macfuse
 ```
 
-This installs macFUSE, **not StudioFS**. Save your open projects before restarting if the installer asks you to do so.
-
 ### macOS permissions
 
 Installing the package and allowing its system component to run are separate steps. macOS may ask you to approve loading the extension in **System Settings → Privacy & Security**, then restart your Mac. Names and locations vary between macOS versions; follow the installer messages and the [macFUSE instructions](https://github.com/macfuse/macfuse/wiki/Getting-Started).
 
 On a Mac with Apple silicon, regular macFUSE may require permission for third-party kernel extensions through the recovery environment: **Startup Security Utility → Reduced Security → Allow user management of kernel extensions from identified developers**. This changes the computer's security policy. Follow the current macFUSE instructions for your particular system, and coordinate with your system administrator on a studio Mac. If company policy prohibits this step, do not try to bypass it with commands from a random forum.
 
-A regular StudioFS installation does not require disabling SIP. Also, do not give every application Full Disk Access “just in case.” If macOS separately asks for terminal access to a protected folder, grant only the access needed, or choose a folder in your home directory for the first test.
+## Downloading StudioFS
 
-## Where do you get StudioFS?
-
-The current repository documents building from source. That is the route below: no invented StudioFS installer or Homebrew command that does not exist here. If your studio administrator has already supplied a verified executable for your Mac, use its path and skip to checking that it starts.
-
-Building requires Git, the Xcode command-line tools, and Rust with Cargo. Install Apple's tools with:
-
-```bash
-xcode-select --install
-```
-
-If the system says they are already installed, you do not need to install them again. You can get Rust by following the [official instructions](https://www.rust-lang.org/tools/install). The current StudioFS `Cargo.toml` requires Rust **1.95 or later**. Check the tools:
-
-```bash
-rustc --version
-cargo --version
-```
-
-Build the program on the Mac where you intend to run it: that saves you from having to choose between Apple silicon and Intel. In the terminal, go to your working directory and run:
-
-```bash
-git clone https://github.com/valandreev/studiofs-cli.git
-cd studiofs-cli
-cargo build --release -p studiofs
-```
-
-A studio team should agree on one version of the code in advance: the current repository branch changes, and compatibility between arbitrary builds is not guaranteed.
-
-**This command produces `target/release/studiofs` inside the repository.** It is a command-line program, not an app in the Applications folder. Start by running it directly:
-
-```bash
-./target/release/studiofs --version
-./target/release/studiofs --help
-```
-
-If you set your own `CARGO_TARGET_DIR`, look for the result in its `release` subdirectory.
-
-Building requires real macFUSE headers, including `fuse_lowlevel.h`. The build looks for them through `pkg-config fuse` and in standard Homebrew directories. If you see an error about a missing header, check your macFUSE installation; Rust itself does not include it. Diagnostics through `pkg-config` require that tool, for example `brew install pkg-config` if you use Homebrew. A missing `MFMount.framework` is a different situation: it disables experimental FSKit, but does not replace or remove the requirements for the regular macFUSE build.
-
-## Saving yourself the long path
-
-You can leave the program in the build directory and always specify its full path. Or copy it into your own directory for commands:
+Open the [StudioFS releases page](https://github.com/valandreev/studiofs-cli/releases) and download the build for your Mac—**Apple silicon** or **Intel**. Extract it if it is packaged in an archive. In the `install` command, replace `/path/to/studiofs` with the path to the downloaded executable:
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-cp ./target/release/studiofs "$HOME/.local/bin/studiofs"
+install -m 755 "/path/to/studiofs" "$HOME/.local/bin/studiofs"
 export PATH="$HOME/.local/bin:$PATH"
+studiofs --version
 studiofs --help
 ```
 
@@ -79,8 +36,6 @@ studiofs --help
 command -v studiofs
 studiofs --version
 ```
-
-After rebuilding, you need to update the copy in `~/.local/bin` separately. Otherwise, it is remarkably easy to spend an entire evening testing the new version with an old executable.
 
 ## Preparing a place to mount
 
@@ -120,18 +75,6 @@ studiofs umount "$HOME/StudioFS/myvolume"
 ```
 
 If macFUSE refuses to mount, revisit system permissions and restarting. If StudioFS reports a missing volume or a problem accessing PostgreSQL or S3, check the relevant settings: reinstalling the driver will not fix the database password.
-
-## What about FSKit?
-
-FSKit in StudioFS remains **experimental and must be enabled separately**. It is not an automatic replacement for regular macFUSE, nor a promise of the same readiness for a production project. The implementation uses macFUSE's `MFMount.framework`; it requires macOS **15.4+**, macFUSE **5.3.3+**, an available framework, and a mount point under `/Volumes`. If the framework was unavailable at build time, selecting FSKit will return an unsupported-backend error.
-
-For a regular installation, leave `STUDIOFS_MOUNT_BACKEND` unset. If you previously experimented in this terminal, return to the default path with:
-
-```bash
-unset STUDIOFS_MOUNT_BACKEND
-```
-
-It is better to experiment with FSKit separately, on a test volume, following the [technical documentation](../../platform-bridges.md#macos-backend-selection). You do not need it for your first mount using this guide.
 
 ## What next?
 

@@ -8,56 +8,23 @@ Below, we use **PowerShell on Windows itself**, not inside WSL. The examples are
 
 Download and install **WinFSP 2026 or newer** from the [official WinFSP GitHub releases](https://github.com/winfsp/winfsp/releases). StudioFS uses several newer WinFSP features, so earlier versions are not supported. Windows may ask for administrator privileges because you are installing a filesystem driver. If the installer asks you to restart, do so before checking StudioFS. On a workstation with restricted permissions, it is best to ask an administrator to handle this step.
 
-## Where to get StudioFS
+## Downloading StudioFS
 
-A prebuilt `studiofs.exe`, if the team provides one for your version, saves you the time needed to build it. Refer to the [StudioFS repository](https://github.com/valandreev/studiofs-cli) and its [releases page](https://github.com/valandreev/studiofs-cli/releases). Check the description of the specific release and the file's architecture.
-
-The current repository documents building from source. We will follow that route below; if the team has provided a prebuilt binary for your version of Windows, skip ahead to checking that it starts.
-
-To build StudioFS, you need [Git for Windows](https://git-scm.com/downloads/win), [Rust through rustup](https://www.rust-lang.org/tools/install), and Microsoft's C++ tools: **Build Tools for Visual Studio**, the **Desktop development with C++** workload, and the Windows SDK. Choose Rust with the MSVC toolchain for Windows. The current `Cargo.toml` requires **Rust 1.95 or newer**; for a different StudioFS version, check the requirement in that version's source code. When installing WinFSP for a source build, include the development tools—SDK / Developer—if the installer offers them separately.
-
-After installing the tools, open a new PowerShell window and check:
-
-```powershell
-git --version
-rustc --version
-cargo --version
-rustup show active-toolchain
-```
-
-On a typical x64 workstation, the active toolchain's name should contain `x86_64-pc-windows-msvc`. If a command is not found, fix the tools' installation or open a new terminal first.
-
-In the folder where you keep source code, run:
-
-```powershell
-git clone https://github.com/valandreev/studiofs-cli.git
-Set-Location .\studiofs-cli
-cargo build --release -p studiofs --bin studiofs
-```
-
-This builds the StudioFS CLI and its dependencies. The first build downloads dependencies and may take longer than you would like with a project delivery looming. Do not continue if Cargo exits with an error. An error about `link.exe` usually points to missing or unavailable MSVC tools; errors about WinFSP libraries call for checking its installation and development tools.
-
-After a successful build using Cargo's default output directory, the program will be here:
-
-```powershell
-.\target\release\studiofs.exe --version
-.\target\release\studiofs.exe --help
-```
-
-The program itself should print its current version and help text. If you set a different `CARGO_TARGET_DIR` or an explicit target, the output path will differ.
-
-## Avoid typing the full path every time
-
-Create a separate folder in your user profile and copy the resulting file there. Run the following commands from the repository root after a successful build:
+Open the [StudioFS releases page](https://github.com/valandreev/studiofs-cli/releases) and download the build for **Windows x64**. If it is packaged in an archive, extract it to a separate folder. Copy all release files to a StudioFS folder in your user profile:
 
 ```powershell
 $studiofsBin = Join-Path $env:LOCALAPPDATA 'Programs\StudioFS'
 New-Item -ItemType Directory -Force -Path $studiofsBin | Out-Null
-Copy-Item .\target\release\studiofs.exe -Destination $studiofsBin
+Copy-Item 'C:\path\to\extracted\release\*' -Destination $studiofsBin -Recurse
 & (Join-Path $studiofsBin 'studiofs.exe') --version
+& (Join-Path $studiofsBin 'studiofs.exe') --help
 ```
 
-If you have a prebuilt file from the team, put it in the same folder. If the release includes additional files and separate instructions, follow those instructions.
+In `Copy-Item`, replace `C:\path\to\extracted\release` with the path to the extracted release folder. Follow any separate release instructions.
+
+## Avoid typing the full path every time
+
+Add the StudioFS folder to your user Path:
 
 In Windows settings, search for **“Edit environment variables for your account”**, open the user **Path** variable, and add the folder shown by `$studiofsBin`. Add the folder itself, without `studiofs.exe`, and preserve the existing entries. Changing your user Path does not require installing the program for all users.
 

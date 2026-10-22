@@ -18,7 +18,7 @@ StudioFS can already do the essentials: mount shared storage as a regular drive,
 | **macOS** | macFUSE |
 | **Linux** | libfuse3 |
 
-On macOS, the main option at present is macFUSE. FSKit support is still “experimental” (and does not work, but we are working on that implementation).
+On macOS, the main option at present is macFUSE.
 
 StudioFS is a command-line application. Installation requires knowing how to run commands in a terminal, but you do not need to know Rust or administer servers professionally.
 

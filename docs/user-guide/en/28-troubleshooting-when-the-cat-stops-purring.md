@@ -53,8 +53,6 @@ On the first mount, StudioFS may display a UAC prompt to configure WinFSP integr
 
 You need **macFUSE** and the permissions its installation requires. If the system asks you to allow a component or restart, complete those steps following [chapter 11](11-install-studiofs-on-macos.md).
 
-Check whether the experimental value `STUDIOFS_MOUNT_BACKEND=fskit` has been left in the launch environment. For regular work, use the default macFUSE backend; switching to an experimental backend is not a universal fix.
-
 ### Linux
 
 The current backend uses **FUSE3**. Check the utility and kernel device:

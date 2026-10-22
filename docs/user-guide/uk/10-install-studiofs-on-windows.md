@@ -8,56 +8,21 @@
 
 Завантажте й установіть **WinFSP 2026 або новішу версію** зі [сторінки випусків офіційного репозиторію WinFSP](https://github.com/winfsp/winfsp/releases). StudioFS використовує кілька новіших можливостей WinFSP, тому попередні версії не підтримуються. Windows може попросити права адміністратора, оскільки встановлюється драйвер файлової системи. Якщо інсталятор просить перезавантаження, виконайте його перед перевіркою StudioFS. На робочій станції з обмеженими правами цей крок краще доручити адміністратору.
 
-## Звідки взяти StudioFS
+## Завантажуємо StudioFS
 
-Готовий `studiofs.exe`, якщо його для вашої версії надає команда, заощадить час на збиранні. Орієнтуйтеся на [репозиторій StudioFS](https://github.com/valandreev/studiofs-cli) та його [сторінку випусків](https://github.com/valandreev/studiofs-cli/releases). Перевіряйте опис конкретного випуску й архітектуру файла.
-
-У поточному репозиторії описано збирання з вихідного коду. Нижче пройдемо саме цей шлях; якщо команда надала готову збірку для вашої версії Windows, перейдіть до перевірки її запуску.
-
-Для збирання потрібні [Git для Windows](https://git-scm.com/downloads/win), [Rust через rustup](https://www.rust-lang.org/tools/install) та засоби C++ від Microsoft: **Build Tools for Visual Studio**, робоче навантаження **Desktop development with C++** і Windows SDK. Обирайте Rust із MSVC toolchain для Windows. Поточний `Cargo.toml` вимагає **Rust 1.95 або новіший**; для іншої версії StudioFS звірте вимогу в її вихідному коді. Встановлюючи WinFSP для збирання, включіть засоби розробки — SDK / Developer, якщо інсталятор пропонує їх окремо.
-
-Після встановлення інструментів відкрийте нове вікно PowerShell і перевірте:
-
-```powershell
-git --version
-rustc --version
-cargo --version
-rustup show active-toolchain
-```
-
-У назві активного toolchain для звичайної x64-станції має бути `x86_64-pc-windows-msvc`. Якщо команда не знайдена, спочатку виправте встановлення інструментів або відкрийте новий термінал.
-
-У папці, де ви тримаєте вихідні коди, виконайте:
-
-```powershell
-git clone https://github.com/valandreev/studiofs-cli.git
-Set-Location .\studiofs-cli
-cargo build --release -p studiofs --bin studiofs
-```
-
-Це збирає CLI StudioFS разом із його залежностями. Перша збірка завантажує залежності й може тривати довше, ніж хотілося б перед здачею проєкту. Не переходьте далі, якщо Cargo завершився помилкою. Помилка про `link.exe` зазвичай вказує на відсутні або недоступні засоби MSVC; помилки про бібліотеки WinFSP потребують перевірки його встановлення та засобів розробки.
-
-За успішної збірки зі стандартним каталогом Cargo програма буде тут:
-
-```powershell
-.\target\release\studiofs.exe --version
-.\target\release\studiofs.exe --help
-```
-
-Поточну версію та довідку має вивести сама програма. Якщо ви задали інший `CARGO_TARGET_DIR` або окремий target, шлях до результату відрізнятиметься.
-
-## Щоб не набирати повний шлях щоразу
-
-Створіть окрему папку у своєму профілі й скопіюйте туди отриманий файл. Наступні команди виконуйте з кореня репозиторію після успішної збірки:
+Відкрийте [сторінку випусків StudioFS](https://github.com/valandreev/studiofs-cli/releases) і завантажте збірку для **Windows x64**. Якщо файл упаковано в архів, розпакуйте його в окрему папку. Скопіюйте всі файли релізу до папки StudioFS у своєму профілі:
 
 ```powershell
 $studiofsBin = Join-Path $env:LOCALAPPDATA 'Programs\StudioFS'
 New-Item -ItemType Directory -Force -Path $studiofsBin | Out-Null
-Copy-Item .\target\release\studiofs.exe -Destination $studiofsBin
+Copy-Item 'C:\path\to\extracted\release\*' -Destination $studiofsBin -Recurse
 & (Join-Path $studiofsBin 'studiofs.exe') --version
+& (Join-Path $studiofsBin 'studiofs.exe') --help
 ```
 
-Якщо маєте готовий файл від команди, покладіть його до тієї самої папки. Коли випуск містить додаткові файли й окремі вказівки, дотримуйтеся цих вказівок.
+У команді `Copy-Item` замініть `C:\path\to\extracted\release` на шлях до розпакованої папки релізу. Якщо реліз містить окремі вказівки, дотримуйтеся їх.
+
+## Щоб не набирати повний шлях щоразу
 
 У параметрах Windows знайдіть **«Змінення змінних середовища для облікового запису»**, відкрийте користувацьку змінну **Path** і додайте папку, отриману командою `$studiofsBin`. Додавайте саме папку, без `studiofs.exe`, зберігаючи попередні записи. Зміна користувацького Path не потребує встановлення програми для всіх користувачів.
 
