@@ -44,5 +44,3 @@ Made your choice? In the next chapter, we will create an S3 bucket and prepare a
 ---
 
 [Contents](README.md) · [Українська](../uk/05-choose-your-setup.md) · [← Previous](04-studiofs-vs-alternatives-which-tool-fits-your-workflow.md) · [Next →](06-s3-a-home-for-your-files.md)
-
-[Linear source](https://linear.app/valandreev/document/05-choose-your-setup-161edffb5f51) · Source updated: 2026-10-19T16:50:42.072Z · Ukrainian original approved for translation.

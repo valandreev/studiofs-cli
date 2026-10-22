@@ -1577,10 +1577,8 @@ fn macos_native_bridge_split_note_covers_sfs475_boundary() {
     let doc = read_workspace_file("docs/macos-native-bridge-split.md");
     let normalized_doc = normalize_doc_whitespace(&doc);
     let required_terms = [
-        "SFS-475",
-        "https://linear.app/valandreev/issue/SFS-475/define-macos-native-bridge-split-from-main",
-        "SFS-474",
-        "https://linear.app/valandreev/issue/SFS-474/probe-fuser-notifierstore-for-macos-repeated-read-cache-behavior",
+        "Tracking issue: SFS-475",
+        "SFS-474 Evidence",
         "fuser::Notifier::store",
         "EINVAL",
         "did not produce macOS kernel-cache hits",

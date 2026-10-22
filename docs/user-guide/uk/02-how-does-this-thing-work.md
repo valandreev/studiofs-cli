@@ -44,5 +44,3 @@ StudioFS спочатку приймає зміни на вашому комп�
 ---
 
 [Зміст](README.md) · [English](../en/02-how-does-this-thing-work.md) · [← Попередня](01-welcome-to-studiofs.md) · [Наступна →](03-capabilities-limits-and-requirements.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/02-how-does-this-thing-work-04c31d4991eb) · Оновлення джерела: 2026-10-17T20:47:34.115Z · Український оригінал прийнято для перенесення.

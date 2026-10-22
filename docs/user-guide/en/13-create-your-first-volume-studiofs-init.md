@@ -89,5 +89,3 @@ Once the command has completed successfully, there is no need to repeat `init`. 
 ---
 
 [Contents](README.md) · [Українська](../uk/13-create-your-first-volume-studiofs-init.md) · [← Previous](12-install-studiofs-on-linux.md) · [Next →](14-mount-your-volume-studiofs-mount.md)
-
-[Linear source](https://linear.app/valandreev/document/13-create-your-first-volume-studiofs-init-af054dd6f1d4)

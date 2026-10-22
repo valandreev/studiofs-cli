@@ -103,5 +103,3 @@ studiofs mount myvolume /mnt/StudioFS
 ---
 
 [Зміст](README.md) · [English](../en/17-unplug-safely-studiofs-umount.md) · [← Попередня](16-connect-a-second-computer-studiofs-discover.md) · [Наступна →](18-studiofs-workloads.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/17-unplug-safely-studiofs-umount-777999ff6f1e)

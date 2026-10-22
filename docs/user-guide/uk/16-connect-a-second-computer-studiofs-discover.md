@@ -94,5 +94,3 @@ studiofs mount myvolume /mnt/StudioFS
 ---
 
 [Зміст](README.md) · [English](../en/16-connect-a-second-computer-studiofs-discover.md) · [← Попередня](15-your-first-files-in-the-cloud.md) · [Наступна →](17-unplug-safely-studiofs-umount.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/16-connect-a-second-computer-studiofs-discover-ee905bdac9dc)

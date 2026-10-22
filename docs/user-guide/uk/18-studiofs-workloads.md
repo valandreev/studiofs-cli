@@ -28,5 +28,3 @@ PostgreSQL, який StudioFS використовує для метаданих
 ---
 
 [Зміст](README.md) · [English](../en/18-studiofs-workloads.md) · [← Попередня](17-unplug-safely-studiofs-umount.md) · [Наступна →](19-sync-bad-wi-fi-and-other-surprises.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/18-working-with-real-creative-projects-97b051e24905)

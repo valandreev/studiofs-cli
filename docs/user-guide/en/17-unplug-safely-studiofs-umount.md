@@ -103,5 +103,3 @@ Substitute your volume name and the path from the [chapter on mounting](14-mount
 ---
 
 [Contents](README.md) · [Українська](../uk/17-unplug-safely-studiofs-umount.md) · [← Previous](16-connect-a-second-computer-studiofs-discover.md) · [Next →](18-studiofs-workloads.md)
-
-[Linear source](https://linear.app/valandreev/document/17-unplug-safely-studiofs-umount-777999ff6f1e)

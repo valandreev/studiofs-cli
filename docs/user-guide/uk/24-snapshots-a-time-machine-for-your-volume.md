@@ -135,5 +135,3 @@ studiofs snapshot delete projectfs.2026-08-12T14-07-09.482Z
 ---
 
 [Зміст](README.md) · [English](../en/24-snapshots-a-time-machine-for-your-volume.md) · [← Попередня](23-deleting-files-there-is-no-magic-trash-can.md) · [Наступна →](25-migrating-studiofs-metadata-to-new-postgresql-server.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/24-snapshots-a-time-machine-for-your-volume-0d9aa8a05bba)

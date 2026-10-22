@@ -89,5 +89,3 @@ studiofs status studio-projects
 ---
 
 [Зміст](README.md) · [English](../en/13-create-your-first-volume-studiofs-init.md) · [← Попередня](12-install-studiofs-on-linux.md) · [Наступна →](14-mount-your-volume-studiofs-mount.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/13-create-your-first-volume-studiofs-init-af054dd6f1d4)

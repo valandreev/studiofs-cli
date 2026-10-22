@@ -52,5 +52,3 @@ Your team now has a simple rule: one person making changes at a time, clear vers
 ---
 
 [Contents](README.md) · [Українська](../uk/21-two-people-one-file-collaboration-and-conflicts.md) · [← Previous](20-cache-why-is-the-cloud-using-my-ssd.md) · [Next →](22-settings-status-and-activity.md)
-
-[Linear source](https://linear.app/valandreev/document/21-two-people-one-file-collaboration-and-conflicts-0f767280fde1)

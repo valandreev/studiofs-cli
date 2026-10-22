@@ -12,5 +12,3 @@ If you have checked all the boxes, proceed to the installation guide for your sy
 ---
 
 [Contents](README.md) · [Українська](../uk/09-check-your-infrastructure.md) · [← Previous](08-tailscale-netbird-a-private-path-to-postgresql.md) · [Next →](10-install-studiofs-on-windows.md)
-
-[Linear source](https://linear.app/valandreev/document/09-check-your-infrastructure-de24b263ec39)

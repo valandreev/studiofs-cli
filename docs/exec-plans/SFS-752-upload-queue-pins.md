@@ -329,7 +329,7 @@ local dirty state remains the replay source.
 
 ## Artifacts and Notes
 
-Issue: https://linear.app/valandreev/issue/SFS-752/keep-cache-pin-counts-aligned-with-accepted-upload-queue-entries
+Issue: SFS-752
 PR: https://github.com/valandreev/studiofs-cli/pull/737
 Implementation commit: `5e784917`.
 Local review accounting fix: `fcbe9ba7`.

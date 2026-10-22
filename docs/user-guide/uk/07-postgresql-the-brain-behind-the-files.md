@@ -175,5 +175,3 @@ postgresql://studiofs:studiofs@VPN_SERVER_ADDRESS:5432/studiofs
 ---
 
 [Зміст](README.md) · [English](../en/07-postgresql-the-brain-behind-the-files.md) · [← Попередня](06-s3-a-home-for-your-files.md) · [Наступна →](08-tailscale-netbird-a-private-path-to-postgresql.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/07-postgresql-the-brain-behind-the-files-922bc87af337) · Оновлення джерела: 2026-10-19T20:16:35.184Z · Український оригінал прийнято для перенесення.

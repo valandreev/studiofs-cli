@@ -66,5 +66,3 @@ Once you have checked reading, editing, and renaming, delete `hello-again.txt` f
 ---
 
 [Contents](README.md) · [Українська](../uk/15-your-first-files-in-the-cloud.md) · [← Previous](14-mount-your-volume-studiofs-mount.md) · [Next →](16-connect-a-second-computer-studiofs-discover.md)
-
-[Linear source](https://linear.app/valandreev/document/15-your-first-files-in-the-cloud-03113b439cb0)

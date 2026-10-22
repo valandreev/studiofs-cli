@@ -132,5 +132,3 @@ Before sharing, check the material and redact passwords, S3 keys, tokens, and fu
 ---
 
 [Contents](README.md) · [Українська](../uk/28-troubleshooting-when-the-cat-stops-purring.md) · [← Previous](27-maintenance-and-removing-a-volume.md) · [Next →](29-logs-diagnostics-and-asking-for-help.md)
-
-[Linear source](https://linear.app/valandreev/document/28-troubleshooting-when-the-cat-stops-purring-3a4d7bbb0f03)

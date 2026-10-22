@@ -22,5 +22,3 @@ In the next chapter, we will take a closer look at the StudioFS local cache.
 ---
 
 [Contents](README.md) · [Українська](../uk/19-sync-bad-wi-fi-and-other-surprises.md) · [← Previous](18-studiofs-workloads.md) · [Next →](20-cache-why-is-the-cloud-using-my-ssd.md)
-
-[Linear source](https://linear.app/valandreev/document/19-sync-bad-wi-fi-and-other-surprises-48d23b2a42ab)

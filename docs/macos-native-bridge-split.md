@@ -2,7 +2,7 @@
 
 Date: 2026-06-02
 
-Tracking issue: [SFS-475](https://linear.app/valandreev/issue/SFS-475/define-macos-native-bridge-split-from-main)
+Tracking issue: SFS-475
 
 Historical note: this SFS-475 split predates SFS-600. References below to
 `studiofs-fuse` describe the removed legacy Linux raw FUSE path and are kept as
@@ -38,7 +38,7 @@ diagnostics.
 
 ## SFS-474 Evidence
 
-[SFS-474](https://linear.app/valandreev/issue/SFS-474/probe-fuser-notifierstore-for-macos-repeated-read-cache-behavior)
+SFS-474
 tested whether the current `studiofs-fuse` backend could use
 `fuser::Notifier::store` to populate macOS hot file pages after stable local
 bytes were available.

@@ -49,5 +49,3 @@ If you deleted a file before creating a snapshot or backup, recovery is not guar
 ---
 
 [Contents](README.md) · [Українська](../uk/23-deleting-files-there-is-no-magic-trash-can.md) · [← Previous](22-settings-status-and-activity.md) · [Next →](24-snapshots-a-time-machine-for-your-volume.md)
-
-[Linear source](https://linear.app/valandreev/document/23-deleting-files-there-is-no-magic-trash-can-f3a94106c3c4)

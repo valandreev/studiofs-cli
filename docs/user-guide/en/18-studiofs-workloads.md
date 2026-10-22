@@ -28,5 +28,3 @@ In the next chapter, we will look at what happens to synchronization when the ne
 ---
 
 [Contents](README.md) · [Українська](../uk/18-studiofs-workloads.md) · [← Previous](17-unplug-safely-studiofs-umount.md) · [Next →](19-sync-bad-wi-fi-and-other-surprises.md)
-
-[Linear source](https://linear.app/valandreev/document/18-working-with-real-creative-projects-97b051e24905)

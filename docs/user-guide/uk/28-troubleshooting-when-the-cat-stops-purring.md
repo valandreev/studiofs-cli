@@ -134,5 +134,3 @@ StudioFS — не комерційний сервіс, і платна техн�
 ---
 
 [Зміст](README.md) · [English](../en/28-troubleshooting-when-the-cat-stops-purring.md) · [← Попередня](27-maintenance-and-removing-a-volume.md) · [Наступна →](29-logs-diagnostics-and-asking-for-help.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/28-troubleshooting-when-the-cat-stops-purring-3a4d7bbb0f03)

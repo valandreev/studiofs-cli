@@ -58,5 +58,3 @@
 ---
 
 [Зміст](README.md) · [English](../en/25-migrating-studiofs-metadata-to-new-postgresql-server.md) · [← Попередня](24-snapshots-a-time-machine-for-your-volume.md) · [Наступна →](26-credentials-encryption-and-access.md)
-
-[Джерело в Linear](https://linear.app/valandreev/document/25-backups-even-time-machines-need-insurance-87d9ae41a6eb)

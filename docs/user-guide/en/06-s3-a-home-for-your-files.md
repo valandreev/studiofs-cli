@@ -81,5 +81,3 @@ We have prepared a home for the data: a private bucket, separate keys, an endpoi
 ---
 
 [Contents](README.md) · [Українська](../uk/06-s3-a-home-for-your-files.md) · [← Previous](05-choose-your-setup.md) · [Next →](07-postgresql-the-brain-behind-the-files.md)
-
-[Linear source](https://linear.app/valandreev/document/06-s3-a-home-for-your-files-99d3dc8ea8c1) · Source updated: 2026-10-19T20:18:03.120Z · Ukrainian original approved for translation.

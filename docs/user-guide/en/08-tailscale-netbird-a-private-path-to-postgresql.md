@@ -147,5 +147,3 @@ In the next section, we will check all the prepared infrastructure together and 
 ---
 
 [Contents](README.md) · [Українська](../uk/08-tailscale-netbird-a-private-path-to-postgresql.md) · [← Previous](07-postgresql-the-brain-behind-the-files.md) · [Next →](09-check-your-infrastructure.md)
-
-[Linear source](https://linear.app/valandreev/document/08-tailscale-netbird-a-private-path-to-postgresql-165dab39a508) · Source updated: 2026-10-19T21:08:26.630Z · Ukrainian original approved for translation.
