@@ -1,7 +1,5 @@
 # 11. Install StudioFS on macOS
 
-> **English translation draft awaiting review.** Not yet approved.
-
 On a Mac, StudioFS starts in the terminal too. Once mounted, you will work with a folder in Finder, your editing application, or your compositor, but first you need to install two separate things: **macFUSE**, which helps macOS mount the filesystem, and **StudioFS** itself.
 
 In this chapter, we will prepare the computer and check that the program starts. We will leave volume creation and full mount setup to [Chapter 13](13-create-your-first-volume-studiofs-init.md) and [Chapter 14](14-mount-your-volume-studiofs-mount.md). Having the program installed does not mean S3 and PostgreSQL are already configured. Unfortunately, they do not administer themselves.

@@ -1,7 +1,5 @@
 # 10. Install StudioFS on Windows
 
-> **English translation draft awaiting editorial and technical review. Not yet approved.**
-
 On an editing workstation, StudioFS has two parts: the `studiofs.exe` program and WinFSP, a Windows component that lets it present a volume as a drive. First, we will install both parts and check that the program starts. Connecting S3 and creating a volume come later: downloading the program alone will not make an empty drive appear.
 
 Below, we use **PowerShell on Windows itself**, not inside WSL. The examples are for Windows x64. Support for other architectures in the code does not, by itself, confirm that a particular build is ready for your computer.

@@ -1,7 +1,5 @@
 # 13. Create Your First Volume — studiofs init
 
-> **English translation draft; review pending.** This text has not yet been approved.
-
 S3 already has room for your files, PostgreSQL is ready to remember their structure, and StudioFS is installed. Now we will bring these components together in a **volume**—a separate StudioFS drive with its own name, settings, and encryption key.
 
 That is what `studiofs init` does. It creates a new volume, but does not yet attach it as a drive in your system. The drive letter or mount directory comes in the next step. We can plan the housewarming, but let us hold off on moving in the furniture.

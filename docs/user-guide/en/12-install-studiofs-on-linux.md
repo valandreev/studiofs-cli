@@ -1,7 +1,5 @@
 # 12. Install StudioFS on Linux
 
-> **English translation draft for editorial and technical review.** This text has not yet been approved.
-
 On Linux, StudioFS mounts storage through **FUSE3**. This component lets the program present files from S3 as an ordinary folder: your editing application sees a path to the media, while StudioFS takes care of retrieving and saving it.
 
 In this chapter, we will prepare the system, build the command-line program, and check that it starts. Creating a volume and actually mounting the storage come in the next chapters. The folder for our future drive will be empty for now—that is normal; the media has not arrived yet.
