@@ -132,7 +132,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let cli = cli::Cli::parse();
-    let _daemon_log_guard = init_tracing(&cli.log_level)?;
+    let _daemon_log_guard = init_tracing(cli.log_level())?;
     cli.dispatch()
 }
 

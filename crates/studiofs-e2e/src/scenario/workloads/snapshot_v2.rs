@@ -345,7 +345,7 @@ fn run_manual_recovery(
         writer,
         context,
         "snapshot-create",
-        &["snapshot", "create"],
+        &snapshot_create_args(&config.volume_name),
     )?;
     let snapshot_id = parse_snapshot_id(&output).ok_or_else(|| {
         ScenarioError::Io(io::Error::other(
@@ -709,7 +709,7 @@ fn spawn_snapshot_create(
     let stderr_path = context.scenario_dir.join("snapshot-create.stderr.log");
     let stdout = fs::File::create(&stdout_path)?;
     let stderr = fs::File::create(&stderr_path)?;
-    let mut command = cli_command(config, client, snapshot_create_args());
+    let mut command = cli_command(config, client, snapshot_create_args(&config.volume_name));
     command.env(
         SNAPSHOT_TEST_PAUSE_BEFORE_READY_MS_ENV,
         SNAPSHOT_TAKEOVER_PAUSE_BEFORE_READY_MS,
@@ -921,8 +921,8 @@ pub(in crate::scenario) fn parse_snapshot_id(stdout: &str) -> Option<String> {
     })
 }
 
-pub(in crate::scenario) fn snapshot_create_args() -> [&'static str; 2] {
-    ["snapshot", "create"]
+pub(in crate::scenario) fn snapshot_create_args(volume: &str) -> [&str; 3] {
+    ["snapshot", volume, "create"]
 }
 
 pub(in crate::scenario) fn snapshot_mount_args(

@@ -86,8 +86,8 @@ EXAMPLES:
     studiofs umount /mnt/studio
 
   Create and recover a whole-volume snapshot:
-    studiofs snapshot create --ttl 7d
-    studiofs snapshot list
+    studiofs snapshot myvolume create --ttl 7d
+    studiofs snapshot myvolume list
     studiofs smount myvolume <snapshot-id> Z:
 
   Check volume status:
@@ -125,6 +125,13 @@ pub(crate) struct Cli {
 }
 
 impl Cli {
+    pub(crate) fn log_level(&self) -> &str {
+        match &self.command {
+            Commands::Snapshot(args) => args.log_level_override().unwrap_or(&self.log_level),
+            _ => &self.log_level,
+        }
+    }
+
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
         self.command.dispatch()
     }
@@ -214,6 +221,31 @@ mod tests {
     fn log_level_propagates_to_umount() {
         let cli = parse_for_test(&["--log-level", "trace", "umount", "Z:"]).unwrap();
         assert_eq!(cli.log_level, "trace");
+    }
+
+    #[test]
+    fn snapshot_log_level_works_before_and_after_the_operation() {
+        for args in [
+            &["--log-level", "trace", "snapshot", "vol", "list"][..],
+            &["snapshot", "--log-level", "trace", "vol", "list"],
+            &["snapshot", "vol", "--log-level", "trace", "list"],
+            &["snapshot", "vol", "list", "--log-level", "trace"],
+            &[
+                "snapshot",
+                "vol",
+                "policy",
+                "set",
+                "--daily-at",
+                "02:30",
+                "--retention",
+                "7d",
+                "--log-level",
+                "trace",
+            ],
+        ] {
+            let cli = parse_for_test(args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert_eq!(cli.log_level(), "trace", "{args:?}");
+        }
     }
 
     #[test]
