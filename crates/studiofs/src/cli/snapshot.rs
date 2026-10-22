@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveTime;
+use clap::error::{ContextKind, ContextValue};
 use clap::{ArgMatches, Command};
 use clap::{Args, FromArgMatches, Subcommand};
 use std::path::{Path, PathBuf};
@@ -79,10 +80,31 @@ impl FromArgMatches for SnapshotArgs {
         if raw.volume_name.starts_with('-') {
             command_arguments.insert(0, raw.volume_name.clone());
         }
-        let matches = snapshot_command_schema().try_get_matches_from(
-            std::iter::once("studiofs snapshot <VOLUME_NAME>")
-                .chain(command_arguments.iter().map(String::as_str)),
-        )?;
+        let schema = snapshot_command_schema();
+        let is_command_name = schema
+            .get_subcommands()
+            .any(|command| command.get_name() == raw.volume_name);
+        let matches = schema
+            .try_get_matches_from(
+                std::iter::once("studiofs snapshot <VOLUME_NAME>")
+                    .chain(command_arguments.iter().map(String::as_str)),
+            )
+            .map_err(|mut error| {
+                // Old syntax (`snapshot list`) parses the command as the volume name.
+                if is_command_name && error.kind() != clap::error::ErrorKind::DisplayHelp {
+                    error.insert(
+                        ContextKind::Suggested,
+                        ContextValue::StyledStrs(vec![
+                            format!(
+                                "the volume name comes first: studiofs snapshot <VOLUME_NAME> {}",
+                                raw.volume_name
+                            )
+                            .into(),
+                        ]),
+                    );
+                }
+                error
+            })?;
         let command = SnapshotCommand::from_arg_matches(&matches)?;
         Ok(Self {
             volume_name: raw.volume_name,
@@ -806,6 +828,27 @@ mod tests {
             );
         }
         assert!(parse_for_test(&["snapshot"]).is_err());
+    }
+
+    #[test]
+    fn old_snapshot_syntax_explains_that_the_volume_comes_first() {
+        for (args, command) in [
+            (&["snapshot", "list"][..], "list"),
+            (&["snapshot", "inspect", "abc"], "inspect"),
+            (&["snapshot", "policy", "show"], "policy"),
+        ] {
+            let error = parse_for_test(args).err().expect("old syntax is rejected");
+            assert!(
+                error.to_string().contains(&format!(
+                    "the volume name comes first: studiofs snapshot <VOLUME_NAME> {command}"
+                )),
+                "{args:?}: {error}"
+            );
+        }
+        let error = parse_for_test(&["snapshot", "production", "inspect"])
+            .err()
+            .expect("missing snapshot id");
+        assert!(!error.to_string().contains("the volume name comes first"));
     }
 
     #[test]
