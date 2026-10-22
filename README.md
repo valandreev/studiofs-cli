@@ -50,8 +50,8 @@ changes in the background.
 
 ## User Guide
 
-- [Українська — посібник користувача](docs/user-guide/uk/README.md)
-- [English — user guide](docs/user-guide/en/README.md)
+- [Українська — посібник користувача](docs/user-guide/uk/README.md) · [швидкий старт](docs/user-guide/uk/quick-start.md)
+- [English — user guide](docs/user-guide/en/README.md) · [quick start](docs/user-guide/en/quick-start.md)
 
 All 30 chapters are available in Ukrainian and English. The approved Ukrainian
 version is the source of truth; the guide remains a work in progress.
@@ -361,6 +361,7 @@ Useful test/runtime variables include:
 
 The practical user manual lives separately in [docs/user-guide/](docs/user-guide/README.md):
 [Українська](docs/user-guide/uk/README.md) · [English](docs/user-guide/en/README.md).
+Quick start: [Українська](docs/user-guide/uk/quick-start.md) · [English](docs/user-guide/en/quick-start.md).
 
 ### Technical contracts and developer reference
 
