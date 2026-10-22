@@ -1,8 +1,7 @@
 # 27. Maintenance and Removing a Volume
+> **Work in progress**
 
 Maintaining StudioFS involves several different tasks: checking metadata, finding unused objects in S3, removing a client's local data, or permanently deleting a volume. Each has its own command. We will start with checks and move on to deletion once we understand exactly what it removes.
-
-The examples use a volume named `myvolume`. Replace it with your own volume name. Before maintenance, close applications using the volume, allow changes to synchronize, and unmount it. If you plan to repair or clean up shared data, coordinate a pause in work with other users. Check your backups: successful synchronization does not replace them.
 
 ## Checking metadata: `fsck`
 
@@ -75,8 +74,6 @@ These are fundamentally different actions:
 | --- | --- | --- |
 | `destroy myvolume --local` | Deletes the local metadata directory, including the cache inside it | Keeps S3 data and shared metadata |
 | `destroy myvolume` | Deletes the same local state | Deletes the volume's S3 data and shared PostgreSQL metadata |
-
-Neither command is needed for ordinary unmounting. To simply finish working, see the [chapter on safe unmounting](17-unplug-safely-studiofs-umount.md).
 
 ### Local removal: `destroy --local`
 

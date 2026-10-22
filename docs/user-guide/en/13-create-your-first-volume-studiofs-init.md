@@ -1,8 +1,7 @@
 # 13. Create Your First Volume — studiofs init
+> **Work in progress**
 
-> **English translation draft; review pending.** This text has not yet been approved.
-
-S3 already has room for your files, PostgreSQL is ready to remember their structure, and StudioFS is installed. Now we will bring these components together in a **volume**—a separate StudioFS drive with its own name, settings, and encryption key.
+S3 already has room for your files, PostgreSQL is ready to remember their structure, Tailscale connects them, and StudioFS is installed. Now we will bring these components together in a **volume**—a separate StudioFS drive with its own name, settings, and encryption key.
 
 That is what `studiofs init` does. It creates a new volume, but does not yet attach it as a drive in your system. The drive letter or mount directory comes in the next step. We can plan the housewarming, but let us hold off on moving in the furniture.
 
@@ -24,10 +23,10 @@ First, you can check the available options in your installed version:
 studiofs init --help
 ```
 
-Below is a **template**: replace all uppercase values with your own. Addresses ending in `.invalid` deliberately do not point to real services. The command is shown on one line so you can adapt it for Bash, PowerShell, or another shell without different line continuation characters:
+Below is a **template**: replace all uppercase values with your own. The example host names are placeholders, not real services. The command is shown on one line so you can adapt it for Bash, PowerShell, or another shell without different line continuation characters:
 
 ```text
-studiofs init studio-projects --endpoint 'https://S3_API_HOST.invalid' --bucket 'YOUR_PRIVATE_BUCKET' --region 'YOUR_S3_REGION' --access-key 'YOUR_ACCESS_KEY_ID' --secret-key 'YOUR_SECRET_ACCESS_KEY' --meta 'postgresql://YOUR_PG_USER:YOUR_URL_ENCODED_PASSWORD@PRIVATE_PG_HOST.invalid:5432/studiofs?sslmode=require'
+studiofs init studio-projects --endpoint 'https://S3_API_HOST:PORT' --bucket 'YOUR_PRIVATE_BUCKET' --region 'YOUR_S3_REGION' --access-key 'YOUR_ACCESS_KEY_ID' --secret-key 'YOUR_SECRET_ACCESS_KEY' --meta 'postgresql://YOUR_PG_USER:YOUR_URL_ENCODED_PASSWORD@PRIVATE_PG_HOST:5432/studiofs?sslmode=require'
 ```
 
 | Part of the command | What to supply |
@@ -40,23 +39,17 @@ studiofs init studio-projects --endpoint 'https://S3_API_HOST.invalid' --bucket 
 | `--secret-key` | That key's Secret Access Key. |
 | `--meta` | The PostgreSQL server DSN. This option is required. |
 
-In the example, `PRIVATE_PG_HOST.invalid` stands for your server's private hostname. If you use TLS, the name must match the server certificate. `sslmode=require` requires TLS; the server must support it, and its certificate must pass trust and hostname validation. Omitting this parameter does not make TLS mandatory: the default mode allows a fallback to an unencrypted PostgreSQL connection if the server does not support TLS.
-
-If you followed the earlier chapters with PostgreSQL without TLS inside a secure VPN, do not copy `sslmode=require` blindly. For a connection deliberately set up this way, you can explicitly specify `sslmode=disable`, keeping the server accessible only through the private network. The VPN protects the network route, while TLS protects the PostgreSQL connection itself; these are separate settings.
+In the example, `PRIVATE_PG_HOST` stands for your server's private hostname.
 
 In a URL, a password containing characters such as `@`, `:`, `/`, or `#` must be correctly encoded as a URL component. Quotes around the DSN protect the string from the shell, but do not perform that encoding. A password written incorrectly can easily turn into a “strange server address.”
-
-**Before inserting real secrets, take care of command history.** This template passes keys and the password as process arguments: they may remain in shell history or be visible to other users through process inspection tools. Use a trusted computer and configure history handling for your shell before running it. Do not save the completed command in a repository, chat, or screenshot. Substituting a variable may keep the secret out of the history text itself, but will not hide the expanded process argument.
 
 ## What happens after you run it
 
 StudioFS first connects to the PostgreSQL maintenance database **`postgres`** and checks whether the **`studiofs`** database exists. If it does not, StudioFS tries to create it. The database name is fixed: putting another name in the DSN will not create a separate database for this volume—StudioFS rewrites it to the required name.
 
-The user therefore needs access to `postgres` and, if `studiofs` does not exist yet, permission to create it. An administrator can help prepare the database in advance; in that case, database creation permission is not needed for this step. Within `studiofs` itself, you need permission to create the internal schema and work with its data.
-
 Next, the command checks the S3 bucket. If the check fails, it tries to create the bucket. This may require the additional `CreateBucket` permission. A message about attempting creation **does not prove the bucket is missing**: incorrect keys, an endpoint, or permissions may have caused the initial failure. A bucket that has already been created and is accessible avoids the need for permission to create it.
 
-After the checks, StudioFS prepares shared metadata, checks whether a volume with that name already exists, and creates the local database, root directory, and encryption key for the new volume. The initial state is published to PostgreSQL. Future file data will go into S3 under the volume's prefix; an empty volume is not expected to show familiar user folders there.
+After the checks, StudioFS prepares shared metadata, checks whether a volume with that name already exists, and creates the local database, root directory, and encryption key for the new volume. The initial state is published to PostgreSQL.
 
 By default, the local database is at `~/.studiofs/meta/studio-projects/studio-projects.db`, where `~` is the user's home directory. If you have configured `STUDIOFS_CLIENT_ROOT`, that directory will be the root instead. The command shows the exact path at the end.
 
@@ -78,7 +71,7 @@ You can also inspect the status:
 studiofs status studio-projects
 ```
 
-Expect information about your volume, rather than a `Volume ... not found` message. This is a useful check of local state, but it does not yet prove that uploading and reading a file through S3 works. We will do that practical check after mounting.
+Expect information about your volume, rather than a `Volume ... not found` message.
 
 ## If you need to try again
 

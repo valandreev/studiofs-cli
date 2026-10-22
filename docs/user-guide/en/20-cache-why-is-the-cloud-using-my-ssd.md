@@ -1,4 +1,5 @@
 # 20. Cache: Why Is the Cloud Using My SSD?
+> **Work in progress**
 
 You opened a few clips from a cloud volume, and now your laptop has less free space. Has StudioFS decided to download the entire archive? No: it keeps the data you are working with nearby, so it does not have to go back to S3 for every next piece of video. The cloud is far away, and editing applications do not like waiting.
 
@@ -6,9 +7,9 @@ But the word “cache” is a little misleading here. Your local disk holds more
 
 ## What stays on your computer
 
-When reading, StudioFS fetches the data it needs from storage and caches it locally. That is not necessarily the exact number of bytes the application requested: fetching fragments and reading ahead can bring in more. Reopening material you have already read usually takes fewer network requests.
+When reading, StudioFS fetches the data it needs from storage and caches it locally. Reopening material you have already read usually takes fewer network requests. If the needed data is already in the cache, StudioFS will not download it again.
 
-When writing, changes become available on your computer first. Background processes then upload the contents to S3 and send shared metadata through PostgreSQL. An application's “saved” message alone does not mean another team member can already access that version.
+When writing, changes become available on your computer first. Background processes then upload the contents to S3 and send shared metadata through PostgreSQL.
 
 It helps to distinguish two states of local data:
 
@@ -23,7 +24,7 @@ For each volume, StudioFS creates a separate directory named after its UUID insi
 
 Inside the volume's cache directory, `payload/objects` holds local contents, `upload/objects` stages uploads, `index/cache.redb` holds the index, and `tmp` is used for temporary operations. StudioFS also keeps local metadata separately. These parts form a connected working state, rather than a collection of independent files you can clean up by hand.
 
-Choose a fast local SSD with space to spare for the cache. Do not place it inside the mounted StudioFS volume itself. Remember what else needs that disk: the operating system, your editing application's files, proxies, and exports.
+For the cache, choose a fast local NVMe SSD with enough free space and a filesystem recommended for your OS: NTFS on Windows, APFS on macOS, or ext4 on Linux. Do not use exFAT.
 
 Here is an example of options for **the next mount** on Linux:
 
@@ -31,9 +32,9 @@ Here is an example of options for **the next mount** on Linux:
 studiofs mount studio /mnt/studio --cache-dir /srv/studiofs-cache --cache-size 50GB
 ```
 
-Here, `studio` is the example volume name, and you need to replace both paths with your own. On Windows, the cache path might look like `D:\StudioFS-cache`; on macOS, `/Users/yourname/StudioFS-cache`.
+Here, `studio` is an example volume name, and you need to replace both paths with your own. On Windows, the cache path might look like `D:\StudioFS-cache`; on macOS, `/Users/yourname/StudioFS-cache`.
 
-You can save the options as global defaults:
+You can save these options as StudioFS defaults with:
 
 ```bash
 studiofs settings --cache-dir /srv/studiofs-cache --cache-size 50GB
@@ -49,40 +50,7 @@ It is also **not a guaranteed size limit for the entire local directory**. The i
 
 For sizes, use the suffixes `B`, `KB`, `MB`, `GB`, `TB`, `PB`, and `EB`. In StudioFS, these use binary units: `1KB = 1024B`, `1GB = 1024 × 1024 × 1024B`. For example, `50GB` and `1.5GB` are valid values; the parser discards any fractional byte. Write `GB`, rather than `GiB` or just `G`: the CLI does not support those alternative suffixes.
 
-Do not give the cache all the SSD's free space. Leave headroom for the largest local write you expect and for the rest of the system. If you write faster than the connection can upload to S3, the queue and local data will grow even with a healthy connection.
-
-## Three read options that are easy to mix up
-
-| Option | What it controls | What to watch for |
-|---|---|---|
-| `--read-buffer` | The read buffer budget in RAM | Takes a size, such as `256MB`; rounded up to whole MiB. This is not an SSD budget. |
-| `--readahead` | The sequential read-ahead width in blocks | Takes a whole number of at least `1`, rather than a number of megabytes. |
-| `--prefetch` | The prefetch concurrency budget | Takes a whole number of at least `1`; more concurrent requests may increase network and disk load. |
-
-These options are available in `mount` and `settings`. Start with the defaults. Then change one option at a time and test the same working scenario: playing a clip sequentially and jumping around the timeline put different demands on the system. Turning every number up to the maximum will not turn a laptop into a server—sometimes it just makes the cooling louder.
-
-## Checking where the space went
-
-For our example with a separate cache directory:
-
-```bash
-studiofs status studio --cache-dir /srv/studiofs-cache
-studiofs status studio --cache-dir /srv/studiofs-cache --verbose
-```
-
-Pass the **base directory**, without the UUID: the command adds it itself. For `status`, specify a custom `--cache-dir` explicitly; do not expect it to pick up the mount path saved through `settings`.
-
-In the `Local Cache` section, check:
-
-- `Root`—whether you are looking at the correct cache for this volume;
-- `Usage bytes`—the accounted size of local contents;
-- `Dirty bytes`—the amount of locally modified data;
-- `Evictable bytes`—the amount of data available for eviction;
-- `Pending uploads`—the number of uploads still awaiting completion.
-
-These counters do not replace checking the disk's free space through your operating system. `Usage bytes` is not the size of all files on the SSD, while `Used space` in the general part of the report refers to the volume's data. If you see `unknown` instead of a counter, the value is unknown, rather than zero.
-
-`--verbose` adds diagnostics from the mounted process when available. Pay attention to the snapshot's freshness. A `Pending uploads` count of zero alone also does not prove that all shared metadata has been published: check the synchronization diagnostics described in the previous chapter.
+Do not give the cache all the SSD's free space. Leave headroom for the largest local write you expect and for the rest of the system. If you write faster than the connection can upload to S3, the queue and local data will grow even with a healthy connection. By default, StudioFS tries to leave 10% free on the disk that holds the cache directory.
 
 ## If the SSD is almost full
 
@@ -90,7 +58,7 @@ Pause large new writes and exports to this disk. Check the free space, the cache
 
 Let background work finish. For immediate headroom, you can free space **outside StudioFS's working directories**, for example by removing your own exports that you no longer need. Do not manually delete the cache itself, its index, staged uploads, or local metadata. Reducing `--cache-size` does not make unpublished data safe to delete either.
 
-Review the cache budget and disk location for the next start. If unpublished data remains after a crash, preserve its directory and return to the same working state: locally saved data and metadata are needed for recovery. Bytes that were still only in process memory before the crash do not have that guarantee.
+Before the next startup, check the cache size and directory location. If unpublished data remains after a crash, do not change the cache directory: its local data and metadata are needed for recovery. Bytes that were still only in process memory before the crash do not have that guarantee.
 
 The cache is there to make work faster. The safest way to think of it is as your desk: it holds both copies of reference material and a draft you have not handed to anyone yet.
 

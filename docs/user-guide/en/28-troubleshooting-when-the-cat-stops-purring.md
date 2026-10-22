@@ -1,4 +1,5 @@
 # 28. Troubleshooting: When the Cat Stops Purring
+> **Work in progress**
 
 The drive will not mount, a colleague cannot see yesterday's render, and the SSD has suddenly run out of space? Let us start with exactly what is failing. There is always time to reinstall everything. Changes that have not been uploaded yet are better kept safe first.
 
@@ -52,8 +53,6 @@ On the first mount, StudioFS may display a UAC prompt to configure WinFSP integr
 ### macOS
 
 You need **macFUSE** and the permissions its installation requires. If the system asks you to allow a component or restart, complete those steps following [chapter 11](11-install-studiofs-on-macos.md).
-
-Check whether the experimental value `STUDIOFS_MOUNT_BACKEND=fskit` has been left in the launch environment. For regular work, use the default macFUSE backend; switching to an experimental backend is not a universal fix.
 
 ### Linux
 

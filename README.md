@@ -53,8 +53,8 @@ changes in the background.
 - [Українська — посібник користувача](docs/user-guide/uk/README.md)
 - [English — user guide](docs/user-guide/en/README.md)
 
-Chapters 01–08 are available; chapters 09–30 are planned placeholders.
-The English translation awaits separate editorial review.
+All 30 chapters are available in Ukrainian and English. The approved Ukrainian
+version is the source of truth; the guide remains a work in progress.
 
 ## What Problem Does StudioFS Solve?
 

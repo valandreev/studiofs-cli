@@ -2,7 +2,7 @@
 
 [English](../en/README.md) · [Про документацію](../README.md)
 
-Глави **01–08**: прийнятий український оригінал із Linear. Глави **09–30**: українські чернетки для вашого редагування й затвердження; такі самі тексти додано до відповідних Linear Documents. Англійські переклади цих глав підготовлено за вашим дорученням; вони очікують перегляду.
+Українську версію всіх 30 глав схвалено як джерело істини для англійського перекладу. Посібник ще не остаточний і надалі доповнюватиметься.
 
 ## Знайомство зі StudioFS
 
@@ -35,7 +35,7 @@
 
 ## Щоденна робота
 
-- [18. Робота зі справжніми творчими проєктами](18-working-with-real-creative-projects.md)
+- [18. Для чого підходить StudioFS і де потрібна обережність](18-studiofs-workloads.md)
 - [19. Синхронізація, поганий Wi-Fi та інші несподіванки](19-sync-bad-wi-fi-and-other-surprises.md)
 - [20. Кеш: чому хмара використовує мій SSD?](20-cache-why-is-the-cloud-using-my-ssd.md)
 - [21. Двоє людей, один файл: співпраця та конфлікти](21-two-people-one-file-collaboration-and-conflicts.md)
@@ -45,7 +45,7 @@
 
 - [23. Видалення файлів: чарівного кошика немає](23-deleting-files-there-is-no-magic-trash-can.md)
 - [24. Знімки: машина часу для вашого тому](24-snapshots-a-time-machine-for-your-volume.md)
-- [25. Резервні копії: навіть машині часу потрібна страховка](25-backups-even-time-machines-need-insurance.md)
+- [25. Перенесення метаданих StudioFS на новий сервер PostgreSQL](25-migrating-studiofs-metadata-to-new-postgresql-server.md)
 - [26. Облікові дані, шифрування та доступ](26-credentials-encryption-and-access.md)
 - [27. Обслуговування та видалення тому](27-maintenance-and-removing-a-volume.md)
 

@@ -1,4 +1,5 @@
 # 22. Settings, Status and Activity
+> **Work in progress**
 
 StudioFS usually works alongside your editing software: you open files while it reads data, maintains a cache, and sends changes in the background. But sometimes you want to know: what is happening now, is there enough space, and why did the same clip open faster yesterday?
 
@@ -36,7 +37,7 @@ The command saves the settings in `config.toml` and prints its path. The usual l
 | macOS | `~/Library/Application Support/studiofs/config.toml` |
 | Linux | `~/.config/studiofs/config.toml` |
 
-Changing these values does not reconfigure an existing mount or move the old cache to the new directory. To apply them, finish working with the files, unmount the volume normally, and mount it again. Do not delete the old cache blindly: it may still contain changes that have not been uploaded.
+Changing these values does not reconfigure an existing mount or move the old cache to the new directory. To apply them, finish working with the files and remount the volume.
 
 For the cache directory and size, explicit `mount` options take priority over saved values, which take priority over defaults. If no directory is specified, StudioFS uses `<meta-dir>/cache`, usually at `~/.studiofs/meta/<volume-name>/cache`. Within the base directory, each volume's cache lives separately under its UUID.
 
@@ -46,29 +47,9 @@ On macOS and Linux, you can also save a default mount point:
 studiofs settings --mount-point /mnt/studio
 ```
 
-This is a Linux example; on macOS, choose a directory you can access. The rules for appending the volume name to the path are covered in the [mounting chapter](14-mount-your-volume-studiofs-mount.md). On Windows, explicitly specify a drive letter when running `mount`, such as `Z:`.
-
 ## Disk cache and memory are different resources
 
 A larger cache helps reopen previously read media without downloading it from S3 again. It also participates in handling written data locally. However, `--cache-size` does not increase the volume's capacity or reserve the entire specified amount of disk space in advance. Leave free space for the operating system, applications, and their temporary files. A completely full SSD rarely gets faster just because we remain optimistic.
-
-Three more public options are available for reading:
-
-| Option | What it sets |
-|---|---|
-| `--read-buffer SIZE` | The read buffer budget in RAM; the size is rounded up to MiB. |
-| `--readahead BLOCKS` | The width of sequential readahead, in blocks. |
-| `--prefetch COUNT` | The concurrency budget for prefetching. |
-
-For example, this command saves a buffer budget and readahead settings:
-
-```bash
-studiofs settings --read-buffer 4GB --readahead 256 --prefetch 192
-```
-
-This illustrates the syntax; it is not a universal recipe for an editing workstation. On a computer with limited RAM, the buffer competes with your editor for memory, and excessive prefetching may read media you never even open. Start with the defaults, change one setting at a time, and compare the same task. The buffer size must be greater than zero; `readahead` and `prefetch` must be integers of at least `1`.
-
-You can also pass these options directly to `mount` for an individual mount. Their priority is: an explicit command option, the corresponding `STUDIOFS_*` environment variable, a saved value, and the built-in default. If the result differs from what you expected, also check the environment from which StudioFS starts. Internal thresholds and service switches do not need adjusting for everyday work.
 
 ## Volume status: read the snapshot and its warnings together
 

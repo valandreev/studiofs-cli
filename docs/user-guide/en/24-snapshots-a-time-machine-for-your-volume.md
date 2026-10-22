@@ -1,4 +1,5 @@
 # 24. Snapshots: A Time Machine for Your Volume
+> **Work in progress**
 
 Yesterday your edit opened fine. Today someone has overwritten a file you need. You would like to go back a step and retrieve the old version. That is what StudioFS **snapshots** are for: captured states of the entire volume that you can open separately and browse without write access.
 
@@ -6,7 +7,7 @@ This time machine has a very practical purpose: find the file you need and copy 
 
 ## What exactly goes into a snapshot?
 
-Snapshot v2 captures the volume's state from the shared metadata in PostgreSQL. It covers **the entire volume**, rather than a selected folder. Its contents are tied to data in object storage.
+A snapshot captures the volume's state from the shared metadata in PostgreSQL. It covers **the entire volume**, rather than a selected folder. Its contents are tied to data in object storage.
 
 The distinction we already know matters here: locally saved changes may not yet have been published for other clients. A snapshot does not automatically gather everything in your computer's local cache. Before an important checkpoint, save your work in the application and wait for data uploads and metadata synchronization to finish. If a project consists of several related files, let the application finish writing them; if necessary, close the project and agree on a pause with your colleagues.
 
@@ -86,21 +87,9 @@ studiofs smount projectfs projectfs.2026-08-12T14-07-09.482Z /mnt/snapshot
 
 Choose a path your user can access; do not mount the snapshot over the working volume. If needed, you can set a separate cache with `--cache-dir <path>`.
 
-`smount` always opens the snapshot **read-only**. A `--read-only` flag is neither needed nor supported. You can browse files on this drive and copy them elsewhere, but you cannot modify, rename, or delete them.
+`smount` always opens the snapshot **read-only**. You can browse files on this drive and copy them elsewhere, but you cannot modify, rename, or delete them.
 
 To recover a file, copy it from the snapshot to a separate folder on an ordinary drive or on the working volume. Check that it is the version you need before replacing the current file. For a project with multiple files, copy the required set together and check it in the appropriate application. There is no separate command here to roll back the entire volume.
-
-When you are finished, unmount the snapshot with the usual StudioFS command:
-
-```powershell
-studiofs umount Z:
-```
-
-Or, for the path in the Unix example:
-
-```bash
-studiofs umount /mnt/snapshot
-```
 
 ## Daily snapshots without calendar reminders
 
@@ -145,6 +134,6 @@ Losing PostgreSQL, the required S3 objects, or key material can cost you both yo
 
 ---
 
-[Contents](README.md) · [Українська](../uk/24-snapshots-a-time-machine-for-your-volume.md) · [← Previous](23-deleting-files-there-is-no-magic-trash-can.md) · [Next →](25-backups-even-time-machines-need-insurance.md)
+[Contents](README.md) · [Українська](../uk/24-snapshots-a-time-machine-for-your-volume.md) · [← Previous](23-deleting-files-there-is-no-magic-trash-can.md) · [Next →](25-migrating-studiofs-metadata-to-new-postgresql-server.md)
 
 [Linear source](https://linear.app/valandreev/document/24-snapshots-a-time-machine-for-your-volume-0d9aa8a05bba)

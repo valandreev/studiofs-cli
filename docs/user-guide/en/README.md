@@ -2,7 +2,7 @@
 
 [Українська](../uk/README.md) · [About this guide](../README.md)
 
-All 30 chapters are available in English. Chapters **09–30** are translations of the Ukrainian drafts, prepared at your request; English review is pending. The matching Linear Documents contain the same translations.
+All 30 chapters are translated from the approved Ukrainian version, which is the source of truth. The guide remains a work in progress.
 
 ## Getting to Know StudioFS
 
@@ -16,7 +16,7 @@ All 30 chapters are available in English. Chapters **09–30** are translations 
 - [05. Choose Your Setup](05-choose-your-setup.md)
 - [06. S3: A Home for Your Files](06-s3-a-home-for-your-files.md)
 - [07. PostgreSQL: The Brain Behind the Files](07-postgresql-the-brain-behind-the-files.md)
-- [08. Tailscale / NetBird: A Private Path to PostgreSQL](08-tailscale-netbird-a-private-path-to-postgresql.md)
+- [08. Tailscale: A Private Path to PostgreSQL](08-tailscale-netbird-a-private-path-to-postgresql.md)
 - [09. Check Your Infrastructure](09-check-your-infrastructure.md)
 
 ## Installing StudioFS
@@ -35,7 +35,7 @@ All 30 chapters are available in English. Chapters **09–30** are translations 
 
 ## Everyday Work
 
-- [18. Working with Real Creative Projects](18-working-with-real-creative-projects.md)
+- [18. What StudioFS Is Suited For, and Where to Be Careful](18-studiofs-workloads.md)
 - [19. Sync, Bad Wi-Fi, and Other Surprises](19-sync-bad-wi-fi-and-other-surprises.md)
 - [20. Cache: Why Is the Cloud Using My SSD?](20-cache-why-is-the-cloud-using-my-ssd.md)
 - [21. Two People, One File: Collaboration and Conflicts](21-two-people-one-file-collaboration-and-conflicts.md)
@@ -45,7 +45,7 @@ All 30 chapters are available in English. Chapters **09–30** are translations 
 
 - [23. Deleting Files: There Is No Magic Trash Can](23-deleting-files-there-is-no-magic-trash-can.md)
 - [24. Snapshots: A Time Machine for Your Volume](24-snapshots-a-time-machine-for-your-volume.md)
-- [25. Backups: Even Time Machines Need Insurance](25-backups-even-time-machines-need-insurance.md)
+- [25. Migrating StudioFS Metadata to a New PostgreSQL Server](25-migrating-studiofs-metadata-to-new-postgresql-server.md)
 - [26. Credentials, Encryption and Access](26-credentials-encryption-and-access.md)
 - [27. Maintenance and Removing a Volume](27-maintenance-and-removing-a-volume.md)
 

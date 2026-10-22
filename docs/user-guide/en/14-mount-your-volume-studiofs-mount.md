@@ -1,16 +1,7 @@
 # 14. Mount Your Volume — studiofs mount
+> **Work in progress**
 
 The volume is ready, but your editing application does not yet know where to find the media. Let us mount it in your computer's file system: in Windows it will appear as a drive with a letter, and on macOS or Linux as a folder. That is what `studiofs mount` does.
-
-We will call our volume `myvolume` below. If you created yours under a different name, replace `myvolume` in the commands with that name. There is no need to create another volume here: `mount` connects one you have already prepared.
-
-## Before you start
-
-This computer needs StudioFS and the mounting software for your system: **WinFSP on Windows, macFUSE on macOS, or libfuse3 on Linux**. Installation instructions are in the earlier chapters.
-
-You also need the volume's local configuration. After `studiofs init`, it is already on the computer where you created the volume. On another computer, first retrieve the existing volume's configuration using `studiofs discover`; we will cover that scenario separately. Running `init` again does not replace connecting to a shared volume.
-
-For the first launch, check access to PostgreSQL and S3. If you reach the database through Tailscale or NetBird, turn on the VPN. StudioFS works with local metadata, but that does not mean a fresh client can obtain the whole shared file space without a network connection.
 
 ## Windows: choosing an available drive letter
 
@@ -28,23 +19,23 @@ Open File Explorer and go to `Z:\`. A new volume may be empty—that is normal. 
 
 ## macOS and Linux: choosing a folder
 
-For your first mount, a folder in your own home directory is convenient, since you have write access there:
+On macOS, use the `/Volumes/Studiofs` directory prepared in the previous chapter:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS"
+studiofs mount myvolume /Volumes/Studiofs
 ```
 
-In this example, the actual mount point is **`$HOME/StudioFS/myvolume`**. StudioFS appends the volume name to the supplied path unless its last component already matches that name. So the command with the full path:
+StudioFS appends the volume name to the supplied path unless its last component already matches that name. The actual mount point will be **`/Volumes/Studiofs/myvolume`**. On Linux, use a folder in your home directory:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS/myvolume"
+studiofs mount myvolume /mnt/StudioFS
 ```
 
-leads to the same place, rather than `myvolume/myvolume`. These are alternative examples: you only need to run one of them.
+Both commands create a mount point using the volume name. Run the command for your system.
 
-StudioFS tries to create the required directories itself. Choose a dedicated mount folder without your working files in it. If the system denies access, check permissions on the parent directory; for a first attempt, your home folder is usually more convenient than the system directories `/mnt` or `/Volumes`.
+StudioFS tries to create the required directories itself. Choose a dedicated mount folder without your working files in it. On macOS, make sure you have write access to `/Volumes/Studiofs`; chapter 11 explains how to set it up. On Linux, use a folder your user can access.
 
-On macOS, open Finder, press **⌘⇧G**, and enter the full path to `StudioFS/myvolume` in your home folder. On Linux, open that folder in your file manager. The paths are similar, but the system software differs: macOS uses macFUSE, and Linux uses libfuse3. Permission settings and installation requirements also depend on the platform.
+On macOS, open Finder, press **⌘⇧G**, and enter `/Volumes/Studiofs/myvolume`. On Linux, open `/mnt/StudioFS/myvolume` in your file manager. The systems use different software: macOS uses macFUSE, and Linux uses libfuse3.
 
 ## Why has the terminal not returned to the prompt?
 
@@ -61,13 +52,19 @@ On macOS or Linux, supply your path instead of `Z:`. This mode is useful for the
 For everyday work, there is **background mode**:
 
 ```powershell
-studiofs mount myvolume Z: --detach
+studiofs mount myvolume Z: -d
 ```
 
-Or on macOS or Linux:
+On macOS:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS" -d
+studiofs mount myvolume /Volumes/Studiofs -d
+```
+
+On Linux:
+
+```bash
+studiofs mount myvolume /mnt/StudioFS -d
 ```
 
 `-d` is short for `--detach`. StudioFS starts a separate process, leaving you free to use the terminal again. You cannot pass `--foreground` and `--detach` together.
@@ -82,10 +79,16 @@ After launch, open the drive or folder and look at its contents. In a second ter
 Get-ChildItem Z:\
 ```
 
-Or on macOS or Linux:
+On macOS:
 
 ```bash
-ls -la "$HOME/StudioFS/myvolume"
+ls -la /Volumes/Studiofs/myvolume
+```
+
+On Linux:
+
+```bash
+ls -la /mnt/StudioFS/myvolume
 ```
 
 To check writing, use File Explorer or your file manager to create a folder called `mount-check`, confirm that it appears, and delete it. An empty volume will be empty again afterward. If you deliberately mounted it with `--read-only`, creating the folder should be denied—that is the expected behavior.
@@ -114,10 +117,16 @@ A background mount is stopped with a separate command. On Windows:
 studiofs umount Z:
 ```
 
-On macOS or Linux, pass **the actual path, including the volume name**:
+On macOS, pass **the actual path, including the volume name**:
 
 ```bash
-studiofs umount "$HOME/StudioFS/myvolume"
+studiofs umount /Volumes/Studiofs/myvolume
+```
+
+On Linux:
+
+```bash
+studiofs umount /mnt/StudioFS/myvolume
 ```
 
 Wait for the command to finish. We will cover unmounting and shutdown in more detail in a separate chapter; forcibly terminating the process should not become your usual way of removing the drive.
