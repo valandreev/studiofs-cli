@@ -3728,6 +3728,30 @@ fn ram_readahead_serves_sequential_reads_from_loaded_chunks() {
 }
 
 #[test]
+fn ram_readahead_lead_covers_requests_larger_than_depth() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) =
+        make_ram_readahead_test_vfs(&tmp, "ram-readahead-large", 8 * RAM_READAHEAD_TEST_MIB);
+    rt.block_on(async move {
+        let len = 60 * RAM_READAHEAD_TEST_MIB;
+        let ino = write_ram_readahead_test_file(&vfs, b"ram-readahead-large.bin", len).await;
+        let reader = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+        assert!(vfs.enable_sequential_ram_readahead(reader));
+
+        // WinFSP passes whole unbuffered frames, larger than the 8 MiB depth.
+        let request = 12 * RAM_READAHEAD_TEST_MIB;
+        for offset in (0..len).step_by(request) {
+            let data = read_ram_readahead_range(&vfs, reader, ino, offset, request).await;
+            assert!(data == ram_readahead_pattern(offset, request));
+        }
+        let stats = vfs.ram_readahead_stats();
+        assert_eq!(stats.hit_reads, 3, "{stats:?}");
+        assert_eq!(stats.discarded_chunks, 0, "{stats:?}");
+        vfs.release_fh(reader).await.unwrap();
+    });
+}
+
+#[test]
 fn ram_readahead_serves_forward_overlapping_reads_from_loaded_chunks() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) =

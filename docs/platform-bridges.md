@@ -653,7 +653,7 @@ observe that per-descriptor hint, so it opts all read-only handles into VFS
 sequential RAM read-ahead (`StudioVfs::enable_sequential_ram_readahead`).
 After two forward reads whose ranges touch or overlap and extend the stream,
 the VFS loads 4 MiB-aligned chunks ahead in background tasks. Its idle lead is
-`sequential_ram_readahead_bytes` (default 32 MiB on macOS,
+`sequential_ram_readahead_bytes` (default 32 MiB on macOS and Windows,
 `STUDIOFS_SEQUENTIAL_RAM_READAHEAD_BYTES`, `0` disables it). Both read-ahead
 environment variables accept byte counts or size suffixes such as `8MB`, with
 surrounding whitespace allowed. Nonzero configured depths round up to 4 MiB
@@ -668,11 +668,16 @@ installs its bytes only if no invalidation of the inode happened since it was
 scheduled; any invalidation, seek, or switch to kernel read-ahead discards all
 chunks of the handle. Chunks ending at or before the next callback's start
 are released, while its overlapping tail remains available for reuse.
-Write-capable handles and the Linux and WinFSP bridges do not use RAM read-ahead.
+A lead never ends inside the next request: when a callback is larger than the
+configured depth, the lead extends to the request size plus one chunk.
+WinFSP opts in read-only handles that run without the cache manager
+(`FILE_FLAG_NO_BUFFERING`, as AJA System Test opens files, or the
+conservative cache policy); cached WinFSP handles keep cache-manager
+read-ahead. Write-capable handles and the Linux bridge do not use RAM read-ahead.
 
 When pending/active uploads, deferred materialization/release, or dirty local
 payload objects compete for the cache disk, read-ahead uses
-`sequential_ram_readahead_shared_bytes` (default 12 MiB on macOS,
+`sequential_ram_readahead_shared_bytes` (default 12 MiB on macOS and Windows,
 `STUDIOFS_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES`). It holds this shared depth
 for two seconds after the last busy observation. Shared depth is capped at
 the idle depth; zero disables new speculative loads while busy. As with idle

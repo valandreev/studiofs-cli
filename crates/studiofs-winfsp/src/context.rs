@@ -2023,6 +2023,11 @@ impl FileSystemContext for StudioFsContext {
         let disable_os_cache =
             self.should_disable_os_cache_for_handle(handle.handle(), trunc, raw_create_options, 0);
         handle.handle_mut().set_disable_os_cache(disable_os_cache);
+        // Uncached readers (FILE_FLAG_NO_BUFFERING, e.g. AJA System Test) get no
+        // cache-manager read-ahead; overlap their disk reads in the VFS instead.
+        if disable_os_cache && !handle.handle().is_dir && !open_flags.allows_write() {
+            self.vfs.enable_sequential_ram_readahead(handle.handle().fh);
+        }
         self.vfs.note_winfsp_os_cache_open(disable_os_cache);
         set_current_winfsp_open_disable_cache(disable_os_cache);
 
@@ -3622,6 +3627,49 @@ mod tests {
         );
 
         <StudioFsContext as FileSystemContext>::close(&ctx, handle);
+    }
+
+    #[test]
+    fn uncached_read_only_open_enables_sequential_ram_readahead() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("uncached-ram-readahead");
+        assert!(wait_until(Duration::from_secs(1), || vfs.coherence_allows_os_cache()));
+        vfs.create(ROOT_INO, b"frames.bin", 0, 0, 0o644)
+            .expect("create file");
+        let file_name = U16CString::from_str(r"\frames.bin").expect("u16 path");
+        let open = |create_options, access| {
+            <StudioFsContext as FileSystemContext>::open(
+                &ctx,
+                file_name.as_ucstr(),
+                create_options,
+                access,
+                &mut empty_open_file_info(),
+            )
+            .expect("open existing file")
+        };
+
+        let uncached = open(
+            FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION,
+            FILE_GENERIC_READ_ACCESS,
+        );
+        assert!(uncached.disable_os_cache);
+        assert!(vfs.sequential_ram_readahead_enabled(uncached.fh));
+
+        let cached = open(0, FILE_GENERIC_READ_ACCESS);
+        assert!(!cached.disable_os_cache);
+        assert!(
+            !vfs.sequential_ram_readahead_enabled(cached.fh),
+            "cache-manager read-ahead serves cached handles"
+        );
+
+        let writer = open(
+            FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION,
+            FILE_GENERIC_READ_ACCESS | FILE_GENERIC_WRITE_ACCESS,
+        );
+        assert!(!vfs.sequential_ram_readahead_enabled(writer.fh));
+
+        for handle in [uncached, cached, writer] {
+            <StudioFsContext as FileSystemContext>::close(&ctx, handle);
+        }
     }
 
     #[test]
