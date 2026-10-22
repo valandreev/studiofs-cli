@@ -35,7 +35,7 @@
 
 ## Щоденна робота
 
-- [18. Робота зі справжніми творчими проєктами](18-working-with-real-creative-projects.md)
+- [18. Для чого підходить StudioFS і де потрібна обережність](18-studiofs-workloads.md)
 - [19. Синхронізація, поганий Wi-Fi та інші несподіванки](19-sync-bad-wi-fi-and-other-surprises.md)
 - [20. Кеш: чому хмара використовує мій SSD?](20-cache-why-is-the-cloud-using-my-ssd.md)
 - [21. Двоє людей, один файл: співпраця та конфлікти](21-two-people-one-file-collaboration-and-conflicts.md)

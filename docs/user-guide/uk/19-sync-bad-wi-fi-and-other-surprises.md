@@ -84,6 +84,6 @@ studiofs perf /mnt/studio --count 5
 
 ---
 
-[Зміст](README.md) · [English](../en/19-sync-bad-wi-fi-and-other-surprises.md) · [← Попередня](18-working-with-real-creative-projects.md) · [Наступна →](20-cache-why-is-the-cloud-using-my-ssd.md)
+[Зміст](README.md) · [English](../en/19-sync-bad-wi-fi-and-other-surprises.md) · [← Попередня](18-studiofs-workloads.md) · [Наступна →](20-cache-why-is-the-cloud-using-my-ssd.md)
 
 [Джерело в Linear](https://linear.app/valandreev/document/19-sync-bad-wi-fi-and-other-surprises-48d23b2a42ab)
