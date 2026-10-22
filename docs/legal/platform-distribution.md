@@ -204,7 +204,8 @@ Observed on 2026-10-22 with `cargo build --locked -p studiofs --release` in an
   `libfuse.2.dylib`, which macFUSE distributes under the LGPL; LGPL-2.1
   dynamic linking is compatible with GPL-3.0-only. The notice file names
   macFUSE and libfuse.
-- **FSKit/MFMount is excluded from 0.2.0 release binaries.** Release builds
+- **FSKit/MFMount is excluded from 0.2.0 release binaries** (confirmed by
+  the maintainer on 2026-10-22). Release builds
   must set `STUDIOFS_MFMOUNT_FRAMEWORK_DIR` to a directory without
   `MFMount.framework`, and the release gate below must show no `MFMount`
   load command. Developers may still build FSKit locally.
