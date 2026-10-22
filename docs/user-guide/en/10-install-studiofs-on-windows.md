@@ -6,15 +6,7 @@ Below, we use **PowerShell on Windows itself**, not inside WSL. The examples are
 
 ## WinFSP first
 
-Visit the [official WinFSP website](https://winfsp.dev/), download the installer, and install the component. Windows may ask for administrator privileges because you are installing a filesystem driver. If the installer asks you to restart, do so before checking StudioFS. On a workstation with restricted permissions, it is best to ask an administrator to handle this step.
-
-Keep the default installation location unless you have a reason to change it. StudioFS looks for the WinFSP library alongside its executable and in the standard `WinFsp\bin` folder under `Program Files (x86)` or `Program Files`. An x64 build needs `winfsp-x64.dll`. For example, with a default installation, you can check:
-
-```powershell
-Test-Path 'C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll'
-```
-
-`True` confirms that the file exists at that exact location, but does not yet verify that the driver works. If you see `False`, check the installation location and selected architecture. Copying a random DLL from the internet is no substitute for installing WinFSP.
+Download and install **WinFSP 2026 or newer** from the [official WinFSP GitHub releases](https://github.com/winfsp/winfsp/releases). StudioFS uses several newer WinFSP features, so earlier versions are not supported. Windows may ask for administrator privileges because you are installing a filesystem driver. If the installer asks you to restart, do so before checking StudioFS. On a workstation with restricted permissions, it is best to ask an administrator to handle this step.
 
 ## Where to get StudioFS
 
@@ -87,7 +79,7 @@ Your account needs write access to StudioFS's local state and cache folders. The
 
 If startup reports a missing WinFSP DLL, check its installation, the standard path, and the architecture match. If Windows blocks a downloaded file, check its source and contact your administrator according to your studio's policies. You do not need to change PowerShell Execution Policy to run `studiofs.exe`—that setting controls scripts and is not a way to install a driver.
 
-**If help opens, the client is ready to configure.** This does not yet verify storage access or a real mount. If your workstation runs Windows, you can skip the macOS and Linux installation chapters and move on to [creating your first volume](13-create-your-first-volume-studiofs-init.md). If a colleague has already created the volume, see [connecting a second computer](16-connect-a-second-computer-studiofs-discover.md). For the mount, prepare an unused drive letter, such as `Z:`; we will cover the commands and verify operation in the [chapter on mounting](14-mount-your-volume-studiofs-mount.md).
+**If help opens, the client is ready to configure.**
 
 ---
 
