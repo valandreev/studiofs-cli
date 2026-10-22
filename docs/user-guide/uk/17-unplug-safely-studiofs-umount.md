@@ -43,7 +43,7 @@ studiofs perf /Volumes/Studiofs/myvolume --section upload --section metadata --c
 На Linux:
 
 ```bash
-studiofs perf "$HOME/StudioFS/myvolume" --section upload --section metadata --count 5
+studiofs perf /mnt/StudioFS/myvolume --section upload --section metadata --count 5
 ```
 
 Це **спостереження, а не команда синхронізації**. Порожня черга завантажень або нульова швидкість передавання ще не доводять, що всі версії та метадані опубліковані. Для важливої передачі роботи іншому комп’ютеру додатково перевірте на ньому останні файли: відкрийте їх і переконайтеся, що бачите потрібні зміни, а не лише знайомі назви.
@@ -67,7 +67,7 @@ studiofs umount /Volumes/Studiofs/myvolume
 Для папки на Linux:
 
 ```bash
-studiofs umount "$HOME/StudioFS/myvolume"
+studiofs umount /mnt/StudioFS/myvolume
 ```
 
 Замініть шлях на той, який використали під час підключення. Якщо в ньому є пробіли, залиште лапки. Зверніть увагу на написання: `umount`, без літери `n` після `u`.
@@ -103,7 +103,7 @@ studiofs mount myvolume /Volumes/Studiofs
 На Linux:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS"
+studiofs mount myvolume /mnt/StudioFS
 ```
 
 Підставте свою назву тому та шлях із [розділу про підключення](14-mount-your-volume-studiofs-mount.md). Після запуску дайте StudioFS відновити незавершену роботу, якщо вона залишилася. Далі можна знову відкривати проєкт — або спершу переконатися, що вчорашні зміни вже доступні колезі.

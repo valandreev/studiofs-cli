@@ -37,14 +37,14 @@ studiofs mount myvolume /Volumes/Studiofs
 StudioFS додає ім’я тому до переданого шляху, якщо його остання частина ще не збігається з цим ім’ям. Фактична точка буде **`/Volumes/Studiofs/myvolume`**. У Linux використайте папку у своєму домашньому каталозі:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS"
+studiofs mount myvolume /mnt/StudioFS
 ```
 
 Обидві команди створюють точку монтування з назвою тому. Виконайте команду для своєї системи.
 
 StudioFS намагається створити потрібні каталоги самостійно. Оберіть окрему папку для підключення, без ваших робочих файлів. На macOS перевірте, що маєте права запису в `/Volumes/Studiofs`; інструкцію з підготовки прав наведено в главі 11. У Linux використовуйте папку, до якої ваш користувач має доступ.
 
-На macOS відкрийте Finder, натисніть **⌘⇧G** і введіть `/Volumes/Studiofs/myvolume`. На Linux відкрийте `$HOME/StudioFS/myvolume` у файловому менеджері. Системні засоби різні: macOS використовує macFUSE, Linux — libfuse3.
+На macOS відкрийте Finder, натисніть **⌘⇧G** і введіть `/Volumes/Studiofs/myvolume`. На Linux відкрийте `/mnt/StudioFS/myvolume` у файловому менеджері. Системні засоби різні: macOS використовує macFUSE, Linux — libfuse3.
 
 ## Чому термінал не повернув запрошення?
 
@@ -73,7 +73,7 @@ studiofs mount myvolume /Volumes/Studiofs -d
 На Linux:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS" -d
+studiofs mount myvolume /mnt/StudioFS -d
 ```
 
 `-d` — скорочення для `--detach`. StudioFS запускає окремий процес, і терміналом знову можна користуватися. `--foreground` і `--detach` разом передавати не можна.
@@ -97,7 +97,7 @@ ls -la /Volumes/Studiofs/myvolume
 На Linux:
 
 ```bash
-ls -la "$HOME/StudioFS/myvolume"
+ls -la /mnt/StudioFS/myvolume
 ```
 
 Для перевірки запису створіть через Провідник чи файловий менеджер папку `mount-check`, переконайтеся, що вона з’явилася, і видаліть її. Порожній том після цього знову буде порожнім. Якщо ви свідомо підключили його з `--read-only`, створення папки має бути заборонене — це очікувана поведінка.
@@ -135,7 +135,7 @@ studiofs umount /Volumes/Studiofs/myvolume
 На Linux:
 
 ```bash
-studiofs umount "$HOME/StudioFS/myvolume"
+studiofs umount /mnt/StudioFS/myvolume
 ```
 
 Дочекайтеся завершення команди. Детальніше про відключення та завершення роботи поговоримо в окремій главі; примусове завершення процесу не варто робити звичним способом прибрати диск.

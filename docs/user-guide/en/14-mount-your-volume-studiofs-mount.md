@@ -37,14 +37,14 @@ studiofs mount myvolume /Volumes/Studiofs
 StudioFS appends the volume name to the supplied path unless its last component already matches that name. The actual mount point will be **`/Volumes/Studiofs/myvolume`**. On Linux, use a folder in your home directory:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS"
+studiofs mount myvolume /mnt/StudioFS
 ```
 
 Both commands create a mount point using the volume name. Run the command for your system.
 
 StudioFS tries to create the required directories itself. Choose a dedicated mount folder without your working files in it. On macOS, make sure you have write access to `/Volumes/Studiofs`; chapter 11 explains how to set it up. On Linux, use a folder your user can access.
 
-On macOS, open Finder, press **⌘⇧G**, and enter `/Volumes/Studiofs/myvolume`. On Linux, open `$HOME/StudioFS/myvolume` in your file manager. The systems use different software: macOS uses macFUSE, and Linux uses libfuse3.
+On macOS, open Finder, press **⌘⇧G**, and enter `/Volumes/Studiofs/myvolume`. On Linux, open `/mnt/StudioFS/myvolume` in your file manager. The systems use different software: macOS uses macFUSE, and Linux uses libfuse3.
 
 ## Why has the terminal not returned to the prompt?
 
@@ -73,7 +73,7 @@ studiofs mount myvolume /Volumes/Studiofs -d
 On Linux:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS" -d
+studiofs mount myvolume /mnt/StudioFS -d
 ```
 
 `-d` is short for `--detach`. StudioFS starts a separate process, leaving you free to use the terminal again. You cannot pass `--foreground` and `--detach` together.
@@ -97,7 +97,7 @@ ls -la /Volumes/Studiofs/myvolume
 On Linux:
 
 ```bash
-ls -la "$HOME/StudioFS/myvolume"
+ls -la /mnt/StudioFS/myvolume
 ```
 
 To check writing, use File Explorer or your file manager to create a folder called `mount-check`, confirm that it appears, and delete it. An empty volume will be empty again afterward. If you deliberately mounted it with `--read-only`, creating the folder should be denied—that is the expected behavior.
@@ -135,7 +135,7 @@ studiofs umount /Volumes/Studiofs/myvolume
 On Linux:
 
 ```bash
-studiofs umount "$HOME/StudioFS/myvolume"
+studiofs umount /mnt/StudioFS/myvolume
 ```
 
 Wait for the command to finish. We will cover unmounting and shutdown in more detail in a separate chapter; forcibly terminating the process should not become your usual way of removing the drive.

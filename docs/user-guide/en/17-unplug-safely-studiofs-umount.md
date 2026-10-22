@@ -43,7 +43,7 @@ studiofs perf /Volumes/Studiofs/myvolume --section upload --section metadata --c
 On Linux:
 
 ```bash
-studiofs perf "$HOME/StudioFS/myvolume" --section upload --section metadata --count 5
+studiofs perf /mnt/StudioFS/myvolume --section upload --section metadata --count 5
 ```
 
 This is **observation, not a synchronization command**. An empty upload queue or a transfer rate of zero does not prove that all versions and metadata have been published. For an important handoff to another computer, also check the latest files there: open them and make sure you see the changes you need, rather than just familiar names.
@@ -67,7 +67,7 @@ studiofs umount /Volumes/Studiofs/myvolume
 For a folder on Linux:
 
 ```bash
-studiofs umount "$HOME/StudioFS/myvolume"
+studiofs umount /mnt/StudioFS/myvolume
 ```
 
 Replace the path with the one you used when mounting. Keep the quotes if it contains spaces. Notice the spelling: `umount`, with no `n` after the `u`.
@@ -103,7 +103,7 @@ studiofs mount myvolume /Volumes/Studiofs
 On Linux:
 
 ```bash
-studiofs mount myvolume "$HOME/StudioFS"
+studiofs mount myvolume /mnt/StudioFS
 ```
 
 Substitute your volume name and the path from the [chapter on mounting](14-mount-your-volume-studiofs-mount.md). After startup, let StudioFS resume any unfinished work. Then you can reopen your project—or first make sure yesterday's changes are already available to your colleague.

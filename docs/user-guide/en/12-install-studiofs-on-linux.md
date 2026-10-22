@@ -6,9 +6,7 @@ In this chapter, we will prepare the system, download StudioFS, and check that i
 
 ## Which Linux distribution should I use?
 
-The repository has checks for **Ubuntu 24.04** and **Rocky Linux 9**. For testing a real mount on Rocky, the documentation requires **version 9.4 or later**. These are reference points for choosing a workstation system, rather than a promise that every distribution with a similar name has already been tested.
-
-The commands below cover these two systems. On Debian, Fedora, Arch, and other distributions, the required packages and their names may differ; we do not yet have separate verified instructions for them here.
+StudioFS has been tested on **Ubuntu 24.04** and **Rocky Linux 9.4**. It should work on other Linux distributions, but we have not tested them; system package names and requirements may differ.
 
 You need administrator privileges to install system packages. Run StudioFS as your regular user.
 
@@ -81,14 +79,15 @@ In this example, we expect the path to `studiofs` in your `.local/bin` folder. A
 
 ## Preparing a mount folder
 
-Choose an empty folder in your home directory. For example, for a future volume named `studio`:
+Create `/mnt/StudioFS` and give it to your user so StudioFS can create mount points inside it:
 
 ```bash
-mkdir -p "$HOME/StudioFS/studio"
-ls -ld "$HOME/StudioFS/studio"
+sudo mkdir -p /mnt/StudioFS
+sudo chown "$(id -un):$(id -gn)" /mnt/StudioFS
+ls -ld /mnt/StudioFS
 ```
 
-The folder you create should belong to your user. Do not put media in it before mounting: ordinary local files will not automatically become volume files, and once the file system is mounted, it will hide the folder's existing contents.
+For a volume named `studio`, the actual mount point will be `/mnt/StudioFS/studio`: StudioFS appends the volume name to the directory you provide. Do not put media in it before mounting: ordinary local files will not automatically become volume files, and once the file system is mounted, it will hide the folder's existing contents.
 
 Run StudioFS as the same user who will work with the media. There is no need to make the folder accessible to everyone with `chmod 777` or run the program through `sudo` to get past an unexplained access error. First check the folder's owner and access to `/dev/fuse`. These examples prepare a mount for your user; access from other accounts requires a separate permissions check.
 
