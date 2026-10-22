@@ -39,6 +39,8 @@ For remote PostgreSQL access, we recommend a private network such as **Tailscale
 
 Either way, remember to keep independent backups: **S3 is a place to store data, not an automatic guarantee against data loss.**
 
+If you want to set up both options right away with ready-made commands, use the [Quick Start](quick-start.md).
+
 Made your choice? In the next chapter, we will create an S3 bucket and prepare access settings for StudioFS.
 
 ---
