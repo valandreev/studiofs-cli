@@ -41,25 +41,26 @@ const RAM_READAHEAD_MIN_STREAK: u32 = 2;
 /// chunk boundary miss and the chunk read is wasted.
 const RAM_READAHEAD_MIN_DEPTH_CHUNKS: u64 = 2;
 
-/// Default idle per-handle read-ahead depth. Only macFUSE opts handles in today.
+/// Default idle per-handle read-ahead depth. macFUSE and WinFSP opt handles in.
 ///
 /// Read-ahead competes with background write-back and upload rereads for the
 /// cache disk. On the reference USB disk, 12 MiB raised a 16 GB F_NOCACHE read
 /// by about 50% while the upload kept 40-70% of its rate; 32 MiB read faster
 /// but stalled the upload until the read ended. Use 32 MiB only while idle
 /// and retain the 12 MiB depth while background disk work is pending.
-pub(super) const DEFAULT_SEQUENTIAL_RAM_READAHEAD_BYTES: usize = if cfg!(target_os = "macos") {
-    32 * 1024 * 1024
-} else {
-    0
-};
+pub(super) const DEFAULT_SEQUENTIAL_RAM_READAHEAD_BYTES: usize =
+    if cfg!(any(target_os = "macos", windows)) {
+        32 * 1024 * 1024
+    } else {
+        0
+    };
 
-pub(super) const DEFAULT_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES: usize = if cfg!(target_os = "macos")
-{
-    12 * 1024 * 1024
-} else {
-    0
-};
+pub(super) const DEFAULT_SEQUENTIAL_RAM_READAHEAD_SHARED_BYTES: usize =
+    if cfg!(any(target_os = "macos", windows)) {
+        12 * 1024 * 1024
+    } else {
+        0
+    };
 const RAM_READAHEAD_SHARED_HOLD: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
@@ -487,6 +488,13 @@ impl StudioVfs {
                 return;
             }
             let first = end / CHUNK_BYTES;
+            // A lead shorter than the next request never covers it: WinFSP
+            // passes whole unbuffered frames, which can exceed the depth.
+            let depth_chunks = if depth_chunks == 0 {
+                0
+            } else {
+                depth_chunks.max((read as u64).div_ceil(CHUNK_BYTES) + 1)
+            };
             let limit = first.saturating_add(depth_chunks);
             while state
                 .chunks

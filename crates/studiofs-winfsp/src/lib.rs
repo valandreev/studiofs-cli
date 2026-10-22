@@ -831,7 +831,7 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     } = request;
 
     let options = parse_mount_options(&volume_label).map_err(invalid_input_io_error)?;
-    tracing::info!(
+    tracing::debug!(
         metadata_cache_policy = options.metadata_cache_policy.as_str(),
         file_info_timeout_ms = options.file_info_timeout_ms,
         dir_info_timeout_ms = options.dir_info_timeout_ms,

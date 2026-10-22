@@ -13,13 +13,27 @@ use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_cached_handle_reloads_after_queue_overflow() {
-    assert_eq!(
-        std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref(),
-        Ok("1"),
-        "set STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 to run this native mount test"
-    );
-    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
-        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive, for example Z:");
+    // Same lookup as the mount_sanity suite: process env first, then the workspace `.env`.
+    let configured_value = |key: &str| {
+        std::env::var(key).ok().or_else(|| {
+            dotenvy::from_path_iter(studiofs_test_support::workspace_root().join(".env"))
+                .ok()?
+                .flatten()
+                .find_map(|(name, value)| (name == key).then_some(value))
+        })
+    };
+    if configured_value("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Some("1") {
+        return;
+    }
+    let mount_point = match configured_value("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP overflow mount test: set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
     let bytes = mount_point.as_bytes();
     assert!(
         bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':',
