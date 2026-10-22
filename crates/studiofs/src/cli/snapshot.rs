@@ -635,9 +635,7 @@ fn snapshot_context_error(path: &Path, error: impl std::fmt::Display) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::super::parse_for_test;
-    use super::{
-        SnapshotArgs, SnapshotCommand, format_catalog_error, format_duration, resolve_volume,
-    };
+    use super::{SnapshotCommand, format_catalog_error, format_duration, resolve_volume};
     use std::fs;
     use std::time::Duration;
 
@@ -679,6 +677,11 @@ mod tests {
                 .contains("no local metadata found for snapshot volume 'unknown'")
         );
         assert!(!error.to_string().contains("corrupt"));
+        assert!(
+            error
+                .to_string()
+                .contains("studiofs snapshot <VOLUME_NAME> <COMMAND>")
+        );
     }
 
     #[test]
@@ -741,23 +744,37 @@ mod tests {
 
     #[test]
     fn snapshot_parser_accepts_reserved_and_unicode_volume_names() {
-        for volume_name in ["create", "list", "inspect", "delete", "policy", "help"] {
-            let parsed = snapshot_args(&["snapshot", volume_name, "list"]);
+        for volume_name in [
+            "create",
+            "list",
+            "inspect",
+            "delete",
+            "policy",
+            "help",
+            "команда обсяг",
+        ] {
+            let super::super::Commands::Snapshot(parsed) =
+                parse_for_test(&["snapshot", volume_name, "list"])
+                    .expect("parse named snapshot command")
+                    .command
+            else {
+                panic!("expected snapshot command");
+            };
             assert_eq!(parsed.volume_name, volume_name);
             assert!(matches!(parsed.command, SnapshotCommand::List));
         }
-
-        let parsed = snapshot_args(&["snapshot", "команда обсяг", "policy", "show"]);
-        assert_eq!(parsed.volume_name, "команда обсяг");
-        assert!(matches!(parsed.command, SnapshotCommand::Policy(_)));
     }
 
     #[test]
-    fn snapshot_help_is_generated_from_the_command_schema() {
+    fn snapshot_help_shows_the_required_volume_and_policy_commands() {
         let help = parse_for_test(&["snapshot", "--help"])
             .err()
             .expect("snapshot help should exit during parsing");
         assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(
+            help.to_string()
+                .contains("studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>")
+        );
         assert!(help.to_string().contains("policy"));
 
         let nested_help = parse_for_test(&["snapshot", "volume", "policy", "--help"])
@@ -766,13 +783,6 @@ mod tests {
         assert_eq!(nested_help.kind(), clap::error::ErrorKind::DisplayHelp);
         assert!(nested_help.to_string().contains("set"));
         assert!(nested_help.to_string().contains("show"));
-    }
-
-    fn snapshot_args(args: &[&str]) -> SnapshotArgs {
-        match parse_for_test(args).expect("parse snapshot args").command {
-            super::super::Commands::Snapshot(args) => args,
-            _ => panic!("expected snapshot command"),
-        }
     }
 
     #[test]

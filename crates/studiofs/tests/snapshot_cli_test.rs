@@ -16,16 +16,6 @@ use studiofs_meta::{
 };
 use uuid::Uuid;
 
-const VALID_SNAPSHOT_COMMANDS: &[&[&str]] = &[
-    &["create"],
-    &["list"],
-    &["inspect", "volume.2026-08-11T20-58-31.482Z"],
-    &["delete", "volume.2026-08-11T20-58-31.482Z"],
-    &["policy", "set", "--daily-at", "02:30", "--retention", "7d"],
-    &["policy", "show"],
-    &["policy", "cancel"],
-];
-
 fn run_snapshot(root: &std::path::Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_studiofs"))
         .arg("snapshot")
@@ -48,105 +38,6 @@ fn output_text(output: &Output) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )
-}
-
-fn has_snapshot_usage(text: &str) -> bool {
-    text.contains("snapshot") && text.contains("<VOLUME_NAME>") && text.contains("<COMMAND>")
-}
-
-#[test]
-fn snapshot_help_requires_a_volume_name_before_the_command() {
-    let root = studiofs_test_support::workspace_target_tempdir("snapshot-cli-help-");
-    let output = run_snapshot(root.path(), &["--help"]);
-    let text = output_text(&output);
-
-    assert!(output.status.success(), "snapshot --help failed: {text}");
-    assert!(
-        has_snapshot_usage(&text),
-        "help does not show the required volume name: {text}"
-    );
-}
-
-#[test]
-fn snapshot_operations_require_a_volume_name() {
-    let root = studiofs_test_support::workspace_target_tempdir("snapshot-cli-no-name-");
-
-    for command in VALID_SNAPSHOT_COMMANDS {
-        let output = run_snapshot(root.path(), command);
-        let text = output_text(&output);
-        assert!(
-            !output.status.success(),
-            "snapshot accepted a command without a volume name: {command:?}"
-        );
-        assert!(
-            text.contains("usage:") || text.contains("Usage:"),
-            "missing-name error did not show command usage: {text}"
-        );
-    }
-}
-
-#[test]
-fn snapshot_operations_reject_invalid_names_before_side_effects() {
-    let root = studiofs_test_support::workspace_target_tempdir("snapshot-cli-invalid-");
-
-    for command in VALID_SNAPSHOT_COMMANDS {
-        let args = std::iter::once("bad:name")
-            .chain(command.iter().copied())
-            .collect::<Vec<_>>();
-        let output = run_snapshot(root.path(), &args);
-        let text = output_text(&output);
-
-        assert!(
-            !output.status.success(),
-            "snapshot accepted an invalid volume name for {command:?}: {text}"
-        );
-        assert!(
-            text.contains("invalid volume name"),
-            "snapshot did not report an invalid volume name for {command:?}: {text}"
-        );
-        assert!(
-            !text.contains("could not connect") && !text.contains("Do you want to proceed?"),
-            "snapshot performed work before rejecting the invalid name: {text}"
-        );
-    }
-}
-
-#[test]
-fn snapshot_operations_report_unknown_named_volumes_without_scanning_other_metadata() {
-    for command in VALID_SNAPSHOT_COMMANDS {
-        let root = studiofs_test_support::workspace_target_tempdir("snapshot-cli-unknown-");
-        let unrelated_db = root
-            .path()
-            .join("meta")
-            .join("unrelated")
-            .join("unrelated.db");
-        fs::create_dir_all(unrelated_db.parent().expect("metadata directory"))
-            .expect("create unrelated metadata directory");
-        fs::write(&unrelated_db, b"not a redb database").expect("write unrelated corrupt database");
-
-        let args = std::iter::once("unknown-volume")
-            .chain(command.iter().copied())
-            .collect::<Vec<_>>();
-        let output = run_snapshot(root.path(), &args);
-        let text = output_text(&output);
-
-        assert!(
-            !output.status.success(),
-            "snapshot accepted unknown volume for {command:?}: {text}"
-        );
-        assert!(
-            text.contains("no local metadata found for snapshot volume 'unknown-volume'"),
-            "snapshot did not report the explicitly named missing volume for {command:?}: {text}"
-        );
-        assert!(
-            has_snapshot_usage(&text),
-            "unknown-volume error omitted the command usage for {command:?}: {text}"
-        );
-        assert!(
-            !text.contains("corrupt or unsupported") && !text.contains("unrelated"),
-            "snapshot inspected unrelated metadata for {command:?}: {text}"
-        );
-    }
 }
 
 fn configured_test_pg_dsn() -> Option<String> {

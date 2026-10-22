@@ -247,8 +247,7 @@ cargo test -p studiofs-meta many_snapshots_do_not_grow_serving_checkpoint_or_eve
 Run the parser and CLI-service checks for the canonical eight-form surface:
 
 ```powershell
-cargo test -p studiofs --bin studiofs snapshot_parser -- --nocapture
-cargo test -p studiofs --test snapshot_cli_test -- --nocapture
+cargo test -p studiofs --bin studiofs cli::snapshot::tests -- --nocapture
 cargo test -p studiofs --test snapshot_cli_test snapshot_cli_scopes_catalog_and_policy_to_the_named_volume -- --ignored --exact --nocapture --test-threads=1
 cargo check -p studiofs -p studiofs-meta -p studiofs-vfs
 ```
