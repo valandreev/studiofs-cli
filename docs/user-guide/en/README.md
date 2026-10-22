@@ -2,8 +2,6 @@
 
 [Українська](../uk/README.md) · [About this guide](../README.md)
 
-All 30 chapters are translated from the approved Ukrainian version, which is the source of truth. The guide remains a work in progress.
-
 **Want to get going fast?** The [Quick Start](quick-start.md) takes you from an empty server to shared team drives on one page.
 
 ## Getting to Know StudioFS
