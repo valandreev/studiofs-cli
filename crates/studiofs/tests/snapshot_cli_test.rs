@@ -64,17 +64,18 @@ struct PgVolumeCleanup {
 impl Drop for PgVolumeCleanup {
     fn drop(&mut self) {
         if let Ok(runtime) = tokio::runtime::Runtime::new() {
-            let dsn = self.dsn.clone();
-            let names = self.names.clone();
-            let _ = runtime.block_on(async move {
-                let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-                    .await
-                    .ok()?;
+            let _ = runtime.block_on(async {
+                let (client, connection) =
+                    tokio_postgres::connect(&self.dsn, tokio_postgres::NoTls)
+                        .await
+                        .ok()?;
                 let connection_task = tokio::spawn(connection);
                 let result = client
-                    .execute("DELETE FROM volumes WHERE name = ANY($1)", &[&names])
+                    .execute("DELETE FROM volumes WHERE name = ANY($1)", &[&self.names])
                     .await;
-                connection_task.abort();
+                // Dropping the client lets the connection terminate cleanly before joining it.
+                drop(client);
+                let _ = connection_task.await;
                 result.ok()
             });
         }
@@ -212,6 +213,8 @@ fn snapshot_cli_scopes_catalog_and_policy_to_the_named_volume() {
         &beta_checkpoint,
         &beta_format_info,
     ));
+    drop(client);
+    let _ = runtime.block_on(connection_task);
     let alpha =
         PgSnapshotBackend::open(&dsn, alpha_id).expect("open first volume snapshot backend");
     let beta = PgSnapshotBackend::open(&dsn, beta_id).expect("open second volume snapshot backend");
@@ -353,5 +356,4 @@ fn snapshot_cli_scopes_catalog_and_policy_to_the_named_volume() {
         .block_on(beta.load_catalog(&beta_entry.snapshot_id))
         .expect("load second volume snapshot after foreign delete request");
     assert_eq!(beta_after_delete, beta_entry);
-    connection_task.abort();
 }

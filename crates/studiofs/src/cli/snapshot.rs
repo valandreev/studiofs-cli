@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::NaiveTime;
 use clap::{ArgMatches, Command};
 use clap::{Args, FromArgMatches, Subcommand};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -60,7 +60,7 @@ impl clap::Args for SnapshotArgs {
     fn augment_args(command: Command) -> Command {
         <SnapshotRawArgs as clap::Args>::augment_args(command)
             .about("Create and recover whole-volume Snapshot v2 views")
-            .override_usage("studiofs snapshot <VOLUME_NAME> <COMMAND>")
+            .override_usage("studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>")
             .disable_help_flag(true)
             .override_help(snapshot_command_schema().render_help().to_string())
     }
@@ -75,8 +75,9 @@ impl FromArgMatches for SnapshotArgs {
         let raw = SnapshotRawArgs::from_arg_matches(matches)?;
         let mut command_arguments = raw.command_arguments;
         // Clap reserves first-token subcommand names; parse this command's tail separately.
-        if command_arguments.is_empty() && matches!(raw.volume_name.as_str(), "-h" | "--help") {
-            command_arguments.push(raw.volume_name.clone());
+        // A leading flag is never a volume name: let the schema show help or reject it.
+        if raw.volume_name.starts_with('-') {
+            command_arguments.insert(0, raw.volume_name.clone());
         }
         let matches = snapshot_command_schema().try_get_matches_from(
             std::iter::once("studiofs snapshot <VOLUME_NAME>")
@@ -185,18 +186,21 @@ impl SnapshotArgs {
 }
 
 struct ResolvedVolume {
+    meta_dir: PathBuf,
     format_info: FormatInfo,
     engine: Arc<PgSnapshotBackend>,
     context: SnapshotVolumeContext,
 }
 
 fn resolve_volume(client_root: &Path, volume_name: &str) -> Result<ResolvedVolume> {
-    let path = crate::cli::utils::default_meta_dir_in_client_root(client_root, volume_name)
-        .map_err(|error| anyhow!("{error}; usage: studiofs snapshot <VOLUME_NAME> <COMMAND>"))?
-        .join(format!("{volume_name}.db"));
+    let meta_dir = crate::cli::utils::default_meta_dir_in_client_root(client_root, volume_name)
+        .map_err(|error| {
+            anyhow!("{error}; usage: studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>")
+        })?;
+    let path = meta_dir.join(format!("{volume_name}.db"));
     if !path.is_file() {
         return Err(anyhow!(
-            "no local metadata found for snapshot volume '{volume_name}'; initialize or discover this PostgreSQL-backed volume first; usage: studiofs snapshot <VOLUME_NAME> <COMMAND>"
+            "no local metadata found for snapshot volume '{volume_name}'; initialize or discover this PostgreSQL-backed volume first; usage: studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>"
         ));
     }
     let info = match mounted_format_info(volume_name)? {
@@ -239,6 +243,7 @@ fn resolve_volume(client_root: &Path, volume_name: &str) -> Result<ResolvedVolum
             )
         })?;
     Ok(ResolvedVolume {
+        meta_dir,
         format_info: info,
         engine,
         context,
@@ -292,7 +297,7 @@ fn create_snapshot(
     let cancel = CancellationToken::new();
     let signal_cancel = cancel.clone();
     let cancellation_requested = cancel.clone();
-    let snapshot_id = entry.snapshot_id.clone();
+    let snapshot_id = entry.snapshot_id;
     let ready = runtime.block_on(async {
         let signal_task = tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
@@ -452,14 +457,11 @@ fn build_worker(volume: &ResolvedVolume) -> Result<Arc<SnapshotWorker>> {
     let worker_id =
         studiofs_meta::snapshot_ports::SnapshotWorkerId::new(format!("cli-{}", std::process::id()))
             .map_err(|error| anyhow!("snapshot worker identity is invalid: {error}"))?;
-    let client_root = crate::cli::utils::get_client_root()?;
-    let materializer_root = crate::cli::utils::default_meta_dir_in_client_root(
-        &client_root,
-        &volume.context.volume_name,
-    )?
-    .join("cache")
-    .join("snapshot-v2")
-    .join("materializer");
+    let materializer_root = volume
+        .meta_dir
+        .join("cache")
+        .join("snapshot-v2")
+        .join("materializer");
     SnapshotWorker::new(
         volume.context.clone(),
         worker_id,
@@ -627,7 +629,7 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
 
 fn snapshot_context_error(path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
     anyhow!(
-        "snapshot volume context at '{}' is unavailable: {error}; initialize or rediscover the named PostgreSQL-backed volume; usage: studiofs snapshot <VOLUME_NAME> <COMMAND>",
+        "snapshot volume context at '{}' is unavailable: {error}; initialize or rediscover the named PostgreSQL-backed volume; usage: studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>",
         path.display()
     )
 }
@@ -650,7 +652,7 @@ mod tests {
             assert!(
                 error
                     .to_string()
-                    .contains("studiofs snapshot <VOLUME_NAME> <COMMAND>")
+                    .contains("studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>")
             );
         }
         assert!(!root.path().join("meta").exists());
@@ -680,7 +682,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("studiofs snapshot <VOLUME_NAME> <COMMAND>")
+                .contains("studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>")
         );
     }
 
@@ -783,6 +785,27 @@ mod tests {
         assert_eq!(nested_help.kind(), clap::error::ErrorKind::DisplayHelp);
         assert!(nested_help.to_string().contains("set"));
         assert!(nested_help.to_string().contains("show"));
+
+        for args in [&["snapshot", "-h"][..], &["snapshot", "--help", "list"]] {
+            let help = parse_for_test(args).err().expect("help should exit");
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn snapshot_parser_rejects_flags_in_the_volume_position() {
+        for args in [
+            &["snapshot", "--unknown-flag", "list"][..],
+            &["snapshot", "--ttl", "7d", "create"],
+        ] {
+            let error = parse_for_test(args).err().expect("flag is not a volume");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{args:?}"
+            );
+        }
+        assert!(parse_for_test(&["snapshot"]).is_err());
     }
 
     #[test]
