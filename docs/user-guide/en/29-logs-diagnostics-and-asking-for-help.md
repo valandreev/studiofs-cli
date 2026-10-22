@@ -1,4 +1,5 @@
 # 29. Logs, Diagnostics and Asking for Help
+> **Work in progress**
 
 “It worked yesterday, but today it hangs” is a perfectly understandable way to start a conversation. Finding the cause takes a few more details: what you were doing, when it happened, and what StudioFS saw at the time. Let’s gather that information without sending your entire working project along with its passwords.
 

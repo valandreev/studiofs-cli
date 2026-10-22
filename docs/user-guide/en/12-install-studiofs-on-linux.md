@@ -1,4 +1,5 @@
 # 12. Install StudioFS on Linux
+> **Work in progress**
 
 On Linux, StudioFS mounts storage through **FUSE3**. This component lets the program present files from S3 as an ordinary folder: your editing application sees a path to the media, while StudioFS takes care of retrieving and saving it.
 
@@ -24,7 +25,7 @@ sudo apt-get install -y fuse3 libfuse3-3 libgtk-3-0t64 libxdo3 \
 
 These are system libraries and tools needed to run the program and mount FUSE3.
 
-### Rocky Linux 9.4 and later in the 9 series
+### Rocky Linux 9.4
 
 Some required packages come from additional repositories. The commands below enable EPEL and CRB, which changes the system's package sources. On a workstation managed by your studio, coordinate this with your system administrator.
 

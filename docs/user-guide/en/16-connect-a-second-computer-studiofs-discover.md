@@ -1,18 +1,17 @@
 # 16. Connect a Second Computer — studiofs discover
+> **Work in progress**
 
-Your first computer already has a volume and some files. Now you want to open them on another machine: perhaps move from the studio workstation to your laptop at home, or give a colleague access to the project materials.
+The first computer already has a volume and its first files. Now we want to open them on another machine: for example, move work from a studio workstation to a laptop at home, or give a colleague access to project materials.
 
-That is what `studiofs discover` is for. It finds an **existing volume in PostgreSQL** and prepares its local metadata on the new computer. The name sounds a little adventurous, but it will not search the entire internet for a lost drive: you need to know the server address and volume name.
+That is what `studiofs discover` is for. It finds an **existing volume in PostgreSQL** and prepares its local metadata on the new computer. The name sounds a little adventurous, but the command will not search the entire internet for a lost drive: you need to know the server address and volume name.
 
-**You do not need to run `studiofs init` again on the second computer.** The volume already exists. We are attaching another client to the same file space.
+**You do not need to run `studiofs init` again on the second computer.** The volume has already been created. We are attaching another client to the same space.
 
 ## Prepare the second computer
 
 Install StudioFS and the mounting tools for your system: WinFSP on Windows, macFUSE on macOS, or libfuse3 on Linux. The steps are in chapters [10](10-install-studiofs-on-windows.md), [11](11-install-studiofs-on-macos.md), and [12](12-install-studiofs-on-linux.md).
 
-Connect the computer to the same private Tailscale or NetBird network and check PostgreSQL access using [chapter 08](08-tailscale-netbird-a-private-path-to-postgresql.md). Joining the VPN is not enough on its own: the network and database rules must allow this client to connect. You also need access to S3, where the computer will fetch file contents.
-
-Have the **exact name of the existing volume** and the connection string for the same PostgreSQL server ready. We will use `myvolume` below. Replace it with your own name if you chose a different one when creating the volume. This is not a new local alias: `discover` searches for the volume by the name you provide.
+Connect the computer to the same private Tailscale or NetBird network and check PostgreSQL access using [chapter 08](08-tailscale-netbird-a-private-path-to-postgresql.md).
 
 On the first computer, finish writing a small test file and give StudioFS time to publish the changes. PostgreSQL must have a valid metadata checkpoint available for the new client. Having files in S3 alone is not enough to connect.
 
@@ -21,22 +20,20 @@ On the first computer, finish writing a small test file and give StudioFS time t
 On the **second computer**, open a terminal or PowerShell. The general command format is:
 
 ```text
-studiofs discover <volume-name> --meta "<PostgreSQL-connection-string>"
+studiofs discover <disk-name> --meta "<your-postgres-connection>"
 ```
 
-Replace the placeholders in angle brackets with your volume name and PostgreSQL connection string; do not type the brackets themselves. For example, the command might look like this:
+Angle brackets mark the places for your values; do not type them literally. For example, the command might look like this:
 
 ```bash
 studiofs discover myvolume --meta "postgres://studiofs:YOUR_PASSWORD@100.101.102.103:5432"
 ```
 
-Replace the user, password, address, and port with your own. The address here is an example: use your server's VPN address or private hostname, rather than the first computer's `127.0.0.1`. On the second machine, `127.0.0.1` means that machine itself. StudioFS uses the `studiofs` database; check TLS requirements and connection parameters with the server administrator.
-
-If the password contains special URI characters, encode them for the connection string. Quotes prevent the shell from splitting the string, but they do not replace that encoding. Do not post a command containing a real password in a chat or report: it may also remain in your terminal history.
+Replace the user, password, address, and port with your own. The address here is an example: use your server's VPN address or private hostname.
 
 During `discover`, StudioFS fetches the published checkpoint and volume settings from PostgreSQL and creates a local metadata database. **It does not download all your video, audio, and images to disk at once.** The client will read the contents of the files it needs from S3 as you work, using its own local cache.
 
-This command has no separate `--access-key` or `--secret-key` options. S3 settings, including the stored access keys, arrive as part of the existing volume's configuration. A successful `discover` does not yet check whether those keys are valid or whether the second computer can read objects from S3. We will check that by opening a file after mounting. Only trusted users should have access to the metadata and the client's local state.
+This command has no separate `--access-key` or `--secret-key` options. S3 settings, including saved access keys, arrive as part of the existing volume's configuration.
 
 ## Mount the discovered volume
 
@@ -78,7 +75,7 @@ A small text file is enough for the first check:
 
 Keep both computers connected to the network and both StudioFS processes running during this check. Do not edit the same file simultaneously: for now, we are checking that changes arrive; we will get to conflicts later.
 
-Files **do not have to appear instantly**. Saving locally, uploading to S3, and another client receiving metadata are separate steps. There is no universal promise that “everything will be there in three seconds”: timing depends on the network, the amount of changes, and the state of the clients. That is why we start with a short text file rather than an export of an entire season of a TV series.
+Files **do not have to appear instantly**, but since we are testing with a small text file, they should appear almost instantly.
 
 ## If something goes wrong
 

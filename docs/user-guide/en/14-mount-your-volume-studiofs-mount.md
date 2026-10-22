@@ -1,16 +1,7 @@
 # 14. Mount Your Volume — studiofs mount
+> **Work in progress**
 
 The volume is ready, but your editing application does not yet know where to find the media. Let us mount it in your computer's file system: in Windows it will appear as a drive with a letter, and on macOS or Linux as a folder. That is what `studiofs mount` does.
-
-We will call our volume `myvolume` below. If you created yours under a different name, replace `myvolume` in the commands with that name. There is no need to create another volume here: `mount` connects one you have already prepared.
-
-## Before you start
-
-This computer needs StudioFS and the mounting software for your system: **WinFSP on Windows, macFUSE on macOS, or libfuse3 on Linux**. Installation instructions are in the earlier chapters.
-
-You also need the volume's local configuration. After `studiofs init`, it is already on the computer where you created the volume. On another computer, first retrieve the existing volume's configuration using `studiofs discover`; we will cover that scenario separately. Running `init` again does not replace connecting to a shared volume.
-
-For the first launch, check access to PostgreSQL and S3. If you reach the database through Tailscale or NetBird, turn on the VPN. StudioFS works with local metadata, but that does not mean a fresh client can obtain the whole shared file space without a network connection.
 
 ## Windows: choosing an available drive letter
 
@@ -61,7 +52,7 @@ On macOS or Linux, supply your path instead of `Z:`. This mode is useful for the
 For everyday work, there is **background mode**:
 
 ```powershell
-studiofs mount myvolume Z: --detach
+studiofs mount myvolume Z: -d
 ```
 
 On macOS:

@@ -1,4 +1,5 @@
 # 28. Troubleshooting: When the Cat Stops Purring
+> **Work in progress**
 
 The drive will not mount, a colleague cannot see yesterday's render, and the SSD has suddenly run out of space? Let us start with exactly what is failing. There is always time to reinstall everything. Changes that have not been uploaded yet are better kept safe first.
 

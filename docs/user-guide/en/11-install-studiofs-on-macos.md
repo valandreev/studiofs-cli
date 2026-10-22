@@ -1,4 +1,5 @@
 # 11. Install StudioFS on macOS
+> **Work in progress**
 
 On a Mac, StudioFS starts in the terminal too. Once mounted, you will work with a folder in Finder, your editing application, or your compositor, but first you need to install two separate things: **macFUSE**, which helps macOS mount the filesystem, and **StudioFS** itself.
 

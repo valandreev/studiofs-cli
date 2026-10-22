@@ -1,4 +1,5 @@
 # 23. Deleting Files: There Is No Magic Trash Can
+> **Work in progress**
 
 **In StudioFS, do not count on recovering a deleted file from the trash or Recycle Bin.** This applies to ordinary deletion in a file manager, even if it calls the action “Move to Trash.”
 
@@ -39,15 +40,11 @@ A snapshot records the state of a volume at a particular moment. It may help you
 
 You still need a separate backup: a snapshot is not an independent copy of all the data and does not protect against every storage problem. Before a major cleanup, try restoring the files you need to a safe, separate location. A “copy complete” message alone does not tell you whether the copy is usable.
 
-We will cover preparing snapshots in the [next chapter](24-snapshots-a-time-machine-for-your-volume.md), and independent backups in [chapter 25](25-backups-even-time-machines-need-insurance.md).
+We will cover preparing snapshots in the [next chapter](24-snapshots-a-time-machine-for-your-volume.md). Independent backups should be arranged separately for your infrastructure.
 
 ## If you have already deleted something you need
 
-Stop further cleanup and notify the person responsible for the volume. Record the path, the approximate time of deletion, and the computer where it happened: these details will help locate the appropriate snapshot or backup.
-
-Check the copies you have: a snapshot from before deletion, backup storage, or an original saved separately. Restore to a separate location first so you can check the contents without overwriting the team's current files.
-
-Do not clear the cache or manually change S3 objects or PostgreSQL records in an attempt to recover a file. Such actions can make further work with the data more difficult. If you have no verified copy, contact your administrator or support, but do not assume recovery is guaranteed.
+If you deleted a file before creating a snapshot or backup, recovery is not guaranteed. StudioFS has no trash folder from which you can restore a deleted file.
 
 ---
 

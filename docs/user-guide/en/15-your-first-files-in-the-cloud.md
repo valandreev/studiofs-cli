@@ -1,4 +1,5 @@
 # 15. Your First Files in the Cloud
+> **Work in progress**
 
 The volume is mounted. Now let us try the everyday tasks: create a folder, copy a file, open it, rename it, and delete what we no longer need. We will start with a short text file you can afford to lose. That terabyte of source footage can take a coffee break for now.
 
@@ -61,14 +62,6 @@ An application can write again after that confirmation. Before shutting down you
 Once you have checked reading, editing, and renaming, delete `hello-again.txt` from `notes`. Check that it is gone, then delete the empty `notes` and `first-test` folders. Look at the name and path once more before confirming.
 
 **Do not count on the system Recycle Bin or Trash.** Deletion on a mounted volume may be permanent, and the change propagates to the shared file space. That is why we practiced in a separate folder and kept the original text on the local drive. We will discuss deletion in more detail in chapter 23.
-
-## Now try one small media file
-
-If every step worked without errors, copy one small clip or image to the volume, keeping its original elsewhere. Open it in your working application. This helps you check your particular application, its version, and the way it handles files: success in a text editor does not guarantee identical behavior from every video editing, graphics, and 3D package on every platform.
-
-When you first open data that is not in the local cache, StudioFS fetches the parts it needs from S3. A later read may be faster thanks to the cache, so one quick repeat viewing does not measure your cloud storage speed.
-
-You have now checked the basic file operations on your computer. In the next chapter, we will connect a second computer and see how it obtains the shared file space and files that have already been published.
 
 ---
 

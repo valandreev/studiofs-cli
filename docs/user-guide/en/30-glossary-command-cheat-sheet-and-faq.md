@@ -1,4 +1,5 @@
 # 30. Glossary, Command Cheat Sheet and FAQ
+> **Work in progress**
 
 This chapter is here to help you look up a term, find a command, and get back to work. If you are setting up StudioFS for the first time, start by [choosing your setup](05-choose-your-setup.md) rather than copying every command in order.
 
@@ -62,7 +63,7 @@ studiofs smount projectfs projectfs.2026-08-12T14-07-09.482Z Y:
 
 `studiofs destroy projectfs` **destructively deletes the volume**; it does not unmount it. The `--local` option keeps remote data but deletes local state and can destroy changes that have not yet been uploaded. Do not use it to “refresh the cache.”
 
-`studiofs dump projectfs --path-to-dump ./projectfs-metadata.json` exports part of the PostgreSQL metadata. This JSON does not contain the files themselves and is not a complete backup of the database or volume. `load` changes the target database; the procedures and limits of both commands are described in the [backup chapter](25-backups-even-time-machines-need-insurance.md).
+`studiofs dump projectfs --path-to-dump ./projectfs-metadata.json` exports part of the PostgreSQL metadata. This JSON does not contain the files themselves and is not a complete backup of the database or volume. `load` changes the target database; the migration steps and limits of both commands are described in the [metadata migration chapter](25-migrating-studiofs-metadata-to-new-postgresql-server.md).
 
 ## Frequently asked questions
 
@@ -88,7 +89,7 @@ StudioFS keeps the data applications need close at hand and accumulates new chan
 
 ### Does a snapshot replace a backup?
 
-No. A snapshot depends on the availability of the necessary metadata, objects, and keys for the same volume. It also does not automatically include everything still unpublished in the local cache. For disaster recovery, you need [backups and tested recovery](25-backups-even-time-machines-need-insurance.md).
+No. A snapshot depends on the availability of the necessary metadata, objects, and keys for the same volume. It also does not automatically include everything still unpublished in the local cache. For disaster recovery, use independent backups with a tested recovery procedure.
 
 ### Do I need to run `init` or `discover` again after a connection outage?
 
