@@ -204,34 +204,48 @@
 
     .cat-stage {
       position: relative;
-      aspect-ratio: 1 / 1.08;
-      border-radius: 36px;
+      width: 100%;
+      border-radius: 28px;
+      border: 1px solid var(--line);
       background:
-        radial-gradient(circle closest-side at 50% 50%, rgba(246, 227, 216, 0.95), rgba(244, 241, 232, 0.8) 55%, rgba(244, 241, 232, 0) 100%);
-      display: grid;
-      place-items: center;
+        radial-gradient(420px 300px at 30% 30%, rgba(168, 87, 42, 0.16), transparent 70%),
+        linear-gradient(160deg, var(--night-2), var(--night));
+      overflow: hidden;
     }
-    .cat-stage img {
-      width: 58%;
-      height: auto;
-      filter: drop-shadow(0 30px 40px rgba(0,0,0,0.35));
+    .cat-stage svg { display: block; width: 100%; height: auto; }
+    .cat-stage text { font-family: var(--mono); }
+    .bit { font-size: 12.5px; font-weight: 500; text-anchor: middle; dominant-baseline: central; }
+    .frag { animation: fall 2.4s linear infinite; }
+    @keyframes fall {
+      0% { transform: translateY(-30px); opacity: 0; }
+      15% { opacity: 1; }
+      85% { opacity: 1; }
+      100% { transform: translateY(78px); opacity: 0; }
     }
-    .cat-tag {
-      position: absolute;
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.06em;
-      padding: 7px 11px;
-      border-radius: 10px;
-      background: var(--night);
-      border: 1px solid var(--line-strong);
-      color: var(--muted);
-      white-space: nowrap;
+    .paw { animation: paw 6s ease-in-out infinite; }
+    @keyframes paw {
+      0%, 18% { transform: translateX(0); }
+      45%, 62% { transform: translateX(50px); }
+      85%, 100% { transform: translateX(0); }
     }
-    .cat-tag i { font-style: normal; color: var(--copper-bright); }
-    .cat-tag.t1 { top: 12%; left: -4%; }
-    .cat-tag.t2 { top: 64%; right: -6%; }
-    .cat-tag.t3 { bottom: 10%; left: 4%; }
+    .drag-clip { animation: drag-clip 6s ease-in-out infinite; }
+    @keyframes drag-clip {
+      0%, 18% { transform: translate(-50px, -24px); opacity: 1; }
+      45%, 80% { transform: translate(0, 0); opacity: 1; }
+      90% { transform: translate(0, 0); opacity: 0; }
+      91% { transform: translate(-50px, -24px); opacity: 0; }
+      100% { transform: translate(-50px, -24px); opacity: 1; }
+    }
+    .playhead { animation: scrub 8s linear infinite; }
+    @keyframes scrub { from { transform: translateX(0); } to { transform: translateX(316px); } }
+    .blink { animation: blink 4.5s infinite; transform-box: fill-box; transform-origin: center; }
+    @keyframes blink { 0%, 92%, 100% { transform: scaleY(1); } 95% { transform: scaleY(0.1); } }
+    .frame-a { animation: frames 1.2s steps(1) infinite; }
+    .frame-b { animation: frames 1.2s steps(1) infinite -0.6s; }
+    @keyframes frames { 0% { opacity: 1; } 50% { opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) {
+      .frag, .paw, .drag-clip, .playhead, .blink, .frame-a, .frame-b { animation: none; }
+    }
 
     /* ---------- problem ---------- */
     .loops {
@@ -550,7 +564,7 @@
     /* ---------- responsive ---------- */
     @media (max-width: 960px) {
       .hero .wrap, .install-grid { grid-template-columns: 1fr; }
-      .cat-stage { max-width: 380px; width: 100%; margin: 0 auto; }
+      .cat-stage { max-width: 460px; margin: 0 auto; }
       .diagram { grid-template-columns: 1fr; }
       .features, .platforms { grid-template-columns: 1fr 1fr; }
       .flow-note { grid-template-columns: 1fr 1fr; }
@@ -559,8 +573,6 @@
       section { padding: 72px 0; }
       .nav-links a:not(.btn) { display: none; }
       .loops, .features, .platforms, .flow-note { grid-template-columns: 1fr; }
-      .cat-tag.t1 { left: 0; }
-      .cat-tag.t2 { right: 0; }
     }
   </style>
 </head>
@@ -613,10 +625,63 @@
         </div>
       </div>
       <div class="cat-stage" aria-hidden="true">
-        <img src="assets/cat_logo.svg" alt="" />
-        <div class="cat-tag t1"><i>read</i> 2 s of a 2 h RAW file</div>
-        <div class="cat-tag t2"><i>save</i> → local, upload later</div>
-        <div class="cat-tag t3"><i>mount</i> Z:  /mnt/studio</div>
+        <svg viewBox="0 0 400 400" xmlns="http://www.w3.org/2000/svg">
+          <!-- fragments streaming on demand into the preview -->
+          <text x="300" y="20" font-size="9" fill="#6d737d" text-anchor="middle">s3://studio · on demand</text>
+          <g fill="#6f9fd6">
+            <rect class="frag" x="262" y="30" width="7" height="7" rx="1.5" style="animation-delay:-0.2s" />
+            <rect class="frag" x="282" y="30" width="7" height="7" rx="1.5" style="animation-delay:-1.4s" />
+            <rect class="frag" x="302" y="30" width="7" height="7" rx="1.5" style="animation-delay:-0.8s" fill="#d27a45" />
+            <rect class="frag" x="322" y="30" width="7" height="7" rx="1.5" style="animation-delay:-2s" />
+            <rect class="frag" x="342" y="30" width="7" height="7" rx="1.5" style="animation-delay:-0.5s" />
+          </g>
+
+          <!-- preview monitor -->
+          <rect x="238" y="112" width="140" height="92" rx="10" fill="#0c0e11" stroke="rgba(247,247,243,0.18)" />
+          <g clip-path="url(#mon)">
+            <rect class="frame-a" x="246" y="120" width="124" height="66" fill="url(#shotA)" />
+            <rect class="frame-b" x="246" y="120" width="124" height="66" fill="url(#shotB)" />
+            <circle class="frame-a" cx="330" cy="140" r="9" fill="#f6e3d8" opacity="0.9" />
+            <circle class="frame-b" cx="282" cy="146" r="7" fill="#f6e3d8" opacity="0.8" />
+          </g>
+          <text id="tc" x="308" y="197" font-size="9" fill="#a3acb9" text-anchor="middle">00:00:00:00</text>
+          <circle cx="250" cy="197" r="3" fill="#c9776a" />
+
+          <!-- the cat, made of bits -->
+          <g id="cat"></g>
+
+          <!-- timeline -->
+          <rect x="20" y="282" width="360" height="100" rx="12" fill="#0c0e11" stroke="rgba(247,247,243,0.12)" />
+          <g font-size="8" fill="#6d737d">
+            <text x="30" y="300">V2</text><text x="30" y="324">V1</text><text x="30" y="348">A1</text>
+          </g>
+          <g>
+            <rect x="48" y="290" width="70" height="15" rx="4" fill="#234a78" />
+            <rect x="250" y="290" width="58" height="15" rx="4" fill="#234a78" />
+            <rect x="48" y="314" width="118" height="15" rx="4" fill="#3a4350" />
+            <rect x="232" y="314" width="132" height="15" rx="4" fill="#3a4350" />
+            <rect x="48" y="338" width="316" height="15" rx="4" fill="#1f3a2c" />
+            <path d="M52 346 q6 -6 12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0 t12 0" fill="none" stroke="#7fc49a" stroke-width="1.2" opacity="0.7" />
+          </g>
+          <rect class="drag-clip" x="166" y="314" width="66" height="15" rx="4" fill="#a8572a" />
+          <text class="drag-clip" x="171" y="324.5" font-size="8" fill="#f6e3d8">shot_042</text>
+          <g class="paw" id="paw"></g>
+          <g class="playhead">
+            <line x1="48" y1="284" x2="48" y2="380" stroke="#d27a45" stroke-width="1.5" />
+            <path d="M44 284 h8 l-4 5 z" fill="#d27a45" />
+          </g>
+          <text x="364" y="373" font-size="8" fill="#6d737d" text-anchor="end">Z:\project\edit.drp</text>
+
+          <defs>
+            <clipPath id="mon"><rect x="246" y="120" width="124" height="66" rx="4" /></clipPath>
+            <linearGradient id="shotA" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#234a78" /><stop offset="1" stop-color="#a8572a" />
+            </linearGradient>
+            <linearGradient id="shotB" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#171c23" /><stop offset="1" stop-color="#6f9fd6" />
+            </linearGradient>
+          </defs>
+        </svg>
       </div>
     </div>
   </header>
@@ -976,6 +1041,99 @@
     var ua = navigator.userAgent;
     var guess = /Windows/.test(ua) ? 'windows' : /Mac/.test(ua) ? 'macos' : /Linux/.test(ua) ? 'linux' : null;
     if (guess) document.querySelector('.tab[data-tab="' + guess + '"]').click();
+
+    // Hero: a cat drawn from bits, editing on a timeline.
+    (function () {
+      var ns = 'http://www.w3.org/2000/svg';
+      var art = [
+        '..X........X..',
+        '..XX......XX..',
+        '..XXX....XXX..',
+        '..XXXXXXXXXX..',
+        '.XXXXXXXXXXXX.',
+        '.XXEEXXXXEEXX.',
+        '.XXEEXXXXEEXX.',
+        '.XXXXXNNXXXXX.',
+        '..XXXXXXXXXX..',
+        '...XXXXXXXX...',
+        '..XXXXXXXXXX..',
+        '.XXXXXXXXXXXX.......',
+        '.XXXXXXXXXXXX......X',
+        '.XXXXXXXXXXXX.....XX',
+        '..XXXXXXXXXXXXXXXXX.',
+        '..XX....XX..........'
+      ];
+      var cell = 13, ox = 28, oy = 72;
+      var cat = document.getElementById('cat');
+      var paw = document.getElementById('paw');
+      var bits = [];
+      var cells = document.createElementNS(ns, 'g');
+      cat.appendChild(cells);
+      var eyes = document.createElementNS(ns, 'g');
+      eyes.setAttribute('class', 'blink');
+      art.forEach(function (row, y) {
+        row.split('').forEach(function (ch, x) {
+          if (ch === '.') return;
+          var t = document.createElementNS(ns, 'text');
+          t.setAttribute('class', 'bit');
+          t.setAttribute('x', ox + x * cell + cell / 2);
+          t.setAttribute('y', oy + y * cell + cell / 2);
+          var color = '#e4e8ee', op = 0.55 + Math.random() * 0.45;
+          if (ch === 'E') { color = '#f6e3d8'; op = 1; }
+          if (ch === 'N') { color = '#171c23'; op = 1; }
+          t.setAttribute('fill', color);
+          t.setAttribute('opacity', op.toFixed(2));
+          t.textContent = Math.random() < 0.5 ? '0' : '1';
+          (ch === 'E' ? eyes : cat).appendChild(t);
+          if (ch === 'X') bits.push(t);
+          var r = document.createElementNS(ns, 'rect');
+          r.setAttribute('x', ox + x * cell + 0.5);
+          r.setAttribute('y', oy + y * cell + 0.5);
+          r.setAttribute('width', cell - 1);
+          r.setAttribute('height', cell - 1);
+          r.setAttribute('rx', 2);
+          r.setAttribute('fill', ch === 'E' ? '#a8572a' : ch === 'N' ? '#ffcffc' : '#cad3df');
+          r.setAttribute('opacity', ch === 'X' ? (0.08 + Math.random() * 0.1).toFixed(2) : 0.85);
+          cells.insertBefore(r, cells.firstChild);
+        });
+      });
+      cat.appendChild(eyes);
+      // Front paw resting on the timeline, pushing a clip.
+      [[0, 0], [1, 0], [0, 1], [1, 1], [2, 1]].forEach(function (p) {
+        var t = document.createElementNS(ns, 'text');
+        t.setAttribute('class', 'bit');
+        t.setAttribute('x', 98 + p[0] * cell + cell / 2);
+        t.setAttribute('y', 278 + p[1] * cell + cell / 2);
+        t.setAttribute('fill', '#f7f7f3');
+        t.textContent = '1';
+        var r = document.createElementNS(ns, 'rect');
+        r.setAttribute('x', 98 + p[0] * cell + 0.5);
+        r.setAttribute('y', 278 + p[1] * cell + 0.5);
+        r.setAttribute('width', cell - 1);
+        r.setAttribute('height', cell - 1);
+        r.setAttribute('rx', 2);
+        r.setAttribute('fill', '#3a4350');
+        paw.appendChild(r);
+        paw.appendChild(t);
+      });
+
+      var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (reduce) return;
+      setInterval(function () {
+        for (var i = 0; i < 6; i++) {
+          var b = bits[Math.floor(Math.random() * bits.length)];
+          b.textContent = b.textContent === '0' ? '1' : '0';
+        }
+      }, 120);
+      var tc = document.getElementById('tc');
+      var start = performance.now();
+      function pad(n) { return (n < 10 ? '0' : '') + n; }
+      (function tick(now) {
+        var f = Math.floor((now - start) / (1000 / 24)) % (24 * 3600);
+        tc.textContent = '00:' + pad(Math.floor(f / 1440) % 60) + ':' + pad(Math.floor(f / 24) % 60) + ':' + pad(f % 24);
+        requestAnimationFrame(tick);
+      })(start);
+    })();
   </script>
 </body>
 </html>
