@@ -247,6 +247,12 @@ pub enum RunnerError {
         /// Mounted scenario that requires a local studiofs binary.
         scenario: String,
     },
+    /// The supplied studiofs binary path does not point at a file.
+    #[error("E2E studiofs binary not found at {path}; build it first")]
+    StudiofsBinNotFound {
+        /// Path passed through --studiofs-bin.
+        path: PathBuf,
+    },
     /// Timeout string could not be parsed.
     #[error(
         "invalid E2E timeout '{value}': expected integer seconds or a value ending in ms, s, or m"
@@ -368,6 +374,11 @@ pub fn run_with_executor(
         return Err(RunnerError::MissingStudiofsBin {
             scenario: definition.name.to_string(),
         });
+    }
+    if let Some(path) = &request.studiofs_bin
+        && !path.is_file()
+    {
+        return Err(RunnerError::StudiofsBinNotFound { path: path.clone() });
     }
     let sandbox = root.join(&run_id);
     let selected_platform = request.platform.resolved().to_string();
@@ -3354,6 +3365,34 @@ plain child stderr\n",
 
         assert!(matches!(err, RunnerError::MissingStudiofsBin { scenario }
             if scenario == scenario::BASIC_MULTI_CLIENT_SMOKE));
+    }
+
+    #[test]
+    fn nonexistent_studiofs_bin_fails_before_infra_startup() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let executor = RecordingExecutor::default();
+        let missing = temp.path().join("missing").join("studiofs.exe");
+
+        let err = run_with_executor(
+            RunRequest {
+                root: temp.path().join("e2e-runs"),
+                run_id: Some("nonexistent-studiofs-bin".to_string()),
+                scenarios: vec![scenario::BASIC_MULTI_CLIENT_SMOKE.to_string()],
+                seed: 324,
+                studiofs_bin: Some(missing.clone()),
+                platform: PlatformSelection::Auto,
+                retention: RetentionPolicy::Always,
+                report: None,
+                port_range: Some("33200-33210".to_string()),
+                timeout: None,
+                infra: InfraMode::Compose,
+            },
+            &executor,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, RunnerError::StudiofsBinNotFound { path } if path == missing));
+        assert!(executor.calls.borrow().is_empty());
     }
 
     #[test]
