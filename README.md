@@ -31,9 +31,9 @@ changes in the background.
   and platform bridges. Mounted benchmarks measure workload-specific performance.
 
 - **Self-hosted and open**
-  Unlike proprietary SaaS alternatives, StudioFS is **100% open-source and
-  self-hosted**, giving you control over your storage, metadata, and
-  infrastructure.
+  StudioFS is open-source and self-hosted, giving you control over your storage,
+  metadata, and infrastructure. Platform mount components have their own
+  [licenses and installation requirements](docs/legal/platform-distribution.md).
 
 - **Cat logo**
   Because infrastructure is better with a little personality. 🐱
@@ -178,6 +178,13 @@ durability and recovery rules.
 
 Install the platform mount prerequisites first: libfuse3 on Linux, macFUSE on
 macOS, or WinFSP on Windows. See [development setup](docs/development.md).
+
+Install these components separately; StudioFS release archives must not bundle
+their drivers or shared libraries. In particular, macFUSE must be installed by
+the user, without an automatic download or installation by a StudioFS installer.
+See the [platform distribution policy](docs/legal/platform-distribution.md)
+before redistributing a build; 0.2.0 release binaries exclude the experimental
+FSKit/MFMount backend.
 
 Initialize a new volume (Bash example, with local S3-compatible storage and
 PostgreSQL already running; replace these development credentials as needed):
@@ -402,9 +409,33 @@ JuiceFS has served as an important technical reference point for StudioFS.
 
 ## License
 
-The [source and asset provenance audit](docs/legal/source-provenance.md)
-records evidence and unresolved publication gates for the planned public release.
+StudioFS is licensed under the **GNU General Public License, version 3 only**
+(`GPL-3.0-only`). The complete, unmodified license is in [LICENSE](LICENSE).
 
-This project is distributed under the GPL-3.0 license. You may use and modify
-StudioFS for personal or commercial purposes, subject to the terms of the
-license.
+You may run and modify StudioFS for personal or commercial productions,
+including paid studio work. Private use and modifications within your
+organization do not require publishing source code. Simply storing or
+processing your own media, assets, or other data with StudioFS does not license
+those files under the GPL.
+
+Redistributing StudioFS, including modified builds or paid copies, carries GPL
+obligations: retain license and copyright notices, identify modifications, and
+provide recipients the corresponding source and build material as required by
+the license. Charging for copies is permitted. For example, binary downloads can
+satisfy this by offering equivalent access to the corresponding source at no
+further charge, with clear directions from the download location (GPLv3
+section 6(d)); section 6 also lists other methods. See the
+[GNU GPL FAQ](https://www.gnu.org/licenses/gpl-faq.en.html) for explanations of
+private use, commercial distribution, and program output.
+
+Third-party code, assets, and native components retain their own license and
+attribution requirements; this declaration does not relicense them. Consult the
+[dependency audit](docs/legal/rust-dependency-audit.md),
+[platform terms and required notices](docs/legal/platform-distribution.md#required-notices),
+and [contribution guidance](docs/contributing.md#licensing-and-provenance).
+The complete third-party notice artifact is tracked in SFS-853 and remains
+required before release.
+
+The [source and asset provenance audit](docs/legal/source-provenance.md)
+records evidence and unresolved publication gates for the planned public release;
+adding the license does not clear those gates.

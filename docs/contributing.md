@@ -6,6 +6,26 @@ is added or changed, and who owns each part of CI.
 
 ---
 
+## Licensing and provenance
+
+Submit original StudioFS contributions under **GPL-3.0-only**, the project's
+license in [LICENSE](../LICENSE). Confirm that you have authority to contribute
+the work, including any required employer or client permission.
+
+Identify copied, adapted, translated, or generated third-party material in your
+contribution, with its source, license, and attribution requirements. Preserve
+existing copyright and license notices; the project license does not replace
+upstream grants. Flag uncertain rights before submitting code, documentation,
+fixtures, or artwork. See the [source provenance audit](legal/source-provenance.md).
+
+Changes to dependencies or packaging must also preserve the applicable
+third-party notices and follow the [dependency audit](legal/rust-dependency-audit.md)
+and [native platform distribution policy](legal/platform-distribution.md).
+SFS-853 tracks the complete generated notice artifact; audit inventories alone
+are not distribution notices.
+
+---
+
 ## Verification Matrix
 
 StudioFS is a cross-platform filesystem product. It targets Linux, macOS, and
