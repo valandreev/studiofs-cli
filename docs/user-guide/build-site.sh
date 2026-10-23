@@ -12,6 +12,11 @@ set -euo pipefail
 guide_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$guide_dir/../.." && pwd)"
 out_dir="${1:-$repo_root/site/docs}"
+# Resolve a relative output path against the caller's directory, before cd.
+case "$out_dir" in
+  /*) ;;
+  *) out_dir="$PWD/$out_dir" ;;
+esac
 
 cd "$guide_dir"
 rm -rf .build
