@@ -109,8 +109,9 @@ def complete_license_directory_evidence(package: dict, rows: list[dict], archive
     root = Path(package["manifest_path"]).parent
     known = {row["path"] for row in rows}
     added = []
-    for folder in root.rglob("LICENSES"):
-        if not folder.is_dir() or folder.is_symlink():
+    # Match the folder name case-insensitively so Linux CI and Windows release runs collect the same files.
+    for folder in root.rglob("*"):
+        if folder.name.lower() != "licenses" or not folder.is_dir() or folder.is_symlink():
             continue
         for path in folder.rglob("*"):
             if not path.is_file() or path.is_symlink():
@@ -281,6 +282,14 @@ def self_test() -> None:
     first = render_package_notice(nested)
     second = render_package_notice(nested)
     assert first == second and "vendor/native/LICENSE" in first and "native terms" in first
+    with tempfile.TemporaryDirectory() as scratch:
+        crate = Path(scratch)
+        (crate / "licenses").mkdir()
+        (crate / "licenses" / "MIT.txt").write_text("mit", encoding="utf-8")
+        found = complete_license_directory_evidence(
+            {"manifest_path": str(crate / "Cargo.toml")}, [], None, type("Helpers", (), {"sha256": staticmethod(lambda _: "h")})()
+        )
+        assert found == [{"path": "licenses/MIT.txt", "sha256": "h"}], found
     row = {"sha256": "abc", "path": "LICENSE"}
     assert primary_evidence([row], type("Helpers", (), {"is_primary_evidence": staticmethod(lambda _: True)})())
     assert not primary_evidence([], type("Helpers", (), {"is_primary_evidence": staticmethod(lambda _: True)})())

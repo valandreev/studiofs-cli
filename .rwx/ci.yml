@@ -110,6 +110,8 @@ tasks:
       - Cargo.lock
       - Cargo.toml
       - crates/*/Cargo.toml
+      - crates/*/src/lib.rs
+      - crates/*/src/main.rs
       - deny.toml
       - LICENSE
       - docs/legal/**
