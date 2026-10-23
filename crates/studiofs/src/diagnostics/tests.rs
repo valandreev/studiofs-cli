@@ -431,7 +431,13 @@ fn endpoint_for_shortens_long_unix_socket_paths() {
                 .to_string_lossy()
                 .len()
     );
-    assert_eq!(Path::new(&path).parent(), Some(dir.path()));
+    // The hashed name stays in the mounts directory only when that directory is
+    // short enough; long CI workspace paths fall back to the shared temp root.
+    let hashed_name_bytes = "sfsdiag-42-0000000000000000.sock".len();
+    if dir.path().as_os_str().as_bytes().len() + 1 + hashed_name_bytes <= MAX_UNIX_SOCKET_PATH_BYTES
+    {
+        assert_eq!(Path::new(&path).parent(), Some(dir.path()));
+    }
     assert!(Path::new(&path).as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
 }
 

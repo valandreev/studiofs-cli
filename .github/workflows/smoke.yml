@@ -72,6 +72,9 @@ jobs:
         run: cargo test -p studiofs-macfuse --lib --no-run
 
       - name: Run macFUSE native bridge smoke tests
+        env:
+          # Hosted runners usually cannot load the macFUSE kext; real mounts need it.
+          STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS: ${{ steps.macfuse-check.outputs.loaded == 'true' && '1' || '0' }}
         run: cargo test -p studiofs-macfuse --lib -- --nocapture
         timeout-minutes: 5
 
