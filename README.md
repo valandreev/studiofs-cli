@@ -53,9 +53,6 @@ changes in the background.
 - [Українська — посібник користувача](docs/user-guide/uk/README.md) · [швидкий старт](docs/user-guide/uk/quick-start.md)
 - [English — user guide](docs/user-guide/en/README.md) · [quick start](docs/user-guide/en/quick-start.md)
 
-All 30 chapters are available in Ukrainian and English. The approved Ukrainian
-version is the source of truth; the guide remains a work in progress.
-
 ## What Problem Does StudioFS Solve?
 
 In a classic remote production pipeline, artists often need to download hundreds
