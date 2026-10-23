@@ -120,7 +120,7 @@ jobs:
         run: |
           mkdir -p target/release-assets
           binary="target/$TARGET/release/studiofs"
-          lipo -verify_arch arm64 "$binary"
+          lipo "$binary" -verify_arch arm64
           otool -L "$binary" | tee "target/release-assets/linkage-$TARGET.txt"
           grep -F 'libfuse.2.dylib' "target/release-assets/linkage-$TARGET.txt"
           if grep -F 'MFMount' "target/release-assets/linkage-$TARGET.txt"; then
