@@ -46,6 +46,17 @@ def normalized_lock_hash(path: Path) -> str:
 
 def executable_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
     info.mode = 0o755
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.mtime = 0
+    return info
+
+
+def plain_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.mode = 0o644
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.mtime = 0
     return info
 
 
@@ -148,7 +159,7 @@ def create_package(
                     path,
                     arcname=archive_name,
                     recursive=False,
-                    filter=executable_tarinfo if name == binary_name else None,
+                    filter=executable_tarinfo if name == binary_name else plain_tarinfo,
                 )
             info = tarfile.TarInfo(f"{package_name}/BUILD-INFO.json")
             payload = (json.dumps(build_info, indent=2, sort_keys=True) + "\n").encode("utf-8")

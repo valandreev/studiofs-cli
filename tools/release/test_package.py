@@ -122,7 +122,7 @@ class ReleasePackageTests(unittest.TestCase):
         self.binary = self.repo / "target" / self.target / "release" / "studiofs"
         self.binary.parent.mkdir(parents=True)
         self.binary.write_bytes(b"fake unix executable")
-        self.binary.chmod(0o755)
+        self.binary.chmod(0o644)
         archive_path = self.package()
         self.assertTrue(archive_path.name.endswith(".tar.gz"))
         folder = "studiofs-9.8.7-aarch64-apple-darwin"

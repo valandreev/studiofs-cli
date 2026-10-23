@@ -21,6 +21,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Check version and tag
         env:
           REF_TYPE: ${{ github.ref_type }}
@@ -33,6 +34,9 @@ jobs:
           if os.environ['REF_TYPE'] == 'tag' and os.environ['REF_NAME'] != 'v' + version:
               raise SystemExit('Tag must match the workspace version: v' + version)
           PY
+          if [ "$REF_TYPE" = tag ]; then
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo 'Tagged commit must be reachable from main' >&2; exit 1; }
+          fi
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: 1.95.0
@@ -42,6 +46,7 @@ jobs:
           cargo deny --locked check licenses
           python3 docs/legal/check-license-policy.py
           python3 docs/legal/generate-third-party-notices.py --self-test
+          python3 tools/release/test_package.py
       - name: Stage complete release notices
         run: python3 docs/legal/generate-third-party-notices.py --release --output-dir target/license-compliance
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -193,9 +198,13 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          if gh release view "$TAG" --json isDraft > target/release.json 2>/dev/null; then
-            python3 -c 'import json; assert json.load(open("target/release.json"))["isDraft"], "Refusing to modify a published release"'
+          if gh release view "$TAG" --json isDraft,assets > target/release.json 2> target/release.err; then
+            python3 -c 'import json; d=json.load(open("target/release.json")); assert d["isDraft"], "Refusing to modify a published release"; [print(a["name"]) for a in d["assets"]]' > target/old-assets.txt
+            while read -r asset; do gh release delete-asset "$TAG" "$asset" --yes; done < target/old-assets.txt
+          elif grep -qi 'release not found' target/release.err; then
+            printf 'StudioFS %s draft. See INSTALL.md in each package and the attached source archive and checksums.\nSource commit: %s\n' "$TAG" "$GITHUB_SHA" > target/notes.md
+            gh release create "$TAG" --verify-tag --draft --title "StudioFS $TAG" --notes-file target/notes.md
           else
-            gh release create "$TAG" --verify-tag --draft --title "StudioFS $TAG" --notes-file docs/releases.md
+            cat target/release.err >&2; exit 1
           fi
-          gh release upload "$TAG" target/release-assets/* --clobber
+          gh release upload "$TAG" target/release-assets/*
