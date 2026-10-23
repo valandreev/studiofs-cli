@@ -17035,50 +17035,9 @@ fn deferred_namespace_create_commit_does_not_clear_larger_dirty_attr() {
 #[test]
 fn deferred_namespace_first_write_marks_dirty_attr_uploading() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-create-first-write-uploading");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create_with_deferred_metadata_admission(
-                1,
-                b"deferred-create-first-write-uploading.txt",
-                0,
-                0,
-                0o644,
-                rt.handle(),
-            )
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs
-            .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
-            .expect("open deferred-created file");
-
-        vfs.write_fh(fh, ino, 0, b"payload after deferred create")
-            .await
-            .expect("write deferred-created file");
-
-        let dirty = vfs
-            .state
-            .namespace
-            .dirty_attrs
-            .lock()
-            .get(&ino)
-            .cloned()
-            .expect("first write should leave a dirty attr");
-        assert_eq!(dirty.upload_state, MetaUploadState::Uploading);
-        assert!(dirty.content_epoch > attr.content_epoch);
-        assert!(dirty.size > 0);
-
-        vfs.release_fh(fh).await.expect("release handle");
-    });
-}
-
-#[test]
-fn deferred_namespace_lookup_uses_written_size_before_create_commit() {
-    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-create-read-size");
-    let name = b"deferred-create-read-size.txt";
-    let payload = b"accepted before deferred create commit";
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-create-first-write-uploading");
+    let name = b"deferred-create-first-write-uploading.txt";
+    let payload = b"payload after deferred create";
 
     // Keep the create admission queued so the lookup observes its in-memory
     // namespace entry while a first write updates the inode's dirty attribute.
@@ -17097,6 +17056,8 @@ fn deferred_namespace_lookup_uses_written_size_before_create_commit() {
         .expect("accept write before create commit");
 
     let dirty_attr = vfs.peek_dirty_attr(attr.ino).expect("written dirty attr");
+    assert_eq!(dirty_attr.upload_state, MetaUploadState::Uploading);
+    assert!(dirty_attr.content_epoch > attr.content_epoch);
     assert_eq!(dirty_attr.size, payload.len() as u64);
     assert_eq!(
         vfs.getattr(attr.ino).expect("get written attr").size,
@@ -17105,7 +17066,7 @@ fn deferred_namespace_lookup_uses_written_size_before_create_commit() {
     );
     assert_eq!(
         vfs.namespace_resolver(NamespacePathStyle::Windows)
-            .resolve_path_for_mount(r"\deferred-create-read-size.txt")
+            .resolve_path_for_mount(r"\deferred-create-first-write-uploading.txt")
             .expect("resolve deferred file path")
             .size,
         payload.len() as u64,
