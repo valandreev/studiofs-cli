@@ -1014,6 +1014,15 @@ fn finish_mount_result(
     }
 }
 
+/// Final log lines written after a clean unmount.
+const UNMOUNT_FAREWELL_LINES: [&str; 2] = ["glory to Ukraine!", "glory to Heroes!"];
+
+fn log_unmount_farewell() {
+    for line in UNMOUNT_FAREWELL_LINES {
+        tracing::info!("{line}");
+    }
+}
+
 fn run_mount_vfs_shutdown(
     runtime: Runtime,
     vfs: Arc<StudioVfs>,
@@ -1843,7 +1852,11 @@ impl MountRuntimeGuard {
                 std::env::var_os(daemon_mount_point_env_key()).is_some(),
             );
         let cleanup_error = self.cleanup_with_record_removal(!retain_failed_record);
-        finish_mount_result(mount_result, cleanup_error)
+        let result = finish_mount_result(mount_result, cleanup_error);
+        if result.is_ok() {
+            log_unmount_farewell();
+        }
+        result
     }
 
     fn launch_mount(&mut self) -> anyhow::Result<()> {
