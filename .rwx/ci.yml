@@ -95,6 +95,34 @@ tasks:
       sys.exit(0)
       PY
 
+  - key: cargo-deny-install
+    use: rust
+    run: cargo install --root target/license-tools cargo-deny --version 0.20.2 --locked
+
+  - key: python3
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y python3
+
+  - key: license-compliance
+    use: [code, rust, cargo-deny-install, python3]
+    filter:
+      - Cargo.lock
+      - Cargo.toml
+      - crates/*/Cargo.toml
+      - deny.toml
+      - LICENSE
+      - docs/legal/**
+      - .rwx/ci.yml
+      - .github/workflows/license-compliance.yml
+    run: |
+      set -euo pipefail
+      export PATH="$PWD/target/license-tools/bin:$PATH"
+      cargo deny --locked check licenses
+      python3 docs/legal/generate-third-party-notices.py --self-test
+      python3 docs/legal/check-license-policy.py
+      python3 docs/legal/generate-third-party-notices.py --output-dir target/license-compliance
+
   - key: quality
     use:
       - cargo-fmt
@@ -102,6 +130,7 @@ tasks:
       - cargo-clippy-all-features
       - cargo-doc
       - cargo-audit
+      - license-compliance
     run: echo "Quality gates passed"
 
   - key: cargo-test-linux-workspace

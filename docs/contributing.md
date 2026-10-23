@@ -21,7 +21,8 @@ fixtures, or artwork. See the [source provenance audit](legal/source-provenance.
 Changes to dependencies or packaging must also preserve the applicable
 third-party notices and follow the [dependency audit](legal/rust-dependency-audit.md)
 and [native platform distribution policy](legal/platform-distribution.md).
-SFS-853 tracks the complete generated notice artifact; audit inventories alone
+Use the [license compliance commands](legal/license-compliance.md) to generate
+the notice review bundle and check release evidence; audit inventories alone
 are not distribution notices.
 
 ---

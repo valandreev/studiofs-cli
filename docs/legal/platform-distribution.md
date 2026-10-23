@@ -278,8 +278,9 @@ otool -L studiofs | grep -E 'fuse|MFMount'                     # only libfuse.2.
 
 ## Open items
 
-- SFS-853: generate the full third-party notice file, including the native
-  table above.
+- Generate the third-party notice bundle, including the native table above,
+  using the [license compliance commands](license-compliance.md). Resolve its
+  reported evidence gaps before release packaging.
 - SFS-854: run the release gate checks above on the actual artifacts; the
   Windows `dumpbin` check is not yet run on a release build.
 - FSKit escalation above, before `STUDIOFS_MOUNT_BACKEND=fskit` ships.

@@ -92,7 +92,8 @@ manifest/lockfile, or that workflow, and also supports manual dispatch.
 
 | Job | Runner | Purpose |
 |-----|--------|---------|
-| **Quality Gates** | RWX `ubuntu:24.04` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, `cargo audit` |
+| **Quality Gates** | RWX `ubuntu:24.04` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, `cargo audit`, `cargo deny` license policy, and generated third-party notice validation |
+| **License compliance** | RWX `ubuntu:24.04`, GitHub Actions `ubuntu-24.04` | Dependency license policy, notice generator self-check, downloadable review bundle, and post-publication release evidence check |
 | **Ubuntu Linux** | RWX `ubuntu:24.04` | Workspace tests, local-first VFS checks, and operator-run mounted libfuse3 E2E |
 | **Rocky Linux** | RWX `rockylinux:9` | Workspace tests; mounted libfuse3 release validation is required on Rocky 9.4+ |
 | **macOS** | `macos-latest` | Clippy + tests for macOS-owned crates |
@@ -139,6 +140,17 @@ running `rwx logs`.
 
 The hosted Linux real mounted E2E targets fail preflight when `/dev/fuse` is
 unavailable. That is an infrastructure failure, not a test skip.
+
+The RWX quality gate pins `cargo-deny` 0.20.2 and checks the full locked
+workspace dependency graph. It also runs the third-party notice generator's
+self-test and license-policy negative probe before generating the review bundle
+under `target/license-compliance/`. GitHub Actions runs the same gate for pull
+requests and publishes that review bundle as a CI artifact. Before publishing,
+run the generator locally with `--release`; it fails while release notice
+evidence remains unresolved. The `release: published` workflow run checks the
+already-published release and uploads its bundle when the evidence gate passes;
+it cannot hold publication. See the
+[license compliance release contract](legal/license-compliance.md).
 
 ## Tests
 
