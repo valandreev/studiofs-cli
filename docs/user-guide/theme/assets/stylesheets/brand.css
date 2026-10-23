@@ -1,0 +1,47 @@
+/* StudioFS brand tokens, from docs/branding/studiofs-logo-final/brand-system.html */
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&display=swap");
+
+:root {
+  --sfs-signal: #234a78;
+  --sfs-signal-bright: #6f9fd6;
+  --sfs-copper: #a8572a;
+  --sfs-copper-bright: #d27a45;
+  --sfs-sand: #f4f1e8;
+  --sfs-ink: #111317;
+  --sfs-night: #171c23;
+}
+
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: var(--sfs-signal);
+  --md-primary-fg-color--light: var(--sfs-signal-bright);
+  --md-primary-fg-color--dark: #183555;
+  --md-accent-fg-color: var(--sfs-copper);
+  --md-typeset-a-color: var(--sfs-signal);
+  --md-default-bg-color: #fbfaf6;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: var(--sfs-night);
+  --md-primary-fg-color--light: #2d333d;
+  --md-primary-fg-color--dark: var(--sfs-ink);
+  --md-accent-fg-color: var(--sfs-copper-bright);
+  --md-typeset-a-color: var(--sfs-signal-bright);
+  --md-default-bg-color: var(--sfs-ink);
+  --md-hue: 215;
+}
+
+.md-header__title,
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  font-family: "Space Grotesk", var(--md-text-font-family), sans-serif;
+  letter-spacing: -0.01em;
+}
+
+.md-typeset h1 {
+  font-weight: 700;
+}
+
+.md-header__button.md-logo img {
+  height: 1.6rem;
+}

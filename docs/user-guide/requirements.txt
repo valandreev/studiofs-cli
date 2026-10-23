@@ -1,0 +1,2 @@
+# Static site generator for the user guide (see build-site.sh).
+zensical==0.0.72

@@ -31,3 +31,7 @@ deslop*.txt
 .rwx/bin/
 .codebase-memory/
 .antigravitycli/
+
+# User guide site build output (docs/user-guide/build-site.sh)
+/docs/user-guide/.build/
+/site/docs/
