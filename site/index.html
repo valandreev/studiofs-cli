@@ -1230,7 +1230,12 @@
     // blocks flying out to the sides and the new ones flying in.
     (function () {
       var mq = window.matchMedia;
-      if (!mq || !mq('(min-width: 900px) and (min-height: 600px)').matches) return;
+      if (!mq) return;
+      // Phones and tiny windows keep normal scrolling; re-evaluate if the
+      // window is resized across the threshold.
+      var big = mq('(min-width: 700px) and (min-height: 450px)');
+      if (big.addEventListener) big.addEventListener('change', function () { location.reload(); });
+      if (!big.matches) return;
       if (mq('(prefers-reduced-motion: reduce)').matches) return;
 
       var nav = document.querySelector('nav');
