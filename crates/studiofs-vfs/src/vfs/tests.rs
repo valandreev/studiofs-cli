@@ -17074,6 +17074,62 @@ fn deferred_namespace_first_write_marks_dirty_attr_uploading() {
 }
 
 #[test]
+fn deferred_namespace_lookup_uses_written_size_before_create_commit() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-create-read-size");
+    let name = b"deferred-create-read-size.txt";
+    let payload = b"accepted before deferred create commit";
+
+    // Keep the create admission queued so the lookup observes its in-memory
+    // namespace entry while a first write updates the inode's dirty attribute.
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(true, AtomicOrdering::Release);
+    let attr = vfs
+        .create_with_deferred_metadata_admission(ROOT_INO, name, 0, 0, 0o644, rt.handle())
+        .expect("admit deferred file create");
+    let fh = vfs
+        .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+        .expect("open deferred-created file");
+    rt.block_on(vfs.write_fh(fh, attr.ino, 0, payload))
+        .expect("accept write before create commit");
+
+    let dirty_attr = vfs.peek_dirty_attr(attr.ino).expect("written dirty attr");
+    assert_eq!(dirty_attr.size, payload.len() as u64);
+    assert_eq!(
+        vfs.getattr(attr.ino).expect("get written attr").size,
+        payload.len() as u64,
+        "getattr must expose the accepted size while create metadata is pending"
+    );
+    assert_eq!(
+        vfs.namespace_resolver(NamespacePathStyle::Windows)
+            .resolve_path_for_mount(r"\deferred-create-read-size.txt")
+            .expect("resolve deferred file path")
+            .size,
+        payload.len() as u64,
+        "path lookup must expose the accepted size while create metadata is pending"
+    );
+    assert_eq!(
+        rt.block_on(vfs.read(attr.ino, 0, payload.len() as u32))
+            .expect("read accepted writer bytes")
+            .as_ref(),
+        payload
+    );
+
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(false, AtomicOrdering::Release);
+    vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+    rt.block_on(vfs.wait_for_deferred_namespace_metadata(attr.ino))
+        .expect("commit deferred file create");
+    rt.block_on(vfs.release_fh(fh)).expect("release writer");
+}
+
+#[test]
 fn deferred_namespace_written_file_reads_back_after_flush() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-create-written-readback");

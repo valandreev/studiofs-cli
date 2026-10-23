@@ -1150,6 +1150,21 @@ fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
         repeated
             .sync_all()
             .expect("first sync_all through WinFSP mount");
+        let repeated_ino = wait_for_lookup(
+            &vfs_observer,
+            b"repeated-flush.bin",
+            "repeated-flush inode",
+            Duration::from_secs(5),
+        )
+        .ino;
+        let clean_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while vfs_observer.inode_has_local_dirty_state(repeated_ino) {
+            assert!(
+                std::time::Instant::now() < clean_deadline,
+                "first sync_all did not reach the clean inode state before the second callback"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         repeated
             .sync_all()
             .expect("second sync_all through WinFSP mount");

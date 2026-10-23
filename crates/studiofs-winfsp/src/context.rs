@@ -4271,6 +4271,71 @@ mod tests {
     }
 
     #[test]
+    fn winfsp_async_write_close_then_read_only_reopen_returns_created_payload() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("async-write-close-read-reopen");
+        let file_name = U16CString::from_str(r"\callback-roundtrip.bin").expect("u16 path");
+        let mut writer_info = empty_open_file_info();
+        let writer = <StudioFsContext as FileSystemContext>::create(
+            &ctx,
+            file_name.as_ucstr(),
+            FILE_CREATE_DISPOSITION << CREATE_DISPOSITION_SHIFT,
+            FILE_GENERIC_READ_ACCESS | FILE_GENERIC_WRITE_ACCESS,
+            0,
+            None,
+            0,
+            None,
+            false,
+            &mut writer_info,
+        )
+        .expect("create deferred file");
+
+        let payload = b"callback write survives read-only reopen";
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        let written = ctx
+            .rt
+            .block_on(AsyncFileSystemContext::write_async(
+                &ctx,
+                &writer,
+                payload,
+                0,
+                false,
+                false,
+                &mut file_info,
+            ))
+            .expect("write_async");
+        assert_eq!(written, payload.len() as u32);
+
+        <StudioFsContext as FileSystemContext>::cleanup(&ctx, &writer, None, 0);
+        <StudioFsContext as FileSystemContext>::close(&ctx, writer);
+
+        let mut reader_info = empty_open_file_info();
+        let reader = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            file_name.as_ucstr(),
+            0,
+            FILE_GENERIC_READ_ACCESS,
+            &mut reader_info,
+        )
+        .expect("reopen file read-only");
+        assert_eq!(reader_info.as_ref().file_size, payload.len() as u64);
+
+        let mut readback = vec![0; payload.len()];
+        let read = ctx
+            .rt
+            .block_on(AsyncFileSystemContext::read_async(
+                &ctx,
+                &reader,
+                &mut readback,
+                0,
+            ))
+            .expect("read_async");
+        assert_eq!(&readback[..read as usize], payload);
+
+        <StudioFsContext as FileSystemContext>::cleanup(&ctx, &reader, None, 0);
+        <StudioFsContext as FileSystemContext>::close(&ctx, reader);
+    }
+
+    #[test]
     fn winfsp_runtime_stats_open_accepts_windows_normalized_component() {
         let (_tmp, _vfs, ctx, _queue) = make_test_context("runtime-stats-open-normalized");
         let file_name = U16CString::from_str(r"\.studiofs-runtime-stats.").expect("u16 path");

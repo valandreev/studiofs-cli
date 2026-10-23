@@ -190,20 +190,21 @@ impl StudioVfs {
 
     fn deferred_namespace_lookup(&self, parent: Ino, name: &[u8]) -> Option<InodeAttr> {
         let key = DeferredNamespaceKey::new(parent, name);
-        let inner = self.state.namespace.deferred.inner.lock();
-        let ino = inner.entries.get(&key).copied()?;
-        inner.attrs.get(&ino).cloned()
+        let ino = {
+            let inner = self.state.namespace.deferred.inner.lock();
+            inner.entries.get(&key).copied()?
+        };
+        self.deferred_namespace_attr(ino)
     }
 
     pub(super) fn deferred_namespace_attr(&self, ino: Ino) -> Option<InodeAttr> {
-        self.state
-            .namespace
-            .deferred
-            .inner
-            .lock()
-            .attrs
-            .get(&ino)
-            .cloned()
+        // Snapshot dirty EOF before namespace settlement and materialization can retire it.
+        let dirty_attr = self.peek_dirty_attr(ino);
+        let attr = {
+            let inner = self.state.namespace.deferred.inner.lock();
+            inner.attrs.get(&ino).cloned()?
+        };
+        Some(dirty_attr.unwrap_or(attr))
     }
 
     fn deferred_namespace_op_estimated_bytes(op: &DeferredNamespaceOp) -> usize {
