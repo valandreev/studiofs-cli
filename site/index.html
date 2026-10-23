@@ -404,6 +404,8 @@
     .install-steps h3 { font-size: 17px; display: flex; gap: 12px; align-items: baseline; }
     .install-steps h3 span { font-family: var(--mono); font-size: 12px; color: var(--copper-bright); }
     .install-steps p { margin: 8px 0 0; color: var(--muted); font-size: 15px; }
+    .install-steps p a { color: var(--signal-bright); text-decoration: none; }
+    .install-steps p a:hover { text-decoration: underline; }
 
     .term {
       border-radius: var(--radius);
@@ -837,16 +839,12 @@
           </div>
           <div class="card">
             <h3><span>02</span>Download a release</h3>
-            <p>Grab the archive for your machine from GitHub Releases, verify its <code>.sha256</code> file and extract it.</p>
+            <p>Grab the archive for your machine from <a href="https://github.com/valandreev/studiofs-cli/releases">GitHub Releases</a>, verify its <code>.sha256</code> file and extract it.</p>
           </div>
           <div class="card">
             <h3><span>03</span>Create a volume and mount it</h3>
             <p>Run <code>init</code> once. Other clients join with <code>discover</code>.</p>
           </div>
-          <a class="btn btn-primary" href="https://github.com/valandreev/studiofs-cli/releases" style="justify-self:start;margin-top:6px">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m0 0l-5-5m5 5l5-5M4 19h16"/></svg>
-            GitHub Releases
-          </a>
         </div>
 
         <div class="term">
