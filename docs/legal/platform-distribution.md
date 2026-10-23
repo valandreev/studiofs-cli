@@ -24,10 +24,9 @@ WinFsp binaries; each user installs the platform driver from its upstream.
 
 ## StudioFS license position
 
-- StudioFS is intended to be GPL-3.0-only. The workspace manifest currently
-  declares `license = "GPL-3.0"` and the repository has no `LICENSE` file;
-  SFS-852 owns the SPDX correction (`GPL-3.0-only`) and adding the license
-  text. Every release archive must contain the GPLv3 text.
+- StudioFS declares `GPL-3.0-only` in the workspace manifest; internal crates
+  inherit it. SFS-852 added the complete GPLv3 text in [LICENSE](../../LICENSE)
+  on 2026-10-23. Every release archive must contain that text.
 - Git history records project-author aliases and separate branding uploads;
   it does not prove sole copyright ownership or authority to grant an
   additional GPLv3 §7 permission (see the macOS escalation). Confirm the
@@ -278,7 +277,6 @@ otool -L studiofs | grep -E 'fuse|MFMount'                     # only libfuse.2.
 
 ## Open items
 
-- SFS-852: correct the SPDX expression to `GPL-3.0-only` and add `LICENSE`.
 - SFS-853: generate the full third-party notice file, including the native
   table above.
 - SFS-854: run the release gate checks above on the actual artifacts; the

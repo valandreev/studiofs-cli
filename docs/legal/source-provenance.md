@@ -5,6 +5,11 @@ evidence below.** This is an engineering provenance inventory, not a grant of
 rights or legal clearance. It records what the repository demonstrates and
 what a release owner must still establish.
 
+SFS-852 update, 2026-10-23: [LICENSE](../../LICENSE) now contains the complete
+GPLv3 text and workspace metadata declares `GPL-3.0-only`. The baseline findings
+below retain their historical scope; this resolves P1's missing license text,
+not its outstanding contribution-authority evidence or the other publication gates.
+
 ## Audited snapshot and method
 
 The source snapshot is `c7be848af03c6bebaa5e890406e3d0ec8c0d729b`, with 718
@@ -85,10 +90,11 @@ DDK1805's two commits add `cat_logo.svg` (`02f902cb`) and `png/cat_logo.png`
 the illustration's creator, original source or permission terms. Do not
 attribute all code or assets to a sole rightsholder based on this history.
 
-No tracked LICENSE/COPYING/NOTICE file was found. `Cargo.toml` declares
-`GPL-3.0` and README repeats it; these establish licensing intent, not missing
-third-party grants. SFS-852 owns adding the GPLv3 text and the intended
-`GPL-3.0-only` declaration. It must not silently relicense upstream material.
+At the audited baseline, no tracked LICENSE/COPYING/NOTICE file was found.
+`Cargo.toml` declared `GPL-3.0` and README repeated it; these established
+licensing intent, not missing third-party grants. SFS-852 subsequently added
+the GPLv3 text and explicit `GPL-3.0-only` declaration, without replacing
+upstream grants.
 
 ## JuiceFS: reference material versus implementation
 
@@ -233,7 +239,7 @@ any reachable history. Do not mark the repository cleared while rows remain.
 
 | ID | Scope / missing evidence | Required resolution | Owner / gate |
 | --- | --- | --- | --- |
-| P1 | Project source, prose, scripts and contribution authority are inferred from local development history. Root license text is missing. | Maintainer records author/alias and employer/client authority, identifies copied/translated contributions with exact upstream terms, or excludes unresolved content. Add intended project license text without overriding upstream grants. | Maintainer confirmation; SFS-852 license formalization; SFS-854 publication gate. |
+| P1 | Project source, prose, scripts and contribution authority are inferred from local development history. **License text resolved by SFS-852:** GPLv3 LICENSE added, metadata declares GPL-3.0-only. | Maintainer records author/alias and employer/client authority, identifies copied/translated contributions with exact upstream terms, or excludes unresolved content. The project license does not override upstream grants. | Maintainer confirmation; SFS-854 publication gate. |
 | P2 | macFUSE fallback header's upstream origin and notices are unresolved. **Tree remediated:** the never-compiled fallback was deleted; only reachable history remains. | Verify a macOS build with installed macFUSE headers (not run on the Windows remediation host). History: accepted by the maintainer decision below. | SFS-851 finding; maintainer remediation; SFS-853 notices; SFS-854 gate. |
 | P3 | All 22 branding files, especially the separately uploaded cat artwork, lack a source/rights record. | Obtain creator/source and redistribution grant covering SVGs, PNG derivatives and HTML artwork; record required attribution and asset-specific terms. Otherwise replace/exclude assets and update consumers. | Maintainer and asset contributor; SFS-854 gate. |
 | P4 | Four redb fixtures: incomplete baseline origin/content provenance. | Establish synthetic generation and right to publish data, document original redb version/schema/input or regenerate compatible synthetic baselines and derived fixtures with focused fixture tests. | Maintainer/fixture author; SFS-854 gate. |
