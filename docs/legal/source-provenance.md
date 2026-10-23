@@ -19,7 +19,7 @@ in its 718-file count.
 The audit enumerated the complete tracked tree, scanned attribution/source
 indicators, inspected the native boundaries, asset set, fixture documentation
 and relevant introduction commits, and checked contributor history. The checkout
-is not shallow; HEAD has 5,156 reachable commits, beginning at `da2d97c2`
+is not shallow; the baseline (`c7be848a`) has 5,156 reachable commits, beginning at `da2d97c2`
 (2026-02-15). Other local refs contain checkpoints and unrelated branch work;
 they are not the source release set. History inspection was targeted, not a
 review of every historical blob. Making an existing Git repository public also
@@ -51,7 +51,7 @@ claim.
 | Tools and automation | 30 | `tools/`, `.github/`, `.rwx/`, `docker/`, and crate scripts. Project benchmark/test/CI glue; some run or refer to external programs. Those programs are not copied into this source tree. |
 | Cargo metadata | 14 | Workspace plus twelve crate manifests and `Cargo.lock`. Declared GPL intent; fetched package rights are covered separately by SFS-849. |
 | Existing legal audits | 4 | Dependency audit, generator, JSON ledger and platform review. Their dependency/native conclusions retain their own stated evidence limits. |
-| Repository controls | 15 | AGENTS files, formatting/editor/configuration files and hidden metadata. The tracked machine-local JSON needs a publication decision (P5). |
+| Repository controls | 15 | AGENTS files, formatting/editor/configuration files, the metadata fixture README and hidden metadata. The tracked machine-local symlink needs a publication decision (P5). |
 | **Total** | **718** | All baseline paths accounted for; no submodule entries in the baseline tree. |
 
 There is no tracked vendored dependency-source tree in this snapshot. Cargo's
@@ -65,7 +65,7 @@ actual archives under SFS-854.
 
 ## Contributor and rightsholder evidence
 
-HEAD's Git author names are Valentine Andreev (4,842 commits), Valentine (308),
+The baseline's Git author names are Valentine Andreev (4,842 commits), Valentine (308),
 valandreev (4), and DDK1805 (2). The first three are apparent account/name aliases;
 there is no `.mailmap` that formally resolves them. Other local refs also contain
 T3 Code author metadata; those refs do not add an independent rights grant to
@@ -197,7 +197,7 @@ any reachable history. Do not mark the repository cleared while rows remain.
 | P2 | macFUSE fallback header's upstream origin and notices are unresolved. | Pin origin, compare the declaration subset and supply applicable copyright/license/modification notices; alternatively remove the unused subset and verify the real-header build contract. Check historical exposure too. | SFS-851 finding; maintainer remediation; SFS-853 notices; SFS-854 gate. |
 | P3 | All 22 branding files, especially the separately uploaded cat artwork, lack a source/rights record. | Obtain creator/source and redistribution grant covering SVGs, PNG derivatives and HTML artwork; record required attribution and asset-specific terms. Otherwise replace/exclude assets and update consumers. | Maintainer and asset contributor; SFS-854 gate. |
 | P4 | Four redb fixtures: incomplete baseline origin/content provenance. | Establish synthetic generation and right to publish data, document original redb version/schema/input or regenerate compatible synthetic baselines and derived fixtures with focused fixture tests. | Maintainer/fixture author; SFS-854 gate. |
-| P5 | Tracked `.antigravitycli/9d7276d9-1579-4c0b-8fa1-49bdc747c598.json` is machine-local tool metadata introduced at `c3d34463`, with an absolute local project path. | Remove/exclude it from public source, decide how reachable history is handled, and complete the separate secret/private-data scan. An ignore rule does not untrack existing content. | SFS-854 publication hygiene. |
+| P5 | `.antigravitycli/9d7276d9-1579-4c0b-8fa1-49bdc747c598.json` is a tracked symlink (mode `120000`) introduced at `c3d34463`; its blob is an absolute user-home path, not JSON content. Windows checkouts without symlink support materialize it as a small plain file. | Remove/exclude it from public source, decide how reachable history is handled, and complete the separate secret/private-data scan. An ignore rule does not untrack existing content. | SFS-854 publication hygiene. |
 
 SFS-849 dependency evidence gaps, SFS-850 native packaging conditions and
 SFS-853 generated notices remain separate release gates. This source audit
@@ -220,8 +220,22 @@ git grep -n -I -i -E 'copyright|SPDX|copied from|adapted from|derived from|Juice
 git diff --check
 ```
 
-The delivery checks compare all 718 inventory path/blob pairs with `git ls-tree`,
-assert unique paths and category totals, verify report-local links and the
+The inventory integrity check compares every path/blob pair with the baseline
+tree (no output from `Compare-Object` means an exact match), then reports
+duplicate paths (expected `0`) and category totals:
+
+```powershell
+$base = 'c7be848af03c6bebaa5e890406e3d0ec8c0d729b'
+$tree = git ls-tree -r $base | ForEach-Object { $meta, $path = $_ -split "`t", 2; "$path`t$(($meta -split ' ')[2])" }
+$rows = Get-Content docs/legal/source-provenance-inventory.tsv | Select-Object -Skip 1 | ForEach-Object { , ($_ -split "`t") }
+Compare-Object $tree ($rows | ForEach-Object { "$($_[0])`t$($_[1])" })
+($rows | Group-Object { $_[0] } | Where-Object Count -gt 1).Count
+$rows | Group-Object { $_[2] } | Sort-Object Name | Format-Table Count, Name
+```
+
+The TSV has no file-mode column; `git ls-tree` shows the one symlink (P5) and the
+one executable script, `tools/perf/linux-juicefs-parity-gate.sh`. The delivery
+checks also verify report-local links and the
 fixture hashes recorded upstream in this repository, and inspect the final
 documentation diff. These checks verify inventory integrity, not ownership.
 No Rust/full suites, native builds, release archives or exhaustive historical
