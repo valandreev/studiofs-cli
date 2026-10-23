@@ -28,10 +28,12 @@ WinFsp binaries; each user installs the platform driver from its upstream.
   declares `license = "GPL-3.0"` and the repository has no `LICENSE` file;
   SFS-852 owns the SPDX correction (`GPL-3.0-only`) and adding the license
   text. Every release archive must contain the GPLv3 text.
-- The code copyright holder is the project author; the only other
-  contributor commits add branding images under `docs/branding/`. An
-  additional GPLv3 §7 permission (see the macOS escalation) is therefore
-  feasible without contributor sign-off, but no such exception exists today.
+- Git history records project-author aliases and separate branding uploads;
+  it does not prove sole copyright ownership or authority to grant an
+  additional GPLv3 §7 permission (see the macOS escalation). Confirm the
+  affected rightsholders before granting any exception. The
+  [source provenance audit](source-provenance.md) records unresolved source,
+  contribution and asset evidence; no such exception exists today.
 - GPLv3 §1 "System Libraries" covers OS components and the compiler runtime
   (Windows system DLLs, the MSVC runtime, glibc, Apple system frameworks). It
   does **not** cover third-party drivers such as WinFsp, libfuse3 shipped by a

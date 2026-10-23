@@ -1,6 +1,6 @@
 # SFS-663 PostgreSQL command-pool size implementation plan
 
-This ExecPlan is a living document. It follows `E:\dev\studiofs-cli\.agent\PLANS.md`; the `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections must be updated as the work advances.
+This ExecPlan is a living document. It follows `.agent/PLANS.md`; the `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections must be updated as the work advances.
 
 **Goal:** Allow each StudioFS client to choose its PostgreSQL command-pool capacity at runtime, retaining a default of four connections, while keeping the persisted volume schema unchanged.
 
@@ -95,7 +95,7 @@ Finally document the default, variable name, precedence, invalid-value behavior,
 
 ## Concrete Steps
 
-All commands run from `E:\dev\studiofs-cli` in PowerShell.
+All commands run from `<repo-root>` in PowerShell.
 
 1. Create the failing tests in `crates/studiofs-meta/src/pg_engine.rs`/`runtime.rs` and run:
 

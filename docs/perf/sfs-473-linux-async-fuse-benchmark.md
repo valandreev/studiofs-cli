@@ -5,7 +5,7 @@ Date: 2026-05-31
 Host:
 
 - Windows 11 host, WSL2 Ubuntu guest.
-- Kernel: `Linux valslegion 6.6.87.2-microsoft-standard-WSL2`.
+- Kernel: `Linux <host> 6.6.87.2-microsoft-standard-WSL2`.
 - Rust: `rustc 1.96.0 (ac68faa20 2026-05-25)`.
 - FUSE: `fusermount3`, `fuse3` package version `3.14.0`.
 - fio: `fio-3.36`.

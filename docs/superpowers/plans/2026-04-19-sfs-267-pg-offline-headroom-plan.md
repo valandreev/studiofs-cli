@@ -1,6 +1,6 @@
 # SFS-267 PG Offline Headroom Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task under `.agent/PLANS.md`. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Implement canonical PostgreSQL-offline write continuation with finite preallocated headroom, read-only degradation on exhaustion, preserved known-lock enforcement, and reconnect replay/coalescing.
 

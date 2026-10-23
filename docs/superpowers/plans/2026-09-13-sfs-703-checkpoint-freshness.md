@@ -140,7 +140,7 @@ Add focused tests for environment override parsing if the existing `pg_env_var` 
 - Modify: this plan with actual progress, evidence, surprises, decisions, and outcomes.
 - Commit: every intended SFS-703 source, test, schema, plan, and documentation file; preserve unrelated worktree content.
 
-Run only focused validation from `E:\dev\studiofs-cli`, at minimum:
+Run only focused validation from `<repo-root>`, at minimum:
 
     cargo fmt -- --check
     cargo test -p studiofs-meta checkpoint_freshness --lib
@@ -153,7 +153,7 @@ If changed SQL or lifecycle behavior requires it and the local `.env` provides `
 
 ## Concrete Steps
 
-All commands run from `E:\dev\studiofs-cli` in PowerShell. The implementation must use `apply_patch` for file edits and must not use a full workspace test suite. The first red test command is:
+All commands run from `<repo-root>` in PowerShell. The implementation must use `apply_patch` for file edits and must not use a full workspace test suite. The first red test command is:
 
     cargo test -p studiofs-meta checkpoint_freshness --lib
 

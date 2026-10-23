@@ -200,7 +200,7 @@ assertion if the focused test exposes a gap.
 
 ## Concrete Steps
 
-1. From `E:\dev\studiofs-cli`, add the cleanup error-preservation regression in
+1. From `<repo-root>`, add the cleanup error-preservation regression in
    `crates/studiofs/src/cli/mount/session.rs`, adjacent to the existing mount
    launch tests. Run the filtered `studiofs` tests and observe the new test
    fail if it is written against behavior not yet implemented.
@@ -217,7 +217,7 @@ assertion if the focused test exposes a gap.
    `cli/winfsp_bootstrap.rs`, whose registry access configures
    `MountUseMountmgrFromFSD` and is a separate operation.
 
-4. Run the focused validation from `E:\dev\studiofs-cli`:
+4. Run the focused validation from `<repo-root>`:
 
        cargo test -p studiofs prepared_mount_launch -- --nocapture
        cargo test -p studiofs foreground_shutdown_releases_vfs_handles_before_runtime_shutdown -- --nocapture

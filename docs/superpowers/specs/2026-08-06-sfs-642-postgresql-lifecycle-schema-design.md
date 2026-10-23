@@ -256,7 +256,7 @@ capability in the final Linear update and response.
 
 ## Concrete steps
 
-All commands below are run from `/Volumes/Storage/dev/studiofs`. The test-first
+All commands below are run from `<repo-root>`. The test-first
 rule applies to each new regression test: add one test, run its exact filter
 and observe the failure, then make the smallest production change that turns
 it green.

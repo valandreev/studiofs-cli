@@ -1,6 +1,6 @@
 # Atomic Bootstrap Checkpoint Descriptor Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task under `.agent/PLANS.md`. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Expose one validated PostgreSQL bootstrap descriptor whose checkpoint bytes, replay floor, volume identity, format identity, checksum, and publication generation are read from one consistent record.
 
@@ -56,7 +56,7 @@ The test should exercise the public shape directly:
 
 - [x] **Step 2: Run the test to verify it fails**
 
-Run from `/Volumes/Storage/dev/studiofs`:
+Run from `<repo-root>`:
 
     cargo test -p studiofs-meta bootstrap_checkpoint_descriptor
 
@@ -338,7 +338,7 @@ leave freshness, coordination, and local installation follow-ups untouched.
 
 ## Concrete Steps
 
-All commands run from `/Volumes/Storage/dev/studiofs`. Use one Cargo command at
+All commands run from `<repo-root>`. Use one Cargo command at
 a time to avoid target-directory locks. Keep PostgreSQL credentials in the
 environment only; never paste `.env` or DSNs into artifacts.
 

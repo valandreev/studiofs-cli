@@ -117,7 +117,7 @@ Milestone 3 rebuilds the release binary, mounts the `test` volume, and runs `tar
 
 ## Concrete Steps
 
-From the repository root `/Volumes/Storage/dev/studiofs`:
+From the repository root `<repo-root>`:
 
     cargo test -p studiofs-vfs --lib ram_readahead -- --nocapture
     cargo test -p studiofs-vfs --lib read_window -- --nocapture

@@ -5,7 +5,7 @@
 This document is the canonical mounted-IO contract for StudioFS.
 
 The reference implementation for data-plane economics is the local JuiceFS
-repository at `E:\dev\studiofs-project\juicefs`, commit
+repository at `<juicefs-checkout>`, commit
 `668828b61b216ccd289a1e0e10515a41c5f4f4ee`.
 
 StudioFS implements one production mount model:

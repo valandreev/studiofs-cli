@@ -1,6 +1,6 @@
 # SFS-40 Daily Automatic Snapshot Policy Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task under `.agent/PLANS.md`. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make one connected StudioFS client automatically create and materialize at most one automatic Snapshot v2 job per eligible daily policy slot, with deterministic timezone/DST behavior and fenced evaluator takeover.
 
@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Follow `/Volumes/Storage/dev/studiofs/.agent/PLANS.md`; keep this plan living and update progress, discoveries, decisions, and outcomes.
+- Follow `.agent/PLANS.md`; keep this plan living and update progress, discoveries, decisions, and outcomes.
 - Preserve dependency direction: domain <- ports <- application <- adapters/runtime/API.
 - Write each test before production code, run it failing, then add the minimum implementation.
 - PostgreSQL is authoritative for policy generations, slots, evaluator leases, catalog rows, jobs, and fencing.
@@ -43,7 +43,7 @@
 
 - [ ] **Step 2: Run the exact tests and verify RED.**
 
-  Run from `/Volumes/Storage/dev/studiofs`:
+  Run from `<repo-root>`:
 
       cargo test -p studiofs-meta policy_default_timezone_is_utc -- --nocapture
       cargo test -p studiofs-meta dst_gap_records_skipped_slot -- --nocapture

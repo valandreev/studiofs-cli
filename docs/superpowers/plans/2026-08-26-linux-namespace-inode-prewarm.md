@@ -1,6 +1,6 @@
 # Linux namespace inode prewarm Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task under `.agent/PLANS.md`. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the first writable Linux namespace operation avoid the initial local inode-allocator refill that can block scenario 23, while leaving macOS and Windows behavior unchanged.
 
@@ -191,7 +191,7 @@ Windows FUSE bridge source needs to be edited.
         );
     }
 
-- [x] **Step 2: Run the focused test before changing production code.** From `/home/val/dev/studiofs-cli`, ran:
+- [x] **Step 2: Run the focused test before changing production code.** From `<repo-root>`, ran:
 
     cargo test -p studiofs-vfs --lib vfs::tests::linux_start_prewarm_namespace_inode_reservation -- --exact --nocapture
 
@@ -242,7 +242,7 @@ Windows FUSE bridge source needs to be edited.
   `start()` call returns before this block. Because the read-only return is
   earlier, read-only mounts do not touch the allocator.
 
-- [x] **Step 3: Run the focused test.** From `/home/val/dev/studiofs-cli`, ran:
+- [x] **Step 3: Run the focused test.** From `<repo-root>`, ran:
 
     cargo test -p studiofs-vfs --lib vfs::tests::linux_start_prewarm_namespace_inode_reservation -- --exact --nocapture
 
@@ -279,7 +279,7 @@ Windows FUSE bridge source needs to be edited.
   actual command results.
 
 - [x] **Step 1: Run the complete `studiofs-vfs` library tests.** Ran
-  `/home/val/dev/studiofs-cli`, run:
+  `<repo-root>`, run:
 
     cargo test -p studiofs-vfs --lib
 

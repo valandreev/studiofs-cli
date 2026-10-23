@@ -10,7 +10,7 @@ The first milestone implements the first priority of `docs/code-reviews/sfs-879-
 
 ## Progress
 
-- [x] (2026-10-21) Recorded root `/Volumes/Storage/dev/studiofs`, branch `feature/sfs-879-macos-readwrite-throughput-gap-vs-lucidlink-investigation`, clean starting worktree; read source, contracts, and Linear issue.
+- [x] (2026-10-21) Recorded root `<repo-root>`, branch `feature/sfs-879-macos-readwrite-throughput-gap-vs-lucidlink-investigation`, clean starting worktree; read source, contracts, and Linear issue.
 - [x] (2026-10-21) Added a UBC-open regression, observed its expected failure, then removed the direct_io restriction; 7 open tests and 6 RAM read-ahead tests passed.
 - [x] (2026-10-21) Focused macFUSE Clippy passed for the initial change.
 - [x] (2026-10-21) Collected baseline, rejected adapter-only candidate, and corrected mounted runs on retained 16 GB and 2 GB files; two reads per case. Cold-cache/Finder acceptance remains environment-gated.

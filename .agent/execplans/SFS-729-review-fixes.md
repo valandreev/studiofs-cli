@@ -103,7 +103,7 @@ For the annotation follow-up, construct `RemoteReplayExecution` before acquiring
 
 ## Concrete Steps
 
-Run commands from `/Volumes/Storage/dev/studiofs`. Before the production changes, the bridge assertion and cancellation-metric test failed as expected; the caller-predicate test failed to compile because that predicate did not yet exist. The new `PgSyncFailure` test covers mappings that were already implemented. After the fix, run:
+Run commands from `<repo-root>`. Before the production changes, the bridge assertion and cancellation-metric test failed as expected; the caller-predicate test failed to compile because that predicate did not yet exist. The new `PgSyncFailure` test covers mappings that were already implemented. After the fix, run:
 
     cargo test -p studiofs-meta --lib pg_engine::tests::remote_apply:: -- --nocapture
     cargo test -p studiofs-meta --lib pg_engine::tests::lifecycle::replay_cancellation_includes_worker_and_caller_shutdown

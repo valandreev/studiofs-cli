@@ -45,7 +45,7 @@ Require a volume argument before the existing operation enum. Derive its validat
 
 ## Concrete Steps
 
-From `E:\dev\studiofs-cli`, run sequentially:
+From `<repo-root>`, run sequentially:
 
     cargo test -p studiofs --bin studiofs cli::snapshot::tests -- --nocapture
     cargo test -p studiofs --bin studiofs snapshot_log_level_works_before_and_after_the_operation -- --nocapture

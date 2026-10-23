@@ -179,7 +179,7 @@ boundary.
 
 ## Concrete Steps
 
-All commands run from `E:\dev\studiofs-cli`.
+All commands run from `<repo-root>`.
 
 - Add tests before the implementation and run:
   `cargo test -p studiofs --bin studiofs discover_`

@@ -8,7 +8,7 @@ The blue/yellow tray flag must mean this mount's accepted changes have reached r
 
 ## Progress
 
-- [x] (2026-10-18) Read SFS-866, recorded checkout E:/dev/studiofs-cli, matching feature branch and clean initial worktree; confirmed unsafe metadata threshold.
+- [x] (2026-10-18) Read SFS-866, recorded checkout <repo-root>, matching feature branch and clean initial worktree; confirmed unsafe metadata threshold.
 - [x] (2026-10-18) Trace metadata acknowledgement; expose exclusive journal end and durable cursor in one redb transaction with backend forwarding.
 - [x] (2026-10-18) Finish VFS payload ownership/handoff proof, including owned upload/finalization/retry leases; four focused VFS tests passed and the delayed-retry shutdown ownership test passed.
 - [x] (2026-10-18) Implement diagnostics transport, tray mapping and freshness/heartbeat tests; 22 tray tests passed after the confirmed red regression.
@@ -57,7 +57,7 @@ First trace accepted writes through dirty memory, persisted staging, upload sche
 
 ## Concrete Steps
 
-From E:/dev/studiofs-cli use focused commands only. Start with `cargo test -p studiofs --bin studiofs tray::supported::tests:: -- --nocapture`. Run module-filtered metadata/VFS tests for the new summary and the registered E2E scenario selected during implementation. Record actual commands and results below as they become available. Finish with formatting, scoped Clippy and `git diff --check`.
+From <repo-root> use focused commands only. Start with `cargo test -p studiofs --bin studiofs tray::supported::tests:: -- --nocapture`. Run module-filtered metadata/VFS tests for the new summary and the registered E2E scenario selected during implementation. Record actual commands and results below as they become available. Finish with formatting, scoped Clippy and `git diff --check`.
 
 ## Validation and Acceptance
 
@@ -75,7 +75,7 @@ Validated commands: `cargo test -p studiofs --bin studiofs tray::supported::test
 
 After the final handoff changes, `cargo test -p studiofs-vfs -p studiofs-e2e --lib sync_safety -- --nocapture` passed four VFS and two runner tests. The just-built VFS test executable also passed `shutdown_owns_epoch_retry_before_reopening_local_stores`, proving delayed publication retry is visible and still joined/cancelled by shutdown.
 
-Final tray/transport verification passed 23 tray tests and `legacy_runtime_snapshot_cannot_certify_sync_completion` (one test). `cargo build -p studiofs -p studiofs-e2e` succeeded. The rebuilt runner listed the new acceptance at position 29, preserving existing numbered scenarios. Command: `target/debug/studiofs-e2e.exe run mounted-sync-safety-two-client-acceptance --studiofs-bin E:/dev/studiofs-cli/target/debug/studiofs.exe --platform windows-winfsp --run-id sfs866-sync-safety-20261018-a --retain always --timeout 600s`. Result: Passed; report at `target/e2e-runs/sfs866-sync-safety-20261018-a/report.json`, detailed snapshot/hash evidence at `artifacts/scenarios/mounted-sync-safety-two-client-acceptance/sync-safety-summary.json`. Cleanup reported passed with no errors. `cargo clippy -p studiofs-meta -p studiofs-vfs -p studiofs -p studiofs-e2e --all-targets -- -D warnings`, `cargo fmt --all -- --check` and `git diff --check` passed. The only lint correction collapsed the new scenario's nested cleanup condition without changing behavior.
+Final tray/transport verification passed 23 tray tests and `legacy_runtime_snapshot_cannot_certify_sync_completion` (one test). `cargo build -p studiofs -p studiofs-e2e` succeeded. The rebuilt runner listed the new acceptance at position 29, preserving existing numbered scenarios. Command: `target/debug/studiofs-e2e.exe run mounted-sync-safety-two-client-acceptance --studiofs-bin <repo-root>/target/debug/studiofs.exe --platform windows-winfsp --run-id sfs866-sync-safety-20261018-a --retain always --timeout 600s`. Result: Passed; report at `target/e2e-runs/sfs866-sync-safety-20261018-a/report.json`, detailed snapshot/hash evidence at `artifacts/scenarios/mounted-sync-safety-two-client-acceptance/sync-safety-summary.json`. Cleanup reported passed with no errors. `cargo clippy -p studiofs-meta -p studiofs-vfs -p studiofs -p studiofs-e2e --all-targets -- -D warnings`, `cargo fmt --all -- --check` and `git diff --check` passed. The only lint correction collapsed the new scenario's nested cleanup condition without changing behavior.
 
 ## Interfaces and Dependencies
 

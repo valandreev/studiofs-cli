@@ -230,14 +230,14 @@ added as a substitute for an observable state condition.
 
 ## Concrete Steps
 
-Run all commands from `E:\dev\studiofs-cli`.
+Run all commands from `<repo-root>`.
 
 1. Add the public encoder and fixture module with `apply_patch`; do not edit
    files with shell redirection. (Completed.)
 2. Format and compile the affected crates. (Completed.)
 
     cargo fmt --all
-    cargo check --target-dir E:\dev\studiofs-cli\analysis-s24\target -p studiofs-meta -p studiofs-e2e
+    cargo check --target-dir <repo-root>\analysis-s24\target -p studiofs-meta -p studiofs-e2e
 
 3. Run focused tests with nonzero test counts, including the existing metadata
    replication backlog tests, the VFS cleanup regression, and the new fixture
@@ -245,7 +245,7 @@ Run all commands from `E:\dev\studiofs-cli`.
 4. Rebuild the product and E2E binaries before the native scenario. (Completed
    for the current exploratory configuration.)
 
-    cargo build --target-dir E:\dev\studiofs-cli\analysis-s24\target -p studiofs -p studiofs-e2e
+    cargo build --target-dir <repo-root>\analysis-s24\target -p studiofs -p studiofs-e2e
 
 5. Run only scenario 24 with the registered runner and retained artifacts after
    each mounted-validation correction. The accepted native runs are

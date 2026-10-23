@@ -129,7 +129,7 @@ the lock before automatic thread joining.
 
 ## Concrete Steps
 
-Work from `/Volumes/Storage/dev/studiofs`. Use `RUSTFLAGS='-D warnings'` for
+Work from `<repo-root>`. Use `RUSTFLAGS='-D warnings'` for
 focused tests and compile checks. Run the fsck regression with
 `cargo test -p studiofs --bin studiofs repair_preserves_replacement_for_stale_dangling_report`.
 Run the VFS regression under
@@ -259,7 +259,7 @@ Finding 6 is cosmetic. `DirEntryValue` contains two scalar fields; cloning it
 does not allocate. Adding a public `Copy` contract has no demonstrated behavior
 or performance benefit for this issue, so leave the type unchanged.
 
-From `/Volumes/Storage/dev/studiofs`, rerun focused follow-up tests with
+From `<repo-root>`, rerun focused follow-up tests with
 `RUSTFLAGS='-D warnings'`: `cargo test -p studiofs-vfs --lib
 vfs::namespace_ops::tests::`, `cargo test -p studiofs-vfs --lib
 stale_positive_lookup_does_not_delete_or_hide_replacement_entry`,

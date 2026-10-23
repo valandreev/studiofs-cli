@@ -126,7 +126,7 @@ Add reopen coverage around the durable marker: close an engine after a failed bo
 
 ## Concrete Steps
 
-Work from `/Volumes/Storage/dev/studiofs`.
+Work from `<repo-root>`.
 
 1. Write the focused regression test and run it alone:
 

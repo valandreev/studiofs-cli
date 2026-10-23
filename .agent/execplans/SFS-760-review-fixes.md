@@ -1,7 +1,7 @@
 # Propagate the remaining redb removal errors
 
 This ExecPlan is maintained under `.agent/PLANS.md`. Repository root is
-`/Volumes/Storage/dev/studiofs`; branch is
+`<repo-root>`; branch is
 `feature/sfs-760-propagate-redb-table-removal-errors-from-metadata-write`.
 The starting checkout is clean at `54e85098`.
 

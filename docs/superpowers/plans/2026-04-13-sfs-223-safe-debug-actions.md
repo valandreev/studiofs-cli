@@ -1,6 +1,6 @@
 # SFS-223 Safe Debug Actions Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task under `.agent/PLANS.md`. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add controller-safe diagnostics actions for bounded log verbosity changes, capture bundles, counter resets, and lightweight self-checks with loud-action timeline auditing and fail-open behavior.
 

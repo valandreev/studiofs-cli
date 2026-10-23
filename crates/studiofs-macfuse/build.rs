@@ -42,7 +42,6 @@ fn main() {
     build.std("c11");
     build.define("_FILE_OFFSET_BITS", "64");
     build.define("FUSE_USE_VERSION", "26");
-    build.define("STUDIOFS_REAL_MACFUSE_HEADERS_REQUIRED", "1");
     let Ok(output) = Command::new("pkg-config")
         .args(["--cflags", "--libs-only-L", "fuse"])
         .output()

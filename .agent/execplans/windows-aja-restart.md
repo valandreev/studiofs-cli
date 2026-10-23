@@ -8,7 +8,7 @@ A Windows AJA workload succeeds initially, but replacing its file before S3 uplo
 
 ## Progress
 
-- [x] (2026-10-17) Recorded checkout `E:/dev/studiofs-cli`, branch `bug/winfsp-bughunt-01`, initially clean worktree, and release mount `test` on `Z:` (PID 41604).
+- [x] (2026-10-17) Recorded checkout `<repo-root>`, branch `bug/winfsp-bughunt-01`, initially clean worktree, and release mount `test` on `Z:` (PID 41604).
 - [x] (2026-10-17) Read relevant VFS/cache/WinFSP contracts and inspected recent scheduler PRs #813/#814; delegated scheduler and WinFSP read-path investigations.
 - [x] (2026-10-17) Preserved live write-path counters under `target/perf/aja-restart-2026-10-17/`; no production metadata or existing payload was modified.
 - [x] (2026-10-17) Ran the authorized three-pass 4 GiB native probe on the original release mount. Delete/recreate and truncate canceled old pending bytes; all six verified reads passed. Warm reads were 1.51–1.54 GiB/s. The original AJA read failure was not reproduced.
@@ -77,7 +77,7 @@ After the failing test identifies the defect, correct the shared owner and its r
 
 ## Concrete Steps
 
-Run all commands from `E:/dev/studiofs-cli`. Preserve probe results in `target/perf/aja-restart-2026-10-17/`. Read existing counters from `D:/cache/8d16df8d-1dae-445a-b5b5-a4217f863ea2/write_path_observability.json`; do not print secret-bearing configuration. Use `cargo test -p <affected-crate> <specific-filter>` and require nonzero test execution. Cargo commands run sequentially. Before native acceptance rebuild the product; do not count the currently running old binary as fixed validation.
+Run all commands from `<repo-root>`. Preserve probe results in `target/perf/aja-restart-2026-10-17/`. Read existing counters from `D:/cache/8d16df8d-1dae-445a-b5b5-a4217f863ea2/write_path_observability.json`; do not print secret-bearing configuration. Use `cargo test -p <affected-crate> <specific-filter>` and require nonzero test execution. Cargo commands run sequentially. Before native acceptance rebuild the product; do not count the currently running old binary as fixed validation.
 
 ## Validation and Acceptance
 

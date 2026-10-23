@@ -5,7 +5,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
 
 bench_bin="$repo_root/target/bench/studiofs-bench"
-juicefs_repo="/home/val/dev/juicefs"
+juicefs_repo="$repo_root/../juicefs"
 source_repo="$repo_root"
 output_root="$repo_root/target/perf"
 runs=5
@@ -36,7 +36,7 @@ Options:
   --workload-bytes <n>           Large sequential workload size. Defaults to 1 GiB.
   --small-workload-bytes <n>     Small-file workload size. Defaults to 256 MiB.
   --source-repo <path>           Repository copied by the repo-copy workload. Defaults to this repo.
-  --juicefs-repo <path>          Local JuiceFS checkout used as behavior reference. Defaults to /home/val/dev/juicefs.
+  --juicefs-repo <path>          Local JuiceFS checkout used as behavior reference. Defaults to ../juicefs next to this repo.
   --studiofs-old-target <path>   Mounted current-main/direct target.
   --studiofs-new-target <path>   Mounted feature/direct target.
   --studiofs-adaptive-target <path>
@@ -47,9 +47,9 @@ Options:
   -h, --help                     Show this help.
 
 JuiceFS reference checked during planning:
-  /home/val/dev/juicefs/cmd/bench.go
-  /home/val/dev/juicefs/cmd/mdtest.go
-  /home/val/dev/juicefs/.github/scripts/fio.sh
+  <juicefs-checkout>/cmd/bench.go
+  <juicefs-checkout>/cmd/mdtest.go
+  <juicefs-checkout>/.github/scripts/fio.sh
 USAGE
 }
 

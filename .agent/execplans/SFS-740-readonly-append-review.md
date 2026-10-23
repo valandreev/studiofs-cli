@@ -110,7 +110,7 @@ bare `APPEND` remains a writer. Adjust the macFUSE append-writer test to use
 
 ## Concrete Steps
 
-Run from `E:\dev\studiofs-cli`:
+Run from `<repo-root>`:
 
     cargo fmt --all -- --check
     cargo test -p studiofs-vfs --lib test_open_flags_bitwise -- --nocapture

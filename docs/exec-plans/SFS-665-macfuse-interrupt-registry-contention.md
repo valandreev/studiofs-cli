@@ -269,7 +269,7 @@ teardown still unregisters FFI before map removal.
 
 ## Concrete Steps
 
-Run from `/Volumes/Storage/dev/studiofs`:
+Run from `<repo-root>`:
 
     cargo test -p studiofs-macfuse --lib interrupt_registry -- --nocapture
     cargo test -p studiofs-macfuse --lib next_interrupt_key_skips_zero_after_wrap -- --test-threads=1

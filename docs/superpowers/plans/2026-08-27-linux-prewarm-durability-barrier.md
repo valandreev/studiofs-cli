@@ -1,6 +1,6 @@
 # Linux prewarm durability barrier Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task under `.agent/PLANS.md`. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the Linux startup namespace prewarm locally durable before the first mounted namespace operation, preventing the relaxed Redb barrier from blocking scenario 22.
 
@@ -44,7 +44,7 @@ idempotent.
           "Linux namespace prewarm should force one immediate local metadata barrier"
       );
 
-- [x] **Step 2: Run the focused test and confirm RED.** From `/home/val/dev/studiofs-cli`, run:
+- [x] **Step 2: Run the focused test and confirm RED.** From `<repo-root>`, run:
 
       cargo test -p studiofs-vfs --lib vfs::tests::linux_start_prewarm_namespace_inode_reservation -- --exact --nocapture
 
@@ -105,7 +105,7 @@ the immediate durability attempt failed.
 
 - Test: `crates/studiofs-vfs/src/vfs/tests.rs` and the complete `studiofs-vfs` library test target.
 
-- [x] **Step 1: Run the namespace allocator test group.** From `/home/val/dev/studiofs-cli`, run:
+- [x] **Step 1: Run the namespace allocator test group.** From `<repo-root>`, run:
 
       cargo test -p studiofs-vfs --lib namespace_inode -- --nocapture
 
@@ -141,7 +141,7 @@ the immediate durability attempt failed.
 
 - No source files; use retained E2E artifacts under `target/e2e-runs/`.
 
-- [x] **Step 1: Rebuild the release binaries.** From `/home/val/dev/studiofs-cli`, run:
+- [x] **Step 1: Rebuild the release binaries.** From `<repo-root>`, run:
 
       cargo build --release -p studiofs -p studiofs-e2e
 

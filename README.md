@@ -402,6 +402,9 @@ JuiceFS has served as an important technical reference point for StudioFS.
 
 ## License
 
+The [source and asset provenance audit](docs/legal/source-provenance.md)
+records evidence and unresolved publication gates for the planned public release.
+
 This project is distributed under the GPL-3.0 license. You may use and modify
 StudioFS for personal or commercial purposes, subject to the terms of the
 license.

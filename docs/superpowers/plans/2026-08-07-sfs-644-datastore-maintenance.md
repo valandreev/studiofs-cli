@@ -1,6 +1,6 @@
 # SFS-644 DataStore Maintenance Boundary Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task under `.agent/PLANS.md`. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Remove the raw `DataStore::operator` escape hatch, give the VFS janitor a streaming provider-neutral listing API, validate delete keys at the data boundary, and make WinFSP's direct `studiofs-data` edge test-only.
 
@@ -10,7 +10,7 @@
 
 ---
 
-This living plan follows `.agent/PLANS.md`. The repository is `E:\dev\studiofs-cli` on branch `feature/sfs-644-s33-narrow-datastore-maintenance-operations-and-remove-the`. Full workspace test suites are intentionally excluded; run focused package checks only.
+This living plan follows `.agent/PLANS.md`. The repository is `<repo-root>` on branch `feature/sfs-644-s33-narrow-datastore-maintenance-operations-and-remove-the`. Full workspace test suites are intentionally excluded; run focused package checks only.
 
 ## Purpose / Big Picture
 
@@ -84,7 +84,7 @@ Files:
 
 Add one async test that writes two keys below `unit-volume/objects/`, calls `list_object_entries("unit-volume/objects/")`, consumes the stream with `futures::StreamExt::next`, and asserts the two returned keys. Add one async test that calls `delete_by_key` with `other-volume/object` and `unit-volume/../other/object`, then asserts each error is `DataError::InvalidObjectKey`. The tests must be written before production changes and use the existing `Operator::new(Memory::default())` fixture.
 
-Run from `E:\dev\studiofs-cli`:
+Run from `<repo-root>`:
 
     cargo test -p studiofs-data list_object_entries --lib
 
@@ -170,7 +170,7 @@ Expected metadata output has `name studiofs-data` and `kind dev`. The package ma
 
 ### Task 6: Focused verification and handoff
 
-Run from `E:\dev\studiofs-cli`:
+Run from `<repo-root>`:
 
     cargo fmt --all -- --check
     cargo test -p studiofs-data --lib

@@ -120,7 +120,7 @@ offline state, legacy read-only, and two-root uniqueness coverage.
 
 ## Concrete Steps
 
-Run from `/Volumes/Storage/dev/studiofs`, one Cargo command at a time:
+Run from `<repo-root>`, one Cargo command at a time:
 
     cargo test -p studiofs-meta sfs623_pg_allocator_ -- --ignored --nocapture --test-threads=1  # historical SFS-623 acceptance filter
     cargo test -p studiofs-meta sfs623_allocator_state_ -- --nocapture

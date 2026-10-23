@@ -50,7 +50,7 @@ Two independent edits run in parallel: one limited to `crates/studiofs-macfuse`,
 
 ## Concrete Steps
 
-From the repository root `/Volumes/Storage/dev/studiofs`:
+From the repository root `<repo-root>`:
 
     cargo fmt --all
     cargo test -p studiofs-macfuse --lib read_buffer

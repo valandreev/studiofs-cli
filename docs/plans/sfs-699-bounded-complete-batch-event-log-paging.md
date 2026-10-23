@@ -150,7 +150,7 @@ and SQL contract text, but do not replace the live query coverage.
 
 ## Concrete Steps
 
-Run commands from `E:\dev\studiofs-cli`.
+Run commands from `<repo-root>`.
 
 1. Edit the SQL, metadata I/O, sync, engine construction, test fixture, and new
    focused test module with `apply_patch`. Keep unrelated worktree changes

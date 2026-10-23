@@ -6,7 +6,7 @@ SFS-873: individual inode requests beyond the 8192-target WinFSP queue are lost.
 The foreground producer must remain nonblocking at capacity, and recovery must
 retain bounded memory. Queue acceptance never proves native cache invalidation.
 The current branch is `feature/sfs-873-winfsp-invalidation-queue-overflow-permanently-drops`
-in `E:/dev/studiofs-cli`; the starting worktree was clean.
+in `<repo-root>`; the starting worktree was clean.
 
 ## Progress
 
@@ -68,7 +68,7 @@ Update queue regressions in `context.rs` and the coherence contract.
 
 ## Concrete Steps and Validation
 
-Run from `E:/dev/studiofs-cli`, sequentially:
+Run from `<repo-root>`, sequentially:
 
     cargo test -p studiofs-winfsp --lib winfsp_invalidation_queue -- --test-threads=1
     cargo test -p studiofs-meta --lib list_inode_ids_after -- --test-threads=1
