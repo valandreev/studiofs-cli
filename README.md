@@ -421,9 +421,10 @@ those files under the GPL.
 Redistributing StudioFS, including modified builds or paid copies, carries GPL
 obligations: retain license and copyright notices, identify modifications, and
 provide recipients the corresponding source and build material as required by
-the license. Charging for copies is permitted. For binary downloads, provide
-equivalent access to the corresponding source through the same place at no
-additional charge (GPLv3 section 6(d)). See the
+the license. Charging for copies is permitted. For example, binary downloads can
+satisfy this by offering equivalent access to the corresponding source at no
+further charge, with clear directions from the download location (GPLv3
+section 6(d)); section 6 also lists other methods. See the
 [GNU GPL FAQ](https://www.gnu.org/licenses/gpl-faq.en.html) for explanations of
 private use, commercial distribution, and program output.
 

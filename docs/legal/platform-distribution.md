@@ -215,7 +215,8 @@ Observed on 2026-10-22 with `cargo build --locked -p studiofs --release` in an
   `MFMount.framework` is under a GPL-compatible license without clause 4, or
   (b) a GPLv3 §7 additional permission from the StudioFS copyright holder to
   link with macFUSE components, which changes the SPDX expression to
-  `GPL-3.0-only WITH <exception>` and must be coordinated with SFS-852. Ask
+  `GPL-3.0-only WITH <exception>` and needs a new tracked issue to update the
+  workspace `license` field, LICENSE/notice files and README. Ask
   the macFUSE maintainer, as the Open Source Status page directs for
   licensing questions, before choosing.
 

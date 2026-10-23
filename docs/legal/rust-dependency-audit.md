@@ -218,7 +218,7 @@ texts. Do not rewrite third-party manifests or the lockfile to normalize labels.
 | --- | --- | --- |
 | Missing packaged license/notice evidence | Resolve each package listed in the final evidence-gap section against its exact source revision, or exclude it from the distributed set. A manifest label is not a replacement for the copyright/permission notice. Verify vendored/native per-file supplements. | SFS-853; SFS-854 validates artifacts |
 | StudioFS license text and spelling | Resolved by SFS-852: root LICENSE contains the GPLv3 text and workspace metadata declares GPL-3.0-only. The pinned inventory preserves the pre-correction evidence. | SFS-852 |
-| Complete corresponding source and notices | Provide GPL-compliant corresponding source/build material, MPL source access, selected permissive texts/attributions and native supplements. Verify WinFsp pinned evidence and CDLA/CCADB notice treatment. Generated JSON alone satisfies none of these packaging obligations. | SFS-852 / SFS-853 / SFS-854 |
+| Complete corresponding source and notices | Provide GPL-compliant corresponding source/build material, MPL source access, selected permissive texts/attributions and native supplements. Verify WinFsp pinned evidence and CDLA/CCADB notice treatment. Generated JSON alone satisfies none of these packaging obligations. | SFS-853 / SFS-854 |
 | Exact target, architecture and feature set | Reproduce on native release builders, inspect actual executable links/generated content and archive contents, and account for any target/features different from these three graphs. Host build tools are not automatic binary inclusions or exclusions. | SFS-854 |
 | Native platform conditions | Follow SFS-850's documented external-driver/system-library policy and MFMount exclusion; check actual artifacts. No native licensing exception is newly granted by this report. | SFS-850 decisions; SFS-854 enforcement |
 | Dependency drift | Regenerate at the exact 0.2.0 tag/lockfile; review changed expressions and source evidence. Unknown/custom/new licenses must fail review rather than inherit a blanket allowance. | SFS-853 / SFS-854 |
@@ -259,9 +259,8 @@ root or in a root `LICENSES/` directory; nested vendor notices (for example
 `objc2-foundation`'s `src/copying.rs` are listed as evidence rows but do not
 satisfy the status. **65 registry packages** lack such a named file;
 the other **12** are first-party workspace packages whose root LICENSE was
-missing at the audited baseline (added by SFS-852). This is a notice-evidence gap
-in that snapshot, not a claim that the crates have no
-license grant. Some have notices in README or source headers: for example,
+missing at the audited baseline (added by SFS-852). This is a notice-evidence
+gap in that snapshot, not a claim that the crates have no license grant. Some have notices in README or source headers: for example,
 `wasite 1.0.2` README names “The Wasite Contributors” and its license alternatives.
 The exact source text still needs to enter the selected-license notice artifact.
 
