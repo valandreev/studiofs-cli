@@ -10,3 +10,7 @@ every file in the notices. Each folder needs:
   and the `license` expression from the crate's `Cargo.toml` that the texts cover.
 
 Do not write license text from memory and do not alter upstream text.
+
+An `EXCEPTION.txt` in place of a license text records a maintainer-accepted
+exception for a crate with no upstream license file; it is reproduced in the
+notices as such and must be listed in the publication gate.

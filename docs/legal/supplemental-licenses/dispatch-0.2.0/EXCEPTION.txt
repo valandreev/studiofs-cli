@@ -1,0 +1,12 @@
+dispatch 0.2.0 - documented notice-evidence exception
+
+The crate manifest declares `license = "MIT"` and `authors = ["Steven Sheldon"]`
+(repository: https://github.com/SSheldon/rust-dispatch). Neither the published
+crate archive nor the upstream repository (checked 2026-10-23) contains a license
+or copyright file, so no verbatim license text exists to reproduce here.
+
+This entry is NOT a license text. It records that StudioFS redistributes the crate
+(macOS builds only, via winit 0.30 -> objc2-foundation 0.2.2) on the strength of
+the author's MIT declaration in the manifest, and that the maintainer accepted this
+exception on 2026-10-23. The upstream author has been, or will be, asked to publish
+a license file; when one exists, replace this folder with it.

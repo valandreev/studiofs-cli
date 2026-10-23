@@ -1,0 +1,4 @@
+Crate: dispatch 0.2.0
+Repository: https://github.com/SSheldon/rust-dispatch
+Evidence: none upstream; see EXCEPTION.txt (maintainer-accepted exception, 2026-10-23)
+License expression (Cargo.toml): MIT
