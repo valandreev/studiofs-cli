@@ -1016,14 +1016,14 @@
 <pre data-panel="windows"><span class="c"># 1. install WinFsp: https://github.com/winfsp/winfsp/releases</span>
 
 <span class="c"># 2. extract the release zip, open the folder, then</span>
-<span class="p">&gt; </span>studiofs.exe --version
+<span class="p">&gt; </span>.\studiofs.exe --version
 
 <span class="c"># 3. join an existing volume</span>
-<span class="p">&gt; </span>studiofs.exe discover myvolume `
+<span class="p">&gt; </span>.\studiofs.exe discover myvolume `
     --meta <span class="s">postgres://user:pass@db:5432</span>
 
 <span class="c"># 4. mount it as a drive letter</span>
-<span class="p">&gt; </span>studiofs.exe mount myvolume Z:</pre>
+<span class="p">&gt; </span>.\studiofs.exe mount myvolume Z:</pre>
 <pre data-panel="macos" hidden><span class="c"># 1. install macFUSE yourself: https://macfuse.github.io</span>
 
 <span class="c"># 2. extract the release and check it</span>
@@ -1032,11 +1032,11 @@
 <span class="p">$ </span>cd studiofs-*-aarch64-apple-darwin &amp;&amp; ./studiofs --version
 
 <span class="c"># 3. join an existing volume</span>
-<span class="p">$ </span>studiofs discover myvolume \
+<span class="p">$ </span>./studiofs discover myvolume \
     --meta <span class="s">postgres://user:pass@db:5432</span>
 
 <span class="c"># 4. mount it</span>
-<span class="p">$ </span>studiofs mount myvolume ~/Studio</pre>
+<span class="p">$ </span>./studiofs mount myvolume ~/Studio</pre>
 <pre data-panel="linux" hidden><span class="c"># 1. bridge + runtime libraries (Ubuntu 24.04)</span>
 <span class="p">$ </span>sudo apt-get install fuse3 libgtk-3-0t64 libxdo3 libayatana-appindicator3-1
 
@@ -1046,13 +1046,13 @@
 <span class="p">$ </span>cd studiofs-*-x86_64-unknown-linux-gnu &amp;&amp; ./studiofs --version
 
 <span class="c"># 3. create a volume</span>
-<span class="p">$ </span>studiofs init myvolume \
+<span class="p">$ </span>./studiofs init myvolume \
     --endpoint <span class="s">https://s3.example.com</span> --bucket <span class="s">studio</span> \
     --access-key <span class="s">…</span> --secret-key <span class="s">…</span> \
     --meta <span class="s">postgres://user:pass@db:5432</span>
 
 <span class="c"># 4. mount it</span>
-<span class="p">$ </span>studiofs mount myvolume /mnt/studio</pre>
+<span class="p">$ </span>./studiofs mount myvolume /mnt/studio</pre>
         </div>
       </div>
     </div>
