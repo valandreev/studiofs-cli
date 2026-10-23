@@ -610,6 +610,7 @@ fn evidence_view_filters_by_scope_object_identity_and_marker_span() {
             },
         )
         .expect("append end marker");
+    // Markers can share a millisecond, so in-span events sit on the inclusive span bounds.
     let source = StaticDiagnosticsSource {
         recent_events: vec![
             sample_scoped_recent_event(
@@ -621,21 +622,21 @@ fn evidence_view_filters_by_scope_object_identity_and_marker_span() {
             ),
             sample_scoped_recent_event(
                 2,
-                start.occurred_unix_ms.saturating_add(1),
+                start.occurred_unix_ms,
                 SUBSYSTEM_UPLOAD_PIPELINE,
                 "sample",
                 serde_json::json!({"pending_uploads": 2, "path": "Q:/clips/reel.mov"}),
             ),
             sample_scoped_recent_event(
                 3,
-                start.occurred_unix_ms.saturating_add(2),
+                start.occurred_unix_ms,
                 SUBSYSTEM_CACHE,
                 "sample",
                 serde_json::json!({"pending_uploads": 99, "path": "Q:/clips/reel.mov"}),
             ),
             sample_scoped_recent_event(
                 4,
-                end.occurred_unix_ms.saturating_sub(1),
+                end.occurred_unix_ms,
                 SUBSYSTEM_UPLOAD_PIPELINE,
                 "sample",
                 serde_json::json!({"pending_uploads": 5, "path": "Q:/clips/reel.mov"}),

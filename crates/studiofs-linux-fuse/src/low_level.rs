@@ -236,6 +236,8 @@ unsafe extern "C" {
         keep_cache: c_int,
         parallel_direct_writes: c_int,
     ) -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_file_info_has_parallel_direct_writes() -> c_int;
 }
 
 pub(crate) struct SessionState {
@@ -5375,8 +5377,13 @@ mod tests {
     fn file_info_init_sets_requested_cache_flags() {
         // SAFETY: the C shim initializes and inspects a stack-local fuse_file_info.
         let flags = unsafe { super::studiofs_linux_fuse_file_info_flags_after_init(0, 1, 1) };
+        // SAFETY: the C shim only reports the libfuse headers it was compiled against.
+        let has_parallel_direct_writes =
+            unsafe { super::studiofs_linux_fuse_file_info_has_parallel_direct_writes() } != 0;
 
-        assert_eq!(flags, 6);
+        // libfuse < 3.15 (Ubuntu 24.04 ships 3.14) has no parallel_direct_writes bit.
+        let expected = if has_parallel_direct_writes { 6 } else { 2 };
+        assert_eq!(flags, expected);
     }
 
     #[test]

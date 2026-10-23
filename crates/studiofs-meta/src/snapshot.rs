@@ -564,7 +564,7 @@ impl SnapshotDailyPolicy {
                     .map(|date| self.resolve_local_slot_in_timezone(timezone, date))
                     && let SnapshotPolicySlot::Due { due_at, .. } = yesterday_slot
                     && due_at <= now
-                    && !latest_completed.is_some_and(|completed| due_at <= completed)
+                    && latest_completed.is_none_or(|completed| due_at > completed)
                 {
                     return Some(yesterday_slot);
                 }
@@ -575,7 +575,7 @@ impl SnapshotDailyPolicy {
                 match self.resolve_local_slot_in_timezone(timezone, yesterday) {
                     SnapshotPolicySlot::Due { due_at, .. }
                         if due_at <= now
-                            && !latest_completed.is_some_and(|completed| due_at <= completed) =>
+                            && latest_completed.is_none_or(|completed| due_at > completed) =>
                     {
                         SnapshotPolicySlot::Due {
                             local_date: yesterday,

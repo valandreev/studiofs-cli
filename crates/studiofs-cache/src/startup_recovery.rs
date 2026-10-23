@@ -362,7 +362,7 @@ fn remove_temp_files(layout: &LocalPayloadLayout) -> Result<u64, io::Error> {
     let intent_dir = batch_intent_dir(layout);
     visit_files_recursive(&layout.tmp_dir, &mut |file| -> io::Result<()> {
         if file.starts_with(&intent_dir)
-            && !file.extension().is_some_and(|extension| extension == "tmp")
+            && file.extension().is_none_or(|extension| extension != "tmp")
         {
             return Ok(());
         }

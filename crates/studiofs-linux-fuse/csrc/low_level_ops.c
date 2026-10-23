@@ -359,3 +359,11 @@ int studiofs_linux_fuse_file_info_flags_after_init(int direct_io,
 #endif
     return flags;
 }
+
+int studiofs_linux_fuse_file_info_has_parallel_direct_writes(void) {
+#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 15)
+    return 1;
+#else
+    return 0;
+#endif
+}

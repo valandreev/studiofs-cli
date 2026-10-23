@@ -766,13 +766,14 @@ impl FilePayloadStore {
         let _staging_probe = self.enter_test_staging_probe();
 
         if self.write_mode == LocalPayloadWriteMode::UnbufferedFast {
-            if let Some(temp_path) = self.try_write_temp_payload_file_unbuffered(
+            let unbuffered_temp_path = self.try_write_temp_payload_file_unbuffered(
                 temp_dir,
                 object_id,
                 data,
                 sync_file_data,
                 unbuffered_scratch,
-            )? {
+            )?;
+            if let Some(temp_path) = unbuffered_temp_path {
                 return Ok(temp_path);
             }
             #[cfg(test)]

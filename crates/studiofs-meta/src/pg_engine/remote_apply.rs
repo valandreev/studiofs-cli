@@ -405,9 +405,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
             {
                 excluded_index += 1;
             }
-            if !excluded_ranges
+            if excluded_ranges
                 .get(excluded_index)
-                .is_some_and(|range| range.start <= seq)
+                .is_none_or(|range| range.start > seq)
             {
                 Self::add_event_overlay_conflicts(&mut overlay, event);
             }
