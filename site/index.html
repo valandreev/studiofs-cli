@@ -445,54 +445,6 @@
     .p { color: var(--copper-bright); user-select: none; }
     .s { color: #9cc3ef; }
 
-    /* ---------- compare ---------- */
-    .table-wrap {
-      margin-top: 48px;
-      overflow-x: auto;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: rgba(23, 28, 35, 0.7);
-    }
-    table { width: 100%; border-collapse: collapse; min-width: 820px; }
-    th, td {
-      text-align: left;
-      padding: 16px 18px;
-      border-bottom: 1px solid var(--line);
-      vertical-align: top;
-      font-size: 14.5px;
-    }
-    tr:last-child td { border-bottom: 0; }
-    thead th {
-      font-family: var(--mono);
-      font-size: 11.5px;
-      font-weight: 500;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--dim);
-      background: rgba(17, 19, 23, 0.5);
-    }
-    tbody th { font-weight: 600; font-family: "Space Grotesk", sans-serif; font-size: 16px; letter-spacing: -0.01em; white-space: nowrap; }
-    tbody th small { display: block; font-family: "IBM Plex Sans", sans-serif; font-weight: 400; font-size: 12.5px; color: var(--dim); }
-    td { color: var(--muted); }
-    tr.us { background: rgba(168, 87, 42, 0.1); }
-    tr.us th { color: var(--copper-bright); }
-    tr.us td { color: var(--text); }
-    .yes::before, .no::before, .mid::before {
-      display: inline-block;
-      width: 18px;
-      font-weight: 600;
-    }
-    .yes::before { content: "✓"; color: #7fc49a; }
-    .no::before { content: "✕"; color: #c9776a; }
-    .mid::before { content: "~"; color: #d9b36a; }
-    .note-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 18px;
-      margin-top: 18px;
-    }
-    .note-row .card p { margin: 8px 0 0; color: var(--muted); font-size: 15px; }
-
     /* ---------- caution + cta ---------- */
     .caution {
       display: flex;
@@ -549,7 +501,7 @@
     @media (max-width: 720px) {
       section { padding: 72px 0; }
       .nav-links a:not(.btn) { display: none; }
-      .loops, .features, .platforms, .note-row, .flow-note { grid-template-columns: 1fr; }
+      .loops, .features, .platforms, .flow-note { grid-template-columns: 1fr; }
       .cat-tag.t1 { left: 0; }
       .cat-tag.t2 { right: 0; }
     }
@@ -564,7 +516,6 @@
         <a href="#how">How it works</a>
         <a href="#features">Features</a>
         <a href="#install">Install</a>
-        <a href="#compare">Compare</a>
         <a href="https://github.com/valandreev/studiofs-cli/blob/main/docs/user-guide/en/README.md">Docs</a>
         <a class="btn btn-ghost btn-sm" href="https://github.com/valandreev/studiofs-cli">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -883,88 +834,6 @@
 
 <span class="c"># 4. mount it as a drive letter</span>
 <span class="p">&gt; </span>studiofs.exe mount myvolume Z:</pre>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ================= COMPARE ================= -->
-  <section id="compare">
-    <div class="wrap">
-      <p class="eyebrow">Compare</p>
-      <h2>Sync folder, shared drive, or S3 mount?</h2>
-      <p class="lead">
-        Before comparing product names, look at what each tool does with your files.
-        StudioFS is a shared filesystem: one file space for everyone, with only the needed
-        parts of files downloaded as you work.
-      </p>
-
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Tool</th>
-              <th>Approach</th>
-              <th>Partial reads of huge files</th>
-              <th>Edits &amp; writes</th>
-              <th>Hosting</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr class="us">
-              <th>StudioFS<small>open source, GPL-3.0</small></th>
-              <td>Shared filesystem, local-first</td>
-              <td><span class="yes"></span>Fragments &amp; byte ranges on demand</td>
-              <td><span class="yes"></span>Saved locally, uploaded in background; works at high latency</td>
-              <td>Your S3 + your PostgreSQL</td>
-            </tr>
-            <tr>
-              <th>LucidLink<small>commercial service</small></th>
-              <td>Shared filesystem</td>
-              <td><span class="yes"></span>Streams what you need</td>
-              <td><span class="yes"></span>Designed for collaborative editing</td>
-              <td>Vendor service, paid subscription</td>
-            </tr>
-            <tr>
-              <th>JuiceFS<small>open source</small></th>
-              <td>Shared filesystem, metadata server in the loop</td>
-              <td><span class="yes"></span>Yes, with local cache</td>
-              <td><span class="mid"></span>Writes depend on metadata RTT; above ~10&nbsp;ms gets painful</td>
-              <td>Your S3 + metadata engine</td>
-            </tr>
-            <tr>
-              <th>rclone mount<small>open source</small></th>
-              <td>Object storage mounted as a drive</td>
-              <td><span class="yes"></span>With VFS cache</td>
-              <td><span class="mid"></span>Small edits may re-upload whole objects; multi-client consistency is on you</td>
-              <td>Any cloud / S3</td>
-            </tr>
-            <tr>
-              <th>Dropbox / Google Drive<small>commercial services</small></th>
-              <td>Sync with online-only files</td>
-              <td><span class="no"></span>Usually downloads the whole file</td>
-              <td><span class="yes"></span>Local copies, then sync</td>
-              <td>Vendor cloud, egress limits</td>
-            </tr>
-            <tr>
-              <th>Resilio / Syncthing<small>sync tools</small></th>
-              <td>Full local copies on every machine</td>
-              <td><span class="no"></span>Everything is local</td>
-              <td><span class="yes"></span>Local copies, then sync</td>
-              <td>Peer-to-peer</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <div class="note-row">
-        <div class="card">
-          <h3>Pick StudioFS when</h3>
-          <p>Your team is spread across cities and countries, the project is measured in terabytes, and you want to own your storage and avoid per-seat vendor lock-in.</p>
-        </div>
-        <div class="card">
-          <h3>Pick something else when</h3>
-          <p>You need a proven tool for critical production today, you don't want to run S3 and PostgreSQL yourself, or you need the whole project fully offline.</p>
         </div>
       </div>
     </div>
