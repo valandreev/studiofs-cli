@@ -54,6 +54,20 @@ jobs:
           name: notice-input
           path: target/license-compliance/
           if-no-files-found: error
+      - name: Archive vendored dependency source
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])")
+          name="studiofs-v$version-dependency-source"
+          mkdir -p "target/$name" target/dependency-source
+          cargo +1.95.0 vendor --locked --versioned-dirs "target/$name/vendor" > "target/$name/cargo-vendor-config.toml"
+          cp Cargo.lock "target/$name/"
+          tar -C target -czf "target/dependency-source/$name.tar.gz" "$name"
+          (cd target/dependency-source && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-dependency-source
+          path: target/dependency-source/
+          if-no-files-found: error
 
   build:
     name: Build ${{ matrix.target }}
@@ -202,7 +216,12 @@ jobs:
             python3 -c 'import json; d=json.load(open("target/release.json")); assert d["isDraft"], "Refusing to modify a published release"; [print(a["name"]) for a in d["assets"]]' > target/old-assets.txt
             while read -r asset; do gh release delete-asset "$TAG" "$asset" --yes; done < target/old-assets.txt
           elif grep -qi 'release not found' target/release.err; then
-            printf 'StudioFS %s draft. See INSTALL.md in each package and the attached source archive and checksums.\nSource commit: %s\n' "$TAG" "$GITHUB_SHA" > target/notes.md
+            if [ -f "docs/release-notes/$TAG.md" ]; then
+              cp "docs/release-notes/$TAG.md" target/notes.md
+            else
+              printf 'StudioFS %s draft. See INSTALL.md in each package and the attached source archives and checksums.\n' "$TAG" > target/notes.md
+            fi
+            printf '\nSource commit: %s\n' "$GITHUB_SHA" >> target/notes.md
             gh release create "$TAG" --verify-tag --draft --title "StudioFS $TAG" --notes-file target/notes.md
           else
             cat target/release.err >&2; exit 1

@@ -85,11 +85,12 @@ identity and linkage evidence, not a promise of bit-for-bit reproducible builds.
 
 The release's `studiofs-v0.2.0-source.tar.gz` contains the exact tracked project
 source and build scripts. GitHub also supplies source archives for the tag.
-`Cargo.lock` and the bundled inventory identify dependency versions, checksums
-and upstream source locations. A project source archive alone does not establish
-complete corresponding-source delivery for every third-party component. The
-[publication gate](legal/v0.2.0-publication-gate.md) must approve that delivery
-method and notice evidence before a draft is published.
+`studiofs-v0.2.0-dependency-source.tar.gz` contains `cargo vendor --locked`
+output for every locked Rust dependency, plus `Cargo.lock` and the Cargo source
+replacement configuration needed to build offline from it. Separately installed
+platform components (WinFsp, macFUSE, libfuse3 and desktop libraries) are not
+redistributed. The [publication gate](legal/v0.2.0-publication-gate.md) records
+the approval of this delivery method.
 
 ## Prepare a release on GitHub
 
