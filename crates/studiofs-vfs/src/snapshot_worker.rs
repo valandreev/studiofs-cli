@@ -2271,7 +2271,15 @@ mod tests {
         let task = tokio::spawn(worker.run(cancel.clone()));
 
         reconstruct_started.notified().await;
-        jobs.renewed.notified().await;
+        // Hold materialization until a renewal succeeds after the transient
+        // failure; releasing it earlier lets publication race that renewal.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while jobs.renew_count.load(Ordering::SeqCst) < 3 {
+                jobs.renewed.notified().await;
+            }
+        })
+        .await
+        .expect("worker must keep renewing after a transient renewal failure");
         reconstruct_release.notify_one();
         tokio::time::timeout(Duration::from_secs(1), jobs.published.notified())
             .await

@@ -15024,7 +15024,11 @@ fn write_path_observability_reports_writer_cache_drain_lag_without_landing_journ
             .unwrap();
         }
 
+        // Deferred materialization can still move the lag while it is sampled,
+        // so bracket the snapshot with direct readings of the pacing signal.
+        let lag_before = vfs.total_landed_write_drain_lag_bytes();
         let snapshot = vfs.write_path_observability_snapshot();
+        let lag_after = vfs.total_landed_write_drain_lag_bytes();
         assert_eq!(
             snapshot.landing_zone.accepted_writes, 0,
             "ordinary mounted writeback should not enqueue duplicate landing-zone writes"
@@ -15033,10 +15037,12 @@ fn write_path_observability_reports_writer_cache_drain_lag_without_landing_journ
             snapshot.landing_zone.accepted_bytes, 0,
             "writer/cache dirty state is the only accepted-byte pipeline for this path"
         );
-        assert_eq!(
-            snapshot.drain_lag.current_bytes,
-            vfs.total_landed_write_drain_lag_bytes(),
-            "snapshot should expose the same lag signal used by soft pacing"
+        assert!(
+            (lag_before.min(lag_after)..=lag_before.max(lag_after))
+                .contains(&snapshot.drain_lag.current_bytes),
+            "snapshot should expose the same lag signal used by soft pacing: \
+             before={lag_before} snapshot={} after={lag_after}",
+            snapshot.drain_lag.current_bytes
         );
         assert!(
             snapshot.drain_lag.current_bytes > 0,
