@@ -1,5 +1,45 @@
 # Rust dependency license audit for v0.2.0
 
+## SFS-882 renewed baseline, 2026-10-24
+
+The committed inventory is intentionally renewed for the compatible security
+updates in SFS-882 after reviewing all **26 added or updated crate archives**.
+The [per-package review](sfs-882-dependency-license-review.md) records their
+exact archive checksums, license expressions, copyright/notice decisions and
+the expanded AWS-LC native notices. Eleven old versions were replaced and
+15 additional versions were introduced; unchanged external identities retain
+their prior checksums and license expressions. No license-policy exception or
+baseline-validation relaxation was added.
+
+The current ledger contains **667 lock entries: 655 registry packages and
+12 workspace packages**, all workspace packages at 0.2.0. Its LF-normalized
+lockfile SHA-256 is
+`dded12951cd1c32fce190f9410fdc5db0176fc7d2118eb6c7a4af1f4a08b4017`.
+Reviewed inventory SHA-256 is
+`be36ad31ec34e4ed38d2958f684c71e975858db66266705def33310e84bddcb0`.
+The inventory, expression counts and scope tables below describe the original
+SFS-849 snapshot; use the current JSON ledger and SFS-882 review for this delta.
+The existing distribution-profile decisions still apply: select MIT for the
+new dual MIT/Apache RustCrypto packages, and preserve every mandatory term
+of AWS-LC's compound expression, including ISC, Apache-2.0, MIT and BSD-3-Clause.
+
+Reproduction used `cargo metadata --locked --format-version 1` saved as
+`target/sfs-882/metadata.json`, then
+`python3 docs/legal/generate-rust-dependency-inventory.py --metadata target/sfs-882/metadata.json --output target/sfs-882/inventory-candidate.json`.
+The candidate was promoted to the committed inventory only after archive review.
+The generator retains its historical `metadata_snapshot.path` label; the actual
+input for this renewal is the explicit metadata path above. Target scope graphs
+were regenerated on macOS ARM64 and remain dependency candidates, not native
+build/link evidence.
+
+Pinned cargo-deny 0.20.2 license checks, policy probes, inventory/notice self-tests,
+and strict release notice generation passed. The generated notices reproduce
+the full AWS-LC and Fiat texts and retain the CCADB attribution. Current hashes
+and publication limits are in the [publication gate](v0.2.0-publication-gate.md).
+No actual release archive or native linkage approval is implied.
+
+## Original SFS-849 audit (historical)
+
 Engineering audit for SFS-849,
 checked 2026-10-23. **Inventory complete; public release remains conditional on
 the blockers below.** The selected manifest-level licenses have no identified

@@ -68,6 +68,7 @@ tasks:
     use: [code, rust, cargo-audit-install]
     filter:
       - Cargo.lock
+      - .cargo/audit.toml
     run: |
       cargo audit --json --file ./Cargo.lock > cargo-audit.json || true
       python3 - <<'PY'

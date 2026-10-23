@@ -1,0 +1,9 @@
+[advisories]
+# v0.2.0 exception; remove/narrow with the v0.3.0 migration:
+# https://linear.app/valandreev/issue/SFS-883
+# quick-xml 0.38 parses S3 responses from the operator-configured endpoint;
+# quick-xml 0.37 parses AWS STS responses in reqsign credential flows.
+# Malicious XML from these services can cause CPU/memory denial of service.
+# quick-xml 0.39 is used by wayland-scanner at build time on protocol XML.
+# Upgrading opendal/reqsign is deferred because it changes the S3 adapter API.
+ignore = ["RUSTSEC-2026-0194", "RUSTSEC-2026-0195"]
