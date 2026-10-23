@@ -21,6 +21,7 @@ TARGETS = {
     "macos-aarch64": "aarch64-apple-darwin",
 }
 EVIDENCE_NAMES = ("license", "copying", "notice", "copyright", "unlicense")
+SOURCE_SUFFIXES = {".rs", ".c", ".h", ".cc", ".cpp", ".py", ".js", ".json", ".toml"}
 TREE_ROW = re.compile(r"^(\d+)([A-Za-z0-9_.+-]+) v([^ |]+)(?: \(([^)]*)\))?\|(.*)$")
 
 
@@ -30,6 +31,21 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def repo_text_sha256(path: Path) -> str:
+    """Hash repository text as committed (LF), independent of checkout autocrlf."""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def is_primary_evidence(relative: str) -> bool:
+    """Root-level license/notice files or files in a root LICENSES/ directory; never source files."""
+    parts = Path(relative).parts
+    if Path(relative).suffix.lower() in SOURCE_SUFFIXES:
+        return False
+    if len(parts) == 1:
+        return parts[0].lower().startswith(EVIDENCE_NAMES)
+    return len(parts) == 2 and parts[0].lower() == "licenses"
 
 
 def lock_key(package: dict) -> tuple[str, str, str | None]:
@@ -95,6 +111,7 @@ def target_roles(metadata: dict, root_id: str, allowed_ids: set[str] | None = No
 
 
 def evidence_for(package: dict) -> tuple[list[dict], dict, Path | None]:
+    hash_file = sha256 if package.get("source") else repo_text_sha256
     manifest = Path(package["manifest_path"])
     package_root = manifest.parent
     files: set[Path] = {manifest}
@@ -119,7 +136,7 @@ def evidence_for(package: dict) -> tuple[list[dict], dict, Path | None]:
             relative = path.relative_to(package_root).as_posix()
         except ValueError as error:
             raise RuntimeError(f"license evidence escapes package root: {path}") from error
-        rows.append({"path": relative, "sha256": sha256(path)})
+        rows.append({"path": relative, "sha256": hash_file(path)})
     checksum_path = package_root / ".cargo-checksum.json"
     cache = None
     archive_path = None
@@ -347,11 +364,11 @@ def generate(repo: Path, metadata_path: Path, lock_path: Path) -> dict:
             "license_expression": license_expr,
             "license_expression_id": expression_id,
             "repository": package.get("repository"),
-            "manifest": {"path": manifest_rel, "sha256": sha256(Path(package["manifest_path"]))},
+            "manifest": {"path": manifest_rel, "sha256": (sha256 if package.get("source") else repo_text_sha256)(Path(package["manifest_path"]))},
             "license_evidence": evidence,
             "cargo_cache_checksum_evidence": cache,
             "source_integrity_status": integrity,
-            "license_evidence_status": "missing" if not license_expr or not any(row.get("sha256") and Path(row.get("path", "")).name.lower().startswith(EVIDENCE_NAMES) for row in evidence) else "present",
+            "license_evidence_status": "missing" if not license_expr or not any(row.get("sha256") and is_primary_evidence(row["path"]) for row in evidence) else "present",
             "distribution_obligation_profile": expression_id,
             "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
             "target_scope_classification": "selected-for-studiofs-target" if per_package.get(package["id"]) else "outside-selected-studiofs-targets",
@@ -365,7 +382,7 @@ def generate(repo: Path, metadata_path: Path, lock_path: Path) -> dict:
         "schema_version": 1,
         "purpose": "SFS-849 static pinned Rust license audit; target graphs are dependency scope evidence, not final binary-link proof",
         "inputs": {
-            "lockfile": {"path": "Cargo.lock", "sha256": sha256(lock_path)},
+            "lockfile": {"path": "Cargo.lock", "sha256": repo_text_sha256(lock_path), "sha256_input": "LF-normalized bytes"},
             "metadata_snapshot": {"path": "target/sfs-849/metadata.json"},
         },
         "target_scopes": targets,
@@ -402,6 +419,9 @@ def self_test() -> None:
     else:
         raise AssertionError("archive verification accepted an absent evidence member")
     assert lock_key({"name": "x", "version": "1", "source": None}) == ("x", "1", None)
+    assert is_primary_evidence("LICENSE-MIT") and is_primary_evidence("LICENSES/Apache-2.0.txt")
+    assert not is_primary_evidence("src/copying.rs") and not is_primary_evidence("copying.rs")
+    assert not is_primary_evidence("vendor/swift/LICENSE.txt")
 
     def package(package_id: str, proc_macro: bool = False) -> dict:
         return {"id": package_id, "targets": [{"kind": ["proc-macro"] if proc_macro else ["lib"]}]}

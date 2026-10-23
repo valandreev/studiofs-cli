@@ -4,7 +4,8 @@
   "inputs": {
     "lockfile": {
       "path": "Cargo.lock",
-      "sha256": "6aa67300c6d7cbcea3434be234e3cfcb32fbef93eea27de67fc5ac504d6f2c55"
+      "sha256": "5e4aeef99a7b65931c365dba7a7eb07d8017a14bad330ff08ccd0fe61cb36946",
+      "sha256_input": "LF-normalized bytes"
     },
     "metadata_snapshot": {
       "path": "target/sfs-849/metadata.json"
@@ -33136,7 +33137,7 @@
         "sha256": "0ee638a5da3799329310ad4cfa62fbf045d5f56e3ef5ba4149e7452dcf89d5a8"
       },
       "source_integrity_status": "verified",
-      "license_evidence_status": "present",
+      "license_evidence_status": "missing",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
@@ -33420,7 +33421,7 @@
         "sha256": "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
       },
       "source_integrity_status": "verified",
-      "license_evidence_status": "present",
+      "license_evidence_status": "missing",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
@@ -49011,12 +49012,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs/Cargo.toml",
-        "sha256": "83ebc2da19da0655a6e2bad6e1fbe99567ca17b8ba30ee2ff0353a00318c4a35"
+        "sha256": "ffa5e04fbf88bd0f705cb6d7c4aeaf9d987871acd9669679d9c244e85cafbde1"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "83ebc2da19da0655a6e2bad6e1fbe99567ca17b8ba30ee2ff0353a00318c4a35"
+          "sha256": "ffa5e04fbf88bd0f705cb6d7c4aeaf9d987871acd9669679d9c244e85cafbde1"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49061,12 +49062,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-bridge/Cargo.toml",
-        "sha256": "f2dbb1816b45edac8af12e7c1c97dcd657dbb128b2ee05f036197ceeae522500"
+        "sha256": "7f39a0061f6f855d70e4f3e3b89bcd186874d75d7a3e6c55d54cdcf6cb796d0c"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "f2dbb1816b45edac8af12e7c1c97dcd657dbb128b2ee05f036197ceeae522500"
+          "sha256": "7f39a0061f6f855d70e4f3e3b89bcd186874d75d7a3e6c55d54cdcf6cb796d0c"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49134,12 +49135,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-cache/Cargo.toml",
-        "sha256": "07723a3b3a06477ea9d2ae5a59a07b2474359d9811829b922e6df9a0ddca703e"
+        "sha256": "52d9b1a39493ca48e94dd122794fa0577b4d36e216fa9baad4646f7f987d665d"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "07723a3b3a06477ea9d2ae5a59a07b2474359d9811829b922e6df9a0ddca703e"
+          "sha256": "52d9b1a39493ca48e94dd122794fa0577b4d36e216fa9baad4646f7f987d665d"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49211,12 +49212,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-data/Cargo.toml",
-        "sha256": "304b007108de05d19b2d8e3edc7dcb7ea17af07e248243ded98dde10dc6b0688"
+        "sha256": "2a71e36c54ac6428b665b4934a55e65bb21e8978e9efd8ed020f037c57b8e4f9"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "304b007108de05d19b2d8e3edc7dcb7ea17af07e248243ded98dde10dc6b0688"
+          "sha256": "2a71e36c54ac6428b665b4934a55e65bb21e8978e9efd8ed020f037c57b8e4f9"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49322,12 +49323,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-e2e/Cargo.toml",
-        "sha256": "a88ebc10b680c4073e4011291ac100f0d3ea93420e31582ab5dda066f22864b1"
+        "sha256": "5e3631abb7f6f10dd4dab7a2598530e7b05d13217b5fb4f13a05bbd3ca410810"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "a88ebc10b680c4073e4011291ac100f0d3ea93420e31582ab5dda066f22864b1"
+          "sha256": "5e3631abb7f6f10dd4dab7a2598530e7b05d13217b5fb4f13a05bbd3ca410810"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49353,12 +49354,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-linux-fuse/Cargo.toml",
-        "sha256": "84229c70374eaab913a818ba60dd2b77d544d06166347807bb3348707d6b0fc6"
+        "sha256": "5c55e754b53097f92d12e1423c1d256d5c66b2727374dd254f4fe87993428a28"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "84229c70374eaab913a818ba60dd2b77d544d06166347807bb3348707d6b0fc6"
+          "sha256": "5c55e754b53097f92d12e1423c1d256d5c66b2727374dd254f4fe87993428a28"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49406,12 +49407,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-macfuse/Cargo.toml",
-        "sha256": "d51154b4c21b729c1e33a847a635a06139fbeab2db7fe3b34094b28693bb4cc0"
+        "sha256": "ceaa41200e7139640da186067bc2758138f41ced185bebfbe807d4526e403edc"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "d51154b4c21b729c1e33a847a635a06139fbeab2db7fe3b34094b28693bb4cc0"
+          "sha256": "ceaa41200e7139640da186067bc2758138f41ced185bebfbe807d4526e403edc"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49459,12 +49460,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-meta/Cargo.toml",
-        "sha256": "e3d82cc9a6d7f610689970a94b4d7dae70c90e973697a2a93eb61a36501fc199"
+        "sha256": "1567209c26d5f5f34aa9602e4429311db5d9c5cd8b4e10189413773fae347f13"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "e3d82cc9a6d7f610689970a94b4d7dae70c90e973697a2a93eb61a36501fc199"
+          "sha256": "1567209c26d5f5f34aa9602e4429311db5d9c5cd8b4e10189413773fae347f13"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49622,12 +49623,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-scenario/Cargo.toml",
-        "sha256": "b4e149b844692399cea5933be9268c8da316a8ec796e6ccdb481b4f072cb5c89"
+        "sha256": "08da408eb7439c6ecdd90d40eef0cd9eaa2740bd35b805966e37b33fd8a62934"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "b4e149b844692399cea5933be9268c8da316a8ec796e6ccdb481b4f072cb5c89"
+          "sha256": "08da408eb7439c6ecdd90d40eef0cd9eaa2740bd35b805966e37b33fd8a62934"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49653,12 +49654,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-test-support/Cargo.toml",
-        "sha256": "8dd2366fc5ae0ad7019e54a404791cb8f9837bb78015a1cac3f02a7884d041cd"
+        "sha256": "282c1ba54234a15363fb3fe224ef6883ad00f8b648755614e0678ae8d2ef8193"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "8dd2366fc5ae0ad7019e54a404791cb8f9837bb78015a1cac3f02a7884d041cd"
+          "sha256": "282c1ba54234a15363fb3fe224ef6883ad00f8b648755614e0678ae8d2ef8193"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49812,12 +49813,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-vfs/Cargo.toml",
-        "sha256": "9dcbe14d55dd383b93a06944fe93b263f450d0289282e4ebfcc8c47689364ee7"
+        "sha256": "af36bdfeac74778ef439b26c51cabd2b15e4bc331bc68fec1c2eadc4e3701811"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "9dcbe14d55dd383b93a06944fe93b263f450d0289282e4ebfcc8c47689364ee7"
+          "sha256": "af36bdfeac74778ef439b26c51cabd2b15e4bc331bc68fec1c2eadc4e3701811"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49947,12 +49948,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-winfsp/Cargo.toml",
-        "sha256": "2d11d35cd762702dcec5ff8ffd755449bbcb45784b747b28bd8908923fd74efa"
+        "sha256": "6a7dc8d48291b9876ae20beb94dbf4f5538d903d41524a620c6cfb87ad3af8e9"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "2d11d35cd762702dcec5ff8ffd755449bbcb45784b747b28bd8908923fd74efa"
+          "sha256": "6a7dc8d48291b9876ae20beb94dbf4f5538d903d41524a620c6cfb87ad3af8e9"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -50190,7 +50191,7 @@
         "sha256": "79b237cfbe320601dd24b4ac817a5b68bb28f5508e33f08d42be0682cadc8ac9"
       },
       "source_integrity_status": "verified",
-      "license_evidence_status": "present",
+      "license_evidence_status": "missing",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
@@ -59826,7 +59827,7 @@
         "sha256": "bb0e353e6a2fbdc176932bbaab493762eb1255a7900fe0fea1a2f96c296cc909"
       },
       "source_integrity_status": "verified",
-      "license_evidence_status": "present",
+      "license_evidence_status": "missing",
       "distribution_obligation_profile": "spdx:0ba40231f7ee15be",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "outside-selected-studiofs-targets",

@@ -11,7 +11,9 @@ claim that future binaries are cleared for distribution.
 
 The baseline is commit `778070e39253d3744f027799d9aed9cbde6d4cfe`, on
 `feature/sfs-849-audit-rust-dependency-licenses-for-v020`. `Cargo.lock` SHA-256 is
-`6aa67300c6d7cbcea3434be234e3cfcb32fbef93eea27de67fc5ac504d6f2c55`.
+`5e4aeef99a7b65931c365dba7a7eb07d8017a14bad330ff08ccd0fe61cb36946`
+(LF-normalized committed bytes; workspace manifests are hashed the same way, so
+the value does not depend on a checkout's `core.autocrlf`).
 The workspace version at this baseline is **0.1.1**; this audit prepares 0.2.0
 and must be regenerated for the actual release lockfile.
 
@@ -41,7 +43,8 @@ The generator records representative graphs for `x86_64-pc-windows-msvc`,
 `x86_64-unknown-linux-gnu`, and `aarch64-apple-darwin`. These are **Cargo dependency
 graph candidates observed from Windows**, not native builds, link maps, an SBOM
 of executable bytes, or evidence for every architecture/feature combination.
-The generator's exact commands and role definitions are recorded in the inventory.
+The exact Cargo commands and role definitions are in the generator script;
+the inventory records each target's selection source.
 Cargo itself describes `tree -e normal,build` as an approximation of a build,
 rather than a guarantee of exact compiled contents.
 ([Cargo tree](https://doc.rust-lang.org/cargo/commands/cargo-tree.html),
@@ -246,7 +249,11 @@ metadata can unify workspace features, so these roles are a conservative graph
 description, not an exact Cargo compilation-unit model.
 
 The filename-based evidence scan finds a primary LICENSE/COPYING/NOTICE/COPYRIGHT/
-UNLICENSE file for **579 rows**. **61 registry packages** lack such a named file;
+UNLICENSE file for **575 rows**. Primary means a non-source file at the package
+root or in a root `LICENSES/` directory; nested vendor notices (for example
+`symbolic-demangle`'s `vendor/swift/LICENSE.txt`) and source files such as
+`objc2-foundation`'s `src/copying.rs` are listed as evidence rows but do not
+satisfy the status. **65 registry packages** lack such a named file;
 the other **12** are first-party workspace packages covered by SFS-852's missing
 root LICENSE. This is a notice-evidence gap, not a claim that the crates have no
 license grant. Some have notices in README or source headers: for example,
@@ -264,9 +271,9 @@ distributed; SFS-854 must reject any shipped unresolved entry. The ledger's
 | Product graph scope | Packages missing a named primary license/notice file |
 | --- | --- |
 | L | `libappindicator-sys 0.9.0` |
-| L,M | `mappings 0.7.2`; `pprof_util 0.8.2`; `symbolic-common 12.17.2` |
-| M | `block2 0.5.1`; `block2 0.6.2`; `dispatch 0.2.0`; `objc-sys 0.3.5`; `objc2 0.5.2`; `objc2 0.6.4`; `objc2-app-kit 0.2.2`; `objc2-app-kit 0.3.2`; `objc2-cloud-kit 0.3.2`; `objc2-core-data 0.3.2`; `objc2-core-foundation 0.3.2`; `objc2-core-graphics 0.3.2`; `objc2-core-image 0.3.2`; `objc2-core-text 0.3.2`; `objc2-core-video 0.3.2`; `objc2-encode 4.1.0`; `objc2-io-kit 0.3.2`; `objc2-quartz-core 0.3.2`; `objc2-system-configuration 0.3.2` |
-| Outside W/L/M | `base64-simd 0.8.0`; `crc-catalog 2.4.0`; `dispatch2 0.3.1`; `gloo-timers 0.3.0`; `jni 0.22.4`; `jni-macros 0.22.4`; `jni-sys-macros 0.4.1`; `ndk 0.9.0`; `ndk-context 0.1.1`; `ndk-sys 0.6.0+11769913`; `objc2-cloud-kit 0.2.2`; `objc2-contacts 0.2.2`; `objc2-core-data 0.2.2`; `objc2-core-image 0.2.2`; `objc2-core-location 0.2.2`; `objc2-io-surface 0.3.2`; `objc2-link-presentation 0.2.2`; `objc2-metal 0.2.2`; `objc2-quartz-core 0.2.2`; `objc2-symbols 0.2.2`; `objc2-ui-kit 0.2.2`; `objc2-uniform-type-identifiers 0.2.2`; `objc2-user-notifications 0.2.2`; `r-efi 5.3.0`; `valuable 0.1.1`; `vsimd 0.8.0`; `wasip2 1.0.2+wasi-0.2.9`; `wasip3 0.4.0+wasi-0.3.0-rc-2026-01-06`; `wasite 1.0.2`; `wasm-encoder 0.244.0`; `wasmparser 0.244.0`; `winapi-i686-pc-windows-gnu 0.4.0`; `winapi-x86_64-pc-windows-gnu 0.4.0`; `wit-component 0.244.0`; `wit-parser 0.244.0` |
+| L,M | `mappings 0.7.2`; `pprof_util 0.8.2`; `symbolic-common 12.17.2`; `symbolic-demangle 12.17.2` |
+| M | `block2 0.5.1`; `block2 0.6.2`; `dispatch 0.2.0`; `objc-sys 0.3.5`; `objc2 0.5.2`; `objc2 0.6.4`; `objc2-app-kit 0.2.2`; `objc2-app-kit 0.3.2`; `objc2-cloud-kit 0.3.2`; `objc2-core-data 0.3.2`; `objc2-core-foundation 0.3.2`; `objc2-core-graphics 0.3.2`; `objc2-core-image 0.3.2`; `objc2-core-text 0.3.2`; `objc2-core-video 0.3.2`; `objc2-encode 4.1.0`; `objc2-foundation 0.2.2`; `objc2-foundation 0.3.2`; `objc2-io-kit 0.3.2`; `objc2-quartz-core 0.3.2`; `objc2-system-configuration 0.3.2` |
+| Outside W/L/M | `base64-simd 0.8.0`; `crc-catalog 2.4.0`; `dispatch2 0.3.1`; `gloo-timers 0.3.0`; `jni 0.22.4`; `jni-macros 0.22.4`; `jni-sys-macros 0.4.1`; `ndk 0.9.0`; `ndk-context 0.1.1`; `ndk-sys 0.6.0+11769913`; `objc2-cloud-kit 0.2.2`; `objc2-contacts 0.2.2`; `objc2-core-data 0.2.2`; `objc2-core-image 0.2.2`; `objc2-core-location 0.2.2`; `objc2-io-surface 0.3.2`; `objc2-link-presentation 0.2.2`; `objc2-metal 0.2.2`; `objc2-quartz-core 0.2.2`; `objc2-symbols 0.2.2`; `objc2-ui-kit 0.2.2`; `objc2-uniform-type-identifiers 0.2.2`; `objc2-user-notifications 0.2.2`; `r-efi 5.3.0`; `valuable 0.1.1`; `vsimd 0.8.0`; `wasip2 1.0.2+wasi-0.2.9`; `wasip3 0.4.0+wasi-0.3.0-rc-2026-01-06`; `wasite 1.0.2`; `wasm-encoder 0.244.0`; `wasm-metadata 0.244.0`; `wasmparser 0.244.0`; `winapi-i686-pc-windows-gnu 0.4.0`; `winapi-x86_64-pc-windows-gnu 0.4.0`; `wit-component 0.244.0`; `wit-parser 0.244.0` |
 | W | `winfsp 0.12.4+winfsp-2.1`; `winfsp-sys 0.12.1+winfsp-2.1` |
 | W,L,M | `crc32c 0.6.8` |
 
@@ -277,7 +284,7 @@ the self-test passed and a fresh generator run to
 `target/sfs-849/verified-inventory.json` was **byte-identical** to the committed
 snapshot. Independent assertions verified the 652 lock identities, all 640
 archive checksums and all 1,703 evidence members. Inventory SHA-256:
-`dccea8e46343de8c5b4473bb7f540c5d0fe63b4f1fca4645ae506fec0a583afb`.
+`b396e84001ef1fd5d7cc71b19c1050445984d339cf052ef8695b59f762ef9e49`.
 Tools: Python 3.13.7, Cargo 1.99.0 (`5f94df478`), rustc 1.99.0 (`b940084d7`).
 Checksum-file-only fallback is explicitly unresolved until archive verification;
 the current snapshot uses actual archives for all registry packages. Review
