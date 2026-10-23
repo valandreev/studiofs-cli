@@ -62,7 +62,7 @@ tasks:
 
   - key: cargo-audit-install
     use: rust
-    run: cargo install --locked cargo-audit
+    run: cargo install --locked cargo-audit --version 0.22.1
 
   - key: cargo-audit
     use: [code, rust, cargo-audit-install]
@@ -82,16 +82,22 @@ tasks:
           print("Failed to parse cargo-audit output:", exc)
           sys.exit(1)
 
-      if report.get("vulnerabilities", {}).get("found", False):
+      vulnerabilities = report.get("vulnerabilities", {})
+      if vulnerabilities.get("found", False):
           print("VULNERABILITIES FOUND")
+          for vulnerability in vulnerabilities.get("list", []):
+              package = vulnerability.get("package") or {}
+              advisory = vulnerability.get("advisory") or {}
+              print("-", advisory.get("id"), package.get("name"), package.get("version"))
           sys.exit(1)
 
-      warnings = report.get("warnings", {}).get("unmaintained", [])
-      if warnings:
-          print("Unmaintained dependencies (non-fatal):")
-          for warning in warnings:
-              package = warning.get("package") or {}
-              print("-", package.get("name"), package.get("version"))
+      for kind, warnings in sorted(report.get("warnings", {}).items()):
+          if warnings:
+              print(f"{kind.capitalize()} dependencies (non-fatal):")
+              for warning in warnings:
+                  package = warning.get("package") or {}
+                  advisory = (warning.get("advisory") or {}).get("id", "")
+                  print("-", package.get("name"), package.get("version"), advisory)
 
       sys.exit(0)
       PY

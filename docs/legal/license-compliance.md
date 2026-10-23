@@ -85,8 +85,9 @@ The generated notices also include the curated
 and plan templates identified by the source provenance audit. These supplements
 do not waive any unresolved registry-package evidence.
 
-The preceding audit recorded **65 third-party packages without named primary
-notice evidence**. The generator also searches `LICENSES/` directories; consult
+The SFS-849 audit recorded **65 third-party packages without named primary
+notice evidence**; after the SFS-882 renewal, strict generation reports zero
+unresolved entries. The generator also searches `LICENSES/` directories; consult
 its inventory for the current gap count. Crates that ship no license file are
 covered by verbatim upstream texts in `supplemental-licenses/` (see its README). Review generation records these gaps;
 `--release` returns failure while any remain.
