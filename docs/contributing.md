@@ -65,6 +65,10 @@ vulnerabilities regardless of target platform. Running it once in RWX covers
 the full dependency graph, including platform-specific crates such as
 `studiofs-winfsp`. Platform-conditional vulnerabilities (e.g. a Windows-only
 advisory on a `windows-sys` crate) are surfaced in the same audit run.
+Accepted exceptions live in `.cargo/audit.toml`, each with its rationale and
+removal issue; v0.2.0 ignores only the `quick-xml` advisories RUSTSEC-2026-0194
+and RUSTSEC-2026-0195 (SFS-883). Unmaintained, unsound and yanked warnings are
+printed but do not fail the gate.
 
 **Compile/unit/smoke distinctions:**
 

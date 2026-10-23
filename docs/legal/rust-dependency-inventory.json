@@ -4,7 +4,7 @@
   "inputs": {
     "lockfile": {
       "path": "Cargo.lock",
-      "sha256": "5e4aeef99a7b65931c365dba7a7eb07d8017a14bad330ff08ccd0fe61cb36946",
+      "sha256": "dded12951cd1c32fce190f9410fdc5db0176fc7d2118eb6c7a4af1f4a08b4017",
       "sha256_input": "LF-normalized bytes"
     },
     "metadata_snapshot": {
@@ -15,22 +15,22 @@
     "windows-x86_64": {
       "triple": "x86_64-pc-windows-msvc",
       "selection_source": "cargo tree -e normal,build package set and features; roles propagated through target-filtered metadata restricted to that set",
-      "package_count": 322
+      "package_count": 336
     },
     "linux-x86_64": {
       "triple": "x86_64-unknown-linux-gnu",
       "selection_source": "cargo tree -e normal,build package set and features; roles propagated through target-filtered metadata restricted to that set",
-      "package_count": 409
+      "package_count": 423
     },
     "macos-aarch64": {
       "triple": "aarch64-apple-darwin",
       "selection_source": "cargo tree -e normal,build package set and features; roles propagated through target-filtered metadata restricted to that set",
-      "package_count": 353
+      "package_count": 367
     }
   },
   "package_counts": {
-    "lock_rows": 652,
-    "registry_third_party": 640,
+    "lock_rows": 667,
+    "registry_third_party": 655,
     "workspace": 12
   },
   "packages": [
@@ -1651,7 +1651,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -1665,7 +1665,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -2156,7 +2156,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -2479,7 +2479,7 @@
         {
           "from": {
             "name": "h2",
-            "version": "0.4.13",
+            "version": "0.4.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -2728,22 +2728,22 @@
     },
     {
       "name": "aws-lc-rs",
-      "version": "1.16.2",
+      "version": "1.18.2",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "a054912289d18629dc78375ba2c3726a3afe3ff71b4edba9dedfca0e3446d1fc",
+      "checksum": "faac5829c2b74c28f830747e7818ccfb684261b5f48a1118b1e2a13d36dfab13",
       "package_kind": "third-party",
       "license_expression": "ISC AND (Apache-2.0 OR ISC)",
       "license_expression_id": "spdx:f152bfd226674693",
       "repository": "https://github.com/aws/aws-lc-rs",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-lc-rs@1.16.2/Cargo.toml",
-        "sha256": "c13a940c6eb2ac2d48b934ed4d6024de054157c65065435a397acef7370776f3"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-lc-rs@1.18.2/Cargo.toml",
+        "sha256": "517c7bbff7942205d4a1ae7073001960e1308e649d23dd9cf7a7c6abd55a1a0b"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "c13a940c6eb2ac2d48b934ed4d6024de054157c65065435a397acef7370776f3",
-          "archive_member_sha256": "c13a940c6eb2ac2d48b934ed4d6024de054157c65065435a397acef7370776f3",
+          "sha256": "517c7bbff7942205d4a1ae7073001960e1308e649d23dd9cf7a7c6abd55a1a0b",
+          "archive_member_sha256": "517c7bbff7942205d4a1ae7073001960e1308e649d23dd9cf7a7c6abd55a1a0b",
           "archive_member_status": "verified"
         },
         {
@@ -2755,8 +2755,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/aws-lc-rs-1.16.2.crate",
-        "sha256": "a054912289d18629dc78375ba2c3726a3afe3ff71b4edba9dedfca0e3446d1fc"
+        "path": "registry/cache/crates-io/aws-lc-rs-1.18.2.crate",
+        "sha256": "faac5829c2b74c28f830747e7818ccfb684261b5f48a1118b1e2a13d36dfab13"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -2768,7 +2768,7 @@
         {
           "from": {
             "name": "rustls",
-            "version": "0.23.36",
+            "version": "0.23.46",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -2781,7 +2781,7 @@
         {
           "from": {
             "name": "rustls-webpki",
-            "version": "0.103.13",
+            "version": "0.103.16",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -2796,16 +2796,16 @@
     },
     {
       "name": "aws-lc-sys",
-      "version": "0.39.1",
+      "version": "0.46.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "83a25cf98105baa966497416dbd42565ce3a8cf8dbfd59803ec9ad46f3126399",
+      "checksum": "f1622d8446a2d4b2ce0c7eefc73dd43a99779028d5ee5c2dd8073a658ba8a2bc",
       "package_kind": "third-party",
       "license_expression": "ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)",
       "license_expression_id": "spdx:3d3f4adc8c1e1c4c",
       "repository": "https://github.com/aws/aws-lc-rs",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-lc-sys@0.39.1/Cargo.toml",
-        "sha256": "d8c539a9e808d47957792e575db61bc713df2ba08eae8398227b9496109e04a6"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-lc-sys@0.46.0/Cargo.toml",
+        "sha256": "79a7f5dc4c8589e46b2482aa6e2a79acf644c39bed85adbf3ae3905200135fc2"
       },
       "license_evidence": [
         {
@@ -2822,8 +2822,8 @@
         },
         {
           "path": "Cargo.toml",
-          "sha256": "d8c539a9e808d47957792e575db61bc713df2ba08eae8398227b9496109e04a6",
-          "archive_member_sha256": "d8c539a9e808d47957792e575db61bc713df2ba08eae8398227b9496109e04a6",
+          "sha256": "79a7f5dc4c8589e46b2482aa6e2a79acf644c39bed85adbf3ae3905200135fc2",
+          "archive_member_sha256": "79a7f5dc4c8589e46b2482aa6e2a79acf644c39bed85adbf3ae3905200135fc2",
           "archive_member_status": "verified"
         },
         {
@@ -2835,8 +2835,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/aws-lc-sys-0.39.1.crate",
-        "sha256": "83a25cf98105baa966497416dbd42565ce3a8cf8dbfd59803ec9ad46f3126399"
+        "path": "registry/cache/crates-io/aws-lc-sys-0.46.0.crate",
+        "sha256": "f1622d8446a2d4b2ce0c7eefc73dd43a99779028d5ee5c2dd8073a658ba8a2bc"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -2848,7 +2848,7 @@
         {
           "from": {
             "name": "aws-lc-rs",
-            "version": "1.16.2",
+            "version": "1.18.2",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -2966,7 +2966,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -2980,7 +2980,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -3495,7 +3495,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -3509,7 +3509,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -4462,7 +4462,7 @@
         {
           "from": {
             "name": "postgres-protocol",
-            "version": "0.6.10",
+            "version": "0.6.12",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -5322,7 +5322,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -5336,7 +5336,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -5560,6 +5560,86 @@
           "from": {
             "name": "digest",
             "version": "0.10.7",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        }
+      }
+    },
+    {
+      "name": "block-buffer",
+      "version": "0.12.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/RustCrypto/utils",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#block-buffer@0.12.1/Cargo.toml",
+        "sha256": "f21191120ab1d04327657b7125f25b0e3f2bce34af5e921d3c66d24de11d5e60"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "f21191120ab1d04327657b7125f25b0e3f2bce34af5e921d3c66d24de11d5e60",
+          "archive_member_sha256": "f21191120ab1d04327657b7125f25b0e3f2bce34af5e921d3c66d24de11d5e60",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "98181e7249d0c01737645ec982499ce99a0f07eb8f7d625b8840d799d10dbc01",
+          "archive_member_sha256": "98181e7249d0c01737645ec982499ce99a0f07eb8f7d625b8840d799d10dbc01",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/block-buffer-0.12.1.crate",
+        "sha256": "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "digest",
+            "version": "0.11.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -6182,7 +6262,7 @@
         {
           "from": {
             "name": "postgres-protocol",
-            "version": "0.6.10",
+            "version": "0.6.12",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -6195,7 +6275,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -6370,7 +6450,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -6388,7 +6468,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -6545,7 +6625,7 @@
         {
           "from": {
             "name": "h2",
-            "version": "0.4.13",
+            "version": "0.4.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -6662,7 +6742,7 @@
         {
           "from": {
             "name": "postgres-protocol",
-            "version": "0.6.10",
+            "version": "0.6.12",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -6675,7 +6755,7 @@
         {
           "from": {
             "name": "postgres-types",
-            "version": "0.2.12",
+            "version": "0.2.14",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -6714,7 +6794,7 @@
         {
           "from": {
             "name": "quinn-proto",
-            "version": "0.11.14",
+            "version": "0.11.19",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -6753,7 +6833,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -6767,7 +6847,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -6781,7 +6861,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -6795,7 +6875,7 @@
         {
           "from": {
             "name": "tokio",
-            "version": "1.53.1",
+            "version": "1.54.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -6808,7 +6888,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -7341,7 +7421,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -7355,7 +7435,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -7382,7 +7462,7 @@
         {
           "from": {
             "name": "aws-lc-sys",
-            "version": "0.39.1",
+            "version": "0.46.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -7747,6 +7827,19 @@
         {
           "from": {
             "name": "chacha20",
+            "version": "0.10.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "chacha20",
             "version": "0.9.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
@@ -7889,6 +7982,19 @@
         },
         {
           "from": {
+            "name": "md-5",
+            "version": "0.11.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "nix",
             "version": "0.26.4",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -7995,6 +8101,19 @@
           "from": {
             "name": "sha2",
             "version": "0.10.9",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "sha2",
+            "version": "0.11.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -8217,6 +8336,92 @@
     },
     {
       "name": "chacha20",
+      "version": "0.10.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/RustCrypto/stream-ciphers",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#chacha20@0.10.2/Cargo.toml",
+        "sha256": "b48970318446b5a41b06b1e27f2e691b6fc9245ee82beabde925f0a0889d58ba"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "b48970318446b5a41b06b1e27f2e691b6fc9245ee82beabde925f0a0889d58ba",
+          "archive_member_sha256": "b48970318446b5a41b06b1e27f2e691b6fc9245ee82beabde925f0a0889d58ba",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "b8c6939380a400f53e11923d50fcc4dd2fa1ba8339fd9d04cda38a0251b6c9b0",
+          "archive_member_sha256": "b8c6939380a400f53e11923d50fcc4dd2fa1ba8339fd9d04cda38a0251b6c9b0",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/chacha20-0.10.2.crate",
+        "sha256": "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "rand",
+            "version": "0.10.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "rng"
+          ]
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "rng"
+          ]
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "rng"
+          ]
+        }
+      }
+    },
+    {
+      "name": "chacha20",
       "version": "0.9.1",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "checksum": "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818",
@@ -8349,7 +8554,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -8452,7 +8657,7 @@
         {
           "from": {
             "name": "postgres-types",
-            "version": "0.2.12",
+            "version": "0.2.14",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -8478,7 +8683,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -8492,7 +8697,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -8506,7 +8711,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -8520,7 +8725,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -8643,7 +8848,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -8910,7 +9115,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -8924,7 +9129,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -9301,7 +9506,7 @@
         {
           "from": {
             "name": "aws-lc-sys",
-            "version": "0.39.1",
+            "version": "0.46.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -9313,6 +9518,86 @@
         }
       ],
       "targets": {}
+    },
+    {
+      "name": "cmov",
+      "version": "0.5.4",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a",
+      "package_kind": "third-party",
+      "license_expression": "Apache-2.0 OR MIT",
+      "license_expression_id": "spdx:12c4662dfa8e784a",
+      "repository": "https://github.com/RustCrypto/utils",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#cmov@0.5.4/Cargo.toml",
+        "sha256": "3f91a59940445ae78e4155fc6bd53efaf277f8369a0c6385f0033d986a3455ad"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "3f91a59940445ae78e4155fc6bd53efaf277f8369a0c6385f0033d986a3455ad",
+          "archive_member_sha256": "3f91a59940445ae78e4155fc6bd53efaf277f8369a0c6385f0033d986a3455ad",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "archive_member_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "70c9d40f1f9545c3f133b8a67206e89da850f6468eed072281bb3701514114a9",
+          "archive_member_sha256": "70c9d40f1f9545c3f133b8a67206e89da850f6468eed072281bb3701514114a9",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/cmov-0.5.4.crate",
+        "sha256": "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:12c4662dfa8e784a",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "ctutils",
+            "version": "0.4.5",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        }
+      }
     },
     {
       "name": "cobs",
@@ -9604,6 +9889,86 @@
         }
       ],
       "targets": {}
+    },
+    {
+      "name": "const-oid",
+      "version": "0.10.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c",
+      "package_kind": "third-party",
+      "license_expression": "Apache-2.0 OR MIT",
+      "license_expression_id": "spdx:12c4662dfa8e784a",
+      "repository": "https://github.com/RustCrypto/formats",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#const-oid@0.10.2/Cargo.toml",
+        "sha256": "591ac78fc8cd99d8a31110e8cb572534bb9d04af23bc48db855a34d4a6c78569"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "591ac78fc8cd99d8a31110e8cb572534bb9d04af23bc48db855a34d4a6c78569",
+          "archive_member_sha256": "591ac78fc8cd99d8a31110e8cb572534bb9d04af23bc48db855a34d4a6c78569",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "73b9dc2e79c7308998dd30296e073aefaefb944a68fb89aa412c23c0edcabcaa",
+          "archive_member_sha256": "73b9dc2e79c7308998dd30296e073aefaefb944a68fb89aa412c23c0edcabcaa",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/const-oid-0.10.2.crate",
+        "sha256": "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:12c4662dfa8e784a",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "digest",
+            "version": "0.11.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        }
+      }
     },
     {
       "name": "const-oid",
@@ -10576,6 +10941,101 @@
       }
     },
     {
+      "name": "cpufeatures",
+      "version": "0.3.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/RustCrypto/utils",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.3.1/Cargo.toml",
+        "sha256": "2e82ee61a94e8ef99197ca59723e9794d0f08363f28bacab680292af6ccdde61"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "2e82ee61a94e8ef99197ca59723e9794d0f08363f28bacab680292af6ccdde61",
+          "archive_member_sha256": "2e82ee61a94e8ef99197ca59723e9794d0f08363f28bacab680292af6ccdde61",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "73b9dc2e79c7308998dd30296e073aefaefb944a68fb89aa412c23c0edcabcaa",
+          "archive_member_sha256": "73b9dc2e79c7308998dd30296e073aefaefb944a68fb89aa412c23c0edcabcaa",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/cpufeatures-0.3.1.crate",
+        "sha256": "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [
+        "has-target-conditioned-edge"
+      ],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "sha2",
+            "version": "0.11.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "chacha20",
+            "version": "0.10.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(any(target_arch = \"x86_64\", target_arch = \"x86\"))"
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        }
+      }
+    },
+    {
       "name": "crc",
       "version": "3.3.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -11467,6 +11927,86 @@
       }
     },
     {
+      "name": "crypto-common",
+      "version": "0.2.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/RustCrypto/traits",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#crypto-common@0.2.2/Cargo.toml",
+        "sha256": "1b47561054dd2fe13246f2f6e19c29eac256269e02c96162fd6efed28247e78a"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "1b47561054dd2fe13246f2f6e19c29eac256269e02c96162fd6efed28247e78a",
+          "archive_member_sha256": "1b47561054dd2fe13246f2f6e19c29eac256269e02c96162fd6efed28247e78a",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "d2e7ec5355c96eeade56b09187ceb48a6a30299da3ce7531a66d3d11405ab963",
+          "archive_member_sha256": "d2e7ec5355c96eeade56b09187ceb48a6a30299da3ce7531a66d3d11405ab963",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/crypto-common-0.2.2.crate",
+        "sha256": "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "digest",
+            "version": "0.11.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        }
+      }
+    },
+    {
       "name": "ctrlc",
       "version": "3.5.2",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -11514,7 +12054,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -11527,6 +12067,86 @@
         }
       ],
       "targets": {}
+    },
+    {
+      "name": "ctutils",
+      "version": "0.4.5",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0",
+      "package_kind": "third-party",
+      "license_expression": "Apache-2.0 OR MIT",
+      "license_expression_id": "spdx:12c4662dfa8e784a",
+      "repository": "https://github.com/RustCrypto/utils",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#ctutils@0.4.5/Cargo.toml",
+        "sha256": "2ef94bf9e6dd13a9153d2205af4bb4ff049e37ee243fa561f7f931c008de7948"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "2ef94bf9e6dd13a9153d2205af4bb4ff049e37ee243fa561f7f931c008de7948",
+          "archive_member_sha256": "2ef94bf9e6dd13a9153d2205af4bb4ff049e37ee243fa561f7f931c008de7948",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "archive_member_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "91585c36e4fb9ab4ca0d3dfac5d66d3c0c62cc51f640a0e1196542daf2267eae",
+          "archive_member_sha256": "91585c36e4fb9ab4ca0d3dfac5d66d3c0c62cc51f640a0e1196542daf2267eae",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/ctutils-0.4.5.crate",
+        "sha256": "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:12c4662dfa8e784a",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "digest",
+            "version": "0.11.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        }
+      }
     },
     {
       "name": "cursor-icon",
@@ -11768,7 +12388,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -11782,7 +12402,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -12135,6 +12755,130 @@
       }
     },
     {
+      "name": "digest",
+      "version": "0.11.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/RustCrypto/traits",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#digest@0.11.3/Cargo.toml",
+        "sha256": "59c4f2cba7e34831c87e8f4844718d91d0f276af7bd192de76fda7d5a8978eb9"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "59c4f2cba7e34831c87e8f4844718d91d0f276af7bd192de76fda7d5a8978eb9",
+          "archive_member_sha256": "59c4f2cba7e34831c87e8f4844718d91d0f276af7bd192de76fda7d5a8978eb9",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "af59cea35d7f5e2777a713b8d155d65efa2c339eb43f3c14e868c6ac8506edad",
+          "archive_member_sha256": "af59cea35d7f5e2777a713b8d155d65efa2c339eb43f3c14e868c6ac8506edad",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/digest-0.11.3.crate",
+        "sha256": "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "hmac",
+            "version": "0.13.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "md-5",
+            "version": "0.11.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "sha2",
+            "version": "0.11.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "block-api",
+            "default",
+            "mac",
+            "oid"
+          ]
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "block-api",
+            "default",
+            "mac",
+            "oid"
+          ]
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "block-api",
+            "default",
+            "mac",
+            "oid"
+          ]
+        }
+      }
+    },
+    {
       "name": "directories",
       "version": "6.0.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -12182,7 +12926,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -12848,7 +13592,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -12862,7 +13606,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -12876,7 +13620,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -12890,7 +13634,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -12904,7 +13648,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -13135,7 +13879,7 @@
         {
           "from": {
             "name": "aws-lc-sys",
-            "version": "0.39.1",
+            "version": "0.46.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -13914,7 +14658,7 @@
         {
           "from": {
             "name": "postgres-protocol",
-            "version": "0.6.10",
+            "version": "0.6.12",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -13927,7 +14671,7 @@
         {
           "from": {
             "name": "postgres-types",
-            "version": "0.2.12",
+            "version": "0.2.14",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -13940,7 +14684,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -14633,7 +15377,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -14729,7 +15473,7 @@
         {
           "from": {
             "name": "h2",
-            "version": "0.4.13",
+            "version": "0.4.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -14865,7 +15609,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -15380,7 +16124,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -15394,7 +16138,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -15471,7 +16215,7 @@
         {
           "from": {
             "name": "aws-lc-sys",
-            "version": "0.39.1",
+            "version": "0.46.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -15545,7 +16289,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -15559,7 +16303,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -15573,7 +16317,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -15807,7 +16551,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -16022,7 +16766,7 @@
         {
           "from": {
             "name": "h2",
-            "version": "0.4.13",
+            "version": "0.4.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -16537,7 +17281,7 @@
         {
           "from": {
             "name": "h2",
-            "version": "0.4.13",
+            "version": "0.4.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -16887,7 +17631,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -17712,19 +18456,6 @@
       "resolved_incoming_dependency_edges": [
         {
           "from": {
-            "name": "quinn-proto",
-            "version": "0.11.14",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "serde-saphyr",
             "version": "0.0.27",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -17852,6 +18583,19 @@
       "resolved_incoming_dependency_edges": [
         {
           "from": {
+            "name": "quinn-proto",
+            "version": "0.11.19",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(all(target_family = \"wasm\", target_os = \"unknown\"))"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "tempfile",
             "version": "3.25.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -17875,6 +18619,19 @@
               "target": "cfg(not(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"))))"
             }
           ]
+        },
+        {
+          "from": {
+            "name": "rand",
+            "version": "0.10.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
         }
       ],
       "targets": {
@@ -17882,19 +18639,28 @@
           "roles": [
             "runtime"
           ],
-          "enabled_features": []
+          "enabled_features": [
+            "std",
+            "sys_rng"
+          ]
         },
         "linux-x86_64": {
           "roles": [
             "runtime"
           ],
-          "enabled_features": []
+          "enabled_features": [
+            "std",
+            "sys_rng"
+          ]
         },
         "macos-aarch64": {
           "roles": [
             "runtime"
           ],
-          "enabled_features": []
+          "enabled_features": [
+            "std",
+            "sys_rng"
+          ]
         }
       }
     },
@@ -19239,22 +20005,22 @@
     },
     {
       "name": "h2",
-      "version": "0.4.13",
+      "version": "0.4.20",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54",
+      "checksum": "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118",
       "package_kind": "third-party",
       "license_expression": "MIT",
       "license_expression_id": "spdx:e5dcffe836b6ec8a",
       "repository": "https://github.com/hyperium/h2",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#h2@0.4.13/Cargo.toml",
-        "sha256": "0ace58ad85f0e77f98cf0d06c414fcd3114b0b62f96246a306222c2aac07d217"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#h2@0.4.20/Cargo.toml",
+        "sha256": "21f9c0931a0aecb68fd64ba5b3aa2c311055f54c55443fb669833379bb45ed16"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "0ace58ad85f0e77f98cf0d06c414fcd3114b0b62f96246a306222c2aac07d217",
-          "archive_member_sha256": "0ace58ad85f0e77f98cf0d06c414fcd3114b0b62f96246a306222c2aac07d217",
+          "sha256": "21f9c0931a0aecb68fd64ba5b3aa2c311055f54c55443fb669833379bb45ed16",
+          "archive_member_sha256": "21f9c0931a0aecb68fd64ba5b3aa2c311055f54c55443fb669833379bb45ed16",
           "archive_member_status": "verified"
         },
         {
@@ -19266,8 +20032,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/h2-0.4.13.crate",
-        "sha256": "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+        "path": "registry/cache/crates-io/h2-0.4.20.crate",
+        "sha256": "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -20117,7 +20883,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -20210,7 +20976,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -20329,19 +21095,6 @@
         },
         {
           "from": {
-            "name": "postgres-protocol",
-            "version": "0.6.10",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "reqsign",
             "version": "0.16.5",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -20356,9 +21109,89 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        }
+      }
+    },
+    {
+      "name": "hmac",
+      "version": "0.13.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/RustCrypto/MACs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#hmac@0.13.0/Cargo.toml",
+        "sha256": "b4f4b988204282ae1e47df9f4353449afd5f389d588e4445f7c8df8e69586fab"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "b4f4b988204282ae1e47df9f4353449afd5f389d588e4445f7c8df8e69586fab",
+          "archive_member_sha256": "b4f4b988204282ae1e47df9f4353449afd5f389d588e4445f7c8df8e69586fab",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "9e0dfd2dd4173a530e238cb6adb37aa78c34c6bc7444e0e10c1ab5d8881f63ba",
+          "archive_member_sha256": "9e0dfd2dd4173a530e238cb6adb37aa78c34c6bc7444e0e10c1ab5d8881f63ba",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/hmac-0.13.0.crate",
+        "sha256": "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "postgres-protocol",
+            "version": "0.6.12",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
             {
@@ -20452,7 +21285,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -20789,7 +21622,7 @@
         {
           "from": {
             "name": "h2",
-            "version": "0.4.13",
+            "version": "0.4.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -21506,6 +22339,99 @@
             "default",
             "std"
           ]
+        }
+      }
+    },
+    {
+      "name": "hybrid-array",
+      "version": "0.4.10",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "3944cf8cf766b40e2a1a333ee5e9b563f854d5fa49d6a8ca2764e97c6eddb214",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/RustCrypto/hybrid-array",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#hybrid-array@0.4.10/Cargo.toml",
+        "sha256": "31517da085083323273f1f45e65dc099c629c72b02da2dfc846b4a3bf4bcb9a6"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "31517da085083323273f1f45e65dc099c629c72b02da2dfc846b4a3bf4bcb9a6",
+          "archive_member_sha256": "31517da085083323273f1f45e65dc099c629c72b02da2dfc846b4a3bf4bcb9a6",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "70c9d40f1f9545c3f133b8a67206e89da850f6468eed072281bb3701514114a9",
+          "archive_member_sha256": "70c9d40f1f9545c3f133b8a67206e89da850f6468eed072281bb3701514114a9",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/hybrid-array-0.4.10.crate",
+        "sha256": "3944cf8cf766b40e2a1a333ee5e9b563f854d5fa49d6a8ca2764e97c6eddb214"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "block-buffer",
+            "version": "0.12.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "crypto-common",
+            "version": "0.2.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
         }
       }
     },
@@ -22936,7 +23862,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -23023,7 +23949,7 @@
         {
           "from": {
             "name": "h2",
-            "version": "0.4.13",
+            "version": "0.4.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -24619,6 +25545,19 @@
         },
         {
           "from": {
+            "name": "getrandom",
+            "version": "0.4.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\"), target_feature = \"atomics\"))"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "uuid",
             "version": "1.21.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -25379,8 +26318,33 @@
         },
         {
           "from": {
+            "name": "cpufeatures",
+            "version": "0.3.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(all(target_arch = \"aarch64\", target_os = \"android\"))"
+            },
+            {
+              "kind": "normal",
+              "target": "cfg(all(target_arch = \"aarch64\", target_os = \"linux\"))"
+            },
+            {
+              "kind": "normal",
+              "target": "cfg(all(target_arch = \"aarch64\", target_vendor = \"apple\"))"
+            },
+            {
+              "kind": "normal",
+              "target": "cfg(all(target_arch = \"loongarch64\", target_os = \"linux\"))"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "tokio",
-            "version": "1.53.1",
+            "version": "1.54.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -25504,7 +26468,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -25648,7 +26612,7 @@
         {
           "from": {
             "name": "studiofs-bridge",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-bridge"
           },
@@ -25662,7 +26626,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -26248,7 +27212,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -26262,7 +27226,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -26276,7 +27240,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -27515,7 +28479,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -27663,7 +28627,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -27690,7 +28654,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -27704,7 +28668,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -27800,7 +28764,7 @@
         {
           "from": {
             "name": "quinn-proto",
-            "version": "0.11.14",
+            "version": "0.11.19",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -28093,19 +29057,6 @@
               "target": null
             }
           ]
-        },
-        {
-          "from": {
-            "name": "postgres-protocol",
-            "version": "0.6.10",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
         }
       ],
       "targets": {
@@ -28134,6 +29085,98 @@
           "enabled_features": [
             "default",
             "std"
+          ]
+        }
+      }
+    },
+    {
+      "name": "md-5",
+      "version": "0.11.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/RustCrypto/hashes",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#md-5@0.11.0/Cargo.toml",
+        "sha256": "0e817299c0742b797a8da9fd0747aba0b67210eb3c118694e8f3da82ae0e21e9"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "0e817299c0742b797a8da9fd0747aba0b67210eb3c118694e8f3da82ae0e21e9",
+          "archive_member_sha256": "0e817299c0742b797a8da9fd0747aba0b67210eb3c118694e8f3da82ae0e21e9",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "831e0f43ad0bf014c1c4fec5767aae470434c1d66d6e671be2d823e729063e25",
+          "archive_member_sha256": "831e0f43ad0bf014c1c4fec5767aae470434c1d66d6e671be2d823e729063e25",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/md-5-0.11.0.crate",
+        "sha256": "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "postgres-protocol",
+            "version": "0.6.12",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "default",
+            "oid"
+          ]
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "default",
+            "oid"
+          ]
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "default",
+            "oid"
           ]
         }
       }
@@ -28322,7 +29365,7 @@
         {
           "from": {
             "name": "postgres-protocol",
-            "version": "0.6.10",
+            "version": "0.6.12",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -28780,7 +29823,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -29091,7 +30134,7 @@
         {
           "from": {
             "name": "tokio",
-            "version": "1.53.1",
+            "version": "1.54.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -31375,7 +32418,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -31735,7 +32778,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -33445,7 +34488,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -34802,7 +35845,7 @@
         {
           "from": {
             "name": "rustls",
-            "version": "0.23.36",
+            "version": "0.23.46",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -35189,7 +36232,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -35203,7 +36246,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -35217,7 +36260,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -35884,7 +36927,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -35898,7 +36941,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -35912,7 +36955,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -35926,7 +36969,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -35940,7 +36983,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -35954,7 +36997,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -36467,7 +37510,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -36481,7 +37524,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -36654,7 +37697,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -37257,7 +38300,7 @@
         {
           "from": {
             "name": "tokio",
-            "version": "1.53.1",
+            "version": "1.54.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -37270,7 +38313,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -37524,7 +38567,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -37532,6 +38575,19 @@
             {
               "kind": "build",
               "target": "cfg(target_os = \"linux\")"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "aws-lc-sys",
+            "version": "0.46.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "build",
+              "target": "cfg(unix)"
             }
           ]
         },
@@ -38171,7 +39227,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -38185,7 +39241,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -38199,7 +39255,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -38252,22 +39308,22 @@
     },
     {
       "name": "postgres-protocol",
-      "version": "0.6.10",
+      "version": "0.6.12",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "3ee9dd5fe15055d2b6806f4736aa0c9637217074e224bbec46d4041b91bb9491",
+      "checksum": "08808e3c483c46e999108051c78334f473d5adb59d78bb80a1268c7e6aa6c514",
       "package_kind": "third-party",
       "license_expression": "MIT OR Apache-2.0",
       "license_expression_id": "spdx:db11fec9946737df",
       "repository": "https://github.com/rust-postgres/rust-postgres",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#postgres-protocol@0.6.10/Cargo.toml",
-        "sha256": "915de2776ada1efdc76a1a0a001b89940e2dfadf82b5c5b48be090094ff083e3"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#postgres-protocol@0.6.12/Cargo.toml",
+        "sha256": "98db9402f098322f55f821253759c5a9d2421ca1d6a337fb87712e63d003c88f"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "915de2776ada1efdc76a1a0a001b89940e2dfadf82b5c5b48be090094ff083e3",
-          "archive_member_sha256": "915de2776ada1efdc76a1a0a001b89940e2dfadf82b5c5b48be090094ff083e3",
+          "sha256": "98db9402f098322f55f821253759c5a9d2421ca1d6a337fb87712e63d003c88f",
+          "archive_member_sha256": "98db9402f098322f55f821253759c5a9d2421ca1d6a337fb87712e63d003c88f",
           "archive_member_status": "verified"
         },
         {
@@ -38285,8 +39341,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/postgres-protocol-0.6.10.crate",
-        "sha256": "3ee9dd5fe15055d2b6806f4736aa0c9637217074e224bbec46d4041b91bb9491"
+        "path": "registry/cache/crates-io/postgres-protocol-0.6.12.crate",
+        "sha256": "08808e3c483c46e999108051c78334f473d5adb59d78bb80a1268c7e6aa6c514"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -38298,7 +39354,7 @@
         {
           "from": {
             "name": "postgres-types",
-            "version": "0.2.12",
+            "version": "0.2.14",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -38311,7 +39367,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -38351,22 +39407,22 @@
     },
     {
       "name": "postgres-types",
-      "version": "0.2.12",
+      "version": "0.2.14",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "54b858f82211e84682fecd373f68e1ceae642d8d751a1ebd13f33de6257b3e20",
+      "checksum": "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be",
       "package_kind": "third-party",
       "license_expression": "MIT OR Apache-2.0",
       "license_expression_id": "spdx:db11fec9946737df",
       "repository": "https://github.com/rust-postgres/rust-postgres",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#postgres-types@0.2.12/Cargo.toml",
-        "sha256": "9bfff651f37ba68001c05aac8453f047698fa5edf99026e348c2452c1724e9e0"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#postgres-types@0.2.14/Cargo.toml",
+        "sha256": "ebe765b78027fd46f4efd7ed1e34688733417c3454b2fd6c0017ea936dd8e188"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "9bfff651f37ba68001c05aac8453f047698fa5edf99026e348c2452c1724e9e0",
-          "archive_member_sha256": "9bfff651f37ba68001c05aac8453f047698fa5edf99026e348c2452c1724e9e0",
+          "sha256": "ebe765b78027fd46f4efd7ed1e34688733417c3454b2fd6c0017ea936dd8e188",
+          "archive_member_sha256": "ebe765b78027fd46f4efd7ed1e34688733417c3454b2fd6c0017ea936dd8e188",
           "archive_member_status": "verified"
         },
         {
@@ -38384,8 +39440,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/postgres-types-0.2.12.crate",
-        "sha256": "54b858f82211e84682fecd373f68e1ceae642d8d751a1ebd13f33de6257b3e20"
+        "path": "registry/cache/crates-io/postgres-types-0.2.14.crate",
+        "sha256": "851ca9db4932932d69f3ea811b1abe63087a0f740a47692619dd40d4899b68be"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -38397,7 +39453,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -39370,7 +40426,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -39961,7 +41017,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -40212,7 +41268,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -40549,22 +41605,22 @@
     },
     {
       "name": "quinn-proto",
-      "version": "0.11.14",
+      "version": "0.11.19",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098",
+      "checksum": "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe",
       "package_kind": "third-party",
       "license_expression": "MIT OR Apache-2.0",
       "license_expression_id": "spdx:db11fec9946737df",
       "repository": "https://github.com/quinn-rs/quinn",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#quinn-proto@0.11.14/Cargo.toml",
-        "sha256": "2ea17a7b3aced9c82de6507b4f3dfefef5c01ddf71c7f1b1426a481098539586"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#quinn-proto@0.11.19/Cargo.toml",
+        "sha256": "95aaf88c74814dd46a53d07ca82c0ec90bcb7275c57a739336d287a7478feb58"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "2ea17a7b3aced9c82de6507b4f3dfefef5c01ddf71c7f1b1426a481098539586",
-          "archive_member_sha256": "2ea17a7b3aced9c82de6507b4f3dfefef5c01ddf71c7f1b1426a481098539586",
+          "sha256": "95aaf88c74814dd46a53d07ca82c0ec90bcb7275c57a739336d287a7478feb58",
+          "archive_member_sha256": "95aaf88c74814dd46a53d07ca82c0ec90bcb7275c57a739336d287a7478feb58",
           "archive_member_status": "verified"
         },
         {
@@ -40582,8 +41638,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/quinn-proto-0.11.14.crate",
-        "sha256": "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+        "path": "registry/cache/crates-io/quinn-proto-0.11.19.crate",
+        "sha256": "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -41279,6 +42335,139 @@
     },
     {
       "name": "rand",
+      "version": "0.10.3",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/rust-random/rand",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#rand@0.10.3/Cargo.toml",
+        "sha256": "9d9a2f6f49bb8d49ef1761e183d0d4fd4ad66dfd225b77815ba83775cf48de67"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "9d9a2f6f49bb8d49ef1761e183d0d4fd4ad66dfd225b77815ba83775cf48de67",
+          "archive_member_sha256": "9d9a2f6f49bb8d49ef1761e183d0d4fd4ad66dfd225b77815ba83775cf48de67",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "COPYRIGHT",
+          "sha256": "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5",
+          "archive_member_sha256": "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "35242e7a83f69875e6edeff02291e688c97caafe2f8902e4e19b49d3e78b4cab",
+          "archive_member_sha256": "35242e7a83f69875e6edeff02291e688c97caafe2f8902e4e19b49d3e78b4cab",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "209fbbe0ad52d9235e37badf9cadfe4dbdc87203179c0899e738b39ade42177b",
+          "archive_member_sha256": "209fbbe0ad52d9235e37badf9cadfe4dbdc87203179c0899e738b39ade42177b",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/rand-0.10.3.crate",
+        "sha256": "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "postgres-protocol",
+            "version": "0.6.12",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "quinn-proto",
+            "version": "0.11.19",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "tokio-postgres",
+            "version": "0.7.18",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "default",
+            "std",
+            "std_rng",
+            "sys_rng",
+            "thread_rng"
+          ]
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "default",
+            "std",
+            "std_rng",
+            "sys_rng",
+            "thread_rng"
+          ]
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "default",
+            "std",
+            "std_rng",
+            "sys_rng",
+            "thread_rng"
+          ]
+        }
+      }
+    },
+    {
+      "name": "rand",
       "version": "0.8.5",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "checksum": "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404",
@@ -41453,49 +42642,10 @@
       "resolved_incoming_dependency_edges": [
         {
           "from": {
-            "name": "postgres-protocol",
-            "version": "0.6.10",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "quinn-proto",
-            "version": "0.11.14",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "tokio-postgres",
-            "version": "0.7.16",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
             {
@@ -41736,6 +42886,131 @@
     },
     {
       "name": "rand_core",
+      "version": "0.10.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/rust-random/rand_core",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#rand_core@0.10.1/Cargo.toml",
+        "sha256": "4ff4becbb9ef65154f4840262f8d0cffa97d97a265b994b9d53f53925bdd3578"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "4ff4becbb9ef65154f4840262f8d0cffa97d97a265b994b9d53f53925bdd3578",
+          "archive_member_sha256": "4ff4becbb9ef65154f4840262f8d0cffa97d97a265b994b9d53f53925bdd3578",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "COPYRIGHT",
+          "sha256": "92b81db30f7ab6d693e0af5661a40d273ca1947e891123ed823924192c10cbc7",
+          "archive_member_sha256": "92b81db30f7ab6d693e0af5661a40d273ca1947e891123ed823924192c10cbc7",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "6df43f6f4b5d4587f3d8d71e45532c688fd168afa5fe89d571cb32fa09c4ef51",
+          "archive_member_sha256": "6df43f6f4b5d4587f3d8d71e45532c688fd168afa5fe89d571cb32fa09c4ef51",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "8b6e9feec03e7c9a5facb26855cecd31662bf989b636bcfe79521bdf8ac863f0",
+          "archive_member_sha256": "8b6e9feec03e7c9a5facb26855cecd31662bf989b636bcfe79521bdf8ac863f0",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/rand_core-0.10.1.crate",
+        "sha256": "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "chacha20",
+            "version": "0.10.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "getrandom",
+            "version": "0.4.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "rand",
+            "version": "0.10.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "rand_pcg",
+            "version": "0.10.2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": []
+        }
+      }
+    },
+    {
+      "name": "rand_core",
       "version": "0.6.4",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "checksum": "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c",
@@ -41967,6 +43242,73 @@
       }
     },
     {
+      "name": "rand_pcg",
+      "version": "0.10.2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/rust-random/rngs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#rand_pcg@0.10.2/Cargo.toml",
+        "sha256": "7244a51b7bdf719aeecf8a06f6c65913d347bb0800373129ac41ea77cbadf655"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "7244a51b7bdf719aeecf8a06f6c65913d347bb0800373129ac41ea77cbadf655",
+          "archive_member_sha256": "7244a51b7bdf719aeecf8a06f6c65913d347bb0800373129ac41ea77cbadf655",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "COPYRIGHT",
+          "sha256": "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5",
+          "archive_member_sha256": "90eb64f0279b0d9432accfa6023ff803bc4965212383697eee27a0f426d5f8d5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "6df43f6f4b5d4587f3d8d71e45532c688fd168afa5fe89d571cb32fa09c4ef51",
+          "archive_member_sha256": "6df43f6f4b5d4587f3d8d71e45532c688fd168afa5fe89d571cb32fa09c4ef51",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "2234e3cefee876aeb686ad89e978bdb07bf118a1186ab1cf161bcdf69d4b4f57",
+          "archive_member_sha256": "2234e3cefee876aeb686ad89e978bdb07bf118a1186ab1cf161bcdf69d4b4f57",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/rand_pcg-0.10.2.crate",
+        "sha256": "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "quinn-proto",
+            "version": "0.11.19",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
       "name": "raw-window-handle",
       "version": "0.6.2",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -42122,7 +43464,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -42136,7 +43478,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -42932,7 +44274,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -43146,7 +44488,7 @@
         {
           "from": {
             "name": "quinn-proto",
-            "version": "0.11.14",
+            "version": "0.11.19",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -43163,7 +44505,7 @@
         {
           "from": {
             "name": "rustls",
-            "version": "0.23.36",
+            "version": "0.23.46",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -43176,7 +44518,7 @@
         {
           "from": {
             "name": "rustls-webpki",
-            "version": "0.103.13",
+            "version": "0.103.16",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -43535,7 +44877,7 @@
         {
           "from": {
             "name": "quinn-proto",
-            "version": "0.11.14",
+            "version": "0.11.19",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -44024,22 +45366,22 @@
     },
     {
       "name": "rustls",
-      "version": "0.23.36",
+      "version": "0.23.46",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "c665f33d38cea657d9614f766881e4d510e0eda4239891eea56b4cadcf01801b",
+      "checksum": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
       "package_kind": "third-party",
       "license_expression": "Apache-2.0 OR ISC OR MIT",
       "license_expression_id": "spdx:4f3687dfffe45524",
       "repository": "https://github.com/rustls/rustls",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#rustls@0.23.36/Cargo.toml",
-        "sha256": "e41361657c8f26c21338b4d0856282fc9b2ee70a1fe26e3246a251caf07b0540"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#rustls@0.23.46/Cargo.toml",
+        "sha256": "ef983ace35d7ad699e22682ee0ee45211f805b074fc9e84190b62f200259070f"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "e41361657c8f26c21338b4d0856282fc9b2ee70a1fe26e3246a251caf07b0540",
-          "archive_member_sha256": "e41361657c8f26c21338b4d0856282fc9b2ee70a1fe26e3246a251caf07b0540",
+          "sha256": "ef983ace35d7ad699e22682ee0ee45211f805b074fc9e84190b62f200259070f",
+          "archive_member_sha256": "ef983ace35d7ad699e22682ee0ee45211f805b074fc9e84190b62f200259070f",
           "archive_member_status": "verified"
         },
         {
@@ -44063,8 +45405,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/rustls-0.23.36.crate",
-        "sha256": "c665f33d38cea657d9614f766881e4d510e0eda4239891eea56b4cadcf01801b"
+        "path": "registry/cache/crates-io/rustls-0.23.46.crate",
+        "sha256": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -44130,7 +45472,7 @@
         {
           "from": {
             "name": "quinn-proto",
-            "version": "0.11.14",
+            "version": "0.11.19",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -44143,7 +45485,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -44337,7 +45679,7 @@
         {
           "from": {
             "name": "quinn-proto",
-            "version": "0.11.14",
+            "version": "0.11.19",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -44389,7 +45731,7 @@
         {
           "from": {
             "name": "rustls",
-            "version": "0.23.36",
+            "version": "0.23.46",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -44415,7 +45757,7 @@
         {
           "from": {
             "name": "rustls-webpki",
-            "version": "0.103.13",
+            "version": "0.103.16",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -44428,7 +45770,7 @@
         {
           "from": {
             "name": "webpki-roots",
-            "version": "1.0.6",
+            "version": "1.0.11",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -44474,22 +45816,22 @@
     },
     {
       "name": "rustls-webpki",
-      "version": "0.103.13",
+      "version": "0.103.16",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e",
+      "checksum": "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281",
       "package_kind": "third-party",
       "license_expression": "ISC",
       "license_expression_id": "spdx:d8d62d58d661d5dd",
       "repository": "https://github.com/rustls/webpki",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#rustls-webpki@0.103.13/Cargo.toml",
-        "sha256": "a9b2f60ecbca2b9e33449899b15e344c2003664c5901bec9b8ada33722c18285"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#rustls-webpki@0.103.16/Cargo.toml",
+        "sha256": "5b759da0e12ee54e9b3ee5e0d3fac82e0ecee11317d464f9dfbb53e9d73d0948"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "a9b2f60ecbca2b9e33449899b15e344c2003664c5901bec9b8ada33722c18285",
-          "archive_member_sha256": "a9b2f60ecbca2b9e33449899b15e344c2003664c5901bec9b8ada33722c18285",
+          "sha256": "5b759da0e12ee54e9b3ee5e0d3fac82e0ecee11317d464f9dfbb53e9d73d0948",
+          "archive_member_sha256": "5b759da0e12ee54e9b3ee5e0d3fac82e0ecee11317d464f9dfbb53e9d73d0948",
           "archive_member_status": "verified"
         },
         {
@@ -44501,8 +45843,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/rustls-webpki-0.103.13.crate",
-        "sha256": "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+        "path": "registry/cache/crates-io/rustls-webpki-0.103.16.crate",
+        "sha256": "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -44514,7 +45856,7 @@
         {
           "from": {
             "name": "rustls",
-            "version": "0.23.36",
+            "version": "0.23.46",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -45616,7 +46958,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -45630,7 +46972,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -45644,7 +46986,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -45658,7 +47000,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -45672,7 +47014,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -45686,7 +47028,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -45864,7 +47206,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -46318,7 +47660,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -46332,7 +47674,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -46346,7 +47688,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -46360,7 +47702,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -46374,7 +47716,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -46388,7 +47730,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -46986,19 +48328,6 @@
         },
         {
           "from": {
-            "name": "postgres-protocol",
-            "version": "0.6.10",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "reqsign",
             "version": "0.16.5",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -47013,7 +48342,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -47027,7 +48356,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -47041,7 +48370,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -47055,7 +48384,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -47069,7 +48398,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -47110,6 +48439,98 @@
             "default",
             "oid",
             "std"
+          ]
+        }
+      }
+    },
+    {
+      "name": "sha2",
+      "version": "0.11.1",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/RustCrypto/hashes",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.1/Cargo.toml",
+        "sha256": "a2eb64ea4fa73cd686f453b7428c415dad6dda57c4e0b6825ffc6f6d765dcc05"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "a2eb64ea4fa73cd686f453b7428c415dad6dda57c4e0b6825ffc6f6d765dcc05",
+          "archive_member_sha256": "a2eb64ea4fa73cd686f453b7428c415dad6dda57c4e0b6825ffc6f6d765dcc05",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_sha256": "a9040321c3712d8fd0b09cf52b17445de04a23a10165049ae187cd39e5c86be5",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "831e0f43ad0bf014c1c4fec5767aae470434c1d66d6e671be2d823e729063e25",
+          "archive_member_sha256": "831e0f43ad0bf014c1c4fec5767aae470434c1d66d6e671be2d823e729063e25",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/sha2-0.11.1.crate",
+        "sha256": "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "postgres-protocol",
+            "version": "0.6.12",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "default",
+            "oid"
+          ]
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "default",
+            "oid"
+          ]
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "default",
+            "oid"
           ]
         }
       }
@@ -47340,7 +48761,7 @@
         {
           "from": {
             "name": "tokio",
-            "version": "1.53.1",
+            "version": "1.54.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -47764,7 +49185,7 @@
         {
           "from": {
             "name": "h2",
-            "version": "0.4.13",
+            "version": "0.4.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -47777,7 +49198,7 @@
         {
           "from": {
             "name": "quinn-proto",
-            "version": "0.11.14",
+            "version": "0.11.19",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -47994,7 +49415,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -48284,13 +49705,13 @@
         {
           "from": {
             "name": "tokio",
-            "version": "1.53.1",
+            "version": "1.54.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
             {
               "kind": "normal",
-              "target": "cfg(any(not(target_family = \"wasm\"), all(target_os = \"wasi\", not(target_env = \"p1\"))))"
+              "target": "cfg(any(not(target_family = \"wasm\"), target_os = \"emscripten\", all(target_os = \"wasi\", not(target_env = \"p1\"))))"
             }
           ]
         },
@@ -48323,7 +49744,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -48750,7 +50171,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -48895,7 +50316,7 @@
         {
           "from": {
             "name": "postgres-protocol",
-            "version": "0.6.10",
+            "version": "0.6.12",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -49003,12 +50424,12 @@
     },
     {
       "name": "studiofs",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs/Cargo.toml",
@@ -49023,7 +50444,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [
@@ -49053,12 +50474,12 @@
     },
     {
       "name": "studiofs-bridge",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-bridge/Cargo.toml",
@@ -49073,7 +50494,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [
@@ -49083,7 +50504,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -49097,7 +50518,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -49126,12 +50547,12 @@
     },
     {
       "name": "studiofs-cache",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-cache/Cargo.toml",
@@ -49146,7 +50567,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [],
@@ -49154,7 +50575,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -49168,7 +50589,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -49203,12 +50624,12 @@
     },
     {
       "name": "studiofs-data",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-data/Cargo.toml",
@@ -49223,7 +50644,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [
@@ -49233,7 +50654,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -49251,7 +50672,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -49265,7 +50686,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -49279,7 +50700,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -49314,12 +50735,12 @@
     },
     {
       "name": "studiofs-e2e",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-e2e/Cargo.toml",
@@ -49334,7 +50755,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
@@ -49345,12 +50766,12 @@
     },
     {
       "name": "studiofs-linux-fuse",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-linux-fuse/Cargo.toml",
@@ -49365,7 +50786,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [
@@ -49375,7 +50796,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -49398,12 +50819,12 @@
     },
     {
       "name": "studiofs-macfuse",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-macfuse/Cargo.toml",
@@ -49418,7 +50839,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [
@@ -49428,7 +50849,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -49451,12 +50872,12 @@
     },
     {
       "name": "studiofs-meta",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-meta/Cargo.toml",
@@ -49471,7 +50892,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [
@@ -49481,7 +50902,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -49495,7 +50916,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -49509,7 +50930,7 @@
         {
           "from": {
             "name": "studiofs-bridge",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-bridge"
           },
@@ -49523,7 +50944,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -49537,7 +50958,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -49551,7 +50972,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -49565,7 +50986,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -49579,7 +51000,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -49614,12 +51035,12 @@
     },
     {
       "name": "studiofs-scenario",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-scenario/Cargo.toml",
@@ -49634,7 +51055,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
@@ -49645,12 +51066,12 @@
     },
     {
       "name": "studiofs-test-support",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-test-support/Cargo.toml",
@@ -49665,7 +51086,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
@@ -49676,7 +51097,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -49690,7 +51111,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -49704,7 +51125,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -49718,7 +51139,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -49732,7 +51153,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -49746,7 +51167,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -49760,7 +51181,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -49774,7 +51195,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -49788,7 +51209,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -49804,12 +51225,12 @@
     },
     {
       "name": "studiofs-vfs",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-vfs/Cargo.toml",
@@ -49824,7 +51245,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [
@@ -49834,7 +51255,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -49848,7 +51269,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -49862,7 +51283,7 @@
         {
           "from": {
             "name": "studiofs-bridge",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-bridge"
           },
@@ -49876,7 +51297,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -49890,7 +51311,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -49904,7 +51325,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -49939,12 +51360,12 @@
     },
     {
       "name": "studiofs-winfsp",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
-      "license_expression": "GPL-3.0",
-      "license_expression_id": "spdx:3207cff3bf6b01bb",
+      "license_expression": "GPL-3.0-only",
+      "license_expression_id": "spdx:ffbc986889d4c74b",
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-winfsp/Cargo.toml",
@@ -49959,7 +51380,7 @@
       "cargo_cache_checksum_evidence": null,
       "source_integrity_status": "not-applicable",
       "license_evidence_status": "missing",
-      "distribution_obligation_profile": "spdx:3207cff3bf6b01bb",
+      "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [
@@ -49969,7 +51390,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50045,7 +51466,7 @@
         {
           "from": {
             "name": "rustls",
-            "version": "0.23.36",
+            "version": "0.23.46",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -50354,7 +51775,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50368,7 +51789,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -51194,7 +52615,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -51208,7 +52629,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -51222,7 +52643,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -51569,7 +52990,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -51583,7 +53004,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -51597,7 +53018,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -51637,7 +53058,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -51651,7 +53072,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -51665,7 +53086,7 @@
         {
           "from": {
             "name": "studiofs-test-support",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-test-support"
           },
@@ -51679,7 +53100,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -52019,7 +53440,7 @@
         {
           "from": {
             "name": "quinn-proto",
-            "version": "0.11.14",
+            "version": "0.11.19",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -52045,7 +53466,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -52059,7 +53480,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -52073,7 +53494,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -52087,7 +53508,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -52101,7 +53522,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -52115,7 +53536,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -52129,7 +53550,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -52143,7 +53564,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -52157,7 +53578,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -53254,7 +54675,7 @@
         {
           "from": {
             "name": "quinn-proto",
-            "version": "0.11.14",
+            "version": "0.11.19",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -53399,22 +54820,22 @@
     },
     {
       "name": "tokio",
-      "version": "1.53.1",
+      "version": "1.54.1",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed",
+      "checksum": "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3",
       "package_kind": "third-party",
       "license_expression": "MIT",
       "license_expression_id": "spdx:e5dcffe836b6ec8a",
       "repository": "https://github.com/tokio-rs/tokio",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#tokio@1.53.1/Cargo.toml",
-        "sha256": "e0194904acf8d55946b949cacca2b266051bb2a99844c606829fb0159c39cfb1"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#tokio@1.54.1/Cargo.toml",
+        "sha256": "9a8189f0dc5320ae7c66786d6414b5650fcf1b1deab634135d2306bdc28d34ec"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "e0194904acf8d55946b949cacca2b266051bb2a99844c606829fb0159c39cfb1",
-          "archive_member_sha256": "e0194904acf8d55946b949cacca2b266051bb2a99844c606829fb0159c39cfb1",
+          "sha256": "9a8189f0dc5320ae7c66786d6414b5650fcf1b1deab634135d2306bdc28d34ec",
+          "archive_member_sha256": "9a8189f0dc5320ae7c66786d6414b5650fcf1b1deab634135d2306bdc28d34ec",
           "archive_member_status": "verified"
         },
         {
@@ -53426,8 +54847,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/tokio-1.53.1.crate",
-        "sha256": "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+        "path": "registry/cache/crates-io/tokio-1.54.1.crate",
+        "sha256": "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -53442,7 +54863,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -53460,7 +54881,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -53534,7 +54955,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -53630,7 +55051,7 @@
         {
           "from": {
             "name": "h2",
-            "version": "0.4.13",
+            "version": "0.4.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -53708,7 +55129,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -53722,7 +55143,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -53736,7 +55157,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -53750,7 +55171,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -53764,7 +55185,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -53778,7 +55199,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -53792,7 +55213,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -53957,7 +55378,7 @@
         {
           "from": {
             "name": "tokio",
-            "version": "1.53.1",
+            "version": "1.54.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -53991,22 +55412,22 @@
     },
     {
       "name": "tokio-postgres",
-      "version": "0.7.16",
+      "version": "0.7.18",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "dcea47c8f71744367793f16c2db1f11cb859d28f436bdb4ca9193eb1f787ee42",
+      "checksum": "a528f7d280f6d5b9cd149635c8705b0dd049754bc67d81d31fa25169a93809d3",
       "package_kind": "third-party",
       "license_expression": "MIT OR Apache-2.0",
       "license_expression_id": "spdx:db11fec9946737df",
       "repository": "https://github.com/rust-postgres/rust-postgres",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#tokio-postgres@0.7.16/Cargo.toml",
-        "sha256": "c7326ac30dedf76b4a784f832be92d7bc0b16a7a4e82041986a5beb79f53a230"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#tokio-postgres@0.7.18/Cargo.toml",
+        "sha256": "02bd134a85a0aa1cec2e5f8152ab94dc34f2345922a9ef0cb0ce51f63d8bfe90"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "c7326ac30dedf76b4a784f832be92d7bc0b16a7a4e82041986a5beb79f53a230",
-          "archive_member_sha256": "c7326ac30dedf76b4a784f832be92d7bc0b16a7a4e82041986a5beb79f53a230",
+          "sha256": "02bd134a85a0aa1cec2e5f8152ab94dc34f2345922a9ef0cb0ce51f63d8bfe90",
+          "archive_member_sha256": "02bd134a85a0aa1cec2e5f8152ab94dc34f2345922a9ef0cb0ce51f63d8bfe90",
           "archive_member_status": "verified"
         },
         {
@@ -54024,8 +55445,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/tokio-postgres-0.7.16.crate",
-        "sha256": "dcea47c8f71744367793f16c2db1f11cb859d28f436bdb4ca9193eb1f787ee42"
+        "path": "registry/cache/crates-io/tokio-postgres-0.7.18.crate",
+        "sha256": "a528f7d280f6d5b9cd149635c8705b0dd049754bc67d81d31fa25169a93809d3"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -54039,7 +55460,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -54053,7 +55474,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -54067,7 +55488,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -54081,7 +55502,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -54215,7 +55636,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -54327,7 +55748,7 @@
         {
           "from": {
             "name": "h2",
-            "version": "0.4.13",
+            "version": "0.4.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -54340,7 +55761,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -54354,7 +55775,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -54368,7 +55789,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -54382,7 +55803,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -54396,7 +55817,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -54558,7 +55979,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -55747,7 +57168,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -55878,7 +57299,7 @@
         {
           "from": {
             "name": "h2",
-            "version": "0.4.13",
+            "version": "0.4.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -55943,7 +57364,7 @@
         {
           "from": {
             "name": "quinn-proto",
-            "version": "0.11.14",
+            "version": "0.11.19",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -55969,7 +57390,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -55983,7 +57404,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -55997,7 +57418,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -56011,7 +57432,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -56025,7 +57446,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -56039,7 +57460,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -56053,7 +57474,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -56169,7 +57590,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -56521,7 +57942,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -56535,7 +57956,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -56549,7 +57970,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -56699,7 +58120,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -56957,6 +58378,19 @@
               "target": null
             }
           ]
+        },
+        {
+          "from": {
+            "name": "hybrid-array",
+            "version": "0.4.10",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
         }
       ],
       "targets": {
@@ -56964,19 +58398,25 @@
           "roles": [
             "runtime"
           ],
-          "enabled_features": []
+          "enabled_features": [
+            "const-generics"
+          ]
         },
         "linux-x86_64": {
           "roles": [
             "runtime"
           ],
-          "enabled_features": []
+          "enabled_features": [
+            "const-generics"
+          ]
         },
         "macos-aarch64": {
           "roles": [
             "runtime"
           ],
-          "enabled_features": []
+          "enabled_features": [
+            "const-generics"
+          ]
         }
       }
     },
@@ -57779,7 +59219,7 @@
         {
           "from": {
             "name": "rustls-webpki",
-            "version": "0.103.13",
+            "version": "0.103.16",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -57924,7 +59364,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -57938,7 +59378,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -57952,7 +59392,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -57966,7 +59406,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -58244,7 +59684,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -58262,7 +59702,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -58336,7 +59776,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -58350,7 +59790,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -58364,7 +59804,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -58378,7 +59818,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -59266,6 +60706,19 @@
           "from": {
             "name": "getrandom",
             "version": "0.3.4",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"none\")))"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "getrandom",
+            "version": "0.4.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -61060,7 +62513,7 @@
         {
           "from": {
             "name": "quinn-proto",
-            "version": "0.11.14",
+            "version": "0.11.19",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -61101,22 +62554,22 @@
     },
     {
       "name": "webpki-roots",
-      "version": "1.0.6",
+      "version": "1.0.11",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed",
+      "checksum": "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171",
       "package_kind": "third-party",
       "license_expression": "CDLA-Permissive-2.0",
       "license_expression_id": "spdx:cb277f172e98a156",
       "repository": "https://github.com/rustls/webpki-roots",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#webpki-roots@1.0.6/Cargo.toml",
-        "sha256": "4cdfbd70b7f7a64e9385f5b704b70bb072a828c79b1a9caa7e96b2ab1063b0ea"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#webpki-roots@1.0.11/Cargo.toml",
+        "sha256": "e7d0bebbfabe4f0158a3a85bc1d28d46a7aea24ff76288ceb1ccfb16a1ef4c7a"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "4cdfbd70b7f7a64e9385f5b704b70bb072a828c79b1a9caa7e96b2ab1063b0ea",
-          "archive_member_sha256": "4cdfbd70b7f7a64e9385f5b704b70bb072a828c79b1a9caa7e96b2ab1063b0ea",
+          "sha256": "e7d0bebbfabe4f0158a3a85bc1d28d46a7aea24ff76288ceb1ccfb16a1ef4c7a",
+          "archive_member_sha256": "e7d0bebbfabe4f0158a3a85bc1d28d46a7aea24ff76288ceb1ccfb16a1ef4c7a",
           "archive_member_status": "verified"
         },
         {
@@ -61128,8 +62581,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/webpki-roots-1.0.6.crate",
-        "sha256": "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
+        "path": "registry/cache/crates-io/webpki-roots-1.0.11.crate",
+        "sha256": "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -61169,7 +62622,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -61256,7 +62709,7 @@
         {
           "from": {
             "name": "tokio-postgres",
-            "version": "0.7.16",
+            "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -61880,7 +63333,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -61894,7 +63347,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -62125,8 +63578,23 @@
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
-      "nonproduction_scope_hints": [],
+      "nonproduction_scope_hints": [
+        "has-target-conditioned-edge"
+      ],
       "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "iana-time-zone",
+            "version": "0.1.65",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_os = \"windows\")"
+            }
+          ]
+        },
         {
           "from": {
             "name": "windows",
@@ -62235,23 +63703,8 @@
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
-      "nonproduction_scope_hints": [
-        "has-target-conditioned-edge"
-      ],
+      "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
-        {
-          "from": {
-            "name": "iana-time-zone",
-            "version": "0.1.65",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(target_os = \"windows\")"
-            }
-          ]
-        },
         {
           "from": {
             "name": "windows",
@@ -63502,84 +64955,6 @@
               "target": "cfg(target_os = \"windows\")"
             }
           ]
-        },
-        {
-          "from": {
-            "name": "errno",
-            "version": "0.3.14",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "jiff",
-            "version": "0.2.20",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "quinn-udp",
-            "version": "0.5.14",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "rustix",
-            "version": "1.1.3",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "tempfile",
-            "version": "3.25.0",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "winapi-util",
-            "version": "0.1.11",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
         }
       ],
       "targets": {
@@ -63598,8 +64973,6 @@
             "Win32_Graphics_Gdi",
             "Win32_Media",
             "Win32_Security",
-            "Win32_Storage",
-            "Win32_Storage_FileSystem",
             "Win32_System",
             "Win32_System_Com",
             "Win32_System_Com_StructuredStorage",
@@ -63608,7 +64981,6 @@
             "Win32_System_SystemInformation",
             "Win32_System_SystemServices",
             "Win32_System_Threading",
-            "Win32_System_Time",
             "Win32_System_WindowsProgramming",
             "Win32_UI",
             "Win32_UI_Accessibility",
@@ -63689,6 +65061,32 @@
         },
         {
           "from": {
+            "name": "errno",
+            "version": "0.3.14",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "jiff",
+            "version": "0.2.20",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "nu-ansi-term",
             "version": "0.50.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -63702,8 +65100,60 @@
         },
         {
           "from": {
+            "name": "quinn-udp",
+            "version": "0.5.14",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "rustix",
             "version": "0.38.44",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "rustix",
+            "version": "1.1.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "tempfile",
+            "version": "3.25.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "winapi-util",
+            "version": "0.1.11",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -63825,6 +65275,45 @@
               "target": "cfg(target_os = \"windows\")"
             }
           ]
+        },
+        {
+          "from": {
+            "name": "anstyle-query",
+            "version": "1.1.5",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "anstyle-wincon",
+            "version": "3.0.11",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "socket2",
+            "version": "0.6.5",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
         }
       ],
       "targets": {
@@ -63838,9 +65327,15 @@
             "Win32_Globalization",
             "Win32_Graphics",
             "Win32_Graphics_Gdi",
+            "Win32_Networking",
+            "Win32_Networking_WinSock",
             "Win32_System",
+            "Win32_System_Console",
+            "Win32_System_IO",
             "Win32_System_LibraryLoader",
             "Win32_System_SystemServices",
+            "Win32_System_Threading",
+            "Win32_System_WindowsProgramming",
             "Win32_UI",
             "Win32_UI_Accessibility",
             "Win32_UI_Controls",
@@ -63903,32 +65398,6 @@
       "resolved_incoming_dependency_edges": [
         {
           "from": {
-            "name": "anstyle-query",
-            "version": "1.1.5",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "anstyle-wincon",
-            "version": "3.0.11",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "ctrlc",
             "version": "3.5.2",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -63981,21 +65450,8 @@
         },
         {
           "from": {
-            "name": "socket2",
-            "version": "0.6.5",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": "cfg(windows)"
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "tokio",
-            "version": "1.53.1",
+            "version": "1.54.1",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -64044,7 +65500,6 @@
             "Win32_System_IO",
             "Win32_System_Pipes",
             "Win32_System_SystemServices",
-            "Win32_System_Threading",
             "Win32_System_WindowsProgramming",
             "Win32_UI",
             "Win32_UI_Shell",
@@ -65401,7 +66856,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -65474,7 +66929,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -65553,7 +67008,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -65866,7 +67321,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -66922,7 +68377,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -67663,7 +69118,7 @@
         {
           "from": {
             "name": "aws-lc-rs",
-            "version": "1.16.2",
+            "version": "1.18.2",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -67715,7 +69170,7 @@
         {
           "from": {
             "name": "rustls",
-            "version": "0.23.36",
+            "version": "0.23.46",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -67741,7 +69196,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -67755,7 +69210,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.1.1",
+            "version": "0.2.0",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
