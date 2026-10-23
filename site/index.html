@@ -560,6 +560,22 @@
     footer a:hover { color: var(--text); }
     footer .links { display: flex; flex-wrap: wrap; gap: 20px; }
 
+    /* ---------- scroll reveal ---------- */
+    html.js-reveal, html.js-reveal body { overflow-x: clip; }
+    .reveal {
+      opacity: 0;
+      transition: opacity .7s ease, transform .7s cubic-bezier(.2,.7,.2,1);
+      transition-delay: var(--d, 0s);
+      will-change: transform, opacity;
+    }
+    .reveal.from-left { transform: translateX(-80px); }
+    .reveal.from-right { transform: translateX(80px); }
+    .reveal.from-below { transform: translateY(50px); }
+    .reveal.is-in { opacity: 1; transform: none; }
+    @media (prefers-reduced-motion: reduce) {
+      .reveal { opacity: 1; transform: none; transition: none; }
+    }
+
     /* ---------- responsive ---------- */
     @media (max-width: 960px) {
       .hero .wrap, .install-grid { grid-template-columns: 1fr; }
@@ -1131,6 +1147,47 @@
         tc.textContent = '00:' + pad(Math.floor(f / 1440) % 60) + ':' + pad(Math.floor(f / 24) % 60) + ':' + pad(f % 24);
         requestAnimationFrame(tick);
       })(start);
+    })();
+
+    // Scroll reveal: blocks slide in from the sides as they enter the viewport
+    // and slide back out as they leave it.
+    (function () {
+      if (!('IntersectionObserver' in window)) return;
+      if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+      document.documentElement.classList.add('js-reveal');
+      var groups = [
+        '.loops > .card', '.diagram > .node', '.remote > .node', '.flow-note > div',
+        '.features > .card', '.platforms > .card', '.install-steps > .card', '.term',
+        '.pricing > .plan', '.caution', '.cta'
+      ];
+      var items = [];
+      groups.forEach(function (sel) {
+        var els = document.querySelectorAll(sel);
+        els.forEach(function (el) {
+          var parent = el.parentElement;
+          var siblings = Array.prototype.filter.call(parent.children, function (c) { return c.matches(sel); });
+          var cols = getComputedStyle(parent).gridTemplateColumns.split(' ').filter(Boolean).length || 1;
+          var i = siblings.indexOf(el);
+          var col = i % cols;
+          var dir = 'from-below';
+          if (cols > 1 && col === 0) dir = 'from-left';
+          else if (cols > 1 && col === cols - 1) dir = 'from-right';
+          if (el.matches('.term')) dir = 'from-right';
+          if (el.matches('.install-steps > .card')) dir = 'from-left';
+          el.classList.add('reveal', dir);
+          el.style.setProperty('--d', (Math.min(i, 5) * 0.06).toFixed(2) + 's');
+          items.push(el);
+        });
+      });
+      document.querySelectorAll('section h2, section .eyebrow, section .lead').forEach(function (el) {
+        if (el.closest('.cta')) return;
+        el.classList.add('reveal', 'from-below');
+        items.push(el);
+      });
+      var io = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) { e.target.classList.toggle('is-in', e.isIntersecting); });
+      }, { threshold: 0.12, rootMargin: '0px 0px -6% 0px' });
+      items.forEach(function (el) { io.observe(el); });
     })();
   </script>
 </body>
