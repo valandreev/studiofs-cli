@@ -5,10 +5,16 @@ evidence below.** This is an engineering provenance inventory, not a grant of
 rights or legal clearance. It records what the repository demonstrates and
 what a release owner must still establish.
 
+**Status update, 2026-10-23:** the maintainer attestations recorded below
+resolve P1, P3 and P4 for the current publication review. They are maintainer
+statements, not independent authorship, asset-rights or fixture-content
+verification. The audited snapshot and its inventory remain unchanged.
+
 SFS-852 update, 2026-10-23: [LICENSE](../../LICENSE) now contains the complete
 GPLv3 text and workspace metadata declares `GPL-3.0-only`. The baseline findings
-below retain their historical scope; this resolves P1's missing license text,
-not its outstanding contribution-authority evidence or the other publication gates.
+below retain their historical scope; at that stage SFS-852 resolved P1's missing
+license text, while the contribution-authority statement was supplied later as
+recorded above. Other publication gates remain separate.
 
 ## Audited snapshot and method
 
@@ -95,6 +101,17 @@ At the audited baseline, no tracked LICENSE/COPYING/NOTICE file was found.
 licensing intent, not missing third-party grants. SFS-852 subsequently added
 the GPLv3 text and explicit `GPL-3.0-only` declaration, without replacing
 upstream grants.
+
+**Maintainer attestations (2026-10-23):** the maintainer states that the
+StudioFS code was written alone by a private individual who owns the code.
+This does not establish aliases among the Git author names listed above, and
+no additional aliases are claimed here. The maintainer also states that friend
+Denys Koliaka helped with the cat artwork, that the maintainer later refined
+it, and that all rights to the artwork belong to the maintainer. Finally, the
+maintainer states that all data in the four tracked redb fixtures comes from a
+synthetic test environment. These statements resolve the corresponding audit
+questions for this publication review; they have not been independently
+verified and do not supersede separate upstream-notice or release checks.
 
 ## JuiceFS: reference material versus implementation
 
@@ -231,20 +248,20 @@ text comparison or binary database content audit was performed.
 
 ## Release-blocking evidence register
 
-These are explicit **open** gates. Flagging them completes the audit record;
-it does not satisfy the acceptance requirement that every third-party file
-already has proven redistribution rights. The release owner must attach the
-resolution evidence here and have SFS-854 verify the exact public commit and
-any reachable history. Do not mark the repository cleared while rows remain.
+This register preserves the findings from the audited snapshot and records
+their current disposition. Maintainer attestations resolve P1, P3 and P4 as
+described above; remaining gates still require the listed action. SFS-854 must
+verify the exact publication commit and reachable history. These attestations
+are not independent proof of provenance or redistribution rights.
 
 | ID | Scope / missing evidence | Required resolution | Owner / gate |
 | --- | --- | --- | --- |
-| P1 | Project source, prose, scripts and contribution authority are inferred from local development history. **License text resolved by SFS-852:** GPLv3 LICENSE added, metadata declares GPL-3.0-only. | Maintainer records author/alias and employer/client authority, identifies copied/translated contributions with exact upstream terms, or excludes unresolved content. The project license does not override upstream grants. | Maintainer confirmation; SFS-854 publication gate. |
+| P1 | Project code authorship and contribution authority were inferred from local development history. **License text resolved by SFS-852:** GPLv3 LICENSE added, metadata declares GPL-3.0-only. **Resolved by maintainer attestation (2026-10-23):** code was written alone by a private individual who owns it. Git author-name aliases remain unconfirmed; P6 separately tracks identified third-party templates. | Retain the dated attestation; the project license does not override upstream grants. | Maintainer attestation; SFS-854 verifies publication scope. |
 | P2 | macFUSE fallback header's upstream origin and notices are unresolved. **Tree remediated:** the never-compiled fallback was deleted; only reachable history remains. | Verify a macOS build with installed macFUSE headers (not run on the Windows remediation host). History: accepted by the maintainer decision below. | SFS-851 finding; maintainer remediation; SFS-853 notices; SFS-854 gate. |
-| P3 | All 22 branding files, especially the separately uploaded cat artwork, lack a source/rights record. | Obtain creator/source and redistribution grant covering SVGs, PNG derivatives and HTML artwork; record required attribution and asset-specific terms. Otherwise replace/exclude assets and update consumers. | Maintainer and asset contributor; SFS-854 gate. |
-| P4 | Four redb fixtures: incomplete baseline origin/content provenance. | Establish synthetic generation and right to publish data, document original redb version/schema/input or regenerate compatible synthetic baselines and derived fixtures with focused fixture tests. | Maintainer/fixture author; SFS-854 gate. |
+| P3 | At the audited snapshot, all 22 branding files lacked a source/rights record. **Resolved by maintainer attestation (2026-10-23):** friend Denys Koliaka helped with the cat artwork, the maintainer later refined it, and all rights belong to the maintainer. | Retain the dated attestation for the branding files; it is not independent verification. | Maintainer attestation; SFS-854 records the disposition. |
+| P4 | At the audited snapshot, the four redb fixtures had incomplete origin/content provenance. **Resolved by maintainer attestation (2026-10-23):** all fixture data comes from a synthetic test environment. | Retain the dated attestation; no independent binary-content audit was performed. | Maintainer attestation; SFS-854 records the disposition. |
 | P5 | `.antigravitycli/9d7276d9-1579-4c0b-8fa1-49bdc747c598.json` is a tracked symlink (mode `120000`) introduced at `c3d34463`; its blob is an absolute user-home path, not JSON content. Windows checkouts without symlink support materialize it as a small plain file. The documentation review also found developer-local paths (`/home/val/…`, `E:\dev\studiofs-cli`, `/Volumes/Storage/dev/studiofs`) across plans/specs, a machine hostname in `docs/perf/sfs-473-linux-async-fuse-benchmark.md:8`, and an absolute checkout path in `docs/tests.md:1239`; no secrets were found. **Docs remediated:** tracked Markdown now uses `<repo-root>`, `<juicefs-checkout>` and `<host>` placeholders, and `tools/perf/linux-juicefs-parity-gate.sh` defaults to a sibling `../juicefs` checkout instead of `/home/val/dev/juicefs`. | **Tree remediated:** the symlink was untracked (it was already in `.gitignore`). History: accepted by the maintainer decision below. Complete the separate secret/private-data scan. | SFS-854 publication hygiene. |
-| P6 | MIT-licensed agent-workflow templates are reproduced without their notices: `.agent/PLANS.md` (OpenAI Cookbook `articles/codex_exec_plans.md`, © 2025 OpenAI; full-text match) and the ExecPlan preamble/section skeleton copied into `docs/plans/` and `docs/superpowers/plans/`; `docs/agents/domain.md` and `docs/agents/triage-labels.md` (mattpocock/skills `setup-matt-pocock-skills`, © 2026 Matt Pocock); the "REQUIRED SUB-SKILL" plan header (obra/superpowers `writing-plans`, © 2025 Jesse Vincent). **Remediated:** `.agent/PLANS.md`, `docs/agents/domain.md` and `docs/agents/triage-labels.md` now open with the source, copyright line and full MIT permission notice in an HTML comment; the 16 superpowers headers were reworded to point at `.agent/PLANS.md`. | SFS-853 should list these MIT sources in the generated third-party notices; SFS-854 confirms no other copies. History: accepted by the maintainer decision below. The short ExecPlan preamble in individual plans derives from `.agent/PLANS.md`, which carries the notice. | SFS-853 notices; SFS-854 gate. |
+| P6 | MIT-licensed agent-workflow templates are reproduced without their notices: `.agent/PLANS.md` (OpenAI Cookbook `articles/codex_exec_plans.md`, © 2025 OpenAI; full-text match) and the ExecPlan preamble/section skeleton copied into `docs/plans/` and `docs/superpowers/plans/`; `docs/agents/domain.md` and `docs/agents/triage-labels.md` (mattpocock/skills `setup-matt-pocock-skills`, © 2026 Matt Pocock); the "REQUIRED SUB-SKILL" plan header (obra/superpowers `writing-plans`, © 2025 Jesse Vincent). **Remediated:** `.agent/PLANS.md`, `docs/agents/domain.md` and `docs/agents/triage-labels.md` now open with the source, copyright line and full MIT permission notice in an HTML comment; the 16 superpowers headers were reworded to point at `.agent/PLANS.md`. | **Generated notices resolved by SFS-854:** the curated source-material notice supplement reproduces these attributions and full MIT terms in THIRD-PARTY-NOTICES.txt; the SFS-854 recheck verifies their inclusion. History: accepted by the maintainer decision below. The short ExecPlan preamble in individual plans derives from `.agent/PLANS.md`, which carries the notice. | SFS-853 notices; SFS-854 gate. |
 
 SFS-849 dependency evidence gaps, SFS-850 native packaging conditions and
 SFS-853 generated notices remain separate release gates. This source audit

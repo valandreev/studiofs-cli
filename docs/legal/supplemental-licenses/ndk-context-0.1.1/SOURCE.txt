@@ -1,0 +1,4 @@
+Repository: https://github.com/rust-windowing/android-ndk-rs
+Tag or commit: commit 10f2ba388fca20f7349996ebae26ccda7a6fda5c (vcs_info; crate subdirectory ndk-context; repo-root license files)
+Upstream files: LICENSE-APACHE, LICENSE-MIT
+License expression (Cargo.toml): MIT OR Apache-2.0

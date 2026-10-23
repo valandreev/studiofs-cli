@@ -1,0 +1,9 @@
+Repository: https://github.com/bytecodealliance/wasm-tools
+Commit: d4e317f22c3bace76cb3205003bcc34b4929037d
+Crate source path in repository: crates/wit-component
+Upstream license file paths:
+  LICENSE-APACHE
+  LICENSE-Apache-2.0_WITH_LLVM-exception
+  LICENSE-MIT
+Cargo.toml license expression: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+Texts were fetched verbatim from the upstream repository at the commit above (.cargo_vcs_info.json sha1).

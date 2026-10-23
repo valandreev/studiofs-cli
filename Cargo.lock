@@ -4800,7 +4800,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "studiofs"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4857,7 +4857,7 @@ dependencies = [
 
 [[package]]
 name = "studiofs-bridge"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "libc",
  "studiofs-meta",
@@ -4866,7 +4866,7 @@ dependencies = [
 
 [[package]]
 name = "studiofs-cache"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "libc",
@@ -4884,7 +4884,7 @@ dependencies = [
 
 [[package]]
 name = "studiofs-data"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aws-sdk-s3",
  "aws-smithy-http-client",
@@ -4908,7 +4908,7 @@ dependencies = [
 
 [[package]]
 name = "studiofs-e2e"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4936,7 +4936,7 @@ dependencies = [
 
 [[package]]
 name = "studiofs-linux-fuse"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "cc",
@@ -4953,7 +4953,7 @@ dependencies = [
 
 [[package]]
 name = "studiofs-macfuse"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cc",
  "dashmap",
@@ -4975,7 +4975,7 @@ dependencies = [
 
 [[package]]
 name = "studiofs-meta"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bitflags 2.11.0",
  "chrono",
@@ -5005,7 +5005,7 @@ dependencies = [
 
 [[package]]
 name = "studiofs-scenario"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5016,14 +5016,14 @@ dependencies = [
 
 [[package]]
 name = "studiofs-test-support"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "studiofs-vfs"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aws-sdk-s3",
  "aws-smithy-http-client",
@@ -5057,7 +5057,7 @@ dependencies = [
 
 [[package]]
 name = "studiofs-winfsp"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "dotenvy",
  "futures",

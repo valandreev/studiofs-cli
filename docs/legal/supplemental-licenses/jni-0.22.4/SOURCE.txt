@@ -1,0 +1,4 @@
+Repository: https://github.com/jni-rs/jni-rs
+Tag or commit: commit 5ae9458a4ec44c5318f37ddc7569c1d4ae8a69e7 (crate subdirectory crates/jni; repo-root license files)
+Upstream files: LICENSE-APACHE, LICENSE-MIT
+License expression (Cargo.toml): MIT OR Apache-2.0

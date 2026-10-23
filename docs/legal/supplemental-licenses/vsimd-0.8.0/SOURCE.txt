@@ -1,0 +1,4 @@
+Repository: https://github.com/Nugine/simd
+Tag or commit: commit d74c030d9dc4f3cae02146d1f497ff62726ef09a (crate subdirectory crates/vsimd; repo-root LICENSE)
+Upstream files: LICENSE
+License expression (Cargo.toml): MIT

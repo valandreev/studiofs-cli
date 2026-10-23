@@ -1,0 +1,5 @@
+Crate: objc2-encode 4.1.0
+Repository: https://github.com/madsmtm/objc2
+Upstream license files: LICENSE-MIT.txt (repository root, verbatim, from commit ee9a7ada2131f5944b8750428e265c15632f2a19)
+Crate source commit: 8d214f5477365ffcbcbb7de058c86ed9a518efb7. At that commit the repository has only LICENSE.md, which states the licensing and links to the license texts but does not contain them; the verbatim texts first appear in commit ee9a7ada2131f5944b8750428e265c15632f2a19, the one used here.
+License expression (Cargo.toml): MIT

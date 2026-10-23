@@ -1,0 +1,8 @@
+Repository: https://github.com/rustwasm/gloo
+Commit: f3bb1d1a1c33dbcccaf26446aca7d0cea8e9d574
+Crate source path in repository: crates/timers
+Upstream license file paths:
+  LICENSE-APACHE
+  LICENSE-MIT
+Cargo.toml license expression: MIT OR Apache-2.0
+Texts were fetched verbatim from the upstream repository at the commit above (.cargo_vcs_info.json sha1).

@@ -1,0 +1,4 @@
+Repository: https://github.com/getsentry/symbolic
+Tag or commit: tag 12.17.2 (commit 8d78a4488250dec1b6f35bef0ead50ab56a56814; no vcs_info in crate)
+Upstream files: LICENSE
+License expression (Cargo.toml): MIT

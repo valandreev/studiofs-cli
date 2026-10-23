@@ -1,0 +1,9 @@
+Repository: https://github.com/bytecodealliance/wasi-rs
+Commit: 06ce201370fcde0d1b0d47cac8ecb1b0b312c9f9
+Crate source path in repository: crates/wasip3
+Upstream license file paths:
+  LICENSE-APACHE
+  LICENSE-Apache-2.0_WITH_LLVM-exception
+  LICENSE-MIT
+Cargo.toml license expression: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+Texts were fetched verbatim from the upstream repository at the commit above (.cargo_vcs_info.json sha1).

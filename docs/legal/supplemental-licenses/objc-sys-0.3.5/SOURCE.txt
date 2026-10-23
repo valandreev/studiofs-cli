@@ -1,0 +1,7 @@
+Repository: https://github.com/madsmtm/objc2
+Commit: 4fc083f1c6d6784577e38b0ee8dbd344481e2fd2 (matches the crate's .cargo_vcs_info.json)
+Crate: objc-sys-0.3.5 (published package path: crates/objc-sys)
+Upstream file: LICENSE.txt (repository root)
+License expression (Cargo.toml): MIT
+
+LICENSE.txt is copied verbatim from the upstream repository at the commit above.

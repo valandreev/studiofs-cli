@@ -1,0 +1,4 @@
+Repository: https://github.com/polarsignals/rust-jemalloc-pprof
+Tag or commit: commit febd0a9c2edf0c6b7e0fd5f2064970021a282e67 (vcs_info; repo-root LICENSE)
+Upstream files: LICENSE
+License expression (Cargo.toml): Apache-2.0

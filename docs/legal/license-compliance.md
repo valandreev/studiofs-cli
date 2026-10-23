@@ -67,15 +67,28 @@ can identify exact versions and obtain covered source. Corresponding source and
 build material must accompany GPL distribution through the release's chosen
 compliant source-delivery method; a repository URL alone is not a substitute
 for that release decision. Run the native linkage/archive checks documented in
-the platform policy before publication. This repository currently has no binary
-archive packager; future packaging automation must make these commands an
-explicit prerequisite and copy the complete directory. The GitHub
+the platform policy before publication. Packaging automation must make these
+commands an explicit prerequisite and copy the complete directory. The GitHub
 `release: published` check is post-publication verification, not a publication
 lock or an attachment to an existing binary archive.
 
+SFS-854 adds the separate [Release builds workflow](../../.github/workflows/release.yml)
+and [archive helper](../../tools/release/package.py). That workflow runs the strict
+command above before starting five native product builds, includes the complete
+notice directory in every archive, checks native linkage, and attaches successful
+tag builds to a draft Release. The older published-event check remains a
+post-publication verification. See [release instructions](../releases.md) for
+the target matrix and the explicit final publication step.
+
+The generated notices also include the curated
+[source-material notices](source-material-notices.txt) for the MIT documentation
+and plan templates identified by the source provenance audit. These supplements
+do not waive any unresolved registry-package evidence.
+
 The preceding audit recorded **65 third-party packages without named primary
 notice evidence**. The generator also searches `LICENSES/` directories; consult
-its inventory for the current gap count. Review generation records these gaps;
+its inventory for the current gap count. Crates that ship no license file are
+covered by verbatim upstream texts in `supplemental-licenses/` (see its README). Review generation records these gaps;
 `--release` returns failure while any remain.
 Resolve the exact upstream notice/copyright evidence and review any required
 supplements before distribution. Do not substitute a generic SPDX text for

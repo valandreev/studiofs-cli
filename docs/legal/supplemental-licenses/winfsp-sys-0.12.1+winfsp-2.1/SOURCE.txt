@@ -1,0 +1,4 @@
+Repository: https://github.com/SnowflakePowered/winfsp-rs
+Tag or commit: commit 5ae65f6ae65837bf368887672c5baca7542c3cc7 (vcs_info; crate subdirectory winfsp-sys; repo-root LICENSE.md)
+Upstream files: LICENSE.md
+License expression (Cargo.toml): GPL-3.0

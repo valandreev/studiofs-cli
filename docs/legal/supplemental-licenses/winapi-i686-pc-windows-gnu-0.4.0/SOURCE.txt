@@ -1,0 +1,4 @@
+Crate: winapi-i686-pc-windows-gnu 0.4.0
+Repository: https://github.com/retep998/winapi-rs
+Upstream license files: LICENSE-MIT, LICENSE-APACHE (repository root, verbatim, from tag 0.3.9; the repository has no 0.4.0 tag and the root license files cover the whole repository)
+License expression (Cargo.toml): MIT/Apache-2.0
