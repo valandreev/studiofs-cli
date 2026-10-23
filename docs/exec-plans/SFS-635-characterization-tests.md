@@ -152,7 +152,7 @@ issue-linked repros as their production-fix inputs.
 
 ## Concrete Steps
 
-Run commands from `/Volumes/Storage/dev/studiofs`.
+Run commands from `<repo-root>`.
 
     cargo test -p studiofs-vfs process_upload_does_not_complete_queue_when_local_transition_fails -- --ignored --nocapture  # expected panic, reported as pass
     cargo test -p studiofs-cache upload_queue -- --nocapture  # 14 passed, 1 ignored

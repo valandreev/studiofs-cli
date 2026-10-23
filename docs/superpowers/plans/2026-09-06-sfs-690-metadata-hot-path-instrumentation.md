@@ -73,7 +73,7 @@ The implementation adds seven opt-in hot-path entry counters, existing cache/nat
 
 ## Context and Orientation
 
-The repository is a Rust 2024 workspace at `E:\dev\studiofs-cli`. `crates/studiofs-winfsp` contains the Windows adapter and the ignored native test in `crates/studiofs-winfsp/tests/mount_sanity/metadata_baseline.rs`. The adapter resolves paths, opens handles, fills directory buffers, and calls into `crates/studiofs-vfs`. The VFS uses local `redb` metadata for foreground operations; PostgreSQL and object storage are not foreground metadata read dependencies.
+The repository is a Rust 2024 workspace at `<repo-root>`. `crates/studiofs-winfsp` contains the Windows adapter and the ignored native test in `crates/studiofs-winfsp/tests/mount_sanity/metadata_baseline.rs`. The adapter resolves paths, opens handles, fills directory buffers, and calls into `crates/studiofs-vfs`. The VFS uses local `redb` metadata for foreground operations; PostgreSQL and object storage are not foreground metadata read dependencies.
 
 The benchmark script `tools/perf/sfs-680-windows-metadata-ab.ps1` checks out a baseline source snapshot and runs the current candidate source against the same release ignored test. It stores build logs, environment data, copied CSV reports, run records, and a summary below a unique `target/perf` directory. A workload is one of `stat`, `open_close`, `negative_lookup`, or `enumeration`, and each workload performs 1000 correct filesystem operations in each of three measured passes.
 
@@ -91,7 +91,7 @@ Finally, add a focused SFS-690 performance-contract document describing the new 
 
 ## Concrete Steps
 
-Run all commands from `E:\dev\studiofs-cli` in PowerShell. The red test must be run before the implementation that makes it pass:
+Run all commands from `<repo-root>` in PowerShell. The red test must be run before the implementation that makes it pass:
 
     cargo test -p studiofs-winfsp --test mount_sanity metadata_baseline::tests::callback_counter_classifies_vfs_hot_path_events -- --exact --nocapture
 

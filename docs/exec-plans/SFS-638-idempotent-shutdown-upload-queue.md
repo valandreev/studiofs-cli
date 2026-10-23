@@ -149,7 +149,7 @@ double-shutdown assertions on each platform.
 
 ## Concrete Steps
 
-Run commands from `/Volumes/Storage/dev/studiofs`.
+Run commands from `<repo-root>`.
 
     cargo test -p studiofs-cache wait_for_idle_wakes_after_last_completion -- --nocapture
     cargo test -p studiofs-vfs concurrent_shutdown_callers_observe_first_error -- --nocapture

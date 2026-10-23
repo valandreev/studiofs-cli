@@ -65,7 +65,7 @@ release diagnostic-overhead loop described below.
 
 ## Context and Orientation
 
-Repository: `/home/val/dev/studiofs-cli`, initially clean on
+Repository: `<repo-root>`, initially clean on
 `feature/sfs-792-remove-btreemap-snapshot-churn-from-the-linux-async-write`.
 `crates/studiofs-linux-fuse/src/async_writes.rs` owns the ledger (the pending
 request registry and accumulated counters). Its `metrics_snapshot` creates the

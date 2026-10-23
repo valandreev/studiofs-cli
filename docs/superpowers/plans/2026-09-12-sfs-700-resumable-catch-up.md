@@ -94,7 +94,7 @@ Finally, in `crates/studiofs-meta/src/pg_engine/metadata_sync.rs`, decode the se
 
 ## Concrete Steps
 
-All commands run from `E:\dev\studiofs-cli` in PowerShell. Do not run the workspace-wide suites; the repository contract reserves those for the user/operator.
+All commands run from `<repo-root>` in PowerShell. Do not run the workspace-wide suites; the repository contract reserves those for the user/operator.
 
 1. Confirm the starting point with `git status --short`, `git branch --show-current`, and `git log -1 --oneline`.
 2. Add the focused test before production implementation and run it with `cargo test -p studiofs-meta <test-filter> --lib -- --nocapture`. Expected initial result: a compile error identifying the missing transaction-scoped page API, not `running 0 tests`.

@@ -8,14 +8,14 @@ A slow write must cause EIO only on the callback whose 30-second write wait expi
 
 ## Progress
 
-- [x] (2026-10-11) Record root `/home/val/dev/studiofs-cli`, branch `feature/sfs-796-bound-linux-async-write-barrier-waits-so-wedged-writes`, clean worktree; trace all ten review findings.
+- [x] (2026-10-11) Record root `<repo-root>`, branch `feature/sfs-796-bound-linux-async-write-barrier-waits-so-wedged-writes`, clean worktree; trace all ten review findings.
 - [x] (2026-10-11) Four new regressions failed on old code; evidence: `target/sfs-796-review-red.log`. Added cleanup/shutdown race and late sticky-error coverage.
 - [x] (2026-10-11) Remove global timeout poisoning; implement owned late release; publish timeout metrics and update documentation.
 - [x] (2026-10-11) Final Linux suite: 173 passed, 3 mounted tests ignored. Focused VFS suite: 5 passed. Crate check, all-target Clippy with -D warnings, formatting and diff checks passed. Independent read-only review found no actionable issues.
 
 ## Surprises & Discoveries
 
-The graph project configured in AGENTS.md is absent; the available index is `home-val-dev-studiofs-cli`. Direct source inspection confirms that the global barrier_failed/shutting_down flags poison unrelated callbacks. The existing kernel-barrier test deliberately asserts permanent failure after late completion, so those assertions need replacement. VFS already offers a synchronous handle close followed by owned background durability work, which avoids inventing another background lifecycle.
+The graph project configured in AGENTS.md is absent; the available index is `<codebase-memory-project>`. Direct source inspection confirms that the global barrier_failed/shutting_down flags poison unrelated callbacks. The existing kernel-barrier test deliberately asserts permanent failure after late completion, so those assertions need replacement. VFS already offers a synchronous handle close followed by owned background durability work, which avoids inventing another background lifecycle.
 
 ## Decision Log
 
@@ -40,7 +40,7 @@ First add tests that time out a retained ticket then exercise unrelated inode op
 
 ## Concrete Steps
 
-Run from `/home/val/dev/studiofs-cli`:
+Run from `<repo-root>`:
 
     cargo test -p studiofs-linux-fuse --lib timeout -- --nocapture
     cargo test -p studiofs-linux-fuse --lib

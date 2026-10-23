@@ -7,7 +7,7 @@ backend boundary, while SFS-598 will gate the result against JuiceFS parity.
 This task owns the shared VFS writer/cache behavior that the Linux backend will
 exercise.
 
-The local JuiceFS reference at `/home/val/dev/juicefs` routes foreground writes
+The local JuiceFS reference at `<juicefs-checkout>` routes foreground writes
 through `VFS.Write -> handle.writer.Write -> chunk.Writer`. Its cached store
 uses `BufferSize`, `MaxUpload`, `MaxStageWrite`, staged cache files, and
 background upload workers so ordinary writes accept data at local writer/cache

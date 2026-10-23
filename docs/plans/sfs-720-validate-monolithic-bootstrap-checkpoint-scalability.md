@@ -111,7 +111,7 @@ native low-resource hardware was unavailable.
 
 ## Concrete Steps
 
-From `/Volumes/Storage/dev/studiofs`, run the focused fixture test first and
+From `<repo-root>`, run the focused fixture test first and
 expect it to fail before the fixture helper exists. Implement one vertical slice
 until it passes, then run the ignored benchmark with the configured
 `STUDIOFS_TEST_PG_DSN` and a bounded namespace-size set. Keep generated JSON

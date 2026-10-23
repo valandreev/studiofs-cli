@@ -1,6 +1,6 @@
 # SFS-222 Budgeted Profiling Windows Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task under `.agent/PLANS.md`. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add bounded profiling windows to live diagnostics runs so a controller can start and stop wall/blocking-first and CPU captures under explicit presets and budgets without restarting the daemon.
 

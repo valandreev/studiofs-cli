@@ -153,7 +153,7 @@ Call the local prune pass from `start_background_poll` before its PostgreSQL syn
 
 ## Concrete Steps
 
-Run commands from `/Volumes/Storage/dev/studiofs`.
+Run commands from `<repo-root>`.
 
 1. Add and run the focused metadata regression tests before implementation. Confirm the tests fail because acknowledged local rows are still retained or the expected diagnostics are absent.
 2. Implement the redb batch deletion, cursor-guarded maintenance call, poll integration, and metric mapping. Re-run the same focused tests and expect them to pass.

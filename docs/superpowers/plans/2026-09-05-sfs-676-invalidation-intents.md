@@ -84,7 +84,7 @@ native delivery. No aggressive timeout or macOS/Linux implementation is included
 
 ## Concrete Steps
 
-Work in `E:\dev\studiofs-cli` on the existing SFS-676 branch. Add failing focused
+Work in `<repo-root>` on the existing SFS-676 branch. Add failing focused
 tests first for rename chains, removed aliases, content-only changes, aborted
 transactions, overflow and unsupported adapters. Run Cargo sequentially.
 

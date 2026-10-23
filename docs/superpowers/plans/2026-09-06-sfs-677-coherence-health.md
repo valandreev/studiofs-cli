@@ -311,7 +311,7 @@ snapshot if that is the least disruptive existing surface.
 
 ## Concrete Steps
 
-All commands run from `E:\dev\studiofs-cli` in PowerShell. Cargo commands are
+All commands run from `<repo-root>` in PowerShell. Cargo commands are
 focused and sequential; no full workspace suite is run.
 
 1. Add the failing unit tests for the tracker transitions and run them with:

@@ -274,7 +274,7 @@ cross-references, not partial implementations.
 
 ## Concrete Steps
 
-All commands run from /Volumes/Storage/dev/studiofs.
+All commands run from <repo-root>.
 
 The recorded baseline command is:
 

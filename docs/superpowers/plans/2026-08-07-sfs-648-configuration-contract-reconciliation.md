@@ -84,7 +84,7 @@ The reconciliation milestone is complete when the SFS-485 vocabulary test, the r
 
 ### 1. Red tests
 
-From the repository root, `/Volumes/Storage/dev/studiofs` in this checkout, run the new contract test before correcting the live surfaces:
+From the repository root, `<repo-root>` in this checkout, run the new contract test before correcting the live surfaces:
 
     cargo test -p studiofs --test architecture_vocabulary_test configuration_contracts_match_executable_defaults -- --nocapture
 
@@ -96,7 +96,7 @@ Use `apply_patch` for the minimal edits. Update the Linux line in `crates/studio
 
 ### 3. Validation
 
-Run each command separately from `/Volumes/Storage/dev/studiofs`. A successful Cargo test prints `test ... ok` and `test result: ok`; a command requiring a native host is a validation gap, not a pass, when that host is unavailable.
+Run each command separately from `<repo-root>`. A successful Cargo test prints `test ... ok` and `test result: ok`; a command requiring a native host is a validation gap, not a pass, when that host is unavailable.
 
     cargo test -p studiofs --test architecture_vocabulary_test configuration_contracts_match_executable_defaults -- --nocapture
     cargo test -p studiofs --test architecture_vocabulary_test removed_configuration_knobs_have_no_active_surface -- --nocapture

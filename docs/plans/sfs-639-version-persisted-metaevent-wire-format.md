@@ -68,7 +68,7 @@ Finally add behavior-focused tests. Cover every current event kind with a hand-c
 
 ## Concrete Steps
 
-Run all commands from `/Volumes/Storage/dev/studiofs`.
+Run all commands from `<repo-root>`.
 
 1. Confirm the branch and clean baseline:
 

@@ -184,7 +184,7 @@ pass.
 
 ## Concrete Steps
 
-Run commands from `/Volumes/Storage/dev/studiofs`, one Cargo test filter per
+Run commands from `<repo-root>`, one Cargo test filter per
 command to avoid workspace file-lock contention.
 
     cargo test -p studiofs-cache upload_queue --lib -- --nocapture

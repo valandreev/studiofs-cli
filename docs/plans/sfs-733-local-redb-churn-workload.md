@@ -48,7 +48,7 @@ Add a short perf note with the exact PowerShell and shell commands for the defau
 
 ## Concrete Steps
 
-Run from `E:\dev\studiofs-cli` in PowerShell:
+Run from `<repo-root>` in PowerShell:
 
     cargo test -p studiofs-meta local_metadata_churn_redb_growth_workload -- --ignored --nocapture
 

@@ -1,12 +1,12 @@
 # SFS-595 JuiceFS Writer Pipeline Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task under `.agent/PLANS.md`. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ensure StudioFS completed writer blocks stage and drain continuously, JuiceFS-style, before `flush`, `fsync`, or `release`.
 
 **Architecture:** Reuse the existing `MountedWriterStack`, deferred materialization task, and `CachedStore`; do not add a second writer pipeline. Tighten worker scheduling, bounded drain behavior, and observability only where focused tests show a gap.
 
-**Tech Stack:** Rust 2024, Tokio, existing `studiofs-vfs` unit tests, local JuiceFS reference at `/home/val/dev/juicefs`.
+**Tech Stack:** Rust 2024, Tokio, existing `studiofs-vfs` unit tests, local JuiceFS reference at `<juicefs-checkout>`.
 
 ---
 
@@ -16,7 +16,7 @@
 - Modify if a test fails: `crates/studiofs-vfs/src/vfs/sync_ops.rs` for per-inode deferred drain behavior.
 - Modify if worker-level continuous drain is the gap: `crates/studiofs-vfs/src/vfs/workers.rs`.
 - Modify if observability is missing: `crates/studiofs-vfs/src/vfs/metrics.rs` and `crates/studiofs-vfs/src/vfs.rs`.
-- Reference only: `/home/val/dev/juicefs/pkg/vfs/vfs.go`, `/home/val/dev/juicefs/pkg/chunk/cached_store.go`, `/home/val/dev/juicefs/pkg/chunk/disk_cache.go`.
+- Reference only: `<juicefs-checkout>/pkg/vfs/vfs.go`, `<juicefs-checkout>/pkg/chunk/cached_store.go`, `<juicefs-checkout>/pkg/chunk/disk_cache.go`.
 
 ## Task 1: Verify The Existing Continuous Drain Surface
 

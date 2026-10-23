@@ -8,7 +8,7 @@ Concurrent append and truncate writers can publish different contents with the s
 
 ## Progress
 
-- [x] (2026-10-13) Recorded repository `/home/val/dev/studiofs-cli`, branch `bug/linux-bughunt-02`, and initial changes. Read root and metadata/VFS/E2E contracts.
+- [x] (2026-10-13) Recorded repository `<repo-root>`, branch `bug/linux-bughunt-02`, and initial changes. Read root and metadata/VFS/E2E contracts.
 - [x] Inspected retained failures `fix2-hot-1` and `fix3-hot-21` and traced foreign apply, self apply, pending restoration, and base reconciliation.
 - [x] (2026-10-13) Replaced the unfaithful truncate regression. The complete later foreign publication regression fails with size 207 instead of 406; the self-ack regression already passes in both orders.
 - [x] (2026-10-13) Restricted stale Ready filtering to earlier content epochs and removed all TMPDBG instrumentation, preserving the VFS eviction fix. Validation pending.
@@ -43,7 +43,7 @@ First replace `ready_foreign_truncate_overwrite_replaces_published_same_epoch_ap
 
 ## Concrete Steps
 
-Work from `/home/val/dev/studiofs-cli`. Run `cargo test -p studiofs-meta same_epoch --lib -- --nocapture` for initial regressions. Run `cargo test -p studiofs-meta`, `cargo test -p studiofs-vfs`, `cargo check -p studiofs-meta -p studiofs-vfs`, and `cargo clippy -p studiofs-meta -p studiofs-vfs --all-targets -- -D warnings`. Run `cargo fmt --all --check` and `git diff --check`. Build with `cargo build -p studiofs -p studiofs-e2e`. List registered scenarios with `target/debug/studiofs-e2e list`, then repeatedly run `target/debug/studiofs-e2e run --scenario mounted-hotspot-churn-convergence --studiofs-bin target/dbg-wrap/studiofs --run-id <unique-id> --retain on-failure --timeout 300s`. Keep validation command logs under target; stop and inspect any failure before continuing.
+Work from `<repo-root>`. Run `cargo test -p studiofs-meta same_epoch --lib -- --nocapture` for initial regressions. Run `cargo test -p studiofs-meta`, `cargo test -p studiofs-vfs`, `cargo check -p studiofs-meta -p studiofs-vfs`, and `cargo clippy -p studiofs-meta -p studiofs-vfs --all-targets -- -D warnings`. Run `cargo fmt --all --check` and `git diff --check`. Build with `cargo build -p studiofs -p studiofs-e2e`. List registered scenarios with `target/debug/studiofs-e2e list`, then repeatedly run `target/debug/studiofs-e2e run --scenario mounted-hotspot-churn-convergence --studiofs-bin target/dbg-wrap/studiofs --run-id <unique-id> --retain on-failure --timeout 300s`. Keep validation command logs under target; stop and inspect any failure before continuing.
 
 ## Validation and Acceptance
 

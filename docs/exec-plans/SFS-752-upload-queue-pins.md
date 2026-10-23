@@ -245,7 +245,7 @@ committed as `fcbe9ba7`, pushed, and included in the updated PR #737 description
 
 ## Context and Orientation
 
-Work from `E:\dev\studiofs-cli` on
+Work from `<repo-root>` on
 `feature/sfs-752-keep-cache-pin-counts-aligned-with-accepted-upload-queue`.
 `crates/studiofs-cache/src/cached_store.rs` counts runtime references to payloads
 and forwards its first/final references to the local backend. A pin prevents
@@ -270,7 +270,7 @@ Finally document the focused gate in `docs/tests.md` and deliver a regular PR.
 
 ## Concrete Steps
 
-All commands run from `E:\dev\studiofs-cli` in PowerShell. Run Cargo sequentially.
+All commands run from `<repo-root>` in PowerShell. Run Cargo sequentially.
 
     cargo test -p studiofs-cache --lib sfs752_ -- --nocapture
     cargo test -p studiofs-cache --lib upload_queue::tests -- --nocapture

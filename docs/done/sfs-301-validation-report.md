@@ -5,7 +5,7 @@ Host: Windows 11, same machine for StudioFS and JuiceFS probes
 StudioFS volume: `sfs301`, mounted at `Z:`
 StudioFS cache root: `D:\cache\sfs301`
 JuiceFS reference mount: `W:` (`\\juicefs\sqlite`)
-Reference source checkout: `E:\dev\studiofs-project\juicefs`
+Reference source checkout: `<juicefs-checkout>`
 
 ## Summary
 

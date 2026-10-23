@@ -38,7 +38,7 @@ Final local checks passed: 81 apply tests (44 infrastructure tests ignored in th
 
 ## Context and Orientation
 
-The repository root is `/Volumes/Storage/dev/studiofs`, on `feature/sfs-762-bound-repeated-local-event-prefix-projection-during-remote`. `crates/studiofs-meta/src/pg_engine/remote_apply.rs` projects local journal events into remote-visible events and applies replay pages in a redb write transaction. Self-echo means a PostgreSQL batch written by this same client. A prefix match advances the contiguous local flushed watermark; it must not consume a later local-only suffix. `crates/studiofs-meta/src/pg_engine/tests/remote_apply.rs` owns these regressions. Publication uses the same projector in `replication_flush.rs`.
+The repository root is `<repo-root>`, on `feature/sfs-762-bound-repeated-local-event-prefix-projection-during-remote`. `crates/studiofs-meta/src/pg_engine/remote_apply.rs` projects local journal events into remote-visible events and applies replay pages in a redb write transaction. Self-echo means a PostgreSQL batch written by this same client. A prefix match advances the contiguous local flushed watermark; it must not consume a later local-only suffix. `crates/studiofs-meta/src/pg_engine/tests/remote_apply.rs` owns these regressions. Publication uses the same projector in `replication_flush.rs`.
 
 ## Plan of Work
 

@@ -68,7 +68,7 @@ Finally, add or retain focused tests. Outcome coverage will exercise clean idle 
 
 ## Concrete Steps
 
-Run all commands from `/Volumes/Storage/dev/studiofs`.
+Run all commands from `<repo-root>`.
 
 Before editing, confirm the worktree contains only the intended branch state:
 

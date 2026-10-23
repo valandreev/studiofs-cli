@@ -88,7 +88,7 @@ implementation detail there rather than duplicating it in the root file.
 
 ## Concrete Steps
 
-Run from `E:\dev\studiofs-cli`:
+Run from `<repo-root>`:
 
     rg --files -g 'AGENTS.md' -g 'AGENTS.override.md'
     git diff --check

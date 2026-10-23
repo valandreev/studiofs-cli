@@ -69,7 +69,7 @@ Finally, add focused assertions for the four acceptance cases. The before-fetch 
 
 ## Concrete Steps
 
-1. From `E:\dev\studiofs-cli`, add the four ignored RED tests and the shared fixture helper to `crates/studiofs-meta/src/pg_engine/tests/lifecycle.rs`. Use `MetaError::Timeout` for injected failures so the normal sync failure classification is exercised, and use a shared `Arc<Mutex<Vec<CatchUpFaultPoint>>>` recorder to capture observed cursors and page versions.
+1. From `<repo-root>`, add the four ignored RED tests and the shared fixture helper to `crates/studiofs-meta/src/pg_engine/tests/lifecycle.rs`. Use `MetaError::Timeout` for injected failures so the normal sync failure classification is exercised, and use a shared `Arc<Mutex<Vec<CatchUpFaultPoint>>>` recorder to capture observed cursors and page versions.
 
 2. Run the new test filter before adding the production test seam:
 
@@ -81,7 +81,7 @@ Finally, add focused assertions for the four acceptance cases. The before-fetch 
 
 4. Run the same focused ignored command. Expected result: the four tests execute against the configured PostgreSQL service and pass, with nonzero test counts. If `STUDIOFS_TEST_PG_DSN` is unavailable, report the ignored infrastructure prerequisite separately and still run the non-ignored compile/test filter.
 
-5. Run focused nonzero validation from `E:\dev\studiofs-cli`:
+5. Run focused nonzero validation from `<repo-root>`:
 
        cargo test -p studiofs-meta startup_catch_up_fault --lib -- --ignored --nocapture --test-threads=1
        cargo test -p studiofs-meta metadata_paging --lib -- --nocapture

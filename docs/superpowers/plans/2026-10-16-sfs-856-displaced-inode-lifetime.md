@@ -46,7 +46,7 @@ Add public-operation regressions to `crates/studiofs-vfs/src/vfs/tests.rs` using
 
 ## Concrete Steps
 
-From `E:\dev\studiofs-cli`, run `cargo test -p studiofs-vfs --lib sfs856 -- --nocapture` before and after the fix. Run focused metadata rename and unlink filters, related VFS rename/cache and orphan-release filters, `cargo check -p studiofs-vfs -p studiofs-meta`, and `cargo clippy -p studiofs-vfs -p studiofs-meta --all-targets -- -D warnings`. Run `cargo fmt --all -- --check` and `git diff --check`. Do not run full suites.
+From `<repo-root>`, run `cargo test -p studiofs-vfs --lib sfs856 -- --nocapture` before and after the fix. Run focused metadata rename and unlink filters, related VFS rename/cache and orphan-release filters, `cargo check -p studiofs-vfs -p studiofs-meta`, and `cargo clippy -p studiofs-vfs -p studiofs-meta --all-targets -- -D warnings`. Run `cargo fmt --all -- --check` and `git diff --check`. Do not run full suites.
 
 ## Validation and Acceptance
 

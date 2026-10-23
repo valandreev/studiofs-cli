@@ -203,7 +203,7 @@ optimization.
 
 ## Context and Orientation
 
-The repository root is `E:\dev\studiofs-cli`, and the working branch is
+The repository root is `<repo-root>`, and the working branch is
 `feature/sfs-691-fuse-winfsp-path-resolution-and-attribute-lookup-for-hot`.
 The worktree was clean when this plan was started.
 
@@ -292,7 +292,7 @@ lock or observation contract.
 
 ## Concrete Steps
 
-All commands below run from `E:\dev\studiofs-cli` in PowerShell. Do not run a
+All commands below run from `<repo-root>` in PowerShell. Do not run a
 workspace-wide test suite.
 
     git status --short --branch
@@ -315,7 +315,7 @@ with exactly the four workloads (`stat`, `open_close`, `negative_lookup`, and
 columns. A focused test or compile check does not substitute for this native
 gate.
 
-The review follow-up used the same harness from `E:\dev\studiofs-cli` with
+The review follow-up used the same harness from `<repo-root>` with
 `-BaselineCommit 885e7eda -CandidateCommit HEAD -Runs 3`. It produced six
 successful timed CSVs, one candidate attribution CSV, and the retained
 artifact `target/perf/sfs-680-windows-metadata-ab-20260907-164101`. The

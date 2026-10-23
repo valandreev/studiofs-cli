@@ -1,6 +1,6 @@
 # SFS-753 review: recovery accounting and mutation safety
 
-This living ExecPlan follows `.agent/PLANS.md`. Work starts at `179bfb4f` on PR #734 in `E:\dev\studiofs-cli`.
+This living ExecPlan follows `.agent/PLANS.md`. Work starts at `179bfb4f` on PR #734 in `<repo-root>`.
 
 ## Purpose / Big Picture
 
@@ -49,7 +49,7 @@ Implement From<FilePayloadStoreError> for LocalPayloadBackendError in runtime.rs
 
 ## Concrete Steps
 
-Run commands sequentially in E:\dev\studiofs-cli:
+Run commands sequentially in <repo-root>:
 
     cargo test -p studiofs-cache --lib sfs753_ -- --nocapture
     cargo test -p studiofs-cache --lib startup_reconcile_ -- --nocapture

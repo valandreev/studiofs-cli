@@ -94,7 +94,7 @@ remain positive environment overrides:
 ## Reproduction
 
 Build release binaries, then run the full predefined matrix or a comma-
-separated subset from `E:\dev\studiofs-cli`:
+separated subset from `<repo-root>`:
 
     cargo build --release -p studiofs -p studiofs-e2e
     & 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -File .\tools\perf\sfs-718-pg-sync.ps1 -StudiofsBin .\target\release\studiofs.exe -E2eBin .\target\release\studiofs-e2e.exe -Runs 2 -SelectedCase page-batches-32,page-batches-64,page-bytes-2m -ConstrainPostgres

@@ -239,7 +239,7 @@ configuration out of all documentation and diagnostics.
 
 ## Concrete Steps
 
-Run commands from `E:\dev\studiofs-cli`.
+Run commands from `<repo-root>`.
 
 1. Maintain this plan and edit only the schema, PostgreSQL engine, focused
    tests, and documentation files named above. Use `apply_patch` for source

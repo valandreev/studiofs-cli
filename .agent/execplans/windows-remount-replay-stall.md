@@ -8,7 +8,7 @@ A Windows mount must remain readable after uploading a large repository and reop
 
 ## Progress
 
-- [x] (2026-10-10) Recorded root `E:/dev/studiofs-cli`, branch `main`, and unrelated untracked `.claude/` directory; created a task branch.
+- [x] (2026-10-10) Recorded root `<repo-root>`, branch `main`, and unrelated untracked `.claude/` directory; created a task branch.
 - [x] Traced startup pending restoration, self replay, diagnostics backlog reads, and worker shutdown. Started isolated PostgreSQL using compose project `studiofs-remount-regression`.
 - [x] Proved unnecessary journal rescanning (12 scanned rows instead of zero), then eliminated it while preserving pending aliases.
 - [x] Copied the inactive user's local database into ignored `target/remount-investigation/`; offline inspection reproduced exactly 39,124 pending operations from 55,430 retained events (cursor 14,834; next event 70,264).
@@ -47,7 +47,7 @@ The two new tests in `pg_engine/tests/replication_backlog.rs` cover bounded spli
 
 ## Concrete Steps
 
-From `E:/dev/studiofs-cli`, run each targeted test with `cargo test -p studiofs-meta --lib <test_filter> -- --nocapture`. Filters used are `reconcile_regular_file_serving_`, `replica_serving_rename_`, `self_ack`, `restore_pending_state`, `replay_ack_and_completed_suffix_persist_in_one_redb_transaction`, and `split_publication_prefix_ack_waits_for_last_page_and_survives_rollback`. PostgreSQL filter `drained_out_of_order_file_publications_reopen_without_metadata_backlog` uses the isolated loopback service on port 25432 through `STUDIOFS_TEST_PG_DSN`; append `--ignored --test-threads=1`. Use `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check`. Run Cargo sequentially. Never run full suites.
+From `<repo-root>`, run each targeted test with `cargo test -p studiofs-meta --lib <test_filter> -- --nocapture`. Filters used are `reconcile_regular_file_serving_`, `replica_serving_rename_`, `self_ack`, `restore_pending_state`, `replay_ack_and_completed_suffix_persist_in_one_redb_transaction`, and `split_publication_prefix_ack_waits_for_last_page_and_survives_rollback`. PostgreSQL filter `drained_out_of_order_file_publications_reopen_without_metadata_backlog` uses the isolated loopback service on port 25432 through `STUDIOFS_TEST_PG_DSN`; append `--ignored --test-threads=1`. Use `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check`. Run Cargo sequentially. Never run full suites.
 
 Rebuild with `cargo build --release -p studiofs`. The registry was verified using `cargo run -p studiofs-e2e -- list`. Native command: `target/debug/studiofs-e2e.exe run 21 --scenario 8 --studiofs-bin target/release/studiofs.exe --platform windows-winfsp --retain always --run-id windows-remount-replay-fix --port-range 31000-31100`. Native execution requires elevated driver/Docker access. Reports stay under `target/e2e-runs/windows-remount-replay-fix/`.
 

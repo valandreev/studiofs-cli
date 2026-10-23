@@ -101,7 +101,7 @@ Milestone 7 adds `docs/adr/0012-concurrent-namespace-creates-merge-directories.m
 
 ## Concrete Steps
 
-From the repository root `/home/val/dev/studiofs-cli`:
+From the repository root `<repo-root>`:
 
     cargo test -p studiofs-meta --lib replay_merges_concurrently_created_directories
     cargo test -p studiofs-meta --lib remote_apply

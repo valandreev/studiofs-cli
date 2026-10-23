@@ -189,7 +189,7 @@ separate from portable unit validation.
 
 ## Concrete Steps
 
-Run commands from `E:\dev\studiofs-cli`.
+Run commands from `<repo-root>`.
 
 1. Add the lifecycle drain test and run only that test. The first run must fail
    because the wished-for helper is not yet implemented.

@@ -24,7 +24,7 @@ class Sfs598LinuxParityGateTest(unittest.TestCase):
 
         self.assertIn("--studiofs-new-target", result.stdout)
         self.assertIn("--juicefs-target", result.stdout)
-        self.assertIn("/home/val/dev/juicefs", result.stdout)
+        self.assertIn("../juicefs next to this repo", result.stdout)
 
     def test_dry_run_writes_gate_artifacts_under_output_root(self) -> None:
         target_tmp = REPO_ROOT / "target"

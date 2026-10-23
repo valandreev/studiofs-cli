@@ -604,7 +604,7 @@ Rocky 9.4, with Rocky 8.6 best effort, plus five-run performance evidence.
 
 ## Concrete Steps
 
-Run every command from `/home/val/dev/studiofs-cli`.
+Run every command from `<repo-root>`.
 
 The recorded baseline commands are:
 

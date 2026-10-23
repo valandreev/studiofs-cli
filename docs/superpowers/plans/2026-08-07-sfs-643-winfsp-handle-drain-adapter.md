@@ -80,7 +80,7 @@ Finally, format and validate the smallest relevant surface. Run the WinFSP handl
 
 ## Concrete Steps
 
-Run all commands from `E:\dev\studiofs-cli`.
+Run all commands from `<repo-root>`.
 
 1. Replace the WinFSP generic facade construction with direct private methods while preserving the existing `CallbackBarrierState`, gates, hints, cleanup behavior, logging, and callback counters.
 

@@ -1,6 +1,6 @@
 # SFS-232 Unpublished Epoch Uploader Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Implement this plan task-by-task under `.agent/PLANS.md`. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Redesign the background uploader so unpublished epochs are uploaded from local durable state, transition to explicit `PublishReady`, and publish exactly once only after the full epoch is complete.
 

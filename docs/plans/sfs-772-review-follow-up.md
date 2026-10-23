@@ -43,7 +43,7 @@ In `.rwx/ci.yml`, remove anonymous Docker volumes during cleanup and let transie
 
 ## Concrete Steps
 
-From `E:\dev\studiofs-cli`, use the exact filtered `cargo test` command below to observe the existing destroy false pass, then repeat after the fixture change and expect the selected test to fail instead of report `ok`:
+From `<repo-root>`, use the exact filtered `cargo test` command below to observe the existing destroy false pass, then repeat after the fixture change and expect the selected test to fail instead of report `ok`:
 
     $env:STUDIOFS_TEST_PG_DSN = 'host=127.0.0.1 port=1 user=postgres dbname=postgres connect_timeout=1'
     cargo test -p studiofs --test destroy_test destroy_full_removes_local_s3_and_postgres_state -- --ignored --exact --nocapture

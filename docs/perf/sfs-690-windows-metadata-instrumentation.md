@@ -31,7 +31,7 @@ The timed per-workload summary reports minimum, arithmetic mean, median, p95, ma
 
 ## Native command
 
-From `E:\dev\studiofs-cli`, after `.env` has opted into the mount test and configured the same free drive:
+From `<repo-root>`, after `.env` has opted into the mount test and configured the same free drive:
 
     powershell -ExecutionPolicy Bypass -File .\tools\perf\sfs-680-windows-metadata-ab.ps1 -MountPoint Z: -Runs 3
 
