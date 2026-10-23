@@ -445,6 +445,62 @@
     .p { color: var(--copper-bright); user-select: none; }
     .s { color: #9cc3ef; }
 
+    /* ---------- pricing ---------- */
+    .pricing {
+      margin-top: 48px;
+      display: grid;
+      justify-items: center;
+    }
+    .plan {
+      position: relative;
+      width: min(440px, 100%);
+      padding: 34px 30px 30px;
+      border-color: rgba(168, 87, 42, 0.5);
+      text-align: center;
+    }
+    .plan .badge {
+      position: absolute;
+      top: -13px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 5px 12px;
+      border-radius: 999px;
+      background: var(--copper-soft);
+      color: var(--copper);
+      white-space: nowrap;
+    }
+    .plan h3 { font-size: 22px; }
+    .price {
+      margin: 14px 0 4px;
+      font: 600 72px/1 "Space Grotesk", sans-serif;
+      letter-spacing: -0.05em;
+    }
+    .price small { font-size: 18px; color: var(--muted); letter-spacing: 0; font-weight: 500; }
+    .per { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+    .plan ul {
+      list-style: none;
+      padding: 0;
+      margin: 26px 0;
+      display: grid;
+      gap: 10px;
+      text-align: left;
+      color: var(--muted);
+      font-size: 15px;
+    }
+    .plan li::before { content: "✓"; color: #7fc49a; font-weight: 600; margin-right: 10px; }
+    .plan .btn { width: 100%; justify-content: center; }
+    .fine {
+      margin-top: 16px;
+      font-size: 13px;
+      color: var(--dim);
+      max-width: 440px;
+      text-align: center;
+    }
+
     /* ---------- caution + cta ---------- */
     .caution {
       display: flex;
@@ -516,6 +572,7 @@
         <a href="#how">How it works</a>
         <a href="#features">Features</a>
         <a href="#install">Install</a>
+        <a href="#pricing">Pricing</a>
         <a href="docs/">Docs</a>
         <a class="btn btn-ghost btn-sm" href="https://github.com/valandreev/studiofs-cli">
           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -835,6 +892,34 @@
 <span class="c"># 4. mount it as a drive letter</span>
 <span class="p">&gt; </span>studiofs.exe mount myvolume Z:</pre>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= PRICING ================= -->
+  <section id="pricing" style="padding-top:0">
+    <div class="wrap">
+      <p class="eyebrow">Pricing</p>
+      <h2>Simple, transparent pricing.</h2>
+      <p class="lead">We spent weeks on this. After careful market research, we came up with one plan.</p>
+
+      <div class="pricing">
+        <div class="card plan">
+          <span class="badge">Most popular · Only option</span>
+          <h3>Free</h3>
+          <div class="price">$0<small> / forever</small></div>
+          <div class="per">per seat · per studio · per petabyte</div>
+          <ul>
+            <li>Unlimited workstations</li>
+            <li>Unlimited volumes and snapshots</li>
+            <li>All platforms: Windows, Linux, macOS</li>
+            <li>Full source code, GPL-3.0</li>
+            <li>No sales calls. Ever.</li>
+            <li>Cat included</li>
+          </ul>
+          <a class="btn btn-primary" href="https://github.com/valandreev/studiofs-cli/releases">Get it for free</a>
+        </div>
+        <p class="fine">* You still pay your own S3 and PostgreSQL bills. Support is a GitHub issue and a lot of goodwill.</p>
       </div>
     </div>
   </section>
