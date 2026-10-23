@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 INVENTORY_GENERATOR = Path(__file__).with_name("generate-rust-dependency-inventory.py")
 NATIVE_POLICY = Path(__file__).with_name("platform-distribution.md")
 BASELINE_INVENTORY = Path(__file__).with_name("rust-dependency-inventory.json")
+SOURCE_MATERIAL_NOTICES = Path(__file__).with_name("source-material-notices.txt")
 EVIDENCE_PREFIXES = ("license", "copying", "notice", "copyright", "unlicense")
 SOURCE_SUFFIXES = {".rs", ".c", ".h", ".cc", ".cpp", ".py", ".js", ".json", ".toml"}
 
@@ -166,6 +167,10 @@ def native_policy_supplement() -> str:
             "`webpki-roots` includes root-certificate data under CDLA-Permissive-2.0. Preserve the CCADB provenance and attribution; no endorsement is implied.")
 
 
+def source_material_supplement() -> str:
+    return SOURCE_MATERIAL_NOTICES.read_text(encoding="utf-8").strip()
+
+
 def render_package_notice(package: dict) -> str:
     header = [f"{package['name']} {package['version']}"]
     if package.get("authors"):
@@ -259,6 +264,8 @@ def generate(repo: Path, output_dir: Path) -> tuple[dict, str, list[str]]:
         + "\n".join(f"- {name}" for name in release_blockers(unresolved))
         + "\n\n"
         + native_policy_supplement()
+        + "\n\n"
+        + source_material_supplement()
         + "\n"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -276,6 +283,13 @@ def self_test() -> None:
     assert is_notice_file("vendor/components/LICENSES/LGPL-2.1.txt")
     assert not is_notice_file("src/copying.rs") and not is_notice_file("src/license.toml")
     assert native_policy_supplement().startswith("## Statically linked third-party native code")
+    source_notices = source_material_supplement()
+    for copyright_line in (
+        "Copyright (c) 2025 OpenAI",
+        "Copyright (c) 2026 Matt Pocock",
+        "Copyright (c) 2025 Jesse Vincent",
+    ):
+        assert copyright_line in source_notices, copyright_line
     nested = {"name": "nested", "version": "1", "authors": ["Z", "A"], "license_expression": "MIT", "license_evidence": [
         {"path": "vendor/native/LICENSE", "text": "native terms"},
     ]}

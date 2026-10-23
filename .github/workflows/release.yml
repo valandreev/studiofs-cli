@@ -1,0 +1,201 @@
+name: Release builds
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  licenses:
+    name: Check release inputs and notices
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - name: Check version and tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          if os.environ['REF_TYPE'] == 'tag' and os.environ['REF_NAME'] != 'v' + version:
+              raise SystemExit('Tag must match the workspace version: v' + version)
+          PY
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.95.0
+      - name: Check license policy
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo deny --locked check licenses
+          python3 docs/legal/check-license-policy.py
+          python3 docs/legal/generate-third-party-notices.py --self-test
+      - name: Stage complete release notices
+        run: python3 docs/legal/generate-third-party-notices.py --release --output-dir target/license-compliance
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: notice-input
+          path: target/license-compliance/
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: licenses
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13'
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config fuse3 libfuse3-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+      - name: Install macFUSE headers and exclude MFMount
+        if: runner.os == 'macOS'
+        run: |
+          brew install --cask macfuse
+          mkdir -p "$RUNNER_TEMP/no-mfmount"
+          echo "STUDIOFS_MFMOUNT_FRAMEWORK_DIR=$RUNNER_TEMP/no-mfmount" >> "$GITHUB_ENV"
+      - name: Build the CLI with default features
+        run: cargo build -p studiofs --release --locked --target ${{ matrix.target }}
+      - name: Inspect Linux executable
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p target/release-assets
+          binary="target/$TARGET/release/studiofs"
+          readelf -h "$binary" > "target/release-assets/linkage-$TARGET.txt"
+          readelf -d "$binary" >> "target/release-assets/linkage-$TARGET.txt"
+          grep -F 'libfuse3.so.3' "target/release-assets/linkage-$TARGET.txt"
+          case "$TARGET" in
+            x86_64-*) grep -F 'Advanced Micro Devices X86-64' "target/release-assets/linkage-$TARGET.txt" ;;
+            aarch64-*) grep -F 'AArch64' "target/release-assets/linkage-$TARGET.txt" ;;
+          esac
+          "$binary" --version
+      - name: Inspect macOS executable
+        if: runner.os == 'macOS'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p target/release-assets
+          binary="target/$TARGET/release/studiofs"
+          lipo -verify_arch arm64 "$binary"
+          otool -L "$binary" | tee "target/release-assets/linkage-$TARGET.txt"
+          grep -F 'libfuse.2.dylib' "target/release-assets/linkage-$TARGET.txt"
+          if grep -F 'MFMount' "target/release-assets/linkage-$TARGET.txt"; then
+            echo 'MFMount must not be linked into a release' >&2
+            exit 1
+          fi
+          "$binary" --version
+      - name: Inspect Windows executable
+        if: runner.os == 'Windows'
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force target/release-assets | Out-Null
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe |
+            Where-Object FullName -Match '\\Host(x64|arm64)\\(x64|arm64)\\dumpbin.exe$' |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw 'Visual Studio dumpbin is required' }
+          $binary = "target/$env:TARGET/release/studiofs.exe"
+          $inspection = & $dumpbin.FullName /headers /dependents $binary
+          if ($LASTEXITCODE -ne 0) { throw 'dumpbin failed' }
+          $inspection | Set-Content "target/release-assets/linkage-$env:TARGET.txt"
+          $text = $inspection -join "`n"
+          $machine = if ($env:TARGET.StartsWith('aarch64')) { 'AA64 machine' } else { '8664 machine' }
+          $dll = if ($env:TARGET.StartsWith('aarch64')) { 'winfsp-a64.dll' } else { 'winfsp-x64.dll' }
+          if ($text -notmatch [regex]::Escape($machine)) { throw 'Unexpected executable architecture' }
+          if ($text -notmatch ('(?is)delay load dependencies:.*' + [regex]::Escape($dll))) {
+            throw 'Expected delay-loaded WinFsp dependency is missing'
+          }
+          & $binary --version
+          if ($LASTEXITCODE -ne 0) { throw 'Version check failed' }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: notice-input
+          path: target/license-compliance
+      - name: Package binary and required accompanying files
+        run: python tools/release/package.py --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.target }}
+          path: target/release-assets/
+          if-no-files-found: error
+
+  draft:
+    name: Attach all packages to the tagged draft release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: target/release-assets
+          merge-multiple: true
+      - name: Add exact project source and verify archive checksums
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd target/release-assets
+          sha256sum --check -- *.sha256
+          git -C ../.. archive --format=tar.gz --prefix="studiofs-$TAG-source/" HEAD > "studiofs-$TAG-source.tar.gz"
+          sha256sum "studiofs-$TAG-source.tar.gz" > "studiofs-$TAG-source.tar.gz.sha256"
+      - name: Create or update the draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --json isDraft > target/release.json 2>/dev/null; then
+            python3 -c 'import json; assert json.load(open("target/release.json"))["isDraft"], "Refusing to modify a published release"'
+          else
+            gh release create "$TAG" --verify-tag --draft --title "StudioFS $TAG" --notes-file docs/releases.md
+          fi
+          gh release upload "$TAG" target/release-assets/* --clobber
