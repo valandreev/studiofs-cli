@@ -1328,7 +1328,8 @@
         current = to;
         mark();
         var id = target.querySelector('[id]');
-        if (id && history.replaceState) history.replaceState(null, '', '#' + id.id);
+        // Sandboxed previews (about:srcdoc) refuse URL changes; the hash is optional.
+        if (id) { try { history.replaceState(null, '', '#' + id.id); } catch (err) {} }
       }
 
       function atEdge(forward) {
