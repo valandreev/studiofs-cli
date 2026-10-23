@@ -97,7 +97,7 @@ tasks:
 
   - key: cargo-deny-install
     use: rust
-    run: cargo install --root target/license-tools cargo-deny --version 0.20.2 --locked
+    run: cargo install --locked cargo-deny --version 0.20.2
 
   - key: python3
     run: |
@@ -119,7 +119,6 @@ tasks:
       - .github/workflows/license-compliance.yml
     run: |
       set -euo pipefail
-      export PATH="$PWD/target/license-tools/bin:$PATH"
       cargo deny --locked check licenses
       python3 docs/legal/generate-third-party-notices.py --self-test
       python3 docs/legal/check-license-policy.py
