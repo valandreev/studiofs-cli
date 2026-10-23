@@ -29,7 +29,10 @@ not resolve that publication question.
 Codebase Memory identified native/header and documentation paths. Exact-path
 coverage checks were supplemented by direct reads for excluded assets and the
 macFUSE shim's parse gap at line 158. Git and direct text reads supplied history,
-configuration and notice evidence. No existing notices were removed. No product
+configuration and notice evidence. A follow-up review pass read all 209
+documentation files in full, checked their external links, compared the macFUSE
+fallback with upstream headers and ran a tree-wide JuiceFS similarity scan; its
+results are folded into the sections and register below. No existing notices were removed. No product
 code, dependency licenses or asset permissions are changed by this audit.
 
 ## Complete source-tree inventory
@@ -46,8 +49,8 @@ claim.
 | Native source | 3 | Two `csrc/low_level_ops.c` shims and macFUSE `fuse_lowlevel_compat.h`. Header provenance is unresolved (P2). |
 | Branding | 22 | Six SVGs, fourteen PNGs and two HTML boards, all below `docs/branding/studiofs-logo-final/`. Source/rights evidence is missing (P3). |
 | Database fixtures | 4 | Two metadata and two cache-index `.redb` files. Generation is partly documented; baseline origin remains unresolved (P4). |
-| Documentation | 209 | README/CONTEXT and `docs/` excluding branding/legal. Includes guides, ADRs, plans, examples and benchmark reports. Reviewed examples use project CLI/configuration; external reference links do not establish copied text. No sentence-by-sentence comparison of every document was performed (P1). |
-| Agent plans | 68 | `.agent/PLANS.md` and tracked execution plans. Internal development material with source snippets and issue context; covered by project rights confirmation and final publication hygiene (P1/P5). |
+| Documentation | 209 | README/CONTEXT and `docs/` excluding branding/legal. Includes guides, ADRs, plans, examples and benchmark reports. All 209 files were read in full; prose is project-authored apart from the MIT agent-workflow templates in P6, short attributed quotations and functional configuration snippets. Exact-phrase web checks covered suspicious passages only, not every sentence (P1). |
+| Agent plans | 68 | `.agent/PLANS.md` and tracked execution plans. `.agent/PLANS.md` reproduces the OpenAI Cookbook ExecPlan template (P6). Internal development material with source snippets and issue context; covered by project rights confirmation and final publication hygiene (P1/P5). |
 | Tools and automation | 30 | `tools/`, `.github/`, `.rwx/`, `docker/`, and crate scripts. Project benchmark/test/CI glue; some run or refer to external programs. Those programs are not copied into this source tree. |
 | Cargo metadata | 14 | Workspace plus twelve crate manifests and `Cargo.lock`. Declared GPL intent; fetched package rights are covered separately by SFS-849. |
 | Existing legal audits | 4 | Dependency audit, generator, JSON ledger and platform review. Their dependency/native conclusions retain their own stated evidence limits. |
@@ -109,8 +112,28 @@ payload_store}.rs` and `studiofs-vfs/src/vfs/{io_ops,read_path}.rs` under
 `crates/`. Their buffering/staging/cache bodies differ materially; searches for
 distinctive upstream comments also found no matching text in `crates/` or
 `docs/`. Conventional block loops and sparse zero-fill were not classified as
-copied expression. Other paths and historical upstream versions remain outside
-that comparison.
+copied expression.
+
+A wider mechanical scan compared the comments and prose of all tracked `.rs`,
+Markdown, script and configuration files under `crates/`, `docs/`, `tools/` and
+README (600 files) with upstream `pkg/`, `cmd/` and `docs/{en,zh_cn}` at the pinned
+commit (448 files). Shared normalized word 8-grams were limited to S3 key
+placeholders and AWS IAM policy schema. Paragraph-level and sentence-level
+comparisons of topically paired documents (architecture, cache, internals,
+benchmarks, Windows) found no paraphrase or translation match. Shared literals
+are platform/protocol names. `devbench` deliberately mirrors the `juicefs bench`
+flag names and defaults (1 GB big file, 128 KB small files, count 100), and the
+300 MiB buffer default is JuiceFS-aligned; these are compatibility parameters,
+with differing help text, validation and reporting. Chunk 64 MiB and block 4 MiB
+are shared conventional values; object/metadata key layouts, slice overlap
+resolution, read-ahead, eviction and writeback decomposition differ. A
+Chinese-only passage without an English counterpart, upstream `sdk/`,
+`integration/`, `hack/`, `rfcs/` and historical upstream versions remain outside
+the comparison. The upstream commit has no NOTICE file.
+
+A local, gitignored `docs/done/juicefs-winfsp.md` holds a verbatim copy of a
+Juicedata blog post. It has never been committed and is not part of this
+inventory, but it must stay out of any commit and release archive.
 
 JuiceFS's [upstream LICENSE](https://github.com/juicedata/juicefs/blob/668828b61b216ccd289a1e0e10515a41c5f4f4ee/LICENSE)
 is Apache-2.0. If a file is confirmed derived, record its exact upstream path
@@ -139,6 +162,19 @@ and Benjamin Fleischer with an LGPLv2 notice. The
 [libfuse license map](https://github.com/libfuse/libfuse/blob/master/LICENSE)
 also distinguishes library/include terms from utility/example terms. Those
 upstream pages are comparison leads, not proof of this file's exact origin.
+
+A direct comparison with macFUSE `include/fuse_lowlevel.h` and `fuse_common.h`
+(`master`, fetched 2026-10-23) shows that `setattr_x` repeats macFUSE's
+Apple-only struct field for field, `fuse_conn_info` repeats the first five
+libfuse 2.x fields, and `fuse_file_info` follows the non-Apple libfuse 2.9
+layout (`padding : 27`, without macFUSE's `purge_attr`/`purge_ubc`). The
+`fuse_lowlevel_ops` subset is reordered, so it is not ABI-compatible with either
+upstream. `FUSE_SET_ATTR_MODE` through `MTIME_NOW` match upstream, but the
+fallback's `CRTIME`/`CHGTIME`/`BKUPTIME`/`FLAGS` use bits 9–12 where macFUSE uses
+28–31. The fallback is therefore a mixed, partly divergent declaration subset,
+not a verbatim copy. `build.rs` always defines
+`STUDIOFS_REAL_MACFUSE_HEADERS_REQUIRED`, so the fallback branch is never
+compiled; removing it is the smallest P2 resolution.
 
 The build script defines `STUDIOFS_REAL_MACFUSE_HEADERS_REQUIRED`, so the fallback
 is rejected when installed headers are absent in the normal build. That does
@@ -197,12 +233,19 @@ any reachable history. Do not mark the repository cleared while rows remain.
 | P2 | macFUSE fallback header's upstream origin and notices are unresolved. | Pin origin, compare the declaration subset and supply applicable copyright/license/modification notices; alternatively remove the unused subset and verify the real-header build contract. Check historical exposure too. | SFS-851 finding; maintainer remediation; SFS-853 notices; SFS-854 gate. |
 | P3 | All 22 branding files, especially the separately uploaded cat artwork, lack a source/rights record. | Obtain creator/source and redistribution grant covering SVGs, PNG derivatives and HTML artwork; record required attribution and asset-specific terms. Otherwise replace/exclude assets and update consumers. | Maintainer and asset contributor; SFS-854 gate. |
 | P4 | Four redb fixtures: incomplete baseline origin/content provenance. | Establish synthetic generation and right to publish data, document original redb version/schema/input or regenerate compatible synthetic baselines and derived fixtures with focused fixture tests. | Maintainer/fixture author; SFS-854 gate. |
-| P5 | `.antigravitycli/9d7276d9-1579-4c0b-8fa1-49bdc747c598.json` is a tracked symlink (mode `120000`) introduced at `c3d34463`; its blob is an absolute user-home path, not JSON content. Windows checkouts without symlink support materialize it as a small plain file. | Remove/exclude it from public source, decide how reachable history is handled, and complete the separate secret/private-data scan. An ignore rule does not untrack existing content. | SFS-854 publication hygiene. |
+| P5 | `.antigravitycli/9d7276d9-1579-4c0b-8fa1-49bdc747c598.json` is a tracked symlink (mode `120000`) introduced at `c3d34463`; its blob is an absolute user-home path, not JSON content. Windows checkouts without symlink support materialize it as a small plain file. The documentation review also found developer-local paths (`/home/val/…`, `E:\dev\studiofs-cli`, `/Volumes/Storage/dev/studiofs`) across plans/specs, a machine hostname in `docs/perf/sfs-473-linux-async-fuse-benchmark.md:8`, and an absolute checkout path in `docs/tests.md:1239`; no secrets were found. | Remove/exclude it from public source, decide how reachable history is handled, and complete the separate secret/private-data scan. An ignore rule does not untrack existing content. Replace local paths and hostnames with repo-relative or placeholder values. | SFS-854 publication hygiene. |
+| P6 | MIT-licensed agent-workflow templates are reproduced without their notices: `.agent/PLANS.md` (OpenAI Cookbook `articles/codex_exec_plans.md`, © 2025 OpenAI; full-text match) and the ExecPlan preamble/section skeleton copied into `docs/plans/` and `docs/superpowers/plans/`; `docs/agents/domain.md` and `docs/agents/triage-labels.md` (mattpocock/skills `setup-matt-pocock-skills`, © 2026 Matt Pocock); the "REQUIRED SUB-SKILL" plan header (obra/superpowers `writing-plans`, © 2025 Jesse Vincent). | Keep the MIT copyright and permission notice with the copied text (file header or third-party notice), or rewrite the files in project wording and drop the boilerplate header lines. | Maintainer remediation; SFS-853 notices; SFS-854 gate. |
 
 SFS-849 dependency evidence gaps, SFS-850 native packaging conditions and
 SFS-853 generated notices remain separate release gates. This source audit
 does not supersede or close them. No permission requests have been sent to
 contributors/upstreams and no new legal exception has been granted.
+
+External links in the documentation and this report returned HTTP 200 on
+2026-10-23, except `github.com/valandreev/studiofs-cli` pages (releases, issues,
+pull requests). They return 404 only because the repository is private until
+release; recheck them after it is made public. Links to the gitignored
+`docs/code-reviews/` files from a few plans do not resolve in the public tree.
 
 ## Reproduction and validation
 
