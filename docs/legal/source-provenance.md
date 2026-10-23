@@ -36,7 +36,8 @@ results are folded into the sections and register below. No existing notices wer
 licenses and asset permissions are not changed by this audit. A follow-up
 remediation on the same branch removed the dead macFUSE fallback (P2), added MIT
 notices for copied templates (P6) and replaced developer-local paths (P5); the
-inventory still describes the unmodified baseline.
+inventory still describes the unmodified baseline. The `.antigravitycli` symlink was
+also untracked.
 
 ## Complete source-tree inventory
 
@@ -57,7 +58,7 @@ claim.
 | Tools and automation | 30 | `tools/`, `.github/`, `.rwx/`, `docker/`, and crate scripts. Project benchmark/test/CI glue; some run or refer to external programs. Those programs are not copied into this source tree. |
 | Cargo metadata | 14 | Workspace plus twelve crate manifests and `Cargo.lock`. Declared GPL intent; fetched package rights are covered separately by SFS-849. |
 | Existing legal audits | 4 | Dependency audit, generator, JSON ledger and platform review. Their dependency/native conclusions retain their own stated evidence limits. |
-| Repository controls | 15 | AGENTS files, formatting/editor/configuration files, the metadata fixture README and hidden metadata. The tracked machine-local symlink needs a publication decision (P5). |
+| Repository controls | 15 | AGENTS files, formatting/editor/configuration files, the metadata fixture README and hidden metadata. The machine-local symlink was later untracked (P5). |
 | **Total** | **718** | All baseline paths accounted for; no submodule entries in the baseline tree. |
 
 There is no tracked vendored dependency-source tree in this snapshot. Cargo's
@@ -233,16 +234,24 @@ any reachable history. Do not mark the repository cleared while rows remain.
 | ID | Scope / missing evidence | Required resolution | Owner / gate |
 | --- | --- | --- | --- |
 | P1 | Project source, prose, scripts and contribution authority are inferred from local development history. Root license text is missing. | Maintainer records author/alias and employer/client authority, identifies copied/translated contributions with exact upstream terms, or excludes unresolved content. Add intended project license text without overriding upstream grants. | Maintainer confirmation; SFS-852 license formalization; SFS-854 publication gate. |
-| P2 | macFUSE fallback header's upstream origin and notices are unresolved. **Tree remediated:** the never-compiled fallback was deleted; only reachable history remains. | Verify a macOS build with installed macFUSE headers (not run on the Windows remediation host). For history, pin origin, compare the declaration subset and supply applicable copyright/license/modification notices, or accept the historical exposure. | SFS-851 finding; maintainer remediation; SFS-853 notices; SFS-854 gate. |
+| P2 | macFUSE fallback header's upstream origin and notices are unresolved. **Tree remediated:** the never-compiled fallback was deleted; only reachable history remains. | Verify a macOS build with installed macFUSE headers (not run on the Windows remediation host). History: accepted by the maintainer decision below. | SFS-851 finding; maintainer remediation; SFS-853 notices; SFS-854 gate. |
 | P3 | All 22 branding files, especially the separately uploaded cat artwork, lack a source/rights record. | Obtain creator/source and redistribution grant covering SVGs, PNG derivatives and HTML artwork; record required attribution and asset-specific terms. Otherwise replace/exclude assets and update consumers. | Maintainer and asset contributor; SFS-854 gate. |
 | P4 | Four redb fixtures: incomplete baseline origin/content provenance. | Establish synthetic generation and right to publish data, document original redb version/schema/input or regenerate compatible synthetic baselines and derived fixtures with focused fixture tests. | Maintainer/fixture author; SFS-854 gate. |
-| P5 | `.antigravitycli/9d7276d9-1579-4c0b-8fa1-49bdc747c598.json` is a tracked symlink (mode `120000`) introduced at `c3d34463`; its blob is an absolute user-home path, not JSON content. Windows checkouts without symlink support materialize it as a small plain file. The documentation review also found developer-local paths (`/home/val/…`, `E:\dev\studiofs-cli`, `/Volumes/Storage/dev/studiofs`) across plans/specs, a machine hostname in `docs/perf/sfs-473-linux-async-fuse-benchmark.md:8`, and an absolute checkout path in `docs/tests.md:1239`; no secrets were found. **Docs remediated:** tracked Markdown now uses `<repo-root>`, `<juicefs-checkout>` and `<host>` placeholders, and `tools/perf/linux-juicefs-parity-gate.sh` defaults to a sibling `../juicefs` checkout instead of `/home/val/dev/juicefs`. | Remove/exclude the symlink from public source, decide how reachable history (which still holds the old paths) is handled, and complete the separate secret/private-data scan. An ignore rule does not untrack existing content. | SFS-854 publication hygiene. |
-| P6 | MIT-licensed agent-workflow templates are reproduced without their notices: `.agent/PLANS.md` (OpenAI Cookbook `articles/codex_exec_plans.md`, © 2025 OpenAI; full-text match) and the ExecPlan preamble/section skeleton copied into `docs/plans/` and `docs/superpowers/plans/`; `docs/agents/domain.md` and `docs/agents/triage-labels.md` (mattpocock/skills `setup-matt-pocock-skills`, © 2026 Matt Pocock); the "REQUIRED SUB-SKILL" plan header (obra/superpowers `writing-plans`, © 2025 Jesse Vincent). **Remediated:** `.agent/PLANS.md`, `docs/agents/domain.md` and `docs/agents/triage-labels.md` now open with the source, copyright line and full MIT permission notice in an HTML comment; the 16 superpowers headers were reworded to point at `.agent/PLANS.md`. | SFS-853 should list these MIT sources in the generated third-party notices; SFS-854 confirms no other copies. The short ExecPlan preamble in individual plans derives from `.agent/PLANS.md`, which carries the notice. | SFS-853 notices; SFS-854 gate. |
+| P5 | `.antigravitycli/9d7276d9-1579-4c0b-8fa1-49bdc747c598.json` is a tracked symlink (mode `120000`) introduced at `c3d34463`; its blob is an absolute user-home path, not JSON content. Windows checkouts without symlink support materialize it as a small plain file. The documentation review also found developer-local paths (`/home/val/…`, `E:\dev\studiofs-cli`, `/Volumes/Storage/dev/studiofs`) across plans/specs, a machine hostname in `docs/perf/sfs-473-linux-async-fuse-benchmark.md:8`, and an absolute checkout path in `docs/tests.md:1239`; no secrets were found. **Docs remediated:** tracked Markdown now uses `<repo-root>`, `<juicefs-checkout>` and `<host>` placeholders, and `tools/perf/linux-juicefs-parity-gate.sh` defaults to a sibling `../juicefs` checkout instead of `/home/val/dev/juicefs`. | **Tree remediated:** the symlink was untracked (it was already in `.gitignore`). History: accepted by the maintainer decision below. Complete the separate secret/private-data scan. | SFS-854 publication hygiene. |
+| P6 | MIT-licensed agent-workflow templates are reproduced without their notices: `.agent/PLANS.md` (OpenAI Cookbook `articles/codex_exec_plans.md`, © 2025 OpenAI; full-text match) and the ExecPlan preamble/section skeleton copied into `docs/plans/` and `docs/superpowers/plans/`; `docs/agents/domain.md` and `docs/agents/triage-labels.md` (mattpocock/skills `setup-matt-pocock-skills`, © 2026 Matt Pocock); the "REQUIRED SUB-SKILL" plan header (obra/superpowers `writing-plans`, © 2025 Jesse Vincent). **Remediated:** `.agent/PLANS.md`, `docs/agents/domain.md` and `docs/agents/triage-labels.md` now open with the source, copyright line and full MIT permission notice in an HTML comment; the 16 superpowers headers were reworded to point at `.agent/PLANS.md`. | SFS-853 should list these MIT sources in the generated third-party notices; SFS-854 confirms no other copies. History: accepted by the maintainer decision below. The short ExecPlan preamble in individual plans derives from `.agent/PLANS.md`, which carries the notice. | SFS-853 notices; SFS-854 gate. |
 
 SFS-849 dependency evidence gaps, SFS-850 native packaging conditions and
 SFS-853 generated notices remain separate release gates. This source audit
 does not supersede or close them. No permission requests have been sent to
 contributors/upstreams and no new legal exception has been granted.
+
+**Maintainer decision on reachable history (2026-10-23):** the repository will be
+published with its full Git history, without rewriting or a squashed public
+snapshot. Older commits therefore keep the developer-local paths and username,
+the machine hostname, the `.antigravitycli` symlink, the removed macFUSE fallback
+header and the template copies that predate their MIT notices. The maintainer
+accepts that exposure; these are not secrets, and the username already appears
+in many other public places. The SFS-854 secret scan still covers the full history.
 
 External links in the documentation and this report returned HTTP 200 on
 2026-10-23, except `github.com/valandreev/studiofs-cli` pages (releases, issues,
