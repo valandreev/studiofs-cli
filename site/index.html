@@ -560,6 +560,67 @@
     footer a:hover { color: var(--text); }
     footer .links { display: flex; flex-wrap: wrap; gap: 20px; }
 
+    /* ---------- deck mode (slide transitions instead of scrolling) ---------- */
+    html.fp, html.fp body { height: 100%; overflow: hidden; }
+    .deck { position: fixed; top: 65px; left: 0; right: 0; bottom: 0; }
+    .slide {
+      position: absolute;
+      inset: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
+      visibility: hidden;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(247,247,243,0.15) transparent;
+    }
+    .slide.active { visibility: visible; }
+    .slide-inner { margin: auto 0; padding: 8px 0; }
+    html.fp .slide section { padding: 20px 0 !important; background: none; }
+    html.fp .slide .hero { padding: 16px 0 20px; }
+    html.fp .hero h1 { font-size: clamp(44px, 6vw, 76px); margin-top: 20px; }
+    html.fp .hero-cta { margin-top: 26px; }
+    html.fp .lead { margin-top: 12px; }
+    html.fp .loops, html.fp .diagram, html.fp .features, html.fp .platforms,
+    html.fp .install-grid, html.fp .pricing { margin-top: 28px; }
+    html.fp .features { gap: 14px; }
+    html.fp .feature { padding: 20px 22px; }
+    html.fp .feature .ico { margin-bottom: 12px; width: 38px; height: 38px; }
+    html.fp .feature h3 { font-size: 18px; }
+    html.fp .feature p { font-size: 14.5px; margin-top: 6px; }
+    html.fp .flow-note { margin-top: 14px; }
+    html.fp .node { padding: 18px 20px; }
+    html.fp .slide footer { padding-bottom: 8px; }
+    .fp-item {
+      transition: transform .62s cubic-bezier(.65, 0, .25, 1), opacity .5s ease;
+      transition-delay: var(--d, 0s);
+    }
+    .fp-noanim { transition: none !important; }
+    .fp-off-left { transform: translateX(-110vw); opacity: 0; }
+    .fp-off-right { transform: translateX(110vw); opacity: 0; }
+    .fp-off-up { transform: translateY(-70vh); opacity: 0; }
+    .fp-off-down { transform: translateY(70vh); opacity: 0; }
+    .dots {
+      position: fixed;
+      right: 22px;
+      top: 50%;
+      transform: translateY(-50%);
+      display: grid;
+      gap: 10px;
+      z-index: 11;
+    }
+    .dots button {
+      width: 9px;
+      height: 9px;
+      padding: 0;
+      border-radius: 50%;
+      border: 1px solid rgba(247,247,243,0.35);
+      background: transparent;
+      cursor: pointer;
+      transition: background .2s, transform .2s;
+    }
+    .dots button[aria-current="true"] { background: var(--copper-bright); border-color: var(--copper-bright); transform: scale(1.3); }
+
     /* ---------- scroll reveal ---------- */
     html.js-reveal, html.js-reveal body { overflow-x: clip; }
     .reveal {
@@ -1149,10 +1210,192 @@
       })(start);
     })();
 
+    // Deck mode: on large screens the page behaves like a presentation.
+    // The backdrop stays put; scrolling swaps whole screens, with the old
+    // blocks flying out to the sides and the new ones flying in.
+    (function () {
+      var mq = window.matchMedia;
+      if (!mq || !mq('(min-width: 900px) and (min-height: 600px)').matches) return;
+      if (mq('(prefers-reduced-motion: reduce)').matches) return;
+
+      var nav = document.querySelector('nav');
+      var deck = document.createElement('div');
+      deck.className = 'deck';
+      var groups = [];
+      var node = nav.nextElementSibling;
+      while (node && node.tagName !== 'SCRIPT') {
+        var next = node.nextElementSibling;
+        if (node.tagName === 'HEADER' || node.tagName === 'SECTION' || !groups.length) groups.push([]);
+        groups[groups.length - 1].push(node);
+        node = next;
+      }
+      var slides = groups.map(function (g) {
+        var slide = document.createElement('div');
+        slide.className = 'slide';
+        var inner = document.createElement('div');
+        inner.className = 'slide-inner';
+        g.forEach(function (el) { inner.appendChild(el); });
+        slide.appendChild(inner);
+        deck.appendChild(slide);
+        return slide;
+      });
+      nav.parentNode.insertBefore(deck, nav.nextSibling);
+      document.documentElement.classList.add('fp');
+
+      // Decide which way every block travels.
+      var sel = [
+        '.hero .wrap > div:first-child > *', '.cat-stage', '.caution',
+        '.eyebrow', 'h2', '.lead',
+        '.loops > .card', '.diagram > .node', '.remote > .node', '.flow-note > div',
+        '.features > .card', '.platforms > .card', '.install-steps > .card', '.term',
+        '.pricing > *', '.cta .hero-cta', 'footer .wrap'
+      ];
+      slides.forEach(function (slide) {
+        var items = [];
+        sel.forEach(function (q) {
+          slide.querySelectorAll(q).forEach(function (el) {
+            if (items.indexOf(el) >= 0) return;
+            if (q === 'h2' || q === '.lead' || q === '.eyebrow') {
+              if (el.closest('.card')) return;
+              el.dataset.fp = el.closest('.cta') ? 'mid' : 'left';
+            } else if (q === '.cat-stage' || q === '.term' || q === '.remote > .node') {
+              el.dataset.fp = 'right';
+            } else if (q === '.install-steps > .card' || q.indexOf('.hero') === 0) {
+              el.dataset.fp = 'left';
+            } else {
+              var parent = el.parentElement;
+              var cols = getComputedStyle(parent).gridTemplateColumns.split(' ').filter(Boolean).length || 1;
+              var col = Array.prototype.indexOf.call(parent.children, el) % cols;
+              el.dataset.fp = cols > 1 && col === 0 ? 'left' : cols > 1 && col === cols - 1 ? 'right' : 'mid';
+            }
+            el.classList.add('fp-item');
+            items.push(el);
+          });
+        });
+        items.forEach(function (el, i) { el.style.setProperty('--d', (Math.min(i, 9) * 0.035).toFixed(3) + 's'); });
+        slide._items = items;
+      });
+
+      function offClass(el, forward, leaving) {
+        var d = el.dataset.fp;
+        if (d === 'left') return 'fp-off-left';
+        if (d === 'right') return 'fp-off-right';
+        return (forward === leaving) ? 'fp-off-up' : 'fp-off-down';
+      }
+
+      var dots = document.createElement('div');
+      dots.className = 'dots';
+      slides.forEach(function (_, i) {
+        var b = document.createElement('button');
+        b.setAttribute('aria-label', 'Go to screen ' + (i + 1));
+        b.addEventListener('click', function () { go(i); });
+        dots.appendChild(b);
+      });
+      document.body.appendChild(dots);
+
+      var current = 0, busy = false;
+      function mark() {
+        Array.prototype.forEach.call(dots.children, function (b, i) { b.setAttribute('aria-current', String(i === current)); });
+      }
+      slides[0].classList.add('active');
+      mark();
+
+      function go(to) {
+        if (busy || to === current || to < 0 || to >= slides.length) return;
+        busy = true;
+        var forward = to > current;
+        var from = slides[current], target = slides[to];
+        from._items.forEach(function (el) { el.classList.add(offClass(el, forward, true)); });
+        setTimeout(function () {
+          target._items.forEach(function (el) { el.classList.add('fp-noanim', offClass(el, forward, false)); });
+          target.scrollTop = forward ? 0 : target.scrollHeight;
+          target.classList.add('active');
+          void target.offsetWidth;
+          target._items.forEach(function (el) {
+            el.classList.remove('fp-noanim', 'fp-off-left', 'fp-off-right', 'fp-off-up', 'fp-off-down');
+          });
+          setTimeout(function () {
+            from.classList.remove('active');
+            from._items.forEach(function (el) {
+              el.classList.add('fp-noanim');
+              el.classList.remove('fp-off-left', 'fp-off-right', 'fp-off-up', 'fp-off-down');
+              void el.offsetWidth;
+              el.classList.remove('fp-noanim');
+            });
+            busy = false;
+          }, 760);
+        }, 380);
+        current = to;
+        mark();
+        var id = target.querySelector('[id]');
+        if (id && history.replaceState) history.replaceState(null, '', '#' + id.id);
+      }
+
+      function atEdge(forward) {
+        var s = slides[current];
+        return forward ? s.scrollTop + s.clientHeight >= s.scrollHeight - 2 : s.scrollTop <= 1;
+      }
+
+      // One wheel gesture (including trackpad inertia) moves one screen.
+      var lastWheel = 0, consumed = false;
+      window.addEventListener('wheel', function (e) {
+        if (e.ctrlKey) return;
+        var now = Date.now();
+        if (now - lastWheel > 220) consumed = false;
+        lastWheel = now;
+        var forward = e.deltaY > 0;
+        if (Math.abs(e.deltaY) < Math.abs(e.deltaX)) return;
+        if (!consumed && !busy && !atEdge(forward)) return;
+        e.preventDefault();
+        if (consumed || busy || Math.abs(e.deltaY) < 4) return;
+        consumed = true;
+        go(current + (forward ? 1 : -1));
+      }, { passive: false });
+
+      window.addEventListener('keydown', function (e) {
+        if (e.target.closest && e.target.closest('input, textarea, button')) return;
+        var k = e.key, f = null;
+        if (k === 'ArrowDown' || k === 'PageDown' || (k === ' ' && !e.shiftKey)) f = true;
+        if (k === 'ArrowUp' || k === 'PageUp' || (k === ' ' && e.shiftKey)) f = false;
+        if (k === 'Home') { e.preventDefault(); go(0); return; }
+        if (k === 'End') { e.preventDefault(); go(slides.length - 1); return; }
+        if (f === null || !atEdge(f)) return;
+        e.preventDefault();
+        go(current + (f ? 1 : -1));
+      });
+
+      var touchY = null;
+      deck.addEventListener('touchstart', function (e) { touchY = e.touches[0].clientY; }, { passive: true });
+      deck.addEventListener('touchend', function (e) {
+        if (touchY === null) return;
+        var dy = touchY - e.changedTouches[0].clientY;
+        touchY = null;
+        if (Math.abs(dy) < 50 || !atEdge(dy > 0)) return;
+        go(current + (dy > 0 ? 1 : -1));
+      });
+
+      document.addEventListener('click', function (e) {
+        var a = e.target.closest && e.target.closest('a[href^="#"]');
+        if (!a) return;
+        var t = document.getElementById(a.getAttribute('href').slice(1));
+        if (!t) return;
+        var slide = t.closest('.slide');
+        e.preventDefault();
+        go(slides.indexOf(slide));
+      });
+
+      if (location.hash) {
+        var start = document.getElementById(location.hash.slice(1));
+        var idx = start ? slides.indexOf(start.closest('.slide')) : 0;
+        if (idx > 0) { slides[0].classList.remove('active'); slides[idx].classList.add('active'); current = idx; mark(); }
+      }
+    })();
+
     // Scroll reveal: blocks slide in from the sides as they enter the viewport
     // and slide back out as they leave it.
     (function () {
       if (!('IntersectionObserver' in window)) return;
+      if (document.documentElement.classList.contains('fp')) return;
       if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
       document.documentElement.classList.add('js-reveal');
       var groups = [
