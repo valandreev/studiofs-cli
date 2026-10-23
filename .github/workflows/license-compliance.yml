@@ -1,0 +1,71 @@
+name: License compliance
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/license-compliance.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/*/Cargo.toml'
+      - 'deny.toml'
+      - 'LICENSE'
+      - 'docs/legal/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/license-compliance.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/*/Cargo.toml'
+      - 'deny.toml'
+      - 'LICENSE'
+      - 'docs/legal/**'
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  license-compliance:
+    name: License policy and third-party notices
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: 1.95.0
+
+      - name: Install cargo-deny
+        run: cargo install --root target/license-tools cargo-deny --version 0.20.2 --locked
+
+      - name: Add cargo-deny to PATH
+        run: echo "$GITHUB_WORKSPACE/target/license-tools/bin" >> "$GITHUB_PATH"
+
+      - name: Check dependency licenses
+        run: cargo deny --locked check licenses
+
+      - name: Test notice generation and license policy
+        run: |
+          python3 docs/legal/generate-third-party-notices.py --self-test
+          python3 docs/legal/check-license-policy.py
+
+      - name: Generate review bundle
+        if: github.event_name != 'release'
+        run: python3 docs/legal/generate-third-party-notices.py --output-dir target/license-compliance
+
+      - name: Generate release bundle
+        if: github.event_name == 'release'
+        run: python3 docs/legal/generate-third-party-notices.py --release --output-dir target/license-compliance
+
+      - name: Upload notice bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: studiofs-third-party-notices
+          path: target/license-compliance/
+          if-no-files-found: error

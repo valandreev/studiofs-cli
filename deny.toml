@@ -1,0 +1,34 @@
+# SFS-849 reviewed these terms for GPL-3.0-only distribution.
+# Empty targets includes platform-specific dependencies on every platform.
+[graph]
+targets = []
+all-features = true
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-only",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "Apache-2.0 WITH LLVM-exception",
+]
+# The reviewed WinFsp crates use the deprecated GPL-3.0 identifier (GPLv3 only).
+# Keep this alias scoped to the exact audited versions; notices remain required.
+exceptions = [
+    { crate = "winfsp@=0.12.4+winfsp-2.1", allow = ["GPL-3.0"] },
+    { crate = "winfsp-sys@=0.12.1+winfsp-2.1", allow = ["GPL-3.0"] },
+]
+
+# No unknown/custom-license exceptions. AND/WITH obligations remain intact.
+# cargo-audit remains a separate security gate in .rwx/ci.yml.
+[licenses.private]
+ignore = false
