@@ -87,7 +87,8 @@ do not waive any unresolved registry-package evidence.
 
 The preceding audit recorded **65 third-party packages without named primary
 notice evidence**. The generator also searches `LICENSES/` directories; consult
-its inventory for the current gap count. Review generation records these gaps;
+its inventory for the current gap count. Crates that ship no license file are
+covered by verbatim upstream texts in `supplemental-licenses/` (see its README). Review generation records these gaps;
 `--release` returns failure while any remain.
 Resolve the exact upstream notice/copyright evidence and review any required
 supplements before distribution. Do not substitute a generic SPDX text for

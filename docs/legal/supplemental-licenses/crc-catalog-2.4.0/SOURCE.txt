@@ -1,0 +1,4 @@
+Repository: https://github.com/akhilles/crc-catalog
+Tag or commit: commit b500ea693c552f8d946e290722a7b3ee8b9a7ee2 (vcs_info)
+Upstream files: LICENSES/Apache-2.0.txt, LICENSES/MIT.txt
+License expression (Cargo.toml): MIT OR Apache-2.0

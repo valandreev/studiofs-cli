@@ -1,0 +1,9 @@
+Repository: https://github.com/ardaku/wasite
+Commit: 3f7d6ad926848cd52c8d2142fdb2f43ab01ae8ec
+Crate source path in repository: (repository root)
+Upstream license file paths:
+  LICENSE_APACHE_2_0.txt
+  LICENSE_BOOST_1_0.txt
+  LICENSE_MIT.txt
+Cargo.toml license expression: Apache-2.0 OR BSL-1.0 OR MIT
+Texts were fetched verbatim from the upstream repository at the commit above (.cargo_vcs_info.json sha1).

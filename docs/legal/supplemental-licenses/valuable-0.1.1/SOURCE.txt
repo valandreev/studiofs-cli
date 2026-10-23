@@ -1,0 +1,7 @@
+Repository: https://github.com/tokio-rs/valuable
+Commit: 9efc29b6e58cef28f6566a47aa7e142a55fead77
+Crate source path in repository: (repository root; crate is valuable/)
+Upstream license file paths:
+  LICENSE
+Cargo.toml license expression: MIT
+Texts were fetched verbatim from the upstream repository at the commit above (.cargo_vcs_info.json sha1).

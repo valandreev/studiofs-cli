@@ -20,6 +20,7 @@ INVENTORY_GENERATOR = Path(__file__).with_name("generate-rust-dependency-invento
 NATIVE_POLICY = Path(__file__).with_name("platform-distribution.md")
 BASELINE_INVENTORY = Path(__file__).with_name("rust-dependency-inventory.json")
 SOURCE_MATERIAL_NOTICES = Path(__file__).with_name("source-material-notices.txt")
+SUPPLEMENTAL_LICENSES = Path(__file__).with_name("supplemental-licenses")
 EVIDENCE_PREFIXES = ("license", "copying", "notice", "copyright", "unlicense")
 SOURCE_SUFFIXES = {".rs", ".c", ".h", ".cc", ".cpp", ".py", ".js", ".json", ".toml"}
 
@@ -155,6 +156,15 @@ def verified_package(package: dict, locked: dict, helpers) -> tuple[list[dict], 
     return rows, cache
 
 
+def supplemental_files(package: dict) -> list[Path]:
+    """Upstream license texts committed for crates whose published archive ships none (see supplemental-licenses/README.md)."""
+    folder = SUPPLEMENTAL_LICENSES / f"{package['name']}-{package['version']}"
+    if not folder.is_dir():
+        return []
+    files = sorted((path for path in folder.iterdir() if path.is_file()), key=lambda path: path.name.casefold())
+    return files if any(path.name != "SOURCE.txt" for path in files) and any(path.name == "SOURCE.txt" for path in files) else []
+
+
 def primary_evidence(rows: list[dict], helpers) -> bool:
     return any(row.get("sha256") and helpers.is_primary_evidence(row["path"]) for row in rows)
 
@@ -211,7 +221,10 @@ def generate(repo: Path, output_dir: Path) -> tuple[dict, str, list[str]]:
         key = lock_key(package)
         locked = locked_by_key[key]
         evidence, cache = verified_package(package, locked, helpers)
-        missing_primary = not primary_evidence(evidence, helpers) or (package.get("source") is not None and key in baseline_missing)
+        supplemental = supplemental_files(package)
+        missing_primary = not supplemental and (
+            not primary_evidence(evidence, helpers) or (package.get("source") is not None and key in baseline_missing)
+        )
         is_workspace = package["id"] in workspace_ids
         if package.get("source") and missing_primary:
             unresolved.append(f"{package['name']} {package['version']}")
@@ -223,6 +236,9 @@ def generate(repo: Path, output_dir: Path) -> tuple[dict, str, list[str]]:
             path = root.joinpath(*PurePosixPath(row["path"]).parts)
             body = path.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n").rstrip()
             texts.append({"path": row["path"], "sha256": row["sha256"], "text": body})
+        for path in supplemental:
+            body = "\n".join(path.read_text(encoding="utf-8").splitlines()).rstrip()
+            texts.append({"path": f"supplemental/{path.name}", "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(), "text": body})
         texts.sort(key=lambda item: (item["path"].casefold(), item["path"]))
         item = {
             "name": package["name"],
@@ -290,6 +306,7 @@ def self_test() -> None:
         "Copyright (c) 2025 Jesse Vincent",
     ):
         assert copyright_line in source_notices, copyright_line
+    assert supplemental_files({"name": "objc2", "version": "0.6.4"}) and not supplemental_files({"name": "nonexistent", "version": "0"})
     nested = {"name": "nested", "version": "1", "authors": ["Z", "A"], "license_expression": "MIT", "license_evidence": [
         {"path": "vendor/native/LICENSE", "text": "native terms"},
     ]}

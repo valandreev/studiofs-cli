@@ -1,0 +1,4 @@
+Crate: crc32c 0.6.8
+Repository: https://github.com/zowens/crc32c
+Upstream license files: LICENSE-MIT, LICENSE-APACHE (repository root, verbatim, from default-branch commit c92fcff3c76aed4f1083894f243981c0df278f7f; tag v0.6.8 (254a861f) has no license files)
+License expression (Cargo.toml): Apache-2.0/MIT

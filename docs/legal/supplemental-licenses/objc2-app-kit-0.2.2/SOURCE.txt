@@ -1,0 +1,7 @@
+Repository: https://github.com/madsmtm/objc2
+Commit: e282618be4c3a3b9542957e0c8540e9588472ce8 (matches the crate's .cargo_vcs_info.json)
+Crate: objc2-app-kit-0.2.2 (published package path: framework-crates/objc2-app-kit)
+Upstream file: LICENSE.txt (repository root)
+License expression (Cargo.toml): MIT
+
+LICENSE.txt is copied verbatim from the upstream repository at the commit above.

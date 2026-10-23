@@ -1,0 +1,4 @@
+Repository: https://github.com/tauri-apps/libappindicator-rs
+Tag or commit: commit eafd1e3682a1247f595410266091e9684021cb6f (vcs_info; crate subdirectory sys; repo-root license files)
+Upstream files: LICENSE-APACHE, LICENSE-MIT
+License expression (Cargo.toml): Apache-2.0 OR MIT

@@ -1,0 +1,5 @@
+Crate: objc2-core-image 0.3.2
+Repository: https://github.com/madsmtm/objc2
+Upstream license files: LICENSE-ZLIB.txt, LICENSE-APACHE.txt, LICENSE-MIT.txt (repository root, verbatim, from commit ee9a7ada2131f5944b8750428e265c15632f2a19)
+Crate source commit: 7b1abfd750a2cacaea71d6a56ecfb83cb7de560b. At that commit the repository has only LICENSE.md, which states the licensing and links to the license texts but does not contain them; the verbatim texts first appear in commit ee9a7ada2131f5944b8750428e265c15632f2a19, the one used here.
+License expression (Cargo.toml): Zlib OR Apache-2.0 OR MIT

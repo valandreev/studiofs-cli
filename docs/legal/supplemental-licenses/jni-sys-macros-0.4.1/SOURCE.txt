@@ -1,0 +1,4 @@
+Repository: https://github.com/jni-rs/jni-sys
+Tag or commit: commit 64d77b7a5f119d7b55b4e2c169a4668067ff59e6 (vcs_info; repo-root license files)
+Upstream files: LICENSE-APACHE, LICENSE-MIT
+License expression (Cargo.toml): MIT OR Apache-2.0

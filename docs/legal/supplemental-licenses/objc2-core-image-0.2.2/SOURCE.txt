@@ -1,0 +1,5 @@
+Crate: objc2-core-image 0.2.2
+Repository: https://github.com/madsmtm/objc2
+Commit: e282618be4c3a3b9542957e0c8540e9588472ce8 (from the crate's .cargo_vcs_info.json; path_in_vcs framework-crates/objc2-core-image)
+Upstream license file: LICENSE.txt (repository root, verbatim)
+License expression (Cargo.toml): MIT
