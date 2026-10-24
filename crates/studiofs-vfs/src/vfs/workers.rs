@@ -19,6 +19,13 @@ const COHERENCE_INVALIDATION_RETRY_LIMIT: u8 = 3;
 /// Bounded local re-check of writer-deferred generations; nothing else wakes the
 /// invalidation worker when a writer releases or its dirty state drains.
 const COHERENCE_DEFERRED_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Minimum spacing of reset-driven whole-volume reconciliation walks. Ordinary
+/// changes reconcile only the inodes their semantic batches name; a burst of
+/// journal resets must not repeat an O(volume) walk per pass.
+const METADATA_FULL_RECONCILE_MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// Backstop walk spacing for scopes the journal could not name, run only when a
+/// pass has metadata changes to reconcile.
+const METADATA_FULL_RECONCILE_BACKSTOP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const LOCAL_REDB_COMPACTION_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const LOCAL_REDB_COMPACTION_IDLE_WINDOW: Duration = Duration::from_secs(15 * 60);
 const LOCAL_REDB_COMPACTION_DIAGNOSTIC_RECHECK: Duration = Duration::from_secs(60 * 60);
@@ -141,8 +148,100 @@ struct MetadataTraversalSnapshot {
     entries: HashSet<(Ino, Vec<u8>, Ino)>,
 }
 
+/// Inodes named by drained semantic batches that still await payload
+/// reconciliation, or a reset that requires a whole-volume walk.
+#[derive(Debug, Default)]
+pub(super) struct SemanticReconcileScope {
+    inodes: HashSet<Ino>,
+    reset: bool,
+    /// Known inodes were already retired from the kernel for the pending reset.
+    reset_retired: bool,
+}
+
+impl SemanticReconcileScope {
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.inodes.is_empty() && !self.reset
+    }
+
+    fn observe(&mut self, batch: &studiofs_meta::coherence::InvalidationBatch) {
+        use studiofs_meta::coherence::InvalidationIntent;
+        for intent in &batch.intents {
+            match intent {
+                InvalidationIntent::Attributes { ino }
+                | InvalidationIntent::Content { ino }
+                | InvalidationIntent::Directory { ino } => {
+                    self.inodes.insert(*ino);
+                }
+                // The pre-mutation binding is the unlinked or replaced inode.
+                InvalidationIntent::Entry { ino, .. } => self.inodes.extend(*ino),
+                InvalidationIntent::Reset => {
+                    self.reset = true;
+                    self.reset_retired = false;
+                }
+            }
+        }
+    }
+}
+
+/// How often the invalidation worker reconciled by whole-volume walk versus by
+/// the inode scope of drained semantic batches.
+#[derive(Debug, Default)]
+pub(super) struct MetadataReconcileCounters {
+    full_walks: AtomicU64,
+    scoped_passes: AtomicU64,
+}
+
+impl MetadataReconcileCounters {
+    #[cfg(test)]
+    pub(super) fn full_walks(&self) -> u64 {
+        self.full_walks.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn scoped_passes(&self) -> u64 {
+        self.scoped_passes.load(Ordering::Relaxed)
+    }
+}
+
+/// Reconciliation state carried across metadata invalidation passes.
+#[derive(Default)]
+pub(super) struct MetadataReconcileState {
+    inodes: Option<HashSet<Ino>>,
+    entries: Option<HashSet<(Ino, Vec<u8>, Ino)>>,
+    /// Payload baseline; whole-volume after the first walk, then kept current
+    /// per inode by scoped passes.
+    payloads: Option<HashMap<Ino, Vec<u64>>>,
+    last_full_walk: Option<Instant>,
+    pub(super) scope: SemanticReconcileScope,
+}
+
+impl MetadataReconcileState {
+    fn full_walk_due(&self, now: Instant) -> bool {
+        let (Some(last_full_walk), Some(_)) = (self.last_full_walk, &self.payloads) else {
+            return true;
+        };
+        let elapsed = now.saturating_duration_since(last_full_walk);
+        elapsed >= METADATA_FULL_RECONCILE_BACKSTOP_INTERVAL
+            || (self.scope.reset && elapsed >= METADATA_FULL_RECONCILE_MIN_INTERVAL)
+    }
+}
+
+/// Current payload state of the inodes one scoped pass reconciles.
+struct ScopedMetadataPayloads {
+    present: HashSet<Ino>,
+    payloads: HashMap<Ino, Vec<u64>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MetadataInvalidationWakeReason {
+pub(super) enum MetadataReconcileOutcome {
+    Reconciled,
+    Failed,
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MetadataInvalidationWakeReason {
     BackendNotify,
     FallbackPoll,
     /// A writer-deferred invalidation generation may have become deliverable.
@@ -763,7 +862,17 @@ impl StudioVfs {
         (acceptance, generation_complete)
     }
 
+    #[cfg(test)]
     pub(super) fn drain_semantic_invalidations(&self) -> Option<bool> {
+        self.drain_semantic_invalidations_into(&mut SemanticReconcileScope::default())
+    }
+
+    /// Applies pending semantic batches and records the inodes they name in
+    /// `scope`, so reconciliation can follow them without walking the volume.
+    pub(super) fn drain_semantic_invalidations_into(
+        &self,
+        scope: &mut SemanticReconcileScope,
+    ) -> Option<bool> {
         let mut outcome = None;
         let mut batches = self
             .coherence_pending_invalidations
@@ -778,6 +887,7 @@ impl StudioVfs {
                 .map(|batch| (batch, 0)),
         );
         for (batch, attempts) in batches {
+            scope.observe(&batch);
             let retry = batch.clone();
             let (acceptance, generation_complete) = self.apply_semantic_invalidation_batch(batch);
             outcome = Some(
@@ -1092,6 +1202,41 @@ impl StudioVfs {
             payloads,
             entries: namespace_entries,
         })
+    }
+
+    /// Reads the payload state of `inodes` only; O(|inodes|), not O(volume).
+    fn collect_scoped_metadata_payloads<M: ?Sized + JanitorMeta>(
+        engine: &M,
+        inodes: &[Ino],
+        cancel: &CancellationToken,
+    ) -> MetaResult<ScopedMetadataPayloads> {
+        let mut present = HashSet::new();
+        let mut payloads = HashMap::new();
+        for &ino in inodes {
+            if cancel.is_cancelled() {
+                return Err(MetaError::WorkerShutdownCancelled);
+            }
+            let attr = match engine.get_attr(ino) {
+                Ok(attr) => attr,
+                Err(MetaError::InodeNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            };
+            present.insert(ino);
+            if attr.kind != FileType::RegularFile {
+                continue;
+            }
+            let mut object_ids = engine
+                .get_regular_file_graph_object_usage(ino)?
+                .into_iter()
+                .map(|(object_id, _)| object_id)
+                .collect::<Vec<_>>();
+            object_ids.sort_unstable();
+            object_ids.dedup();
+            if !object_ids.is_empty() {
+                payloads.insert(ino, object_ids);
+            }
+        }
+        Ok(ScopedMetadataPayloads { present, payloads })
     }
 
     pub(super) async fn lazy_evict_removed_metadata_payloads(
@@ -1479,9 +1624,7 @@ impl StudioVfs {
         // the first wake must still clear VFS and kernel caches for that state.
         let mut last_namespace_token = None;
         let mut last_metadata_token = None;
-        let mut last_snapshot: Option<HashSet<Ino>> = None;
-        let mut last_namespace_entries: Option<HashSet<(Ino, Vec<u8>, Ino)>> = None;
-        let mut last_payload_snapshot: Option<HashMap<Ino, Vec<u64>>> = None;
+        let mut reconcile = MetadataReconcileState::default();
         let mut fallback_timer = metadata_invalidation_fallback_timer(interval);
 
         loop {
@@ -1506,7 +1649,7 @@ impl StudioVfs {
             self.note_coherence_sync_started();
             // Local commits must not wait for a remote poll to finish before
             // their already-visible state can invalidate the mounted cache.
-            let before_sync_coverage = self.drain_semantic_invalidations();
+            let before_sync_coverage = self.drain_semantic_invalidations_into(&mut reconcile.scope);
             let meta = self.meta.clone();
             let previous_namespace_token = last_namespace_token.clone();
             let previous_metadata_token = last_metadata_token.clone();
@@ -1535,7 +1678,7 @@ impl StudioVfs {
             .await;
             // Earlier transactions may have committed even if the remaining
             // remote sync failed or did not advance its public version token.
-            let after_sync_coverage = self.drain_semantic_invalidations();
+            let after_sync_coverage = self.drain_semantic_invalidations_into(&mut reconcile.scope);
             let Ok((
                 _before_namespace,
                 after_namespace_token,
@@ -1554,120 +1697,236 @@ impl StudioVfs {
                 &after_namespace_token,
                 &after_metadata_token,
             );
-            let Some((semantic_coverage_ready, applied_boundary)) = self
-                .note_metadata_invalidation_pass(
-                    before_sync_coverage,
-                    after_sync_coverage,
+            let pass = self.note_metadata_invalidation_pass(
+                before_sync_coverage,
+                after_sync_coverage,
+                token_namespace_changed,
+                metadata_changed,
+                progress,
+            );
+            // A reset deferred by the walk rate limit runs once it is due, even
+            // when no further metadata change arrives.
+            if pass.is_none() && !(reconcile.scope.reset && reconcile.full_walk_due(Instant::now()))
+            {
+                continue;
+            }
+            match self
+                .reconcile_metadata_pass(
+                    &mut reconcile,
+                    wake_reason,
                     token_namespace_changed,
                     metadata_changed,
-                    progress,
                 )
-            else {
-                continue;
-            };
-
-            let meta = self.meta.clone();
-            let walk_cancel = self.state.shutdown.background_shutdown_token.clone();
-            let current_snapshot =
-                match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                    Self::collect_metadata_snapshot(engine.as_ref(), &walk_cancel)
-                })
                 .await
-                {
-                    Ok(snapshot) => snapshot,
-                    Err(_) if self.shutdown_requested() => break,
-                    Err(error) => {
-                        warn!(
-                            ?wake_reason,
-                            error = %error,
-                            "metadata invalidation snapshot failed; retrying on the next wake"
-                        );
-                        self.note_coherence_apply_failure();
-                        continue;
-                    }
-                };
-            let namespace_changed = metadata_namespace_changed(
-                token_namespace_changed,
-                last_snapshot.as_ref(),
-                &current_snapshot.inodes,
-            ) || last_namespace_entries
-                .as_ref()
-                .is_some_and(|previous| previous != &current_snapshot.entries);
-
-            let changed_namespace_entries = if namespace_changed {
-                metadata_namespace_entry_changes(
-                    last_namespace_entries.as_ref(),
-                    &current_snapshot.entries,
-                )
-            } else {
-                HashSet::new()
-            };
-
-            let changed_payload_inodes = match &last_payload_snapshot {
-                Some(last_payload_snapshot) => Self::changed_metadata_payload_inodes(
-                    last_payload_snapshot,
-                    &current_snapshot.payloads,
-                ),
-                None => current_snapshot.payloads.keys().copied().collect(),
-            };
-            let removed_payloads = match &last_payload_snapshot {
-                Some(last_payload_snapshot) => Self::removed_metadata_payloads(
-                    last_payload_snapshot,
-                    &current_snapshot.payloads,
-                ),
-                None => HashMap::new(),
-            };
-            let runtime_inodes = if namespace_changed {
-                self.runtime_namespace_invalidation_inodes()
-            } else {
-                HashSet::new()
-            };
-            self.lazy_evict_removed_metadata_payloads(
-                removed_payloads,
-                &current_snapshot.inodes,
-                &runtime_inodes,
-            )
-            .await;
-            let attr_cache_inodes = match &last_snapshot {
-                Some(last_snapshot) => metadata_attr_cache_invalidation_set(
-                    last_snapshot,
-                    &current_snapshot.inodes,
-                    namespace_changed,
-                    runtime_inodes,
-                ),
-                None => {
-                    let mut inodes = current_snapshot.inodes.clone();
-                    if namespace_changed {
-                        inodes.extend(runtime_inodes);
-                    }
-                    inodes
-                }
-            };
-            let read_cache_inodes =
-                Self::read_cache_invalidation_set(&attr_cache_inodes, &changed_payload_inodes);
-            self.invalidate_attr_read_cache(read_cache_inodes);
-            self.invalidate_kernel_inodes(
-                attr_cache_inodes
-                    .iter()
-                    .copied()
-                    .chain(changed_payload_inodes.iter().copied()),
-            );
-            self.invalidate_kernel_entries(changed_namespace_entries);
-            if namespace_changed {
-                self.bump_namespace_epoch();
+            {
+                MetadataReconcileOutcome::Reconciled => {}
+                MetadataReconcileOutcome::Failed => continue,
+                MetadataReconcileOutcome::Shutdown => break,
             }
-            if namespace_changed || metadata_changed {
-                self.bump_acl_namespace_epoch();
-            }
-            last_snapshot = Some(current_snapshot.inodes);
-            last_namespace_entries = Some(current_snapshot.entries);
-            last_payload_snapshot = Some(current_snapshot.payloads);
             last_namespace_token = after_namespace_token;
             last_metadata_token = after_metadata_token;
-            if semantic_coverage_ready {
+            if let Some((true, applied_boundary)) = pass {
                 self.note_coherence_coverage_confirmed(applied_boundary, now_unix_millis());
             }
         }
+    }
+
+    /// Reconciles one pass by the drained semantic scope, or by a whole-volume
+    /// walk when the baseline is missing, a reset is due, or the backstop elapsed.
+    pub(super) async fn reconcile_metadata_pass(
+        &self,
+        state: &mut MetadataReconcileState,
+        wake_reason: MetadataInvalidationWakeReason,
+        token_namespace_changed: bool,
+        metadata_changed: bool,
+    ) -> MetadataReconcileOutcome {
+        if state.full_walk_due(Instant::now()) {
+            self.reconcile_metadata_full_walk(
+                state,
+                wake_reason,
+                token_namespace_changed,
+                metadata_changed,
+            )
+            .await
+        } else {
+            self.reconcile_metadata_scope(state).await
+        }
+    }
+
+    /// Whole-volume reconciliation: the first pass, a deferred journal reset, or
+    /// the periodic backstop. Never the per-change path.
+    async fn reconcile_metadata_full_walk(
+        &self,
+        state: &mut MetadataReconcileState,
+        wake_reason: MetadataInvalidationWakeReason,
+        token_namespace_changed: bool,
+        metadata_changed: bool,
+    ) -> MetadataReconcileOutcome {
+        self.metadata_reconcile_counters
+            .full_walks
+            .fetch_add(1, Ordering::Relaxed);
+        let meta = self.meta.clone();
+        let walk_cancel = self.state.shutdown.background_shutdown_token.clone();
+        let current_snapshot = match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+            Self::collect_metadata_snapshot(engine.as_ref(), &walk_cancel)
+        })
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(_) if self.shutdown_requested() => {
+                return MetadataReconcileOutcome::Shutdown;
+            }
+            Err(error) => {
+                warn!(
+                    ?wake_reason,
+                    error = %error,
+                    "metadata invalidation snapshot failed; retrying on the next wake"
+                );
+                self.note_coherence_apply_failure();
+                return MetadataReconcileOutcome::Failed;
+            }
+        };
+        let namespace_changed = metadata_namespace_changed(
+            token_namespace_changed,
+            state.inodes.as_ref(),
+            &current_snapshot.inodes,
+        ) || state
+            .entries
+            .as_ref()
+            .is_some_and(|previous| previous != &current_snapshot.entries);
+
+        let changed_namespace_entries = if namespace_changed {
+            metadata_namespace_entry_changes(state.entries.as_ref(), &current_snapshot.entries)
+        } else {
+            HashSet::new()
+        };
+
+        let changed_payload_inodes = match &state.payloads {
+            Some(previous_payloads) => {
+                Self::changed_metadata_payload_inodes(previous_payloads, &current_snapshot.payloads)
+            }
+            None => current_snapshot.payloads.keys().copied().collect(),
+        };
+        let removed_payloads = match &state.payloads {
+            Some(previous_payloads) => {
+                Self::removed_metadata_payloads(previous_payloads, &current_snapshot.payloads)
+            }
+            None => HashMap::new(),
+        };
+        let runtime_inodes = if namespace_changed {
+            self.runtime_namespace_invalidation_inodes()
+        } else {
+            HashSet::new()
+        };
+        self.lazy_evict_removed_metadata_payloads(
+            removed_payloads,
+            &current_snapshot.inodes,
+            &runtime_inodes,
+        )
+        .await;
+        let attr_cache_inodes = match &state.inodes {
+            Some(previous_inodes) => metadata_attr_cache_invalidation_set(
+                previous_inodes,
+                &current_snapshot.inodes,
+                namespace_changed,
+                runtime_inodes,
+            ),
+            None => {
+                let mut inodes = current_snapshot.inodes.clone();
+                if namespace_changed {
+                    inodes.extend(runtime_inodes);
+                }
+                inodes
+            }
+        };
+        let read_cache_inodes =
+            Self::read_cache_invalidation_set(&attr_cache_inodes, &changed_payload_inodes);
+        self.invalidate_attr_read_cache(read_cache_inodes);
+        self.invalidate_kernel_inodes(
+            attr_cache_inodes
+                .iter()
+                .copied()
+                .chain(changed_payload_inodes.iter().copied()),
+        );
+        self.invalidate_kernel_entries(changed_namespace_entries);
+        if namespace_changed {
+            self.bump_namespace_epoch();
+        }
+        if namespace_changed || metadata_changed {
+            self.bump_acl_namespace_epoch();
+        }
+        state.inodes = Some(current_snapshot.inodes);
+        state.entries = Some(current_snapshot.entries);
+        state.payloads = Some(current_snapshot.payloads);
+        state.last_full_walk = Some(Instant::now());
+        // The walk covered every scope drained before it started.
+        state.scope = SemanticReconcileScope::default();
+        MetadataReconcileOutcome::Reconciled
+    }
+
+    /// Reconciles payloads of the inodes drained semantic batches named. Cache
+    /// and kernel scopes were already retired when those batches were applied.
+    async fn reconcile_metadata_scope(
+        &self,
+        state: &mut MetadataReconcileState,
+    ) -> MetadataReconcileOutcome {
+        self.metadata_reconcile_counters
+            .scoped_passes
+            .fetch_add(1, Ordering::Relaxed);
+        if state.scope.reset && !state.scope.reset_retired {
+            // Legacy kernel adapters cannot apply a Reset intent. Until the
+            // rate-limited walk retires changed names, retire every inode this
+            // mount knows about without reading redb.
+            let mut known_inodes = self.runtime_namespace_invalidation_inodes();
+            known_inodes.extend(state.inodes.iter().flatten().copied());
+            self.invalidate_kernel_inodes(known_inodes);
+            state.scope.reset_retired = true;
+        }
+        let Some(payloads) = state.payloads.as_mut() else {
+            return MetadataReconcileOutcome::Failed;
+        };
+        if state.scope.inodes.is_empty() {
+            return MetadataReconcileOutcome::Reconciled;
+        }
+        let inodes = state.scope.inodes.iter().copied().collect::<Vec<_>>();
+        let scoped_inodes = inodes.clone();
+        let cancel = self.state.shutdown.background_shutdown_token.clone();
+        let current =
+            match run_meta_maintenance(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                Self::collect_scoped_metadata_payloads(engine.as_ref(), &scoped_inodes, &cancel)
+            })
+            .await
+            {
+                Ok(current) => current,
+                Err(_) if self.shutdown_requested() => return MetadataReconcileOutcome::Shutdown,
+                Err(error) => {
+                    // The scope is retained for the next wake.
+                    warn!(
+                        inodes = inodes.len(),
+                        error = %error,
+                        "scoped metadata reconciliation failed; retrying on the next wake"
+                    );
+                    self.note_coherence_apply_failure();
+                    return MetadataReconcileOutcome::Failed;
+                }
+            };
+        state.scope.inodes.clear();
+        let previous = inodes
+            .iter()
+            .filter_map(|ino| payloads.remove(ino).map(|object_ids| (*ino, object_ids)))
+            .collect::<HashMap<_, _>>();
+        let removed_payloads = Self::removed_metadata_payloads(&previous, &current.payloads);
+        payloads.extend(current.payloads);
+        if !removed_payloads.is_empty() {
+            let runtime_inodes = self.runtime_namespace_invalidation_inodes();
+            self.lazy_evict_removed_metadata_payloads(
+                removed_payloads,
+                &current.present,
+                &runtime_inodes,
+            )
+            .await;
+        }
+        MetadataReconcileOutcome::Reconciled
     }
 
     pub(super) async fn background_uploader(self: Arc<Self>, rx: tokio::sync::mpsc::Receiver<()>) {
@@ -2946,6 +3205,103 @@ mod tests {
         let result = StudioVfs::collect_metadata_snapshot(&engine, &cancel);
 
         assert!(matches!(result, Err(MetaError::WorkerShutdownCancelled)));
+    }
+
+    #[test]
+    fn semantic_reconcile_scope_collects_named_inodes_and_resets() {
+        use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+
+        let mut scope = SemanticReconcileScope::default();
+        scope.observe(&InvalidationBatch {
+            generation: 1,
+            intents: vec![
+                InvalidationIntent::Attributes { ino: 10 },
+                InvalidationIntent::Content { ino: 11 },
+                InvalidationIntent::Directory { ino: 12 },
+                InvalidationIntent::Entry {
+                    parent: 12,
+                    name: b"replaced".to_vec(),
+                    ancestors: None,
+                    ino: Some(13),
+                },
+                InvalidationIntent::Entry {
+                    parent: 12,
+                    name: b"created".to_vec(),
+                    ancestors: None,
+                    ino: None,
+                },
+            ],
+        });
+        assert_eq!(scope.inodes, HashSet::from([10, 11, 12, 13]));
+        assert!(!scope.reset);
+
+        scope.reset_retired = true;
+        scope.observe(&InvalidationBatch {
+            generation: 2,
+            intents: vec![InvalidationIntent::Reset],
+        });
+        assert!(scope.reset);
+        assert!(
+            !scope.reset_retired,
+            "a new reset must retire known kernel state again"
+        );
+    }
+
+    #[test]
+    fn metadata_full_walk_runs_for_baseline_reset_and_backstop_only() {
+        let now = Instant::now();
+        let mut state = MetadataReconcileState::default();
+        assert!(
+            state.full_walk_due(now),
+            "the first pass establishes the baseline"
+        );
+
+        state.payloads = Some(HashMap::new());
+        state.last_full_walk = Some(now);
+        state.scope.inodes.insert(42);
+        assert!(
+            !state.full_walk_due(now + METADATA_FULL_RECONCILE_MIN_INTERVAL),
+            "named inode changes reconcile by scope, not by walking the volume"
+        );
+
+        state.scope.reset = true;
+        assert!(
+            !state.full_walk_due(now + Duration::from_secs(1)),
+            "a reset burst must not repeat the walk inside the rate limit"
+        );
+        assert!(state.full_walk_due(now + METADATA_FULL_RECONCILE_MIN_INTERVAL));
+
+        state.scope.reset = false;
+        assert!(state.full_walk_due(now + METADATA_FULL_RECONCILE_BACKSTOP_INTERVAL));
+    }
+
+    #[test]
+    fn scoped_payload_collection_reads_only_named_inodes() {
+        use studiofs_meta::engine::MetaFsOps;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine =
+            studiofs_meta::RedbMetaEngine::open(dir.path().join("meta.redb")).expect("open redb");
+        engine.init_root(0, 0).expect("init root");
+        let file = engine
+            .create_file(ROOT_INO, b"scoped", 0, 0, 0o644)
+            .expect("create file");
+
+        let scoped = StudioVfs::collect_scoped_metadata_payloads(
+            &engine,
+            &[file.ino, u64::MAX],
+            &CancellationToken::new(),
+        )
+        .expect("collect scoped payloads");
+
+        assert_eq!(scoped.present, HashSet::from([file.ino]));
+        assert!(scoped.payloads.is_empty());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            StudioVfs::collect_scoped_metadata_payloads(&engine, &[file.ino], &cancel),
+            Err(MetaError::WorkerShutdownCancelled)
+        ));
     }
 
     #[test]

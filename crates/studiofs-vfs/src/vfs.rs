@@ -4132,6 +4132,8 @@ pub struct StudioVfs {
     coherence_health: Arc<Mutex<CoherenceHealthTracker>>,
     /// Failed or partially admitted semantic generations awaiting retry.
     coherence_pending_invalidations: Mutex<VecDeque<PendingCoherenceInvalidation>>,
+    /// Whole-volume versus scoped metadata reconciliation passes.
+    metadata_reconcile_counters: workers::MetadataReconcileCounters,
     janitor_interval: Duration,
     janitor_skip_newer_than: Duration,
     janitor_max_deletes_per_run: u64,
