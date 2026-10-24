@@ -683,6 +683,12 @@ impl StudioVfs {
             .contains_key(&ino)
     }
 
+    /// Return whether `ino` has deferred attributes or a pending deferred inode.
+    pub(super) fn has_deferred_namespace_attr_or_inode(&self, ino: Ino) -> bool {
+        let deferred = self.state.namespace.deferred.inner.lock();
+        deferred.attrs.contains_key(&ino) || deferred.pending_inodes.contains_key(&ino)
+    }
+
     /// Return an error when deferred namespace metadata persistence is degraded.
     pub fn ensure_deferred_namespace_metadata_healthy(&self) -> VfsResult<()> {
         if !self.read_only_mount
