@@ -33,6 +33,7 @@ use studiofs_vfs::vfs::OsCacheParticipation;
 use studiofs_vfs::{
     KernelInvalidator, LocalSyncPolicy, OpenFlags, ReadAheadOwner, StatFs, StudioVfs,
     VfsFuseAsyncWriteSnapshot, VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot,
+    read_runtime_stats_buffer,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -259,6 +260,8 @@ pub(crate) struct SessionState {
     inode_liveness: FuseInodeLiveness,
     open_liveness: [Mutex<HashMap<u64, FuseOpenHandleGuard>>; LIVENESS_SHARDS],
     invalidation_queue: FuseInvalidationQueue,
+    /// Runtime stats text captured at open, keyed by VFS file handle.
+    runtime_stats_snapshots: Mutex<HashMap<u64, Arc<[u8]>>>,
     #[cfg(test)]
     getattr_calls: AtomicU64,
 }
@@ -307,6 +310,7 @@ impl SessionState {
             inode_liveness: FuseInodeLiveness::default(),
             open_liveness: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             invalidation_queue: FuseInvalidationQueue::default(),
+            runtime_stats_snapshots: Mutex::new(HashMap::new()),
             #[cfg(test)]
             getattr_calls: AtomicU64::new(0),
         }
@@ -2062,6 +2066,10 @@ impl SessionState {
         if self.read_only && (trunc || open_flags.write_access_requested()) {
             return Err(libc::EROFS);
         }
+        let runtime_stats = self.vfs.is_runtime_stats_file_ino(ino);
+        if runtime_stats && (trunc || open_flags.write_access_requested()) {
+            return Err(libc::EACCES);
+        }
         let fh = self
             .vfs
             .open_file_with_known_attr_and_read_ahead_owner(
@@ -2074,6 +2082,11 @@ impl SessionState {
         // Establish kernel liveness before generation preparation or any
         // operation that can publish an invalidation for this handle.
         self.install_open_liveness(ino, fh);
+        if runtime_stats {
+            // Each open reads one consistent snapshot, matching WinFSP and macFUSE.
+            let snapshot = Arc::from(self.vfs.runtime_stats_file_text().into_bytes());
+            self.runtime_stats_snapshots_guard().insert(fh, snapshot);
+        }
         Ok(LinuxFuseAllocatedOpen {
             observed,
             fh,
@@ -2207,6 +2220,7 @@ impl SessionState {
 
     fn reject_prepared_open(&self, ino: u64, fh: u64) {
         debug!(ino, fh, "Linux FUSE rolls back rejected open reply");
+        self.runtime_stats_snapshots_guard().remove(&fh);
         self.remove_open_liveness(fh);
         self.vfs.abort_os_cache_open(fh);
         let _ = self
@@ -2268,6 +2282,9 @@ impl SessionState {
         let fh = file_handle(fi).ok_or(libc::EBADF)?;
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size = clamp_read_size(size);
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            return self.read_runtime_stats(fh, offset, size);
+        }
         let mut buffer = self.read_buffers.take(size);
         let read = match self.runtime_handle.block_on(self.vfs.read_into_fh(
             fh,
@@ -2283,6 +2300,24 @@ impl SessionState {
         };
         buffer.truncate(read as usize);
         Ok(buffer)
+    }
+
+    fn read_runtime_stats(&self, fh: u64, offset: u64, size: usize) -> Result<SyncReadBuffer, i32> {
+        let snapshot = self
+            .runtime_stats_snapshots_guard()
+            .get(&fh)
+            .cloned()
+            .ok_or(libc::EBADF)?;
+        let mut buffer = self.read_buffers.take(size);
+        let read = read_runtime_stats_buffer(&snapshot, offset, buffer.as_mut());
+        buffer.truncate(read as usize);
+        Ok(buffer)
+    }
+
+    fn runtime_stats_snapshots_guard(&self) -> MutexGuard<'_, HashMap<u64, Arc<[u8]>>> {
+        self.runtime_stats_snapshots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     fn readlink(&self, ino: u64) -> Result<Vec<u8>, i32> {
@@ -2453,6 +2488,7 @@ impl SessionState {
     }
 
     fn release(&self, fh: u64) -> Result<(), i32> {
+        self.runtime_stats_snapshots_guard().remove(&fh);
         let local_sync_policy = self.local_sync_policy_for_handle(fh);
         let watermark = self.async_writes.close_handle(fh);
         let outcome = self.async_writes.wait_handle(watermark);
@@ -5791,6 +5827,86 @@ mod tests {
             });
         }
         state.release(open.fh).unwrap();
+    }
+
+    #[test]
+    fn runtime_stats_open_serves_captured_snapshot_until_release() {
+        struct FileInfo(*mut super::raw::FuseFileInfo);
+        impl Drop for FileInfo {
+            fn drop(&mut self) {
+                // SAFETY: the C test helper allocated this pointer with calloc.
+                unsafe { libc::free(self.0.cast()) };
+            }
+        }
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-runtime-stats")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let ino = state.vfs.runtime_stats_file_attr().ino;
+        for flags in [libc::O_WRONLY, libc::O_RDWR, libc::O_RDONLY | libc::O_TRUNC] {
+            assert_eq!(
+                state.open_with_flags(ino, flags).err(),
+                Some(libc::EACCES),
+                "the stats surface is read-only for flags {flags:#x}"
+            );
+        }
+
+        let open = state.open_with_flags(ino, libc::O_RDONLY).unwrap();
+        // SAFETY: the helper allocates and initializes the native header's layout.
+        let fi = FileInfo(unsafe { super::studiofs_linux_fuse_file_info_new_for_test(open.fh) });
+        assert!(!fi.0.is_null(), "allocate native file info");
+
+        let mut text = Vec::new();
+        loop {
+            let offset = libc::off_t::try_from(text.len()).unwrap();
+            let chunk = state.read(ino, 512, offset, fi.0).unwrap();
+            let len = chunk.as_ref().len();
+            text.extend_from_slice(chunk.as_ref());
+            state.read_buffers.put(chunk);
+            if len == 0 {
+                break;
+            }
+        }
+        let text = String::from_utf8(text).expect("stats text is UTF-8");
+        assert!(
+            text.starts_with("# studiofs_runtime_stats"),
+            "unexpected stats text: {text:?}"
+        );
+
+        // Later reads at any offset come from the same captured snapshot.
+        let middle = text.len() / 2;
+        let tail = state
+            .read(
+                ino,
+                text.len(),
+                libc::off_t::try_from(middle).unwrap(),
+                fi.0,
+            )
+            .unwrap();
+        assert_eq!(tail.as_ref(), &text.as_bytes()[middle..]);
+        state.read_buffers.put(tail);
+        let past_eof = state
+            .read(
+                ino,
+                64,
+                libc::off_t::try_from(text.len() + 4096).unwrap(),
+                fi.0,
+            )
+            .unwrap();
+        assert!(past_eof.as_ref().is_empty(), "reads past EOF are empty");
+        state.read_buffers.put(past_eof);
+
+        state.release(open.fh).unwrap();
+        assert!(
+            state.runtime_stats_snapshots.lock().unwrap().is_empty(),
+            "release drops the captured snapshot"
+        );
     }
 
     #[test]
