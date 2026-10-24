@@ -16980,6 +16980,107 @@ fn fsync_waits_for_deferred_namespace_create() {
 }
 
 #[test]
+fn deferred_namespace_sync_setattr_preserves_file_and_directory_attrs() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-sync-setattr-attrs");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        for (is_dir, name) in [
+            (false, b"sync-setattr-file.txt".as_slice()),
+            (true, b"sync-setattr-dir".as_slice()),
+        ] {
+            vfs.state
+                .namespace
+                .deferred
+                .draining
+                .store(true, AtomicOrdering::Release);
+            let attr = if is_dir {
+                vfs.mkdir_with_deferred_metadata_admission(ROOT_INO, name, 0, 0, 0o755, rt.handle())
+            } else {
+                vfs.create_with_deferred_metadata_admission(
+                    ROOT_INO,
+                    name,
+                    0,
+                    0,
+                    0o644,
+                    rt.handle(),
+                )
+            }
+            .expect("admit deferred create");
+            vfs.state
+                .namespace
+                .deferred
+                .draining
+                .store(false, AtomicOrdering::Release);
+
+            vfs.setattr_with_handle(
+                None,
+                attr.ino,
+                SetattrArgs {
+                    size: (!is_dir).then_some(0),
+                    mode: Some(0o600),
+                    ..SetattrArgs::default()
+                },
+            )
+            .expect("set attr on deferred-created inode");
+            vfs.drain_deferred_namespace_metadata_for_barrier()
+                .await
+                .expect("settle deferred namespace create");
+            assert_eq!(
+                meta.get_attr(attr.ino).expect("load committed attr").mode,
+                0o600,
+                "synchronous setattr must survive deferred create for inode {}",
+                attr.ino
+            );
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn deferred_namespace_handle_growth_does_not_drain_pending_create() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-handle-growth-no-drain");
+    let _guard = rt.enter();
+
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(true, AtomicOrdering::Release);
+    let attr = vfs
+        .create_with_deferred_metadata_admission(
+            ROOT_INO,
+            b"deferred-handle-growth-no-drain.txt",
+            0,
+            0,
+            0o644,
+            rt.handle(),
+        )
+        .expect("admit deferred file create");
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(false, AtomicOrdering::Release);
+    let fh = vfs
+        .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+        .expect("open deferred-created file");
+
+    let grown = vfs
+        .setattr_with_handle(Some(fh), attr.ino, SetattrArgs::size_only(4096))
+        .expect("grow deferred-created file");
+
+    assert_eq!(grown.size, 4096);
+    assert!(
+        vfs.has_deferred_namespace_metadata(attr.ino),
+        "handle-backed growth must not wait for the pending create commit"
+    );
+    assert_eq!(vfs.getattr(attr.ino).expect("get grown attr").size, 4096);
+}
+
+#[test]
 fn deferred_namespace_create_commit_does_not_clear_larger_dirty_attr() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-create-keeps-written-dirty-attr");
@@ -17035,42 +17136,81 @@ fn deferred_namespace_create_commit_does_not_clear_larger_dirty_attr() {
 #[test]
 fn deferred_namespace_first_write_marks_dirty_attr_uploading() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-create-first-write-uploading");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create_with_deferred_metadata_admission(
-                1,
-                b"deferred-create-first-write-uploading.txt",
-                0,
-                0,
-                0o644,
-                rt.handle(),
-            )
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs
-            .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
-            .expect("open deferred-created file");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-create-first-write-uploading");
+    let name = b"deferred-create-first-write-uploading.txt";
+    let payload = b"payload after deferred create";
 
-        vfs.write_fh(fh, ino, 0, b"payload after deferred create")
-            .await
-            .expect("write deferred-created file");
+    // Keep the create admission queued so the lookup observes its in-memory
+    // namespace entry while a first write updates the inode's dirty attribute.
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(true, AtomicOrdering::Release);
+    let attr = vfs
+        .create_with_deferred_metadata_admission(ROOT_INO, name, 0, 0, 0o644, rt.handle())
+        .expect("admit deferred file create");
+    let fh = vfs
+        .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+        .expect("open deferred-created file");
+    rt.block_on(vfs.write_fh(fh, attr.ino, 0, payload))
+        .expect("accept write before create commit");
 
-        let dirty = vfs
-            .state
-            .namespace
-            .dirty_attrs
-            .lock()
-            .get(&ino)
-            .cloned()
-            .expect("first write should leave a dirty attr");
-        assert_eq!(dirty.upload_state, MetaUploadState::Uploading);
-        assert!(dirty.content_epoch > attr.content_epoch);
-        assert!(dirty.size > 0);
+    let dirty_attr = vfs.peek_dirty_attr(attr.ino).expect("written dirty attr");
+    assert_eq!(dirty_attr.upload_state, MetaUploadState::Uploading);
+    assert!(dirty_attr.content_epoch > attr.content_epoch);
+    assert_eq!(dirty_attr.size, payload.len() as u64);
+    assert_eq!(
+        vfs.getattr(attr.ino).expect("get written attr").size,
+        payload.len() as u64,
+        "getattr must expose the accepted size while create metadata is pending"
+    );
+    assert_eq!(
+        vfs.namespace_resolver(NamespacePathStyle::Windows)
+            .resolve_path_for_mount(r"\deferred-create-first-write-uploading.txt")
+            .expect("resolve deferred file path")
+            .size,
+        payload.len() as u64,
+        "path lookup must expose the accepted size while create metadata is pending"
+    );
+    assert_eq!(
+        rt.block_on(vfs.read(attr.ino, 0, payload.len() as u32))
+            .expect("read accepted writer bytes")
+            .as_ref(),
+        payload
+    );
+    let assert_written_listing = || {
+        let listed_attr = vfs
+            .readdir_with_attrs(ROOT_INO)
+            .expect("list written file")
+            .into_iter()
+            .find(|entry| entry.entry.ino == attr.ino)
+            .expect("written file is listed")
+            .attr
+            .expect("written file has listing attributes");
+        assert_eq!(listed_attr.size, payload.len() as u64);
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .get(attr.ino, Instant::now())
+                .is_none(),
+            "locally dirty listing attributes must not enter the read cache"
+        );
+    };
+    assert_written_listing();
 
-        vfs.release_fh(fh).await.expect("release handle");
-    });
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(false, AtomicOrdering::Release);
+    vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+    rt.block_on(vfs.wait_for_deferred_namespace_metadata(attr.ino))
+        .expect("commit deferred file create");
+    assert_written_listing();
+    rt.block_on(vfs.release_fh(fh)).expect("release writer");
 }
 
 #[test]
