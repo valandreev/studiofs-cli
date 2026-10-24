@@ -16980,6 +16980,64 @@ fn fsync_waits_for_deferred_namespace_create() {
 }
 
 #[test]
+fn deferred_namespace_sync_setattr_preserves_file_and_directory_attrs() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-sync-setattr-attrs");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        for (is_dir, name) in [
+            (false, b"sync-setattr-file.txt".as_slice()),
+            (true, b"sync-setattr-dir".as_slice()),
+        ] {
+            vfs.state
+                .namespace
+                .deferred
+                .draining
+                .store(true, AtomicOrdering::Release);
+            let attr = if is_dir {
+                vfs.mkdir_with_deferred_metadata_admission(ROOT_INO, name, 0, 0, 0o755, rt.handle())
+            } else {
+                vfs.create_with_deferred_metadata_admission(
+                    ROOT_INO,
+                    name,
+                    0,
+                    0,
+                    0o644,
+                    rt.handle(),
+                )
+            }
+            .expect("admit deferred create");
+            vfs.state
+                .namespace
+                .deferred
+                .draining
+                .store(false, AtomicOrdering::Release);
+
+            vfs.setattr_with_handle(
+                None,
+                attr.ino,
+                SetattrArgs {
+                    size: (!is_dir).then_some(0),
+                    mode: Some(0o600),
+                    ..SetattrArgs::default()
+                },
+            )
+            .expect("set attr on deferred-created inode");
+            vfs.drain_deferred_namespace_metadata_for_barrier()
+                .await
+                .expect("settle deferred namespace create");
+            assert_eq!(
+                meta.get_attr(attr.ino).expect("load committed attr").mode,
+                0o600,
+                "synchronous setattr must survive deferred create for inode {}",
+                attr.ino
+            );
+        }
+    });
+}
+
+#[test]
 fn deferred_namespace_create_commit_does_not_clear_larger_dirty_attr() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-create-keeps-written-dirty-attr");
@@ -17078,6 +17136,27 @@ fn deferred_namespace_first_write_marks_dirty_attr_uploading() {
             .as_ref(),
         payload
     );
+    let assert_written_listing = || {
+        let listed_attr = vfs
+            .readdir_with_attrs(ROOT_INO)
+            .expect("list written file")
+            .into_iter()
+            .find(|entry| entry.entry.ino == attr.ino)
+            .expect("written file is listed")
+            .attr
+            .expect("written file has listing attributes");
+        assert_eq!(listed_attr.size, payload.len() as u64);
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .get(attr.ino, Instant::now())
+                .is_none(),
+            "locally dirty listing attributes must not enter the read cache"
+        );
+    };
+    assert_written_listing();
 
     vfs.state
         .namespace
@@ -17087,6 +17166,7 @@ fn deferred_namespace_first_write_marks_dirty_attr_uploading() {
     vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
     rt.block_on(vfs.wait_for_deferred_namespace_metadata(attr.ino))
         .expect("commit deferred file create");
+    assert_written_listing();
     rt.block_on(vfs.release_fh(fh)).expect("release writer");
 }
 

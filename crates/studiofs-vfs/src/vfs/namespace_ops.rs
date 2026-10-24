@@ -203,6 +203,18 @@ impl StudioVfs {
     }
 
     pub(super) fn deferred_namespace_attr(&self, ino: Ino) -> Option<InodeAttr> {
+        if !self
+            .state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .attrs
+            .contains_key(&ino)
+        {
+            return None;
+        }
+
         // Snapshot dirty EOF before namespace settlement and materialization can retire it.
         let dirty_attr = self.peek_dirty_attr(ino);
         self.state
@@ -1214,6 +1226,13 @@ impl StudioVfs {
             return Ok(attr);
         }
 
+        if self.has_deferred_namespace_metadata(ino) {
+            self.run_sync_future_with_admission(
+                &operation,
+                self.drain_deferred_namespace_metadata_for_barrier(),
+            )?;
+        }
+
         let mut attr = self.attr_only_setattr_base_attr(ino)?;
         if let Some(new_size) = args.size
             && new_size != attr.size
@@ -2109,6 +2128,21 @@ impl StudioVfs {
 
         let meta = self.sync_meta();
         let observed = self.namespace_cache_token_for_parent(ino);
+        // Capture pending names before redb: settlement commits there before retiring them.
+        let deferred_children = {
+            let inner = self.state.namespace.deferred.inner.lock();
+            inner
+                .entries
+                .iter()
+                .filter(|(key, _)| key.parent == ino)
+                .filter_map(|(key, child_ino)| {
+                    inner
+                        .attrs
+                        .get(child_ino)
+                        .map(|attr| (key.name.as_ref().to_vec(), attr.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
         trace!(
             target: "studiofs_vfs::metadata_baseline::readdir",
             "VFS readdir"
@@ -2127,22 +2161,17 @@ impl StudioVfs {
             .collect::<HashSet<_>>();
         let mut confirmed_entry_inos = HashSet::new();
         let mut attrs_by_ino = HashMap::new();
-        {
-            let inner = self.state.namespace.deferred.inner.lock();
-            for (key, child_ino) in &inner.entries {
-                if key.parent != ino || existing_names.contains(key.name.as_ref()) {
-                    continue;
-                }
-                if let Some(attr) = inner.attrs.get(child_ino) {
-                    entries.push(DirEntry {
-                        name: key.name.as_ref().to_vec(),
-                        ino: *child_ino,
-                        kind: attr.kind,
-                    });
-                    attrs_by_ino.insert(*child_ino, attr.clone());
-                    confirmed_entry_inos.insert(*child_ino);
-                }
+        for (name, attr) in deferred_children {
+            if existing_names.contains(&name) {
+                continue;
             }
+            entries.push(DirEntry {
+                name,
+                ino: attr.ino,
+                kind: attr.kind,
+            });
+            confirmed_entry_inos.insert(attr.ino);
+            attrs_by_ino.insert(attr.ino, attr);
         }
         if !entries.is_empty() {
             let child_inos = entries
@@ -2157,26 +2186,56 @@ impl StudioVfs {
                     .map(|entry| (entry.ino, attr_cache.observation(entry.ino)))
                     .collect::<HashMap<_, _>>()
             };
+            let mut local_attr_inos = attrs_by_ino.keys().copied().collect::<HashSet<_>>();
+            {
+                let dirty_attrs = self.state.namespace.dirty_attrs.lock();
+                local_attr_inos.extend(
+                    entries
+                        .iter()
+                        .filter(|entry| dirty_attrs.contains_key(&entry.ino))
+                        .map(|entry| entry.ino),
+                );
+            }
+            for entry in &entries {
+                if !local_attr_inos.contains(&entry.ino) {
+                    continue;
+                }
+                match self.getattr_unchecked(entry.ino) {
+                    Ok(attr) => {
+                        attrs_by_ino.insert(entry.ino, attr);
+                        confirmed_entry_inos.insert(entry.ino);
+                    }
+                    Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                        attrs_by_ino.remove(&entry.ino);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             let mut attrs = Vec::new();
             let attr_batch_len = self
                 .readdir_attr_batch_chunk
                 .min(self.readdir_attr_batch_max_inodes)
                 .max(1);
-            for chunk in child_inos.chunks(attr_batch_len) {
+            let clean_child_inos = child_inos
+                .into_iter()
+                .filter(|child_ino| !local_attr_inos.contains(child_ino))
+                .collect::<Vec<_>>();
+            for chunk in clean_child_inos.chunks(attr_batch_len) {
                 trace!(
                     target: "studiofs_vfs::metadata_baseline::get_attrs_batch",
                     "VFS batched attribute lookup"
                 );
                 attrs.extend(meta.get_attrs_batch(chunk)?);
             }
-            attrs_by_ino = attrs
-                .into_iter()
-                .map(|attr| (attr.ino, attr))
-                .collect::<HashMap<_, _>>();
+            attrs_by_ino.extend(attrs.into_iter().map(|attr| (attr.ino, attr)));
             confirmed_entry_inos.extend(attrs_by_ino.keys().copied());
             let now = Instant::now();
             let mut attr_cache = self.state.namespace.attr_read_cache.lock();
             for entry in &entries {
+                if local_attr_inos.contains(&entry.ino) {
+                    attr_cache.remove(entry.ino);
+                    continue;
+                }
                 if let Some(attr) = attrs_by_ino.get(&entry.ino) {
                     if let Some(observation) = attr_observations.get(&entry.ino).copied() {
                         attr_cache.put_observed(
