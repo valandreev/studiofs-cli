@@ -1226,14 +1226,19 @@ impl StudioVfs {
             return Ok(attr);
         }
 
-        if self.has_deferred_namespace_metadata(ino) {
+        let mut attr = self.attr_only_setattr_base_attr(ino)?;
+        // Handle-backed growth stays local (create, SetEndOfFile, write); other updates
+        // must not race a pending create commit.
+        let defers_handle_growth = args.size.is_some_and(|new_size| {
+            handle_backed_growth_may_defer_strict_flush(fh, new_size, attr.size, &args)
+        });
+        if !defers_handle_growth && self.has_deferred_namespace_metadata(ino) {
             self.run_sync_future_with_admission(
                 &operation,
                 self.drain_deferred_namespace_metadata_for_barrier(),
             )?;
+            attr = self.attr_only_setattr_base_attr(ino)?;
         }
-
-        let mut attr = self.attr_only_setattr_base_attr(ino)?;
         if let Some(new_size) = args.size
             && new_size != attr.size
         {

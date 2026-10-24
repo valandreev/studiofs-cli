@@ -17037,6 +17037,49 @@ fn deferred_namespace_sync_setattr_preserves_file_and_directory_attrs() {
     });
 }
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn deferred_namespace_handle_growth_does_not_drain_pending_create() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-handle-growth-no-drain");
+    let _guard = rt.enter();
+
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(true, AtomicOrdering::Release);
+    let attr = vfs
+        .create_with_deferred_metadata_admission(
+            ROOT_INO,
+            b"deferred-handle-growth-no-drain.txt",
+            0,
+            0,
+            0o644,
+            rt.handle(),
+        )
+        .expect("admit deferred file create");
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(false, AtomicOrdering::Release);
+    let fh = vfs
+        .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+        .expect("open deferred-created file");
+
+    let grown = vfs
+        .setattr_with_handle(Some(fh), attr.ino, SetattrArgs::size_only(4096))
+        .expect("grow deferred-created file");
+
+    assert_eq!(grown.size, 4096);
+    assert!(
+        vfs.has_deferred_namespace_metadata(attr.ino),
+        "handle-backed growth must not wait for the pending create commit"
+    );
+    assert_eq!(vfs.getattr(attr.ino).expect("get grown attr").size, 4096);
+}
+
 #[test]
 fn deferred_namespace_create_commit_does_not_clear_larger_dirty_attr() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
