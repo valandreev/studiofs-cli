@@ -11,6 +11,106 @@ fn record_regular_file_object_usage(
         .or_insert(object_bytes);
 }
 
+/// Upload-completed slices of one chunk, indexed by their immutable payload
+/// reference so reconciling a whole incoming chunk stays linear in its size.
+pub(super) struct CompletedOverlayPayloads<'a> {
+    by_payload: std::collections::HashMap<(u64, u32, u32, u8), Vec<&'a crate::schema::SliceRecord>>,
+}
+
+impl<'a> CompletedOverlayPayloads<'a> {
+    pub(super) fn new(state: &'a RegularFileChunkState) -> Self {
+        let mut by_payload: std::collections::HashMap<_, Vec<_>> = std::collections::HashMap::new();
+        // Candidates keep `state.slices` order, so the first match is unchanged.
+        for existing in state.slices.values() {
+            if let (Some(payload), true) = (
+                existing.payload,
+                matches!(
+                    existing.payload_state,
+                    crate::schema::PayloadRefState::Uploaded
+                        | crate::schema::PayloadRefState::Published
+                ),
+            ) {
+                by_payload
+                    .entry(payload_key(payload))
+                    .or_default()
+                    .push(existing);
+            }
+        }
+        Self { by_payload }
+    }
+
+    /// Payload objects are immutable. A late flush of the same object may
+    /// replace its slice record, but it must not erase upload completion.
+    pub(super) fn preserve(&self, new_slice: &mut crate::schema::SliceRecord) {
+        let Some(payload) = new_slice.payload else {
+            return;
+        };
+        if !matches!(
+            new_slice.payload_state,
+            crate::schema::PayloadRefState::LocalOnly
+                | crate::schema::PayloadRefState::Uploading
+                | crate::schema::PayloadRefState::Recovering
+        ) {
+            return;
+        }
+        let Some(candidates) = self.by_payload.get(&payload_key(payload)) else {
+            return;
+        };
+        if let Some(existing) = candidates.iter().find(|existing| {
+            new_slice.range.start <= existing.range.start
+                && new_slice.range.end >= existing.range.end
+        }) {
+            new_slice.payload_state = existing.payload_state;
+        }
+    }
+}
+
+fn payload_key(payload: PayloadRef) -> (u64, u32, u32, u8) {
+    (
+        payload.object_id,
+        payload.offset,
+        payload.length,
+        payload.flags.bits(),
+    )
+}
+
+/// Answers whether any single slice of a batch contains a range, in
+/// O(log n) per query instead of scanning the batch.
+struct SingleSliceCover {
+    /// Slice starts in ascending order.
+    starts: Vec<u32>,
+    /// Largest end among slices whose start is at or before `starts[i]`.
+    max_end_through: Vec<u32>,
+}
+
+impl SingleSliceCover {
+    fn new(slices: &[crate::schema::SliceRecord]) -> Self {
+        let mut ranges: Vec<_> = slices
+            .iter()
+            .map(|slice| (slice.range.start, slice.range.end))
+            .collect();
+        ranges.sort_unstable();
+        let mut max_end = 0;
+        let (starts, max_end_through) = ranges
+            .into_iter()
+            .map(|(start, end)| {
+                max_end = max_end.max(end);
+                (start, max_end)
+            })
+            .unzip();
+        Self {
+            starts,
+            max_end_through,
+        }
+    }
+
+    fn covers(&self, range: crate::schema::SliceRange) -> bool {
+        // Slices starting after `range.start` cannot contain it.
+        let candidates = self.starts.partition_point(|start| *start <= range.start);
+        candidates > 0 && self.max_end_through[candidates - 1] >= range.end
+    }
+}
+
 impl RedbMetaEngine {
     pub(crate) fn has_local_regular_file_overlay_in_write_txn(
         txn: &redb::WriteTransaction,
@@ -680,38 +780,6 @@ impl RedbMetaEngine {
         Ok(true)
     }
 
-    pub(super) fn preserve_completed_overlay_payload_state(
-        state: &RegularFileChunkState,
-        new_slice: &mut crate::schema::SliceRecord,
-    ) {
-        let Some(payload) = new_slice.payload else {
-            return;
-        };
-        if !matches!(
-            new_slice.payload_state,
-            crate::schema::PayloadRefState::LocalOnly
-                | crate::schema::PayloadRefState::Uploading
-                | crate::schema::PayloadRefState::Recovering
-        ) {
-            return;
-        }
-
-        if let Some(existing) = state.slices.values().find(|existing| {
-            existing.payload == Some(payload)
-                && new_slice.range.start <= existing.range.start
-                && new_slice.range.end >= existing.range.end
-                && matches!(
-                    existing.payload_state,
-                    crate::schema::PayloadRefState::Uploaded
-                        | crate::schema::PayloadRefState::Published
-                )
-        }) {
-            // Payload objects are immutable. A late flush of the same object may
-            // replace its slice record, but it must not erase upload completion.
-            new_slice.payload_state = existing.payload_state;
-        }
-    }
-
     fn apply_regular_file_overlay_mutation_in_txn(
         &self,
         txn: &redb::WriteTransaction,
@@ -783,23 +851,20 @@ impl RedbMetaEngine {
                     crate::schema::RegularFileChunkState::default()
                 };
                 let mut new_slices = incoming_slices.to_vec();
+                let completed = CompletedOverlayPayloads::new(&state);
                 for new_slice in &mut new_slices {
-                    Self::preserve_completed_overlay_payload_state(&state, new_slice);
+                    completed.preserve(new_slice);
                 }
 
-                // Pre-calculate which existing slices are fully covered by the incoming ones.
-                // This bounds metadata growth and performs O(N*M) where N is incoming slices and M is existing in one chunk.
-                let mut fully_covered = Vec::new();
-                for (id, existing) in &state.slices {
-                    for new_slice in new_slices.iter() {
-                        if new_slice.range.start <= existing.range.start
-                            && new_slice.range.end >= existing.range.end
-                        {
-                            fully_covered.push(*id);
-                            break;
-                        }
-                    }
-                }
+                // Existing slices fully covered by a single incoming slice are
+                // dropped, which bounds metadata growth.
+                let incoming_cover = SingleSliceCover::new(&new_slices);
+                let fully_covered: Vec<_> = state
+                    .slices
+                    .iter()
+                    .filter(|(_, existing)| incoming_cover.covers(existing.range))
+                    .map(|(id, _)| *id)
+                    .collect();
 
                 for id in fully_covered {
                     if let Some(removed) = state.slices.remove(&id)
@@ -1017,5 +1082,88 @@ impl crate::engine::MetaEngine for RedbMetaEngine {
         attr: Option<&InodeAttr>,
     ) -> MetaResult<Option<InodeAttr>> {
         self.flush_regular_file_overlay_slices_with_attr_txn(ino, chunk_slices, attr)
+    }
+}
+
+#[cfg(test)]
+mod overlay_index_tests {
+    use super::*;
+    use crate::schema::{
+        BlockFlags, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord,
+    };
+
+    fn slice(start: u32, end: u32, object_id: u64, state: PayloadRefState) -> SliceRecord {
+        SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range: SliceRange::new(start, end).expect("slice range"),
+            payload: Some(PayloadRef {
+                object_id,
+                offset: 0,
+                length: end - start,
+                flags: BlockFlags::PARTIAL_BLOCK,
+            }),
+            payload_state: state,
+        }
+    }
+
+    #[test]
+    fn single_slice_cover_matches_pairwise_scan() {
+        let mut seed = 0x2545_f491_u32;
+        let mut next = move |bound: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % bound
+        };
+        for _ in 0..200 {
+            let batch: Vec<_> = (0..1 + next(12))
+                .map(|_| {
+                    let start = next(64);
+                    slice(start, start + 1 + next(24), 1, PayloadRefState::LocalOnly)
+                })
+                .collect();
+            let cover = SingleSliceCover::new(&batch);
+            for _ in 0..32 {
+                let start = next(80);
+                let range = SliceRange::new(start, start + 1 + next(16)).expect("query range");
+                let expected = batch.iter().any(|candidate| {
+                    candidate.range.start <= range.start && candidate.range.end >= range.end
+                });
+                assert_eq!(
+                    cover.covers(range),
+                    expected,
+                    "range {range:?} in {batch:?}"
+                );
+            }
+        }
+        assert!(!SingleSliceCover::new(&[]).covers(SliceRange::new(0, 1).expect("range")));
+    }
+
+    #[test]
+    fn completed_overlay_payloads_keep_upload_completion_for_the_same_object_span() {
+        let mut state = RegularFileChunkState::default();
+        state
+            .slices
+            .insert(SliceId(1), slice(0, 4096, 7, PayloadRefState::Uploaded));
+        state.slices.insert(
+            SliceId(2),
+            slice(8192, 12288, 8, PayloadRefState::LocalOnly),
+        );
+        let completed = CompletedOverlayPayloads::new(&state);
+
+        let mut replayed = slice(0, 4096, 7, PayloadRefState::LocalOnly);
+        completed.preserve(&mut replayed);
+        assert_eq!(replayed.payload_state, PayloadRefState::Uploaded);
+
+        // A different object, an unfinished upload, or a narrower range keeps its state.
+        let mut other_object = slice(0, 4096, 9, PayloadRefState::LocalOnly);
+        let mut unfinished = slice(8192, 12288, 8, PayloadRefState::LocalOnly);
+        let mut narrower = slice(0, 2048, 7, PayloadRefState::LocalOnly);
+        narrower.payload = state.slices[&SliceId(1)].payload;
+        for candidate in [&mut other_object, &mut unfinished, &mut narrower] {
+            completed.preserve(candidate);
+            assert_eq!(candidate.payload_state, PayloadRefState::LocalOnly);
+        }
     }
 }

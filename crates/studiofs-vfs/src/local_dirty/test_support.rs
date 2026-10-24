@@ -235,6 +235,91 @@ mod tests {
     }
 
     #[test]
+    fn oversized_overlay_mutation_commits_instead_of_failing_forever() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "overlay-oversized-mutation");
+        let attr = vfs
+            .create(1, b"fragmented.bin", 0, 0, 0o644)
+            .expect("create file");
+
+        // Distinct 4 KiB extents cannot be superseded, so a heavily fragmented
+        // file legitimately needs one descriptor larger than the queue budget.
+        let slices_per_chunk = 4096u32;
+        let chunk_slices: Vec<_> = (0..20u64)
+            .map(|chunk_id| {
+                let slices = (0..slices_per_chunk)
+                    .map(|index| {
+                        let start = index * 4096;
+                        studiofs_meta::schema::SliceRecord {
+                            slice_id: studiofs_meta::schema::SliceId::default(),
+                            order: studiofs_meta::schema::SliceOrder::default(),
+                            range: studiofs_meta::schema::SliceRange::new(start, start + 4096)
+                                .expect("slice range"),
+                            payload: Some(studiofs_meta::schema::PayloadRef {
+                                object_id: 1_000_000 + chunk_id * 10_000 + u64::from(index),
+                                offset: 0,
+                                length: 4096,
+                                flags: studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK,
+                            }),
+                            payload_state: studiofs_meta::schema::PayloadRefState::LocalOnly,
+                        }
+                    })
+                    .collect();
+                (studiofs_meta::schema::ChunkId(chunk_id), slices)
+            })
+            .collect();
+        let mutation = studiofs_meta::RegularFileOverlayMutation {
+            ino: attr.ino,
+            chunk_slices: chunk_slices.clone(),
+            attr: None,
+        };
+        assert!(
+            overlay_mutation_descriptor_bytes(&mutation)
+                > OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES,
+            "precondition: the mutation must exceed the shared queue budget"
+        );
+
+        rt.block_on(async {
+            VfsOverlayCommitter { vfs: &vfs }
+                .commit_overlay(attr.ino, chunk_slices, None, true)
+                .await
+                .expect("an oversized overlay must commit once the queue is empty");
+        });
+
+        assert_eq!(
+            meta.get_regular_file_overlay_object_ids(attr.ino)
+                .expect("overlay object ids")
+                .len(),
+            20 * slices_per_chunk as usize
+        );
+        vfs.ensure_volatile_overlay_metadata_healthy()
+            .expect("overlay metadata must stay healthy");
+    }
+
+    #[test]
+    fn oversized_overlay_waiter_deregisters_once_on_admission_or_cancellation() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-oversized-waiter");
+        let batch = &vfs.state.local_dirty.overlay_batch;
+        let waiters = || batch.inner.lock().oversized_waiters;
+
+        let cancelled = OversizedOverlayWaiter::register(batch);
+        assert_eq!(
+            waiters(),
+            1,
+            "a waiting oversized mutation holds back smaller ones"
+        );
+        drop(cancelled);
+        assert_eq!(waiters(), 0, "a cancelled admission must deregister");
+
+        let mut admitted = OversizedOverlayWaiter::register(batch);
+        admitted.admitted(&mut batch.inner.lock());
+        assert_eq!(waiters(), 0);
+        drop(admitted);
+        assert_eq!(waiters(), 0, "an admitted waiter must not deregister twice");
+    }
+
+    #[test]
     fn first_overlay_sequence_is_above_completion_sentinel() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "overlay-first-sequence");
@@ -2187,6 +2272,103 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![7001, 7002],
             "payload refs should follow the sorted chunk-local slice order"
+        );
+    }
+
+    #[test]
+    fn build_overlay_slice_records_supersedes_fully_overwritten_slices() {
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let drain = test_drain(events, false, false, None, uploads, observed_inodes);
+
+        // Each round models one buffered-write spill object: its segments share
+        // the object id, which is also their sequence, like
+        // `install_persisted_pending_local_dirty_slice`.
+        let positions = 512u32;
+        let rounds = 4u64;
+        let mut slices = Vec::new();
+        for round in 0..rounds {
+            let object_id = 10_000 * (round + 1);
+            for step in 0..positions {
+                // Visit positions in a different order each round, like random writes.
+                let position = (step * 197 + round as u32 * 31) % positions;
+                let start = position * 4096;
+                slices.push(PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(start, start + 4096)
+                        .expect("slice range"),
+                    0,
+                    start,
+                    object_id,
+                    object_id,
+                    step * 4096,
+                ));
+            }
+        }
+        // A later write covering only half of an extent must not hide the
+        // uncovered half of the earlier extent.
+        let partial_start = positions * 4096;
+        slices.push(PendingDirtySlice::persisted(
+            studiofs_meta::schema::SliceRange::new(partial_start, partial_start + 8192)
+                .expect("wide range"),
+            0,
+            partial_start,
+            u64::MAX - 1,
+            90_001,
+            0,
+        ));
+        slices.push(PendingDirtySlice::persisted(
+            studiofs_meta::schema::SliceRange::new(partial_start, partial_start + 4096)
+                .expect("narrow range"),
+            0,
+            partial_start,
+            u64::MAX,
+            90_002,
+            0,
+        ));
+        let mut dirty_chunk_slices = std::collections::BTreeMap::new();
+        dirty_chunk_slices.insert(0, slices);
+
+        let records = drain
+            .build_overlay_slice_records(41, &[], dirty_chunk_slices)
+            .expect("overlay records");
+
+        let records = &records[0].1;
+        let object_ids: Vec<u64> = records
+            .iter()
+            .map(|record| record.payload.as_ref().expect("payload").object_id)
+            .collect();
+        // Fully overwritten rounds keep one record each so their objects stay
+        // referenced; the last round keeps every extent visible.
+        let superseded_rounds = (rounds - 1) as usize;
+        assert_eq!(
+            records.len(),
+            superseded_rounds + positions as usize + 2,
+            "fully overwritten records must not accumulate per write"
+        );
+        assert_eq!(object_ids[..superseded_rounds], [10_000, 20_000, 30_000]);
+        let last_round = &records[superseded_rounds..superseded_rounds + positions as usize];
+        assert!(
+            last_round
+                .iter()
+                .all(|record| record.payload.as_ref().expect("payload").object_id == 40_000),
+            "every visible 4 KiB extent must come from the last write"
+        );
+        let mut visible_starts: Vec<u32> =
+            last_round.iter().map(|record| record.range.start).collect();
+        visible_starts.sort_unstable();
+        assert_eq!(
+            visible_starts,
+            (0..positions)
+                .map(|position| position * 4096)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(object_ids[object_ids.len() - 2..], [90_001, 90_002]);
+        assert!(
+            records
+                .windows(2)
+                .all(|pair| pair[0].order.0 < pair[1].order.0),
+            "surviving records keep increasing commit order"
         );
     }
 

@@ -330,6 +330,25 @@ cargo test -p studiofs-bridge --lib posix::tests:: -- --nocapture
 Windows cannot execute the POSIX module guarded by `cfg(unix)`. These focused
 tests do not establish live mounted disk-full acceptance.
 
+### SFS-885 Fragmented Overlay Mutation Regressions
+
+Random small writes used to leave one overlay record per write, so the
+per-inode overlay mutation outgrew the 4 MiB shared queue budget and every
+drain and `fsync` failed. These tests cover superseding fully overwritten
+records without orphaning their payload objects, admitting an oversized
+mutation alone instead of rejecting it, the waiter's cancellation accounting,
+and the indexed redb-engine checks that replaced per-chunk pairwise scans:
+
+```sh
+cargo test -p studiofs-vfs --lib build_overlay_slice_records_supersedes_fully_overwritten_slices -- --nocapture
+cargo test -p studiofs-vfs --lib oversized_overlay -- --nocapture
+cargo test -p studiofs-meta --lib overlay_index_tests -- --nocapture
+```
+
+These focused tests do not establish mounted acceptance. The mounted check
+is `fio --rw=randwrite --bs=4k --size=256M --runtime=15 --time_based` on a
+Linux mount followed by `fsync` of the file, which must succeed.
+
 ### SFS-752 Upload Queue Pin Ownership
 
 These focused tests use the real local payload backend without S3 or PostgreSQL.

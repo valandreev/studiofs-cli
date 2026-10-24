@@ -328,6 +328,8 @@ struct QueuedOverlayMutation {
 struct OverlayBatchInner {
     queue: std::collections::VecDeque<QueuedOverlayMutation>,
     queued_descriptor_bytes: usize,
+    /// Oversized mutations waiting for an empty queue; smaller ones yield to them.
+    oversized_waiters: usize,
     draining: bool,
     next_sequence: u128,
     completed_sequence: u128,
@@ -548,12 +550,12 @@ impl StudioVfs {
         }
         self.ensure_volatile_overlay_metadata_healthy()?;
         let descriptor_bytes = overlay_mutation_descriptor_bytes(&mutation);
-        if descriptor_bytes > OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES {
-            return Err(VfsError::Other(format!(
-                "overlay metadata mutation ({descriptor_bytes} bytes) exceeds the {} byte queue limit",
-                OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES
-            )));
-        }
+        // A heavily fragmented file can need one descriptor larger than the
+        // shared budget. Rejecting it would fail every later drain of the inode,
+        // so it is admitted alone once the queue is empty instead.
+        let oversized = descriptor_bytes > OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES;
+        let mut oversized_waiter = oversized
+            .then(|| OversizedOverlayWaiter::register(&self.state.local_dirty.overlay_batch));
         let admission_semaphore = self.state.local_dirty.overlay_batch.admission.clone();
         let mut admission = None;
         let (completion, receiver) = tokio::sync::oneshot::channel();
@@ -585,11 +587,16 @@ impl StudioVfs {
                     ));
                 }
                 self.ensure_volatile_overlay_metadata_healthy()?;
-                if inner
-                    .queued_descriptor_bytes
-                    .saturating_add(descriptor_bytes)
-                    > OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES
-                {
+                let fits = if oversized {
+                    inner.queue.is_empty()
+                } else {
+                    inner.oversized_waiters == 0
+                        && inner
+                            .queued_descriptor_bytes
+                            .saturating_add(descriptor_bytes)
+                            <= OVERLAY_BATCH_MAX_QUEUED_DESCRIPTOR_BYTES
+                };
+                if !fits {
                     None
                 } else {
                     let sequence = inner.next_sequence;
@@ -605,6 +612,9 @@ impl StudioVfs {
                     let queued_admission = admission.take().ok_or_else(|| {
                         VfsError::Other("overlay queue admission was already consumed".to_string())
                     })?;
+                    if let Some(waiter) = oversized_waiter.as_mut() {
+                        waiter.admitted(&mut inner);
+                    }
                     inner.next_sequence = next_sequence;
                     inner.last_admitted_sequence = Some(sequence);
                     inner.enqueued = inner.enqueued.saturating_add(1);
@@ -655,6 +665,43 @@ impl StudioVfs {
             .await
             .map_err(|_| VfsError::Other("overlay batch drainer stopped".to_string()))?
             .map_err(|error| clone_overlay_batch_error(&error))
+    }
+}
+
+/// Registers an oversized mutation so smaller admissions cannot keep the queue
+/// non-empty forever; a cancelled admission deregisters on drop.
+struct OversizedOverlayWaiter<'a> {
+    batch: &'a OverlayBatchState,
+    registered: bool,
+}
+
+impl<'a> OversizedOverlayWaiter<'a> {
+    fn register(batch: &'a OverlayBatchState) -> Self {
+        let mut inner = batch.inner.lock();
+        inner.oversized_waiters = inner.oversized_waiters.saturating_add(1);
+        Self {
+            batch,
+            registered: true,
+        }
+    }
+
+    fn admitted(&mut self, inner: &mut OverlayBatchInner) {
+        if std::mem::take(&mut self.registered) {
+            inner.oversized_waiters = inner.oversized_waiters.saturating_sub(1);
+        }
+    }
+}
+
+impl Drop for OversizedOverlayWaiter<'_> {
+    fn drop(&mut self) {
+        if !std::mem::take(&mut self.registered) {
+            return;
+        }
+        {
+            let mut inner = self.batch.inner.lock();
+            inner.oversized_waiters = inner.oversized_waiters.saturating_sub(1);
+        }
+        self.batch.space_available.notify_waiters();
     }
 }
 

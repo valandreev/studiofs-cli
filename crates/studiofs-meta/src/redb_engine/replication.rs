@@ -1854,8 +1854,10 @@ impl RedbMetaEngine {
                         // the newer local state for the same payload reference.
                         let mut slices = slices.clone();
                         if let Some(current) = current.get(chunk_id) {
+                            let completed =
+                                super::payload_objects::CompletedOverlayPayloads::new(current);
                             for slice in &mut slices {
-                                Self::preserve_completed_overlay_payload_state(current, slice);
+                                completed.preserve(slice);
                             }
                         }
                         let next = Self::set_regular_file_chunk_state_in_txn(
