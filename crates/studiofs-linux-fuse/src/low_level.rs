@@ -166,6 +166,12 @@ unsafe extern "C" {
         ops_size: libc::size_t,
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
+    fn studiofs_linux_fuse_wrap_exit_signal(sig: c_int) -> c_int;
+    fn studiofs_linux_fuse_unwrap_exit_signal(sig: c_int);
+    #[cfg(test)]
+    fn studiofs_linux_fuse_enter_loop_thread();
+    #[cfg(test)]
+    fn studiofs_linux_fuse_leave_loop_thread();
     fn studiofs_linux_fuse_session_loop_mt(
         session: *mut raw::FuseSession,
         max_threads: c_uint,
@@ -876,6 +882,11 @@ impl Session {
         let result = unsafe { raw::fuse_set_signal_handlers(self.raw.as_ptr()) };
         if result == 0 {
             self.signal_handlers_installed = true;
+            for signal in FUSE_EXIT_SIGNALS {
+                // SAFETY: wrapping only replaces the plain handler libfuse just
+                // installed; the wrapper chains to it.
+                unsafe { studiofs_linux_fuse_wrap_exit_signal(signal) };
+            }
             Ok(())
         } else {
             Err(io::Error::last_os_error())
@@ -953,6 +964,12 @@ impl Session {
         }
     }
 }
+
+/// Signals whose libfuse handler exits the session loop.
+///
+/// The handler only sets a flag that the loop thread sees when the signal
+/// interrupts its own wait, so the C shim forwards these signals to that thread.
+const FUSE_EXIT_SIGNALS: [c_int; 3] = [libc::SIGHUP, libc::SIGINT, libc::SIGTERM];
 
 /// Hold kernel invalidations until the kernel has applied real root attributes.
 ///
@@ -3342,6 +3359,11 @@ impl Session {
         detach_raw_session_with(
             signal_handlers_installed,
             || {
+                for signal in FUSE_EXIT_SIGNALS {
+                    // SAFETY: restores libfuse's own handler so its removal
+                    // recognizes it; a no-op for signals that were not wrapped.
+                    unsafe { studiofs_linux_fuse_unwrap_exit_signal(signal) };
+                }
                 // SAFETY: handlers were installed for this retained live session.
                 unsafe { raw::fuse_remove_signal_handlers(raw.as_ptr()) };
                 // libfuse restores SIG_DFL, but `studiofs umount` sends SIGTERM after
@@ -3507,6 +3529,81 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use studiofs_meta::MetaInodes;
+
+    static EXIT_SIGNAL_TEST_HITS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn record_exit_signal_for_test(_signal: libc::c_int) {
+        EXIT_SIGNAL_TEST_HITS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn exit_signal_on_another_thread_wakes_the_session_loop_thread() {
+        // SIGUSR2 stands in for SIGINT so the test never touches the harness's
+        // own interrupt handling; the shim wraps any plain handler the same way.
+        let signal = libc::SIGUSR2;
+        // SAFETY: plain sigaction calls on a zeroed, then kernel-filled struct.
+        let previous = unsafe {
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = record_exit_signal_for_test as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(libc::sigaction(signal, &action, &mut previous), 0);
+            previous
+        };
+        // SAFETY: the current handler is the plain test handler installed above.
+        assert_eq!(
+            unsafe { super::studiofs_linux_fuse_wrap_exit_signal(signal) },
+            1
+        );
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (woke_tx, woke_rx) = mpsc::channel();
+        let loop_thread = thread::spawn(move || {
+            // Model the libfuse loop: block the signal, then wait with
+            // sigsuspend until the exit flag is set, without a lost wakeup.
+            // SAFETY: per-thread signal mask manipulation on local sets.
+            unsafe {
+                let mut blocked: libc::sigset_t = std::mem::zeroed();
+                let mut waiting: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut blocked);
+                libc::sigaddset(&mut blocked, signal);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut waiting);
+                libc::sigdelset(&mut waiting, signal);
+                super::studiofs_linux_fuse_enter_loop_thread();
+                ready_tx.send(()).expect("test receiver remains alive");
+                while EXIT_SIGNAL_TEST_HITS.load(Ordering::SeqCst) == 0 {
+                    libc::sigsuspend(&waiting);
+                }
+                super::studiofs_linux_fuse_leave_loop_thread();
+            }
+            let _ = woke_tx.send(());
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("loop thread registers itself");
+
+        // Deliver the signal to this thread, as the kernel does when it picks
+        // the main thread for a process-directed Ctrl+C.
+        // SAFETY: raise targets the calling thread, which leaves it unblocked.
+        assert_eq!(unsafe { libc::raise(signal) }, 0);
+        let woke = woke_rx.recv_timeout(Duration::from_secs(5));
+
+        // SAFETY: restores the wrapped handler, then the original disposition.
+        let restored_handler = unsafe {
+            super::studiofs_linux_fuse_unwrap_exit_signal(signal);
+            let mut current: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &mut current);
+            libc::sigaction(signal, &previous, std::ptr::null_mut());
+            current.sa_sigaction
+        };
+        woke.expect("an exit signal on another thread must wake the loop thread");
+        loop_thread.join().expect("loop thread must not panic");
+        assert!(EXIT_SIGNAL_TEST_HITS.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            restored_handler, record_exit_signal_for_test as *const () as libc::sighandler_t,
+            "unwrap must reinstall the original handler so libfuse can remove it"
+        );
+    }
 
     fn decode_directory_reply(buffer: &super::DirectoryEntryBuffer) -> Vec<(Vec<u8>, u64, u32)> {
         let mut bytes = buffer.as_slice();
