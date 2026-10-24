@@ -418,6 +418,82 @@ mod tests {
     }
 
     #[test]
+    fn pending_slice_commit_waits_for_deferred_create() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (store_runtime, vfs, meta) =
+            make_unstarted_test_vfs(&tmp, "deferred-create-pending-slice");
+        let namespace_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create current-thread namespace runtime");
+        let payload = Bytes::from_static(b"accepted before deferred create settles");
+        let object_id = meta.next_object_id().expect("allocate object id");
+
+        store_runtime
+            .block_on(vfs.persist_local_object_payloads(
+                vec![(object_id, payload.clone())],
+                1,
+                LocalSyncPolicy::Strict,
+            ))
+            .expect("persist local payload");
+        let attr = vfs
+            .create_with_deferred_metadata_admission(
+                1,
+                b"deferred-pending-slice.bin",
+                0,
+                0,
+                0o644,
+                namespace_runtime.handle(),
+            )
+            .expect("admit deferred create");
+        let mut attr_to_persist = attr.clone();
+        attr_to_persist.size = payload.len() as u64;
+        attr_to_persist.content_epoch = 1;
+        attr_to_persist.upload_state = MetaUploadState::Uploading;
+        let slice = PendingDirtySlice::persisted(
+            studiofs_meta::schema::SliceRange::new(0, payload.len() as u32)
+                .expect("payload slice range"),
+            0,
+            0,
+            object_id,
+            object_id,
+            0,
+        );
+        let pending_slices = std::collections::BTreeMap::from([(0, vec![slice])]);
+
+        namespace_runtime
+            .block_on(
+                vfs.local_dirty_flush_session(attr.ino)
+                    .commit_pending_slice_snapshot(
+                        pending_slices,
+                        attr_to_persist.content_epoch,
+                        Some(attr_to_persist),
+                    ),
+            )
+            .expect("commit pending slices after deferred create");
+
+        let committed_slices = meta
+            .lookup_regular_file_slices(attr.ino, 0, payload.len() as u64)
+            .expect("look up committed slices");
+        assert_eq!(committed_slices.len(), 1);
+        assert_eq!(
+            committed_slices[0]
+                .payload
+                .as_ref()
+                .expect("committed payload ref")
+                .object_id,
+            object_id,
+            "the pending payload must remain referenced after create settles"
+        );
+        assert_eq!(
+            store_runtime
+                .block_on(vfs.read(attr.ino, 0, payload.len() as u32))
+                .expect("read committed payload"),
+            payload
+        );
+    }
+
+    #[test]
     fn stale_pending_slice_commit_without_dirty_attr_preserves_newer_size() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-stale-attr");

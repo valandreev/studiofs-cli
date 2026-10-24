@@ -2148,7 +2148,7 @@ impl StudioVfs {
         expected: super::AttrReadObservation,
     ) -> VfsResult<Option<InodeAttr>> {
         if self.ignored_entry_attr(ino).is_some()
-            || self.deferred_namespace_attr(ino).is_some()
+            || self.has_deferred_namespace_attr_or_inode(ino)
             || self.peek_dirty_attr(ino).is_some()
         {
             return Ok(None);

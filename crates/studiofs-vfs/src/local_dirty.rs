@@ -1149,6 +1149,9 @@ impl<'a> LocalDirtyFlushSession<'a> {
         if pending_slices.is_empty() {
             return Ok(());
         }
+        self.vfs
+            .wait_for_deferred_namespace_metadata(self.ino)
+            .await?;
 
         let mut content_epoch = content_epoch;
         let mut attr_to_persist = attr_to_persist;
