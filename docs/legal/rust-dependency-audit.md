@@ -1,5 +1,29 @@
 # Rust dependency license audit for v0.2.0
 
+## PR #851 renewed baseline, 2026-10-24
+
+The committed inventory is renewed for `xxhash-rust 0.8.15 -> 0.8.16` after
+reviewing both published crate archives. The new archive SHA-256 is
+`4d93c89cdc2d3a63c3ec48ffe926931bdc069eafa8e4402fe6d8f790c9d1e576`.
+Both manifests declare `BSL-1.0`; their `LICENSE` files are byte-identical
+(SHA-256 `c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566`).
+No changed copyright or additional embedded-component license terms were found.
+Retain the existing Boost license text; no policy exception is needed.
+
+Reproduction used `cargo metadata --locked --format-version 1` saved as
+`target/pr851/metadata.json`, then
+`python docs/legal/generate-rust-dependency-inventory.py --metadata target/pr851/metadata.json --output target/pr851/inventory-candidate.json`.
+The lockfile also reassigns incoming dependency
+edges among already reviewed `windows-core` and `windows-sys` versions; the
+inventory records those edges and target features without changing their
+archive evidence. Counts remain 667 lock entries, including 655 registry and
+12 workspace packages, with unchanged package counts for all three target scopes.
+The LF-normalized lockfile SHA-256 is
+`54b0005c383f4f84d2ed8084444a29c9cb826c1b6cc3c37243ef808a6a2fe55c`;
+the renewed inventory SHA-256 is
+`c5530f695a3a965d119613e20a811c547de0a53fb2986dfe61af4cced929477a`.
+Earlier audit and release-artifact hashes below remain historical evidence.
+
 ## SFS-882 renewed baseline, 2026-10-24
 
 The committed inventory is intentionally renewed for the compatible security
