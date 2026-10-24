@@ -217,7 +217,7 @@ where
             Vec<studiofs_meta::schema::SliceRecord>,
         )>,
     > {
-        let mut chunks: std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>> =
+        let mut chunks: std::collections::BTreeMap<u64, OverlayChunkRecords> =
             std::collections::BTreeMap::new();
 
         if !dirty_chunk_slices.is_empty() {
@@ -234,9 +234,7 @@ where
                 for slice in slices {
                     if let Some(object_id) = slice.object_id {
                         let slice_len = slice.range.len();
-                        append_unique_overlay_slice_record(
-                            &mut chunks,
-                            chunk_id,
+                        chunks.entry(chunk_id).or_default().append_unique(
                             studiofs_meta::schema::SliceRecord {
                                 slice_id: studiofs_meta::schema::SliceId::default(),
                                 order: studiofs_meta::schema::SliceOrder::default(),
@@ -287,26 +285,31 @@ where
             self.append_persisted_block_slice_records(&mut chunks, persisted)?;
         }
 
-        for slices in chunks.values_mut() {
-            let mut next_slice_id = 1u64;
-            let mut next_slice_order = 1u64;
-            for slice in slices.iter_mut() {
-                slice.slice_id = studiofs_meta::schema::SliceId(next_slice_id);
-                slice.order = studiofs_meta::schema::SliceOrder(next_slice_order);
-                next_slice_id = next_slice_id.saturating_add(1);
-                next_slice_order = next_slice_order.saturating_add(1);
-            }
-        }
-
+        // Upload submission follows these block snapshots, so their records stay.
+        let upload_object_ids: std::collections::HashSet<u64> = persisted_blocks
+            .iter()
+            .map(|persisted| persisted.object_id)
+            .collect();
         Ok(chunks
             .into_iter()
-            .map(|(k, v)| (studiofs_meta::schema::ChunkId(k), v))
+            .map(|(chunk_id, records)| {
+                let mut slices = records.into_visible_records(&upload_object_ids);
+                let mut next_slice_id = 1u64;
+                let mut next_slice_order = 1u64;
+                for slice in &mut slices {
+                    slice.slice_id = studiofs_meta::schema::SliceId(next_slice_id);
+                    slice.order = studiofs_meta::schema::SliceOrder(next_slice_order);
+                    next_slice_id = next_slice_id.saturating_add(1);
+                    next_slice_order = next_slice_order.saturating_add(1);
+                }
+                (studiofs_meta::schema::ChunkId(chunk_id), slices)
+            })
             .collect())
     }
 
     fn append_persisted_block_slice_records(
         &self,
-        chunks: &mut std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>>,
+        chunks: &mut std::collections::BTreeMap<u64, OverlayChunkRecords>,
         persisted: &PersistedPayloadEntry,
     ) -> VfsResult<()> {
         let block_start = (persisted.block_index as u64).saturating_mul(self.block_size as u64);
@@ -387,10 +390,10 @@ where
                     ),
                 ))
             })?;
-            append_unique_overlay_slice_record(
-                chunks,
-                chunk_id,
-                studiofs_meta::schema::SliceRecord {
+            chunks
+                .entry(chunk_id)
+                .or_default()
+                .append_unique(studiofs_meta::schema::SliceRecord {
                     slice_id: studiofs_meta::schema::SliceId::default(),
                     order: studiofs_meta::schema::SliceOrder::default(),
                     range: slice_range,
@@ -401,8 +404,7 @@ where
                         flags,
                     }),
                     payload_state: studiofs_meta::schema::PayloadRefState::LocalOnly,
-                },
-            );
+                });
             file_pos = file_pos.checked_add(slice_len).ok_or_else(|| {
                 crate::VfsError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -519,27 +521,130 @@ where
     }
 }
 
-fn append_unique_overlay_slice_record(
-    chunks: &mut std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>>,
-    chunk_id: u64,
-    record: studiofs_meta::schema::SliceRecord,
-) {
-    let slices = chunks.entry(chunk_id).or_default();
-    let Some(existing) = slices.iter_mut().find(|existing| {
-        existing.range == record.range
-            && existing.payload_state == record.payload_state
-            && same_overlay_payload_reference(existing.payload, record.payload)
-    }) else {
-        slices.push(record);
-        return;
-    };
-    // A pending persisted slice marks every object as partial, while the
-    // block-snapshot path can prove that the same object covers a full block.
-    // Keep the later, more precise reference when both describe the same
-    // immutable object span.
-    if existing.payload != record.payload {
-        *existing = record;
+/// Range plus immutable object span; flags are excluded so precise and partial
+/// references to the same span deduplicate.
+type OverlayRecordKey = (u32, u32, Option<(u64, u32, u32)>);
+
+/// Overlay records for one chunk in commit order: a later record wins reads.
+#[derive(Default)]
+pub(super) struct OverlayChunkRecords {
+    records: Vec<studiofs_meta::schema::SliceRecord>,
+    by_reference: std::collections::HashMap<OverlayRecordKey, smallvec::SmallVec<[usize; 1]>>,
+}
+
+impl OverlayChunkRecords {
+    fn append_unique(&mut self, record: studiofs_meta::schema::SliceRecord) {
+        let key = (
+            record.range.start,
+            record.range.end,
+            record
+                .payload
+                .map(|payload| (payload.object_id, payload.offset, payload.length)),
+        );
+        let candidates = self.by_reference.entry(key).or_default();
+        let existing = candidates.iter().copied().find(|index| {
+            let existing = &self.records[*index];
+            existing.payload_state == record.payload_state
+                && same_overlay_payload_reference(existing.payload, record.payload)
+        });
+        let Some(existing) = existing else {
+            candidates.push(self.records.len());
+            self.records.push(record);
+            return;
+        };
+        // A pending persisted slice marks every object as partial, while the
+        // block-snapshot path can prove that the same object covers a full block.
+        // Keep the later, more precise reference when both describe the same
+        // immutable object span.
+        if self.records[existing].payload != record.payload {
+            self.records[existing] = record;
+        }
     }
+
+    /// Drop records that later records fully cover, so repeated overwrites keep
+    /// the descriptor bounded by visible extents instead of write count.
+    ///
+    /// The metadata engine already drops existing slices covered by newer ones;
+    /// this applies the same rule inside one mutation. A covered record survives
+    /// when it is the last reference to its object, or when its object is
+    /// submitted for upload, so no local payload loses its only reference.
+    fn into_visible_records(
+        self,
+        upload_object_ids: &std::collections::HashSet<u64>,
+    ) -> Vec<studiofs_meta::schema::SliceRecord> {
+        let records = self.records;
+        let mut covered = vec![false; records.len()];
+        let mut coverage = std::collections::BTreeMap::new();
+        for (index, record) in records.iter().enumerate().rev() {
+            covered[index] = range_is_covered(&coverage, record.range);
+            insert_covered_range(&mut coverage, record.range);
+        }
+        if !covered.contains(&true) {
+            return records;
+        }
+
+        let mut visible_references: std::collections::HashMap<u64, usize> =
+            std::collections::HashMap::new();
+        for (record, covered) in records.iter().zip(&covered) {
+            if let (false, Some(payload)) = (*covered, record.payload) {
+                *visible_references.entry(payload.object_id).or_default() += 1;
+            }
+        }
+        let mut keep = vec![true; records.len()];
+        for (index, record) in records.iter().enumerate().rev() {
+            if !covered[index] {
+                continue;
+            }
+            keep[index] = record.payload.is_some_and(|payload| {
+                if upload_object_ids.contains(&payload.object_id) {
+                    return true;
+                }
+                let references = visible_references.entry(payload.object_id).or_default();
+                let only_reference = *references == 0;
+                *references = references.saturating_add(1);
+                only_reference
+            });
+        }
+        records
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(record, keep)| keep.then_some(record))
+            .collect()
+    }
+}
+
+/// Whether one disjoint interval in `coverage` (start -> end) contains `range`.
+fn range_is_covered(
+    coverage: &std::collections::BTreeMap<u32, u32>,
+    range: studiofs_meta::schema::SliceRange,
+) -> bool {
+    coverage
+        .range(..=range.start)
+        .next_back()
+        .is_some_and(|(_, end)| *end >= range.end)
+}
+
+/// Add `range` to `coverage`, merging overlapping or adjacent intervals.
+fn insert_covered_range(
+    coverage: &mut std::collections::BTreeMap<u32, u32>,
+    range: studiofs_meta::schema::SliceRange,
+) {
+    let (mut start, mut end) = (range.start, range.end);
+    if let Some((&previous_start, &previous_end)) = coverage.range(..=start).next_back()
+        && previous_end >= start
+    {
+        start = previous_start;
+        end = end.max(previous_end);
+        coverage.remove(&previous_start);
+    }
+    while let Some((&next_start, &next_end)) = coverage.range(start..).next() {
+        if next_start > end {
+            break;
+        }
+        end = end.max(next_end);
+        coverage.remove(&next_start);
+    }
+    coverage.insert(start, end);
 }
 
 fn same_overlay_payload_reference(

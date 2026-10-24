@@ -752,8 +752,10 @@ impl RedbMetaEngine {
         if let Some(previous) = previous {
             for (chunk_id, chunk) in &mut chunks {
                 if let Some(previous_chunk) = previous.chunks.get(chunk_id) {
+                    let completed =
+                        super::payload_objects::CompletedOverlayPayloads::new(previous_chunk);
                     for slice in chunk.slices.values_mut() {
-                        Self::preserve_completed_overlay_payload_state(previous_chunk, slice);
+                        completed.preserve(slice);
                     }
                 }
             }
