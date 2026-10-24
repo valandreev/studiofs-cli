@@ -330,6 +330,22 @@ cargo test -p studiofs-bridge --lib posix::tests:: -- --nocapture
 Windows cannot execute the POSIX module guarded by `cfg(unix)`. These focused
 tests do not establish live mounted disk-full acceptance.
 
+### SFS-887 Synchronous Namespace Operations on the Mount Runtime
+
+Platform dispatcher threads (libfuse, macFUSE, WinFSP) call `rename`,
+`unlink`, `rmdir`, and `link` outside any Tokio context. These calls used to
+build and drop a temporary multi-thread runtime per operation, which cost about
+1.5 ms each and cancelled any task the operation spawned. `start()` now records
+the mount runtime and synchronous entry points block on it:
+
+```sh
+cargo test -p studiofs-vfs --lib sync_namespace_ops_from_foreign_thread_run_on_mount_runtime -- --nocapture
+```
+
+This focused test does not establish mounted acceptance. The mounted check is
+a per-op `rename`/`unlink` latency microbenchmark on a Linux mount, compared
+with the audit baseline of about 1.5 ms per unlink and 4.2 ms per rename.
+
 ### SFS-886 Linux Runtime Stats Surface
 
 The Linux FUSE bridge used to send reads of `.studiofs-runtime-stats` to the
