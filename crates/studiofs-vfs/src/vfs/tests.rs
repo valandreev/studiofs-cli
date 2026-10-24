@@ -2589,6 +2589,93 @@ fn invalidation_worker_retries_writer_deferred_generation_without_new_metadata()
 }
 
 #[test]
+fn local_namespace_change_reconciles_by_scope_without_walking_the_volume() {
+    use super::workers::{
+        MetadataInvalidationWakeReason, MetadataReconcileOutcome, MetadataReconcileState,
+    };
+    use studiofs_meta::MetaEvent;
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "semantic-scoped-reconcile");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let mut files = Vec::new();
+        for dir_index in 0..8 {
+            let dir = vfs
+                .mkdir(ROOT_INO, format!("dir-{dir_index}").as_bytes(), 0, 0, 0o755)
+                .expect("mkdir");
+            for file_index in 0..32 {
+                let name = format!("file-{file_index}");
+                vfs.create(dir.ino, name.as_bytes(), 0, 0, 0o644)
+                    .expect("create");
+                files.push((dir.ino, name));
+            }
+        }
+        vfs.set_kernel_invalidator(Arc::new(AlwaysQueueKernelInvalidator));
+        let counters = &vfs.metadata_reconcile_counters;
+        let mut state = MetadataReconcileState::default();
+        // Drives the worker's per-change step directly: each local commit is
+        // drained from the journal, then reconciled as one pass.
+        let pass = MetadataInvalidationWakeReason::BackendNotify;
+        vfs.drain_semantic_invalidations_into(&mut state.scope);
+        let outcome = vfs
+            .reconcile_metadata_pass(&mut state, pass, true, true)
+            .await;
+        assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
+        assert_eq!(
+            counters.full_walks(),
+            1,
+            "the first pass establishes the baseline"
+        );
+
+        let (parent, name) = &files[0];
+        vfs.rename(*parent, name.as_bytes(), ROOT_INO, b"renamed", false)
+            .expect("rename");
+        vfs.drain_semantic_invalidations_into(&mut state.scope);
+        let outcome = vfs
+            .reconcile_metadata_pass(&mut state, pass, true, false)
+            .await;
+        assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
+
+        let (parent, name) = &files[1];
+        vfs.unlink(*parent, name.as_bytes()).expect("unlink");
+        vfs.drain_semantic_invalidations_into(&mut state.scope);
+        let outcome = vfs
+            .reconcile_metadata_pass(&mut state, pass, true, false)
+            .await;
+        assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
+
+        // A replicated change is journaled; its scope is consumed by inode.
+        let (parent, name) = &files[2];
+        let entry = meta.lookup(*parent, name.as_bytes()).expect("lookup");
+        let mut changed = meta.get_attr(entry.ino).expect("attr");
+        changed.mtime += 1;
+        meta.apply_replica_serving_state(&[MetaEvent::SetAttr { attr: changed }])
+            .expect("commit replicated change");
+        vfs.drain_semantic_invalidations_into(&mut state.scope);
+        assert!(
+            !state.scope.is_empty(),
+            "replicated change must name its scope"
+        );
+        let outcome = vfs
+            .reconcile_metadata_pass(&mut state, pass, false, true)
+            .await;
+        assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
+        assert!(
+            state.scope.is_empty(),
+            "scoped pass must consume the drained scope"
+        );
+
+        assert_eq!(counters.scoped_passes(), 3);
+        assert_eq!(
+            counters.full_walks(),
+            1,
+            "a local rename or unlink must not trigger a whole-volume traversal"
+        );
+    });
+}
+
+#[test]
 fn upload_dirty_state_without_an_open_writer_does_not_defer_invalidation() {
     use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
 

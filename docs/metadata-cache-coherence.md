@@ -154,9 +154,22 @@ Windows evidence does not establish macOS/Linux acceptance.
 Redb write transactions publish retained intents only after successful commit,
 before releasing write serialization. The PostgreSQL adapter exposes that local
 journal through `MetaReplication`; VFS consumes it before and after remote sync,
-including partial-sync failure and unchanged remote-token cases. The existing
-snapshot comparison remains as conservative reconciliation, without claiming
-precise delivery coverage from a snapshot diff.
+including partial-sync failure and unchanged remote-token cases.
+
+Per-change reconciliation (SFS-889) follows the drained batches: it re-reads
+only the inodes their intents name and evicts payload objects those inodes no
+longer reference. Cache and kernel scopes were already retired when the batch
+was applied. A whole-volume snapshot comparison remains as a conservative
+backstop, without claiming precise delivery coverage from its diff. It runs on
+the first pass (to establish the payload baseline), at most once per minute
+after a journal Reset, and otherwise at most every 15 minutes when a pass has
+metadata changes. While a Reset waits for that rate limit, every inode the
+mount already knows about is retired from the kernel at once, because legacy
+adapters cannot apply Reset themselves. Changed names are retired when the
+deferred walk runs. Intents are journaled when replica events are applied to
+the serving view. Local foreground operations invalidate their own scopes
+inline. When a local commit journals nothing, the payload objects it replaced
+are reclaimed by the next backstop walk or GC, not on the per-change path.
 
 Entry intents retain raw historical ancestor components and the previous inode
 binding. These contain no Windows separator or native notification flag. Directory
