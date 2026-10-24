@@ -394,6 +394,18 @@ user manual; their existing paths remain stable:
 - [docs/platform-bridges.md](docs/platform-bridges.md) - WinFSP and FUSE integration
 - [docs/legal/platform-distribution.md](docs/legal/platform-distribution.md) - WinFsp, libfuse3, and macFUSE distribution terms
 
+## Support StudioFS
+
+StudioFS is a free, open-source project developed and maintained in my spare time.
+
+If StudioFS has been useful to you, consider supporting its continued development with a small, one-time donation.
+
+**[Support StudioFS — Make a Donation](https://send.monobank.ua/jar/4S6k1iwV4d)**
+
+Donations are entirely optional, and StudioFS will always remain free and open source.
+
+Thank you for your support!
+
 ## Credits and Inspiration
 
 StudioFS is heavily inspired by the design choices of
