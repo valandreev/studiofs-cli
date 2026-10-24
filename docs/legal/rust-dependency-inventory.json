@@ -4,7 +4,7 @@
   "inputs": {
     "lockfile": {
       "path": "Cargo.lock",
-      "sha256": "54b0005c383f4f84d2ed8084444a29c9cb826c1b6cc3c37243ef808a6a2fe55c",
+      "sha256": "037ddc054286eab15a43c6732db4f6aaa19a2de9e3400a3479caba0521eae0d5",
       "sha256_input": "LF-normalized bytes"
     },
     "metadata_snapshot": {
@@ -29,8 +29,8 @@
     }
   },
   "package_counts": {
-    "lock_rows": 667,
-    "registry_third_party": 655,
+    "lock_rows": 669,
+    "registry_third_party": 657,
     "workspace": 12
   },
   "packages": [
@@ -1651,7 +1651,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -1665,7 +1665,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -2966,7 +2966,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -2980,7 +2980,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -3064,22 +3064,22 @@
     },
     {
       "name": "aws-smithy-async",
-      "version": "1.2.13",
+      "version": "1.2.14",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "5cc50d0f63e714784b84223abd7abbc8577de8c35d699e0edd19f0a88a08ae13",
+      "checksum": "2ffcaf626bdda484571968400c326a244598634dc75fd451325a54ad1a59acfc",
       "package_kind": "third-party",
       "license_expression": "Apache-2.0",
       "license_expression_id": "spdx:2af71558e438db0b",
       "repository": "https://github.com/smithy-lang/smithy-rs",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-smithy-async@1.2.13/Cargo.toml",
-        "sha256": "669d8cea288ebd286ef94545d8329ec6821ca005a34fd409be2b57d4fc9b213c"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-smithy-async@1.2.14/Cargo.toml",
+        "sha256": "648b1689e15380148666b999a7d09be0b2b737406fed7bfc542c6700b0e3b646"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "669d8cea288ebd286ef94545d8329ec6821ca005a34fd409be2b57d4fc9b213c",
-          "archive_member_sha256": "669d8cea288ebd286ef94545d8329ec6821ca005a34fd409be2b57d4fc9b213c",
+          "sha256": "648b1689e15380148666b999a7d09be0b2b737406fed7bfc542c6700b0e3b646",
+          "archive_member_sha256": "648b1689e15380148666b999a7d09be0b2b737406fed7bfc542c6700b0e3b646",
           "archive_member_status": "verified"
         },
         {
@@ -3091,8 +3091,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/aws-smithy-async-1.2.13.crate",
-        "sha256": "5cc50d0f63e714784b84223abd7abbc8577de8c35d699e0edd19f0a88a08ae13"
+        "path": "registry/cache/crates-io/aws-smithy-async-1.2.14.crate",
+        "sha256": "2ffcaf626bdda484571968400c326a244598634dc75fd451325a54ad1a59acfc"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -3169,7 +3169,7 @@
         {
           "from": {
             "name": "aws-smithy-runtime-api",
-            "version": "1.11.5",
+            "version": "1.12.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -3495,7 +3495,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -3509,7 +3509,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -3525,22 +3525,22 @@
     },
     {
       "name": "aws-smithy-json",
-      "version": "0.62.4",
+      "version": "0.62.7",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "27b3a779093e18cad88bbae08dc4261e1d95018c4c5b9356a52bcae7c0b6e9bb",
+      "checksum": "701a947f4797e52a911e114a898667c746c39feea467bbd1abd7b3721f702ffa",
       "package_kind": "third-party",
       "license_expression": "Apache-2.0",
       "license_expression_id": "spdx:2af71558e438db0b",
       "repository": "https://github.com/smithy-lang/smithy-rs",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-smithy-json@0.62.4/Cargo.toml",
-        "sha256": "592a03c56fefb1710ff4a0149deb3c0d0f09d55df848a1d8d744a3731e8145de"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-smithy-json@0.62.7/Cargo.toml",
+        "sha256": "c50809c7f6348f6341d6a1a0c7c87bd27f6b4009aef37faaca480dd8ce48abf3"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "592a03c56fefb1710ff4a0149deb3c0d0f09d55df848a1d8d744a3731e8145de",
-          "archive_member_sha256": "592a03c56fefb1710ff4a0149deb3c0d0f09d55df848a1d8d744a3731e8145de",
+          "sha256": "c50809c7f6348f6341d6a1a0c7c87bd27f6b4009aef37faaca480dd8ce48abf3",
+          "archive_member_sha256": "c50809c7f6348f6341d6a1a0c7c87bd27f6b4009aef37faaca480dd8ce48abf3",
           "archive_member_status": "verified"
         },
         {
@@ -3552,8 +3552,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/aws-smithy-json-0.62.4.crate",
-        "sha256": "27b3a779093e18cad88bbae08dc4261e1d95018c4c5b9356a52bcae7c0b6e9bb"
+        "path": "registry/cache/crates-io/aws-smithy-json-0.62.7.crate",
+        "sha256": "701a947f4797e52a911e114a898667c746c39feea467bbd1abd7b3721f702ffa"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -3716,22 +3716,22 @@
     },
     {
       "name": "aws-smithy-runtime-api",
-      "version": "1.11.5",
+      "version": "1.12.3",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "b4af6e5def28be846479bbeac55aa4603d6f7986fc5da4601ba324dd5d377516",
+      "checksum": "9db177daa6ba8afb9ee1aefcf548c907abcf52065e394ee11a92780057fe0e8c",
       "package_kind": "third-party",
       "license_expression": "Apache-2.0",
       "license_expression_id": "spdx:2af71558e438db0b",
       "repository": "https://github.com/smithy-lang/smithy-rs",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-smithy-runtime-api@1.11.5/Cargo.toml",
-        "sha256": "bead442d661075dc424ed9ea619497343ee2091b2e2a2a6cd14e160d1181e081"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-smithy-runtime-api@1.12.3/Cargo.toml",
+        "sha256": "51e205b57ec399e08a16d752cb398e069174b69444e58c8396c84fee8be60797"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "bead442d661075dc424ed9ea619497343ee2091b2e2a2a6cd14e160d1181e081",
-          "archive_member_sha256": "bead442d661075dc424ed9ea619497343ee2091b2e2a2a6cd14e160d1181e081",
+          "sha256": "51e205b57ec399e08a16d752cb398e069174b69444e58c8396c84fee8be60797",
+          "archive_member_sha256": "51e205b57ec399e08a16d752cb398e069174b69444e58c8396c84fee8be60797",
           "archive_member_status": "verified"
         },
         {
@@ -3743,8 +3743,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/aws-smithy-runtime-api-1.11.5.crate",
-        "sha256": "b4af6e5def28be846479bbeac55aa4603d6f7986fc5da4601ba324dd5d377516"
+        "path": "registry/cache/crates-io/aws-smithy-runtime-api-1.12.3.crate",
+        "sha256": "9db177daa6ba8afb9ee1aefcf548c907abcf52065e394ee11a92780057fe0e8c"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -3833,6 +3833,19 @@
         },
         {
           "from": {
+            "name": "aws-smithy-json",
+            "version": "0.62.7",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "aws-smithy-observability",
             "version": "0.2.5",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -3859,6 +3872,19 @@
         },
         {
           "from": {
+            "name": "aws-smithy-schema",
+            "version": "0.1.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "aws-types",
             "version": "1.3.13",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -3874,23 +3900,23 @@
       "targets": {}
     },
     {
-      "name": "aws-smithy-types",
-      "version": "1.4.5",
+      "name": "aws-smithy-runtime-api-macros",
+      "version": "1.0.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "8ca2734c16913a45343b37313605d84e7d8b34a4611598ce1d25b35860a2bed3",
+      "checksum": "8d7396fd9500589e62e460e987ecb671bad374934e55ec3b5f498cc7a8a8a7b7",
       "package_kind": "third-party",
       "license_expression": "Apache-2.0",
       "license_expression_id": "spdx:2af71558e438db0b",
       "repository": "https://github.com/smithy-lang/smithy-rs",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-smithy-types@1.4.5/Cargo.toml",
-        "sha256": "6c7595fd115cf9d69d14770d65c0c57c5a0847ae111ff6553b02542d8306ff73"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-smithy-runtime-api-macros@1.0.0/Cargo.toml",
+        "sha256": "e6dcd687a26c7dc3ac8b0d8a8f9e65234c6e2c00d11ab0add84fe172e3c4cf32"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "6c7595fd115cf9d69d14770d65c0c57c5a0847ae111ff6553b02542d8306ff73",
-          "archive_member_sha256": "6c7595fd115cf9d69d14770d65c0c57c5a0847ae111ff6553b02542d8306ff73",
+          "sha256": "e6dcd687a26c7dc3ac8b0d8a8f9e65234c6e2c00d11ab0add84fe172e3c4cf32",
+          "archive_member_sha256": "e6dcd687a26c7dc3ac8b0d8a8f9e65234c6e2c00d11ab0add84fe172e3c4cf32",
           "archive_member_status": "verified"
         },
         {
@@ -3902,8 +3928,118 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/aws-smithy-types-1.4.5.crate",
-        "sha256": "8ca2734c16913a45343b37313605d84e7d8b34a4611598ce1d25b35860a2bed3"
+        "path": "registry/cache/crates-io/aws-smithy-runtime-api-macros-1.0.0.crate",
+        "sha256": "8d7396fd9500589e62e460e987ecb671bad374934e55ec3b5f498cc7a8a8a7b7"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:2af71558e438db0b",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "aws-smithy-runtime-api",
+            "version": "1.12.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
+      "name": "aws-smithy-schema",
+      "version": "0.1.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "7442cb268338f0eb8278140a107c046756aa01093d8ef5e99628d34ae09c94f5",
+      "package_kind": "third-party",
+      "license_expression": "Apache-2.0",
+      "license_expression_id": "spdx:2af71558e438db0b",
+      "repository": "https://github.com/smithy-lang/smithy-rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-smithy-schema@0.1.0/Cargo.toml",
+        "sha256": "1a38fb4e80b59753814d836b00e320288209319bfa80d038449dc4790595744c"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "1a38fb4e80b59753814d836b00e320288209319bfa80d038449dc4790595744c",
+          "archive_member_sha256": "1a38fb4e80b59753814d836b00e320288209319bfa80d038449dc4790595744c",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b",
+          "archive_member_sha256": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/aws-smithy-schema-0.1.0.crate",
+        "sha256": "7442cb268338f0eb8278140a107c046756aa01093d8ef5e99628d34ae09c94f5"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:2af71558e438db0b",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "outside-selected-studiofs-targets",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "aws-smithy-json",
+            "version": "0.62.7",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {}
+    },
+    {
+      "name": "aws-smithy-types",
+      "version": "1.4.9",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "53f93074121a1be41317b9aa607143ae17900631f7f59a99f2b905d519d6783b",
+      "package_kind": "third-party",
+      "license_expression": "Apache-2.0",
+      "license_expression_id": "spdx:2af71558e438db0b",
+      "repository": "https://github.com/smithy-lang/smithy-rs",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#aws-smithy-types@1.4.9/Cargo.toml",
+        "sha256": "a891c2a7e82ae2f32d1c6f4346c9edaba923a473be9642463a13cb4a0aa90434"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "a891c2a7e82ae2f32d1c6f4346c9edaba923a473be9642463a13cb4a0aa90434",
+          "archive_member_sha256": "a891c2a7e82ae2f32d1c6f4346c9edaba923a473be9642463a13cb4a0aa90434",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b",
+          "archive_member_sha256": "09e8a9bcec8067104652c168685ab0931e7868f9c8284b66f5ae6edae5f1130b",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/aws-smithy-types-1.4.9.crate",
+        "sha256": "53f93074121a1be41317b9aa607143ae17900631f7f59a99f2b905d519d6783b"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -4019,7 +4155,7 @@
         {
           "from": {
             "name": "aws-smithy-json",
-            "version": "0.62.4",
+            "version": "0.62.7",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -4045,7 +4181,20 @@
         {
           "from": {
             "name": "aws-smithy-runtime-api",
-            "version": "1.11.5",
+            "version": "1.12.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "aws-smithy-schema",
+            "version": "0.1.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -4594,7 +4743,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -5322,7 +5471,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -5336,7 +5485,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -6450,7 +6599,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -6468,7 +6617,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -6573,7 +6722,7 @@
         {
           "from": {
             "name": "aws-smithy-runtime-api",
-            "version": "1.11.5",
+            "version": "1.12.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -6586,7 +6735,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -6833,7 +6982,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -6847,7 +6996,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -6861,7 +7010,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -7029,7 +7178,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -7421,7 +7570,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -7435,7 +7584,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -8554,7 +8703,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -8683,7 +8832,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -8697,7 +8846,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -8711,7 +8860,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -8725,7 +8874,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -8848,7 +8997,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -9115,7 +9264,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -9129,7 +9278,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -12054,7 +12203,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -12388,7 +12537,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -12402,7 +12551,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -12926,7 +13075,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -13592,7 +13741,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -13606,7 +13755,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -13620,7 +13769,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -13634,7 +13783,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -13648,7 +13797,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -15377,7 +15526,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -15609,7 +15758,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -16124,7 +16273,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -16138,7 +16287,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -16289,7 +16438,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -16303,7 +16452,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -16317,7 +16466,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -16662,7 +16811,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -17514,7 +17663,7 @@
         {
           "from": {
             "name": "aws-smithy-async",
-            "version": "1.2.13",
+            "version": "1.2.14",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -20883,7 +21032,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -20976,7 +21125,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -21109,7 +21258,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -21285,7 +21434,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -21418,7 +21567,7 @@
         {
           "from": {
             "name": "aws-smithy-runtime-api",
-            "version": "1.11.5",
+            "version": "1.12.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -21431,7 +21580,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -21596,7 +21745,20 @@
         {
           "from": {
             "name": "aws-smithy-runtime-api",
-            "version": "1.11.5",
+            "version": "1.12.3",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "aws-smithy-schema",
+            "version": "0.1.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -21609,7 +21771,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -21861,7 +22023,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -22009,7 +22171,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -22215,7 +22377,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -23862,7 +24024,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -24590,7 +24752,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -26468,7 +26630,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -26599,7 +26761,7 @@
         {
           "from": {
             "name": "rand",
-            "version": "0.8.5",
+            "version": "0.8.6",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -26612,7 +26774,7 @@
         {
           "from": {
             "name": "studiofs-bridge",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-bridge"
           },
@@ -26626,7 +26788,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -27212,7 +27374,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -27226,7 +27388,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -27240,7 +27402,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -28627,7 +28789,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -28654,7 +28816,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -28668,7 +28830,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -29823,7 +29985,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -31449,7 +31611,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -32418,7 +32580,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -32778,7 +32940,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -34488,7 +34650,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -36232,7 +36394,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -36246,7 +36408,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -36260,7 +36422,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -36927,7 +37089,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -36941,7 +37103,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -36955,7 +37117,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -36969,7 +37131,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -36983,7 +37145,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -37510,7 +37672,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -38118,7 +38280,7 @@
         {
           "from": {
             "name": "aws-smithy-async",
-            "version": "1.2.13",
+            "version": "1.2.14",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -38183,7 +38345,7 @@
         {
           "from": {
             "name": "aws-smithy-runtime-api",
-            "version": "1.11.5",
+            "version": "1.12.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -38196,7 +38358,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -38471,7 +38633,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -38567,7 +38729,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -39227,7 +39389,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -39241,7 +39403,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -39255,7 +39417,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -40426,7 +40588,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -40441,6 +40603,19 @@
           "from": {
             "name": "async-trait",
             "version": "0.1.89",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "aws-smithy-runtime-api-macros",
+            "version": "1.0.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -41017,7 +41192,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -41268,7 +41443,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -41774,6 +41949,19 @@
           "from": {
             "name": "async-trait",
             "version": "0.1.89",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "aws-smithy-runtime-api-macros",
+            "version": "1.0.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -42468,22 +42656,22 @@
     },
     {
       "name": "rand",
-      "version": "0.8.5",
+      "version": "0.8.6",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404",
+      "checksum": "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a",
       "package_kind": "third-party",
       "license_expression": "MIT OR Apache-2.0",
       "license_expression_id": "spdx:db11fec9946737df",
       "repository": "https://github.com/rust-random/rand",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#rand@0.8.5/Cargo.toml",
-        "sha256": "9bb028fb3b697653beb433ddcf4c1292b3db10ea5ed27a695df6e4e604ba6d4b"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#rand@0.8.6/Cargo.toml",
+        "sha256": "917446eb5e8c9a6cdc288851905dc62b032f65a7e84edddf0eba96a17bb5afc0"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "9bb028fb3b697653beb433ddcf4c1292b3db10ea5ed27a695df6e4e604ba6d4b",
-          "archive_member_sha256": "9bb028fb3b697653beb433ddcf4c1292b3db10ea5ed27a695df6e4e604ba6d4b",
+          "sha256": "917446eb5e8c9a6cdc288851905dc62b032f65a7e84edddf0eba96a17bb5afc0",
+          "archive_member_sha256": "917446eb5e8c9a6cdc288851905dc62b032f65a7e84edddf0eba96a17bb5afc0",
           "archive_member_status": "verified"
         },
         {
@@ -42507,8 +42695,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/rand-0.8.5.crate",
-        "sha256": "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
+        "path": "registry/cache/crates-io/rand-0.8.6.crate",
+        "sha256": "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -42591,22 +42779,22 @@
     },
     {
       "name": "rand",
-      "version": "0.9.2",
+      "version": "0.9.3",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1",
+      "checksum": "7ec095654a25171c2124e9e3393a930bddbffdc939556c914957a4c3e0a87166",
       "package_kind": "third-party",
       "license_expression": "MIT OR Apache-2.0",
       "license_expression_id": "spdx:db11fec9946737df",
       "repository": "https://github.com/rust-random/rand",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#rand@0.9.2/Cargo.toml",
-        "sha256": "2af4bbbb05a303fb72404597e803b64cb081d03b5aee2098490567afd54a2358"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#rand@0.9.3/Cargo.toml",
+        "sha256": "ce864a62aa38274ce86d81f96a806846bce37e9a599896f7581d28c767d48fa1"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "2af4bbbb05a303fb72404597e803b64cb081d03b5aee2098490567afd54a2358",
-          "archive_member_sha256": "2af4bbbb05a303fb72404597e803b64cb081d03b5aee2098490567afd54a2358",
+          "sha256": "ce864a62aa38274ce86d81f96a806846bce37e9a599896f7581d28c767d48fa1",
+          "archive_member_sha256": "ce864a62aa38274ce86d81f96a806846bce37e9a599896f7581d28c767d48fa1",
           "archive_member_status": "verified"
         },
         {
@@ -42630,8 +42818,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/rand-0.9.2.crate",
-        "sha256": "6db2770f06117d490610c7488547d543617b21bfa07796d7a12f6f1bd53850d1"
+        "path": "registry/cache/crates-io/rand-0.9.3.crate",
+        "sha256": "7ec095654a25171c2124e9e3393a930bddbffdc939556c914957a4c3e0a87166"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -42643,7 +42831,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -42754,7 +42942,7 @@
         {
           "from": {
             "name": "rand",
-            "version": "0.8.5",
+            "version": "0.8.6",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -42846,7 +43034,7 @@
         {
           "from": {
             "name": "rand",
-            "version": "0.9.2",
+            "version": "0.9.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -43076,7 +43264,7 @@
         {
           "from": {
             "name": "rand",
-            "version": "0.8.5",
+            "version": "0.8.6",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -43187,7 +43375,7 @@
         {
           "from": {
             "name": "rand",
-            "version": "0.9.2",
+            "version": "0.9.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -43464,7 +43652,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -43478,7 +43666,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -44274,7 +44462,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -45485,7 +45673,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -46037,7 +46225,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -46737,7 +46925,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -46958,7 +47146,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -46972,7 +47160,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -46986,7 +47174,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -47000,7 +47188,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -47014,7 +47202,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -47028,7 +47216,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -47206,7 +47394,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -47660,7 +47848,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -47674,7 +47862,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -47688,7 +47876,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -47702,7 +47890,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -47716,7 +47904,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -47730,7 +47918,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -48342,7 +48530,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -48356,7 +48544,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -48370,7 +48558,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -48384,7 +48572,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -48398,7 +48586,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -49415,7 +49603,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -50171,7 +50359,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -50424,7 +50612,7 @@
     },
     {
       "name": "studiofs",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50474,7 +50662,7 @@
     },
     {
       "name": "studiofs-bridge",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50504,7 +50692,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -50518,7 +50706,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -50547,7 +50735,7 @@
     },
     {
       "name": "studiofs-cache",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50575,7 +50763,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50589,7 +50777,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -50624,7 +50812,7 @@
     },
     {
       "name": "studiofs-data",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50654,7 +50842,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -50672,7 +50860,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -50686,7 +50874,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50700,7 +50888,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -50735,7 +50923,7 @@
     },
     {
       "name": "studiofs-e2e",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50766,7 +50954,7 @@
     },
     {
       "name": "studiofs-linux-fuse",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50796,7 +50984,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50819,7 +51007,7 @@
     },
     {
       "name": "studiofs-macfuse",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50849,7 +51037,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50872,7 +51060,7 @@
     },
     {
       "name": "studiofs-meta",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50902,7 +51090,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -50916,7 +51104,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50930,7 +51118,7 @@
         {
           "from": {
             "name": "studiofs-bridge",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-bridge"
           },
@@ -50944,7 +51132,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -50958,7 +51146,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -50972,7 +51160,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -50986,7 +51174,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -51000,7 +51188,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -51035,7 +51223,7 @@
     },
     {
       "name": "studiofs-scenario",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -51066,7 +51254,7 @@
     },
     {
       "name": "studiofs-test-support",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -51097,7 +51285,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -51111,7 +51299,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -51125,7 +51313,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -51139,7 +51327,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -51153,7 +51341,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -51167,7 +51355,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -51181,7 +51369,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -51195,7 +51383,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -51209,7 +51397,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -51225,7 +51413,7 @@
     },
     {
       "name": "studiofs-vfs",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -51255,7 +51443,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -51269,7 +51457,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -51283,7 +51471,7 @@
         {
           "from": {
             "name": "studiofs-bridge",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-bridge"
           },
@@ -51297,7 +51485,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -51311,7 +51499,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -51325,7 +51513,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -51360,7 +51548,7 @@
     },
     {
       "name": "studiofs-winfsp",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -51390,7 +51578,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -51775,7 +51963,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -51789,7 +51977,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -51804,6 +51992,19 @@
           "from": {
             "name": "async-trait",
             "version": "0.1.89",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "aws-smithy-runtime-api-macros",
+            "version": "1.0.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -52615,7 +52816,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -52629,7 +52830,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -52643,7 +52844,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -52990,7 +53191,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -53004,7 +53205,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -53018,7 +53219,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -53058,7 +53259,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -53072,7 +53273,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -53086,7 +53287,7 @@
         {
           "from": {
             "name": "studiofs-test-support",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-test-support"
           },
@@ -53100,7 +53301,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -53466,7 +53667,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -53480,7 +53681,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -53494,7 +53695,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -53508,7 +53709,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -53522,7 +53723,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -53536,7 +53737,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -53550,7 +53751,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -53564,7 +53765,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -53578,7 +53779,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -54115,7 +54316,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -54863,7 +55064,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -54881,7 +55082,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -54955,7 +55156,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -54986,7 +55187,7 @@
         {
           "from": {
             "name": "aws-smithy-async",
-            "version": "1.2.13",
+            "version": "1.2.14",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -55025,7 +55226,7 @@
         {
           "from": {
             "name": "aws-smithy-runtime-api",
-            "version": "1.11.5",
+            "version": "1.12.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -55038,7 +55239,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -55129,7 +55330,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -55143,7 +55344,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -55157,7 +55358,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -55171,7 +55372,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -55185,7 +55386,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -55199,7 +55400,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -55460,7 +55661,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -55474,7 +55675,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -55488,7 +55689,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -55502,7 +55703,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -55636,7 +55837,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -55735,7 +55936,7 @@
         {
           "from": {
             "name": "aws-smithy-types",
-            "version": "1.4.5",
+            "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -55761,7 +55962,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -55775,7 +55976,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -55789,7 +55990,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -55803,7 +56004,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -55979,7 +56180,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -57168,7 +57369,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -57273,7 +57474,7 @@
         {
           "from": {
             "name": "aws-smithy-runtime-api",
-            "version": "1.11.5",
+            "version": "1.12.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -57390,7 +57591,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -57404,7 +57605,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -57418,7 +57619,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -57432,7 +57633,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -57446,7 +57647,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -57460,7 +57661,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -57474,7 +57675,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -57590,7 +57791,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -57942,7 +58143,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -57956,7 +58157,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -57970,7 +58171,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -58120,7 +58321,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -59364,7 +59565,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -59378,7 +59579,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -59392,7 +59593,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -59406,7 +59607,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -59684,7 +59885,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -59702,7 +59903,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -59776,7 +59977,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -59790,7 +59991,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -59804,7 +60005,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -59818,7 +60019,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -62622,7 +62823,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -63333,7 +63534,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -63347,7 +63548,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -66848,7 +67049,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -66921,7 +67122,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -67000,7 +67201,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -67313,7 +67514,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -68369,7 +68570,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -69123,7 +69324,7 @@
         {
           "from": {
             "name": "aws-smithy-runtime-api",
-            "version": "1.11.5",
+            "version": "1.12.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -69188,7 +69389,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -69202,7 +69403,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },

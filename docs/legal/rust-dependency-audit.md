@@ -1,5 +1,22 @@
 # Rust dependency license audit for v0.2.0
 
+## Security updates, 2026-10-24
+
+The v0.2.1 lockfile intentionally adds and updates eight registry package
+identities for the approved security dependency updates. The renewed inventory
+contains 657 third-party packages and 12 workspace packages; the LF-normalized
+lockfile SHA-256 is
+`037ddc054286eab15a43c6732db4f6aaa19a2de9e3400a3479caba0521eae0d5`.
+The LF-normalized reviewed inventory SHA-256 is
+`8cd008549c29eb7158a32b3321ebde1c754f23c571a3a738be324b9362d365f9`.
+The [package archive review](security-update-license-review-2026-10-24.md)
+records the exact checksums and license evidence. All changed/new declarations
+remain `Apache-2.0` or `MIT OR Apache-2.0`; no license-policy exception or
+notice supplement was added. Strict release notice generation passed with zero
+unresolved third-party evidence; the existing AWS-LC and Fiat texts and CCADB
+attribution were present in its output. This review does not establish a binary
+link set.
+
 ## PR #851 renewed baseline, 2026-10-24
 
 The committed inventory is renewed for `xxhash-rust 0.8.15 -> 0.8.16` after

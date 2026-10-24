@@ -94,14 +94,18 @@ the approval of this delivery method.
 
 ## Prepare a release on GitHub
 
+The next distribution version is 0.2.1. Its working release notes are in
+[release-notes/v0.2.1.md](release-notes/v0.2.1.md). Keep the historical 0.2.0
+artifact and publication details above tied to their published version.
+
 The [Release builds workflow](../.github/workflows/release.yml) runs on a pushed
-version tag or manually from Actions. Use `v0.2.0` for workspace version `0.2.0`;
+version tag or manually from Actions. Use `v0.2.1` for workspace version `0.2.1`;
 a mismatched tag fails. Push the reviewed source branch first. After it is
 merged, the maintainer can tag that exact approved commit:
 
 ```bash
-git tag -a v0.2.0 <approved-commit> -m "StudioFS v0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 <approved-commit> -m "StudioFS v0.2.1"
+git push origin v0.2.1
 ```
 
 Do not retag a published version. Manual runs on a branch create workflow
