@@ -239,6 +239,58 @@ impl RedbMetaEngine {
         Ok(overlay)
     }
 
+    /// Collects overlay dentry keys under `parent` only, so a listing costs
+    /// O(entries in this directory) rather than O(dentries in the volume).
+    pub(super) fn collect_parent_overlay_dentries_from_tables<TCurrent, TBase, TTombstones>(
+        current: &TCurrent,
+        base: &TBase,
+        tombstones: &TTombstones,
+        parent: Ino,
+    ) -> MetaResult<HashSet<Vec<u8>>>
+    where
+        TCurrent: ReadableTable<&'static [u8], &'static [u8]>,
+        TBase: ReadableTable<&'static [u8], &'static [u8]>,
+        TTombstones: ReadableTable<&'static [u8], u8>,
+    {
+        #[cfg(test)]
+        super::tests::PARENT_OVERLAY_DENTRY_ROWS.with(|count| count.set(0));
+        let mut overlay = HashSet::new();
+        let prefix = dentry_prefix(parent);
+        let end = prefix_successor(&prefix);
+
+        let current_rows = match end.as_ref() {
+            Some(end) => current.range(prefix.as_slice()..end.as_ref()),
+            None => current.range(prefix.as_slice()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for row in current_rows {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            #[cfg(test)]
+            super::tests::PARENT_OVERLAY_DENTRY_ROWS.with(|count| count.set(count.get() + 1));
+            let key_bytes = key.value();
+            match base.get(key_bytes)? {
+                Some(base_value) if base_value.value() == value.value() => {}
+                _ => {
+                    overlay.insert(key_bytes.to_vec());
+                }
+            }
+        }
+
+        let tombstone_rows = match end.as_ref() {
+            Some(end) => tombstones.range(prefix.as_slice()..end.as_ref()),
+            None => tombstones.range(prefix.as_slice()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for row in tombstone_rows {
+            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            #[cfg(test)]
+            super::tests::PARENT_OVERLAY_DENTRY_ROWS.with(|count| count.set(count.get() + 1));
+            overlay.insert(key.value().to_vec());
+        }
+
+        Ok(overlay)
+    }
+
     // The boolean records exact-key local authority for remote visibility filtering.
     fn lookup_merged_exact_key_from_opened_tables<TBase, TCurrent, TTombstones>(
         base: &TBase,
@@ -719,8 +771,12 @@ impl RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries =
-            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
+        let overlay_dentries = Self::collect_parent_overlay_dentries_from_tables(
+            &current,
+            &base,
+            &tombstones,
+            parent,
+        )?;
         let merged = Self::readdir_merged_from_opened_tables(
             &base,
             &current,

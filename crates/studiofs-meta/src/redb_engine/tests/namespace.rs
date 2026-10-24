@@ -531,6 +531,68 @@ thread_local! {
     pub(super) static UNICODE_NAME_LOWERINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static VISIBILITY_TABLE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static OVERLAY_DENTRY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static PARENT_OVERLAY_DENTRY_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[test]
+fn readdir_of_small_directory_does_not_scan_unrelated_overlay_dentries() {
+    let engine = temp_engine();
+    let dir = engine
+        .create_dir(ROOT_INO, b"small", 1000, 1000, 0o755)
+        .unwrap();
+    let kept = engine
+        .create_file(dir.ino, b"kept", 1000, 1000, 0o644)
+        .unwrap();
+    let txn = engine.begin_write_txn().unwrap();
+    {
+        let mut current = txn.open_table(DENTRIES_TABLE).unwrap();
+        let mut base = txn.open_table(BASE_DENTRIES_TABLE).unwrap();
+        let mut tombstones = txn.open_table(DENTRY_TOMBSTONES_TABLE).unwrap();
+        let value = encode(&DirEntryValue {
+            ino: kept.ino,
+            kind: FileType::RegularFile,
+        })
+        .unwrap();
+        // A locally deleted base entry inside `dir` must stay hidden.
+        let removed = encode_dentry_key(dir.ino, b"removed");
+        base.insert(removed.as_slice(), value.as_slice()).unwrap();
+        tombstones.insert(removed.as_slice(), 1).unwrap();
+        for parent in 10_000..20_000 {
+            current
+                .insert(
+                    encode_dentry_key(parent, b"unrelated").as_slice(),
+                    value.as_slice(),
+                )
+                .unwrap();
+            tombstones
+                .insert(encode_dentry_key(parent, b"gone").as_slice(), 1)
+                .unwrap();
+        }
+    }
+    txn.commit().unwrap();
+
+    OVERLAY_DENTRY_SCANS.set(0);
+    let names = |entries: Vec<DirEntry>| {
+        entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(engine.readdir(dir.ino).unwrap()), vec![b"kept".to_vec()]);
+    assert_eq!(OVERLAY_DENTRY_SCANS.get(), 0, "read readdir scanned the volume");
+    // One current row plus one tombstone row belong to `dir`.
+    assert_eq!(PARENT_OVERLAY_DENTRY_ROWS.get(), 2);
+
+    let txn = engine.begin_write_txn().unwrap();
+    let merged = RedbMetaEngine::readdir_merged_in_write_txn(&txn, dir.ino).unwrap();
+    txn.abort().unwrap();
+    assert_eq!(names(merged), vec![b"kept".to_vec()]);
+    assert_eq!(
+        OVERLAY_DENTRY_SCANS.get(),
+        0,
+        "write readdir scanned the volume"
+    );
+    assert_eq!(PARENT_OVERLAY_DENTRY_ROWS.get(), 2);
 }
 
 #[test]

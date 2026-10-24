@@ -159,8 +159,12 @@ impl MetaNamespace for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let remote_filter_enabled =
             Self::remote_namespace_visibility_filter_enabled_in_read_txn(&txn)?;
-        let overlay_dentries =
-            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
+        let overlay_dentries = Self::collect_parent_overlay_dentries_from_tables(
+            &current,
+            &base,
+            &tombstones,
+            parent,
+        )?;
 
         let merged = Self::readdir_merged_from_opened_tables(
             &base,
