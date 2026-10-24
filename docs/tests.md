@@ -346,6 +346,23 @@ This focused test does not establish mounted acceptance. The mounted check is
 a per-op `rename`/`unlink` latency microbenchmark on a Linux mount, compared
 with the audit baseline of about 1.5 ms per unlink and 4.2 ms per rename.
 
+### Linux FUSE Exit Signals Off the Loop Thread
+
+libfuse's exit handler only sets the session's exited flag. The multi-thread
+loop sees it when the signal interrupts its own `sem_wait()`, and libfuse
+workers block exit signals. With the tray active, the main thread runs the tray
+event loop and receives a terminal Ctrl+C, so the loop never woke. The C shim
+now wraps libfuse's SIGHUP/SIGINT/SIGTERM handler and re-sends the signal to the
+loop thread:
+
+```sh
+cargo test -p studiofs-linux-fuse --lib exit_signal_on_another_thread_wakes_the_session_loop_thread -- --nocapture
+```
+
+This focused test does not establish mounted acceptance. The mounted check is
+Ctrl+C (or `kill -INT <pid>`) on `studiofs mount` with the tray active on Linux,
+which must log `VFS shutdown: complete` and unmount.
+
 ### SFS-886 Linux Runtime Stats Surface
 
 The Linux FUSE bridge used to send reads of `.studiofs-runtime-stats` to the
