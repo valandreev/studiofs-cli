@@ -20515,6 +20515,50 @@ fn linux_trash_rename_deletes_directory_subtree() {
 }
 
 #[test]
+fn trash_ancestor_check_follows_current_root_child_binding() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "trash-ancestor-root-child-binding");
+
+    let trash_root = vfs
+        .mkdir(ROOT_INO, b".Trash-1000", 1000, 1000, 0o755)
+        .expect("create trash root");
+    let deep = vfs
+        .mkdir(trash_root.ino, b"files", 1000, 1000, 0o755)
+        .expect("create trash files");
+    let deep = vfs
+        .mkdir(deep.ino, b"nested", 1000, 1000, 0o755)
+        .expect("create nested trash directory");
+    let plain = vfs
+        .mkdir(ROOT_INO, b"plain", 1000, 1000, 0o755)
+        .expect("create plain directory");
+    let plain_child = vfs
+        .mkdir(plain.ino, b"child", 1000, 1000, 0o755)
+        .expect("create plain child");
+
+    assert!(!vfs.directory_has_probable_trash_ancestor(ROOT_INO).unwrap());
+    assert!(
+        vfs.directory_has_probable_trash_ancestor(trash_root.ino)
+            .unwrap()
+    );
+    assert!(vfs.directory_has_probable_trash_ancestor(deep.ino).unwrap());
+    assert!(
+        !vfs.directory_has_probable_trash_ancestor(plain_child.ino)
+            .unwrap()
+    );
+
+    // Renaming the root child changes the answer for its whole subtree.
+    vfs.rename(ROOT_INO, b".Trash-1000", ROOT_INO, b"restored", false)
+        .expect("rename trash root away");
+    vfs.rename(ROOT_INO, b"plain", ROOT_INO, b".Trash", false)
+        .expect("rename plain directory to a trash name");
+    assert!(!vfs.directory_has_probable_trash_ancestor(deep.ino).unwrap());
+    assert!(
+        vfs.directory_has_probable_trash_ancestor(plain_child.ino)
+            .unwrap()
+    );
+}
+
+#[test]
 fn windows_recycle_bin_rename_deletes_directory_subtree() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "windows-recycle-bin-directory-delete");

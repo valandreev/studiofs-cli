@@ -2,7 +2,6 @@ use super::{
     AccessLevel, FileType, Ino, MetaError, ROOT_INO, StudioVfs, VfsError, VfsResult, debug, warn,
 };
 use crate::runtime::run_local_cache_io_blocking;
-use std::collections::HashSet;
 
 impl StudioVfs {
     /// Get an extended attribute value.
@@ -133,59 +132,49 @@ impl StudioVfs {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Reports whether `dir_ino` lies under a trash-like directory in the root.
+    ///
+    /// Walks directory parents to the root child and checks only that child's
+    /// own bindings, so the cost tracks path depth rather than the size of the
+    /// root directory.
     pub(super) fn directory_has_probable_trash_ancestor(&self, dir_ino: Ino) -> VfsResult<bool> {
-        let trash_roots = self.root_trash_dir_inodes()?;
-        self.directory_has_any_root_ancestor(dir_ino, &trash_roots)
-    }
-
-    fn directory_has_any_root_ancestor(
-        &self,
-        dir_ino: Ino,
-        trash_roots: &HashSet<Ino>,
-    ) -> VfsResult<bool> {
-        if trash_roots.is_empty() {
-            return Ok(false);
-        }
+        let meta = self.sync_meta();
         let mut current = dir_ino;
         let mut hops = 0usize;
-        while current != 0 && hops < 1024 {
-            if trash_roots.contains(&current) {
-                return Ok(true);
+        // Directory `parent` is authoritative; hard links never apply to directories.
+        let root_child = loop {
+            if current == 0 || current == ROOT_INO || hops >= 1024 {
+                return Ok(false);
             }
-            let attr = self.sync_meta().get_attr(current)?;
-            let parent = attr.parent;
+            let parent = match meta.get_attr(current) {
+                Ok(attr) => attr.parent,
+                Err(MetaError::InodeNotFound(_)) => return Ok(false),
+                Err(err) => return Err(err.into()),
+            };
+            if parent == ROOT_INO {
+                break current;
+            }
             if parent == 0 || parent == current {
-                break;
-            }
-            if trash_roots.contains(&parent) {
-                return Ok(true);
+                return Ok(false);
             }
             current = parent;
             hops += 1;
-        }
-        Ok(false)
-    }
+        };
 
-    fn root_trash_dir_inodes(&self) -> VfsResult<HashSet<Ino>> {
-        self.root_directory_inodes_matching(super::is_probable_trash_component)
-    }
-
-    fn root_directory_inodes_matching(
-        &self,
-        predicate: fn(&[u8]) -> bool,
-    ) -> VfsResult<HashSet<Ino>> {
-        let mut trash_roots = HashSet::new();
-        for entry in self
-            .sync_meta()
-            .readdir(ROOT_INO)?
-            .into_iter()
-            .filter(|entry| entry.kind == FileType::Directory)
-        {
-            if predicate(&entry.name) {
-                trash_roots.insert(entry.ino);
+        // Bindings are candidates; confirm each through the merged lookup.
+        for (parent, name) in meta.entry_bindings_for_inode(root_child)? {
+            if parent != ROOT_INO || !super::is_probable_trash_component(&name) {
+                continue;
+            }
+            match meta.lookup(ROOT_INO, &name) {
+                Ok(entry) if entry.ino == root_child && entry.kind == FileType::Directory => {
+                    return Ok(true);
+                }
+                Ok(_) | Err(MetaError::EntryNotFound { .. }) => {}
+                Err(err) => return Err(err.into()),
             }
         }
-        Ok(trash_roots)
+        Ok(false)
     }
 
     /// Immediately evict a single block from every cache tier.
