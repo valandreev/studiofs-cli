@@ -19208,6 +19208,80 @@ fn shutdown_waits_for_admitted_mutation_that_registers_cleanup() {
 }
 
 #[test]
+fn sync_namespace_ops_from_foreign_thread_run_on_mount_runtime() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sync-future-mount-runtime");
+    {
+        let _guard = rt.enter();
+        vfs.create(ROOT_INO, b"rename-source.txt", 0, 0, 0o644)
+            .expect("create rename source");
+        vfs.create(ROOT_INO, b"unlink-target.txt", 0, 0, 0o644)
+            .expect("create unlink target");
+    }
+
+    let mount_runtime_id = rt.handle().id();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (spawned_done_tx, spawned_done_rx) = std::sync::mpsc::channel();
+    let worker_vfs = Arc::clone(&vfs);
+    let operation_runtime_id = std::thread::spawn(move || {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the libfuse-like worker must start outside any Tokio context"
+        );
+        worker_vfs
+            .rename(
+                ROOT_INO,
+                b"rename-source.txt",
+                ROOT_INO,
+                b"rename-target.txt",
+                true,
+            )
+            .expect("rename from a foreign thread");
+        worker_vfs
+            .unlink(ROOT_INO, b"unlink-target.txt")
+            .expect("unlink from a foreign thread");
+        worker_vfs
+            .run_sync_future(async move {
+                tokio::spawn(async move {
+                    let _ = release_rx.await;
+                    let _ = spawned_done_tx.send(());
+                });
+                Ok(tokio::runtime::Handle::current().id())
+            })
+            .expect("sync future from a foreign thread")
+    })
+    .join()
+    .expect("foreign worker must not panic");
+
+    assert_eq!(
+        vfs.sync_future_runtime_fallbacks(),
+        0,
+        "synchronous VFS operations must not construct a temporary runtime"
+    );
+    assert_eq!(
+        operation_runtime_id, mount_runtime_id,
+        "synchronous VFS operations must run on the mount runtime"
+    );
+    release_tx
+        .send(())
+        .expect("a task spawned by the operation must outlive the call");
+    spawned_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the spawned task must keep running on the mount runtime");
+    {
+        let _guard = rt.enter();
+        assert!(
+            vfs.lookup(ROOT_INO, b"rename-target.txt").is_ok(),
+            "rename must take effect"
+        );
+        assert!(
+            vfs.lookup(ROOT_INO, b"unlink-target.txt").is_err(),
+            "unlink must take effect"
+        );
+    }
+}
+
+#[test]
 fn deferred_namespace_admission_rejects_an_oversized_backlog_entry() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-backlog-limit");

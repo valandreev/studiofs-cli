@@ -110,11 +110,27 @@ impl StudioVfs {
     ) -> VfsResult<T> {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             tokio::task::block_in_place(|| handle.block_on(future))
+        } else if let Some(handle) = self.state.mount_runtime.get() {
+            // Platform dispatcher threads (libfuse, macFUSE, WinFSP) run
+            // outside any Tokio context; tasks the operation spawns must land
+            // on the mount runtime rather than a temporary one dropped here.
+            handle.block_on(future)
         } else {
+            #[cfg(test)]
+            self.state
+                .sync_future_runtime_fallbacks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tokio::runtime::Runtime::new()
                 .expect("failed to create tokio runtime for synchronous VFS operation")
                 .block_on(future)
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn sync_future_runtime_fallbacks(&self) -> u64 {
+        self.state
+            .sync_future_runtime_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(super) fn directory_has_probable_trash_ancestor(&self, dir_ino: Ino) -> VfsResult<bool> {

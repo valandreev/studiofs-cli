@@ -3372,6 +3372,9 @@ impl VfsState {
             file_lock: FileLockState::new(),
             shutdown: ShutdownState::new(),
             sync_safety_activity: Arc::new(SyncSafetyActivity::default()),
+            mount_runtime: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            sync_future_runtime_fallbacks: AtomicU64::new(0),
             metrics: MetricsState::new(),
             fuse_async_write_diagnostics: Mutex::new(FuseAsyncWriteDiagnostics::default()),
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
@@ -3445,6 +3448,11 @@ struct VfsState {
     file_lock: FileLockState,
     shutdown: ShutdownState,
     sync_safety_activity: Arc<SyncSafetyActivity>,
+    /// Runtime registered by `start()`; synchronous entry points called from
+    /// platform dispatcher threads outside any Tokio context run on it.
+    mount_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+    #[cfg(test)]
+    sync_future_runtime_fallbacks: AtomicU64,
     metrics: MetricsState,
     fuse_async_write_diagnostics: Mutex<FuseAsyncWriteDiagnostics>,
     fuse_async_read_snapshot: Mutex<VfsFuseAsyncReadSnapshot>,
@@ -5601,10 +5609,13 @@ impl StudioVfs {
     /// and other maintenance tasks.
     pub fn start(self: &Arc<Self>) -> VfsResult<()> {
         self.ensure_can_start()?;
+        let _ = self
+            .state
+            .mount_runtime
+            .set(tokio::runtime::Handle::current());
         if self.read_only_mount {
             return Ok(());
         }
-        self.register_overlay_batch_runtime(tokio::runtime::Handle::current());
         self.state
             .namespace
             .deferred
