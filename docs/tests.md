@@ -330,6 +330,20 @@ cargo test -p studiofs-bridge --lib posix::tests:: -- --nocapture
 Windows cannot execute the POSIX module guarded by `cfg(unix)`. These focused
 tests do not establish live mounted disk-full acceptance.
 
+### SFS-886 Linux Runtime Stats Surface
+
+The Linux FUSE bridge used to send reads of `.studiofs-runtime-stats` to the
+VFS data path, which returned `ENOENT`. Open now captures one stats snapshot
+per handle, reads serve slices of it until EOF, and release drops it. Write or
+truncating opens fail with `EACCES`:
+
+```sh
+cargo test -p studiofs-linux-fuse --lib runtime_stats_open_serves_captured_snapshot_until_release -- --nocapture
+```
+
+This focused test does not establish mounted acceptance. The mounted check is
+`studiofs perf <mount> --json --count 1` on a Linux mount, which must succeed.
+
 ### SFS-885 Fragmented Overlay Mutation Regressions
 
 Random small writes used to leave one overlay record per write, so the
