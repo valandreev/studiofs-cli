@@ -12,8 +12,8 @@ use crate::async_writes::{
     DEFAULT_MAX_PENDING_BYTES, DEFAULT_MAX_PENDING_WRITES,
 };
 use crate::cache_policy::{
-    LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBuffer, SyncReadBufferPool,
-    SystemMemorySampler, decide_open_cache,
+    CachePolicySelection, LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBuffer,
+    SyncReadBufferPool, SystemMemorySampler, decide_open_cache,
 };
 use crate::directory_cache::{DirectorySnapshot, DirectorySnapshotCache, linux_observation};
 use crate::invalidation::{
@@ -556,14 +556,11 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_async_dio(
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_writeback_cache(
     userdata: *mut c_void,
 ) -> c_int {
-    let cache_policy = callback_state_from_userdata(userdata)
-        .map(|state| state.cache_policy)
-        .unwrap_or_else(linux_fuse_cache_policy_from_env);
-    if cache_policy == LinuxFuseCachePolicy::Kernel {
-        1
-    } else {
-        0
-    }
+    // Without a session there is no chosen policy; never request writeback.
+    fuse_flag(
+        callback_state_from_userdata(userdata)
+            .is_some_and(|state| state.cache_policy.wants_writeback_cache()),
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -630,26 +627,28 @@ fn current_gid() -> u32 {
 
 fn linux_fuse_cache_policy_from_env() -> LinuxFuseCachePolicy {
     let value = std::env::var("STUDIOFS_LINUX_FUSE_CACHE_POLICY").ok();
-    let selection = LinuxFuseCachePolicy::parse(value.as_deref());
+    let selection = linux_fuse_cache_policy_selection_for_value(
+        value.as_deref(),
+        LINUX_FUSE_ADAPTIVE_DEFAULT_READY,
+    );
     if selection.warning_required {
         warn!(
             value = value.as_deref().unwrap_or_default(),
             "unknown STUDIOFS_LINUX_FUSE_CACHE_POLICY; using adaptive policy"
         );
     }
-    linux_fuse_effective_cache_policy_for_value(value.as_deref(), LINUX_FUSE_ADAPTIVE_DEFAULT_READY)
+    selection.policy
 }
 
-fn linux_fuse_effective_cache_policy_for_value(
+fn linux_fuse_cache_policy_selection_for_value(
     value: Option<&str>,
     adaptive_default_ready: bool,
-) -> LinuxFuseCachePolicy {
-    let selection = LinuxFuseCachePolicy::parse(value);
+) -> CachePolicySelection {
+    let mut selection = LinuxFuseCachePolicy::parse(value);
     if !adaptive_default_ready && value.is_none() {
-        LinuxFuseCachePolicy::Direct
-    } else {
-        selection.policy
+        selection.policy = LinuxFuseCachePolicy::Direct;
     }
+    selection
 }
 
 fn linux_fuse_env_flag(name: &str) -> bool {
@@ -5545,7 +5544,7 @@ mod tests {
     #[test]
     fn runtime_cache_policy_keeps_unset_default_direct_until_adaptive_is_ready() {
         assert_eq!(
-            super::linux_fuse_effective_cache_policy_for_value(None, false),
+            super::linux_fuse_cache_policy_selection_for_value(None, false).policy,
             crate::cache_policy::LinuxFuseCachePolicy::Direct
         );
     }
@@ -5553,7 +5552,7 @@ mod tests {
     #[test]
     fn runtime_cache_policy_honors_explicit_adaptive_before_default_switch() {
         assert_eq!(
-            super::linux_fuse_effective_cache_policy_for_value(Some("adaptive"), false),
+            super::linux_fuse_cache_policy_selection_for_value(Some("adaptive"), false).policy,
             crate::cache_policy::LinuxFuseCachePolicy::Adaptive
         );
     }
@@ -5561,7 +5560,7 @@ mod tests {
     #[test]
     fn runtime_cache_policy_uses_adaptive_after_readiness_gate() {
         assert_eq!(
-            super::linux_fuse_effective_cache_policy_for_value(None, true),
+            super::linux_fuse_cache_policy_selection_for_value(None, true).policy,
             crate::cache_policy::LinuxFuseCachePolicy::Adaptive
         );
     }
