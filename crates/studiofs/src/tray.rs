@@ -4,7 +4,7 @@ use crate::cli::mount::MountArgs;
 mod supported {
     use super::MountArgs;
     use crate::diagnostics::{
-        DiagnosticsRuntimeSnapshot, LocalDiagnosticsClient, LocalDiagnosticsDiscovery,
+        DiagnosticsHealthSnapshot, LocalDiagnosticsClient, LocalDiagnosticsDiscovery,
         discover_local_sessions,
     };
     use image::imageops::FilterType;
@@ -65,6 +65,7 @@ mod supported {
     const COLOR_WHITE: [u8; 3] = [0xF7, 0xF7, 0xF3];
     const ANIMATION_TICK: Duration = Duration::from_millis(100);
     const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(300);
+    const DIAGNOSTICS_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(750);
     const DIAGNOSTICS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
     const DIAGNOSTICS_STARTUP_GRACE: Duration = Duration::from_secs(5);
     const DIAGNOSTICS_MAX_AGE: Duration = Duration::from_secs(2);
@@ -774,7 +775,7 @@ mod supported {
                         break;
                     }
 
-                    std::thread::sleep(DIAGNOSTICS_POLL_INTERVAL);
+                    std::thread::sleep(diagnostics_poll_interval(next_activity.mode));
                 }
             })
             .map(Some)
@@ -787,6 +788,14 @@ mod supported {
     fn join_optional_thread(name: &str, handle: Option<JoinHandle<()>>) {
         if handle.is_some_and(|handle| handle.join().is_err()) {
             tracing::warn!(thread = name, "background tray helper thread panicked");
+        }
+    }
+
+    fn diagnostics_poll_interval(mode: TrayPulseMode) -> Duration {
+        if mode == TrayPulseMode::Idle {
+            DIAGNOSTICS_IDLE_POLL_INTERVAL
+        } else {
+            DIAGNOSTICS_POLL_INTERVAL
         }
     }
 
@@ -804,7 +813,7 @@ mod supported {
     fn current_activity_status(discovery: &LocalDiagnosticsDiscovery) -> Option<TrayActivity> {
         let client = LocalDiagnosticsClient::new(discovery.clone());
         let snapshot = crate::runtime_bridge::block_on(async move {
-            tokio::time::timeout(DIAGNOSTICS_REQUEST_TIMEOUT, client.runtime_snapshot())
+            tokio::time::timeout(DIAGNOSTICS_REQUEST_TIMEOUT, client.health())
                 .await
                 .map_err(|error| anyhow::anyhow!(error))
                 .and_then(|result| result)
@@ -813,7 +822,7 @@ mod supported {
         Some(activity_status(&snapshot))
     }
 
-    fn activity_status(snapshot: &DiagnosticsRuntimeSnapshot) -> TrayActivity {
+    fn activity_status(snapshot: &DiagnosticsHealthSnapshot) -> TrayActivity {
         activity_status_at(
             snapshot,
             std::time::SystemTime::now()
@@ -822,7 +831,7 @@ mod supported {
         )
     }
 
-    fn activity_status_at(snapshot: &DiagnosticsRuntimeSnapshot, now_unix_ms: u64) -> TrayActivity {
+    fn activity_status_at(snapshot: &DiagnosticsHealthSnapshot, now_unix_ms: u64) -> TrayActivity {
         let pending_metadata_ops = snapshot
             .synchronization
             .state
@@ -1016,14 +1025,27 @@ mod supported {
 
         #[test]
         fn activity_mode_is_active_for_pending_uploads() {
-            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            let mut snapshot = DiagnosticsHealthSnapshot::default();
             snapshot.upload.pending_uploads = 1;
             assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
         }
 
         #[test]
+        fn diagnostics_polling_backs_off_only_while_idle() {
+            let idle = diagnostics_poll_interval(TrayPulseMode::Idle);
+            assert!(idle > diagnostics_poll_interval(TrayPulseMode::Active));
+            for mode in [TrayPulseMode::Booting, TrayPulseMode::Unavailable] {
+                assert_eq!(
+                    diagnostics_poll_interval(mode),
+                    diagnostics_poll_interval(TrayPulseMode::Active)
+                );
+            }
+            assert!(idle + DIAGNOSTICS_REQUEST_TIMEOUT < DIAGNOSTICS_MAX_AGE);
+        }
+
+        #[test]
         fn activity_mode_is_active_for_pending_metadata_ops() {
-            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            let mut snapshot = DiagnosticsHealthSnapshot::default();
             snapshot.synchronization.state.pending_metadata_ops = 10;
             assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
         }
@@ -1031,7 +1053,7 @@ mod supported {
         #[test]
         fn activity_mode_is_active_for_small_metadata_backlog() {
             for count in [1, 2, 9] {
-                let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+                let mut snapshot = DiagnosticsHealthSnapshot::default();
                 snapshot.synchronization.state.pending_metadata_ops = count;
                 assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
             }
@@ -1039,14 +1061,14 @@ mod supported {
 
         #[test]
         fn activity_mode_is_active_for_inflight_metadata_ops() {
-            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            let mut snapshot = DiagnosticsHealthSnapshot::default();
             snapshot.synchronization.state.inflight_metadata_ops = 1;
             assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
         }
 
         #[test]
         fn activity_mode_is_idle_when_synchronized() {
-            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            let mut snapshot = DiagnosticsHealthSnapshot::default();
             snapshot.sync_safety.state = studiofs_vfs::VfsSyncSafetyState::Safe;
             snapshot.generated_unix_ms = 10_000;
             assert_eq!(
@@ -1057,7 +1079,7 @@ mod supported {
 
         #[test]
         fn activity_mode_never_trusts_missing_stale_or_future_telemetry() {
-            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            let mut snapshot = DiagnosticsHealthSnapshot::default();
             assert_eq!(
                 activity_status_at(&snapshot, 10_000).mode,
                 TrayPulseMode::Unavailable
@@ -1074,14 +1096,14 @@ mod supported {
 
         #[test]
         fn activity_mode_is_active_until_authoritative_completion() {
-            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            let mut snapshot = DiagnosticsHealthSnapshot::default();
             snapshot.sync_safety.state = studiofs_vfs::VfsSyncSafetyState::Syncing;
             assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
         }
 
         #[test]
         fn activity_mode_keeps_known_publication_work_red_during_unstable_snapshot() {
-            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            let mut snapshot = DiagnosticsHealthSnapshot::default();
             snapshot.sync_safety.reasons =
                 vec![studiofs_vfs::VfsSyncSafetyReason::PublishingMetadata];
             assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
@@ -1152,7 +1174,7 @@ mod supported {
 
         #[test]
         fn activity_status_keeps_upload_bytes_for_tooltip() {
-            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            let mut snapshot = DiagnosticsHealthSnapshot::default();
             snapshot.upload.pending_uploads = 2;
             snapshot.upload.pending_upload_bytes = 7 * 1024 * 1024 * 1024;
             let activity = activity_status(&snapshot);
@@ -1162,7 +1184,7 @@ mod supported {
 
         #[test]
         fn activity_status_shows_no_pending_bytes_when_idle() {
-            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            let mut snapshot = DiagnosticsHealthSnapshot::default();
             snapshot.sync_safety.state = studiofs_vfs::VfsSyncSafetyState::Safe;
             snapshot.generated_unix_ms = 10_000;
             let activity = activity_status_at(&snapshot, 10_001);

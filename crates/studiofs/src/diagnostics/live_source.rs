@@ -103,7 +103,10 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             file_sessions: self.vfs.file_session_stats(),
             foreground_reads: self.vfs.foreground_read_protection_stats(),
             write_path: self.vfs.write_path_observability_snapshot(),
-            zeroio: self.vfs.zeroio_runtime_snapshot(),
+            synchronization: DiagnosticsSynchronizationSnapshot {
+                state: self.vfs.synchronization_state_snapshot(),
+            },
+            sync_safety: self.vfs.sync_safety_snapshot(),
             coherence: self.vfs.coherence_health_snapshot(),
         }
     }
@@ -117,14 +120,12 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             ingress: health.ingress,
             write_path: health.write_path,
             upload: health.upload,
-            zeroio: health.zeroio,
+            zeroio: self.vfs.zeroio_runtime_snapshot(),
             cache: DiagnosticsCacheSnapshot {
                 state: self.vfs.cache_state_snapshot(),
             },
-            synchronization: DiagnosticsSynchronizationSnapshot {
-                state: self.vfs.synchronization_state_snapshot(),
-            },
-            sync_safety: self.vfs.sync_safety_snapshot(),
+            synchronization: health.synchronization,
+            sync_safety: health.sync_safety,
             coherence: health.coherence,
         }
     }

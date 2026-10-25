@@ -21,11 +21,14 @@ unmount normally before powering off; the tray observation does not replace the
 filesystem's shutdown barriers. Local crash recovery from cache is a separate,
 weaker guarantee than this indicator's remote synchronization guarantee.
 
-The tray polls mount-local diagnostics every 300 ms, with a one-second request
-timeout. Reported activity expires after two seconds without a fresh heartbeat,
-including active upload estimates. Startup remains in its starting state during
-the five-second diagnostics grace period. The icon animation itself performs no
-PostgreSQL or S3 requests. The same runtime contract and color mapping serve
+The tray polls mount-local Health diagnostics every 300 ms while starting,
+active, or unavailable, and every 750 ms when idle, with a one-second request
+timeout. Health reads runtime counters and pending work without enumerating
+inode lifecycles; per-inode ZeroIO details are computed only for explicit
+RuntimeSnapshot requests. Reported activity expires after two seconds without
+a fresh heartbeat, including active upload estimates. Startup remains in its
+starting state during the five-second diagnostics grace period. The icon animation
+itself performs no PostgreSQL or S3 requests. The same runtime contract and color mapping serve
 Windows, macOS and Linux.
 
 The runtime checks the durable acknowledgement of its own local metadata
