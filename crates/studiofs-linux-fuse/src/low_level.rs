@@ -699,18 +699,7 @@ fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
 }
 
 fn argv_strings(volume_name: &str, read_only: bool) -> Vec<String> {
-    let mut args = argv_strings_for_cache_policy(volume_name, linux_fuse_cache_policy_from_env());
-    if read_only {
-        args.extend(["-o".to_owned(), "ro".to_owned()]);
-    }
-    args
-}
-
-fn argv_strings_for_cache_policy(
-    volume_name: &str,
-    _cache_policy: LinuxFuseCachePolicy,
-) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "studiofs-linux-fuse".to_owned(),
         "-o".to_owned(),
         format!("fsname={volume_name}"),
@@ -722,7 +711,11 @@ fn argv_strings_for_cache_policy(
         "default_permissions".to_owned(),
         "-o".to_owned(),
         format!("max_read={LINUX_FUSE_MAX_READ_SIZE}"),
-    ]
+    ];
+    if read_only {
+        args.extend(["-o".to_owned(), "ro".to_owned()]);
+    }
+    args
 }
 
 fn path_to_cstring(path: &std::path::Path) -> io::Result<CString> {
@@ -4437,14 +4430,6 @@ mod tests {
         );
         // SAFETY: the non-null session is uniquely owned by this test.
         unsafe { super::raw::fuse_session_destroy(session) };
-    }
-
-    #[test]
-    fn argv_kernel_cache_policy_keeps_mount_options_portable() {
-        let args =
-            super::argv_strings_for_cache_policy("demo", super::LinuxFuseCachePolicy::Kernel);
-
-        assert!(!args.iter().any(|arg| arg == "writeback_cache"));
     }
 
     #[test]
