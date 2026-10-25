@@ -397,12 +397,15 @@ log line.
 Health polling must not enter the full ZeroIO collection path. The live-source
 regression uses existing upload-queue snapshot counters to detect that path,
 including a computed-but-discarded result, and checks that explicit runtime
-snapshots retain inode details. Tray tests cover idle backoff and conservative
+snapshots retain inode details. Cache tests show storage stats and pending
+upload summaries read incrementally maintained totals instead of probing the
+cache index per pinned object or walking the queue. Tray tests cover idle backoff and conservative
 synchronization status, including stale and legacy telemetry:
 
 ```sh
 cargo test -p studiofs --bin studiofs diagnostics:: -- --nocapture
 cargo test -p studiofs --bin studiofs tray:: -- --nocapture
+cargo test -p studiofs-cache --lib -- sfs891 local_runtime_pins pending_summary
 STUDIOFS_CLIENT_ROOT="$PWD/target/sfs-891-client-root" cargo test -p studiofs --bin studiofs prepared_mount_launch_publishes_live_diagnostics_and_supports_attach -- --nocapture
 ```
 

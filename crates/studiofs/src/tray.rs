@@ -775,6 +775,10 @@ mod supported {
                         break;
                     }
 
+                    // A request's internal park can consume the shutdown unpark token.
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
                     std::thread::park_timeout(diagnostics_poll_interval(next_activity.mode));
                 }
             })

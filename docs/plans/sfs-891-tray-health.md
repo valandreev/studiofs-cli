@@ -32,14 +32,22 @@ completion.
 - [x] (2026-10-25 18:11Z) Addressed the attached polling review: reuse synchronization fields,
   document the Health field, wake parked tray helpers during shutdown, and
   ran focused verification. Recorded all seven recommendations' dispositions.
+- [x] (2026-10-25 19:30Z) Branch review against `main` found Health still
+  scaling with pending uploads: `storage_stats` probed the cache index once per
+  runtime-pinned object, and `pending_summary` walked the queue under its lock.
+  Both now read incrementally maintained totals; the tray monitor rechecks
+  shutdown before parking.
 
 ## Surprises & Discoveries
 
-The issue's additional upload-bytes finding is already addressed for normal
-uploads: `StudioVfs::upload_stats` uses recorded payload lengths from
-`PendingUploadSummary`. Only legacy entries with unknown lengths read the cache
-index. Queue summaries and write-path metrics still scale with pending work,
-which is the dirty-set bound allowed by the issue.
+The issue's additional upload-bytes finding was only partly addressed:
+`StudioVfs::upload_stats` used recorded payload lengths, but the same Health
+poll reached `write_path_observability_snapshot` → `storage_stats` →
+`runtime_pinned_evictable_bytes`, which opened one cache-index read transaction
+per runtime-pinned object. Every queued upload holds a pin, so this repeated the
+per-pending-op redb pattern from the issue comment. `pending_summary` also
+walked every pending operation under the queue lock, twice per Health request.
+Only legacy entries with unknown payload lengths still read the cache index.
 
 The current environment has `perf` but no `/dev/fuse`. A real mounted write
 profile with an active tray therefore cannot be claimed here.
@@ -69,6 +77,15 @@ idle. Keep the existing two-second snapshot freshness and heartbeat expiry:
 750 ms plus the one-second request timeout leaves 250 ms scheduling margin.
 This replaces the initial one-second/three-second proposal and preserves the
 existing expiry contract with less code. No additional configuration or dependencies.
+
+Runtime pins now record the evictable index bytes they hide. The value is read
+once when an object gains its first pin and refreshed after any index mutation
+of a pinned object (`put`, `put_batch`, `mark_uploaded`, orphan pruning), all
+under the payload mutation gates. Dirty/Uploading transitions cannot change it.
+The upload queue keeps payload bytes, unknown-length ids, creation times, and
+retry counts in `PendingTotals`, updated at every `by_object` change.
+`studiofs status` keeps its one-shot RuntimeSnapshot: switching it to Health
+would show default PostgreSQL sync values against older daemons.
 
 ## Outcomes & Retrospective
 
@@ -168,6 +185,11 @@ Its local Unix socket requires permission to connect outside this sandbox.
 Then run `cargo check -p studiofs` and
 `cargo clippy -p studiofs --all-targets -- -D warnings`.
 Use `cargo fmt --all -- --check` and `git diff --check` for final hygiene.
+
+For the incremental totals, run
+`cargo test -p studiofs-cache --lib -- sfs891 local_runtime_pins pending_summary`.
+The pinned-bytes regression failed when `storage_stats` re-read pinned rows and
+passes with the counter.
 
 ## Validation and Acceptance
 
