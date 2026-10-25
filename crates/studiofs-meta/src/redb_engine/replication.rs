@@ -1,5 +1,22 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static REPLICA_INVALIDATION_DERIVATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Counts replica invalidation derivations that read redb on this thread.
+#[cfg(test)]
+pub(crate) fn take_replica_invalidation_derivations() -> usize {
+    REPLICA_INVALIDATION_DERIVATIONS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+fn record_replica_invalidation_derivation() {
+    REPLICA_INVALIDATION_DERIVATIONS.with(|count| count.set(count.get() + 1));
+}
+
 fn collect_prefix_keys<V: redb::Value + 'static>(
     table: &impl ReadableTable<&'static [u8], V>,
     prefix: &[u8],
@@ -338,6 +355,11 @@ impl RedbMetaEngine {
         txn: &RedbWriteTransaction<'_>,
         ino: Ino,
     ) -> MetaResult<()> {
+        if txn.invalidations_suppressed() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        record_replica_invalidation_derivation();
         let mut pending = vec![(ino, Self::invalidation_ancestors(txn, ino)?, 0usize)];
         let mut visited = HashSet::new();
         let mut remaining = crate::coherence::MAX_INVALIDATION_INTENTS;
@@ -422,6 +444,11 @@ impl RedbMetaEngine {
         name: &[u8],
         new_ino: Option<Ino>,
     ) -> MetaResult<()> {
+        if txn.invalidations_suppressed() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        record_replica_invalidation_derivation();
         txn.invalidate(InvalidationIntent::Entry {
             parent,
             name: name.to_vec(),
@@ -449,6 +476,11 @@ impl RedbMetaEngine {
         ino: Ino,
         content: bool,
     ) -> MetaResult<()> {
+        if txn.invalidations_suppressed() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        record_replica_invalidation_derivation();
         txn.invalidate(InvalidationIntent::Attributes { ino });
         if content {
             txn.invalidate(InvalidationIntent::Content { ino });
@@ -485,6 +517,10 @@ impl RedbMetaEngine {
         txn: &RedbWriteTransaction<'_>,
         event: &crate::events::MetaEvent,
     ) -> MetaResult<()> {
+        // Intent derivation only reads; skip it when the journal would drop the result.
+        if txn.invalidations_suppressed() {
+            return Ok(());
+        }
         use crate::events::MetaEvent;
         match event {
             MetaEvent::SetAttr { attr } => {

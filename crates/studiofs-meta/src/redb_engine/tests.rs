@@ -95,6 +95,56 @@ fn coherence_journal_directory_rename_and_removal_retain_descendant_paths() {
 }
 
 #[test]
+fn suppressed_replica_base_mirror_skips_invalidation_derivation_reads() {
+    let engine = temp_engine();
+    let dir = engine
+        .create_dir(ROOT_INO, b"old", 1000, 1000, 0o755)
+        .unwrap();
+    let file = engine
+        .create_file(dir.ino, b"child", 1000, 1000, 0o644)
+        .unwrap();
+    let rename = MetaEvent::RenameEntry {
+        parent: ROOT_INO,
+        name: b"old".to_vec(),
+        new_parent: ROOT_INO,
+        new_name: b"new".to_vec(),
+        entry: DirEntryValue {
+            ino: dir.ino,
+            kind: FileType::Directory,
+        },
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: None,
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    };
+    let events = [
+        MetaEvent::SetAttr { attr: dir.clone() },
+        MetaEvent::SetAttr { attr: file.clone() },
+        rename,
+    ];
+    engine.take_invalidation_batches();
+    replication::take_replica_invalidation_derivations();
+
+    // Self-batch base mirroring discards its intents, so it must not derive them.
+    let txn = engine.begin_write_txn().unwrap();
+    txn.without_invalidations(|| {
+        RedbMetaEngine::apply_replica_events_to_base_in_txn(&txn, &events, &HashSet::new())
+    })
+    .unwrap();
+    txn.commit().unwrap();
+    assert_eq!(replication::take_replica_invalidation_derivations(), 0);
+    assert!(engine.take_invalidation_batches().is_empty());
+
+    // Control: the same mirror outside suppression still derives and journals intents.
+    let txn = engine.begin_write_txn().unwrap();
+    RedbMetaEngine::apply_replica_events_to_base_in_txn(&txn, &events, &HashSet::new()).unwrap();
+    txn.commit().unwrap();
+    assert!(replication::take_replica_invalidation_derivations() > 0);
+    assert!(!engine.take_invalidation_batches().is_empty());
+}
+
+#[test]
 fn coherence_journal_metadata_only_changes_preserve_content_scope() {
     use crate::coherence::InvalidationIntent;
     let engine = temp_engine();

@@ -757,6 +757,11 @@ impl RedbWriteTransaction<'_> {
         }
     }
 
+    /// Whether scopes recorded now would be dropped by [`Self::without_invalidations`].
+    pub(crate) fn invalidations_suppressed(&self) -> bool {
+        self.invalidations_suppressed.get()
+    }
+
     /// Runs `apply` without journaling the invalidation scopes it records.
     ///
     /// Only for writes that cannot change what the local serving view already
