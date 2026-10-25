@@ -21,13 +21,15 @@ use crate::local::{
 };
 use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
 use crate::runtime::LocalPayloadLayout;
-use crate::upload_queue::{PendingUpload, UploadQueue, UploadSubmitOutcome, now_unix_ms};
+use crate::upload_queue::{
+    ObjectFileMapping, PendingUpload, UploadQueue, UploadSubmitOutcome, now_unix_ms,
+};
 use crate::upload_stage::{UploadStageStore, UploadStageStoreError};
 
 /// Stable identifier for cached payload objects.
 pub type ObjectId = u64;
 /// Upload submission: inode, first file offset, contiguous origin, object ID, epoch, payload length.
-pub type UploadOp = (u64, u64, Option<u64>, ObjectId, u64, u64);
+pub type UploadOp = (u64, u64, Option<ObjectFileMapping>, ObjectId, u64, u64);
 
 const DEFAULT_WRITER_MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const MIN_WRITER_PAGE_ALLOCATION: usize = 64 * 1024;
@@ -892,7 +894,7 @@ impl CachedStore {
         let outcome = self.submit_pinned_upload_with_payload(
             ino,
             offset,
-            Some(offset),
+            (payload_len > 0).then(|| ObjectFileMapping::whole(offset, payload_len)),
             object_id,
             content_epoch,
             payload_len,
@@ -910,7 +912,7 @@ impl CachedStore {
         &self,
         ino: u64,
         offset: u64,
-        object_file_offset: Option<u64>,
+        file_mapping: Option<ObjectFileMapping>,
         object_id: ObjectId,
         content_epoch: u64,
         payload_len: u64,
@@ -919,7 +921,7 @@ impl CachedStore {
         let outcome = self.submit_pinned_upload_with_payload(
             ino,
             offset,
-            object_file_offset,
+            file_mapping,
             object_id,
             content_epoch,
             payload_len,
@@ -934,7 +936,7 @@ impl CachedStore {
         &self,
         ino: u64,
         offset: u64,
-        object_file_offset: Option<u64>,
+        file_mapping: Option<ObjectFileMapping>,
         object_id: ObjectId,
         content_epoch: u64,
         payload_len: u64,
@@ -942,7 +944,7 @@ impl CachedStore {
         let (outcome, pending_count) = self.upload_queue.submit_with_payload_and_pending_count(
             ino,
             offset,
-            object_file_offset,
+            file_mapping,
             object_id,
             content_epoch,
             payload_len,
@@ -972,11 +974,11 @@ impl CachedStore {
                 "failed to link upload-stage payloads before batch upload submit"
             );
         }
-        for (ino, offset, object_file_offset, object_id, content_epoch, payload_len) in ops {
+        for (ino, offset, file_mapping, object_id, content_epoch, payload_len) in ops {
             let outcome = self.submit_pinned_upload_with_payload(
                 *ino,
                 *offset,
-                *object_file_offset,
+                *file_mapping,
                 *object_id,
                 *content_epoch,
                 *payload_len,
@@ -1162,7 +1164,7 @@ impl CachedStore {
         let outcome = self.submit_pinned_upload_with_payload(
             ino,
             offset,
-            Some(offset),
+            (payload_len_u64 > 0).then(|| ObjectFileMapping::whole(offset, payload_len_u64)),
             object_id,
             content_epoch,
             payload_len_u64,
@@ -2854,9 +2856,9 @@ mod tests {
         let batch_store = Arc::clone(&store);
         let batch = std::thread::spawn(move || {
             batch_store.submit_uploads_batch(&[
-                (1, 0, Some(0), 101, 3, 7),
-                (1, 8, Some(8), 102, 3, 5),
-                (1, 8, Some(8), 102, 3, 5),
+                (1, 0, Some(ObjectFileMapping::whole(0, 7)), 101, 3, 7),
+                (1, 8, Some(ObjectFileMapping::whole(8, 5)), 102, 3, 5),
+                (1, 8, Some(ObjectFileMapping::whole(8, 5)), 102, 3, 5),
             ])
         });
         pin_entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -2940,7 +2942,14 @@ mod tests {
             let (store, _rx) =
                 CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone()).unwrap();
             store.put(101, b"payload", false).unwrap();
-            store.submit_upload_with_payload(1, 0, Some(0), 101, 3, payload_len);
+            store.submit_upload_with_payload(
+                1,
+                0,
+                Some(ObjectFileMapping::whole(0, payload_len)),
+                101,
+                3,
+                payload_len,
+            );
             let op = store.snapshot_pending_uploads().pop().unwrap();
             store.complete_upload(&op);
             assert_eq!(
@@ -3055,7 +3064,7 @@ mod tests {
             let old = store.snapshot_pending_uploads().pop().unwrap();
             let rebased = PendingUpload {
                 offset: 8,
-                object_file_offset: Some(2),
+                file_mapping: Some(ObjectFileMapping::whole(2, 9)),
                 content_epoch: 4,
                 payload_len,
                 ..old.clone()
@@ -3209,7 +3218,14 @@ mod tests {
             let thread = std::thread::spawn(move || match transition {
                 0 => background.pin(101),
                 1 => background.unpin(101),
-                _ => background.submit_uploads_batch(&[(1, 0, Some(0), 101, 3, 7)]),
+                _ => background.submit_uploads_batch(&[(
+                    1,
+                    0,
+                    Some(ObjectFileMapping::whole(0, 7)),
+                    101,
+                    3,
+                    7,
+                )]),
             });
             entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let was_locked = store.pinned.try_lock().is_none();
@@ -3248,10 +3264,10 @@ mod tests {
         store.put(101, b"payload", false).unwrap();
         store.put(102, b"other", false).unwrap();
         let ops = [
-            (1, 0, Some(0), 101, 3, 7),
-            (1, 0, Some(0), 101, 2, 7),
-            (1, 0, Some(0), 101, 4, 7),
-            (1, 8, Some(8), 102, 3, 5),
+            (1, 0, Some(ObjectFileMapping::whole(0, 7)), 101, 3, 7),
+            (1, 0, Some(ObjectFileMapping::whole(0, 7)), 101, 2, 7),
+            (1, 0, Some(ObjectFileMapping::whole(0, 7)), 101, 4, 7),
+            (1, 8, Some(ObjectFileMapping::whole(8, 5)), 102, 3, 5),
         ];
         store.submit_uploads_batch(&ops);
         store.submit_uploads_batch(&ops);
@@ -3301,7 +3317,10 @@ mod tests {
         store.put(102, b"other", false).unwrap();
         drop(rx);
         store.submit_upload(1, 0, 101, 3);
-        store.submit_uploads_batch(&[(1, 0, Some(0), 101, 3, 7), (1, 8, Some(8), 102, 3, 5)]);
+        store.submit_uploads_batch(&[
+            (1, 0, Some(ObjectFileMapping::whole(0, 7)), 101, 3, 7),
+            (1, 8, Some(ObjectFileMapping::whole(8, 5)), 102, 3, 5),
+        ]);
         assert_eq!(store.pending_upload_count(), 0);
         assert!(store.pinned.lock().objects.is_empty());
         assert!(!store.local_payload_backend.is_evictable(101));
@@ -3406,7 +3425,7 @@ mod tests {
         cached_store.submit_uploads_batch(&[(
             7,
             1024,
-            Some(1024),
+            Some(ObjectFileMapping::whole(1024, put.data.len() as u64)),
             put.object_id,
             3,
             put.data.len() as u64,

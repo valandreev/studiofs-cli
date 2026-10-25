@@ -46,7 +46,7 @@ struct StartupGraphObject {
     object_id: u64,
     payload_len: u64,
     absolute_offset: u64,
-    object_file_offset: Option<u64>,
+    file_mapping: Option<studiofs_cache::ObjectFileMapping>,
 }
 
 impl<'a> StartupReplayCoordinator<'a> {
@@ -251,7 +251,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 object_id: block.object_id,
                 payload_len: u64::from(block.offset).saturating_add(u64::from(block.length)),
                 absolute_offset,
-                object_file_offset: geometry.object_file_offset,
+                file_mapping: None,
             });
         }
         for (object_id, geometry) in &mut geometries {
@@ -260,12 +260,11 @@ impl<'a> StartupReplayCoordinator<'a> {
                 .local_payload_backend
                 .object_stats(*object_id)
                 .map(|stats| stats.payload_len);
-            geometry.object_file_offset = geometry.contiguous_origin(payload_len);
             geometry.payload_len = payload_len.unwrap_or(geometry.payload_len);
         }
         for object in &mut objects {
             let geometry = &geometries[&object.object_id];
-            object.object_file_offset = geometry.object_file_offset;
+            object.file_mapping = geometry.file_mapping();
             object.payload_len = geometry.payload_len;
         }
         Ok(objects)
@@ -302,7 +301,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.replay_ops.push((
             ino,
             graph_object.absolute_offset,
-            graph_object.object_file_offset,
+            graph_object.file_mapping,
             graph_object.object_id,
             content_epoch,
             graph_object.payload_len,

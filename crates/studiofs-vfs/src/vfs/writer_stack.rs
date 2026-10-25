@@ -747,10 +747,9 @@ impl MountedWriterStack {
         if file.ino != ino {
             return Ok(0);
         };
+        // Sustained writes never go idle, so dirty bytes older than the idle window drain too.
         if min_idle.is_some_and(|idle| {
-            file.last_write.elapsed() < idle
-                && file.dirty_since.elapsed()
-                    < idle.saturating_mul(super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES as u32)
+            file.last_write.elapsed() < idle && file.dirty_since.elapsed() < idle
         }) {
             return Ok(0);
         }
@@ -873,6 +872,8 @@ impl MountedWriterStack {
             }
         }
         file.dirty_bytes = file.dirty_bytes.saturating_sub(staged_dirty_bytes);
+        // Bytes left behind start a new age window instead of inheriting the drained one.
+        file.dirty_since = Instant::now();
         let clean = file.dirty_bytes == 0;
         drop(file);
         self.subtract_dirty(staged_dirty_bytes);
@@ -1001,6 +1002,8 @@ impl MountedWriterStack {
             }
         }
         file.dirty_bytes = file.dirty_bytes.saturating_sub(staged_dirty_bytes);
+        // Bytes left behind start a new age window instead of inheriting the drained one.
+        file.dirty_since = Instant::now();
         let clean = file.dirty_bytes == 0;
         drop(file);
         self.subtract_dirty(staged_dirty_bytes);
@@ -2046,17 +2049,26 @@ mod tests {
         stack
             .write_bytes(write_spec(1, 7, 32, 100), b"old")
             .unwrap();
+        let idle = Duration::from_millis(200);
+        assert_eq!(stack.prepare_finish_inode_if_idle(7, idle).unwrap(), 0);
         {
             let shard = stack.shards[MountedWriterStack::inode_shard_index(7)].lock();
-            shard.files[&7].lock().dirty_since = Instant::now() - Duration::from_secs(2);
+            shard.files[&7].lock().dirty_since = Instant::now() - idle - Duration::from_millis(1);
         }
         stack.write_bytes(write_spec(1, 7, 0, 101), b"new").unwrap();
         assert!(
-            stack
-                .prepare_finish_inode_if_idle(7, Duration::from_millis(200))
-                .unwrap()
-                > 0,
-            "aged dirty fragments must drain even after a recent write"
+            stack.prepare_finish_inode_if_idle(7, idle).unwrap() > 0,
+            "dirty fragments older than one idle window must drain even after a recent write"
+        );
+        stack.finish_prepared_inode(7, 900).unwrap();
+
+        stack
+            .write_bytes(write_spec(1, 7, 8, 102), b"next")
+            .unwrap();
+        assert_eq!(
+            stack.prepare_finish_inode_if_idle(7, idle).unwrap(),
+            0,
+            "a drain starts a new age window"
         );
     }
 

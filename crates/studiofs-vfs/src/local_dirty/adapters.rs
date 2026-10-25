@@ -193,7 +193,10 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
             submit_ops.push((
                 ino,
                 offset,
-                Some(offset),
+                Some(studiofs_cache::ObjectFileMapping::whole(
+                    offset,
+                    block.len() as u64,
+                )),
                 block.object_id,
                 content_epoch,
                 block.len() as u64,

@@ -1356,7 +1356,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 (
                     self.ino,
                     geometry.offset,
-                    geometry.contiguous_origin(payload_len),
+                    geometry.file_mapping(),
                     *object_id,
                     content_epoch,
                     payload_len.unwrap_or(geometry.payload_len),

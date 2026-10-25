@@ -18,6 +18,7 @@ A sustained random writer must also feed background upload before fsync.
 - [x] (2026-10-25) Bound dirty residency through the existing deferred worker; age regression passes.
 - [x] (2026-10-25) Register mounted-random-write-packing acceptance with byte readback, object bound, pre-fsync upload samples and retained fsync timing.
 - [x] (2026-10-25) Focused tests, all-target checks/Clippy, formatting and final diff review passed; rebuilt mounted scenario passed with cleanup.
+- [x] (2026-10-25) Review follow-up: replace the optional origin with a gapless file mapping, drain aged state after one idle window, test packed reattach and pending deletion against real metadata, test gapped spill geometry, and make the mounted scenario assert fsync and early upload.
 
 ## Surprises & Discoveries
 
@@ -28,6 +29,14 @@ shared objects before removing them from the dirty-object set. The existing
 idle-tail worker waits for file inactivity, which sustained random writes prevent.
 Linear's advertised get_agent_context endpoint returned Tool not found.
 
+Review found the aged-drain threshold multiplied an already multiplied linger
+window: 1.2 s × 6 = 7.2 s. The first live run therefore queued no upload until
+10.5 s of the 15 s workload. The age window also survived partial drains. The
+SFS-900 commit had also left `deferred_sparse_tail_rebases_when_size_growth_overtakes_materialization`
+failing: its sparse head and tail now pack into one object queued at offset 0.
+The existing spill batches already shared one object between non-adjacent
+blocks, so the earlier min/max geometry was wrong for them as well.
+
 ## Decision Log
 
 - Decision: preserve separate overlay slices and existing object storage format.
@@ -37,6 +46,13 @@ Linear's advertised get_agent_context endpoint returned Tool not found.
   disables contiguous stale reattachment for scattered objects.
   Rationale: inferring a file mapping from packed bytes can corrupt data. Existing
   metadata references still allow marking/rebasing a live object. Date: 2026-10-25.
+- Decision: replace the optional origin with `ObjectFileMapping`, a gapless file
+  range with one origin. Rationale: requiring a fully referenced object also
+  refused reattach for head-overwritten or tail-truncated contiguous objects,
+  whose stale path can then remove the local payload. Mapping only referenced,
+  gapless bytes is safe for packed and contiguous objects alike; gapped references
+  refuse, which also stops superseded middle bytes from refilling holes.
+  Date: 2026-10-25.
 - Decision: reuse the per-inode deferred materialization task and local durability
   boundary. Rationale: no new worker, service, dependency or tuning flag is needed.
   Date: 2026-10-25.
@@ -155,3 +171,30 @@ crash-restart, cold-peer, cross-platform or release-performance gates.
 
 Revision: record final focused command evidence, live metrics and remaining
 validation boundaries after independent review and successful native rerun.
+
+Revision: review follow-up. Upload ops carry `file_mapping: Option<ObjectFileMapping>`
+and the reattach port maps exactly that range. Aged writer state drains after
+one idle window and each drain restarts the window. The aged regression fails
+with the old 7.2 s threshold. New tests cover gapless mapping rules, real-meta
+reattach of a packed survivor, pending deletion only after the last packed
+segment, and gapped spill geometry. The mounted scenario now asserts the first
+active upload within 5 s and fsync within 3× its spanned metadata commit time
+plus 500 ms.
+
+    cargo test --offline -p studiofs-vfs --lib
+    1236 passed; 0 failed
+    cargo test --offline -p studiofs-cache --lib -- upload_queue:: cached_store::tests::sfs752_ submit_uploads_batch
+    52 passed; 0 failed
+    cargo test --offline -p studiofs-e2e --lib random_write_packing
+    2 passed; 0 failed
+    cargo clippy --offline -p studiofs-vfs -p studiofs-cache -p studiofs-e2e --all-targets -- -D warnings
+    cargo check --offline -p studiofs --all-targets
+    cargo fmt --all -- --check
+    cargo build --offline -p studiofs -p studiofs-e2e
+    target/debug/studiofs-e2e run mounted-random-write-packing --studiofs-bin target/debug/studiofs --run-id sfs900-review-fixes --retain always --timeout 180s
+    status=Passed; cleanup=passed; exit_code=0
+
+Live metrics: 19,971 writes, 23 payload objects (bound 52), first active upload
+at 3.1 s, 72 of 147 samples with pending and active uploads, largest sample gap
+184 ms, fsync 2,639.6 ms against 1,939.1 ms of spanned metadata commit time, and
+exact readback. Crash-restart, cold-peer and cross-platform gates remain unrun.

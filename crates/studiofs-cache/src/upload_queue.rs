@@ -17,6 +17,28 @@ use tracing::debug;
 /// Inode number (re-exported convenience).
 pub type Ino = u64;
 
+/// File bytes that map one-to-one onto a contiguous range of a payload object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectFileMapping {
+    /// First mapped file offset.
+    pub file_offset: u64,
+    /// Object offset holding the byte at `file_offset`.
+    pub object_offset: u64,
+    /// Mapped length in bytes.
+    pub len: u64,
+}
+
+impl ObjectFileMapping {
+    /// Maps `len` bytes of an object whose byte 0 sits at `file_offset`.
+    pub fn whole(file_offset: u64, len: u64) -> Self {
+        Self {
+            file_offset,
+            object_offset: 0,
+            len,
+        }
+    }
+}
+
 /// A pending upload operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingUpload {
@@ -24,8 +46,9 @@ pub struct PendingUpload {
     pub ino: Ino,
     /// File offset this payload object corresponds to.
     pub offset: u64,
-    /// File origin for a fully mapped contiguous object; `None` for packed or partial mappings.
-    pub object_file_offset: Option<u64>,
+    /// Gapless file mapping of the referenced object bytes for stale-epoch reattach;
+    /// `None` when the references are scattered, as in a packed object.
+    pub file_mapping: Option<ObjectFileMapping>,
     /// Object ID (object ID).
     pub object_id: u64,
     /// Uploaded payload length in bytes.
@@ -203,7 +226,7 @@ impl UploadQueue {
         object_id: u64,
         content_epoch: u64,
     ) -> UploadSubmitOutcome {
-        self.submit_with_payload(ino, offset, Some(offset), object_id, content_epoch, 0)
+        self.submit_with_payload(ino, offset, None, object_id, content_epoch, 0)
     }
 
     /// Submit a pending upload with explicit uploaded-payload geometry.
@@ -217,7 +240,7 @@ impl UploadQueue {
         &self,
         ino: Ino,
         offset: u64,
-        object_file_offset: Option<u64>,
+        file_mapping: Option<ObjectFileMapping>,
         object_id: u64,
         content_epoch: u64,
         payload_len: u64,
@@ -225,7 +248,7 @@ impl UploadQueue {
         self.submit_with_payload_and_pending_count(
             ino,
             offset,
-            object_file_offset,
+            file_mapping,
             object_id,
             content_epoch,
             payload_len,
@@ -240,7 +263,7 @@ impl UploadQueue {
         &self,
         ino: Ino,
         offset: u64,
-        object_file_offset: Option<u64>,
+        file_mapping: Option<ObjectFileMapping>,
         object_id: u64,
         content_epoch: u64,
         payload_len: u64,
@@ -248,7 +271,7 @@ impl UploadQueue {
         let op = PendingUpload {
             ino,
             offset,
-            object_file_offset,
+            file_mapping,
             object_id,
             payload_len,
             content_epoch,
@@ -957,28 +980,70 @@ mod tests {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, rx) = UploadQueue::new(dir.path());
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 0, Some(0), 101, 1, 7),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                0,
+                Some(ObjectFileMapping::whole(0, 7)),
+                101,
+                1,
+                7
+            ),
             (UploadSubmitOutcome::New, 1)
         );
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 0, Some(0), 101, 2, 7),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                0,
+                Some(ObjectFileMapping::whole(0, 7)),
+                101,
+                2,
+                7
+            ),
             (UploadSubmitOutcome::Updated, 1)
         );
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 0, Some(0), 101, 1, 7),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                0,
+                Some(ObjectFileMapping::whole(0, 7)),
+                101,
+                1,
+                7
+            ),
             (UploadSubmitOutcome::Ignored, 1)
         );
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 8, Some(8), 102, 1, 5),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                8,
+                Some(ObjectFileMapping::whole(8, 5)),
+                102,
+                1,
+                5
+            ),
             (UploadSubmitOutcome::New, 2)
         );
         drop(rx);
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 16, Some(16), 103, 1, 9),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                16,
+                Some(ObjectFileMapping::whole(16, 9)),
+                103,
+                1,
+                9
+            ),
             (UploadSubmitOutcome::Closed, 2)
         );
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 0, Some(0), 101, 3, 9),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                0,
+                Some(ObjectFileMapping::whole(0, 9)),
+                101,
+                3,
+                9
+            ),
             (UploadSubmitOutcome::Closed, 2)
         );
         assert_eq!(queue.snapshot_pending()[0].content_epoch, 2);
@@ -1012,7 +1077,7 @@ mod tests {
 
         let first_queue = Arc::clone(&queue);
         let first = tokio::task::spawn_blocking(move || {
-            first_queue.submit_with_payload(1, 0, Some(0), 77, 1, 10)
+            first_queue.submit_with_payload(1, 0, Some(ObjectFileMapping::whole(0, 10)), 77, 1, 10)
         });
         let first_paused = tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
             .await
@@ -1066,12 +1131,12 @@ mod tests {
     async fn sfs752_failed_rebased_requeue_holds_state_lock_and_restores_pending() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
-        queue.submit_with_payload(1, 0, Some(0), 77, 1, 10);
+        queue.submit_with_payload(1, 0, Some(ObjectFileMapping::whole(0, 10)), 77, 1, 10);
         let current = recv_one(&queue, &mut rx).await;
         drop(rx);
         let mut rebased = current.clone();
         rebased.offset = 10;
-        rebased.object_file_offset = Some(10);
+        rebased.file_mapping = Some(ObjectFileMapping::whole(10, 10));
         rebased.content_epoch = 2;
 
         let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1210,8 +1275,15 @@ mod tests {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
-        queue.submit_with_payload(10, 0, Some(0), 100, 1, 4096);
-        queue.submit_with_payload(10, 4096, Some(4096), 101, 1, 8192);
+        queue.submit_with_payload(10, 0, Some(ObjectFileMapping::whole(0, 4096)), 100, 1, 4096);
+        queue.submit_with_payload(
+            10,
+            4096,
+            Some(ObjectFileMapping::whole(4096, 8192)),
+            101,
+            1,
+            8192,
+        );
         queue.submit(11, 0, 102, 1);
         let mut retry = recv_one(&queue, &mut rx).await;
         assert_eq!(retry.object_id, 100);
@@ -1250,17 +1322,17 @@ mod tests {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
-        queue.submit_with_payload(10, 0, Some(0), 100, 1, 4096);
+        queue.submit_with_payload(10, 0, Some(ObjectFileMapping::whole(0, 4096)), 100, 1, 4096);
         let current = recv_one(&queue, &mut rx).await;
         let mut rebased = current.clone();
         rebased.offset = 4096;
-        rebased.object_file_offset = Some(4096);
+        rebased.file_mapping = Some(ObjectFileMapping::whole(4096, 4096));
         rebased.content_epoch = 2;
 
         assert!(queue.requeue_rebased(&current, rebased.clone()));
         let queued = recv_one(&queue, &mut rx).await;
         assert_eq!(queued.offset, 4096);
-        assert_eq!(queued.object_file_offset, Some(4096));
+        assert_eq!(queued.file_mapping, rebased.file_mapping);
         assert_eq!(queued.content_epoch, 2);
 
         assert!(

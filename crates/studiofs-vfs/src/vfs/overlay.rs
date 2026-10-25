@@ -2,7 +2,7 @@ use super::{ResolvedSliceSource, StudioVfs, VfsResult};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use studiofs_cache::upload_queue::PendingUpload;
+use studiofs_cache::upload_queue::{ObjectFileMapping, PendingUpload};
 use studiofs_meta::types::Ino;
 
 use crate::VfsMeta;
@@ -11,38 +11,43 @@ use crate::runtime::run_meta;
 #[derive(Clone, Copy)]
 pub(super) struct ObjectUploadGeometry {
     pub(super) offset: u64,
-    pub(super) object_file_offset: Option<u64>,
     pub(super) payload_len: u64,
+    end: u64,
+    origin: Option<u64>,
     referenced_bytes: u64,
-    object_start: u32,
 }
 
 impl ObjectUploadGeometry {
     pub(super) fn new(file_offset: u64, object_offset: u32, len: u32) -> Self {
         Self {
             offset: file_offset,
-            object_file_offset: file_offset.checked_sub(u64::from(object_offset)),
             payload_len: u64::from(object_offset) + u64::from(len),
+            end: file_offset.saturating_add(u64::from(len)),
+            origin: file_offset.checked_sub(u64::from(object_offset)),
             referenced_bytes: u64::from(len),
-            object_start: object_offset,
         }
     }
 
     pub(super) fn include(&mut self, other: Self) {
         self.offset = self.offset.min(other.offset);
-        if self.object_file_offset != other.object_file_offset {
-            self.object_file_offset = None;
-        }
         self.payload_len = self.payload_len.max(other.payload_len);
+        self.end = self.end.max(other.end);
+        if self.origin != other.origin {
+            self.origin = None;
+        }
         self.referenced_bytes = self.referenced_bytes.saturating_add(other.referenced_bytes);
-        self.object_start = self.object_start.min(other.object_start);
     }
 
-    pub(super) fn contiguous_origin(self, payload_len: Option<u64>) -> Option<u64> {
-        let payload_len = payload_len?;
-        (self.object_start == 0 && self.referenced_bytes == payload_len)
-            .then_some(self.object_file_offset)
-            .flatten()
+    /// Only bytes with a known file position may be reattached: a packed object's
+    /// unreferenced bytes belong to file offsets that no surviving segment records.
+    pub(super) fn file_mapping(self) -> Option<ObjectFileMapping> {
+        let origin = self.origin?;
+        let len = self.end - self.offset;
+        (self.referenced_bytes == len).then_some(ObjectFileMapping {
+            file_offset: self.offset,
+            object_offset: self.offset - origin,
+            len,
+        })
     }
 }
 
@@ -337,17 +342,39 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::{ExtentRecordId, ObjectUploadGeometry, PendingUploadCatalog};
-    use studiofs_cache::upload_queue::PendingUpload;
+    use studiofs_cache::upload_queue::{ObjectFileMapping, PendingUpload};
 
     #[test]
-    fn packed_geometry_requires_a_known_fully_mapped_object_for_reattach() {
-        let mut geometry = ObjectUploadGeometry::new(100, 0, 4);
-        assert_eq!(geometry.contiguous_origin(None), None);
-        assert_eq!(geometry.contiguous_origin(Some(8)), None);
-        geometry.include(ObjectUploadGeometry::new(104, 4, 4));
-        assert_eq!(geometry.contiguous_origin(Some(8)), Some(100));
-        geometry.include(ObjectUploadGeometry::new(200, 8, 4));
-        assert_eq!(geometry.contiguous_origin(Some(12)), None);
+    fn packed_geometry_maps_only_gapless_references_with_one_origin() {
+        let mut contiguous = ObjectUploadGeometry::new(100, 0, 4);
+        contiguous.include(ObjectUploadGeometry::new(104, 4, 4));
+        assert_eq!(
+            contiguous.file_mapping(),
+            Some(ObjectFileMapping::whole(100, 8))
+        );
+
+        // Head overwrite and tail truncation of a contiguous object keep their mapping.
+        assert_eq!(
+            ObjectUploadGeometry::new(104, 4, 4).file_mapping(),
+            Some(ObjectFileMapping {
+                file_offset: 104,
+                object_offset: 4,
+                len: 4,
+            })
+        );
+
+        let mut packed = ObjectUploadGeometry::new(100, 0, 4);
+        packed.include(ObjectUploadGeometry::new(200, 4, 4));
+        assert_eq!(packed.file_mapping(), None, "scattered origins");
+
+        let mut gap = ObjectUploadGeometry::new(100, 0, 4);
+        gap.include(ObjectUploadGeometry::new(108, 8, 4));
+        assert_eq!(
+            gap.file_mapping(),
+            None,
+            "superseded middle bytes are unmapped"
+        );
+        assert_eq!(gap.payload_len, 12);
     }
 
     #[test]
@@ -358,7 +385,7 @@ mod tests {
             PendingUpload {
                 ino,
                 offset: block_offset,
-                object_file_offset: Some(block_offset),
+                file_mapping: None,
                 object_id: 101,
                 payload_len: 0,
                 content_epoch: 3,
@@ -369,7 +396,7 @@ mod tests {
             PendingUpload {
                 ino,
                 offset: block_offset,
-                object_file_offset: Some(block_offset),
+                file_mapping: None,
                 object_id: 202,
                 payload_len: 0,
                 content_epoch: 5,

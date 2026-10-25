@@ -1624,7 +1624,7 @@ impl StudioVfs {
                 (
                     ino,
                     geometry.offset,
-                    geometry.contiguous_origin(payload_len),
+                    geometry.file_mapping(),
                     *object_id,
                     content_epoch,
                     payload_len.unwrap_or(geometry.payload_len),
@@ -1645,11 +1645,11 @@ impl StudioVfs {
         }
         let mut submit_upload_ops = Vec::new();
         for op in upload_ops {
-            let (op_ino, offset, object_file_offset, object_id, op_epoch, payload_len) = op;
+            let (op_ino, offset, file_mapping, object_id, op_epoch, payload_len) = op;
             if let Some(current) = retained_pending.remove(&object_id) {
                 let mut rebased = current.clone();
                 rebased.offset = offset;
-                rebased.object_file_offset = object_file_offset;
+                rebased.file_mapping = file_mapping;
                 rebased.content_epoch = op_epoch;
                 rebased.payload_len = payload_len;
                 if self.cached_store.requeue_rebased_upload(&current, rebased) {
@@ -1659,7 +1659,7 @@ impl StudioVfs {
             submit_upload_ops.push((
                 op_ino,
                 offset,
-                object_file_offset,
+                file_mapping,
                 object_id,
                 op_epoch,
                 payload_len,

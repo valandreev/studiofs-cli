@@ -335,15 +335,18 @@ tests do not establish live mounted disk-full acceptance.
 Finished writer fragments share block-sized payload objects across an inode's
 chunks. Each overlay slice retains its own file range, object offset and write
 sequence. Upload lengths describe physical payload bytes, including unreferenced
-tails. Scattered or incomplete mappings cannot use contiguous stale-epoch
-reattachment. Replay and truncate rebuild the same geometry; the last surviving
-segment retains the shared object's upload pin. Aged dirty writer state drains
-through the existing background worker even while writes continue.
+tails. Stale-epoch reattachment receives only a gapless file mapping with one
+origin and maps exactly those referenced bytes; scattered references, as in a
+packed object or a gapped spill batch, refuse it. Replay and truncate rebuild the
+same geometry; the last surviving segment retains the shared object's upload pin
+and only its removal schedules pending deletion. Dirty writer state older than
+the 1.2 s idle window drains through the existing background worker even while
+writes continue.
 
 Focused checks (no remote services):
 
 ```sh
-cargo test -p studiofs-vfs --lib -- packed_ writer_stack_retries_transient_materialization_failure --nocapture
+cargo test -p studiofs-vfs --lib -- packed_ writer_stack_retries_transient_materialization_failure vfs_upload_meta_reattaches buffered_write_spill_batches deferred_sparse_tail_rebases --nocapture
 cargo test -p studiofs-cache --lib -- upload_queue:: cached_store::tests::sfs752_ submit_uploads_batch --nocapture
 cargo test -p studiofs-e2e --lib random_write_packing -- --nocapture
 ```
@@ -355,13 +358,14 @@ cargo build -p studiofs -p studiofs-e2e
 target/debug/studiofs-e2e run mounted-random-write-packing --studiofs-bin target/debug/studiofs --run-id sfs900-random-packing --retain always --timeout 180s
 ```
 
-The scenario performs 15 seconds of random 4 KiB writes over a 256 MiB file,
-observes active uploads with a pending backlog before fsync, checks readback,
-and bounds physical payload objects by accepted bytes divided by pack size plus
-partial drains. `random-write-packing.json` retains fsync duration, upload samples
-and public runtime snapshots before/after fsync. Compare fsync to local metadata
-commit timings in the retained mount logs. Unit tests alone do not establish
-mounted latency acceptance.
+The scenario performs 15 seconds of random 4 KiB writes over a 256 MiB file and
+samples the upload queue every 100 ms. It fails unless an active upload with a
+pending backlog appears within 5 s, fsync stays within three times the local
+metadata commit time it spans plus 500 ms, readback matches, and physical payload
+objects stay within accepted bytes divided by pack size plus partial drains.
+`random-write-packing.json` retains these values, the upload samples and public
+runtime snapshots before/after fsync. Unit tests alone do not establish mounted
+latency acceptance.
 
 ### SFS-897 Random-Write fsync and Upload Pipeline Regressions
 

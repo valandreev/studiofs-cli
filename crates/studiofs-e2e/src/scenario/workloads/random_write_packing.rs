@@ -8,6 +8,12 @@ const FILE_BYTES: usize = 256 * 1024 * 1024;
 const WRITE_BYTES: usize = 4096;
 const PACK_BYTES: usize = 4 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+// Aged writer-stack bytes drain after about 1.2 s; allow commit and upload admission on top.
+const FIRST_UPLOAD_DEADLINE_MS: u64 = 5_000;
+// fsync must be bounded by its metadata commits, not by per-fragment payload work.
+const FSYNC_COMMIT_MULTIPLE: f64 = 3.0;
+const FSYNC_FLOOR_MS: f64 = 500.0;
 
 pub(in crate::scenario) struct RandomWritePacking;
 
@@ -57,6 +63,13 @@ impl Scenario for RandomWritePacking {
             serde_json::from_slice(&fs::read(context.scenario_dir.join(SUMMARY))?)?;
         let writes = summary["writes"].as_u64().unwrap_or(0);
         let objects = summary["payload_objects"].as_u64().unwrap_or(u64::MAX);
+        let first_upload_ms = summary["first_upload_ms"].as_u64().unwrap_or(u64::MAX);
+        let fsync_ms = summary["fsync_ms"].as_f64().unwrap_or(f64::INFINITY);
+        let fsync_bound_ms = summary["fsync_commit_ms"]
+            .as_f64()
+            .map_or(0.0, |commit_ms| {
+                FSYNC_COMMIT_MULTIPLE * commit_ms + FSYNC_FLOOR_MS
+            });
         // Each drain can add a partial pack; 32 exceeds the number of aged drains in 15 seconds.
         let bound = writes
             .saturating_mul(WRITE_BYTES as u64)
@@ -66,10 +79,13 @@ impl Scenario for RandomWritePacking {
             || objects == 0
             || objects > bound
             || summary["upload_during_writes"].as_bool() != Some(true)
+            || first_upload_ms > FIRST_UPLOAD_DEADLINE_MS
+            || fsync_ms > fsync_bound_ms
             || summary["readback_matches"].as_bool() != Some(true)
         {
             return Err(io::Error::other(format!(
-                "random-write packing acceptance failed (object bound {bound}): {summary}"
+                "random-write packing acceptance failed (object bound {bound}, \
+                 first upload deadline {FIRST_UPLOAD_DEADLINE_MS} ms, fsync bound {fsync_bound_ms:.1} ms): {summary}"
             ))
             .into());
         }
@@ -106,8 +122,10 @@ fn measure(
             let mut state = 900_u64;
             let mut writes = 0_u64;
             let mut upload_during_writes = false;
+            let mut first_upload_ms = None;
             let mut samples = Vec::new();
             let started = Instant::now();
+            let mut last_sample = started;
             while started.elapsed() < Duration::from_secs(15) {
                 state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let offset = ((state >> 32) as usize % (FILE_BYTES / WRITE_BYTES)) * WRITE_BYTES;
@@ -116,7 +134,8 @@ fn measure(
                 file.write_all(&payload)?;
                 expected[offset..offset + WRITE_BYTES].copy_from_slice(&payload);
                 writes += 1;
-                if writes.is_multiple_of(256) {
+                if last_sample.elapsed() >= SAMPLE_INTERVAL {
+                    last_sample = Instant::now();
                     let text = fs::read_to_string(mount.join(".studiofs-runtime-stats"))?;
                     let stats =
                         RuntimeStatsSnapshot::parse_text(&text).map_err(io::Error::other)?;
@@ -130,8 +149,14 @@ fn measure(
                         .gauges
                         .get("active_uploads")
                         .map_or(0, |metric| metric.value);
-                    upload_during_writes |= pending > 0 && active > 0;
-                    samples.push(json!({"elapsed_ms": started.elapsed().as_millis(), "pending": pending, "active": active}));
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    if pending > 0 && active > 0 {
+                        upload_during_writes = true;
+                        first_upload_ms.get_or_insert(elapsed_ms);
+                    }
+                    samples.push(
+                        json!({"elapsed_ms": elapsed_ms, "pending": pending, "active": active}),
+                    );
                 }
             }
             let before_fsync = fs::read_to_string(mount.join(".studiofs-runtime-stats"))?;
@@ -139,12 +164,15 @@ fn measure(
             file.sync_all()?;
             let fsync_ms = fsync_started.elapsed().as_secs_f64() * 1000.0;
             let after_fsync = fs::read_to_string(mount.join(".studiofs-runtime-stats"))?;
+            let fsync_commit_ms =
+                metadata_commit_ms(&after_fsync)? - metadata_commit_ms(&before_fsync)?;
             file.seek(SeekFrom::Start(0))?;
             let mut actual = Vec::new();
             file.read_to_end(&mut actual)?;
             Ok(
                 json!({"writes": writes, "file_bytes": FILE_BYTES, "write_bytes": WRITE_BYTES,
-            "fsync_ms": fsync_ms, "upload_during_writes": upload_during_writes,
+            "fsync_ms": fsync_ms, "fsync_commit_ms": fsync_commit_ms,
+            "upload_during_writes": upload_during_writes, "first_upload_ms": first_upload_ms,
             "readback_matches": actual == expected, "upload_samples": samples, "before_fsync": before_fsync, "after_fsync": after_fsync}),
             )
         },
@@ -155,6 +183,16 @@ fn measure(
         serde_json::to_vec_pretty(&summary)?,
     )?;
     Ok(())
+}
+
+/// Cumulative local metadata commit time; the delta across fsync covers its final overlay commit.
+fn metadata_commit_ms(stats_text: &str) -> io::Result<f64> {
+    let stats = RuntimeStatsSnapshot::parse_text(stats_text).map_err(io::Error::other)?;
+    Ok(stats
+        .metadata
+        .latencies
+        .get("commit")
+        .map_or(0.0, |histogram| histogram.sum as f64 / 1_000_000.0))
 }
 
 fn count_payload_objects(root: &Path) -> io::Result<u64> {
@@ -181,5 +219,13 @@ mod tests {
         fs::write(tmp.path().join("ab/1.object"), b"payload").unwrap();
         fs::write(tmp.path().join("ab/2.stage"), b"stage").unwrap();
         assert_eq!(count_payload_objects(tmp.path()).unwrap(), 1);
+    }
+
+    #[test]
+    fn reads_cumulative_metadata_commit_time_in_milliseconds() {
+        let text = "# studiofs_runtime_stats schema_version=1\n\
+                    histogram_count metadata.commit ns 3\n\
+                    histogram_sum metadata.commit ns 2490462652\n";
+        assert_eq!(metadata_commit_ms(text).unwrap(), 2_490.462_652);
     }
 }

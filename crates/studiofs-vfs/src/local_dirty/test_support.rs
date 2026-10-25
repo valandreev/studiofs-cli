@@ -1331,6 +1331,37 @@ mod tests {
     }
 
     #[test]
+    fn buffered_write_spill_batches_with_gaps_upload_their_real_object_length() {
+        use crate::vfs::overlay::ObjectUploadGeometry;
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "spill-gapped-geometry");
+        let blocks = vec![
+            DirtyWriteSnapshot::from_shared(0, Bytes::from_static(b"head")),
+            DirtyWriteSnapshot::from_shared(5, Bytes::from_static(b"tail")),
+        ];
+
+        let batches = vfs.build_dirty_write_snapshot_slice_spill_batches(&blocks);
+
+        assert_eq!(batches.len(), 1, "partial blocks share one spill object");
+        let mut segments = batches[0].segments.iter().map(|segment| {
+            ObjectUploadGeometry::new(
+                segment.file_offset,
+                segment.object_offset,
+                u32::try_from(segment.len).unwrap(),
+            )
+        });
+        let mut geometry = segments.next().unwrap();
+        segments.for_each(|segment| geometry.include(segment));
+        assert_eq!(geometry.payload_len, batches[0].payload.len() as u64);
+        assert_eq!(
+            geometry.file_mapping(),
+            None,
+            "non-adjacent blocks have no contiguous file origin"
+        );
+    }
+
+    #[test]
     #[cfg_attr(
         debug_assertions,
         should_panic(expected = "pending_slice_count underflow")
