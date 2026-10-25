@@ -197,6 +197,53 @@ fn serving_rename_reconcile_reduces_local_journal_once_per_replay_pass() {
 }
 
 #[test]
+fn serving_dentry_reconcile_uses_exact_base_keys_without_directory_scans() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"Source", 1000, 1000, 0o644)
+        .unwrap();
+    let setup_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = engine.read_events_range(0, setup_end).unwrap();
+    engine.apply_replica_events_to_base(&setup).unwrap();
+    engine
+        .create_file(ROOT_INO, b"absent", 1000, 1000, 0o644)
+        .unwrap();
+    engine
+        .rename(ROOT_INO, b"Source", ROOT_INO, b"destination")
+        .unwrap();
+    let protected = encode_dentry_key(ROOT_INO, b"destination");
+    let keys = HashSet::from([
+        encode_dentry_key(ROOT_INO, b"Source"),
+        encode_dentry_key(ROOT_INO, b"source"),
+        encode_dentry_key(ROOT_INO, b"absent"),
+        protected.clone(),
+    ]);
+    CASE_FALLBACK_DENTRY_SCANS.set(0);
+
+    engine
+        .reconcile_serving_dentries_from_base(&keys, &HashSet::from([protected]))
+        .unwrap();
+
+    assert_eq!(CASE_FALLBACK_DENTRY_SCANS.get(), 0);
+    let entries = engine.readdir(ROOT_INO).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == b"Source" && entry.ino == file.ino)
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == b"destination" && entry.ino == file.ino)
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.name == b"source" || entry.name == b"absent")
+    );
+}
+
+#[test]
 fn self_rename_mirror_reconcile_uses_exact_dentry_keys() {
     let engine = temp_engine();
     let dir = engine

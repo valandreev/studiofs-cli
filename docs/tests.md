@@ -437,6 +437,22 @@ a create/rename/unlink microbenchmark on a Linux mount with 1 and 8 processes
 that attributes `pg-meta-poll` CPU per operation until the thread goes idle;
 that CPU must stay below the operation's own foreground cost.
 
+### SFS-899 Exact Base Dentry Reconciliation
+
+Exact event keys must not trigger a case-insensitive directory scan while
+reconciling base dentries into serving. This regression checks present and
+missing keys, a differently cased base sibling, and a protected local binding:
+
+```sh
+cargo test -p studiofs-meta --lib serving_dentry_reconcile_uses_exact_base_keys_without_directory_scans -- --nocapture
+```
+
+This does not prove rename throughput scaling. Mounted acceptance still needs
+1-process versus 8-process measurements in separate directories, including
+writer-lock wait, self-ack writer hold time, and `pg-meta-poll` CPU per rename.
+The existing metadata `begin_write` timing starts after the engine writer mutex
+is acquired and therefore excludes its wait time.
+
 ### SFS-887 Synchronous Namespace Operations on the Mount Runtime
 
 Platform dispatcher threads (libfuse, macFUSE, WinFSP) call `rename`,

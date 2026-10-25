@@ -2348,7 +2348,7 @@ impl RedbMetaEngine {
                 .iter()
                 .map(|key| {
                     let (parent, name) = decode_dentry_key(key)?;
-                    let entry = Self::lookup_in_opened_dentry_table(&base, parent, name)?;
+                    let entry = Self::lookup_exact_in_opened_dentry_table(&base, parent, name)?;
                     Ok((key.as_slice(), entry))
                 })
                 .collect::<MetaResult<HashMap<&[u8], Option<DirEntryValue>>>>()?
