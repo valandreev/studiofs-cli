@@ -10,6 +10,12 @@ use crate::schema::counters::{self, LOCAL_PG_FLUSHED_EVENT_SEQ, NEXT_EVENT_SEQ};
 use std::sync::Arc;
 use std::thread;
 
+thread_local! {
+    /// Parent-scoped case-insensitive dentry scans after an exact-key miss.
+    pub(super) static CASE_FALLBACK_DENTRY_SCANS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 fn invalidate_local_storage_page_stats(engine: &RedbMetaEngine) {
     *engine
         .local_storage_page_stats
@@ -180,6 +186,81 @@ fn serving_rename_reconcile_reduces_local_journal_once_per_replay_pass() {
         let name = format!("dst-{index}").into_bytes();
         assert!(engine.lookup(ROOT_INO, &name).is_ok());
     }
+}
+
+#[test]
+fn self_rename_mirror_reconcile_uses_exact_dentry_keys() {
+    let engine = temp_engine();
+    let dir = engine
+        .create_dir(ROOT_INO, b"big", 1000, 1000, 0o755)
+        .unwrap();
+    for index in 0..64 {
+        engine
+            .create_file(
+                dir.ino,
+                format!("sibling-{index}").as_bytes(),
+                1000,
+                1000,
+                0o644,
+            )
+            .unwrap();
+    }
+    let file = engine
+        .create_file(dir.ino, b"src", 1000, 1000, 0o644)
+        .unwrap();
+    let setup_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = engine.read_events_range(0, setup_end).unwrap();
+    engine.apply_replica_events_to_base(&setup).unwrap();
+    // The local rename already moved serving; the self-ack then mirrors it to base.
+    engine.rename(dir.ino, b"src", dir.ino, b"dst").unwrap();
+    let rename = MetaEvent::RenameEntry {
+        parent: dir.ino,
+        name: b"src".to_vec(),
+        new_parent: dir.ino,
+        new_name: b"dst".to_vec(),
+        entry: DirEntryValue {
+            ino: file.ino,
+            kind: FileType::RegularFile,
+        },
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: None,
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    };
+    let txn = engine.begin_write_txn().unwrap();
+    txn.without_invalidations(|| {
+        RedbMetaEngine::apply_replica_events_to_base_in_txn(
+            &txn,
+            std::slice::from_ref(&rename),
+            &HashSet::new(),
+        )
+    })
+    .unwrap();
+    CASE_FALLBACK_DENTRY_SCANS.set(0);
+
+    RedbMetaEngine::reconcile_serving_rename_from_base_in_txn(
+        &txn,
+        dir.ino,
+        b"src",
+        dir.ino,
+        b"dst",
+        &DirEntryValue {
+            ino: file.ino,
+            kind: FileType::RegularFile,
+        },
+        &mut replication::LocalDentryRemovals::default(),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+
+    // Mirror maintenance acts on the exact keys events carry; a miss must not scan the parent.
+    assert_eq!(CASE_FALLBACK_DENTRY_SCANS.get(), 0);
+    assert_eq!(engine.lookup(dir.ino, b"dst").unwrap().ino, file.ino);
+    assert!(matches!(
+        engine.lookup(dir.ino, b"src"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
 }
 
 #[test]

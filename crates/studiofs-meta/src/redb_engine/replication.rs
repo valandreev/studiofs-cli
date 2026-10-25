@@ -513,7 +513,7 @@ impl RedbMetaEngine {
             let table = txn
                 .open_table(table)
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
-            if let Some(entry) = Self::lookup_in_opened_dentry_table(&table, parent, name)? {
+            if let Some(entry) = Self::lookup_exact_in_opened_dentry_table(&table, parent, name)? {
                 txn.invalidate(InvalidationIntent::Attributes { ino: entry.ino });
             }
         }
@@ -2487,11 +2487,12 @@ impl RedbMetaEngine {
         entry: &DirEntryValue,
         local_removals: &mut LocalDentryRemovals,
     ) -> MetaResult<()> {
-        let src_in_base = Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?
-            .map(|value| value.ino == entry.ino && value.kind == entry.kind)
-            .unwrap_or(false);
+        let src_in_base =
+            Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?
+                .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+                .unwrap_or(false);
         let dst_in_base =
-            Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
+            Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
         Self::remove_stale_dentries_for_base_entry(txn, entry, &HashSet::new())?;
@@ -2579,7 +2580,7 @@ impl RedbMetaEngine {
         name: &[u8],
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
-        let matches = Self::lookup_in_write_table(txn, DENTRIES_TABLE, parent, name)?
+        let matches = Self::lookup_exact_in_write_table(txn, DENTRIES_TABLE, parent, name)?
             .map(|current| current.ino == entry.ino && current.kind == entry.kind)
             .unwrap_or(false);
         if matches {

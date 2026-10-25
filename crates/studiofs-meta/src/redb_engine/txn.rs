@@ -128,6 +128,27 @@ impl RedbMetaEngine {
         String::from_utf8_lossy(left).to_lowercase() == right_lower.as_str()
     }
 
+    /// Look up exactly `(parent, name)`, without the case-insensitive fallback.
+    ///
+    /// Mirror maintenance acts on the exact keys carried by events; the
+    /// parent-scoped fallback is foreground lookup semantics and costs a scan
+    /// of the whole directory on every miss.
+    pub(super) fn lookup_exact_in_opened_dentry_table<T>(
+        table: &T,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<Option<DirEntryValue>>
+    where
+        T: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        let key = encode_dentry_key(parent, name);
+        table
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|entry| decode(entry.value()))
+            .transpose()
+    }
+
     pub(super) fn lookup_in_opened_dentry_table<T>(
         table: &T,
         parent: Ino,
@@ -142,6 +163,8 @@ impl RedbMetaEngine {
             return decode(entry.value()).map(Some);
         }
 
+        #[cfg(test)]
+        super::tests::CASE_FALLBACK_DENTRY_SCANS.with(|count| count.set(count.get() + 1));
         let mut name_lower = None;
         let prefix = dentry_prefix(parent);
         let range_end = prefix_successor(&prefix);
@@ -647,6 +670,19 @@ impl RedbMetaEngine {
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Self::lookup_in_opened_dentry_table(&table, parent, name)
+    }
+
+    /// Exact-key form of [`Self::lookup_in_write_table`] for mirror maintenance.
+    pub(super) fn lookup_exact_in_write_table(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<Option<DirEntryValue>> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::lookup_exact_in_opened_dentry_table(&table, parent, name)
     }
 
     pub(super) fn get_attr_from_write_table(
@@ -1329,7 +1365,9 @@ impl RedbMetaEngine {
         parent: Ino,
         name: &[u8],
     ) -> MetaResult<()> {
-        let Some(entry) = Self::lookup_in_write_table(txn, dentry_table_def, parent, name)? else {
+        // Only the exact key is removed below, so only its own index row may go with it.
+        let Some(entry) = Self::lookup_exact_in_write_table(txn, dentry_table_def, parent, name)?
+        else {
             return Ok(());
         };
         let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
