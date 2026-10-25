@@ -31,6 +31,9 @@ starting state during the five-second diagnostics grace period. The icon animati
 itself performs no PostgreSQL or S3 requests. The same runtime contract and color mapping serve
 Windows, macOS and Linux.
 
+Polling pauses are interrupted during shutdown. An in-flight diagnostics request
+retains its one-second timeout.
+
 The runtime checks the durable acknowledgement of its own local metadata
 journal, not a moving global peer head. It reads that boundary before and after
 checking writer, staging, upload and publication owners. Activity leases remain

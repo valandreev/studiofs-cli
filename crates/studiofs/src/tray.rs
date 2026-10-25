@@ -735,7 +735,7 @@ mod supported {
                     if proxy.send_event(TrayUserEvent::Tick).is_err() {
                         break;
                     }
-                    std::thread::sleep(ANIMATION_TICK);
+                    std::thread::park_timeout(ANIMATION_TICK);
                 }
             })
             .map(Some)
@@ -775,7 +775,7 @@ mod supported {
                         break;
                     }
 
-                    std::thread::sleep(diagnostics_poll_interval(next_activity.mode));
+                    std::thread::park_timeout(diagnostics_poll_interval(next_activity.mode));
                 }
             })
             .map(Some)
@@ -786,7 +786,10 @@ mod supported {
     }
 
     fn join_optional_thread(name: &str, handle: Option<JoinHandle<()>>) {
-        if handle.is_some_and(|handle| handle.join().is_err()) {
+        if handle.is_some_and(|handle| {
+            handle.thread().unpark();
+            handle.join().is_err()
+        }) {
             tracing::warn!(thread = name, "background tray helper thread panicked");
         }
     }
@@ -1041,6 +1044,38 @@ mod supported {
                 );
             }
             assert!(idle + DIAGNOSTICS_REQUEST_TIMEOUT < DIAGNOSTICS_MAX_AGE);
+        }
+
+        #[test]
+        fn joining_tray_helper_wakes_its_polling_pause() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn({
+                let stop = stop.clone();
+                move || {
+                    ready_tx.send(()).expect("announce polling pause");
+                    loop {
+                        std::thread::park();
+                        if stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                }
+            });
+            let worker_thread = worker.thread().clone();
+            ready_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("helper ready to park");
+            stop.store(true, Ordering::Release);
+            let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+            let joiner = std::thread::spawn(move || {
+                join_optional_thread("test polling helper", Some(worker));
+                joined_tx.send(()).expect("announce completed join");
+            });
+            let joined = joined_rx.recv_timeout(Duration::from_secs(1));
+            worker_thread.unpark();
+            joiner.join().expect("join test driver after cleanup");
+            joined.expect("joining must wake the helper without waiting for its polling interval");
         }
 
         #[test]

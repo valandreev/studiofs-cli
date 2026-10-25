@@ -96,18 +96,20 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
     }
 
     fn health_snapshot(&self) -> DiagnosticsHealthSnapshot {
+        let generated_unix_ms = now_unix_millis();
+        let synchronization = self.vfs.synchronization_state_snapshot();
         DiagnosticsHealthSnapshot {
-            generated_unix_ms: now_unix_millis(),
+            generated_unix_ms,
             ingress: self.vfs.ingress_stats(),
             upload: self.vfs.upload_stats(),
-            file_sessions: self.vfs.file_session_stats(),
-            foreground_reads: self.vfs.foreground_read_protection_stats(),
+            file_sessions: synchronization.file_sessions.clone(),
+            foreground_reads: synchronization.foreground_reads.clone(),
+            coherence: synchronization.coherence,
             write_path: self.vfs.write_path_observability_snapshot(),
             synchronization: DiagnosticsSynchronizationSnapshot {
-                state: self.vfs.synchronization_state_snapshot(),
+                state: synchronization,
             },
             sync_safety: self.vfs.sync_safety_snapshot(),
-            coherence: self.vfs.coherence_health_snapshot(),
         }
     }
 

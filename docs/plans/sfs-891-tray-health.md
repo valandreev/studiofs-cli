@@ -29,6 +29,9 @@ completion.
 - [x] (2026-10-25 17:40Z) Addressed the follow-up review of `from_health`;
   observed the expanded structured-snapshot regression fail before correction,
   then passed all 42 diagnostic tests, crate check, Clippy, and hygiene checks.
+- [x] (2026-10-25 18:11Z) Addressed the attached polling review: reuse synchronization fields,
+  document the Health field, wake parked tray helpers during shutdown, and
+  ran focused verification. Recorded all seven recommendations' dispositions.
 
 ## Surprises & Discoveries
 
@@ -77,6 +80,56 @@ was also checked by temporarily restoring a discarded ZeroIO call: it failed
 with counter 4 versus 1, then passed after removing that call. No new VFS or
 metadata instrumentation was needed. Mounted profiling remains unavailable;
 SFS-891 stays In Progress pending that acceptance evidence.
+
+The attached review follow-up addressed items 1, 5, and 7. Its new join/wakeup
+regression failed before the correction with a bounded channel timeout, then
+passed with all 25 tray tests. All 42 diagnostics tests, crate check, Clippy,
+formatting, and diff checks also passed. Items 2, 3, 4, and 6 have explicit
+dispositions below; no discovery retry policy or arbitrary timeout was added.
+
+## Attached Review Disposition
+
+Review item 1 is confirmed: `synchronization_state_snapshot` already collects
+file-session, foreground-read, and coherence values. Health should collect that
+snapshot once, clone its owned session/read values into the compatibility fields,
+and copy coherence. The review's example needs those clones: these session/read
+types own strings/vectors, so moving their fields and then the entire snapshot
+would not compile. Other required sampling, including sync safety, remains intact.
+
+Item 2 is rejected for the current lifecycle. In `tray.rs`,
+`dispatch_mount_with_auto_tray` starts the mount in this same process, passes
+`std::process::id()` to its monitor, and sets stop plus sends `MountFinished`
+when `mount_args.dispatch()` returns. The event handler exits on `MountFinished`.
+`MountRuntimeGuard::serve_foreground` in `cli/mount/session.rs` starts the diagnostics
+host once, and cleanup stops it. There is no live replacement or restart of
+that host inside this tray lifetime. A restarted process has a different PID,
+which `find_local_mount_session` deliberately rejects; clearing discovery would
+not reconnect to it. Transient requests to the existing host already retry
+using the valid cached discovery. No new reconnection policy is introduced.
+
+Item 3 is not a confirmed defect. Failing closed to Unavailable after the
+two-second heartbeat limit is intentional. Health still reads pending work,
+mutex-protected telemetry, and local metadata gauges; it is not exclusively
+atomic loads. No measured evidence supports halving its timeout to 500 ms.
+Changing constants cannot guarantee scheduling latency under CPU starvation.
+Keep the existing timeout and expiry invariants.
+
+Item 4 is cosmetic and skipped. Adding PartialEq throughout the VFS/metadata
+telemetry types solely to change a test assertion widens this change across
+crates without altering behavior. JSON comparison is confined to tests.
+
+Item 5 is accepted as a one-line field description. Item 6 is stale: the
+initial working tree at this review was clean, `git ls-files` includes
+`docs/plans/sfs-891-tray-health.md`, and `.agent/PLANS.md` does not require an
+`.agent/execplans` directory. Preserve the tracked path and existing references.
+
+Item 7 is confirmed for polling pauses. Replace the ticker and monitor sleeps
+with `thread::park_timeout`, and unpark each helper before joining it, reusing
+the pattern in `MountStatusMonitor::stop_and_join`. The stop flag remains the
+condition; spurious wakeups only advance another iteration. A channel-coordinated
+test exercises the real join helper and cleans up its worker on failure. This
+interrupts polling pauses; it does not promise to cancel an in-flight diagnostics
+request before its existing timeout.
 
 ## Context and Orientation
 
@@ -172,3 +225,13 @@ Verification for that revision reran
 `cargo check -p studiofs`, and
 `cargo clippy -p studiofs --all-targets -- -D warnings`; formatting and diff
 checks were rerun after formatting the new fixture values.
+
+Attached-review revision records the disposition of all seven findings before
+changing code. It preserves process ownership, protocol compatibility, and
+existing freshness limits, and uses the existing park/unpark shutdown pattern.
+Validation reran `cargo test -p studiofs --bin studiofs tray:: -- --nocapture`
+(25 passed), `cargo test -p studiofs --bin studiofs diagnostics:: -- --nocapture`
+(42 passed), `cargo check -p studiofs`,
+`cargo clippy -p studiofs --all-targets -- -D warnings`,
+`cargo fmt --all -- --check`, and `git diff --check`. Native tray shutdown on
+Windows/macOS and the mounted performance profile remain environment-gated.

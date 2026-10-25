@@ -58,6 +58,7 @@ pub(crate) struct DiagnosticsHealthSnapshot {
     pub file_sessions: VfsFileSessionStats,
     pub foreground_reads: VfsForegroundReadProtectionStats,
     pub write_path: VfsWritePathObservabilitySnapshot,
+    /// Mount-local replication backlog and file-session telemetry.
     #[serde(default)]
     pub synchronization: DiagnosticsSynchronizationSnapshot,
     /// Missing legacy telemetry cannot certify synchronization completion.
