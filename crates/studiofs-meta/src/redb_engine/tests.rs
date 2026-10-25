@@ -277,6 +277,7 @@ fn base_rename_prior_keys_use_exact_lookup_for_stale_index_entries() {
     txn.commit().unwrap();
 
     // The event source does not match base, so the prior key comes from the index.
+    CASE_FALLBACK_DENTRY_SCANS.set(0);
     engine
         .apply_replica_events_to_base(&[MetaEvent::RenameEntry {
             parent: ROOT_INO,
@@ -303,6 +304,99 @@ fn base_rename_prior_keys_use_exact_lookup_for_stale_index_entries() {
         "single exact prior key `Source` must be removed"
     );
     assert_eq!(renamed, Some(entry), "rename destination must be installed");
+    assert_eq!(
+        CASE_FALLBACK_DENTRY_SCANS.get(),
+        0,
+        "an exact source miss must not scan the parent directory"
+    );
+}
+
+#[test]
+fn base_rename_case_variant_source_resolves_exact_prior_key() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"Source", 1000, 1000, 0o644)
+        .unwrap();
+    let setup_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = engine.read_events_range(0, setup_end).unwrap();
+    engine.apply_replica_events_to_base(&setup).unwrap();
+    let entry = DirEntryValue {
+        ino: file.ino,
+        kind: FileType::RegularFile,
+    };
+    CASE_FALLBACK_DENTRY_SCANS.set(0);
+
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"source".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"renamed".to_vec(),
+            entry: entry.clone(),
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        }])
+        .unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let base = txn.open_table(BASE_DENTRIES_TABLE).unwrap();
+    let source =
+        RedbMetaEngine::lookup_exact_in_opened_dentry_table(&base, ROOT_INO, b"Source").unwrap();
+    let renamed =
+        RedbMetaEngine::lookup_exact_in_opened_dentry_table(&base, ROOT_INO, b"renamed").unwrap();
+    assert_eq!(
+        source, None,
+        "case-variant source must not keep `Source` as a duplicate binding"
+    );
+    assert_eq!(renamed, Some(entry), "rename destination must be installed");
+    assert_eq!(
+        CASE_FALLBACK_DENTRY_SCANS.get(),
+        0,
+        "the replica rename source check must not scan the parent directory"
+    );
+}
+
+#[test]
+fn regular_file_serving_install_skips_stale_case_alias_index_key() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"Source", 1000, 1000, 0o644)
+        .unwrap();
+    let setup_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = engine.read_events_range(0, setup_end).unwrap();
+    engine.apply_replica_events_to_base(&setup).unwrap();
+    let txn = engine.begin_write_txn().unwrap();
+    RedbMetaEngine::insert_dentry_index_in_txn(
+        &txn,
+        BASE_DENTRIES_BY_INODE_TABLE,
+        ROOT_INO,
+        b"source",
+        &DirEntryValue {
+            ino: file.ino,
+            kind: FileType::RegularFile,
+        },
+    )
+    .unwrap();
+    txn.commit().unwrap();
+
+    engine
+        .reconcile_regular_file_serving_from_base_with_protected_dentries(
+            &HashSet::from([file.ino]),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let serving = txn.open_table(DENTRIES_TABLE).unwrap();
+    let alias =
+        RedbMetaEngine::lookup_exact_in_opened_dentry_table(&serving, ROOT_INO, b"source").unwrap();
+    assert_eq!(
+        alias, None,
+        "a stale index key must not install a serving alias"
+    );
 }
 
 #[test]

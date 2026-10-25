@@ -1452,8 +1452,9 @@ impl RedbMetaEngine {
                     old_parent_attr,
                     new_parent_attr,
                 } => {
+                    // The event names one exact binding; a case sibling is resolved below.
                     let src_matches =
-                        Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, *parent, name)?
+                        Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, *parent, name)?
                             .map(|current| current.ino == entry.ino && current.kind == entry.kind)
                             .unwrap_or(false);
                     if src_matches {
@@ -2340,33 +2341,17 @@ impl RedbMetaEngine {
             return Ok(false);
         }
         let mut changed = false;
-        let base_entries = {
-            let base = txn
-                .open_table(BASE_DENTRIES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            dentry_keys
-                .iter()
-                .filter(|key| !protected_dentry_keys.contains(*key))
-                .map(|key| {
-                    let (parent, name) = decode_dentry_key(key)?;
-                    let entry = Self::lookup_exact_in_opened_dentry_table(&base, parent, name)?;
-                    Ok((key.as_slice(), entry))
-                })
-                .collect::<MetaResult<HashMap<&[u8], Option<DirEntryValue>>>>()?
-        };
-
         for key in dentry_keys {
             if protected_dentry_keys.contains(key) {
                 continue;
             }
             let (parent, name) = decode_dentry_key(key)?;
+            let base_entry =
+                Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?;
             let invalidation_scope = txn.invalidation_scope();
             let binding_before = Self::invalidation_binding(txn, key)?;
             Self::invalidate_replica_entry(txn, parent, name, None)?;
-            let base_entry = base_entries
-                .get(key.as_slice())
-                .and_then(|entry| entry.as_ref());
-            if let Some(entry) = base_entry {
+            if let Some(entry) = &base_entry {
                 Self::set_dentry_in_txn(txn, parent, name, entry)?;
                 Self::invalidate_replica_inode(txn, entry.ino, false)?;
             } else {
