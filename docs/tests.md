@@ -330,6 +330,31 @@ cargo test -p studiofs-bridge --lib posix::tests:: -- --nocapture
 Windows cannot execute the POSIX module guarded by `cfg(unix)`. These focused
 tests do not establish live mounted disk-full acceptance.
 
+### SFS-897 Random-Write fsync and Upload Pipeline Regressions
+
+After random 4 KiB overwrites, `fsync` materialized every superseded write as
+its own payload object, the PostgreSQL pending-state tracker re-decoded the
+whole unpublished event window on every mutation, upload completion batches
+were split into one transaction per object, and upload statistics walked every
+pending operation. These tests pin the writer-stack supersede, the
+constant-cost hidden-window extension, the forwarded and coalesced overlay
+batches, and the copy-free pending-upload summary:
+
+```sh
+cargo test -p studiofs-vfs --lib writer_stack_drops_fully_superseded_slices_before_materializing -- --nocapture
+cargo test -p studiofs-meta --lib hidden_pending_window_grows_without_reprojecting_unpublished_overlay_history -- --nocapture
+cargo test -p studiofs-meta --lib poisoned_hidden_window_cache_falls_back_without_failing_the_mutation -- --nocapture
+cargo test -p studiofs-vfs --lib runtime_meta_handle_forwards_batched_overlay_upload_marks -- --nocapture
+cargo test -p studiofs-vfs --lib process_upload_marks_fragmented_overlay_object_uploaded_before_local_cleanup -- --nocapture
+cargo test -p studiofs-meta --lib overlay_objects_if_match_answers_a_batch_across_chunks_in_input_order -- --nocapture
+cargo test -p studiofs-cache --lib pending_summary_aggregates_without_copying_operations -- --nocapture
+```
+
+These focused tests do not establish mounted acceptance. The mounted check is
+`fio --rw=randwrite --bs=4k --size=256M --runtime=15 --time_based` on a Linux
+mount without the tray, followed by `fsync` of the file and the upload pipeline
+log line.
+
 ### SFS-890 PostgreSQL Replication Flush Cost per Namespace Operation
 
 The `pg-meta-poll` flush and self-acknowledgement path used to cost more CPU

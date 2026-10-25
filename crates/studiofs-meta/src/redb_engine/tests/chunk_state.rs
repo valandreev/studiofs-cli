@@ -888,6 +888,67 @@ fn mark_overlay_objects_uploaded_batches_matching_objects() {
 }
 
 #[test]
+fn overlay_objects_if_match_answers_a_batch_across_chunks_in_input_order() {
+    let engine = temp_engine();
+    let mut attr = engine
+        .create_file(ROOT_INO, b"overlay-presence-batch.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+    attr.content_epoch = 7;
+    attr.size = u64::from(DEFAULT_CHUNK_SIZE) + 4096;
+
+    let slice = |start: u32, object_id: u64| SliceRecord {
+        slice_id: SliceId::default(),
+        order: SliceOrder::default(),
+        range: SliceRange::new(start, start + 4096).expect("valid range"),
+        payload: Some(PayloadRef::new_partial(object_id, 4096)),
+        payload_state: PayloadRefState::LocalOnly,
+    };
+    engine
+        .flush_regular_file_overlay_slices_with_attr(
+            ino,
+            &[
+                (ChunkId(0), vec![slice(0, 710_001)]),
+                (ChunkId(1), vec![slice(0, 710_002)]),
+            ],
+            Some(&attr),
+        )
+        .unwrap();
+
+    assert_eq!(
+        engine
+            .regular_file_overlay_objects_if_match(ino, 7, &[710_002, 710_999, 710_001])
+            .unwrap(),
+        vec![710_002, 710_001],
+        "referenced objects from every chunk are reported in input order"
+    );
+    assert!(
+        engine
+            .regular_file_overlay_objects_if_match(ino, 6, &[710_001, 710_002])
+            .unwrap()
+            .is_empty(),
+        "a stale epoch matches nothing"
+    );
+    assert!(
+        engine
+            .regular_file_overlay_objects_if_match(ino + 1_000, 7, &[710_001])
+            .unwrap()
+            .is_empty(),
+        "a missing inode matches nothing"
+    );
+    assert!(
+        engine
+            .has_regular_file_overlay_object_if_matches(ino, 7, 710_002)
+            .unwrap()
+    );
+    assert!(
+        !engine
+            .has_regular_file_overlay_object_if_matches(ino, 7, 710_999)
+            .unwrap()
+    );
+}
+
+#[test]
 fn get_inode_lifecycle_recomputes_stale_local_only_row_from_uploaded_overlay() {
     let engine = temp_engine();
     let mut attr = engine

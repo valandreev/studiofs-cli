@@ -745,6 +745,11 @@ impl MountedWriterStack {
         if min_idle.is_some_and(|idle| file.last_write.elapsed() < idle) {
             return Ok(0);
         }
+        let superseded_bytes = drop_superseded_dirty_slices(&mut file);
+        if superseded_bytes > 0 {
+            file.dirty_bytes = file.dirty_bytes.saturating_sub(superseded_bytes);
+            self.subtract_dirty(superseded_bytes);
+        }
         let mut object_count = 0u64;
         for chunk in file.chunks.values_mut() {
             for slice in &mut chunk.slices {
@@ -1026,6 +1031,7 @@ impl MountedWriterStack {
         let Some(file) = file else {
             return;
         };
+        let object_ids: HashSet<u64> = object_ids.iter().copied().collect();
         {
             let mut file = file.lock();
             for chunk in file.chunks.values_mut() {
@@ -1144,6 +1150,7 @@ impl MountedWriterStack {
         let Some(file) = file else {
             return;
         };
+        let object_ids: HashSet<u64> = object_ids.iter().copied().collect();
         {
             let mut file = file.lock();
             for chunk in file.chunks.values_mut() {
@@ -1286,6 +1293,90 @@ fn file_is_clean_and_materialized(file: &FileWriter) -> bool {
                 .iter()
                 .all(|slice| slice.materializing.is_empty())
         })
+}
+
+/// Drops buffered slices whose whole range a newer buffered slice of the same
+/// chunk rewrote, and returns the dirty bytes released.
+///
+/// Random small overwrites otherwise materialize every superseded version as
+/// its own local payload object and upload. Readers resolve writer data newest
+/// first, so a fully covered slice is never read. Only slices that have not
+/// started materializing are dropped or used as cover, so every dropped byte
+/// is still owned by a newer slice in this stack.
+fn drop_superseded_dirty_slices(file: &mut FileWriter) -> usize {
+    let mut released = 0usize;
+    for chunk in file.chunks.values_mut() {
+        if chunk.slices.len() < 2 {
+            continue;
+        }
+        let mut newest_first: Vec<usize> = (0..chunk.slices.len()).collect();
+        newest_first.sort_unstable_by_key(|&index| std::cmp::Reverse(chunk.slices[index].seq));
+        let mut covered = CoveredRanges::default();
+        let mut superseded = vec![false; chunk.slices.len()];
+        for index in newest_first {
+            let slice = &chunk.slices[index];
+            if !slice.finished.is_empty()
+                || !slice.materializing.is_empty()
+                || !slice.pending_materialization.is_empty()
+            {
+                continue;
+            }
+            let Some((start, end)) = slice.writer.accepted_range() else {
+                continue;
+            };
+            if covered.contains(start, end) {
+                superseded[index] = true;
+            } else {
+                covered.insert(start, end);
+            }
+        }
+        let mut index = 0;
+        chunk.slices.retain(|slice| {
+            let keep = !superseded[index];
+            index += 1;
+            if !keep {
+                // Dropping the writer releases its cached-store dirty accounting.
+                released = released.saturating_add(slice.writer.dirty_bytes());
+            }
+            keep
+        });
+    }
+    released
+}
+
+/// Disjoint, non-adjacent half-open ranges keyed by start.
+#[derive(Default)]
+struct CoveredRanges {
+    ranges: BTreeMap<u64, u64>,
+}
+
+impl CoveredRanges {
+    fn contains(&self, start: u64, end: u64) -> bool {
+        self.ranges
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(_, &covered_end)| covered_end >= end)
+    }
+
+    fn insert(&mut self, mut start: u64, mut end: u64) {
+        if let Some((&prev_start, &prev_end)) = self.ranges.range(..=start).next_back()
+            && prev_end >= start
+        {
+            start = prev_start;
+            end = end.max(prev_end);
+        }
+        let absorbed: Vec<u64> = self
+            .ranges
+            .range(start..=end)
+            .map(|(&next_start, _)| next_start)
+            .collect();
+        for next_start in absorbed {
+            if let Some(next_end) = self.ranges.remove(&next_start) {
+                end = end.max(next_end);
+            }
+        }
+        self.ranges.insert(start, end);
+    }
 }
 
 fn materializing_read_span_from_detached(
@@ -1874,6 +1965,48 @@ mod tests {
         assert_eq!(finished[1].chunk_id, ChunkId(1));
         assert_eq!(finished[1].chunk_offset, 0);
         assert_eq!(finished[1].len, 4);
+    }
+
+    #[test]
+    fn writer_stack_drops_fully_superseded_slices_before_materializing() {
+        let (_dir, stack, _rx) = temp_stack(64, 16);
+        let writes: [(u64, &'static [u8]); 7] = [
+            (0, b"aaaaaaaa"),
+            (16, b"bbbbbbbb"),
+            // Rewrites [0, 8) in one slice.
+            (0, b"cccccccc"),
+            // Rewrite [16, 24) in two newer slices that do not coalesce.
+            (20, b"eeee"),
+            (16, b"dddd"),
+            // Only partly rewrites [32, 40), so both slices stay.
+            (32, b"ffffffff"),
+            (36, b"gggggggg"),
+        ];
+        for (index, (offset, data)) in writes.into_iter().enumerate() {
+            stack
+                .write_bytes(write_spec(1, 7, offset, 100 + index as u64 * 10), data)
+                .expect("accept write");
+        }
+        let mut visible = [0_u8; 44];
+        stack.copy_read_spans_into(7, 0, &mut visible);
+
+        let finished = stack.finish_inode(7).expect("finish inode");
+
+        let mut ranges: Vec<_> = finished
+            .iter()
+            .map(|slice| (slice.chunk_offset, slice.len))
+            .collect();
+        ranges.sort_unstable();
+        assert_eq!(
+            ranges,
+            vec![(0, 8), (16, 4), (20, 4), (32, 8), (36, 8)],
+            "fully rewritten slices must not become payload objects"
+        );
+        assert_eq!(&visible[..8], b"cccccccc");
+        assert_eq!(&visible[16..24], b"ddddeeee");
+        assert_eq!(&visible[32..44], b"ffffgggggggg");
+        assert_eq!(stack.total_dirty_bytes(), 0);
+        assert_eq!(stack.cached_store.snapshot_writer_counters().dirty_bytes, 0);
     }
 
     #[test]

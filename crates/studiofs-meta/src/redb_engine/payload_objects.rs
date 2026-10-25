@@ -357,6 +357,20 @@ impl MetaPayloadObjects for RedbMetaEngine {
         expected_epoch: u64,
         object_id: u64,
     ) -> MetaResult<bool> {
+        Ok(!self
+            .regular_file_overlay_objects_if_match(ino, expected_epoch, &[object_id])?
+            .is_empty())
+    }
+
+    fn regular_file_overlay_objects_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> MetaResult<Vec<u64>> {
+        if object_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let txn = self.begin_read_txn()?;
         let inodes = txn
             .open_table(INODES_TABLE)
@@ -366,14 +380,18 @@ impl MetaPayloadObjects for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             Some(g) => g.value().to_vec(),
-            None => return Ok(false),
+            None => return Ok(Vec::new()),
         };
         let attr: InodeAttr = decode(&attr_bytes)?;
         if attr.content_epoch != expected_epoch {
-            return Ok(false);
+            return Ok(Vec::new());
         }
         drop(inodes);
 
+        // One overlay scan answers the whole batch; it stops once every
+        // requested object has been seen.
+        let mut unseen: HashSet<u64> = object_ids.iter().copied().collect();
+        let mut referenced = HashSet::new();
         let table = txn
             .open_table(REGULAR_FILE_OVERLAY_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -387,16 +405,20 @@ impl MetaPayloadObjects for RedbMetaEngine {
                 break;
             }
             let chunk: RegularFileChunkState = decode(value.value())?;
-            if chunk
-                .slices
-                .values()
-                .filter_map(|slice| slice.payload.as_ref())
-                .any(|block| block.object_id == object_id)
-            {
-                return Ok(true);
+            for block in chunk.slices.values().filter_map(|slice| slice.payload) {
+                if unseen.remove(&block.object_id) {
+                    referenced.insert(block.object_id);
+                }
+            }
+            if unseen.is_empty() {
+                break;
             }
         }
-        Ok(false)
+        Ok(object_ids
+            .iter()
+            .copied()
+            .filter(|object_id| referenced.contains(object_id))
+            .collect())
     }
 
     fn mark_regular_file_overlay_object_uploaded_if_matches(
@@ -438,7 +460,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
             }
             drop(inodes);
 
-            let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            let mut overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
                 &txn,
                 REGULAR_FILE_OVERLAY_TABLE,
                 ino,
@@ -446,7 +468,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
             let mut changed_chunk_slices = Vec::new();
             let mut matched_ids = HashSet::new();
 
-            for (chunk_id, mut chunk_state) in overlay_chunks {
+            for (&chunk_id, chunk_state) in &mut overlay_chunks {
                 let mut changed = false;
                 for slice in chunk_state.slices.values_mut() {
                     let Some(block) = slice.payload.as_ref() else {
@@ -488,7 +510,13 @@ impl MetaPayloadObjects for RedbMetaEngine {
                     },
                 )?;
             }
-            Self::sync_unpublished_upload_progress_lifecycle_in_txn(&txn, &attr)?;
+            // The updated chunks are the overlay this transaction commits, so
+            // lifecycle and recovery reuse them instead of decoding it again.
+            Self::sync_unpublished_upload_progress_lifecycle_with_chunks_in_txn(
+                &txn,
+                &attr,
+                &overlay_chunks,
+            )?;
 
             matched_ids
         };

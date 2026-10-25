@@ -39,7 +39,7 @@ pub use runtime::{
     LocalPayloadReadMode, LocalPayloadRuntimeDetection, LocalPayloadSyncMode,
     LocalPayloadWriteMode,
 };
-pub use upload_queue::PendingUpload;
+pub use upload_queue::{PendingUpload, PendingUploadSummary};
 
 const LOCAL_PAYLOAD_OPEN_LOCK_RETRY_ATTEMPTS: usize = 40;
 const LOCAL_PAYLOAD_OPEN_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);

@@ -1650,6 +1650,8 @@ struct UploadState {
     upload_sticky_errors: OrderedMutex<std::collections::HashMap<Ino, String>>,
     upload_completion_batch: tokio::sync::Mutex<UploadCompletionBatch>,
     upload_completion_draining: AtomicBool,
+    overlay_presence_batch: tokio::sync::Mutex<UploadCompletionBatch>,
+    overlay_presence_draining: AtomicBool,
     startup_replay_counts: OrderedMutex<HashMap<(Ino, u64), u64>>,
     active_upload_workers: AtomicUsize,
     upload_requeues: AtomicU64,
@@ -1909,6 +1911,10 @@ impl UploadState {
                 pending: Vec::new(),
             }),
             upload_completion_draining: AtomicBool::new(false),
+            overlay_presence_batch: tokio::sync::Mutex::new(UploadCompletionBatch {
+                pending: Vec::new(),
+            }),
+            overlay_presence_draining: AtomicBool::new(false),
             startup_replay_counts: OrderedMutex::new(HashMap::new(), LockTier::Upload),
             active_upload_workers: AtomicUsize::new(0),
             upload_requeues: AtomicU64::new(0),
@@ -7051,30 +7057,30 @@ impl StudioVfs {
     }
 
     /// Return upload queue and throughput statistics for diagnostics.
-    pub fn upload_stats(&self) -> VfsUploadStats {
-        let pending_uploads = self.pending_uploads_snapshot();
-        let now_ms = now_unix_millis();
-        let (
-            pending_upload_bytes,
-            oldest_pending_upload_age_ms,
-            pending_retry_count,
-            max_pending_retry_count,
-        ) = pending_uploads.iter().fold(
-            (0u64, 0u64, 0u64, 0u32),
-            |(bytes, oldest_age, retries, max_retries), op| {
-                let payload_len = self
-                    .local_payload_backend
-                    .object_stats(op.object_id)
+    /// Pending upload bytes from recorded payload lengths. Only operations
+    /// queued without one fall back to the local payload index.
+    pub(crate) fn pending_upload_bytes(
+        &self,
+        pending: &studiofs_cache::PendingUploadSummary,
+    ) -> u64 {
+        pending
+            .unknown_len_object_ids
+            .iter()
+            .map(|&object_id| {
+                self.local_payload_backend
+                    .object_stats(object_id)
                     .map(|stats| stats.payload_len)
-                    .unwrap_or(u64::from(self.block_size));
-                (
-                    bytes.saturating_add(payload_len),
-                    oldest_age.max(now_ms.saturating_sub(op.created_unix_ms)),
-                    retries.saturating_add(u64::from(op.retry_count)),
-                    max_retries.max(op.retry_count),
-                )
-            },
-        );
+                    .unwrap_or(u64::from(self.block_size))
+            })
+            .fold(pending.payload_bytes, u64::saturating_add)
+    }
+
+    pub fn upload_stats(&self) -> VfsUploadStats {
+        let pending = self.cached_store.pending_upload_summary();
+        let pending_upload_bytes = self.pending_upload_bytes(&pending);
+        let oldest_pending_upload_age_ms = pending
+            .oldest_created_unix_ms
+            .map_or(0, |created| now_unix_millis().saturating_sub(created));
         let cache_metrics = self.cached_store.cache_pipeline_metrics();
         let completed_uploads = cache_metrics.upload_queue.completed;
         let completed_upload_bytes = cache_metrics.upload_queue.completed_bytes;
@@ -7084,7 +7090,7 @@ impl StudioVfs {
         let upload_metrics = &self.upload_scheduler.metrics;
 
         VfsUploadStats {
-            pending_uploads: pending_uploads.len(),
+            pending_uploads: pending.count,
             pending_upload_bytes,
             oldest_pending_upload_age_ms,
             active_uploads: self.upload_scheduler.in_flight(),
@@ -7093,8 +7099,8 @@ impl StudioVfs {
                 .upload
                 .active_upload_workers
                 .load(Ordering::Relaxed),
-            pending_retry_count,
-            max_pending_retry_count,
+            pending_retry_count: pending.retry_count_sum,
+            max_pending_retry_count: pending.max_retry_count,
             completed_uploads,
             completed_upload_bytes,
             completed_uploads_per_sec,

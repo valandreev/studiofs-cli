@@ -991,16 +991,13 @@ impl RedbMetaEngine {
         Ok(Some(record))
     }
 
-    pub(super) fn sync_unpublished_upload_progress_lifecycle_in_txn(
+    /// `overlay_chunks` must be the inode's complete overlay as written in `txn`.
+    pub(super) fn sync_unpublished_upload_progress_lifecycle_with_chunks_in_txn(
         txn: &redb::WriteTransaction,
         attr: &InodeAttr,
+        overlay_chunks: &BTreeMap<ChunkId, RegularFileChunkState>,
     ) -> MetaResult<InodeLifecycleRecord> {
-        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
-            txn,
-            REGULAR_FILE_OVERLAY_TABLE,
-            attr.ino,
-        )?;
-        Self::sync_pending_regular_file_recovery_in_txn(txn, attr, &overlay_chunks)?;
+        Self::sync_pending_regular_file_recovery_in_txn(txn, attr, overlay_chunks)?;
         let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
         let has_published_base =
             Self::has_regular_file_chunk_rows_in_write_txn(txn, REGULAR_FILE_BASE_TABLE, attr.ino)?

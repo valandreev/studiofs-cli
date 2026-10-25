@@ -1951,17 +1951,9 @@ impl StudioVfs {
             if let Err(error) = self.payload_store_run_pressure_maintenance_async().await {
                 warn!(error = %error, "background local backend pressure maintenance failed");
             }
-            let pending_uploads = self.pending_uploads_snapshot();
-            let pending = pending_uploads.len();
-            let pending_upload_bytes = pending_uploads
-                .iter()
-                .map(|op| {
-                    self.local_payload_backend
-                        .object_stats(op.object_id)
-                        .map(|stats| stats.payload_len)
-                        .unwrap_or(u64::from(self.block_size))
-                })
-                .sum::<u64>();
+            let pending_summary = self.cached_store.pending_upload_summary();
+            let pending = pending_summary.count;
+            let pending_upload_bytes = self.pending_upload_bytes(&pending_summary);
             let metadata_backlog = self
                 .meta
                 .run_sync_maintenance(|meta| meta.replication_backlog());
@@ -2004,7 +1996,7 @@ impl StudioVfs {
                 false
             };
 
-            let (p95_ms, max_ms) = self.pending_age_stats_ms(&pending_uploads);
+            let (p95_ms, max_ms) = self.cached_store.pending_upload_age_stats_ms();
             let ingress = self.ingress_stats();
             let materialize_batches = self.state.metrics.materialize_batch_stats.snapshot();
             let foreground_read_protection = self.foreground_read_protection_stats();
@@ -2021,10 +2013,7 @@ impl StudioVfs {
 
             if should_log {
                 ticks_since_last_log = 0;
-                let pending_retry_count = pending_uploads
-                    .iter()
-                    .filter(|op| op.retry_count != 0)
-                    .count() as u64;
+                let pending_retry_count = pending_summary.retrying;
                 let pending_uploads_human =
                     Self::format_upload_pipeline_pending_uploads(pending_upload_bytes);
                 let upload_trouble_counters =
