@@ -465,6 +465,122 @@ mod tests {
     }
 
     #[test]
+    fn pending_slice_upload_mapping_uses_visible_ranges() {
+        use studiofs_cache::ObjectFileMapping;
+
+        let cases = [
+            (
+                vec![(0, 4, 9001, 0), (32, 36, 9001, 4), (0, 4, 9002, 0)],
+                32,
+                Some((32, 4, 4)),
+            ),
+            (vec![(0, 8, 9001, 0), (0, 4, 9002, 0)], 4, Some((4, 4, 4))),
+            (vec![(0, 12, 9001, 0), (4, 8, 9002, 0)], 0, None),
+            (
+                vec![(0, 4, 9001, 0), (8, 12, 9001, 8), (0, 4, 9001, 0)],
+                0,
+                None,
+            ),
+            (vec![(0, 4, 9001, 0), (0, 4, 9002, 0)], 0, None),
+        ];
+        for (records, expected_offset, expected_mapping) in cases {
+            let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+            let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "visible-upload-mapping");
+            let _guard = rt.enter();
+            rt.block_on(async {
+                let attr = vfs.create(1, b"packed.bin", 0, 0, 0o644).unwrap();
+                for object_id in [9001, 9002] {
+                    vfs.local_payload_backend().put(object_id, &[0; 16], false).unwrap();
+                }
+                let slices = records.into_iter().enumerate().map(|(seq, (start, end, object_id, object_offset))| {
+                    PendingDirtySlice::persisted(
+                        studiofs_meta::schema::SliceRange::new(start, end).unwrap(),
+                        0, start, seq as u64 + 1, object_id, object_offset,
+                    )
+                }).collect();
+                vfs.local_dirty_flush_session(attr.ino)
+                    .commit_pending_slice_snapshot(std::collections::BTreeMap::from([(0, slices)]), 1, None)
+                    .await.unwrap();
+                let pending = vfs.pending_uploads_snapshot_for_inode(attr.ino);
+                let packed = pending.iter().find(|op| op.object_id == 9001).unwrap();
+                assert_eq!(packed.offset, expected_offset, "upload must start at the first surviving segment");
+                assert_eq!(packed.file_mapping, expected_mapping.map(|(file_offset, object_offset, len)| ObjectFileMapping {
+                    file_offset, object_offset, len,
+                }), "reattach must describe only visible bytes; retained hidden objects have no mapping");
+            });
+        }
+    }
+
+    #[test]
+    fn visible_payload_slices_match_latest_byte_coverage() {
+        use studiofs_meta::schema::{PayloadRef, SliceId, SliceOrder, SliceRange, SliceRecord};
+
+        let mut records = Vec::new();
+        for (index, (start, end, object_id)) in [
+            (0, 24, Some(1)),
+            (4, 8, Some(2)),
+            (12, 16, None),
+            (6, 14, Some(3)),
+            (20, 28, Some(4)),
+            (28, 32, None),
+            (0, 2, None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = index as u64 + 1;
+            let range = SliceRange::new(start, end).unwrap();
+            records.push(match object_id {
+                Some(object_id) => SliceRecord::new(
+                    SliceId(id),
+                    SliceOrder(id),
+                    range,
+                    PayloadRef {
+                        object_id,
+                        offset: 10,
+                        length: end - start,
+                        flags: Default::default(),
+                    },
+                ),
+                None => SliceRecord::tombstone(SliceId(id), SliceOrder(id), range),
+            });
+            let mut actual = std::collections::BTreeMap::new();
+            for span in visible_payload_slices(&records) {
+                let payload = span.payload.unwrap();
+                for byte in span.range.start..span.range.end {
+                    assert!(
+                        actual
+                            .insert(
+                                byte,
+                                (payload.object_id, payload.offset + byte - span.range.start)
+                            )
+                            .is_none()
+                    );
+                }
+            }
+            for byte in 0..32 {
+                let expected = records
+                    .iter()
+                    .rev()
+                    .find(|record| record.range.start <= byte && byte < record.range.end)
+                    .and_then(|record| {
+                        record.payload.map(|payload| {
+                            (
+                                payload.object_id,
+                                payload.offset + byte - record.range.start,
+                            )
+                        })
+                    });
+                assert_eq!(
+                    actual.get(&byte).copied(),
+                    expected,
+                    "byte {byte}, wave {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn pending_slice_commit_without_dirty_attr_extends_visible_size() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-attr-recovery");
@@ -1328,6 +1444,37 @@ mod tests {
             assert_eq!(batch.segments[0].block_index, block_index as u32);
             assert_eq!(batch.segments[0].object_offset, 0);
         }
+    }
+
+    #[test]
+    fn buffered_write_spill_batches_with_gaps_upload_their_real_object_length() {
+        use crate::vfs::overlay::ObjectUploadGeometry;
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "spill-gapped-geometry");
+        let blocks = vec![
+            DirtyWriteSnapshot::from_shared(0, Bytes::from_static(b"head")),
+            DirtyWriteSnapshot::from_shared(5, Bytes::from_static(b"tail")),
+        ];
+
+        let batches = vfs.build_dirty_write_snapshot_slice_spill_batches(&blocks);
+
+        assert_eq!(batches.len(), 1, "partial blocks share one spill object");
+        let mut segments = batches[0].segments.iter().map(|segment| {
+            ObjectUploadGeometry::new(
+                segment.file_offset,
+                segment.object_offset,
+                u32::try_from(segment.len).unwrap(),
+            )
+        });
+        let mut geometry = segments.next().unwrap();
+        segments.for_each(|segment| geometry.include(segment));
+        assert_eq!(geometry.payload_len, batches[0].payload.len() as u64);
+        assert_eq!(
+            geometry.file_mapping(),
+            None,
+            "non-adjacent blocks have no contiguous file origin"
+        );
     }
 
     #[test]

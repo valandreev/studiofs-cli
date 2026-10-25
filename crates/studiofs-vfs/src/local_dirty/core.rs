@@ -613,6 +613,44 @@ impl OverlayChunkRecords {
     }
 }
 
+/// Clip older payloads against newer records, including holes, without discarding upload intents.
+/// Records must be in increasing precedence order, as emitted by build_overlay_slice_records.
+pub(super) fn visible_payload_slices(
+    records: &[studiofs_meta::schema::SliceRecord],
+) -> Vec<studiofs_meta::schema::SliceRecord> {
+    let mut coverage = std::collections::BTreeMap::<u32, u32>::new();
+    let mut visible = Vec::new();
+    for record in records.iter().rev() {
+        let mut cursor = record.range.start;
+        let first = coverage
+            .range(..=cursor)
+            .next_back()
+            .filter(|(_, end)| **end > cursor)
+            .map_or(cursor, |(start, _)| *start);
+        let mut push_span = |start, end| {
+            if let Some(mut payload) = record.payload {
+                let mut span = record.clone();
+                span.range = studiofs_meta::schema::SliceRange { start, end };
+                payload.offset += start - record.range.start;
+                payload.length = end - start;
+                span.payload = Some(payload);
+                visible.push(span);
+            }
+        };
+        for (&start, &end) in coverage.range(first..record.range.end) {
+            if cursor < start {
+                push_span(cursor, start);
+            }
+            cursor = cursor.max(end);
+        }
+        if cursor < record.range.end {
+            push_span(cursor, record.range.end);
+        }
+        insert_covered_range(&mut coverage, record.range);
+    }
+    visible
+}
+
 /// Whether one disjoint interval in `coverage` (start -> end) contains `range`.
 fn range_is_covered(
     coverage: &std::collections::BTreeMap<u32, u32>,

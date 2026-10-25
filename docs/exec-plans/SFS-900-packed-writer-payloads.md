@@ -1,0 +1,323 @@
+# Pack random-write fragments into shared payload objects
+
+This living ExecPlan follows `.agent/PLANS.md`.
+
+## Purpose / Big Picture
+
+SFS-900 reduces local materialization and upload work after random 4 KiB writes.
+Several file segments share one immutable payload of at most the configured
+block size. Reads retain each segment's file offset, object offset and sequence.
+A sustained random writer must also feed background upload before fsync.
+
+## Progress
+
+- [x] (2026-10-25) Record checkout, clean status and existing SFS-900 branch; read issue and trace writer, drain, reattach, replay and truncate paths.
+- [x] (2026-10-25) Reproduce per-fragment materialization, incorrect upload length and missing aged drain; add stale-epoch refusal regression.
+- [x] (2026-10-25) Pack finished slices across the entire inode, retain reads/retry ownership and persist once per object.
+- [x] (2026-10-25) Correct commit/replay/truncate geometry and refuse contiguous reattach for scattered or incomplete mappings.
+- [x] (2026-10-25) Bound dirty residency through the existing deferred worker; age regression passes.
+- [x] (2026-10-25) Register mounted-random-write-packing acceptance with byte readback, object bound, pre-fsync upload samples and retained fsync timing.
+- [x] (2026-10-25) Focused tests, all-target checks/Clippy, formatting and final diff review passed; rebuilt mounted scenario passed with cleanup.
+- [x] (2026-10-25) Second review: limit aged drains to scattered dirty state, require known length for a mapping, and fail the scenario explicitly when the commit metric is missing.
+- [x] (2026-10-25) Review follow-up: replace the optional origin with a gapless file mapping, drain aged state after one idle window, test packed reattach and pending deletion against real metadata, test gapped spill geometry, and make the mounted scenario assert fsync and early upload.
+
+## Surprises & Discoveries
+
+The upload queue is memory-only and startup rebuilds it from local metadata.
+Both local-dirty commit and truncate requeue infer object length from file
+coordinates. Startup emits one descriptor per resolved span and must aggregate
+shared objects before removing them from the dirty-object set. The existing
+idle-tail worker waits for file inactivity, which sustained random writes prevent.
+Linear's advertised get_agent_context endpoint returned Tool not found.
+
+Review found the aged-drain threshold multiplied an already multiplied linger
+window: 1.2 s × 6 = 7.2 s. The first live run therefore queued no upload until
+10.5 s of the 15 s workload. The age window also survived partial drains. The
+SFS-900 commit had also left `deferred_sparse_tail_rebases_when_size_growth_overtakes_materialization`
+failing: its sparse head and tail now pack into one object queued at offset 0.
+The existing spill batches already shared one object between non-adjacent
+blocks, so the earlier min/max geometry was wrong for them as well.
+
+## Decision Log
+
+- Decision: preserve separate overlay slices and existing object storage format.
+  Rationale: PayloadRef already represents offsets into shared objects; no data
+  migration or remote synchronous callback is needed. Date: 2026-10-25.
+- Decision: represent a contiguous object's file origin as Option<u64>; None
+  disables contiguous stale reattachment for scattered objects.
+  Rationale: inferring a file mapping from packed bytes can corrupt data. Existing
+  metadata references still allow marking/rebasing a live object. Date: 2026-10-25.
+- Decision: replace the optional origin with `ObjectFileMapping`, a gapless file
+  range with one origin. Rationale: requiring a fully referenced object also
+  refused reattach for head-overwritten or tail-truncated contiguous objects,
+  whose stale path can then remove the local payload. Mapping only referenced,
+  gapless bytes is safe for packed and contiguous objects alike; gapped references
+  refuse, which also stops superseded middle bytes from refilling holes.
+  Date: 2026-10-25.
+- Decision: reuse the per-inode deferred materialization task and local durability
+  boundary. Rationale: no new worker, service, dependency or tuning flag is needed.
+  Date: 2026-10-25.
+
+## Context and Orientation
+
+`crates/studiofs-vfs/src/vfs/writer_stack.rs` owns buffered slice writers. Finish
+first detaches bytes, retains read spans during persistence, and later installs
+`FinishedWriterSlice` into `local_dirty.rs`. A slice maps a file range to bytes
+inside an immutable object; its sequence chooses the newest overlapping write.
+`vfs/sync_ops.rs` drives strict and deferred materialization. `studiofs-cache`
+CachedStore persists payloads and pins PendingUpload queue entries until terminal.
+`vfs/upload_lifecycle/worker.rs` marks uploaded objects and can reattach a missing
+object to uncovered file ranges. `vfs/startup_replay.rs` reconstructs uploads;
+`vfs/namespace_ops.rs` retains uploads over truncation/growth.
+
+## Plan of Work and Milestones
+
+First reproduce the per-fragment object count with scattered writes and verify
+bytes via each returned object's offset. Pack newly detached slices before
+exposing materializing state; retain full shared bytes for retries and persist
+one entry per object. Existing pending materialization must keep its identity.
+Keep full-block streaming on its existing fast path.
+
+Next make PendingUpload.object_file_offset optional throughout callers and tests.
+Aggregate object length in object coordinates and obtain actual local object
+length where available. All segments must agree on a checked file origin to
+permit contiguous reattachment. Update commit, startup replay and truncate paths
+and test scattered segments, partial supersede and stale epochs.
+
+Finally allow the existing idle-tail worker to finish sufficiently aged writer
+state even while writes continue. Test with explicit timestamp control and
+observable materialization rather than scheduling sleeps. Verify object usage
+and retention through overwrite/truncate regressions. Document focused commands
+and mounted prerequisites in docs/tests.md.
+
+## Concrete Steps and Validation and Acceptance
+
+Work from `/home/val/dev/studiofs-cli`. Run focused `cargo test -p studiofs-vfs
+--lib <filter> -- --nocapture` and cache queue tests after the type change. New
+regressions must fail before the corresponding fix and pass afterwards. Run
+`cargo check -p studiofs-vfs -p studiofs-cache`, `cargo clippy -p studiofs-vfs
+-p studiofs-cache --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and
+`git diff --check`. Do not run workspace-wide or full ignored suites.
+
+Mounted acceptance requires a rebuilt studiofs binary, usable /dev/fuse and
+local PostgreSQL/object storage, and the registered studiofs-e2e runner. Retain
+artifacts under target. Measure 256 MiB random 4 KiB writes during 15 seconds,
+observe active upload with a pending backlog, and compare fsync time and object
+count to dirty bytes divided by block size. Report unrun live gates explicitly.
+
+## Idempotence and Recovery
+
+Focused tests use isolated target temporary directories. Preserve unrelated
+changes. Pending payloads stay pinned until upload completion; any materialization
+failure keeps detached bytes and sticky errors for the next strict barrier.
+No persistent schema or object encoding changes are planned.
+
+## Interfaces and Dependencies
+
+Reuse Bytes/BytesMut, CachedStore and existing overlay metadata APIs. Optional
+contiguous origin is an in-memory queue contract; no dependency is added.
+
+## Outcomes & Retrospective
+
+Initial red regressions: five objects instead of two for 20 bytes, and inferred upload length 36 instead of actual 12. First broad run: 133 passed, one retention assertion required a slice-write setup because the ordinary block-write path correctly copies all surviving bytes into a replacement object. Subsequent focused runs passed 185 VFS tests, 52 cache/queue tests, one E2E file-count test, and 35 VFS drain/packed/deferred-release tests after the live-discovered drain correction. All-target checks for VFS/cache and E2E passed. Final Clippy passed for all targets of VFS, cache and E2E. The rebuilt live rerun passed with successful cleanup: 8,451 random 4 KiB writes, 11 physical payload objects, exact readback, six samples with simultaneous pending and active uploads, and fsync 2,147.8 ms. Metadata commit histogram sum increased by 2,490.5 ms across three concurrent/background and foreground commits during fsync; this aggregate is diagnostic, not an isolated redb transaction timing. Both failed and passed runner artifacts remain under target/e2e-runs. Full workspace/ignored suites and Windows/macOS mounted gates were not run.
+
+Revision: initial plan records traced geometry hazards and the minimum complete
+packing, retry, replay and background materialization scope.
+
+Revision: independent review found per-chunk packing missed sparse per-inode
+packing; gather across the entire inode and scatter the regression across chunks.
+Replay geometry is aggregated across all resolved spans before the dirty-object
+set consumes the first reference. Refuse reattachment for incomplete mappings as
+well as scattered ones: a surviving segment cannot prove absent payload bytes'
+original file positions. Added a registered E2E scenario because no existing
+scenario exercised sustained random writes and sampled background upload.
+
+Revision: first live scenario proved packed byte correctness (11,165 writes,
+15 payload objects, 1,409 ms fsync) but failed the upload-during-writes gate.
+The deferred task loops after idle/aged materialization and only commits local
+metadata when that loop exits; continuous writes kept refilling it. Complete
+the pass after aged materialization so its existing local metadata drain queues
+uploads, then let the existing task registry reschedule remaining dirty bytes.
+This mounted failure is the regression for the missing drain boundary.
+
+Revision: Clippy identified the expanded optional-origin batch tuple as overly
+complex; share the existing positional submission shape through UploadOp, reused
+by CachedStore and startup replay. No lint exception or dependency was added.
+
+## Final command evidence
+
+All commands ran from `/home/val/dev/studiofs-cli`; Cargo used `--offline` after
+the initial dependency fetch. Commands and nonzero test results were:
+
+    cargo test --offline -p studiofs-vfs --lib -- packed_ writer_stack startup_replay completed_block_materialization process_upload_ explicit_flush_sparse local_dirty:: --nocapture
+    185 passed; 0 failed
+    cargo test --offline -p studiofs-vfs --lib -- packed_ deferred_materialization deferred_release writer_stack_retries_transient_materialization_failure --nocapture
+    35 passed; 0 failed
+    cargo test --offline -p studiofs-cache --lib -- upload_queue:: cached_store::tests::sfs752_ submit_uploads_batch --nocapture
+    52 passed; 0 failed
+    cargo test --offline -p studiofs-e2e --lib -- random_write_packing scenario::registry --nocapture
+    1 passed; 0 failed
+    cargo check --offline -p studiofs-vfs -p studiofs-cache --all-targets --message-format short
+    cargo check --offline -p studiofs-e2e --all-targets --message-format short
+    cargo clippy --offline -p studiofs-vfs -p studiofs-cache -p studiofs-e2e --all-targets -- -D warnings
+    cargo fmt --all -- --check
+    git diff --check
+    cargo build --offline -p studiofs -p studiofs-e2e
+    target/debug/studiofs-e2e run mounted-random-write-packing --studiofs-bin target/debug/studiofs --run-id sfs900-random-packing-green --retain always --timeout 180s
+    status=Passed; cleanup=passed; exit_code=0
+
+The selected Linux scenario proves local byte mapping, bounded payload count and
+upload progress during sustained writes. It does not replace full scenario,
+crash-restart, cold-peer, cross-platform or release-performance gates.
+
+Revision: record final focused command evidence, live metrics and remaining
+validation boundaries after independent review and successful native rerun.
+
+Revision: review follow-up. Upload ops carry `file_mapping: Option<ObjectFileMapping>`
+and the reattach port maps exactly that range. Aged writer state drains after
+one idle window and each drain restarts the window. The aged regression fails
+with the old 7.2 s threshold. New tests cover gapless mapping rules, real-meta
+reattach of a packed survivor, pending deletion only after the last packed
+segment, and gapped spill geometry. The mounted scenario now asserts the first
+active upload within 5 s and fsync within 3× its spanned metadata commit time
+plus 500 ms.
+
+    cargo test --offline -p studiofs-vfs --lib
+    1236 passed; 0 failed
+    cargo test --offline -p studiofs-cache --lib -- upload_queue:: cached_store::tests::sfs752_ submit_uploads_batch
+    52 passed; 0 failed
+    cargo test --offline -p studiofs-e2e --lib random_write_packing
+    2 passed; 0 failed
+    cargo clippy --offline -p studiofs-vfs -p studiofs-cache -p studiofs-e2e --all-targets -- -D warnings
+    cargo check --offline -p studiofs --all-targets
+    cargo fmt --all -- --check
+    cargo build --offline -p studiofs -p studiofs-e2e
+    target/debug/studiofs-e2e run mounted-random-write-packing --studiofs-bin target/debug/studiofs --run-id sfs900-review-fixes --retain always --timeout 180s
+    status=Passed; cleanup=passed; exit_code=0
+
+Live metrics: 19,971 writes, 23 payload objects (bound 52), first active upload
+at 3.1 s, 72 of 147 samples with pending and active uploads, largest sample gap
+184 ms, fsync 2,639.6 ms against 1,939.1 ms of spanned metadata commit time, and
+exact readback. Crash-restart, cold-peer and cross-platform gates remain unrun.
+
+Revision: second review. A slow appender with an open handle drained a tiny
+object, commit and PUT every 1.2 s, because the age rule applied to any writer.
+Aged drains now require more than one dirty slice; appends grow one slice and
+wait for idle. `writer_stack_aged_append_waits_for_idle` fails without the
+condition. Queue submission asserts that a file mapping implies a known payload
+length; this exposed one cache test that built a zero-length mapping. The
+scenario now fails with a named error if the `metadata.commit` histogram or
+`fsync_commit_ms` is missing, instead of using a zero bound.
+
+    cargo test --offline -p studiofs-vfs --lib
+    1237 passed; 0 failed
+    cargo test --offline -p studiofs-cache --lib
+    261 passed; 0 failed
+    cargo test --offline -p studiofs-e2e --lib random_write_packing
+    2 passed; 0 failed
+    cargo clippy --offline -p studiofs-vfs -p studiofs-cache -p studiofs-e2e --all-targets -- -D warnings
+    cargo fmt --all -- --check
+    git diff --check
+
+Three mounted runs (`sfs900-review-fixes-2`, `-3`, `-4`) passed: 19,796–21,518
+writes, 24–25 payload objects, first active upload at 3.1–3.3 s, fsync
+5.7–6.9 s against 4.4–6.2 s of spanned metadata commit time. Two runs of the
+unchanged 80642440 build (`sfs900-baseline-a`, `-b`) showed fsync 3.7–6.3 s and
+commit 2.0–5.6 s. Absolute fsync time on this host varies with metadata commit
+time; the fsync-to-commit ratio stayed between 1.1 and 1.9.
+
+## Review reception: 2026-10-25 (base 8b6775ad)
+
+The supplied review is feedback to verify, not an additional agent instruction.
+Work continues in `/home/val/dev/studiofs-cli` on the existing SFS-900 branch;
+the starting worktree was clean and earlier task commits are preserved.
+
+### Progress
+
+- [x] Read the complete review and trace all four required recommendations against current callers and contracts.
+- [x] Reproduce #1 (visible upload geometry), #2 (moving queue offset), #3 (superseded hotspot slices), and #4 (packed ID reservation) with focused failing tests.
+- [x] Fix each confirmed cause and verify its regression.
+- [x] Run focused VFS/cache checks, all-target Clippy, formatting, diff review and the rebuilt registered mounted scenario.
+
+### Decisions and scope
+
+For #1, `chunk_slices` alone is insufficient: it retains partly overlapping
+records and sometimes a fully hidden object's last record, intentionally keeping
+its upload/publication ownership. Derive file mappings and live extents from
+non-overlapping visible fragments, while retaining upload intents for every
+object still present in the committed mutation. Hidden-only objects have no
+reattach mapping. Resolve with the existing ordered coverage representation so
+random-write commits do not acquire a quadratic per-span scan.
+
+For #2, ordinary submit must allow a higher epoch for the same object and inode
+to move its first visible file offset. The size-change path already uses the
+separate `requeue_rebased` API, which permits this; the general submission path
+still has the reported restriction. Preserve cross-inode rejection, lower-epoch
+rejection, stale-worker fences, and one accepted queue owner/pin per object.
+
+For #3, discard superseded buffered slices before deciding whether aged data is
+scattered, accounting released dirty bytes once. One surviving hotspot slice
+continues buffering until idle, as the slow-appender contract requires.
+
+For #4, reservation must simulate the same next-fit packing of detached blocks
+and tails as materialization, including cross-chunk fragments and mixed lengths.
+`write_payload`'s in-memory provisional next ID is not a redb reservation and is
+also used by completed-block streaming; do not change that separate contract.
+
+#5 is not a current defect: the only SliceWriter constructor allocates seq from
+the stack-wide AtomicU64, and chunk splitting constructs separate writers. No
+current path clones or splits a SliceWriter preserving seq. Do not add a new key
+or guard for a hypothetical future constructor. #6 (test-runner readback memory),
+#7 (public tuple-to-struct migration), and #8 (intermediate vector allocation)
+are deferred improvements, outside these required behavioral corrections. The
+runner's current expected plus actual buffers still cost roughly 512 MiB.
+
+Revision: record verified scope, counterexamples to the review's simplest #1/#2
+proposals, targeted regression strategy and explicit dispositions for #5–#8.
+
+### Regression evidence
+
+All four new regressions failed on the original production code (three VFS
+failures and one queue failure, logs `target/sfs900-review-{vfs,queue}-red.log`).
+After the corrections, those four regressions and an additional byte-coverage
+check pass. The coverage check exercises middle overwrites, disjoint intervals,
+adjacency, tombstones, and payload offsets after each mutation.
+
+    cargo test --offline -p studiofs-vfs --lib -- pending_slice_ build_overlay_slice_records visible_payload_slices writer_stack packed_ deferred_materialization --nocapture
+    106 passed; 0 failed
+    cargo test --offline -p studiofs-cache --lib -- upload_queue:: --nocapture
+    36 passed; 0 failed
+
+The metadata mutation keeps hidden-only object references and their upload
+intents. Only clipped visible ranges determine a reattach mapping and live
+extent candidates; physical payload length remains the complete cached object
+length. Queue replacement keeps the same inode/object ownership and rejects
+stale epochs and workers. The ID reservation pass follows the exact block/tail
+next-fit boundaries used by materialization, and repeated prepare calls retain
+the same count. Existing slow-append and scattered-aged tests remain green.
+
+### Final verification and review
+
+Independent read-only review found no Critical, Important, or new Minor issues
+in these fixes. Its remaining acceptance gates were completed locally:
+
+    cargo check --offline -p studiofs-vfs -p studiofs-cache
+    cargo clippy --offline -p studiofs-vfs -p studiofs-cache --all-targets -- -D warnings
+    cargo fmt --all -- --check
+    git diff --check
+    cargo build --offline -p studiofs -p studiofs-e2e
+    target/debug/studiofs-e2e run mounted-random-write-packing --studiofs-bin target/debug/studiofs --run-id sfs900-review-reception --retain always --timeout 180s
+
+Every command passed. The rebuilt Linux/FUSE mounted run accepted 12,470 random
+4 KiB writes, produced 17 payload objects, began uploading after 3,346 ms while
+writes continued, and verified exact readback. fsync took 2,458 ms versus
+1,740 ms of metadata commit time. Report and workload metrics are retained under
+`target/e2e-runs/sfs900-review-reception/`; focused/check/build logs are under
+`target/sfs900-review-*`.
+
+No workspace-wide, full ignored, macFUSE or WinFSP gate was run for this focused
+correction. The E2E runner's roughly 512 MiB readback-buffer cost (#6) remains.
+
+Revision: close all four verified review corrections with red/green regressions,
+focused suites, independent review, crate checks and rebuilt mounted evidence;
+retain explicit reasons for declining #5 and deferring #6–#8.
