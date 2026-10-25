@@ -2346,6 +2346,7 @@ impl RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             dentry_keys
                 .iter()
+                .filter(|key| !protected_dentry_keys.contains(*key))
                 .map(|key| {
                     let (parent, name) = decode_dentry_key(key)?;
                     let entry = Self::lookup_exact_in_opened_dentry_table(&base, parent, name)?;
@@ -2803,7 +2804,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         for key in keys {
             let (parent, name) = decode_dentry_key(&key)?;
-            let base_matches = Self::lookup_in_opened_dentry_table(&base, parent, name)?
+            let base_matches = Self::lookup_exact_in_opened_dentry_table(&base, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
             if base_matches {

@@ -447,6 +447,14 @@ missing keys, a differently cased base sibling, and a protected local binding:
 cargo test -p studiofs-meta --lib serving_dentry_reconcile_uses_exact_base_keys_without_directory_scans -- --nocapture
 ```
 
+Replica rename prior keys come from the exact base by-inode index. A stale
+index key must not resolve to a differently cased base dentry and turn a single
+prior binding into a preserved duplicate:
+
+```sh
+cargo test -p studiofs-meta --lib base_rename_prior_keys_use_exact_lookup_for_stale_index_entries -- --nocapture
+```
+
 This does not prove rename throughput scaling. Mounted acceptance still needs
 1-process versus 8-process measurements in separate directories, including
 writer-lock wait, self-ack writer hold time, and `pg-meta-poll` CPU per rename.
