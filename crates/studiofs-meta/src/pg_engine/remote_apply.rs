@@ -1760,6 +1760,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             )
         })?;
         let mut changed = false;
+        let mut local_removals = crate::redb_engine::ReplayLocalJournal::default();
         for event in &batch_events {
             if let MetaEvent::RenameEntry {
                 parent,
@@ -1777,6 +1778,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     *new_parent,
                     new_name,
                     entry,
+                    &mut local_removals,
                 )?;
                 changed = true;
             }
@@ -2155,7 +2157,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 continue;
             }
             let (parent, name) = decode_dentry_key(key)?;
-            let Some(entry) = RedbMetaEngine::lookup_merged_in_write_txn(txn, parent, name)? else {
+            // Reconcile keys come from replayed events and name exactly one binding.
+            let Some(entry) = RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)?
+            else {
                 continue;
             };
             if entry.kind == FileType::RegularFile

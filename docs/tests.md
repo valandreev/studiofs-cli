@@ -330,6 +330,28 @@ cargo test -p studiofs-bridge --lib posix::tests:: -- --nocapture
 Windows cannot execute the POSIX module guarded by `cfg(unix)`. These focused
 tests do not establish live mounted disk-full acceptance.
 
+### SFS-890 PostgreSQL Replication Flush Cost per Namespace Operation
+
+The `pg-meta-poll` flush and self-acknowledgement path used to cost more CPU
+per local rename than the rename itself, inside the redb writer transaction.
+These tests pin the removed per-event work: intent derivation under suppressed
+invalidations, per-rename reductions of the local journal, serving replay on
+flush-only restores, and case-insensitive directory scans on exact-key misses:
+
+```sh
+cargo test -p studiofs-meta --lib suppressed_replica_base_mirror_skips_invalidation_derivation_reads -- --nocapture
+cargo test -p studiofs-meta --lib serving_rename_reconcile_reduces_local_journal_once_per_replay_pass -- --nocapture
+cargo test -p studiofs-meta --lib flush_path_pending_restore_recomputes_counters_without_serving_replay -- --nocapture
+cargo test -p studiofs-meta --lib self_rename_mirror_reconcile_uses_exact_dentry_keys -- --nocapture
+cargo test -p studiofs-meta --lib pending_rename_replay_reduces_alias_journal_once_and_uses_exact_keys -- --nocapture
+cargo test -p studiofs-meta --lib serving_dentry_overlay_check_uses_exact_merged_keys -- --nocapture
+```
+
+These focused tests do not establish mounted acceptance. The mounted check is
+a create/rename/unlink microbenchmark on a Linux mount with 1 and 8 processes
+that attributes `pg-meta-poll` CPU per operation until the thread goes idle;
+that CPU must stay below the operation's own foreground cost.
+
 ### SFS-887 Synchronous Namespace Operations on the Mount Runtime
 
 Platform dispatcher threads (libfuse, macFUSE, WinFSP) call `rename`,
