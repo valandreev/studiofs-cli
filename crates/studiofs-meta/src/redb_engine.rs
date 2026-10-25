@@ -1291,6 +1291,7 @@ mod namespace_merge;
 mod payload_objects;
 mod recovery;
 mod replication;
+pub(crate) use replication::LocalDentryRemovals;
 mod snapshots;
 mod symlink;
 mod txn;

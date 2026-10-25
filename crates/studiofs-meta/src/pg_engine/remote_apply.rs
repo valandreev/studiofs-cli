@@ -1760,6 +1760,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             )
         })?;
         let mut changed = false;
+        let mut local_removals = crate::redb_engine::LocalDentryRemovals::default();
         for event in &batch_events {
             if let MetaEvent::RenameEntry {
                 parent,
@@ -1777,6 +1778,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     *new_parent,
                     new_name,
                     entry,
+                    &mut local_removals,
                 )?;
                 changed = true;
             }

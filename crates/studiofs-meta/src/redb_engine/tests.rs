@@ -145,6 +145,44 @@ fn suppressed_replica_base_mirror_skips_invalidation_derivation_reads() {
 }
 
 #[test]
+fn serving_rename_reconcile_reduces_local_journal_once_per_replay_pass() {
+    let engine = temp_engine();
+    let mut renames = Vec::new();
+    for index in 0..8 {
+        let name = format!("src-{index}").into_bytes();
+        let file = engine
+            .create_file(ROOT_INO, &name, 1000, 1000, 0o644)
+            .unwrap();
+        renames.push(MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name,
+            new_parent: ROOT_INO,
+            new_name: format!("dst-{index}").into_bytes(),
+            entry: DirEntryValue {
+                ino: file.ino,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        });
+    }
+    // Base already holds every destination, so each rename consults local removal state.
+    engine.apply_replica_events_to_base(&renames).unwrap();
+    replication::take_local_dentry_journal_scans();
+
+    engine.apply_replica_serving_state(&renames).unwrap();
+
+    assert_eq!(replication::take_local_dentry_journal_scans(), 1);
+    for index in 0..8 {
+        let name = format!("dst-{index}").into_bytes();
+        assert!(engine.lookup(ROOT_INO, &name).is_ok());
+    }
+}
+
+#[test]
 fn coherence_journal_metadata_only_changes_preserve_content_scope() {
     use crate::coherence::InvalidationIntent;
     let engine = temp_engine();
