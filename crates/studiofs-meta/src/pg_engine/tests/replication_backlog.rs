@@ -3849,3 +3849,54 @@ fn hidden_pending_window_grows_without_reprojecting_unpublished_overlay_history(
         "a remote-visible mutation after the hidden window must still be counted"
     );
 }
+
+#[test]
+fn poisoned_hidden_window_cache_falls_back_without_failing_the_mutation() {
+    use crate::engine::MetaEngine;
+    use crate::schema::{
+        ChunkId, PayloadRef, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord,
+    };
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let mut attr = pg
+        .create_file(ROOT_INO, b"poisoned-window.bin", 0, 0, 0o644)
+        .expect("create unpublished file");
+    attr.content_epoch = 1;
+    let flush = |round: u32, attr: &mut InodeAttr| {
+        let start = round * 4096;
+        attr.size = u64::from(start + 4096);
+        let slice = SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range: SliceRange::new(start, start + 4096).expect("slice range"),
+            payload: Some(PayloadRef::new_partial(98_000 + u64::from(round), 4096)),
+            payload_state: PayloadRefState::LocalOnly,
+        };
+        pg.flush_regular_file_overlay_slices_with_attr(
+            attr.ino,
+            &[(ChunkId(0), vec![slice])],
+            Some(attr),
+        )
+    };
+    flush(0, &mut attr).expect("first flush caches the hidden window");
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = pg.pending_hidden_window.lock().expect("window cache");
+        panic!("poison the hidden-window cache");
+    }));
+
+    flush(1, &mut attr).expect("a poisoned optimization cache must not fail the mutation");
+    flush(2, &mut attr).expect("the rebuilt cache keeps serving later mutations");
+
+    let after_seq = pg.local.get_counter(NEXT_EVENT_SEQ).expect("after seq");
+    let state = pg.pending_state.lock().expect("pending state");
+    assert_eq!(state.ops, 0);
+    assert_eq!(
+        state.event_end, after_seq,
+        "the window must keep every event"
+    );
+    drop(state);
+    assert!(
+        !pg.pending_hidden_window.is_poisoned(),
+        "the fallback must clear the poison"
+    );
+}

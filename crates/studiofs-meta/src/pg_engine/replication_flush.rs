@@ -12,6 +12,7 @@ use crate::schema::{ROOT_INO, RegularFileOverlayState, UploadState};
 use crate::types::{DirEntryValue, FileType, Ino, InodeAttr};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::MutexGuard;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -839,10 +840,7 @@ impl PgMetaEngine {
         if state.ops != 0 || before_seq != state.event_end {
             return Ok(false);
         }
-        let mut cached = self
-            .pending_hidden_window
-            .lock()
-            .map_err(|_| MetaError::Storage("pg pending window lock poisoned".to_string()))?;
+        let mut cached = self.lock_pending_hidden_window();
         let Some(window) = cached
             .as_mut()
             .filter(|window| window.event_start == event_start && window.event_end == before_seq)
@@ -865,13 +863,25 @@ impl PgMetaEngine {
     }
 
     fn cache_hidden_pending_window(&self, event_start: u64, event_end: u64, events: &[MetaEvent]) {
-        if let Ok(mut cached) = self.pending_hidden_window.lock() {
-            *cached = Some(PendingHiddenWindow {
-                event_start,
-                event_end,
-                projection: HiddenWindowProjection::from_events(events),
-            });
-        }
+        *self.lock_pending_hidden_window() = Some(PendingHiddenWindow {
+            event_start,
+            event_end,
+            projection: HiddenWindowProjection::from_events(events),
+        });
+    }
+
+    /// The window cache is only an optimization, so a poisoned lock must not
+    /// fail a committed mutation. A panic may have left the cache half
+    /// updated: drop it so the caller falls back to the full projection.
+    fn lock_pending_hidden_window(&self) -> MutexGuard<'_, Option<PendingHiddenWindow>> {
+        self.pending_hidden_window
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                self.pending_hidden_window.clear_poison();
+                let mut cached = poisoned.into_inner();
+                *cached = None;
+                cached
+            })
     }
 
     pub(super) fn request_pending_flush(&self) {

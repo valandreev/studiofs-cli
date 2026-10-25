@@ -343,6 +343,7 @@ batches, and the copy-free pending-upload summary:
 ```sh
 cargo test -p studiofs-vfs --lib writer_stack_drops_fully_superseded_slices_before_materializing -- --nocapture
 cargo test -p studiofs-meta --lib hidden_pending_window_grows_without_reprojecting_unpublished_overlay_history -- --nocapture
+cargo test -p studiofs-meta --lib poisoned_hidden_window_cache_falls_back_without_failing_the_mutation -- --nocapture
 cargo test -p studiofs-vfs --lib runtime_meta_handle_forwards_batched_overlay_upload_marks -- --nocapture
 cargo test -p studiofs-vfs --lib process_upload_marks_fragmented_overlay_object_uploaded_before_local_cleanup -- --nocapture
 cargo test -p studiofs-meta --lib overlay_objects_if_match_answers_a_batch_across_chunks_in_input_order -- --nocapture
