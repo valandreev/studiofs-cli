@@ -65,11 +65,12 @@ impl Scenario for RandomWritePacking {
         let objects = summary["payload_objects"].as_u64().unwrap_or(u64::MAX);
         let first_upload_ms = summary["first_upload_ms"].as_u64().unwrap_or(u64::MAX);
         let fsync_ms = summary["fsync_ms"].as_f64().unwrap_or(f64::INFINITY);
-        let fsync_bound_ms = summary["fsync_commit_ms"]
-            .as_f64()
-            .map_or(0.0, |commit_ms| {
-                FSYNC_COMMIT_MULTIPLE * commit_ms + FSYNC_FLOOR_MS
-            });
+        let fsync_commit_ms = summary["fsync_commit_ms"].as_f64().ok_or_else(|| {
+            io::Error::other(format!(
+                "random-write packing summary lacks fsync_commit_ms: {summary}"
+            ))
+        })?;
+        let fsync_bound_ms = FSYNC_COMMIT_MULTIPLE * fsync_commit_ms + FSYNC_FLOOR_MS;
         // Each drain can add a partial pack; 32 exceeds the number of aged drains in 15 seconds.
         let bound = writes
             .saturating_mul(WRITE_BYTES as u64)
@@ -188,11 +189,12 @@ fn measure(
 /// Cumulative local metadata commit time; the delta across fsync covers its final overlay commit.
 fn metadata_commit_ms(stats_text: &str) -> io::Result<f64> {
     let stats = RuntimeStatsSnapshot::parse_text(stats_text).map_err(io::Error::other)?;
-    Ok(stats
+    let histogram = stats
         .metadata
         .latencies
         .get("commit")
-        .map_or(0.0, |histogram| histogram.sum as f64 / 1_000_000.0))
+        .ok_or_else(|| io::Error::other("runtime stats lack the metadata.commit histogram"))?;
+    Ok(histogram.sum as f64 / 1_000_000.0)
 }
 
 fn count_payload_objects(root: &Path) -> io::Result<u64> {
@@ -227,5 +229,9 @@ mod tests {
                     histogram_count metadata.commit ns 3\n\
                     histogram_sum metadata.commit ns 2490462652\n";
         assert_eq!(metadata_commit_ms(text).unwrap(), 2_490.462_652);
+        assert!(
+            metadata_commit_ms("# studiofs_runtime_stats schema_version=1\n").is_err(),
+            "a renamed commit metric must not turn into a zero fsync bound"
+        );
     }
 }

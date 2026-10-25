@@ -747,9 +747,18 @@ impl MountedWriterStack {
         if file.ino != ino {
             return Ok(0);
         };
-        // Sustained writes never go idle, so dirty bytes older than the idle window drain too.
+        // Sustained scattered writes never go idle, so their dirty bytes drain once older than
+        // the idle window. An appender grows one slice and waits for idle instead.
+        let scattered = || {
+            file.chunks
+                .values()
+                .flat_map(|chunk| &chunk.slices)
+                .filter(|slice| slice.writer.dirty_bytes() > 0)
+                .nth(1)
+                .is_some()
+        };
         if min_idle.is_some_and(|idle| {
-            file.last_write.elapsed() < idle && file.dirty_since.elapsed() < idle
+            file.last_write.elapsed() < idle && (file.dirty_since.elapsed() < idle || !scattered())
         }) {
             return Ok(0);
         }
@@ -2069,6 +2078,27 @@ mod tests {
             stack.prepare_finish_inode_if_idle(7, idle).unwrap(),
             0,
             "a drain starts a new age window"
+        );
+    }
+
+    #[test]
+    fn writer_stack_aged_append_waits_for_idle() {
+        let (_dir, stack, _rx) = temp_stack(64, 16);
+        let idle = Duration::from_millis(200);
+        stack
+            .write_bytes(write_spec(1, 7, 0, 100), b"log1")
+            .unwrap();
+        {
+            let shard = stack.shards[MountedWriterStack::inode_shard_index(7)].lock();
+            shard.files[&7].lock().dirty_since = Instant::now() - idle - Duration::from_millis(1);
+        }
+        stack
+            .write_bytes(write_spec(1, 7, 4, 101), b"log2")
+            .unwrap();
+        assert_eq!(
+            stack.prepare_finish_inode_if_idle(7, idle).unwrap(),
+            0,
+            "a slow appender keeps one growing slice and must not drain a tiny object per window"
         );
     }
 

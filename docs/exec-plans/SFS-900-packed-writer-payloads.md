@@ -18,6 +18,7 @@ A sustained random writer must also feed background upload before fsync.
 - [x] (2026-10-25) Bound dirty residency through the existing deferred worker; age regression passes.
 - [x] (2026-10-25) Register mounted-random-write-packing acceptance with byte readback, object bound, pre-fsync upload samples and retained fsync timing.
 - [x] (2026-10-25) Focused tests, all-target checks/Clippy, formatting and final diff review passed; rebuilt mounted scenario passed with cleanup.
+- [x] (2026-10-25) Second review: limit aged drains to scattered dirty state, require known length for a mapping, and fail the scenario explicitly when the commit metric is missing.
 - [x] (2026-10-25) Review follow-up: replace the optional origin with a gapless file mapping, drain aged state after one idle window, test packed reattach and pending deletion against real metadata, test gapped spill geometry, and make the mounted scenario assert fsync and early upload.
 
 ## Surprises & Discoveries
@@ -198,3 +199,29 @@ Live metrics: 19,971 writes, 23 payload objects (bound 52), first active upload
 at 3.1 s, 72 of 147 samples with pending and active uploads, largest sample gap
 184 ms, fsync 2,639.6 ms against 1,939.1 ms of spanned metadata commit time, and
 exact readback. Crash-restart, cold-peer and cross-platform gates remain unrun.
+
+Revision: second review. A slow appender with an open handle drained a tiny
+object, commit and PUT every 1.2 s, because the age rule applied to any writer.
+Aged drains now require more than one dirty slice; appends grow one slice and
+wait for idle. `writer_stack_aged_append_waits_for_idle` fails without the
+condition. Queue submission asserts that a file mapping implies a known payload
+length; this exposed one cache test that built a zero-length mapping. The
+scenario now fails with a named error if the `metadata.commit` histogram or
+`fsync_commit_ms` is missing, instead of using a zero bound.
+
+    cargo test --offline -p studiofs-vfs --lib
+    1237 passed; 0 failed
+    cargo test --offline -p studiofs-cache --lib
+    261 passed; 0 failed
+    cargo test --offline -p studiofs-e2e --lib random_write_packing
+    2 passed; 0 failed
+    cargo clippy --offline -p studiofs-vfs -p studiofs-cache -p studiofs-e2e --all-targets -- -D warnings
+    cargo fmt --all -- --check
+    git diff --check
+
+Three mounted runs (`sfs900-review-fixes-2`, `-3`, `-4`) passed: 19,796–21,518
+writes, 24–25 payload objects, first active upload at 3.1–3.3 s, fsync
+5.7–6.9 s against 4.4–6.2 s of spanned metadata commit time. Two runs of the
+unchanged 80642440 build (`sfs900-baseline-a`, `-b`) showed fsync 3.7–6.3 s and
+commit 2.0–5.6 s. Absolute fsync time on this host varies with metadata commit
+time; the fsync-to-commit ratio stayed between 1.1 and 1.9.

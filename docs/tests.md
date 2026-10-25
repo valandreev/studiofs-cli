@@ -339,14 +339,14 @@ tails. Stale-epoch reattachment receives only a gapless file mapping with one
 origin and maps exactly those referenced bytes; scattered references, as in a
 packed object or a gapped spill batch, refuse it. Replay and truncate rebuild the
 same geometry; the last surviving segment retains the shared object's upload pin
-and only its removal schedules pending deletion. Dirty writer state older than
-the 1.2 s idle window drains through the existing background worker even while
-writes continue.
+and only its removal schedules pending deletion. Scattered dirty writer state
+older than the 1.2 s idle window drains through the existing background worker
+even while writes continue; an appender's single growing slice waits for idle.
 
 Focused checks (no remote services):
 
 ```sh
-cargo test -p studiofs-vfs --lib -- packed_ writer_stack_retries_transient_materialization_failure vfs_upload_meta_reattaches buffered_write_spill_batches deferred_sparse_tail_rebases --nocapture
+cargo test -p studiofs-vfs --lib -- packed_ writer_stack_retries_transient_materialization_failure vfs_upload_meta_reattaches buffered_write_spill_batches deferred_sparse_tail_rebases writer_stack_aged --nocapture
 cargo test -p studiofs-cache --lib -- upload_queue:: cached_store::tests::sfs752_ submit_uploads_batch --nocapture
 cargo test -p studiofs-e2e --lib random_write_packing -- --nocapture
 ```

@@ -268,6 +268,8 @@ impl UploadQueue {
         content_epoch: u64,
         payload_len: u64,
     ) -> (UploadSubmitOutcome, usize) {
+        // Upload completion reports `payload_len` bytes; a mapping implies the object length is known.
+        debug_assert!(payload_len > 0 || file_mapping.is_none());
         let op = PendingUpload {
             ino,
             offset,

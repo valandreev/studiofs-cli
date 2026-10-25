@@ -2945,7 +2945,7 @@ mod tests {
             store.submit_upload_with_payload(
                 1,
                 0,
-                Some(ObjectFileMapping::whole(0, payload_len)),
+                (payload_len > 0).then(|| ObjectFileMapping::whole(0, payload_len)),
                 101,
                 3,
                 payload_len,
