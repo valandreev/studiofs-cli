@@ -12,7 +12,6 @@ use futures::FutureExt as _;
 use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use studiofs_cache::upload_queue::PendingUpload;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -611,23 +610,6 @@ impl StudioVfs {
             warn!(error = %error, "uploader task join failed");
         }
         guard.handle.take();
-    }
-
-    pub(super) fn pending_age_stats_ms(&self, pending_uploads: &[PendingUpload]) -> (u64, u64) {
-        let now_ms = now_unix_millis();
-        let mut ages: Vec<u64> = pending_uploads
-            .iter()
-            .map(|op| now_ms.saturating_sub(op.created_unix_ms))
-            .collect();
-        if ages.is_empty() {
-            return (0, 0);
-        }
-        ages.sort_unstable();
-        // Safe percentile calculation: use checked arithmetic to avoid overflow
-        let p95_idx = ((ages.len() - 1).saturating_mul(95)) / 100;
-        let p95 = ages[p95_idx];
-        let max = *ages.last().unwrap_or(&0);
-        (p95, max)
     }
 
     pub(super) fn upload_pipeline_is_idle(

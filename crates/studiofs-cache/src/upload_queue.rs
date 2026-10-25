@@ -40,6 +40,26 @@ pub struct PendingUpload {
     pub retry_count: u32,
 }
 
+/// Aggregate view of the pending uploads, computed under the queue lock
+/// without copying the operations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingUploadSummary {
+    /// Number of pending upload operations.
+    pub count: usize,
+    /// Sum of recorded payload lengths, excluding `unknown_len_object_ids`.
+    pub payload_bytes: u64,
+    /// Pending objects queued without a recorded payload length.
+    pub unknown_len_object_ids: Vec<u64>,
+    /// Enqueue time of the oldest pending operation.
+    pub oldest_created_unix_ms: Option<u64>,
+    /// Pending operations that have been retried at least once.
+    pub retrying: u64,
+    /// Sum of retry attempts across pending operations.
+    pub retry_count_sum: u64,
+    /// Largest retry attempt count among pending operations.
+    pub max_retry_count: u32,
+}
+
 /// Manages in-memory pending upload state and dispatch channel.
 pub struct UploadQueue {
     sender: mpsc::Sender<()>,
@@ -595,6 +615,53 @@ impl UploadQueue {
         ops
     }
 
+    /// Summarize the pending upload ops in one pass over the live index.
+    pub fn pending_summary(&self) -> PendingUploadSummary {
+        let state = self.pending_state.lock();
+        let mut summary = PendingUploadSummary {
+            count: state.by_object.len(),
+            ..PendingUploadSummary::default()
+        };
+        for op in state.by_object.values() {
+            if op.payload_len == 0 {
+                summary.unknown_len_object_ids.push(op.object_id);
+            } else {
+                summary.payload_bytes = summary.payload_bytes.saturating_add(op.payload_len);
+            }
+            summary.oldest_created_unix_ms = Some(
+                summary
+                    .oldest_created_unix_ms
+                    .map_or(op.created_unix_ms, |oldest| oldest.min(op.created_unix_ms)),
+            );
+            if op.retry_count != 0 {
+                summary.retrying += 1;
+            }
+            summary.retry_count_sum = summary
+                .retry_count_sum
+                .saturating_add(u64::from(op.retry_count));
+            summary.max_retry_count = summary.max_retry_count.max(op.retry_count);
+        }
+        summary
+    }
+
+    /// Returns the p95 and maximum pending-operation age in milliseconds.
+    pub fn pending_age_stats_ms(&self, now_unix_ms: u64) -> (u64, u64) {
+        let mut ages: Vec<u64> = {
+            let state = self.pending_state.lock();
+            state
+                .by_object
+                .values()
+                .map(|op| now_unix_ms.saturating_sub(op.created_unix_ms))
+                .collect()
+        };
+        let Some(max) = ages.iter().copied().max() else {
+            return (0, 0);
+        };
+        let p95_index = (ages.len() - 1).saturating_mul(95) / 100;
+        let (_, p95, _) = ages.select_nth_unstable(p95_index);
+        (*p95, max)
+    }
+
     /// Snapshot currently pending upload ops for one inode.
     pub fn snapshot_pending_for_ino(&self, ino: Ino) -> Vec<PendingUpload> {
         let state = self.pending_state.lock();
@@ -1136,6 +1203,46 @@ mod tests {
         assert_eq!(pending[0].object_id, 100);
         assert_eq!(pending[0].retry_count, 2);
         assert_eq!(pending[0].not_before_unix_ms, retry.not_before_unix_ms);
+    }
+
+    #[tokio::test]
+    async fn pending_summary_aggregates_without_copying_operations() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit_with_payload(10, 0, 0, 100, 1, 4096);
+        queue.submit_with_payload(10, 4096, 4096, 101, 1, 8192);
+        queue.submit(11, 0, 102, 1);
+        let mut retry = recv_one(&queue, &mut rx).await;
+        assert_eq!(retry.object_id, 100);
+        retry.retry_count = 2;
+        assert!(queue.requeue(retry));
+
+        let snapshot = queue.snapshot_pending();
+        let summary = queue.pending_summary();
+        assert_eq!(
+            summary,
+            PendingUploadSummary {
+                count: 3,
+                payload_bytes: 4096 + 8192,
+                unknown_len_object_ids: vec![102],
+                oldest_created_unix_ms: snapshot.iter().map(|op| op.created_unix_ms).min(),
+                retrying: 1,
+                retry_count_sum: 2,
+                max_retry_count: 2,
+            }
+        );
+
+        let now = snapshot
+            .iter()
+            .map(|op| op.created_unix_ms)
+            .max()
+            .expect("pending ops")
+            + 500;
+        let mut ages: Vec<u64> = snapshot.iter().map(|op| now - op.created_unix_ms).collect();
+        ages.sort_unstable();
+        assert_eq!(queue.pending_age_stats_ms(now), (ages[1], ages[2]));
+        assert_eq!(queue.pending_count(), 3);
     }
 
     #[tokio::test]

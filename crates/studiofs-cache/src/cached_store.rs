@@ -1090,6 +1090,16 @@ impl CachedStore {
         self.upload_queue.snapshot_pending()
     }
 
+    /// Summarizes pending uploads without copying them.
+    pub fn pending_upload_summary(&self) -> crate::upload_queue::PendingUploadSummary {
+        self.upload_queue.pending_summary()
+    }
+
+    /// Returns the p95 and maximum pending-upload age in milliseconds.
+    pub fn pending_upload_age_stats_ms(&self) -> (u64, u64) {
+        self.upload_queue.pending_age_stats_ms(now_unix_ms())
+    }
+
     /// Returns a snapshot of pending uploads for `ino`.
     pub fn snapshot_pending_uploads_for_ino(&self, ino: u64) -> Vec<PendingUpload> {
         self.metrics.upload_queue.record_snapshot_pending();
