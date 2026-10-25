@@ -139,6 +139,61 @@ struct PendingState {
     canceled_inodes: HashSet<Ino>,
     canceled_dirty: BTreeSet<Ino>,
     wakeup_coalesced: u64,
+    // Maintained with every `by_object` change so summaries never walk the queue.
+    totals: PendingTotals,
+}
+
+#[derive(Debug, Default)]
+struct PendingTotals {
+    payload_bytes: u64,
+    unknown_len_object_ids: BTreeSet<u64>,
+    created_unix_ms: BTreeMap<u64, usize>,
+    retrying: u64,
+    retry_count_sum: u64,
+    nonzero_retry_counts: BTreeMap<u32, usize>,
+}
+
+impl PendingTotals {
+    fn add(&mut self, op: &PendingUpload) {
+        if op.payload_len == 0 {
+            self.unknown_len_object_ids.insert(op.object_id);
+        } else {
+            self.payload_bytes = self.payload_bytes.saturating_add(op.payload_len);
+        }
+        *self.created_unix_ms.entry(op.created_unix_ms).or_default() += 1;
+        if op.retry_count != 0 {
+            self.retrying += 1;
+            *self.nonzero_retry_counts.entry(op.retry_count).or_default() += 1;
+        }
+        self.retry_count_sum = self
+            .retry_count_sum
+            .saturating_add(u64::from(op.retry_count));
+    }
+
+    fn remove(&mut self, op: &PendingUpload) {
+        if op.payload_len == 0 {
+            self.unknown_len_object_ids.remove(&op.object_id);
+        } else {
+            self.payload_bytes = self.payload_bytes.saturating_sub(op.payload_len);
+        }
+        Self::decrement(&mut self.created_unix_ms, op.created_unix_ms);
+        if op.retry_count != 0 {
+            self.retrying = self.retrying.saturating_sub(1);
+            Self::decrement(&mut self.nonzero_retry_counts, op.retry_count);
+        }
+        self.retry_count_sum = self
+            .retry_count_sum
+            .saturating_sub(u64::from(op.retry_count));
+    }
+
+    fn decrement<K: Ord>(counts: &mut BTreeMap<K, usize>, key: K) {
+        if let Entry::Occupied(mut entry) = counts.entry(key) {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
 }
 
 /// Runtime ingress state for the upload worker wakeup channel.
@@ -199,6 +254,7 @@ impl UploadQueue {
                 canceled_inodes: HashSet::new(),
                 canceled_dirty: BTreeSet::new(),
                 wakeup_coalesced: 0,
+                totals: PendingTotals::default(),
             }),
             idle_notify,
             shutdown_requested: AtomicBool::new(false),
@@ -640,8 +696,28 @@ impl UploadQueue {
         ops
     }
 
-    /// Summarize the pending upload ops in one pass over the live index.
+    /// Summarize the pending upload ops from incrementally maintained totals.
     pub fn pending_summary(&self) -> PendingUploadSummary {
+        let state = self.pending_state.lock();
+        let totals = &state.totals;
+        PendingUploadSummary {
+            count: state.by_object.len(),
+            payload_bytes: totals.payload_bytes,
+            unknown_len_object_ids: totals.unknown_len_object_ids.iter().copied().collect(),
+            oldest_created_unix_ms: totals.created_unix_ms.keys().next().copied(),
+            retrying: totals.retrying,
+            retry_count_sum: totals.retry_count_sum,
+            max_retry_count: totals
+                .nonzero_retry_counts
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_summary_by_scan(&self) -> PendingUploadSummary {
         let state = self.pending_state.lock();
         let mut summary = PendingUploadSummary {
             count: state.by_object.len(),
@@ -731,6 +807,8 @@ impl UploadQueue {
         if let Some(current) = state.by_object.get_mut(&op.object_id) {
             if current.ino == op.ino && op.content_epoch > current.content_epoch {
                 let previous = std::mem::replace(current, op.clone());
+                state.totals.remove(&previous);
+                state.totals.add(op);
                 Self::unmark_dirty(state, &previous);
                 Self::mark_dirty(state, op);
                 return PendingSubmit::Updated(previous);
@@ -740,6 +818,7 @@ impl UploadQueue {
 
         let ino = op.ino;
         state.by_object.insert(op.object_id, op.clone());
+        state.totals.add(op);
         state.by_inode.entry(ino).or_default().insert(op.object_id);
         Self::mark_dirty(state, op);
         PendingSubmit::New
@@ -795,6 +874,7 @@ impl UploadQueue {
             return (false, false);
         }
         let removed = entry.remove();
+        state.totals.remove(&removed);
         Self::remove_inode_index_entry(state, removed.ino, op.object_id);
         Self::unmark_dirty(state, &removed);
         let became_idle = state.by_object.is_empty();
@@ -813,6 +893,8 @@ impl UploadQueue {
             return None;
         }
         let previous = std::mem::replace(current, op.clone());
+        state.totals.remove(&previous);
+        state.totals.add(op);
         Self::unmark_dirty(state, &previous);
         Self::mark_dirty(state, op);
         Some(previous)
@@ -835,6 +917,8 @@ impl UploadQueue {
             return None;
         }
         let previous = std::mem::replace(current, replacement.clone());
+        state.totals.remove(&previous);
+        state.totals.add(replacement);
         Self::unmark_dirty(state, &previous);
         Self::mark_dirty(state, replacement);
         Some(previous)
@@ -850,6 +934,8 @@ impl UploadQueue {
         };
         if current == failed_op {
             *current = previous.clone();
+            state.totals.remove(failed_op);
+            state.totals.add(&previous);
             Self::unmark_dirty(state, failed_op);
             Self::mark_dirty(state, &previous);
         }
@@ -1350,6 +1436,13 @@ mod tests {
         ages.sort_unstable();
         assert_eq!(queue.pending_age_stats_ms(now), (ages[1], ages[2]));
         assert_eq!(queue.pending_count(), 3);
+        assert_eq!(summary, queue.pending_summary_by_scan());
+
+        for op in snapshot {
+            assert!(queue.complete(&op));
+            assert_eq!(queue.pending_summary(), queue.pending_summary_by_scan());
+        }
+        assert_eq!(queue.pending_summary(), PendingUploadSummary::default());
     }
 
     #[tokio::test]

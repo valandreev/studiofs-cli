@@ -392,6 +392,29 @@ These focused tests do not establish mounted acceptance. The mounted check is
 mount without the tray, followed by `fsync` of the file and the upload pipeline
 log line.
 
+### SFS-891 Tray Health Polling Without Lifecycle Scans
+
+Health polling must not enter the full ZeroIO collection path. The live-source
+regression uses existing upload-queue snapshot counters to detect that path,
+including a computed-but-discarded result, and checks that explicit runtime
+snapshots retain inode details. Cache tests show storage stats and pending
+upload summaries read incrementally maintained totals instead of probing the
+cache index per pinned object or walking the queue. Tray tests cover idle backoff and conservative
+synchronization status, including stale and legacy telemetry:
+
+```sh
+cargo test -p studiofs --bin studiofs diagnostics:: -- --nocapture
+cargo test -p studiofs --bin studiofs tray:: -- --nocapture
+cargo test -p studiofs-cache --lib -- sfs891 local_runtime_pins pending_summary
+STUDIOFS_CLIENT_ROOT="$PWD/target/sfs-891-client-root" cargo test -p studiofs --bin studiofs prepared_mount_launch_publishes_live_diagnostics_and_supports_attach -- --nocapture
+```
+
+These focused checks do not establish mounted performance acceptance. Rebuild
+the product binary and use the registered `studiofs-e2e` scenario runner on a
+host with FUSE, storage services, and a GUI tray session. Retain the mounted
+write profile under `target/`; tray Health polling must no longer appear beneath
+`StudioVfs::zeroio_runtime_snapshot` in the profile.
+
 ### SFS-890 PostgreSQL Replication Flush Cost per Namespace Operation
 
 The `pg-meta-poll` flush and self-acknowledgement path used to cost more CPU

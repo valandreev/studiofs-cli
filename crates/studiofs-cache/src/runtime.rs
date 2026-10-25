@@ -283,6 +283,64 @@ impl LocalPayloadBackendOpenError {
     }
 }
 
+/// Runtime pin counts plus the evictable index bytes each pin currently hides.
+///
+/// The hidden bytes are refreshed whenever a pinned object's index row changes,
+/// so storage stats read one counter instead of probing every pinned object.
+#[derive(Debug, Default)]
+struct RuntimePins {
+    objects: HashMap<u64, RuntimePin>,
+    evictable_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct RuntimePin {
+    count: usize,
+    evictable_bytes: u64,
+}
+
+impl RuntimePins {
+    fn contains(&self, object_id: u64) -> bool {
+        self.objects.contains_key(&object_id)
+    }
+
+    /// Returns whether this is the object's first pin.
+    fn pin(&mut self, object_id: u64) -> bool {
+        let pin = self.objects.entry(object_id).or_default();
+        pin.count = pin.count.saturating_add(1);
+        pin.count == 1
+    }
+
+    fn unpin(&mut self, object_id: u64) {
+        let std::collections::hash_map::Entry::Occupied(mut entry) = self.objects.entry(object_id)
+        else {
+            return;
+        };
+        let pin = entry.get_mut();
+        pin.count = pin.count.saturating_sub(1);
+        if pin.count == 0 {
+            self.evictable_bytes = self.evictable_bytes.saturating_sub(pin.evictable_bytes);
+            entry.remove();
+        }
+    }
+
+    fn forget(&mut self, object_id: u64) {
+        if let Some(pin) = self.objects.remove(&object_id) {
+            self.evictable_bytes = self.evictable_bytes.saturating_sub(pin.evictable_bytes);
+        }
+    }
+
+    fn set_evictable_bytes(&mut self, object_id: u64, bytes: u64) {
+        if let Some(pin) = self.objects.get_mut(&object_id) {
+            self.evictable_bytes = self
+                .evictable_bytes
+                .saturating_sub(pin.evictable_bytes)
+                .saturating_add(bytes);
+            pin.evictable_bytes = bytes;
+        }
+    }
+}
+
 /// Current local backend backed by file-per-object payload files and redb index.
 #[derive(Debug)]
 pub struct LocalPayloadBackendRuntime {
@@ -295,7 +353,7 @@ pub struct LocalPayloadBackendRuntime {
     disk_pressure: Mutex<disk_pressure::DiskPressureState>,
     disk_pressure_refresh_requested: AtomicBool,
     payload_mutation_gates: [Mutex<()>; PAYLOAD_MUTATION_STRIPES],
-    runtime_pinned: Mutex<HashMap<u64, usize>>,
+    runtime_pinned: Mutex<RuntimePins>,
     eviction_scan_skipped_non_evictable: AtomicU64,
     access_touch: AccessTouchFlusher,
     last_dirty_orphan_prune_at: Mutex<Instant>,
@@ -470,7 +528,7 @@ impl LocalPayloadBackendRuntime {
             disk_pressure: Mutex::new(disk_pressure::DiskPressureState::default()),
             disk_pressure_refresh_requested: AtomicBool::new(false),
             payload_mutation_gates: std::array::from_fn(|_| Mutex::new(())),
-            runtime_pinned: Mutex::new(HashMap::new()),
+            runtime_pinned: Mutex::new(RuntimePins::default()),
             eviction_scan_skipped_non_evictable: AtomicU64::new(0),
             last_dirty_orphan_prune_at: Mutex::new(
                 Instant::now()
@@ -600,6 +658,7 @@ impl LocalPayloadBackendRuntime {
                 "local payload runtime failed to prune stale index entry"
             );
         }
+        self.refresh_runtime_pin_bytes(&[object_id]);
     }
 
     fn payload_missing(&self, object_id: u64, operation: &'static str) -> bool {
@@ -663,6 +722,7 @@ impl LocalPayloadBackendRuntime {
         } else {
             self.forget_access_touches(&still_orphaned);
         }
+        self.refresh_runtime_pin_bytes(&still_orphaned);
     }
 
     fn remove_payload_chunk(&self, object_ids: &[u64]) -> Result<(), LocalPayloadBackendError> {
@@ -1025,27 +1085,43 @@ impl LocalPayloadBackendRuntime {
     }
 
     fn is_runtime_pinned(&self, object_id: u64) -> bool {
-        self.runtime_pinned.lock().contains_key(&object_id)
+        self.runtime_pinned.lock().contains(object_id)
     }
 
-    fn runtime_pinned_evictable_bytes(&self) -> u64 {
-        // Collect object ids before index lookups so runtime_pinned is not
-        // held across synchronous index access.
-        let object_ids = self
-            .runtime_pinned
-            .lock()
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        object_ids
-            .into_iter()
-            .filter_map(|object_id| self.index.get_entry(object_id).ok().flatten())
-            .filter(|entry| {
-                entry.lifecycle == LocalPayloadLifecycleState::Uploaded && entry.evictable
-            })
-            .fold(0_u64, |total, entry| {
-                total.saturating_add(entry.payload_len)
-            })
+    /// Re-reads the index rows of pinned `object_ids` and updates the bytes their pins hide.
+    ///
+    /// Callers hold the payload mutation gates for `object_ids`, so no row can change
+    /// between the read and the update.
+    fn refresh_runtime_pin_bytes(&self, object_ids: &[u64]) {
+        let pinned = {
+            let runtime_pinned = self.runtime_pinned.lock();
+            object_ids
+                .iter()
+                .copied()
+                .filter(|object_id| runtime_pinned.contains(*object_id))
+                .collect::<Vec<_>>()
+        };
+        if pinned.is_empty() {
+            return;
+        }
+        // Read outside runtime_pinned so other pins are not blocked on redb.
+        let entries = self.index.get_entries(&pinned).unwrap_or_else(|error| {
+            warn!(
+                object_count = pinned.len(),
+                error = ?error,
+                "local payload runtime pinned evictable lookup failed"
+            );
+            vec![None; pinned.len()]
+        });
+        let mut runtime_pinned = self.runtime_pinned.lock();
+        for (object_id, entry) in pinned.into_iter().zip(entries) {
+            let bytes = entry
+                .filter(|entry| {
+                    entry.lifecycle == LocalPayloadLifecycleState::Uploaded && entry.evictable
+                })
+                .map_or(0, |entry| entry.payload_len);
+            runtime_pinned.set_evictable_bytes(object_id, bytes);
+        }
     }
 
     fn forget_runtime_pins(&self, object_ids: &[u64]) {
@@ -1054,7 +1130,7 @@ impl LocalPayloadBackendRuntime {
         }
         let mut runtime_pinned = self.runtime_pinned.lock();
         for object_id in object_ids {
-            runtime_pinned.remove(object_id);
+            runtime_pinned.forget(*object_id);
         }
     }
 }
@@ -1216,9 +1292,12 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
                 error = ?error,
                 "local payload runtime index upsert failed after payload write; attempted payload rollback"
             );
+            // A failed commit may still have applied, so refresh from the index either way.
+            self.refresh_runtime_pin_bytes(&[object_id]);
             return Err(error.into());
         }
 
+        self.refresh_runtime_pin_bytes(&[object_id]);
         payload_commit.complete();
         Ok(())
     }
@@ -1338,9 +1417,11 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
                 error = ?error,
                 "local payload runtime batch index upsert failed after payload writes; attempted payload rollback"
             );
+            self.refresh_runtime_pin_bytes(&written_object_ids);
             return Err(error.into());
         }
 
+        self.refresh_runtime_pin_bytes(&written_object_ids);
         batch_commit.complete();
         Ok(())
     }
@@ -1375,6 +1456,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         self.run_disk_pressure_maintenance(Instant::now(), platform::filesystem_space)
     }
 
+    // Dirty/Uploading rows are never evictable, so these transitions leave pinned bytes unchanged.
     fn mark_uploading(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
         let _mutation = self.lock_payload_mutations(&[object_id]);
         self.index
@@ -1391,31 +1473,23 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
 
     fn mark_uploaded(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
         let _mutation = self.lock_payload_mutations(&[object_id]);
-        self.index.mark_uploaded(object_id)?;
+        let result = self.index.mark_uploaded(object_id);
+        self.refresh_runtime_pin_bytes(&[object_id]);
+        result?;
         self.note_storage_state_change();
         Ok(())
     }
 
     fn pin(&self, object_id: u64) {
         let _mutation = self.lock_payload_mutations(&[object_id]);
-        let mut runtime_pinned = self.runtime_pinned.lock();
-        let count = runtime_pinned.entry(object_id).or_default();
-        *count = count.saturating_add(1);
+        if self.runtime_pinned.lock().pin(object_id) {
+            self.refresh_runtime_pin_bytes(&[object_id]);
+        }
     }
 
     fn unpin(&self, object_id: u64) {
         let _mutation = self.lock_payload_mutations(&[object_id]);
-        let mut runtime_pinned = self.runtime_pinned.lock();
-        let std::collections::hash_map::Entry::Occupied(mut entry) =
-            runtime_pinned.entry(object_id)
-        else {
-            return;
-        };
-        let count = entry.get_mut();
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            entry.remove();
-        }
+        self.runtime_pinned.lock().unpin(object_id);
     }
 
     fn pin_batch(&self, object_ids: &[u64]) {
@@ -1423,11 +1497,15 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return;
         }
         let _mutations = self.lock_payload_mutations(object_ids);
-        let mut runtime_pinned = self.runtime_pinned.lock();
-        for object_id in object_ids {
-            let count = runtime_pinned.entry(*object_id).or_default();
-            *count = count.saturating_add(1);
-        }
+        let first_pins = {
+            let mut runtime_pinned = self.runtime_pinned.lock();
+            object_ids
+                .iter()
+                .copied()
+                .filter(|object_id| runtime_pinned.pin(*object_id))
+                .collect::<Vec<_>>()
+        };
+        self.refresh_runtime_pin_bytes(&first_pins);
     }
 
     fn unpin_batch(&self, object_ids: &[u64]) {
@@ -1437,16 +1515,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         let _mutations = self.lock_payload_mutations(object_ids);
         let mut runtime_pinned = self.runtime_pinned.lock();
         for object_id in object_ids {
-            let std::collections::hash_map::Entry::Occupied(mut entry) =
-                runtime_pinned.entry(*object_id)
-            else {
-                continue;
-            };
-            let count = entry.get_mut();
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                entry.remove();
-            }
+            runtime_pinned.unpin(*object_id);
         }
     }
 
@@ -1567,7 +1636,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     fn storage_stats(&self) -> LocalPayloadStorageStats {
         match self.index.stats() {
             Ok(stats) => {
-                let runtime_pinned_evictable_bytes = self.runtime_pinned_evictable_bytes();
+                let runtime_pinned_evictable_bytes = self.runtime_pinned.lock().evictable_bytes;
                 LocalPayloadStorageStats {
                     current_bytes: stats.current_bytes,
                     dirty_bytes: stats.dirty_bytes,
@@ -3810,6 +3879,66 @@ mod tests {
         );
         assert_eq!(reopened.storage_stats().evictable_bytes, 30);
         assert!(reopened.object_stats(20).unwrap().evictable);
+    }
+
+    #[test]
+    fn sfs891_storage_stats_track_pinned_bytes_without_index_lookups() {
+        let temp = studiofs_test_support::workspace_target_tempdir("sfs891-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = LocalPayloadBackendRuntime::open_with_budget(
+            LocalPayloadBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x91; 16],
+            },
+            None,
+        )
+        .unwrap();
+        let dirty_ids = (100..164).collect::<Vec<u64>>();
+        for &object_id in &dirty_ids {
+            backend.put(object_id, &[0x01; 10], false).unwrap();
+        }
+        backend.put(20, &[0x02; 30], true).unwrap();
+        backend.pin_batch(&dirty_ids);
+        backend.pin(20);
+        backend.pin(20);
+        assert_eq!(backend.storage_stats().evictable_bytes, 0);
+
+        let lookups_before = backend
+            .index
+            .lookup_read_transactions
+            .load(Ordering::Relaxed);
+        for _ in 0..3 {
+            assert_eq!(backend.storage_stats().evictable_bytes, 0);
+        }
+        assert_eq!(
+            backend
+                .index
+                .lookup_read_transactions
+                .load(Ordering::Relaxed),
+            lookups_before,
+            "storage stats must not probe each pinned object"
+        );
+
+        backend.mark_uploading(100).unwrap();
+        backend.mark_uploaded(100).unwrap();
+        assert_eq!(
+            backend.index.stats().unwrap().evictable_bytes,
+            40,
+            "the index itself counts both uploaded rows as evictable"
+        );
+        assert_eq!(backend.storage_stats().evictable_bytes, 0);
+
+        backend.unpin(100);
+        assert_eq!(backend.storage_stats().evictable_bytes, 10);
+        backend.unpin(20);
+        assert_eq!(backend.storage_stats().evictable_bytes, 10);
+        backend.unpin(20);
+        assert_eq!(backend.storage_stats().evictable_bytes, 40);
+
+        backend.pin(20);
+        backend.remove(20).unwrap();
+        assert_eq!(backend.storage_stats().evictable_bytes, 10);
     }
 
     #[test]
