@@ -729,10 +729,7 @@ impl UploadQueue {
 
     fn record_pending_or_update(state: &mut PendingState, op: &PendingUpload) -> PendingSubmit {
         if let Some(current) = state.by_object.get_mut(&op.object_id) {
-            if current.ino == op.ino
-                && current.offset == op.offset
-                && op.content_epoch > current.content_epoch
-            {
+            if current.ino == op.ino && op.content_epoch > current.content_epoch {
                 let previous = std::mem::replace(current, op.clone());
                 Self::unmark_dirty(state, &previous);
                 Self::mark_dirty(state, op);
@@ -940,6 +937,42 @@ mod tests {
         let op = recv_one(&queue, &mut rx).await;
         assert_eq!(op.object_id, 77);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn packed_submit_newer_epoch_can_move_first_segment() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+        assert_eq!(
+            queue.submit_with_payload(1, 0, None, 77, 1, 8192),
+            UploadSubmitOutcome::New
+        );
+        let stale = recv_one(&queue, &mut rx).await;
+        let mapping = Some(ObjectFileMapping {
+            file_offset: 32768,
+            object_offset: 4096,
+            len: 4096,
+        });
+        assert_eq!(
+            queue.submit_with_payload(1, 32768, mapping, 77, 2, 8192),
+            UploadSubmitOutcome::Updated
+        );
+        let current = recv_one(&queue, &mut rx).await;
+        assert_eq!(
+            (current.offset, current.content_epoch, current.file_mapping),
+            (32768, 2, mapping)
+        );
+        assert!(
+            !queue.complete(&stale),
+            "the displaced worker cannot complete the new owner"
+        );
+        assert!(!queue.cancel(&stale));
+        assert!(!queue.requeue(stale));
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(queue.submit(2, 32768, 77, 3), UploadSubmitOutcome::Ignored);
+        assert_eq!(queue.submit(1, 0, 77, 1), UploadSubmitOutcome::Ignored);
+        assert!(queue.complete(&current));
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[tokio::test]

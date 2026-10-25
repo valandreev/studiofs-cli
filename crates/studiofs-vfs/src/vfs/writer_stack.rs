@@ -747,6 +747,11 @@ impl MountedWriterStack {
         if file.ino != ino {
             return Ok(0);
         };
+        let superseded_bytes = drop_superseded_dirty_slices(&mut file);
+        if superseded_bytes > 0 {
+            file.dirty_bytes = file.dirty_bytes.saturating_sub(superseded_bytes);
+            self.subtract_dirty(superseded_bytes);
+        }
         // Sustained scattered writes never go idle, so their dirty bytes drain once older than
         // the idle window. An appender grows one slice and waits for idle instead.
         let scattered = || {
@@ -762,20 +767,24 @@ impl MountedWriterStack {
         }) {
             return Ok(0);
         }
-        let superseded_bytes = drop_superseded_dirty_slices(&mut file);
-        if superseded_bytes > 0 {
-            file.dirty_bytes = file.dirty_bytes.saturating_sub(superseded_bytes);
-            self.subtract_dirty(superseded_bytes);
-        }
         let mut object_count = 0u64;
+        let mut packed_len = 0;
+        let capacity = self.config.block_size as usize;
+        // Match next-fit packing in pack_finished_slices, including detach_finish block boundaries.
         for chunk in file.chunks.values_mut() {
             for slice in &mut chunk.slices {
-                if slice.writer.dirty_bytes() > 0 {
+                let mut remaining = slice.writer.dirty_bytes();
+                if remaining > 0 {
                     slice.frozen = true;
-                    object_count = object_count.saturating_add(staged_object_count(
-                        slice.writer.dirty_bytes(),
-                        self.config.block_size,
-                    ));
+                }
+                while remaining > 0 {
+                    let len = remaining.min(capacity);
+                    if packed_len == 0 || len > capacity - packed_len {
+                        object_count = object_count.saturating_add(1);
+                        packed_len = 0;
+                    }
+                    packed_len += len;
+                    remaining -= len;
                 }
             }
         }
@@ -2079,6 +2088,64 @@ mod tests {
             0,
             "a drain starts a new age window"
         );
+    }
+
+    #[test]
+    fn writer_stack_aged_overwrites_of_one_range_wait_for_idle() {
+        let (_dir, stack, _rx) = temp_stack(64, 16);
+        let idle = Duration::from_millis(200);
+        stack
+            .write_bytes(write_spec(1, 7, 0, 100), b"old!")
+            .unwrap();
+        {
+            let shard = stack.shards[MountedWriterStack::inode_shard_index(7)].lock();
+            shard.files[&7].lock().dirty_since = Instant::now() - idle - Duration::from_millis(1);
+        }
+        stack
+            .write_bytes(write_spec(1, 7, 0, 101), b"new!")
+            .unwrap();
+        assert_eq!(
+            stack.prepare_finish_inode_if_idle(7, idle).unwrap(),
+            0,
+            "superseded writes to one range are not scattered dirty data"
+        );
+        assert_eq!(stack.dirty_bytes_for_inode(7), 4);
+        let mut actual = [0; 4];
+        stack.copy_read_spans_into(7, 0, &mut actual);
+        assert_eq!(&actual, b"new!");
+        {
+            let shard = stack.shards[MountedWriterStack::inode_shard_index(7)].lock();
+            shard.files[&7].lock().last_write = Instant::now() - idle - Duration::from_millis(1);
+        }
+        assert_eq!(stack.prepare_finish_inode_if_idle(7, idle).unwrap(), 1);
+    }
+
+    #[test]
+    fn writer_stack_reserves_ids_for_packs_instead_of_fragments() {
+        for (block_size, writes, expected) in [
+            (16, vec![(0, 4), (32, 4), (64, 4), (96, 4)], 1),
+            (16, vec![(0, 12), (32, 12), (64, 4)], 2),
+            (16, vec![(0, 20), (64, 4), (96, 8)], 2),
+        ] {
+            let (_dir, stack, _rx) = temp_stack(64, block_size);
+            for (index, (offset, len)) in writes.into_iter().enumerate() {
+                stack
+                    .write_bytes(
+                        write_spec(1, 7, offset, 100 + index as u64 * 10),
+                        vec![1; len],
+                    )
+                    .unwrap();
+            }
+            assert_eq!(stack.prepare_finish_inode(7).unwrap(), expected);
+            assert_eq!(
+                stack.prepare_finish_inode(7).unwrap(),
+                expected,
+                "reservation retries must use the same packing geometry"
+            );
+            let finished = stack.finish_prepared_inode(7, 900).unwrap();
+            let ids: HashSet<_> = finished.iter().map(|slice| slice.object_id).collect();
+            assert_eq!(ids.len(), expected as usize);
+        }
     }
 
     #[test]

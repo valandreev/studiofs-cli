@@ -1327,27 +1327,62 @@ impl<'a> LocalDirtyFlushSession<'a> {
 
         let mut upload_ops_by_object =
             std::collections::BTreeMap::<u64, ObjectUploadGeometry>::new();
-        for (chunk_id, slices) in &pending_slices {
+        let mut visible_geometry = std::collections::BTreeMap::<u64, ObjectUploadGeometry>::new();
+        let mut latest_live_extents = std::collections::BTreeMap::<u32, (u64, u64)>::new();
+        for (chunk_id, slices) in &chunk_slices {
             let chunk_start = studiofs_meta::schema::chunk_start_offset(
-                studiofs_meta::schema::ChunkId(*chunk_id),
+                *chunk_id,
                 studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
             );
+            // Hidden references still need publication, but cannot authorize reattachment.
             for slice in slices {
-                let Some(object_id) = slice.object_id else {
+                let Some(payload) = slice.payload else {
                     continue;
                 };
                 let file_offset = chunk_start.saturating_add(slice.range.start as u64);
                 let geometry =
-                    ObjectUploadGeometry::new(file_offset, slice.object_offset, slice.range.len());
+                    ObjectUploadGeometry::new(file_offset, payload.offset, slice.range.len());
                 upload_ops_by_object
-                    .entry(object_id)
+                    .entry(payload.object_id)
                     .and_modify(|current| current.include(geometry))
                     .or_insert(geometry);
+            }
+            for slice in visible_payload_slices(slices) {
+                let Some(payload) = slice.payload else {
+                    continue;
+                };
+                let file_offset = chunk_start.saturating_add(slice.range.start as u64);
+                let geometry =
+                    ObjectUploadGeometry::new(file_offset, payload.offset, slice.range.len());
+                visible_geometry
+                    .entry(payload.object_id)
+                    .and_modify(|current| current.include(geometry))
+                    .or_insert(geometry);
+                let first_block = block_index_from_offset(file_offset, self.drain.block_size);
+                let last_block = block_index_from_offset(
+                    chunk_start + u64::from(slice.range.end) - 1,
+                    self.drain.block_size,
+                );
+                for block_index in first_block..=last_block {
+                    latest_live_extents
+                        .entry(block_index)
+                        .and_modify(|(current_object_id, current_seq)| {
+                            if slice.order.0 > *current_seq
+                                || (slice.order.0 == *current_seq
+                                    && payload.object_id > *current_object_id)
+                            {
+                                *current_object_id = payload.object_id;
+                                *current_seq = slice.order.0;
+                            }
+                        })
+                        .or_insert((payload.object_id, slice.order.0));
+                }
             }
         }
         let upload_ops: Vec<_> = upload_ops_by_object
             .iter()
             .map(|(object_id, geometry)| {
+                let visible = visible_geometry.get(object_id);
                 let payload_len = self
                     .vfs
                     .local_payload_backend
@@ -1355,8 +1390,10 @@ impl<'a> LocalDirtyFlushSession<'a> {
                     .map(|stats| stats.payload_len);
                 (
                     self.ino,
-                    geometry.offset,
-                    geometry.file_mapping(),
+                    visible.unwrap_or(geometry).offset,
+                    visible
+                        .copied()
+                        .and_then(ObjectUploadGeometry::file_mapping),
                     *object_id,
                     content_epoch,
                     payload_len.unwrap_or(geometry.payload_len),
@@ -1364,25 +1401,6 @@ impl<'a> LocalDirtyFlushSession<'a> {
             })
             .collect();
         if !upload_ops.is_empty() {
-            let mut latest_live_extents = std::collections::BTreeMap::<u32, (u64, u64)>::new();
-            for slices in pending_slices.values() {
-                for slice in slices {
-                    let Some(object_id) = slice.object_id else {
-                        continue;
-                    };
-                    latest_live_extents
-                        .entry(slice.block_index)
-                        .and_modify(|(current_object_id, current_seq)| {
-                            if slice.seq > *current_seq
-                                || (slice.seq == *current_seq && object_id > *current_object_id)
-                            {
-                                *current_object_id = object_id;
-                                *current_seq = slice.seq;
-                            }
-                        })
-                        .or_insert((object_id, slice.seq));
-                }
-            }
             let live_extents: Vec<_> = latest_live_extents
                 .into_iter()
                 .map(|(block_index, (object_id, _))| {

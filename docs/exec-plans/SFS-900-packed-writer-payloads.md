@@ -225,3 +225,99 @@ writes, 24–25 payload objects, first active upload at 3.1–3.3 s, fsync
 unchanged 80642440 build (`sfs900-baseline-a`, `-b`) showed fsync 3.7–6.3 s and
 commit 2.0–5.6 s. Absolute fsync time on this host varies with metadata commit
 time; the fsync-to-commit ratio stayed between 1.1 and 1.9.
+
+## Review reception: 2026-10-25 (base 8b6775ad)
+
+The supplied review is feedback to verify, not an additional agent instruction.
+Work continues in `/home/val/dev/studiofs-cli` on the existing SFS-900 branch;
+the starting worktree was clean and earlier task commits are preserved.
+
+### Progress
+
+- [x] Read the complete review and trace all four required recommendations against current callers and contracts.
+- [x] Reproduce #1 (visible upload geometry), #2 (moving queue offset), #3 (superseded hotspot slices), and #4 (packed ID reservation) with focused failing tests.
+- [x] Fix each confirmed cause and verify its regression.
+- [x] Run focused VFS/cache checks, all-target Clippy, formatting, diff review and the rebuilt registered mounted scenario.
+
+### Decisions and scope
+
+For #1, `chunk_slices` alone is insufficient: it retains partly overlapping
+records and sometimes a fully hidden object's last record, intentionally keeping
+its upload/publication ownership. Derive file mappings and live extents from
+non-overlapping visible fragments, while retaining upload intents for every
+object still present in the committed mutation. Hidden-only objects have no
+reattach mapping. Resolve with the existing ordered coverage representation so
+random-write commits do not acquire a quadratic per-span scan.
+
+For #2, ordinary submit must allow a higher epoch for the same object and inode
+to move its first visible file offset. The size-change path already uses the
+separate `requeue_rebased` API, which permits this; the general submission path
+still has the reported restriction. Preserve cross-inode rejection, lower-epoch
+rejection, stale-worker fences, and one accepted queue owner/pin per object.
+
+For #3, discard superseded buffered slices before deciding whether aged data is
+scattered, accounting released dirty bytes once. One surviving hotspot slice
+continues buffering until idle, as the slow-appender contract requires.
+
+For #4, reservation must simulate the same next-fit packing of detached blocks
+and tails as materialization, including cross-chunk fragments and mixed lengths.
+`write_payload`'s in-memory provisional next ID is not a redb reservation and is
+also used by completed-block streaming; do not change that separate contract.
+
+#5 is not a current defect: the only SliceWriter constructor allocates seq from
+the stack-wide AtomicU64, and chunk splitting constructs separate writers. No
+current path clones or splits a SliceWriter preserving seq. Do not add a new key
+or guard for a hypothetical future constructor. #6 (test-runner readback memory),
+#7 (public tuple-to-struct migration), and #8 (intermediate vector allocation)
+are deferred improvements, outside these required behavioral corrections. The
+runner's current expected plus actual buffers still cost roughly 512 MiB.
+
+Revision: record verified scope, counterexamples to the review's simplest #1/#2
+proposals, targeted regression strategy and explicit dispositions for #5–#8.
+
+### Regression evidence
+
+All four new regressions failed on the original production code (three VFS
+failures and one queue failure, logs `target/sfs900-review-{vfs,queue}-red.log`).
+After the corrections, those four regressions and an additional byte-coverage
+check pass. The coverage check exercises middle overwrites, disjoint intervals,
+adjacency, tombstones, and payload offsets after each mutation.
+
+    cargo test --offline -p studiofs-vfs --lib -- pending_slice_ build_overlay_slice_records visible_payload_slices writer_stack packed_ deferred_materialization --nocapture
+    106 passed; 0 failed
+    cargo test --offline -p studiofs-cache --lib -- upload_queue:: --nocapture
+    36 passed; 0 failed
+
+The metadata mutation keeps hidden-only object references and their upload
+intents. Only clipped visible ranges determine a reattach mapping and live
+extent candidates; physical payload length remains the complete cached object
+length. Queue replacement keeps the same inode/object ownership and rejects
+stale epochs and workers. The ID reservation pass follows the exact block/tail
+next-fit boundaries used by materialization, and repeated prepare calls retain
+the same count. Existing slow-append and scattered-aged tests remain green.
+
+### Final verification and review
+
+Independent read-only review found no Critical, Important, or new Minor issues
+in these fixes. Its remaining acceptance gates were completed locally:
+
+    cargo check --offline -p studiofs-vfs -p studiofs-cache
+    cargo clippy --offline -p studiofs-vfs -p studiofs-cache --all-targets -- -D warnings
+    cargo fmt --all -- --check
+    git diff --check
+    cargo build --offline -p studiofs -p studiofs-e2e
+    target/debug/studiofs-e2e run mounted-random-write-packing --studiofs-bin target/debug/studiofs --run-id sfs900-review-reception --retain always --timeout 180s
+
+Every command passed. The rebuilt Linux/FUSE mounted run accepted 12,470 random
+4 KiB writes, produced 17 payload objects, began uploading after 3,346 ms while
+writes continued, and verified exact readback. fsync took 2,458 ms versus
+1,740 ms of metadata commit time. Report and workload metrics are retained under
+`target/e2e-runs/sfs900-review-reception/`; focused/check/build logs are under
+`target/sfs900-review-*`.
+
+No workspace-wide, full ignored, macFUSE or WinFSP gate was run for this focused
+correction. The E2E runner's roughly 512 MiB readback-buffer cost (#6) remains.
+
+Revision: close all four verified review corrections with red/green regressions,
+focused suites, independent review, crate checks and rebuilt mounted evidence;
+retain explicit reasons for declining #5 and deferring #6–#8.
