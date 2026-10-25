@@ -14,6 +14,14 @@ thread_local! {
     /// Parent-scoped case-insensitive dentry scans after an exact-key miss.
     pub(super) static CASE_FALLBACK_DENTRY_SCANS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Merged serving/base case-insensitive scans after an exact-key miss.
+    pub(super) static CASE_FALLBACK_MERGED_SCANS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Takes the merged case-insensitive fallback scan count on this thread.
+pub(crate) fn take_case_fallback_merged_scans() -> usize {
+    CASE_FALLBACK_MERGED_SCANS.with(|count| count.replace(0))
 }
 
 fn invalidate_local_storage_page_stats(engine: &RedbMetaEngine) {
@@ -249,7 +257,7 @@ fn self_rename_mirror_reconcile_uses_exact_dentry_keys() {
             ino: file.ino,
             kind: FileType::RegularFile,
         },
-        &mut replication::LocalDentryRemovals::default(),
+        &mut replication::ReplayLocalJournal::default(),
     )
     .unwrap();
     txn.commit().unwrap();
@@ -261,6 +269,85 @@ fn self_rename_mirror_reconcile_uses_exact_dentry_keys() {
         engine.lookup(dir.ino, b"src"),
         Err(MetaError::EntryNotFound { .. })
     ));
+}
+
+#[test]
+fn pending_rename_replay_reduces_alias_journal_once_and_uses_exact_keys() {
+    let engine = temp_engine();
+    let dir = engine
+        .create_dir(ROOT_INO, b"big", 1000, 1000, 0o755)
+        .unwrap();
+    for index in 0..32 {
+        engine
+            .create_file(
+                dir.ino,
+                format!("sibling-{index}").as_bytes(),
+                1000,
+                1000,
+                0o644,
+            )
+            .unwrap();
+    }
+    let mut files = Vec::new();
+    for index in 0..8 {
+        files.push(
+            engine
+                .create_file(
+                    dir.ino,
+                    format!("src-{index}").as_bytes(),
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .unwrap(),
+        );
+    }
+    let flushed = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = engine.read_events_range(0, flushed).unwrap();
+    engine.apply_replica_events_to_base(&setup).unwrap();
+    engine
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, flushed)
+        .unwrap();
+    let mut renames = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        let name = format!("src-{index}").into_bytes();
+        let new_name = format!("dst-{index}").into_bytes();
+        engine.rename(dir.ino, &name, dir.ino, &new_name).unwrap();
+        renames.push(MetaEvent::RenameEntry {
+            parent: dir.ino,
+            name,
+            new_parent: dir.ino,
+            new_name,
+            entry: DirEntryValue {
+                ino: file.ino,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        });
+    }
+    let unflushed = engine.get_counter(NEXT_EVENT_SEQ).unwrap() - flushed;
+    RedbMetaEngine::reset_pending_local_alias_event_scan_count_for_test();
+    CASE_FALLBACK_DENTRY_SCANS.set(0);
+
+    // Unpublished renames: base lacks every destination, so each one is a stale candidate.
+    engine
+        .apply_replica_serving_state_for_pending_replay(&renames)
+        .unwrap();
+
+    let scanned = RedbMetaEngine::pending_local_alias_event_scan_count_for_test();
+    assert!(
+        scanned as u64 <= unflushed,
+        "one alias reduction per pass, scanned {scanned} rows of {unflushed}"
+    );
+    assert_eq!(CASE_FALLBACK_DENTRY_SCANS.get(), 0);
+    for (index, file) in files.iter().enumerate() {
+        let name = format!("dst-{index}").into_bytes();
+        assert_eq!(engine.lookup(dir.ino, &name).unwrap().ino, file.ino);
+    }
 }
 
 #[test]

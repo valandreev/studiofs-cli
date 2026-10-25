@@ -1291,9 +1291,11 @@ mod namespace_merge;
 mod payload_objects;
 mod recovery;
 mod replication;
-pub(crate) use replication::LocalDentryRemovals;
+pub(crate) use replication::ReplayLocalJournal;
 #[cfg(test)]
 pub(crate) use replication::take_pending_serving_replays;
+#[cfg(test)]
+pub(crate) use tests::take_case_fallback_merged_scans;
 mod snapshots;
 mod symlink;
 mod txn;

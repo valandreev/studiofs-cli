@@ -2616,6 +2616,28 @@ fn permanent_event_size_error_does_not_restore_claimed_pending_batch() {
 }
 
 #[test]
+fn serving_dentry_overlay_check_uses_exact_merged_keys() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let dir = pg
+        .create_dir(ROOT_INO, b"big", 0, 0, 0o755)
+        .expect("create directory");
+    for index in 0..32 {
+        pg.create_file(dir.ino, format!("sibling-{index}").as_bytes(), 0, 0, 0o644)
+            .expect("create sibling");
+    }
+    // A rename source name is an exact reconcile key that no longer binds anything.
+    let mut keys = HashSet::new();
+    keys.insert(encode_dentry_key(dir.ino, b"renamed-away"));
+    crate::redb_engine::take_case_fallback_merged_scans();
+
+    RemoteApplyCoordinator::new(&pg.local)
+        .reconcile_serving_dentries_from_base_with_overlay(&keys, &OverlayConflictSets::default())
+        .expect("reconcile serving dentries");
+
+    assert_eq!(crate::redb_engine::take_case_fallback_merged_scans(), 0);
+}
+
+#[test]
 fn flush_path_pending_restore_recomputes_counters_without_serving_replay() {
     let (_dir, mut pg) = temp_pg_engine_for_unit();
     pg.remote_format_validated.store(true, Ordering::Release);

@@ -241,18 +241,20 @@ impl LocalDentryMutationReducer {
     }
 }
 
-/// Local dentry removal state shared by the renames of one replay pass.
+/// Local journal reductions shared by the renames of one replay pass.
 ///
-/// The journal reduction runs at most once, on the first rename that needs it,
-/// instead of once per rename. The pass must not append local journal events or
-/// rewrite the dentry mutation baseline while this value is alive; replica
-/// serving and self-batch reconciliation write only namespace mirror tables.
+/// Each reduction runs at most once, on the first rename that needs it,
+/// instead of once per rename. The pass must not append local journal events,
+/// move the flushed cursor or rewrite the dentry mutation baseline while this
+/// value is alive; replica serving and self-batch reconciliation write only
+/// namespace mirror tables.
 #[derive(Default)]
-pub(crate) struct LocalDentryRemovals {
+pub(crate) struct ReplayLocalJournal {
     reducer: Option<LocalDentryMutationReducer>,
+    pending_aliases: Option<PendingLocalAliases>,
 }
 
-impl LocalDentryRemovals {
+impl ReplayLocalJournal {
     fn is_removed(&mut self, txn: &redb::WriteTransaction, dentry_key: &[u8]) -> MetaResult<bool> {
         let reducer = match &mut self.reducer {
             Some(reducer) => reducer,
@@ -264,6 +266,89 @@ impl LocalDentryRemovals {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         reducer.load_key_from_table(&baseline, dentry_key)?;
         Ok(reducer.is_removed(dentry_key))
+    }
+
+    /// Dentry keys the unflushed local journal still binds to `entry`.
+    fn pending_aliases(
+        &mut self,
+        txn: &redb::WriteTransaction,
+        entry: &DirEntryValue,
+    ) -> MetaResult<&HashSet<Vec<u8>>> {
+        let aliases = match &mut self.pending_aliases {
+            Some(aliases) => aliases,
+            empty => empty.insert(RedbMetaEngine::reduce_pending_local_aliases_in_txn(txn)?),
+        };
+        Ok(aliases.for_entry(entry))
+    }
+}
+
+/// Unflushed local dentry aliases for every inode, reduced in one journal pass.
+#[derive(Default)]
+struct PendingLocalAliases {
+    by_entry: HashMap<(Ino, u8), HashSet<Vec<u8>>>,
+    entries_by_key: HashMap<Vec<u8>, HashSet<(Ino, u8)>>,
+    empty: HashSet<Vec<u8>>,
+}
+
+impl PendingLocalAliases {
+    fn identity(entry: &DirEntryValue) -> (Ino, u8) {
+        (entry.ino, entry.kind as u8)
+    }
+
+    fn insert(&mut self, identity: (Ino, u8), key: Vec<u8>) {
+        self.entries_by_key
+            .entry(key.clone())
+            .or_default()
+            .insert(identity);
+        self.by_entry.entry(identity).or_default().insert(key);
+    }
+
+    fn apply(&mut self, event: &crate::events::MetaEvent) {
+        use crate::events::MetaEvent;
+
+        match event {
+            MetaEvent::AddEntry {
+                parent,
+                name,
+                entry,
+            } => self.insert(Self::identity(entry), encode_dentry_key(*parent, name)),
+            MetaEvent::RemoveEntry { parent, name } => {
+                let key = encode_dentry_key(*parent, name);
+                for identity in self.entries_by_key.remove(&key).unwrap_or_default() {
+                    if let Some(keys) = self.by_entry.get_mut(&identity) {
+                        keys.remove(&key);
+                    }
+                }
+            }
+            MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                ..
+            } => {
+                let identity = Self::identity(entry);
+                let old_key = encode_dentry_key(*parent, name);
+                let moved = self
+                    .by_entry
+                    .get_mut(&identity)
+                    .is_some_and(|keys| keys.remove(&old_key));
+                if moved {
+                    if let Some(entries) = self.entries_by_key.get_mut(&old_key) {
+                        entries.remove(&identity);
+                    }
+                    self.insert(identity, encode_dentry_key(*new_parent, new_name));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn for_entry(&self, entry: &DirEntryValue) -> &HashSet<Vec<u8>> {
+        self.by_entry
+            .get(&Self::identity(entry))
+            .unwrap_or(&self.empty)
     }
 }
 
@@ -1731,7 +1816,7 @@ impl RedbMetaEngine {
         events: &[E],
         reject_stale_ready_growth: bool,
     ) -> MetaResult<()> {
-        let mut local_removals = LocalDentryRemovals::default();
+        let mut local_removals = ReplayLocalJournal::default();
         for event in events {
             let event = event.borrow();
             Self::invalidate_replica_event(txn, event)?;
@@ -2039,6 +2124,7 @@ impl RedbMetaEngine {
                 .collect::<MetaResult<HashMap<Ino, Option<InodeAttr>>>>()?
         };
 
+        let mut local_journal = ReplayLocalJournal::default();
         for ino in inodes {
             let invalidation_scope = txn.invalidation_scope();
             let view_before = Self::serving_view_of_inode(txn, *ino)?;
@@ -2056,6 +2142,7 @@ impl RedbMetaEngine {
                             kind: attr.kind,
                         },
                         protected_dentry_keys,
+                        &mut local_journal,
                     )?;
                     Self::install_base_dentries_for_entry_in_txn(
                         txn,
@@ -2442,7 +2529,7 @@ impl RedbMetaEngine {
             new_parent,
             new_name,
             entry,
-            &mut LocalDentryRemovals::default(),
+            &mut ReplayLocalJournal::default(),
         )?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -2456,7 +2543,7 @@ impl RedbMetaEngine {
         new_parent: Ino,
         new_name: &[u8],
         entry: &DirEntryValue,
-        local_removals: &mut LocalDentryRemovals,
+        local_removals: &mut ReplayLocalJournal,
     ) -> MetaResult<()> {
         if entry.kind == FileType::Directory {
             Self::invalidate_directory_descendants(txn, entry.ino)?;
@@ -2485,7 +2572,7 @@ impl RedbMetaEngine {
         new_parent: Ino,
         new_name: &[u8],
         entry: &DirEntryValue,
-        local_removals: &mut LocalDentryRemovals,
+        local_removals: &mut ReplayLocalJournal,
     ) -> MetaResult<()> {
         let src_in_base =
             Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?
@@ -2495,7 +2582,7 @@ impl RedbMetaEngine {
             Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
-        Self::remove_stale_dentries_for_base_entry(txn, entry, &HashSet::new())?;
+        Self::remove_stale_dentries_for_base_entry(txn, entry, &HashSet::new(), local_removals)?;
 
         if dst_in_base {
             let destination_key = encode_dentry_key(new_parent, new_name);
@@ -2593,6 +2680,7 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         entry: &DirEntryValue,
         protected_dentry_keys: &HashSet<Vec<u8>>,
+        local_journal: &mut ReplayLocalJournal,
     ) -> MetaResult<()> {
         let keys =
             Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, entry.ino)?;
@@ -2608,15 +2696,17 @@ impl RedbMetaEngine {
                 continue;
             }
 
+            // Keys come from the by-inode index, so they are exact by construction.
             let (parent, name) = decode_dentry_key(&key)?;
-            let current_matches = Self::lookup_in_opened_dentry_table(&current, parent, name)?
-                .map(|value| value.ino == entry.ino && value.kind == entry.kind)
-                .unwrap_or(false);
+            let current_matches =
+                Self::lookup_exact_in_opened_dentry_table(&current, parent, name)?
+                    .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+                    .unwrap_or(false);
             if !current_matches {
                 continue;
             }
 
-            let base_matches = Self::lookup_in_opened_dentry_table(&base, parent, name)?
+            let base_matches = Self::lookup_exact_in_opened_dentry_table(&base, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
             if !base_matches {
@@ -2630,7 +2720,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let protected = Self::pending_local_alias_dentry_keys_for_inode_in_txn(txn, entry)?;
+        let protected = local_journal.pending_aliases(txn, entry)?.clone();
         for key in candidates {
             if protected.contains(&key) {
                 continue;
@@ -2659,10 +2749,9 @@ impl RedbMetaEngine {
 
     // Pending local AddEntry aliases are local namespace state, not stale
     // remote rename losers, so foreign rename reconciliation must preserve them.
-    fn pending_local_alias_dentry_keys_for_inode_in_txn(
+    fn reduce_pending_local_aliases_in_txn(
         txn: &redb::WriteTransaction,
-        entry: &DirEntryValue,
-    ) -> MetaResult<HashSet<Vec<u8>>> {
+    ) -> MetaResult<PendingLocalAliases> {
         let counters = txn
             .open_table(COUNTERS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -2678,7 +2767,7 @@ impl RedbMetaEngine {
             .unwrap_or(1);
         drop(counters);
 
-        let mut aliases = HashSet::new();
+        let mut aliases = PendingLocalAliases::default();
         if end_seq <= start_seq {
             return Ok(aliases);
         }
@@ -2694,32 +2783,7 @@ impl RedbMetaEngine {
             PENDING_LOCAL_ALIAS_EVENT_SCAN_COUNT
                 .set(PENDING_LOCAL_ALIAS_EVENT_SCAN_COUNT.get().saturating_add(1));
             let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            match crate::events::decode_event(bytes.value())? {
-                crate::events::MetaEvent::AddEntry {
-                    parent,
-                    name,
-                    entry: added,
-                } if added.ino == entry.ino && added.kind == entry.kind => {
-                    aliases.insert(encode_dentry_key(parent, &name));
-                }
-                crate::events::MetaEvent::RemoveEntry { parent, name } => {
-                    aliases.remove(&encode_dentry_key(parent, &name));
-                }
-                crate::events::MetaEvent::RenameEntry {
-                    parent,
-                    name,
-                    new_parent,
-                    new_name,
-                    entry: renamed,
-                    ..
-                } if renamed.ino == entry.ino && renamed.kind == entry.kind => {
-                    let old_key = encode_dentry_key(parent, &name);
-                    if aliases.remove(&old_key) {
-                        aliases.insert(encode_dentry_key(new_parent, &new_name));
-                    }
-                }
-                _ => {}
-            }
+            aliases.apply(&crate::events::decode_event(bytes.value())?);
         }
         Ok(aliases)
     }

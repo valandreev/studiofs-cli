@@ -365,6 +365,8 @@ impl RedbMetaEngine {
             return Ok(exact);
         }
 
+        #[cfg(test)]
+        super::tests::CASE_FALLBACK_MERGED_SCANS.with(|count| count.set(count.get() + 1));
         let mut name_lower = None;
         let prefix = dentry_prefix(parent);
         let end = prefix_successor(&prefix);
@@ -729,6 +731,25 @@ impl RedbMetaEngine {
         parent: Ino,
         name: &[u8],
     ) -> MetaResult<Option<DirEntryValue>> {
+        Self::lookup_merged_in_write_txn_with(txn, parent, name, false)
+    }
+
+    /// Exact-key form of [`Self::lookup_merged_in_write_txn`] for keys taken
+    /// from replayed events, where a case-insensitive sibling is not the entry.
+    pub(crate) fn lookup_merged_exact_in_write_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<Option<DirEntryValue>> {
+        Self::lookup_merged_in_write_txn_with(txn, parent, name, true)
+    }
+
+    fn lookup_merged_in_write_txn_with(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+        exact: bool,
+    ) -> MetaResult<Option<DirEntryValue>> {
         let current = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -738,8 +759,12 @@ impl RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let (entry, is_overlay) =
-            Self::lookup_merged_from_opened_tables(&base, &current, &tombstones, parent, name)?;
+        let (entry, is_overlay) = if exact {
+            let key = encode_dentry_key(parent, name);
+            Self::lookup_merged_exact_key_from_opened_tables(&base, &current, &tombstones, &key)?
+        } else {
+            Self::lookup_merged_from_opened_tables(&base, &current, &tombstones, parent, name)?
+        };
         let Some(entry) = entry else {
             return Ok(None);
         };
