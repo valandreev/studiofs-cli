@@ -32,6 +32,11 @@ impl LinuxFuseCachePolicy {
         };
         CachePolicySelection::recognized(policy)
     }
+
+    /// Only the kernel policy may enable FUSE writeback caching (ADR 0011).
+    pub(crate) const fn wants_writeback_cache(self) -> bool {
+        matches!(self, Self::Kernel)
+    }
 }
 
 /// Parsed policy plus an indicator that the original value was unknown.
@@ -383,6 +388,13 @@ mod tests {
             LinuxFuseCachePolicy::parse(Some("surprise")),
             CachePolicySelection::unrecognized_default()
         );
+    }
+
+    #[test]
+    fn only_kernel_policy_requests_writeback_cache() {
+        assert!(LinuxFuseCachePolicy::Kernel.wants_writeback_cache());
+        assert!(!LinuxFuseCachePolicy::Adaptive.wants_writeback_cache());
+        assert!(!LinuxFuseCachePolicy::Direct.wants_writeback_cache());
     }
 
     #[test]
