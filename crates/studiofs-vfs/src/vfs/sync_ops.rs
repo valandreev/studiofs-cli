@@ -561,8 +561,10 @@ impl StudioVfs {
                 self.record_vfs_write_materialize_completed(idle_tail_started.elapsed());
                 if idle_tail_materialized > 0 {
                     *no_progress_retries = 0;
-                    tokio::task::yield_now().await;
-                    return DeferredMaterializationPassOutcome::Reschedule;
+                    // Commit metadata and queue uploads before materializing another batch.
+                    return DeferredMaterializationPassOutcome::Completed {
+                        allow_reschedule: true,
+                    };
                 }
             }
 

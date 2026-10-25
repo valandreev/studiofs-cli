@@ -5042,7 +5042,7 @@ fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
-        object_file_offset: 0,
+        object_file_offset: Some(0),
         object_id: 7001,
         payload_len: 4096,
         content_epoch: 4,
@@ -5455,7 +5455,7 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
-        object_file_offset: 0,
+        object_file_offset: Some(0),
         object_id: 7001,
         payload_len: 4096,
         content_epoch: 5,
@@ -5660,7 +5660,7 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
-        object_file_offset: 0,
+        object_file_offset: Some(0),
         object_id: 9002,
         payload_len: 4096,
         content_epoch: 5,
@@ -9574,7 +9574,8 @@ fn explicit_flush_sparse_extend_retains_kernel_zero_filled_tail_write() {
             "zero-filled write is queued from the start of the uploaded object"
         );
         assert_eq!(
-            tail_upload_before_extend.object_file_offset, 0,
+            tail_upload_before_extend.object_file_offset,
+            Some(0),
             "tail payload is embedded in a larger zero-filled object that starts at file offset 0"
         );
         assert_eq!(
@@ -9598,7 +9599,8 @@ fn explicit_flush_sparse_extend_retains_kernel_zero_filled_tail_write() {
             "set_len requeue must preserve the queued object extent offset"
         );
         assert_eq!(
-            tail_upload_after_extend.object_file_offset, 0,
+            tail_upload_after_extend.object_file_offset,
+            Some(0),
             "set_len requeue must preserve the uploaded object's file start"
         );
         assert_eq!(
@@ -9837,7 +9839,7 @@ fn zero_filled_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_emp
             "requeued sparse object must keep the original file start so an in-flight upload can be updated"
         );
         assert_eq!(
-            full_zero_filled_upload.object_file_offset, 0,
+            full_zero_filled_upload.object_file_offset, Some(0),
             "requeued sparse object must read from the start of the retained payload"
         );
     });
@@ -10946,7 +10948,7 @@ fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
-        object_file_offset: 0,
+        object_file_offset: Some(0),
         object_id: block.object_id,
         payload_len: u64::from(block.length),
         content_epoch: attr.content_epoch,
@@ -13657,6 +13659,86 @@ fn aggressive_materialization_threshold_is_half_of_dirty_budget() {
     assert_eq!(aggressive_materialization_threshold_bytes(1), 1);
     assert_eq!(aggressive_materialization_threshold_bytes(8), 4);
     assert_eq!(hard_backpressure_threshold_bytes(8), 16);
+}
+
+#[test]
+fn packed_upload_geometry_uses_object_bytes_across_commit_replay_and_truncate() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "packed-upload-geometry");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let mut attr = vfs.create(1, b"packed.bin", 0, 0, 0o644).unwrap();
+        attr.size = 64;
+        attr.content_epoch = 1;
+        meta.set_attr(&attr).unwrap();
+        let object_id = 900_001;
+        vfs.payload_store_put_async(object_id, Bytes::from_static(b"aaaabbbbTAIL"), false)
+            .await
+            .unwrap();
+        for (seq, file_offset, initial_object_offset) in [(1, 0, 0), (2, 32, 4)] {
+            vfs.install_persisted_pending_local_dirty_slice(
+                attr.ino,
+                super::local_dirty::PersistedPendingLocalDirtySliceSpec {
+                    block_index: 0,
+                    file_offset,
+                    len: 4,
+                    seq,
+                    object_id,
+                    initial_object_offset,
+                },
+            );
+        }
+        vfs.flush(attr.ino).await.unwrap();
+        let pending = vfs.pending_uploads_snapshot_for_inode(attr.ino);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].payload_len, 12,
+            "file gaps must not enlarge the upload"
+        );
+        assert_eq!(pending[0].object_file_offset, None);
+        vfs.cancel_pending_uploads_for_inode(attr.ino);
+        vfs.replay_dirty_uploads_from_local_backend(&[], &[meta.get_attr(attr.ino).unwrap()]);
+        let pending = vfs.pending_uploads_snapshot_for_inode(attr.ino);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].payload_len, 12,
+            "replay must preserve the whole object"
+        );
+        assert_eq!(pending[0].object_file_offset, None);
+        vfs.setattr(attr.ino, SetattrArgs::size_only(36)).unwrap();
+        let pending = vfs.pending_uploads_snapshot_for_inode(attr.ino);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].payload_len, 12,
+            "truncate must retain real payload length"
+        );
+        assert_eq!(pending[0].object_file_offset, None);
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, b"xxxx")
+            .await
+            .unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+        assert!(
+            meta.get_regular_file_graph_object_usage(attr.ino)
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == object_id),
+            "one remaining segment keeps the shared object live"
+        );
+        assert!(vfs.cached_store.is_pinned(object_id));
+        vfs.setattr(attr.ino, SetattrArgs::size_only(4)).unwrap();
+        assert!(
+            !meta
+                .get_regular_file_graph_object_usage(attr.ino)
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == object_id)
+        );
+        assert!(
+            !vfs.cached_store.is_pinned(object_id),
+            "last segment removal releases the upload pin"
+        );
+    });
 }
 
 #[test]
@@ -19123,7 +19205,7 @@ fn concurrent_shutdown_callers_observe_first_error() {
         .degraded
         .store(true, AtomicOrdering::Release);
     vfs.cached_store
-        .submit_upload_with_payload(ROOT_INO, 0, 0, 9_900_001, 1, 1);
+        .submit_upload_with_payload(ROOT_INO, 0, Some(0), 9_900_001, 1, 1);
 
     rt.block_on(async {
         let owner_vfs = Arc::clone(&vfs);

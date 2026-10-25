@@ -8,6 +8,44 @@ use studiofs_meta::types::Ino;
 use crate::VfsMeta;
 use crate::runtime::run_meta;
 
+#[derive(Clone, Copy)]
+pub(super) struct ObjectUploadGeometry {
+    pub(super) offset: u64,
+    pub(super) object_file_offset: Option<u64>,
+    pub(super) payload_len: u64,
+    referenced_bytes: u64,
+    object_start: u32,
+}
+
+impl ObjectUploadGeometry {
+    pub(super) fn new(file_offset: u64, object_offset: u32, len: u32) -> Self {
+        Self {
+            offset: file_offset,
+            object_file_offset: file_offset.checked_sub(u64::from(object_offset)),
+            payload_len: u64::from(object_offset) + u64::from(len),
+            referenced_bytes: u64::from(len),
+            object_start: object_offset,
+        }
+    }
+
+    pub(super) fn include(&mut self, other: Self) {
+        self.offset = self.offset.min(other.offset);
+        if self.object_file_offset != other.object_file_offset {
+            self.object_file_offset = None;
+        }
+        self.payload_len = self.payload_len.max(other.payload_len);
+        self.referenced_bytes = self.referenced_bytes.saturating_add(other.referenced_bytes);
+        self.object_start = self.object_start.min(other.object_start);
+    }
+
+    pub(super) fn contiguous_origin(self, payload_len: Option<u64>) -> Option<u64> {
+        let payload_len = payload_len?;
+        (self.object_start == 0 && self.referenced_bytes == payload_len)
+            .then_some(self.object_file_offset)
+            .flatten()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ExtentRecordId {
     pub(super) object_id: u64,
@@ -298,8 +336,19 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtentRecordId, PendingUploadCatalog};
+    use super::{ExtentRecordId, ObjectUploadGeometry, PendingUploadCatalog};
     use studiofs_cache::upload_queue::PendingUpload;
+
+    #[test]
+    fn packed_geometry_requires_a_known_fully_mapped_object_for_reattach() {
+        let mut geometry = ObjectUploadGeometry::new(100, 0, 4);
+        assert_eq!(geometry.contiguous_origin(None), None);
+        assert_eq!(geometry.contiguous_origin(Some(8)), None);
+        geometry.include(ObjectUploadGeometry::new(104, 4, 4));
+        assert_eq!(geometry.contiguous_origin(Some(8)), Some(100));
+        geometry.include(ObjectUploadGeometry::new(200, 8, 4));
+        assert_eq!(geometry.contiguous_origin(Some(12)), None);
+    }
 
     #[test]
     fn pending_upload_catalog_prefers_latest_pending_upload_for_block() {
@@ -309,7 +358,7 @@ mod tests {
             PendingUpload {
                 ino,
                 offset: block_offset,
-                object_file_offset: block_offset,
+                object_file_offset: Some(block_offset),
                 object_id: 101,
                 payload_len: 0,
                 content_epoch: 3,
@@ -320,7 +369,7 @@ mod tests {
             PendingUpload {
                 ino,
                 offset: block_offset,
-                object_file_offset: block_offset,
+                object_file_offset: Some(block_offset),
                 object_id: 202,
                 payload_len: 0,
                 content_epoch: 5,

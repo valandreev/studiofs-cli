@@ -1553,7 +1553,8 @@ impl StudioVfs {
         size: u64,
         content_epoch: u64,
     ) {
-        let mut retained = std::collections::BTreeMap::<u64, (u64, u64, u64, u32)>::new();
+        let mut retained =
+            std::collections::BTreeMap::<u64, (super::overlay::ObjectUploadGeometry, u32)>::new();
         if size > 0 {
             match self.sync_meta().lookup_regular_file_slices(ino, 0, size) {
                 Ok(spans) => {
@@ -1567,28 +1568,24 @@ impl StudioVfs {
                         let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
                         let absolute_offset =
                             chunk_base.saturating_add(u64::from(span.range.start));
-                        let object_file_offset =
-                            absolute_offset.saturating_sub(u64::from(payload.offset));
-                        let payload_end = absolute_offset.saturating_add(u64::from(payload.length));
+                        let geometry = super::overlay::ObjectUploadGeometry::new(
+                            absolute_offset,
+                            payload.offset,
+                            payload.length,
+                        );
                         retained
                             .entry(payload.object_id)
-                            .and_modify(|(offset, object_start, end, block_index)| {
-                                if absolute_offset < *offset {
-                                    *offset = absolute_offset;
+                            .and_modify(|(current, block_index)| {
+                                if absolute_offset < current.offset {
                                     *block_index =
                                         block_index_from_offset(absolute_offset, self.block_size);
                                 }
-                                *object_start = (*object_start).min(object_file_offset);
-                                *end = (*end).max(payload_end);
+                                current.include(geometry);
                             })
-                            .or_insert_with(|| {
-                                (
-                                    absolute_offset,
-                                    object_file_offset,
-                                    payload_end,
-                                    block_index_from_offset(absolute_offset, self.block_size),
-                                )
-                            });
+                            .or_insert((
+                                geometry,
+                                block_index_from_offset(absolute_offset, self.block_size),
+                            ));
                     }
                 }
                 Err(error) => {
@@ -1619,14 +1616,18 @@ impl StudioVfs {
 
         let upload_ops: Vec<_> = retained
             .iter()
-            .map(|(object_id, (_, object_file_offset, payload_end, _))| {
+            .map(|(object_id, (geometry, _))| {
+                let payload_len = self
+                    .local_payload_backend
+                    .object_stats(*object_id)
+                    .map(|stats| stats.payload_len);
                 (
                     ino,
-                    *object_file_offset,
-                    *object_file_offset,
+                    geometry.offset,
+                    geometry.contiguous_origin(payload_len),
                     *object_id,
                     content_epoch,
-                    payload_end.saturating_sub(*object_file_offset),
+                    payload_len.unwrap_or(geometry.payload_len),
                 )
             })
             .collect();
@@ -1669,7 +1670,7 @@ impl StudioVfs {
         }
         let live_extents: Vec<_> = retained
             .into_iter()
-            .map(|(object_id, (_, _, _, block_index))| (ino, block_index, object_id, content_epoch))
+            .map(|(object_id, (_, block_index))| (ino, block_index, object_id, content_epoch))
             .collect();
         self.record_live_extents(&live_extents);
         self.cached_store.submit_uploads_batch(&submit_upload_ops);

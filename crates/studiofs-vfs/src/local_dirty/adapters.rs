@@ -193,7 +193,7 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
             submit_ops.push((
                 ino,
                 offset,
-                offset,
+                Some(offset),
                 block.object_id,
                 content_epoch,
                 block.len() as u64,

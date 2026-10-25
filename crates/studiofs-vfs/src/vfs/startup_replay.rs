@@ -2,7 +2,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use super::file_session::FileSessionOperation;
-use super::overlay::{ExtentRecordId, PendingUploadCatalog, PendingUploadKey, pending_upload_key};
+use super::overlay::{
+    ExtentRecordId, ObjectUploadGeometry, PendingUploadCatalog, PendingUploadKey,
+    pending_upload_key,
+};
 use super::{PendingUpload, StudioVfs, VfsResult, ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT};
 use studiofs_cache::local::LocalPayloadLifecycleState;
 use studiofs_meta::MetaError;
@@ -21,7 +24,7 @@ pub(super) struct StartupReplayCoordinator<'a> {
     quarantined_inodes: HashSet<Ino>,
     quarantined_object_ids: HashSet<u64>,
     removed_orphan_dirty_object_ids: HashSet<u64>,
-    replay_ops: Vec<(u64, u64, u64, u64, u64, u64)>,
+    replay_ops: Vec<studiofs_cache::UploadOp>,
     live_extents: HashMap<(Ino, u32), ExtentRecordId>,
     pending_epoch_finalizations: Vec<(Ino, u64)>,
     seen_replay_inodes: HashSet<Ino>,
@@ -43,7 +46,7 @@ struct StartupGraphObject {
     object_id: u64,
     payload_len: u64,
     absolute_offset: u64,
-    object_file_offset: u64,
+    object_file_offset: Option<u64>,
 }
 
 impl<'a> StartupReplayCoordinator<'a> {
@@ -231,19 +234,39 @@ impl<'a> StartupReplayCoordinator<'a> {
             .sync_meta()
             .lookup_regular_file_slices(attr.ino, 0, attr.size)?;
         let mut objects = Vec::new();
+        let mut geometries = HashMap::<u64, ObjectUploadGeometry>::new();
         for span in spans {
             let Some(block) = span.payload else {
                 continue;
             };
             let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
             let absolute_offset = chunk_base.saturating_add(span.range.start as u64);
+            let geometry = ObjectUploadGeometry::new(absolute_offset, block.offset, block.length);
+            geometries
+                .entry(block.object_id)
+                .and_modify(|current| current.include(geometry))
+                .or_insert(geometry);
             objects.push(StartupGraphObject {
                 block_index: block_index_from_offset(absolute_offset, self.vfs.block_size),
                 object_id: block.object_id,
                 payload_len: u64::from(block.offset).saturating_add(u64::from(block.length)),
                 absolute_offset,
-                object_file_offset: absolute_offset.saturating_sub(u64::from(block.offset)),
+                object_file_offset: geometry.object_file_offset,
             });
+        }
+        for (object_id, geometry) in &mut geometries {
+            let payload_len = self
+                .vfs
+                .local_payload_backend
+                .object_stats(*object_id)
+                .map(|stats| stats.payload_len);
+            geometry.object_file_offset = geometry.contiguous_origin(payload_len);
+            geometry.payload_len = payload_len.unwrap_or(geometry.payload_len);
+        }
+        for object in &mut objects {
+            let geometry = &geometries[&object.object_id];
+            object.object_file_offset = geometry.object_file_offset;
+            object.payload_len = geometry.payload_len;
         }
         Ok(objects)
     }

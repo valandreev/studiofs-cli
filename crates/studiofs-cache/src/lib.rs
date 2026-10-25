@@ -29,7 +29,7 @@ pub const DEFAULT_MEMORY_CACHE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 // --- Re-exports ---
 pub use cached_store::{
     CachedStore, CachedStoreConfig, CachedStoreWriterConfig, CachedStoreWriterCountersSnapshot,
-    CachedStoreWriterError, CachedStoreWriterSlice, DetachedStagedSlice, StagedSlice,
+    CachedStoreWriterError, CachedStoreWriterSlice, DetachedStagedSlice, StagedSlice, UploadOp,
     WriterWriteResult,
 };
 pub use runtime::{

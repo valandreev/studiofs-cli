@@ -905,17 +905,18 @@ where
             }));
         }
 
-        if let Some(rebased_epoch) = self
-            .meta
-            .reattach_uploaded_object_if_uncovered(
-                op.ino,
-                op.content_epoch,
-                op.object_id,
-                op.object_file_offset,
-                payload_len,
-                self.block_size,
-            )
-            .await?
+        if let Some(object_file_offset) = op.object_file_offset
+            && let Some(rebased_epoch) = self
+                .meta
+                .reattach_uploaded_object_if_uncovered(
+                    op.ino,
+                    op.content_epoch,
+                    op.object_id,
+                    object_file_offset,
+                    payload_len,
+                    self.block_size,
+                )
+                .await?
         {
             return Ok(Some(UploadedObjectReconcile {
                 keep_local_object: true,
@@ -1023,13 +1024,16 @@ where
             return Ok(self.requeue_stale_upload_at_epoch(op, live_epoch));
         }
 
+        let Some(object_file_offset) = op.object_file_offset else {
+            return Ok(StaleUploadDisposition::Uncovered);
+        };
         let Some(rebased_epoch) = self
             .meta
             .reattach_uploaded_object_if_uncovered(
                 op.ino,
                 op.content_epoch,
                 op.object_id,
-                op.object_file_offset,
+                object_file_offset,
                 op.payload_len,
                 self.block_size,
             )
@@ -3954,7 +3958,7 @@ mod tests {
         PendingUpload {
             ino: 11,
             offset: 0,
-            object_file_offset: 0,
+            object_file_offset: Some(0),
             object_id: 77,
             payload_len: b"hello".len() as u64,
             content_epoch: 3,
@@ -4306,6 +4310,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packed_upload_never_reattaches_a_contiguous_file_range() {
+        let (processor, _coordinator, _local_payloads, meta, _remote, _shutdown, _policy) =
+            processor_fixture();
+        let op = PendingUpload {
+            object_file_offset: None,
+            ..make_pending_upload()
+        };
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch + 1)));
+        *meta.reattach_epoch.lock() = Some(op.content_epoch + 1);
+
+        assert!(
+            processor
+                .reconcile_uploaded_object_metadata(&op, op.payload_len)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            processor
+                .protect_stale_upload_if_covered(&op, None, None)
+                .await
+                .unwrap(),
+            StaleUploadDisposition::Uncovered
+        );
+        assert!(
+            meta.reattached_uploads.lock().is_empty(),
+            "packed bytes have no contiguous file mapping"
+        );
+    }
+
+    #[tokio::test]
     async fn process_upload_requeues_pre_put_stale_content_epoch_when_payload_can_reattach() {
         let (processor, coordinator, local_payloads, meta, _remote, shutdown, _policy) =
             processor_fixture();
@@ -4330,7 +4367,7 @@ mod tests {
                 op.ino,
                 op.content_epoch,
                 op.object_id,
-                op.object_file_offset,
+                op.object_file_offset.unwrap(),
                 op.payload_len,
                 4096
             )]
@@ -5039,7 +5076,7 @@ mod tests {
             processor_fixture();
         let op = PendingUpload {
             offset: 1024,
-            object_file_offset: 1024,
+            object_file_offset: Some(1024),
             ..make_pending_upload()
         };
         let rebased_epoch = op.content_epoch + 1;
@@ -5096,7 +5133,7 @@ mod tests {
         let payload = Bytes::from_static(b"already uploaded retry payload");
         let op = PendingUpload {
             offset: 1024,
-            object_file_offset: 1024,
+            object_file_offset: Some(1024),
             payload_len: payload.len() as u64,
             retry_count: 1,
             ..make_pending_upload()
@@ -5127,7 +5164,7 @@ mod tests {
                 op.ino,
                 op.content_epoch,
                 op.object_id,
-                op.object_file_offset,
+                op.object_file_offset.unwrap(),
                 op.payload_len,
                 4096
             )],
@@ -5152,7 +5189,7 @@ mod tests {
             processor_fixture();
         let op = PendingUpload {
             offset: 1_048_569,
-            object_file_offset: 0,
+            object_file_offset: Some(0),
             payload_len: 1_048_831,
             retry_count: 1,
             ..make_pending_upload()
@@ -5182,7 +5219,7 @@ mod tests {
                 op.ino,
                 op.content_epoch,
                 op.object_id,
-                op.object_file_offset,
+                op.object_file_offset.unwrap(),
                 op.payload_len,
                 4096
             )],
@@ -5586,7 +5623,7 @@ mod tests {
             ready.push_back(PendingUpload {
                 ino,
                 offset: 0,
-                object_file_offset: 0,
+                object_file_offset: Some(0),
                 object_id,
                 payload_len: 0,
                 content_epoch: 1,

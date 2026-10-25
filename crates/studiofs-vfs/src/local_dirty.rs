@@ -1,4 +1,4 @@
-use super::overlay::PendingUploadCatalog;
+use super::overlay::{ObjectUploadGeometry, PendingUploadCatalog};
 use super::*;
 use crate::utils::{IntervalRange, trim_range_to_available_len};
 use crate::{LockTier, OrderedMutex};
@@ -1325,7 +1325,8 @@ impl<'a> LocalDirtyFlushSession<'a> {
             return Err(VfsError::WouldBlock);
         }
 
-        let mut upload_ops_by_object = std::collections::BTreeMap::<u64, (u64, u64, u64)>::new();
+        let mut upload_ops_by_object =
+            std::collections::BTreeMap::<u64, ObjectUploadGeometry>::new();
         for (chunk_id, slices) in &pending_slices {
             let chunk_start = studiofs_meta::schema::chunk_start_offset(
                 studiofs_meta::schema::ChunkId(*chunk_id),
@@ -1336,28 +1337,29 @@ impl<'a> LocalDirtyFlushSession<'a> {
                     continue;
                 };
                 let file_offset = chunk_start.saturating_add(slice.range.start as u64);
-                let object_file_offset = file_offset.saturating_sub(u64::from(slice.object_offset));
-                let payload_end = file_offset.saturating_add(slice.len() as u64);
+                let geometry =
+                    ObjectUploadGeometry::new(file_offset, slice.object_offset, slice.range.len());
                 upload_ops_by_object
                     .entry(object_id)
-                    .and_modify(|(offset, start, end)| {
-                        *offset = (*offset).min(file_offset);
-                        *start = (*start).min(object_file_offset);
-                        *end = (*end).max(payload_end);
-                    })
-                    .or_insert((file_offset, object_file_offset, payload_end));
+                    .and_modify(|current| current.include(geometry))
+                    .or_insert(geometry);
             }
         }
         let upload_ops: Vec<_> = upload_ops_by_object
             .iter()
-            .map(|(object_id, (offset, object_file_offset, payload_end))| {
+            .map(|(object_id, geometry)| {
+                let payload_len = self
+                    .vfs
+                    .local_payload_backend
+                    .object_stats(*object_id)
+                    .map(|stats| stats.payload_len);
                 (
                     self.ino,
-                    *offset,
-                    *object_file_offset,
+                    geometry.offset,
+                    geometry.contiguous_origin(payload_len),
                     *object_id,
                     content_epoch,
-                    payload_end.saturating_sub(*object_file_offset),
+                    payload_len.unwrap_or(geometry.payload_len),
                 )
             })
             .collect();
