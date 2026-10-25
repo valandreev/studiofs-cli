@@ -1,8 +1,9 @@
 //! Owns local event replication backlog claims and flush completion.
 
+use super::remote_apply::HiddenWindowProjection;
 use super::{
-    ClaimedPendingBatch, LocalEventRange, PendingMutationHint, PendingReplicationState,
-    PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
+    ClaimedPendingBatch, LocalEventRange, PendingHiddenWindow, PendingMutationHint,
+    PendingReplicationState, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
 };
 use crate::engine::{MetaError, MetaInodes, MetaNamespace, MetaResult};
 use crate::events::MetaEvent;
@@ -742,6 +743,9 @@ impl PgMetaEngine {
             state.event_end = state.event_end.max(after_seq);
             return Ok(false);
         }
+        if self.extend_hidden_pending_window(&mut state, before_seq, after_seq, now)? {
+            return Ok(false);
+        }
         if state.ops > 0 && state.event_start.is_some() && before_seq >= state.event_end {
             // A local-only suffix cannot change the already projected remote
             // operation count. Keep it in the range so a later flush can
@@ -778,6 +782,9 @@ impl PgMetaEngine {
                 if state.started_at.is_none() {
                     state.started_at = Some(now);
                 }
+                if state.event_end == after_seq {
+                    self.cache_hidden_pending_window(event_start, after_seq, &events);
+                }
                 return Ok(false);
             }
             if state.ops == 0 {
@@ -808,6 +815,63 @@ impl PgMetaEngine {
         state.event_end = state.event_end.max(after_seq);
         state.force_flush = projected.needs_eager_flush || state.ops >= self.flush_ops_threshold;
         Ok(projected.needs_eager_flush)
+    }
+
+    /// Extends a pending window that projects no remote-visible operation by
+    /// the mutation `[before_seq, after_seq)` without decoding the window again.
+    ///
+    /// A window kept only for local serving replay is never claimed for a
+    /// flush, so it grows for as long as an unpublished file keeps changing.
+    /// Re-projecting it on every mutation is quadratic in that history. The
+    /// cached window projection decides from the mutation's own events
+    /// whether the window stays invisible; any other case returns `false` and
+    /// the caller re-projects the whole window.
+    fn extend_hidden_pending_window(
+        &self,
+        state: &mut PendingReplicationState,
+        before_seq: u64,
+        after_seq: u64,
+        now: Instant,
+    ) -> MetaResult<bool> {
+        let Some(event_start) = state.event_start else {
+            return Ok(false);
+        };
+        if state.ops != 0 || before_seq != state.event_end {
+            return Ok(false);
+        }
+        let mut cached = self
+            .pending_hidden_window
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending window lock poisoned".to_string()))?;
+        let Some(window) = cached
+            .as_mut()
+            .filter(|window| window.event_start == event_start && window.event_end == before_seq)
+        else {
+            return Ok(false);
+        };
+        let suffix = self.local.read_events_range(before_seq, after_seq)?;
+        let complete = u64::try_from(suffix.len()).ok() == Some(after_seq - before_seq);
+        if !complete || !window.projection.extend_if_suffix_stays_hidden(&suffix) {
+            *cached = None;
+            return Ok(false);
+        }
+        window.event_end = after_seq;
+        state.event_end = after_seq;
+        state.last_mutation_at = Some(now);
+        if state.started_at.is_none() {
+            state.started_at = Some(now);
+        }
+        Ok(true)
+    }
+
+    fn cache_hidden_pending_window(&self, event_start: u64, event_end: u64, events: &[MetaEvent]) {
+        if let Ok(mut cached) = self.pending_hidden_window.lock() {
+            *cached = Some(PendingHiddenWindow {
+                event_start,
+                event_end,
+                projection: HiddenWindowProjection::from_events(events),
+            });
+        }
     }
 
     pub(super) fn request_pending_flush(&self) {

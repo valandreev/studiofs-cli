@@ -3774,3 +3774,78 @@ fn hidden_flush_tail_is_republished_in_next_batch_and_acknowledged_after_remount
     );
     reopened.prepare_for_close().expect("close reopened writer");
 }
+
+#[test]
+fn hidden_pending_window_grows_without_reprojecting_unpublished_overlay_history() {
+    use crate::engine::MetaEngine;
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+    use crate::schema::{
+        ChunkId, PayloadRef, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord,
+    };
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let mut attr = pg
+        .create_file(ROOT_INO, b"hidden-window.bin", 0, 0, 0o644)
+        .expect("create unpublished file");
+    attr.content_epoch = 1;
+    let window_start = pg
+        .pending_state
+        .lock()
+        .expect("pending state")
+        .event_start
+        .expect("create keeps a local-only window");
+
+    let mut work_per_round = Vec::new();
+    for round in 0..32u32 {
+        let start = round * 4096;
+        let object_id = 97_000 + u64::from(round);
+        attr.size = u64::from(start + 4096);
+        let slice = SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range: SliceRange::new(start, start + 4096).expect("slice range"),
+            payload: Some(PayloadRef::new_partial(object_id, 4096)),
+            payload_state: PayloadRefState::LocalOnly,
+        };
+        LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+        pg.flush_regular_file_overlay_slices_with_attr(
+            attr.ino,
+            &[(ChunkId(0), vec![slice])],
+            Some(&attr),
+        )
+        .expect("flush random-write overlay");
+        assert!(
+            pg.mark_regular_file_overlay_object_uploaded_if_matches(attr.ino, 1, object_id)
+                .expect("mark uploaded")
+        );
+        work_per_round.push(LOCAL_PROJECTION_WORK.with(std::cell::Cell::get));
+    }
+
+    let after_seq = pg.local.get_counter(NEXT_EVENT_SEQ).expect("after seq");
+    {
+        let state = pg.pending_state.lock().expect("pending state");
+        assert_eq!(
+            state.ops, 0,
+            "an unpublished file has no remote-visible work"
+        );
+        assert_eq!(state.event_start, Some(window_start));
+        assert_eq!(
+            state.event_end, after_seq,
+            "the window must keep every event"
+        );
+    }
+    let first = work_per_round[1];
+    let last = *work_per_round.last().expect("rounds ran");
+    assert!(
+        last <= first,
+        "each mutation must cost the same projection work however long the hidden window \
+         grows: {work_per_round:?}"
+    );
+
+    pg.create_dir(ROOT_INO, b"visible-after-hidden-window", 0, 0, 0o755)
+        .expect("create visible directory");
+    assert!(
+        pg.pending_state.lock().expect("pending state").ops > 0,
+        "a remote-visible mutation after the hidden window must still be counted"
+    );
+}
