@@ -23,6 +23,17 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static PENDING_SERVING_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts non-empty pending-log serving replays on this thread.
+#[cfg(test)]
+pub(crate) fn take_pending_serving_replays() -> usize {
+    PENDING_SERVING_REPLAYS.with(|count| count.replace(0))
+}
+
 /// Counts full local-journal reductions for dentry removal state on this thread.
 #[cfg(test)]
 pub(crate) fn take_local_dentry_journal_scans() -> usize {
@@ -1510,6 +1521,8 @@ impl RedbMetaEngine {
         if events.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        PENDING_SERVING_REPLAYS.with(|count| count.set(count.get() + 1));
 
         let txn = self.begin_write_txn()?;
         let live_events = {

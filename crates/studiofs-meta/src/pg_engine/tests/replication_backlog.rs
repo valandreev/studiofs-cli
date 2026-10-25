@@ -2616,6 +2616,40 @@ fn permanent_event_size_error_does_not_restore_claimed_pending_batch() {
 }
 
 #[test]
+fn flush_path_pending_restore_recomputes_counters_without_serving_replay() {
+    let (_dir, mut pg) = temp_pg_engine_for_unit();
+    pg.remote_format_validated.store(true, Ordering::Release);
+    pg.sync_max_response_bytes_per_page = 1;
+
+    pg.create_dir(ROOT_INO, b"still-pending", 0, 0, 0o755)
+        .expect("create independent pending event");
+    pg.set_xattr(ROOT_INO, b"user.sfs890.oversized", &[b'x'; 128], 0)
+        .expect("create oversized pending event");
+    let claimed = pg
+        .claim_pending_batch(true)
+        .expect("oversized event should be claimable");
+    crate::redb_engine::take_pending_serving_replays();
+
+    // Nothing rewrote serving state since the mutations: the flush only
+    // rejects and re-selects local journal ranges.
+    assert!(matches!(
+        pg.flush_pending_claimed_batch_with_restore(claimed),
+        Err(MetaError::EventTooLarge { .. })
+    ));
+    assert_eq!(crate::redb_engine::take_pending_serving_replays(), 0);
+    assert!(
+        pg.replication_backlog().pending_ops > 0,
+        "the independent directory create must stay pending"
+    );
+    assert!(pg.lookup(ROOT_INO, b"still-pending").is_ok());
+
+    // Replaying after a serving rewrite still runs.
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending local log");
+    assert!(crate::redb_engine::take_pending_serving_replays() > 0);
+}
+
+#[test]
 fn oversized_event_rejects_only_its_sequence_and_restores_independent_events() {
     let (_dir, mut pg) = temp_pg_engine_for_unit();
     pg.remote_format_validated.store(true, Ordering::Release);

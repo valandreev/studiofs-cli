@@ -1292,6 +1292,8 @@ mod payload_objects;
 mod recovery;
 mod replication;
 pub(crate) use replication::LocalDentryRemovals;
+#[cfg(test)]
+pub(crate) use replication::take_pending_serving_replays;
 mod snapshots;
 mod symlink;
 mod txn;
