@@ -330,6 +330,16 @@ impl MetaPayloadObjects for PgMetaEngine {
             .has_regular_file_overlay_object_if_matches(ino, expected_epoch, object_id)
     }
 
+    fn regular_file_overlay_objects_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> MetaResult<Vec<u64>> {
+        self.local
+            .regular_file_overlay_objects_if_match(ino, expected_epoch, object_ids)
+    }
+
     fn mark_regular_file_overlay_object_uploaded_if_matches(
         &self,
         ino: Ino,

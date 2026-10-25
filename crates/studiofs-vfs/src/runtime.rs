@@ -505,12 +505,28 @@ impl<M: ?Sized + MetaPayloadObjects> MetaPayloadObjects for RuntimeMetaHandle<M>
         ) -> MetaResult<bool>
     );
     forward_method!(
+        fn regular_file_overlay_objects_if_match(
+            &self,
+            ino: Ino,
+            expected_epoch: u64,
+            object_ids: &[u64],
+        ) -> MetaResult<Vec<u64>>
+    );
+    forward_method!(
         fn mark_regular_file_overlay_object_uploaded_if_matches(
             &self,
             ino: Ino,
             expected_epoch: u64,
             object_id: u64,
         ) -> MetaResult<bool>
+    );
+    forward_method!(
+        fn mark_regular_file_overlay_objects_uploaded_if_match(
+            &self,
+            ino: Ino,
+            expected_epoch: u64,
+            object_ids: &[u64],
+        ) -> MetaResult<Vec<u64>>
     );
     forward_method!(
         fn publish_regular_file_overlay_to_base_if_matches_batch(
@@ -1038,6 +1054,63 @@ mod tests {
 
         assert_eq!(diagnostics.compaction_attempts, 1);
         assert_eq!(diagnostics.last_compaction_result, Some(outcome));
+    }
+
+    #[test]
+    fn runtime_meta_handle_forwards_batched_overlay_upload_marks() {
+        use studiofs_meta::schema::{
+            ChunkId, PayloadRef, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord,
+        };
+        use studiofs_meta::types::ROOT_INO;
+        use studiofs_meta::{MetaEngine, MetaEvent, MetaFsOps};
+
+        let temp = studiofs_test_support::workspace_target_tempdir("runtime-meta-upload-batch-");
+        let engine = Arc::new(RedbMetaEngine::open(temp.path().join("meta.redb")).expect("redb"));
+        engine.init_root(0, 0).expect("init root");
+        let mut attr = engine
+            .create_file(ROOT_INO, b"batched-upload-marks.bin", 0, 0, 0o644)
+            .expect("create file");
+        attr.content_epoch = 7;
+        attr.size = 8192;
+        let slices = [(0, 4096, 81_001), (4096, 8192, 81_002)]
+            .into_iter()
+            .map(|(start, end, object_id)| SliceRecord {
+                slice_id: SliceId::default(),
+                order: SliceOrder::default(),
+                range: SliceRange::new(start, end).expect("slice range"),
+                payload: Some(PayloadRef::new_partial(object_id, 4096)),
+                payload_state: PayloadRefState::LocalOnly,
+            })
+            .collect();
+        engine
+            .flush_regular_file_overlay_slices_with_attr(
+                attr.ino,
+                &[(ChunkId(0), slices)],
+                Some(&attr),
+            )
+            .expect("flush overlay");
+        let overlay_events = || {
+            engine
+                .read_events_range(0, u64::MAX)
+                .expect("read event log")
+                .into_iter()
+                .filter(|event| {
+                    matches!(event, MetaEvent::SetRegularFileOverlaySlices { ino, .. } if *ino == attr.ino)
+                })
+                .count()
+        };
+        let before = overlay_events();
+
+        let marked = into_vfs_meta(Arc::clone(&engine))
+            .mark_regular_file_overlay_objects_uploaded_if_match(attr.ino, 7, &[81_001, 81_002])
+            .expect("batch mark uploaded");
+
+        assert_eq!(marked, vec![81_001, 81_002]);
+        assert_eq!(
+            overlay_events() - before,
+            1,
+            "one batch must mark both objects in one metadata transaction"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

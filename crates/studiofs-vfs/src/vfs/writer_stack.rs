@@ -1026,6 +1026,7 @@ impl MountedWriterStack {
         let Some(file) = file else {
             return;
         };
+        let object_ids: HashSet<u64> = object_ids.iter().copied().collect();
         {
             let mut file = file.lock();
             for chunk in file.chunks.values_mut() {
@@ -1144,6 +1145,7 @@ impl MountedWriterStack {
         let Some(file) = file else {
             return;
         };
+        let object_ids: HashSet<u64> = object_ids.iter().copied().collect();
         {
             let mut file = file.lock();
             for chunk in file.chunks.values_mut() {

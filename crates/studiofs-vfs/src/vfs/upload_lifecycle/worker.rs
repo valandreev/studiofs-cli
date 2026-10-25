@@ -301,6 +301,23 @@ trait UploadMetaPort: Clone + Send + Sync + 'static {
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool>;
+    async fn regular_file_overlay_objects_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> VfsResult<Vec<u64>> {
+        let mut referenced = Vec::new();
+        for &object_id in object_ids {
+            if self
+                .has_regular_file_overlay_object_if_matches(ino, expected_epoch, object_id)
+                .await?
+            {
+                referenced.push(object_id);
+            }
+        }
+        Ok(referenced)
+    }
     async fn mark_regular_file_overlay_object_uploaded_if_matches(
         &self,
         ino: Ino,
@@ -854,18 +871,16 @@ where
         op: &PendingUpload,
         payload_len: u64,
     ) -> VfsResult<Option<UploadedObjectReconcile>> {
+        // Marking reports whether the object is still referenced at that
+        // epoch, so a separate presence check would only repeat the scan.
         if self
             .meta
-            .has_regular_file_overlay_object_if_matches(op.ino, op.content_epoch, op.object_id)
+            .mark_regular_file_overlay_object_uploaded_if_matches(
+                op.ino,
+                op.content_epoch,
+                op.object_id,
+            )
             .await?
-            && self
-                .meta
-                .mark_regular_file_overlay_object_uploaded_if_matches(
-                    op.ino,
-                    op.content_epoch,
-                    op.object_id,
-                )
-                .await?
         {
             return Ok(Some(UploadedObjectReconcile {
                 keep_local_object: true,
@@ -875,14 +890,6 @@ where
 
         if let Some(latest_attr) = self.meta.get_attr(op.ino).await?
             && latest_attr.content_epoch != op.content_epoch
-            && self
-                .meta
-                .has_regular_file_overlay_object_if_matches(
-                    op.ino,
-                    latest_attr.content_epoch,
-                    op.object_id,
-                )
-                .await?
             && self
                 .meta
                 .mark_regular_file_overlay_object_uploaded_if_matches(
@@ -1374,22 +1381,91 @@ impl Drop for UploadCompletionDrainGuard<'_> {
     }
 }
 
+/// Per-object overlay queries that concurrent upload workers coalesce into one
+/// metadata call per `(ino, expected_epoch)`, so a fragmented file costs one
+/// overlay scan per batch instead of one per object.
+#[derive(Clone, Copy)]
+enum OverlayObjectBatchKind {
+    /// Pre-PUT check that the object is still referenced (read-only).
+    Presence,
+    /// Post-PUT upload completion (write transaction).
+    Completion,
+}
+
+impl OverlayObjectBatchKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Presence => "upload presence",
+            Self::Completion => "upload completion",
+        }
+    }
+}
+
 impl VfsUploadMetaPort {
-    async fn drain_upload_completion_batch(&self) {
+    fn overlay_object_batch(
+        &self,
+        kind: OverlayObjectBatchKind,
+    ) -> (
+        &tokio::sync::Mutex<super::super::UploadCompletionBatch>,
+        &std::sync::atomic::AtomicBool,
+    ) {
+        let upload = &self.vfs.state.upload;
+        match kind {
+            OverlayObjectBatchKind::Presence => (
+                &upload.overlay_presence_batch,
+                &upload.overlay_presence_draining,
+            ),
+            OverlayObjectBatchKind::Completion => (
+                &upload.upload_completion_batch,
+                &upload.upload_completion_draining,
+            ),
+        }
+    }
+
+    /// Queues one object; the first caller to find the batch idle drains it.
+    async fn run_overlay_object_batched(
+        &self,
+        kind: OverlayObjectBatchKind,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> VfsResult<bool> {
+        let (batch, draining) = self.overlay_object_batch(kind);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let should_drain = {
+            let mut batch = batch.lock().await;
+            batch
+                .pending
+                .push(super::super::UploadCompletionBatchEntry {
+                    ino,
+                    expected_epoch,
+                    object_id,
+                    result_tx,
+                });
+            draining
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        };
+        if should_drain {
+            self.drain_overlay_object_batch(kind).await;
+        }
+        result_rx
+            .await
+            .map_err(|_| VfsError::Other(format!("{} batch result was dropped", kind.label())))?
+    }
+
+    async fn drain_overlay_object_batch(&self, kind: OverlayObjectBatchKind) {
+        let (batch, draining) = self.overlay_object_batch(kind);
         let mut guard = UploadCompletionDrainGuard {
-            draining: &self.vfs.state.upload.upload_completion_draining,
+            draining,
             armed: true,
         };
         loop {
             tokio::task::yield_now().await;
             let entries = {
-                let mut batch = self.vfs.state.upload.upload_completion_batch.lock().await;
+                let mut batch = batch.lock().await;
                 if batch.pending.is_empty() {
-                    self.vfs
-                        .state
-                        .upload
-                        .upload_completion_draining
-                        .store(false, Ordering::Release);
+                    draining.store(false, Ordering::Release);
                     guard.disarm();
                     return;
                 }
@@ -1407,18 +1483,25 @@ impl VfsUploadMetaPort {
 
             for ((ino, expected_epoch), entries) in groups {
                 let object_ids: Vec<u64> = entries.iter().map(|entry| entry.object_id).collect();
-                match self
-                    .mark_regular_file_overlay_objects_uploaded_if_match(
-                        ino,
-                        expected_epoch,
-                        &object_ids,
-                    )
-                    .await
-                {
-                    Ok(marked) => {
-                        let marked: HashSet<u64> = marked.into_iter().collect();
+                let result = match kind {
+                    OverlayObjectBatchKind::Presence => {
+                        self.regular_file_overlay_objects_if_match(ino, expected_epoch, &object_ids)
+                            .await
+                    }
+                    OverlayObjectBatchKind::Completion => {
+                        self.mark_regular_file_overlay_objects_uploaded_if_match(
+                            ino,
+                            expected_epoch,
+                            &object_ids,
+                        )
+                        .await
+                    }
+                };
+                match result {
+                    Ok(matched) => {
+                        let matched: HashSet<u64> = matched.into_iter().collect();
                         for entry in entries {
-                            let _ = entry.result_tx.send(Ok(marked.contains(&entry.object_id)));
+                            let _ = entry.result_tx.send(Ok(matched.contains(&entry.object_id)));
                         }
                     }
                     Err(error) => {
@@ -1449,9 +1532,28 @@ impl UploadMetaPort for VfsUploadMetaPort {
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool> {
+        self.run_overlay_object_batched(
+            OverlayObjectBatchKind::Presence,
+            ino,
+            expected_epoch,
+            object_id,
+        )
+        .await
+    }
+
+    async fn regular_file_overlay_objects_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> VfsResult<Vec<u64>> {
+        if object_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let meta = self.vfs.meta.clone();
+        let object_ids = object_ids.to_vec();
         run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.has_regular_file_overlay_object_if_matches(ino, expected_epoch, object_id)
+            engine.regular_file_overlay_objects_if_match(ino, expected_epoch, &object_ids)
         })
         .await
     }
@@ -1462,31 +1564,13 @@ impl UploadMetaPort for VfsUploadMetaPort {
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool> {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let should_drain = {
-            let mut batch = self.vfs.state.upload.upload_completion_batch.lock().await;
-            batch
-                .pending
-                .push(super::super::UploadCompletionBatchEntry {
-                    ino,
-                    expected_epoch,
-                    object_id,
-                    result_tx,
-                });
-            self.vfs
-                .state
-                .upload
-                .upload_completion_draining
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        };
-        if should_drain {
-            let port = self.clone();
-            port.drain_upload_completion_batch().await;
-        }
-        result_rx.await.map_err(|_| {
-            VfsError::Other("upload completion batch result was dropped".to_string())
-        })?
+        self.run_overlay_object_batched(
+            OverlayObjectBatchKind::Completion,
+            ino,
+            expected_epoch,
+            object_id,
+        )
+        .await
     }
 
     async fn mark_regular_file_overlay_objects_uploaded_if_match(
@@ -3038,6 +3122,7 @@ mod tests {
         trace: FakeUploadTrace,
         attrs: Arc<Mutex<HashMap<Ino, Option<InodeAttr>>>>,
         overlay_objects: Arc<Mutex<HashMap<Ino, HashSet<u64>>>>,
+        presence_checks: Arc<AtomicUsize>,
         pending_deletions: Arc<Mutex<Vec<u64>>>,
         uploaded_overlay_objects: Arc<Mutex<Vec<UploadedOverlayObjectRecord>>>,
         reattached_uploads: Arc<Mutex<Vec<ReattachedUploadRecord>>>,
@@ -3051,6 +3136,7 @@ mod tests {
                 trace: FakeUploadTrace::default(),
                 attrs: Arc::new(Mutex::new(HashMap::new())),
                 overlay_objects: Arc::new(Mutex::new(HashMap::new())),
+                presence_checks: Arc::new(AtomicUsize::new(0)),
                 pending_deletions: Arc::new(Mutex::new(Vec::new())),
                 uploaded_overlay_objects: Arc::new(Mutex::new(Vec::new())),
                 reattached_uploads: Arc::new(Mutex::new(Vec::new())),
@@ -3071,6 +3157,7 @@ mod tests {
             expected_epoch: u64,
             object_id: u64,
         ) -> VfsResult<bool> {
+            self.presence_checks.fetch_add(1, Ordering::Relaxed);
             let epoch_matches = self
                 .attrs
                 .lock()
@@ -4842,6 +4929,11 @@ mod tests {
             meta.uploaded_overlay_objects.lock().as_slice(),
             &[(11, 3, 77)],
             "fragmented overlay upload should persist progress against the referenced object id"
+        );
+        assert_eq!(
+            meta.presence_checks.load(Ordering::Relaxed),
+            1,
+            "only the pre-PUT check scans the overlay; the completion mark reports presence itself"
         );
         assert!(
             meta.pending_deletions.lock().is_empty(),
