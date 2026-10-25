@@ -77,8 +77,8 @@ impl MountCommand {
 #[command(about = "Mount a filesystem volume as a local drive")]
 #[command(long_about = "\
 Mount a previously initialized volume. On Windows, the mount point is a drive \
-letter (e.g. Z:). On macOS, it is an existing directory path. Linux mount is \
-currently unsupported.
+letter (e.g. Z:). On macOS and Linux, it is an existing directory path. Linux \
+mounts use libfuse3 and require `fusermount3` (and /dev/fuse) to be available.
 
 The local client uses its cached metadata database while synchronizing shared \
 state through PostgreSQL. Same-mount reads observe accepted writes \
@@ -97,6 +97,9 @@ EXAMPLES:
     studiofs mount myvolume Z:
 
   Basic mount (macOS):
+    studiofs mount myvolume /Volumes/studio
+
+  Basic mount (Linux):
     studiofs mount myvolume /mnt/studio
 
   Local data cache mount (location + size):
