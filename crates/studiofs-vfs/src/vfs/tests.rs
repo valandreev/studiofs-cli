@@ -1964,6 +1964,30 @@ async fn fetch_warmup_shutdown_cancels_in_flight_probe() {
 }
 
 #[test]
+fn janitor_is_owned_by_non_aborting_shutdown_cleanup() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("janitor-shutdown-owner");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "janitor-shutdown-owner");
+
+    rt.block_on(async {
+        vfs.spawn_janitor_worker();
+        tokio::task::yield_now().await;
+        assert!(vfs.state.shutdown.background_tasks.lock().is_empty());
+        assert_eq!(vfs.state.shutdown.background_cleanup_tasks.lock().len(), 1);
+
+        vfs.shutdown(Duration::ZERO)
+            .await
+            .expect("shutdown should wait for the janitor to stop");
+        assert!(
+            vfs.state
+                .shutdown
+                .background_cleanup_tasks
+                .lock()
+                .is_empty()
+        );
+    });
+}
+
+#[test]
 fn rmdir_waits_for_inflight_child_unlink_before_reporting_not_empty() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-inflight-child-unlink");
