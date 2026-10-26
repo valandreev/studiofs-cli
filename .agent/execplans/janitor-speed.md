@@ -14,6 +14,7 @@ The background janitor removes old objects that are no longer referenced by file
 - [x] (2026-10-27) A point `stat` after deletion returned false for the checked object(s); this is a spot check, not proof for every deletion.
 - [x] (2026-10-27) Final focused validation reported successful: release build, `cargo check -p studiofs-vfs`, strict Clippy, formatting, diff check, `janitor_*` tests (4/4), and `reconciliation_finishes` tests (2/2).
 - [x] (2026-10-27) Final mount run at pool 16, grace 60 seconds, interval 10 seconds, and cap 1,000 completed its first cycle in 33,984 ms: 1,000 deleted, 0 deletion errors, 256 reconciliation claims retryable, 0 confirmed.
+- [x] (2026-10-27) Review cleanup: the cycle body moved into `run_janitor_cycle`, so the global janitor lock is released at one site after every completion, error, and shutdown path; reconciliation finishes group claims by object ID instead of scanning a pending queue; the listing loop uses one guarded `select!`. Queue structure, cumulative timing fields, and the queue/ordering tests are retained because they carry the cap, drain, and same-object ordering invariants above.
 - [ ] Diagnose why the final cycle marked all 256 upload-reconciliation claims retryable and confirmed none; the supplied run summary does not include a cause.
 - [ ] A controlled same-set comparison remains outstanding. The full workspace suite was not run, in accordance with the repository instruction to leave it to the user.
 

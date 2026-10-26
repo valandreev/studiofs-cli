@@ -1,8 +1,9 @@
 use futures::StreamExt;
 use opendal::ErrorKind;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::future::Future;
-use std::ops::Deref;
+use std::ops::{ControlFlow, Deref};
 use std::sync::Arc;
 use studiofs_meta::engine::{
     LocalStorageCompactionResult, LocalStorageDiagnostics, MetadataCoherenceProgress,
@@ -32,6 +33,10 @@ struct JanitorObjectDeletionTimings {
     finish: Duration,
 }
 
+fn elapsed_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn janitor_object_delete_keys(
     data_prefix: &str,
     object_id: u64,
@@ -45,65 +50,45 @@ fn janitor_object_delete_keys(
     Some(std::iter::once(legacy_key).chain(fragment_keys).collect())
 }
 
-async fn finish_janitor_reconciliation_claims<I, F, Fut, E, K, KeyFn>(
-    pending: I,
+/// Finishes claims sequentially per key and concurrently across keys. Returns
+/// `(attempted, errors, unfinished)`; after shutdown no further finish starts,
+/// and unstarted claims keep their reconciliation lease for retry after expiry.
+async fn finish_janitor_reconciliation_claims<T, K, Fut, E>(
+    pending: impl IntoIterator<Item = T>,
     shutdown: &CancellationToken,
     max_concurrency: usize,
-    key_for: KeyFn,
-    mut finish: F,
+    key_for: impl Fn(&T) -> K,
+    finish: impl Fn(T) -> Fut,
 ) -> (usize, usize, usize)
 where
-    I: Iterator,
-    F: FnMut(I::Item) -> Fut,
-    Fut: Future<Output = Option<Result<(), E>>>,
-    K: Copy + Eq + std::hash::Hash,
-    KeyFn: Fn(&I::Item) -> K,
+    K: Ord,
+    Fut: Future<Output = Result<(), E>>,
 {
-    let mut pending: std::collections::VecDeque<_> = pending.collect();
-    let mut in_flight = futures::stream::FuturesUnordered::new();
-    let mut active_keys = std::collections::HashSet::new();
-    let mut attempted = 0;
-    let mut errors = 0;
-    let mut unfinished = 0;
-    loop {
-        while !shutdown.is_cancelled() && in_flight.len() < max_concurrency {
-            let Some(index) = pending
-                .iter()
-                .position(|claim| !active_keys.contains(&key_for(claim)))
-            else {
-                break;
-            };
-            let Some(claim) = pending.remove(index) else {
-                break;
-            };
-            let key = key_for(&claim);
-            active_keys.insert(key);
-            let future = finish(claim);
-            in_flight.push(async move { (key, future.await) });
-        }
-        if in_flight.is_empty() {
-            // Already admitted DB finishes are drained above; unadmitted claims
-            // keep their reconciliation lease and can be retried after expiry.
-            unfinished += pending.len();
-            return (attempted, errors, unfinished);
-        }
-        match in_flight.next().await {
-            Some((key, Some(Ok(())))) => {
-                active_keys.remove(&key);
-                attempted += 1;
-            }
-            Some((key, Some(Err(_)))) => {
-                active_keys.remove(&key);
-                attempted += 1;
-                errors += 1;
-            }
-            Some((key, None)) => {
-                active_keys.remove(&key);
-                unfinished += 1;
-            }
-            None => {}
-        }
+    let mut groups: BTreeMap<K, Vec<T>> = BTreeMap::new();
+    for claim in pending {
+        groups.entry(key_for(&claim)).or_default().push(claim);
     }
+    let finish = &finish;
+    futures::stream::iter(groups.into_values())
+        .map(|group| async move {
+            let (mut attempted, mut errors) = (0, 0);
+            let total = group.len();
+            for claim in group {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                attempted += 1;
+                if finish(claim).await.is_err() {
+                    errors += 1;
+                }
+            }
+            (attempted, errors, total - attempted)
+        })
+        .buffer_unordered(max_concurrency)
+        .fold((0, 0, 0), |(a, e, u), (ga, ge, gu)| async move {
+            (a + ga, e + ge, u + gu)
+        })
+        .await
 }
 
 struct JanitorDeletionQueue<Fut> {
@@ -3002,19 +2987,12 @@ impl StudioVfs {
         (result, timings)
     }
 
-    async fn stop_janitor_cycle_if_shutdown(&self, cycle: u64) -> bool {
-        if !self.state.shutdown.background_shutdown_token.is_cancelled() {
-            return false;
+    fn janitor_shutdown_gate(&self) -> ControlFlow<()> {
+        if self.state.shutdown.background_shutdown_token.is_cancelled() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
-        let meta = self.meta.clone();
-        if let Err(error) = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.release_global_janitor_lock()
-        })
-        .await
-        {
-            warn!(cycle, error = %error, "janitor failed to release lock during shutdown");
-        }
-        true
     }
 
     pub(super) async fn background_janitor(self: Arc<Self>) {
@@ -3054,585 +3032,11 @@ impl StudioVfs {
                 debug!(cycle, "janitor cycle skipped: PG lock not acquired");
                 continue;
             }
-            let cycle_started = Instant::now();
-            if self.stop_janitor_cycle_if_shutdown(cycle).await {
-                break;
-            }
 
-            let meta = self.meta.clone();
-            let mut global_snapshot_pins = match run_meta_maintenance(
-                meta,
-                move |engine: Arc<dyn VfsMeta>| engine.get_global_snapshot_pins(),
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    let meta = self.meta.clone();
-                    let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                        engine.release_global_janitor_lock()
-                    })
-                    .await;
-                    warn!(cycle, error = %e, "janitor cycle skipped: snapshot pin query failed");
-                    continue;
-                }
-            };
-
-            if self.stop_janitor_cycle_if_shutdown(cycle).await {
-                break;
-            }
-            let meta = self.meta.clone();
-            let reconciliation_owner = format!("janitor-{cycle}");
-            let claim_owner = reconciliation_owner.clone();
-            let reconciliation_claims_started = Instant::now();
-            debug!(
-                cycle,
-                phase = "reconciliation_claims",
-                "janitor phase started"
-            );
-            let reconciliation_claims = match run_meta_maintenance(
-                meta,
-                move |engine: Arc<dyn VfsMeta>| {
-                    engine.claim_uploaded_fragment_reconciliation(&claim_owner)
-                },
-            )
-            .await
-            {
-                Ok(claims) => claims,
-                Err(e) => {
-                    let meta = self.meta.clone();
-                    let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                        engine.release_global_janitor_lock()
-                    })
-                    .await;
-                    warn!(cycle, error = %e, "janitor cycle skipped: upload reconciliation claim failed");
-                    continue;
-                }
-            };
-            let reconciliation_claim_count = reconciliation_claims.len();
-            debug!(
-                cycle,
-                claims = reconciliation_claim_count,
-                elapsed_ms = reconciliation_claims_started.elapsed().as_millis() as u64,
-                "janitor reconciliation claims loaded"
-            );
-            for claim in &reconciliation_claims {
-                global_snapshot_pins.insert(claim.entry.object_id);
-            }
-            let reconciliation_shutdown = self.state.shutdown.background_shutdown_token.clone();
-            let reconciliation_data_store = self.fetch_scheduler.data_store().clone();
-            let reconciliation_proof_started = Instant::now();
-            debug!(
-                cycle,
-                phase = "reconciliation_proof",
-                "janitor phase started"
-            );
-            let reconciliation_outcomes = futures::stream::iter(
-                reconciliation_claims.into_iter().map(|claim| {
-                    let shutdown = reconciliation_shutdown.clone();
-                    let data_store = reconciliation_data_store.clone();
-                    async move {
-                        let proof = run_with_timeout_or_cancel(
-                            &shutdown,
-                            REMOTE_OBJECT_IO_TIMEOUT,
-                            data_store.get_payload_by_key_with_stats(&claim.entry.object_key),
-                        )
-                        .await;
-                        let outcome = match proof {
-                            TimeoutOrCancel::Completed(Ok((remote_payload, _))) => {
-                                let remote_bytes = remote_payload.to_bytes();
-                                let remote_sha256: [u8; 32] = Sha256::digest(&remote_bytes).into();
-                                if remote_bytes.len() as u64 == claim.entry.expected_byte_length
-                                    && remote_sha256 == claim.entry.expected_sha256
-                                {
-                                    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed
-                                } else {
-                                    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
-                                }
-                            }
-                            TimeoutOrCancel::Completed(Err(_))
-                            | TimeoutOrCancel::TimedOut
-                            | TimeoutOrCancel::Cancelled => {
-                                studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
-                            }
-                        };
-                        (claim, outcome)
-                    }
-                }),
-            )
-            .buffer_unordered(JANITOR_RECONCILIATION_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
-            debug!(
-                cycle,
-                claims = reconciliation_outcomes.len(),
-                elapsed_ms = reconciliation_proof_started.elapsed().as_millis() as u64,
-                "janitor reconciliation proofs completed"
-            );
-            let mut upload_reconciliation_confirmed: u64 = 0;
-            let mut upload_reconciliation_retryable: u64 = 0;
-            for (_, outcome) in &reconciliation_outcomes {
-                match outcome {
-                    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed => {
-                        upload_reconciliation_confirmed =
-                            upload_reconciliation_confirmed.saturating_add(1);
-                    }
-                    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable => {
-                        upload_reconciliation_retryable =
-                            upload_reconciliation_retryable.saturating_add(1);
-                    }
-                }
-            }
-            let reconciliation_finish_started = Instant::now();
-            debug!(
-                cycle,
-                phase = "reconciliation_finish",
-                "janitor phase started"
-            );
-            let (finish_attempted, upload_reconciliation_completion_errors, unfinished_claims) =
-                finish_janitor_reconciliation_claims(
-                    reconciliation_outcomes.into_iter(),
-                    &shutdown,
-                    JANITOR_RECONCILIATION_FINISH_CONCURRENCY,
-                    |(claim, _)| claim.entry.object_id,
-                    |(claim, outcome)| {
-                        let owner = reconciliation_owner.clone();
-                        let object_id = claim.entry.object_id;
-                        let meta = self.meta.clone();
-                        let shutdown = shutdown.clone();
-                        async move {
-                            if shutdown.is_cancelled() {
-                                return None;
-                            }
-                            match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                                engine.finish_uploaded_fragment_reconciliation(
-                                    &owner, &claim, outcome,
-                                )
-                            })
-                            .await
-                            {
-                                Ok(()) => Some(Ok(())),
-                                Err(error) => {
-                                    warn!(
-                                        cycle,
-                                        object_id,
-                                        error = %error,
-                                        "janitor: upload reconciliation completion failed"
-                                    );
-                                    Some(Err(()))
-                                }
-                            }
-                        }
-                    },
-                )
-                .await;
-            if unfinished_claims > 0 {
-                debug!(
-                    cycle,
-                    unfinished_claims,
-                    "janitor shutdown left reconciliation claims for lease expiry"
-                );
-            }
-            debug!(
-                cycle,
-                finish_attempted,
-                confirmed = upload_reconciliation_confirmed,
-                retryable = upload_reconciliation_retryable,
-                finish_errors = upload_reconciliation_completion_errors,
-                unfinished_claims,
-                elapsed_ms = reconciliation_finish_started.elapsed().as_millis() as u64,
-                "janitor reconciliation claims finished"
-            );
-            if self.stop_janitor_cycle_if_shutdown(cycle).await {
-                break;
-            }
-
-            let meta = self.meta.clone();
-            if let Err(error) = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.reconcile_pending_regular_file_recoveries()
-            })
-            .await
-            {
-                warn!(cycle, error = %error, "janitor recovery reconciliation failed");
-            }
-            if self.stop_janitor_cycle_if_shutdown(cycle).await {
-                break;
-            }
-
-            let meta = self.meta.clone();
-            let references_started = Instant::now();
-            debug!(
-                cycle,
-                phase = "metadata_references",
-                "janitor phase started"
-            );
-            let referenced = match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.get_referenced_object_ids()
-            })
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    let meta = self.meta.clone();
-                    let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                        engine.release_global_janitor_lock()
-                    })
-                    .await;
-                    warn!(cycle, error = %e, "janitor cycle failed: get_referenced_object_ids");
-                    continue;
-                }
-            };
-            debug!(
-                cycle,
-                referenced = referenced.len(),
-                elapsed_ms = references_started.elapsed().as_millis() as u64,
-                "janitor metadata references loaded"
-            );
-            if self.stop_janitor_cycle_if_shutdown(cycle).await {
-                break;
-            }
-            let meta = self.meta.clone();
-            let pending_map: HashMap<u64, i64> =
-                match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                    engine.get_pending_deletions()
-                })
-                .await
-                {
-                    Ok(v) => v.into_iter().collect(),
-                    Err(e) => {
-                        warn!(cycle, error = %e, "janitor: failed to read pending deletions");
-                        HashMap::new()
-                    }
-                };
-            if self.stop_janitor_cycle_if_shutdown(cycle).await {
-                break;
-            }
-
-            let meta = self.meta.clone();
-            let recovered_undo_parents =
-                match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                    engine.recover_pending_creates()
-                })
-                .await
-                {
-                    Ok(parents) => parents,
-                    Err(e) => {
-                        warn!(cycle, error = %e, "janitor: pending-create replay failed");
-                        Vec::new()
-                    }
-                };
-            if self.stop_janitor_cycle_if_shutdown(cycle).await {
-                break;
-            }
-            if !recovered_undo_parents.is_empty() {
-                for parent in recovered_undo_parents.iter().copied() {
-                    self.dentry_cache_invalidate_parent(parent);
-                }
-                self.bump_namespace_for_parents(recovered_undo_parents.iter().copied());
-            }
-            if self.stop_janitor_cycle_if_shutdown(cycle).await {
-                break;
-            }
-            let meta = self.meta.clone();
-            let (undo_total, undo_started, undo_replaying, undo_completed) =
-                match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                    engine.list_undo_logs()
-                })
-                .await
-                {
-                    Ok(records) => {
-                        let mut started = 0usize;
-                        let mut replaying = 0usize;
-                        let mut completed = 0usize;
-                        for record in records.iter() {
-                            match record.phase {
-                                studiofs_meta::engine::UndoLogPhase::Started => {
-                                    started = started.saturating_add(1)
-                                }
-                                studiofs_meta::engine::UndoLogPhase::Replaying => {
-                                    replaying = replaying.saturating_add(1)
-                                }
-                                studiofs_meta::engine::UndoLogPhase::Completed => {
-                                    completed = completed.saturating_add(1)
-                                }
-                            }
-                        }
-                        (records.len(), started, replaying, completed)
-                    }
-                    Err(e) => {
-                        warn!(cycle, error = %e, "janitor: failed to read undo-log metrics");
-                        (0usize, 0usize, 0usize, 0usize)
-                    }
-                };
-
-            if self.stop_janitor_cycle_if_shutdown(cycle).await {
-                break;
-            }
-            debug!(cycle, phase = "object_listing", "janitor phase started");
-            let listing_started = Instant::now();
-            let lister = match run_with_timeout_or_cancel(
-                &shutdown,
-                REMOTE_OBJECT_IO_TIMEOUT,
-                self.data_write.list_object_entries(&self.data_prefix),
-            )
-            .await
-            {
-                TimeoutOrCancel::Completed(Ok(lister)) => lister,
-                TimeoutOrCancel::Completed(Err(e)) => {
-                    let meta = self.meta.clone();
-                    let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                        engine.release_global_janitor_lock()
-                    })
-                    .await;
-                    warn!(
-                        cycle,
-                        prefix = self.data_prefix,
-                        error = %e,
-                        "janitor cycle failed: list data prefix"
-                    );
-                    continue;
-                }
-                TimeoutOrCancel::TimedOut | TimeoutOrCancel::Cancelled => {
-                    let meta = self.meta.clone();
-                    let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                        engine.release_global_janitor_lock()
-                    })
-                    .await;
-                    debug!(
-                        cycle,
-                        elapsed_ms = listing_started.elapsed().as_millis() as u64,
-                        "janitor object listing stopped before stream creation"
-                    );
-                    if shutdown.is_cancelled() {
-                        break;
-                    }
-                    continue;
-                }
-            };
-            debug!(
-                cycle,
-                elapsed_ms = listing_started.elapsed().as_millis() as u64,
-                "janitor object listing stream opened"
-            );
-            let mut lister = std::pin::pin!(lister);
-
-            let now = SystemTime::now();
-            let now_unix = now
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let mut scanned: u64 = 0;
-            let mut orphan_candidates: u64 = 0;
-            let mut skipped_young: u64 = 0;
-            let mut skipped_unknown_age: u64 = 0;
-            let mut skipped_non_object_key: u64 = 0;
-            let mut seen_objects: HashSet<u64> = HashSet::new();
-            let deletion_owner = format!("janitor-delete-{cycle}");
-            let mut deletion_queue = JanitorDeletionQueue::new(
-                self.janitor_max_deletes_per_run,
-                JANITOR_OBJECT_DELETE_CONCURRENCY,
-            );
-
-            let mut list_error = None;
-            let mut listing_timed_out = false;
-            let mut shutdown_cancelled = false;
-            let scan_started = Instant::now();
-            while !deletion_queue.reached_cap() {
-                let listing = if deletion_queue.in_flight.is_empty() {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => {
-                            shutdown_cancelled = true;
-                            break;
-                        },
-                        listing = tokio::time::timeout(REMOTE_OBJECT_IO_TIMEOUT, lister.next()) => {
-                            match listing {
-                                Ok(listing) => listing,
-                                Err(_) => {
-                                    listing_timed_out = true;
-                                    break;
-                                }
-                            }
-                        },
-                    }
-                } else {
-                    tokio::select! {
-                        _ = shutdown.cancelled() => {
-                            shutdown_cancelled = true;
-                            break;
-                        },
-                        listing = tokio::time::timeout(REMOTE_OBJECT_IO_TIMEOUT, lister.next()) => {
-                            match listing {
-                                Ok(listing) => listing,
-                                Err(_) => {
-                                    listing_timed_out = true;
-                                    break;
-                                }
-                            }
-                        },
-                        completed = deletion_queue.complete_one() => {
-                            if !completed || deletion_queue.reached_cap() {
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-                };
-                let Some(entry_result) = listing else {
-                    break;
-                };
-                let entry = match entry_result {
-                    Ok(entry) => entry,
-                    Err(err) => {
-                        list_error = Some(err);
-                        break;
-                    }
-                };
-                scanned = scanned.saturating_add(1);
-                let path = entry.key.as_str();
-                let object_id = match parse_object_id_from_key(path) {
-                    Ok(id) => id,
-                    Err(_) => {
-                        skipped_non_object_key = skipped_non_object_key.saturating_add(1);
-                        continue;
-                    }
-                };
-                let Some(delete_keys) =
-                    janitor_object_delete_keys(&self.data_prefix, object_id, path)
-                else {
-                    skipped_non_object_key = skipped_non_object_key.saturating_add(1);
-                    continue;
-                };
-                if !seen_objects.insert(object_id) {
-                    continue;
-                }
-                if referenced.contains(&object_id) {
-                    continue;
-                }
-                if global_snapshot_pins.contains(&object_id) {
-                    continue;
-                }
-                orphan_candidates = orphan_candidates.saturating_add(1);
-                let mut is_old_enough = false;
-                if let Some(ts) = pending_map.get(&object_id) {
-                    let age = now_unix.saturating_sub(*ts) as u64;
-                    if age >= self.janitor_skip_newer_than.as_secs() {
-                        is_old_enough = true;
-                    }
-                } else if let Some(last_modified_st) = entry.last_modified {
-                    let age = now
-                        .duration_since(last_modified_st)
-                        .unwrap_or_else(|_| Duration::from_secs(0));
-                    if age >= self.janitor_skip_newer_than {
-                        is_old_enough = true;
-                    }
-                } else {
-                    skipped_unknown_age = skipped_unknown_age.saturating_add(1);
-                }
-
-                if !is_old_enough {
-                    skipped_young = skipped_young.saturating_add(1);
-                    continue;
-                }
-
-                if shutdown.is_cancelled() {
-                    break;
-                }
-                deletion_queue.wait_for_slot().await;
-                if shutdown.is_cancelled() || deletion_queue.reached_cap() {
-                    break;
-                }
-
-                let vfs = self.clone();
-                let deletion_owner = deletion_owner.clone();
-                let shutdown = shutdown.clone();
-                deletion_queue.push(async move {
-                    vfs.delete_janitor_object(
-                        cycle,
-                        object_id,
-                        delete_keys,
-                        deletion_owner,
-                        shutdown,
-                    )
-                    .await
-                });
-            }
-
-            // Finish every claimed deletion before the global lease can be released,
-            // including when streaming the object listing fails.
-            deletion_queue.drain().await;
-            let listing_delete_elapsed_ms =
-                scan_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            let cycle_elapsed_ms = cycle_started
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64;
-            let claim_ms = deletion_queue
-                .claim_elapsed
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64;
-            let remote_delete_ms = deletion_queue
-                .remote_delete_elapsed
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64;
-            let finish_ms = deletion_queue
-                .finish_elapsed
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64;
-            let deleted = deletion_queue.successful_deletes;
-            let delete_errors = deletion_queue.retryable_failures;
-
-            if listing_timed_out {
-                warn!(
-                    cycle,
-                    elapsed_ms = scan_started.elapsed().as_millis() as u64,
-                    "janitor object listing stream timed out"
-                );
-            }
-
-            if let Some(err) = list_error {
-                let meta = self.meta.clone();
-                let _ = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                    engine.release_global_janitor_lock()
-                })
-                .await;
-                warn!(
-                    cycle,
-                    prefix = self.data_prefix,
-                    error = %err,
-                    "janitor cycle failed while streaming data prefix"
-                );
-                continue;
-            }
-
-            debug!(
-                cycle,
-                scanned,
-                referenced = referenced.len(),
-                snapshot_pins = global_snapshot_pins.len(),
-                upload_reconciliation_claims = reconciliation_claim_count,
-                upload_reconciliation_confirmed,
-                upload_reconciliation_retryable,
-                upload_reconciliation_completion_errors,
-                orphan_candidates,
-                recovered_undo_parents = recovered_undo_parents.len(),
-                undo_total,
-                undo_started,
-                undo_replaying,
-                undo_completed,
-                deleted,
-                cycle_elapsed_ms,
-                listing_delete_elapsed_ms,
-                claim_ms,
-                remote_delete_ms,
-                finish_ms,
-                shutdown_cancelled,
-                skipped_young,
-                skipped_unknown_age,
-                skipped_non_object_key,
-                delete_errors,
-                "janitor cycle complete"
-            );
-
+            // Every started deletion has drained by the time the cycle returns,
+            // so the global lock is released on every completion, error, and
+            // shutdown path here.
+            let flow = self.run_janitor_cycle(cycle, &shutdown).await;
             let meta = self.meta.clone();
             if let Err(e) = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
                 engine.release_global_janitor_lock()
@@ -3641,7 +3045,499 @@ impl StudioVfs {
             {
                 warn!(cycle, error = %e, "janitor cycle failed to release PG lock");
             }
+            if flow.is_break() {
+                break;
+            }
         }
+    }
+
+    /// Runs one janitor cycle under the global janitor lock. `Break` means
+    /// shutdown was observed; `Continue` covers completed and aborted cycles.
+    async fn run_janitor_cycle(
+        self: &Arc<Self>,
+        cycle: u64,
+        shutdown: &CancellationToken,
+    ) -> ControlFlow<()> {
+        let cycle_started = Instant::now();
+        self.janitor_shutdown_gate()?;
+
+        let meta = self.meta.clone();
+        let mut global_snapshot_pins =
+            match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.get_global_snapshot_pins()
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(cycle, error = %e, "janitor cycle skipped: snapshot pin query failed");
+                    return ControlFlow::Continue(());
+                }
+            };
+
+        self.janitor_shutdown_gate()?;
+        let meta = self.meta.clone();
+        let reconciliation_owner = format!("janitor-{cycle}");
+        let claim_owner = reconciliation_owner.clone();
+        let reconciliation_claims_started = Instant::now();
+        debug!(
+            cycle,
+            phase = "reconciliation_claims",
+            "janitor phase started"
+        );
+        let reconciliation_claims = match run_meta_maintenance(
+            meta,
+            move |engine: Arc<dyn VfsMeta>| {
+                engine.claim_uploaded_fragment_reconciliation(&claim_owner)
+            },
+        )
+        .await
+        {
+            Ok(claims) => claims,
+            Err(e) => {
+                warn!(cycle, error = %e, "janitor cycle skipped: upload reconciliation claim failed");
+                return ControlFlow::Continue(());
+            }
+        };
+        let reconciliation_claim_count = reconciliation_claims.len();
+        debug!(
+            cycle,
+            claims = reconciliation_claim_count,
+            elapsed_ms = reconciliation_claims_started.elapsed().as_millis() as u64,
+            "janitor reconciliation claims loaded"
+        );
+        for claim in &reconciliation_claims {
+            global_snapshot_pins.insert(claim.entry.object_id);
+        }
+        let reconciliation_data_store = self.fetch_scheduler.data_store().clone();
+        let reconciliation_proof_started = Instant::now();
+        debug!(
+            cycle,
+            phase = "reconciliation_proof",
+            "janitor phase started"
+        );
+        let reconciliation_outcomes = futures::stream::iter(
+            reconciliation_claims.into_iter().map(|claim| {
+                let shutdown = shutdown.clone();
+                let data_store = reconciliation_data_store.clone();
+                async move {
+                    let proof = run_with_timeout_or_cancel(
+                        &shutdown,
+                        REMOTE_OBJECT_IO_TIMEOUT,
+                        data_store.get_payload_by_key_with_stats(&claim.entry.object_key),
+                    )
+                    .await;
+                    let outcome = match proof {
+                        TimeoutOrCancel::Completed(Ok((remote_payload, _))) => {
+                            let remote_bytes = remote_payload.to_bytes();
+                            let remote_sha256: [u8; 32] = Sha256::digest(&remote_bytes).into();
+                            if remote_bytes.len() as u64 == claim.entry.expected_byte_length
+                                && remote_sha256 == claim.entry.expected_sha256
+                            {
+                                studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed
+                            } else {
+                                studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
+                            }
+                        }
+                        TimeoutOrCancel::Completed(Err(_))
+                        | TimeoutOrCancel::TimedOut
+                        | TimeoutOrCancel::Cancelled => {
+                            studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
+                        }
+                    };
+                    (claim, outcome)
+                }
+            }),
+        )
+        .buffer_unordered(JANITOR_RECONCILIATION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        debug!(
+            cycle,
+            claims = reconciliation_outcomes.len(),
+            elapsed_ms = reconciliation_proof_started.elapsed().as_millis() as u64,
+            "janitor reconciliation proofs completed"
+        );
+        let mut upload_reconciliation_confirmed: u64 = 0;
+        let mut upload_reconciliation_retryable: u64 = 0;
+        for (_, outcome) in &reconciliation_outcomes {
+            match outcome {
+                studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed => {
+                    upload_reconciliation_confirmed =
+                        upload_reconciliation_confirmed.saturating_add(1);
+                }
+                studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable => {
+                    upload_reconciliation_retryable =
+                        upload_reconciliation_retryable.saturating_add(1);
+                }
+            }
+        }
+        let reconciliation_finish_started = Instant::now();
+        debug!(
+            cycle,
+            phase = "reconciliation_finish",
+            "janitor phase started"
+        );
+        let (finish_attempted, upload_reconciliation_completion_errors, unfinished_claims) =
+            finish_janitor_reconciliation_claims(
+                reconciliation_outcomes,
+                shutdown,
+                JANITOR_RECONCILIATION_FINISH_CONCURRENCY,
+                |(claim, _)| claim.entry.object_id,
+                |(claim, outcome)| {
+                    let owner = reconciliation_owner.clone();
+                    let object_id = claim.entry.object_id;
+                    let meta = self.meta.clone();
+                    async move {
+                        run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                            engine.finish_uploaded_fragment_reconciliation(&owner, &claim, outcome)
+                        })
+                        .await
+                        .inspect_err(|error| {
+                            warn!(
+                                cycle,
+                                object_id,
+                                error = %error,
+                                "janitor: upload reconciliation completion failed"
+                            );
+                        })
+                    }
+                },
+            )
+            .await;
+        if unfinished_claims > 0 {
+            debug!(
+                cycle,
+                unfinished_claims, "janitor shutdown left reconciliation claims for lease expiry"
+            );
+        }
+        debug!(
+            cycle,
+            finish_attempted,
+            confirmed = upload_reconciliation_confirmed,
+            retryable = upload_reconciliation_retryable,
+            finish_errors = upload_reconciliation_completion_errors,
+            unfinished_claims,
+            elapsed_ms = reconciliation_finish_started.elapsed().as_millis() as u64,
+            "janitor reconciliation claims finished"
+        );
+        self.janitor_shutdown_gate()?;
+
+        let meta = self.meta.clone();
+        if let Err(error) = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.reconcile_pending_regular_file_recoveries()
+        })
+        .await
+        {
+            warn!(cycle, error = %error, "janitor recovery reconciliation failed");
+        }
+        self.janitor_shutdown_gate()?;
+
+        let meta = self.meta.clone();
+        let references_started = Instant::now();
+        debug!(
+            cycle,
+            phase = "metadata_references",
+            "janitor phase started"
+        );
+        let referenced = match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.get_referenced_object_ids()
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(cycle, error = %e, "janitor cycle failed: get_referenced_object_ids");
+                return ControlFlow::Continue(());
+            }
+        };
+        debug!(
+            cycle,
+            referenced = referenced.len(),
+            elapsed_ms = references_started.elapsed().as_millis() as u64,
+            "janitor metadata references loaded"
+        );
+        self.janitor_shutdown_gate()?;
+        let meta = self.meta.clone();
+        let pending_map: HashMap<u64, i64> =
+            match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.get_pending_deletions()
+            })
+            .await
+            {
+                Ok(v) => v.into_iter().collect(),
+                Err(e) => {
+                    warn!(cycle, error = %e, "janitor: failed to read pending deletions");
+                    HashMap::new()
+                }
+            };
+        self.janitor_shutdown_gate()?;
+
+        let meta = self.meta.clone();
+        let recovered_undo_parents =
+            match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.recover_pending_creates()
+            })
+            .await
+            {
+                Ok(parents) => parents,
+                Err(e) => {
+                    warn!(cycle, error = %e, "janitor: pending-create replay failed");
+                    Vec::new()
+                }
+            };
+        if !recovered_undo_parents.is_empty() {
+            for parent in recovered_undo_parents.iter().copied() {
+                self.dentry_cache_invalidate_parent(parent);
+            }
+            self.bump_namespace_for_parents(recovered_undo_parents.iter().copied());
+        }
+        self.janitor_shutdown_gate()?;
+        let meta = self.meta.clone();
+        let (undo_total, undo_started, undo_replaying, undo_completed) =
+            match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.list_undo_logs()
+            })
+            .await
+            {
+                Ok(records) => {
+                    let mut started = 0usize;
+                    let mut replaying = 0usize;
+                    let mut completed = 0usize;
+                    for record in records.iter() {
+                        match record.phase {
+                            studiofs_meta::engine::UndoLogPhase::Started => {
+                                started = started.saturating_add(1)
+                            }
+                            studiofs_meta::engine::UndoLogPhase::Replaying => {
+                                replaying = replaying.saturating_add(1)
+                            }
+                            studiofs_meta::engine::UndoLogPhase::Completed => {
+                                completed = completed.saturating_add(1)
+                            }
+                        }
+                    }
+                    (records.len(), started, replaying, completed)
+                }
+                Err(e) => {
+                    warn!(cycle, error = %e, "janitor: failed to read undo-log metrics");
+                    (0usize, 0usize, 0usize, 0usize)
+                }
+            };
+
+        self.janitor_shutdown_gate()?;
+        debug!(cycle, phase = "object_listing", "janitor phase started");
+        let listing_started = Instant::now();
+        let lister = match run_with_timeout_or_cancel(
+            shutdown,
+            REMOTE_OBJECT_IO_TIMEOUT,
+            self.data_write.list_object_entries(&self.data_prefix),
+        )
+        .await
+        {
+            TimeoutOrCancel::Completed(Ok(lister)) => lister,
+            TimeoutOrCancel::Completed(Err(e)) => {
+                warn!(
+                    cycle,
+                    prefix = self.data_prefix,
+                    error = %e,
+                    "janitor cycle failed: list data prefix"
+                );
+                return ControlFlow::Continue(());
+            }
+            TimeoutOrCancel::TimedOut | TimeoutOrCancel::Cancelled => {
+                debug!(
+                    cycle,
+                    elapsed_ms = listing_started.elapsed().as_millis() as u64,
+                    "janitor object listing stopped before stream creation"
+                );
+                return self.janitor_shutdown_gate();
+            }
+        };
+        debug!(
+            cycle,
+            elapsed_ms = listing_started.elapsed().as_millis() as u64,
+            "janitor object listing stream opened"
+        );
+        let mut lister = std::pin::pin!(lister);
+
+        let now = SystemTime::now();
+        let now_unix = now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut scanned: u64 = 0;
+        let mut orphan_candidates: u64 = 0;
+        let mut skipped_young: u64 = 0;
+        let mut skipped_unknown_age: u64 = 0;
+        let mut skipped_non_object_key: u64 = 0;
+        let mut seen_objects: HashSet<u64> = HashSet::new();
+        let deletion_owner = format!("janitor-delete-{cycle}");
+        let mut deletion_queue = JanitorDeletionQueue::new(
+            self.janitor_max_deletes_per_run,
+            JANITOR_OBJECT_DELETE_CONCURRENCY,
+        );
+
+        let mut list_error = None;
+        let mut listing_timed_out = false;
+        let mut shutdown_cancelled = false;
+        let scan_started = Instant::now();
+        while !deletion_queue.reached_cap() {
+            let has_in_flight = !deletion_queue.in_flight.is_empty();
+            let listing = tokio::select! {
+                _ = shutdown.cancelled() => {
+                    shutdown_cancelled = true;
+                    break;
+                },
+                listing = tokio::time::timeout(REMOTE_OBJECT_IO_TIMEOUT, lister.next()) => {
+                    match listing {
+                        Ok(listing) => listing,
+                        Err(_) => {
+                            listing_timed_out = true;
+                            break;
+                        }
+                    }
+                },
+                // An empty FuturesUnordered resolves immediately, so only poll
+                // completions while deletions are in flight.
+                completed = deletion_queue.complete_one(), if has_in_flight => {
+                    if !completed || deletion_queue.reached_cap() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let Some(entry_result) = listing else {
+                break;
+            };
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(err) => {
+                    list_error = Some(err);
+                    break;
+                }
+            };
+            scanned = scanned.saturating_add(1);
+            let path = entry.key.as_str();
+            let object_id = match parse_object_id_from_key(path) {
+                Ok(id) => id,
+                Err(_) => {
+                    skipped_non_object_key = skipped_non_object_key.saturating_add(1);
+                    continue;
+                }
+            };
+            let Some(delete_keys) = janitor_object_delete_keys(&self.data_prefix, object_id, path)
+            else {
+                skipped_non_object_key = skipped_non_object_key.saturating_add(1);
+                continue;
+            };
+            if !seen_objects.insert(object_id) {
+                continue;
+            }
+            if referenced.contains(&object_id) {
+                continue;
+            }
+            if global_snapshot_pins.contains(&object_id) {
+                continue;
+            }
+            orphan_candidates = orphan_candidates.saturating_add(1);
+            let mut is_old_enough = false;
+            if let Some(ts) = pending_map.get(&object_id) {
+                let age = now_unix.saturating_sub(*ts) as u64;
+                if age >= self.janitor_skip_newer_than.as_secs() {
+                    is_old_enough = true;
+                }
+            } else if let Some(last_modified_st) = entry.last_modified {
+                let age = now
+                    .duration_since(last_modified_st)
+                    .unwrap_or_else(|_| Duration::from_secs(0));
+                if age >= self.janitor_skip_newer_than {
+                    is_old_enough = true;
+                }
+            } else {
+                skipped_unknown_age = skipped_unknown_age.saturating_add(1);
+            }
+
+            if !is_old_enough {
+                skipped_young = skipped_young.saturating_add(1);
+                continue;
+            }
+
+            if shutdown.is_cancelled() {
+                break;
+            }
+            deletion_queue.wait_for_slot().await;
+            if shutdown.is_cancelled() || deletion_queue.reached_cap() {
+                break;
+            }
+
+            let vfs = self.clone();
+            let deletion_owner = deletion_owner.clone();
+            let shutdown = shutdown.clone();
+            deletion_queue.push(async move {
+                vfs.delete_janitor_object(cycle, object_id, delete_keys, deletion_owner, shutdown)
+                    .await
+            });
+        }
+
+        // Finish every claimed deletion before the global lease can be released,
+        // including when streaming the object listing fails.
+        deletion_queue.drain().await;
+        let listing_delete_elapsed_ms = elapsed_ms(scan_started.elapsed());
+        let cycle_elapsed_ms = elapsed_ms(cycle_started.elapsed());
+        let claim_ms = elapsed_ms(deletion_queue.claim_elapsed);
+        let remote_delete_ms = elapsed_ms(deletion_queue.remote_delete_elapsed);
+        let finish_ms = elapsed_ms(deletion_queue.finish_elapsed);
+        let deleted = deletion_queue.successful_deletes;
+        let delete_errors = deletion_queue.retryable_failures;
+
+        if listing_timed_out {
+            warn!(
+                cycle,
+                elapsed_ms = scan_started.elapsed().as_millis() as u64,
+                "janitor object listing stream timed out"
+            );
+        }
+
+        if let Some(err) = list_error {
+            warn!(
+                cycle,
+                prefix = self.data_prefix,
+                error = %err,
+                "janitor cycle failed while streaming data prefix"
+            );
+            return ControlFlow::Continue(());
+        }
+
+        debug!(
+            cycle,
+            scanned,
+            referenced = referenced.len(),
+            snapshot_pins = global_snapshot_pins.len(),
+            upload_reconciliation_claims = reconciliation_claim_count,
+            upload_reconciliation_confirmed,
+            upload_reconciliation_retryable,
+            upload_reconciliation_completion_errors,
+            orphan_candidates,
+            recovered_undo_parents = recovered_undo_parents.len(),
+            undo_total,
+            undo_started,
+            undo_replaying,
+            undo_completed,
+            deleted,
+            cycle_elapsed_ms,
+            listing_delete_elapsed_ms,
+            claim_ms,
+            remote_delete_ms,
+            finish_ms,
+            shutdown_cancelled,
+            skipped_young,
+            skipped_unknown_age,
+            skipped_non_object_key,
+            delete_errors,
+            "janitor cycle complete"
+        );
+        ControlFlow::Continue(())
     }
 }
 
@@ -3661,7 +3557,7 @@ mod tests {
         let finish_calls = calls.clone();
         let worker = tokio::spawn(async move {
             finish_janitor_reconciliation_claims(
-                [1, 2, 3, 4, 5].into_iter(),
+                [1, 2, 3, 4, 5],
                 &worker_shutdown,
                 2,
                 |claim| *claim,
@@ -3671,7 +3567,7 @@ mod tests {
                     let (complete, result) = oneshot::channel();
                     async move {
                         let _ = started.send((claim, complete));
-                        Some(result.await.unwrap_or(Err(())))
+                        result.await.unwrap_or(Err(()))
                     }
                 },
             )
@@ -3708,7 +3604,7 @@ mod tests {
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
         let worker = tokio::spawn(async move {
             finish_janitor_reconciliation_claims(
-                [(7_u64, 0_u32), (7, 1), (8, 0)].into_iter(),
+                [(7_u64, 0_u32), (7, 1), (8, 0)],
                 &worker_shutdown,
                 2,
                 |(object_id, _)| *object_id,
@@ -3717,7 +3613,7 @@ mod tests {
                     let (complete, result) = oneshot::channel();
                     async move {
                         let _ = started.send((claim, complete));
-                        Some(result.await.unwrap_or(Err(())))
+                        result.await.unwrap_or(Err(()))
                     }
                 },
             )
