@@ -16,6 +16,8 @@ The background janitor removes old objects that are no longer referenced by file
 - [x] (2026-10-27) Final mount run at pool 16, grace 60 seconds, interval 10 seconds, and cap 1,000 completed its first cycle in 33,984 ms: 1,000 deleted, 0 deletion errors, 256 reconciliation claims retryable, 0 confirmed.
 - [x] (2026-10-27) Review cleanup: the cycle body moved into `run_janitor_cycle`, so the global janitor lock is released at one site after every completion, error, and shutdown path; reconciliation finishes group claims by object ID instead of scanning a pending queue; the listing loop uses one guarded `select!`. Queue structure, cumulative timing fields, and the queue/ordering tests are retained because they carry the cap, drain, and same-object ordering invariants above.
 - [x] (2026-10-27) Applied confirmed findings from `docs/code-reviews/2026-10-27-janitor-speed-up-review.md`: snapshot pins load after metadata references, `RemoteConfirmed` finishes run before one `Retryable` finish per object, future-dated pending deletions count as young, unknown-age candidates no longer also count as young, retryable proofs log a reason, and proof hashing streams buffer chunks after a length check. Findings 6 and 7 were declined: per-key allocation cost is negligible per cycle, and deletion concurrency versus `STUDIOFS_PG_POOL_SIZE` is the recorded tuning decision.
+- [x] (2026-10-27) Two-axis review against `main` (standards plus this plan): the listing wait now has one deadline per entry instead of restarting whenever a deletion completes; the listing-error warning carries `scanned`, `deleted`, `delete_errors`, and elapsed fields; the proof step is `prove_reconciliation_claim`; a queue test exercises the production concurrency of 32; the same-object ordering test now waits for the other object's finish before asserting no second fragment started. The cycle-complete event no longer has `skipped_cap`: scanning stops once the successful-delete cap is reached, so `scanned` and `orphan_candidates` count only the listing prefix that was read.
+- [ ] Shutdown during an active deletion and the lock release after a listing error are still covered only by code review; a focused test needs a fake metadata/object-store pair that the crate does not have yet.
 - [ ] Diagnose why the final cycle marked all 256 upload-reconciliation claims retryable and confirmed none; the supplied run summary does not include a cause.
 - [ ] A controlled same-set comparison remains outstanding. The full workspace suite was not run, in accordance with the repository instruction to leave it to the user.
 
@@ -98,7 +100,7 @@ Run focused checks from `/Volumes/Storage/dev/studiofs`; do not run the workspac
 
     cargo test -p studiofs-vfs --lib janitor_deletion_queue -- --nocapture
     cargo test -p studiofs-vfs --lib reconciliation_finishes -- --nocapture
-    cargo test -p studiofs-vfs --lib janitor_object_delete_keys -- --nocapture
+    cargo test -p studiofs-vfs --lib janitor_deletes_the_listed_legacy_key -- --nocapture
     cargo test -p studiofs-vfs --lib janitor_is_owned_by_non_aborting_shutdown_cleanup -- --nocapture
     cargo test -p studiofs-vfs --test vfs_test test_background_janitor_removes_orphan_object -- --exact --nocapture
     cargo check -p studiofs-vfs

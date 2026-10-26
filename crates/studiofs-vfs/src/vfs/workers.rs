@@ -26,11 +26,21 @@ enum JanitorObjectDeletionResult {
     Retryable,
 }
 
+/// Per-object phase durations; the queue sums them across overlapping tasks,
+/// so totals attribute time to PG versus object storage, not wall clock.
 #[derive(Clone, Copy, Debug, Default)]
 struct JanitorObjectDeletionTimings {
     claim: Duration,
     remote_delete: Duration,
     finish: Duration,
+}
+
+impl JanitorObjectDeletionTimings {
+    fn add(&mut self, other: Self) {
+        self.claim = self.claim.saturating_add(other.claim);
+        self.remote_delete = self.remote_delete.saturating_add(other.remote_delete);
+        self.finish = self.finish.saturating_add(other.finish);
+    }
 }
 
 fn elapsed_ms(elapsed: Duration) -> u64 {
@@ -65,6 +75,76 @@ fn order_reconciliation_finishes(
             && later.1 == Retryable
             && earlier.1 == Retryable
     });
+}
+
+/// Reads one uploaded fragment back and compares it with its durable proof.
+async fn prove_reconciliation_claim(
+    data_store: &DataStore,
+    shutdown: &CancellationToken,
+    cycle: u64,
+    claim: studiofs_meta::snapshot_ports::UploadedFragmentReconciliationClaim,
+) -> (
+    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationClaim,
+    studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome,
+) {
+    let proof = run_with_timeout_or_cancel(
+        shutdown,
+        REMOTE_OBJECT_IO_TIMEOUT,
+        data_store.get_payload_by_key_with_stats(&claim.entry.object_key),
+    )
+    .await;
+    let entry = &claim.entry;
+    let retry_reason = match proof {
+        TimeoutOrCancel::Completed(Ok((remote_payload, _))) => {
+            let actual_byte_length = remote_payload.len() as u64;
+            if actual_byte_length != entry.expected_byte_length {
+                debug!(
+                    cycle,
+                    object_id = entry.object_id,
+                    fragment_index = entry.fragment_index,
+                    expected_byte_length = entry.expected_byte_length,
+                    actual_byte_length,
+                    "janitor: reconciliation proof length mismatch"
+                );
+                Some("length_mismatch")
+            } else {
+                let mut hasher = Sha256::new();
+                for chunk in remote_payload {
+                    hasher.update(&chunk);
+                }
+                let remote_sha256: [u8; 32] = hasher.finalize().into();
+                (remote_sha256 != entry.expected_sha256).then_some("sha256_mismatch")
+            }
+        }
+        TimeoutOrCancel::Completed(Err(error)) => {
+            debug!(
+                cycle,
+                object_id = entry.object_id,
+                fragment_index = entry.fragment_index,
+                error = %error,
+                "janitor: reconciliation proof read failed"
+            );
+            Some("read_failed")
+        }
+        TimeoutOrCancel::TimedOut => Some("timed_out"),
+        TimeoutOrCancel::Cancelled => Some("cancelled"),
+    };
+    let outcome = match retry_reason {
+        None => {
+            studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed
+        }
+        Some(reason) => {
+            debug!(
+                cycle,
+                object_id = entry.object_id,
+                fragment_index = entry.fragment_index,
+                reason,
+                "janitor: reconciliation proof retryable"
+            );
+            studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
+        }
+    };
+    (claim, outcome)
 }
 
 fn janitor_object_delete_keys(
@@ -125,9 +205,7 @@ struct JanitorDeletionQueue<Fut> {
     in_flight: futures::stream::FuturesUnordered<Fut>,
     successful_deletes: u64,
     retryable_failures: u64,
-    claim_elapsed: Duration,
-    remote_delete_elapsed: Duration,
-    finish_elapsed: Duration,
+    timings: JanitorObjectDeletionTimings,
     max_deletes: u64,
     max_concurrency: usize,
 }
@@ -141,9 +219,7 @@ where
             in_flight: futures::stream::FuturesUnordered::new(),
             successful_deletes: 0,
             retryable_failures: 0,
-            claim_elapsed: Duration::ZERO,
-            remote_delete_elapsed: Duration::ZERO,
-            finish_elapsed: Duration::ZERO,
+            timings: JanitorObjectDeletionTimings::default(),
             max_deletes,
             max_concurrency,
         }
@@ -151,6 +227,10 @@ where
 
     fn reached_cap(&self) -> bool {
         self.successful_deletes >= self.max_deletes
+    }
+
+    fn has_in_flight(&self) -> bool {
+        !self.in_flight.is_empty()
     }
 
     fn push(&mut self, future: Fut) {
@@ -178,11 +258,7 @@ where
         let Some((result, timings)) = self.in_flight.next().await else {
             return false;
         };
-        self.claim_elapsed = self.claim_elapsed.saturating_add(timings.claim);
-        self.remote_delete_elapsed = self
-            .remote_delete_elapsed
-            .saturating_add(timings.remote_delete);
-        self.finish_elapsed = self.finish_elapsed.saturating_add(timings.finish);
+        self.timings.add(timings);
         match result {
             JanitorObjectDeletionResult::Deleted => {
                 self.successful_deletes = self.successful_deletes.saturating_add(1);
@@ -2985,10 +3061,16 @@ impl StudioVfs {
                 }
             }
         }
-        let outcome = if delete_failed {
-            studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Retryable
+        let (outcome, result) = if delete_failed {
+            (
+                studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Retryable,
+                JanitorObjectDeletionResult::Retryable,
+            )
         } else {
-            studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Deleted
+            (
+                studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome::Deleted,
+                JanitorObjectDeletionResult::Deleted,
+            )
         };
         if let Some(fencing_token) = fencing_token {
             let meta = self.meta.clone();
@@ -3009,11 +3091,6 @@ impl StudioVfs {
             }
             timings.finish = finish_started.elapsed();
         }
-        let result = if delete_failed {
-            JanitorObjectDeletionResult::Retryable
-        } else {
-            JanitorObjectDeletionResult::Deleted
-        };
         (result, timings)
     }
 
@@ -3124,80 +3201,18 @@ impl StudioVfs {
             .iter()
             .map(|claim| claim.entry.object_id)
             .collect();
-        let reconciliation_data_store = self.fetch_scheduler.data_store().clone();
+        let data_store = self.fetch_scheduler.data_store();
         let reconciliation_proof_started = Instant::now();
         debug!(
             cycle,
             phase = "reconciliation_proof",
             "janitor phase started"
         );
-        let mut reconciliation_outcomes = futures::stream::iter(
-            reconciliation_claims.into_iter().map(|claim| {
-                let shutdown = shutdown.clone();
-                let data_store = reconciliation_data_store.clone();
-                async move {
-                    let proof = run_with_timeout_or_cancel(
-                        &shutdown,
-                        REMOTE_OBJECT_IO_TIMEOUT,
-                        data_store.get_payload_by_key_with_stats(&claim.entry.object_key),
-                    )
-                    .await;
-                    let entry = &claim.entry;
-                    let retry_reason = match proof {
-                        TimeoutOrCancel::Completed(Ok((remote_payload, _))) => {
-                            let actual_byte_length = remote_payload.len() as u64;
-                            if actual_byte_length != entry.expected_byte_length {
-                                debug!(
-                                    cycle,
-                                    object_id = entry.object_id,
-                                    fragment_index = entry.fragment_index,
-                                    expected_byte_length = entry.expected_byte_length,
-                                    actual_byte_length,
-                                    "janitor: reconciliation proof length mismatch"
-                                );
-                                Some("length_mismatch")
-                            } else {
-                                let mut hasher = Sha256::new();
-                                for chunk in remote_payload {
-                                    hasher.update(&chunk);
-                                }
-                                let remote_sha256: [u8; 32] = hasher.finalize().into();
-                                (remote_sha256 != entry.expected_sha256).then_some("sha256_mismatch")
-                            }
-                        }
-                        TimeoutOrCancel::Completed(Err(error)) => {
-                            debug!(
-                                cycle,
-                                object_id = entry.object_id,
-                                fragment_index = entry.fragment_index,
-                                error = %error,
-                                "janitor: reconciliation proof read failed"
-                            );
-                            Some("read_failed")
-                        }
-                        TimeoutOrCancel::TimedOut => Some("timed_out"),
-                        TimeoutOrCancel::Cancelled => Some("cancelled"),
-                    };
-                    let outcome = match retry_reason {
-                        None => studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed,
-                        Some(reason) => {
-                            debug!(
-                                cycle,
-                                object_id = entry.object_id,
-                                fragment_index = entry.fragment_index,
-                                reason,
-                                "janitor: reconciliation proof retryable"
-                            );
-                            studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
-                        }
-                    };
-                    (claim, outcome)
-                }
-            }),
-        )
-        .buffer_unordered(JANITOR_RECONCILIATION_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
+        let mut reconciliation_outcomes = futures::stream::iter(reconciliation_claims)
+            .map(|claim| prove_reconciliation_claim(data_store, shutdown, cycle, claim))
+            .buffer_unordered(JANITOR_RECONCILIATION_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
         debug!(
             cycle,
             claims = reconciliation_outcomes.len(),
@@ -3430,8 +3445,7 @@ impl StudioVfs {
         let now = SystemTime::now();
         let now_unix = now
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         let mut scanned: u64 = 0;
         let mut orphan_candidates: u64 = 0;
         let mut skipped_young: u64 = 0;
@@ -3448,14 +3462,17 @@ impl StudioVfs {
         let mut listing_timed_out = false;
         let mut shutdown_cancelled = false;
         let scan_started = Instant::now();
+        // Deletion completions win the select below without resetting this:
+        // the listing bound covers waiting for the next entry, not each poll.
+        let mut listing_deadline = tokio::time::Instant::now() + REMOTE_OBJECT_IO_TIMEOUT;
         while !deletion_queue.reached_cap() {
-            let has_in_flight = !deletion_queue.in_flight.is_empty();
+            let has_in_flight = deletion_queue.has_in_flight();
             let listing = tokio::select! {
                 _ = shutdown.cancelled() => {
                     shutdown_cancelled = true;
                     break;
                 },
-                listing = tokio::time::timeout(REMOTE_OBJECT_IO_TIMEOUT, lister.next()) => {
+                listing = tokio::time::timeout_at(listing_deadline, lister.next()) => {
                     match listing {
                         Ok(listing) => listing,
                         Err(_) => {
@@ -3476,6 +3493,7 @@ impl StudioVfs {
             let Some(entry_result) = listing else {
                 break;
             };
+            listing_deadline = tokio::time::Instant::now() + REMOTE_OBJECT_IO_TIMEOUT;
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(err) => {
@@ -3529,6 +3547,7 @@ impl StudioVfs {
                 break;
             }
             deletion_queue.wait_for_slot().await;
+            listing_deadline = tokio::time::Instant::now() + REMOTE_OBJECT_IO_TIMEOUT;
             if shutdown.is_cancelled() {
                 shutdown_cancelled = true;
                 break;
@@ -3551,9 +3570,9 @@ impl StudioVfs {
         deletion_queue.drain().await;
         let listing_delete_elapsed_ms = elapsed_ms(scan_started.elapsed());
         let cycle_elapsed_ms = elapsed_ms(cycle_started.elapsed());
-        let claim_ms = elapsed_ms(deletion_queue.claim_elapsed);
-        let remote_delete_ms = elapsed_ms(deletion_queue.remote_delete_elapsed);
-        let finish_ms = elapsed_ms(deletion_queue.finish_elapsed);
+        let claim_ms = elapsed_ms(deletion_queue.timings.claim);
+        let remote_delete_ms = elapsed_ms(deletion_queue.timings.remote_delete);
+        let finish_ms = elapsed_ms(deletion_queue.timings.finish);
         let deleted = deletion_queue.successful_deletes;
         let delete_errors = deletion_queue.retryable_failures;
 
@@ -3570,6 +3589,11 @@ impl StudioVfs {
                 cycle,
                 prefix = self.data_prefix,
                 error = %err,
+                scanned,
+                deleted,
+                delete_errors,
+                cycle_elapsed_ms,
+                listing_delete_elapsed_ms,
                 "janitor cycle failed while streaming data prefix"
             );
             return ControlFlow::Continue(());
@@ -3668,6 +3692,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let worker_shutdown = shutdown.clone();
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = mpsc::unbounded_channel();
         let worker = tokio::spawn(async move {
             finish_janitor_reconciliation_claims(
                 [(7_u64, 0_u32), (7, 1), (8, 0)],
@@ -3676,10 +3701,13 @@ mod tests {
                 |(object_id, _)| *object_id,
                 move |claim| {
                     let started = started_tx.clone();
+                    let finished = finished_tx.clone();
                     let (complete, result) = oneshot::channel();
                     async move {
                         let _ = started.send((claim, complete));
-                        result.await.unwrap_or(Err(()))
+                        let result = result.await.unwrap_or(Err(()));
+                        let _ = finished.send(claim);
+                        result
                     }
                 },
             )
@@ -3697,6 +3725,9 @@ mod tests {
         finish_other_object
             .send(Ok(()))
             .expect("finish other object");
+        // The current-thread worker runs until it is idle again before this
+        // receive returns, so a freed slot would already have started (7, 1).
+        assert_eq!(finished_rx.recv().await, Some((8, 0)));
         assert!(
             matches!(started_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
             "second fragment must wait for the first fragment's finish"
@@ -3876,6 +3907,59 @@ mod tests {
             mpsc::error::TryRecvError::Disconnected
         );
         assert_eq!(max_active.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn janitor_deletion_queue_admits_at_most_the_production_concurrency() {
+        use tokio::sync::{mpsc, oneshot};
+
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(async move {
+            let mut queue = JanitorDeletionQueue::new(u64::MAX, JANITOR_OBJECT_DELETE_CONCURRENCY);
+            for _ in 0..=JANITOR_OBJECT_DELETE_CONCURRENCY {
+                queue.wait_for_slot().await;
+                let started = started_tx.clone();
+                queue.push(async move {
+                    let (complete, result) = oneshot::channel();
+                    let _ = started.send(complete);
+                    let result = result
+                        .await
+                        .unwrap_or(JanitorObjectDeletionResult::Retryable);
+                    (result, JanitorObjectDeletionTimings::default())
+                });
+                // A pushed future starts only when the queue polls it.
+                if queue.in_flight.len() == JANITOR_OBJECT_DELETE_CONCURRENCY {
+                    queue.wait_for_slot().await;
+                }
+            }
+            queue.drain().await;
+            queue.successful_deletes
+        });
+
+        let mut completions = Vec::new();
+        for _ in 0..JANITOR_OBJECT_DELETE_CONCURRENCY {
+            completions.push(started_rx.recv().await.expect("deletion starts"));
+        }
+        assert!(
+            matches!(started_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "a full queue must not start another deletion"
+        );
+
+        completions
+            .pop()
+            .expect("in-flight deletion")
+            .send(JanitorObjectDeletionResult::Deleted)
+            .expect("release one deletion");
+        completions.push(started_rx.recv().await.expect("freed slot is reused"));
+        for completion in completions {
+            completion
+                .send(JanitorObjectDeletionResult::Deleted)
+                .expect("release deletion");
+        }
+        assert_eq!(
+            worker.await.expect("queue worker"),
+            JANITOR_OBJECT_DELETE_CONCURRENCY as u64 + 1
+        );
     }
 
     #[tokio::test]
