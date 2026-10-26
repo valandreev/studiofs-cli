@@ -821,10 +821,10 @@ fn merged_dentry_case_insensitive_current_only_entry_stays_locally_visible() {
         &current,
         &tombstones,
         || {
-            Ok((
+            Ok(Some((
                 read_txn.open_table(DENTRIES_BY_FOLDED_NAME_TABLE).unwrap(),
                 read_txn.open_table(BASE_DENTRIES_BY_FOLDED_NAME_TABLE).unwrap(),
-            ))
+            )))
         },
         ROOT_INO,
         b"local",
@@ -1064,6 +1064,42 @@ fn single_table_case_insensitive_lookup_visits_only_folded_candidates() {
         assert_eq!(FOLDED_DENTRY_INDEX_ROWS.get(), rows, "{name:?}");
     }
     txn.abort().unwrap();
+}
+
+#[test]
+fn read_only_artifact_without_folded_indexes_keeps_case_insensitive_lookup() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("legacy.db");
+    let file_ino = {
+        let engine = RedbMetaEngine::open(&path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+        let file = engine
+            .create_file(ROOT_INO, b"MiXeD", 1000, 1000, 0o644)
+            .unwrap();
+        // Shape the file like an artifact written before the folded indexes existed.
+        let txn = engine.begin_write_txn().unwrap();
+        for table in [
+            DENTRIES_BY_FOLDED_NAME_TABLE,
+            BASE_DENTRIES_BY_FOLDED_NAME_TABLE,
+        ] {
+            assert!(txn.delete_table(table).unwrap());
+        }
+        txn.open_table(SETTINGS_TABLE)
+            .unwrap()
+            .insert(DENTRY_BY_INODE_INDEX_VERSION_SETTING, b"1".as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        engine.prepare_for_close().unwrap();
+        file.ino
+    };
+
+    let engine = RedbMetaEngine::open_read_only(&path).unwrap();
+    assert_eq!(engine.lookup(ROOT_INO, b"MiXeD").unwrap().ino, file_ino);
+    assert_eq!(engine.lookup(ROOT_INO, b"mixed").unwrap().ino, file_ino);
+    assert!(matches!(
+        engine.lookup(ROOT_INO, b"missing"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
 }
 
 #[test]

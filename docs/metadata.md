@@ -683,6 +683,8 @@ For regular files:
 Both folded indexes are maintained with the by-inode indexes by every dentry
 write helper and rebuilt on snapshot restore. Opening a database whose
 `dentry_by_inode_index_version` is not current rebuilds both index families.
+A read-only snapshot artifact is never rebuilt; when its index version is not
+current, a case-insensitive miss scans the parent as before the folded indexes.
 
 ### `readdir(parent)`
 

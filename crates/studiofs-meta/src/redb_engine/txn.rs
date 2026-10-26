@@ -26,6 +26,18 @@ impl RedbMetaEngine {
             .is_some())
     }
 
+    /// Whether the dentry secondary indexes match the current index version.
+    pub(super) fn dentry_indexes_current_in_read_txn(
+        txn: &redb::ReadTransaction,
+    ) -> MetaResult<bool> {
+        let settings = txn
+            .open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(settings
+            .get(DENTRY_BY_INODE_INDEX_VERSION_SETTING)?
+            .is_some_and(|version| version.value() == CURRENT_DENTRY_BY_INODE_INDEX_VERSION))
+    }
+
     pub(super) fn remote_namespace_visibility_filter_enabled_in_write_txn(
         txn: &redb::WriteTransaction,
     ) -> MetaResult<bool> {
@@ -100,8 +112,8 @@ impl RedbMetaEngine {
         Ok(table.get(ino)?.is_some())
     }
 
-    /// Reference case-insensitive name equality; [`fold_dentry_name`] must agree with it.
-    #[cfg(test)]
+    /// Case-insensitive name equality for the legacy directory scan;
+    /// [`fold_dentry_name`] must agree with it.
     pub(super) fn names_equal_case_insensitive(
         left: &[u8],
         right: &[u8],
@@ -306,7 +318,8 @@ impl RedbMetaEngine {
     ///
     /// `open_folded` opens the serving and base case-folded indexes; it runs only
     /// after an exact-key miss, so a hit pays no extra table opens and a miss
-    /// visits only the stored names that fold to `name`.
+    /// visits only the stored names that fold to `name`. `None` means the
+    /// indexes are not current, and the lookup scans the directory instead.
     pub(super) fn lookup_merged_from_opened_tables<
         TBase,
         TCurrent,
@@ -328,7 +341,7 @@ impl RedbMetaEngine {
         TTombstones: ReadableTable<&'static [u8], u8>,
         TCurrentFolded: ReadableTable<&'static [u8], u8>,
         TBaseFolded: ReadableTable<&'static [u8], u8>,
-        F: FnOnce() -> MetaResult<(TCurrentFolded, TBaseFolded)>,
+        F: FnOnce() -> MetaResult<Option<(TCurrentFolded, TBaseFolded)>>,
     {
         let key = encode_dentry_key(parent, name);
         let exact =
@@ -339,7 +352,9 @@ impl RedbMetaEngine {
 
         #[cfg(test)]
         super::tests::CASE_FALLBACK_MERGED_SCANS.with(|count| count.set(count.get() + 1));
-        let (current_folded, base_folded) = open_folded()?;
+        let Some((current_folded, base_folded)) = open_folded()? else {
+            return Self::lookup_merged_by_directory_scan(base, current, tombstones, parent, name);
+        };
         let prefix = folded_dentry_prefix(parent, name)?;
         let current_rows = current_folded
             .range(prefix.as_slice()..)
@@ -365,6 +380,55 @@ impl RedbMetaEngine {
                     current,
                     tombstones,
                     &stored_key,
+                )?;
+                if resolved.0.is_some() {
+                    return Ok(resolved);
+                }
+            }
+        }
+        Ok((None, false))
+    }
+
+    /// Case-insensitive fallback for a read-only database whose folded indexes
+    /// are missing or predate the current index version: scans the parent in
+    /// the serving and base tables, as lookups did before those indexes.
+    fn lookup_merged_by_directory_scan<TBase, TCurrent, TTombstones>(
+        base: &TBase,
+        current: &TCurrent,
+        tombstones: &TTombstones,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<(Option<DirEntryValue>, bool)>
+    where
+        TBase: ReadableTable<&'static [u8], &'static [u8]>,
+        TCurrent: ReadableTable<&'static [u8], &'static [u8]>,
+        TTombstones: ReadableTable<&'static [u8], u8>,
+    {
+        let mut name_lower = None;
+        let prefix = dentry_prefix(parent);
+        let end = prefix_successor(&prefix);
+        let current_rows = match end.as_ref() {
+            Some(end) => current.range(prefix.as_slice()..end.as_ref()),
+            None => current.range(prefix.as_slice()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_rows = match end.as_ref() {
+            Some(end) => base.range(prefix.as_slice()..end.as_ref()),
+            None => base.range(prefix.as_slice()..),
+        }
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for row in current_rows.chain(base_rows) {
+            let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (stored_parent, stored_name) = decode_dentry_key(key.value())?;
+            if stored_parent == parent
+                && Self::names_equal_case_insensitive(stored_name, name, &mut name_lower)
+            {
+                let resolved = Self::lookup_merged_exact_key_from_opened_tables(
+                    base,
+                    current,
+                    tombstones,
+                    key.value(),
                 )?;
                 if resolved.0.is_some() {
                     return Ok(resolved);
@@ -779,7 +843,7 @@ impl RedbMetaEngine {
                 &base,
                 &current,
                 &tombstones,
-                || Self::open_folded_dentry_indexes_in_write_txn(txn),
+                || Self::open_folded_dentry_indexes_in_write_txn(txn).map(Some),
                 parent,
                 name,
             )?
