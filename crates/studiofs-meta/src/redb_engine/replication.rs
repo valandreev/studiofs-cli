@@ -2580,10 +2580,22 @@ impl RedbMetaEngine {
             }
         }
         let before = Self::replay_scope_view(txn, &scope)?;
-        // Reconcile without deriving intents up front: for this client's own
-        // renames the view almost never changes. A real correction journals
-        // the intents the reconcile would have derived before writing, from
-        // the captured pre-write view.
+        // Descendant paths are not part of the captured view, and their
+        // historical ancestry is what the kernel cached, so a directory
+        // rename derives them before writing and keeps them only on a real
+        // change.
+        let descendant_scope = txn.invalidation_scope();
+        for event in &renames {
+            if let crate::events::MetaEvent::RenameEntry { entry, .. } = event
+                && entry.kind == FileType::Directory
+            {
+                Self::invalidate_directory_descendants(txn, entry.ino)?;
+            }
+        }
+        // Reconcile without deriving the remaining intents up front: for this
+        // client's own renames the view almost never changes. A real
+        // correction journals the intents the reconcile would have derived
+        // before writing, from the captured pre-write view.
         txn.without_invalidations(|| -> MetaResult<()> {
             for event in &renames {
                 if let crate::events::MetaEvent::RenameEntry {
@@ -2610,13 +2622,16 @@ impl RedbMetaEngine {
         })?;
         if Self::replay_scope_view(txn, &scope)? != before && !txn.invalidations_suppressed() {
             Self::journal_rename_reconcile_intents(txn, &renames, &scope, &before)?;
+        } else {
+            descendant_scope.discard();
         }
         Ok(true)
     }
 
-    /// Journals, after the write, the intents
+    /// Journals, after the write, the name and inode intents
     /// [`Self::reconcile_serving_rename_from_base_in_txn`] derives before it,
-    /// using the bindings captured in `before`.
+    /// using the bindings captured in `before`. Directory descendants are
+    /// derived by the caller before the write.
     fn journal_rename_reconcile_intents(
         txn: &RedbWriteTransaction<'_>,
         renames: &[&crate::events::MetaEvent],
@@ -2659,9 +2674,6 @@ impl RedbMetaEngine {
             else {
                 continue;
             };
-            if entry.kind == FileType::Directory {
-                Self::invalidate_directory_descendants(txn, entry.ino)?;
-            }
             for (parent, name) in [(*parent, name), (*new_parent, new_name)] {
                 let key = encode_dentry_key(parent, name);
                 let ino = bindings_before
