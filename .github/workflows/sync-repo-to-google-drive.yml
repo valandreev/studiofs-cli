@@ -1,4 +1,4 @@
-name: Sync Google Drive
+name: Sync Wasabi repository snapshots
 
 on:
   push:
@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: google-drive-repo-sync
-  cancel-in-progress: true
+  group: wasabi-repo-snapshot-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -28,13 +28,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rclone
 
-      - name: Restore rclone config
-        env:
-          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
-        run: |
-          mkdir -p "$HOME/.config/rclone"
-          echo "$RCLONE_CONFIG_B64" | base64 -d > "$HOME/.config/rclone/rclone.conf"
-
       - name: Create repo snapshot info
         run: |
           cat > _REPO_SNAPSHOT_INFO.md <<EOF
@@ -47,18 +40,40 @@ jobs:
           Synced at UTC: $(date -u +"%Y-%m-%d %H:%M:%S")
           EOF
 
-      - name: Sync repository files to Google Drive
+      - name: Create repository archive
+        id: archive
+        env:
+          ARCHIVE_PATH: ${{ runner.temp }}/repo-cli-${{ github.sha }}.tar.gz
         run: |
-          rclone sync . gdrive:/repo-cli \
-            --exclude ".git/**" \
-            --exclude "target/**" \
-            --exclude "node_modules/**" \
-            --exclude "dist/**" \
-            --exclude "build/**" \
-            --exclude ".cache/**" \
-            --exclude ".DS_Store" \
-            --delete-excluded \
-            --drive-chunk-size 64M \
-            --transfers 4 \
-            --checkers 8 \
+          tar \
+            --exclude=".git" \
+            --exclude="target" \
+            --exclude="node_modules" \
+            --exclude="dist" \
+            --exclude="build" \
+            --exclude=".cache" \
+            --exclude=".DS_Store" \
+            -czf "$ARCHIVE_PATH" \
+            -C "$GITHUB_WORKSPACE" .
+          echo "path=$ARCHIVE_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload repository archive to Wasabi
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.WASABI_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.WASABI_SECRET_ACCESS_KEY }}
+          WASABI_BUCKET: ${{ vars.WASABI_BUCKET }}
+          RCLONE_CONFIG_WASABI_TYPE: s3
+          RCLONE_CONFIG_WASABI_PROVIDER: Wasabi
+          RCLONE_CONFIG_WASABI_ENV_AUTH: "true"
+          RCLONE_CONFIG_WASABI_REGION: ${{ vars.WASABI_REGION }}
+          RCLONE_CONFIG_WASABI_ENDPOINT: ${{ vars.WASABI_ENDPOINT }}
+          ARCHIVE_PATH: ${{ steps.archive.outputs.path }}
+        run: |
+          : "${AWS_ACCESS_KEY_ID:?Set repository secret WASABI_ACCESS_KEY_ID}"
+          : "${AWS_SECRET_ACCESS_KEY:?Set repository secret WASABI_SECRET_ACCESS_KEY}"
+          : "${WASABI_BUCKET:?Set repository variable WASABI_BUCKET}"
+          : "${RCLONE_CONFIG_WASABI_REGION:?Set repository variable WASABI_REGION}"
+          : "${RCLONE_CONFIG_WASABI_ENDPOINT:?Set repository variable WASABI_ENDPOINT}"
+          rclone copyto "$ARCHIVE_PATH" \
+            "wasabi:${WASABI_BUCKET}/repo-cli/${GITHUB_SHA}.tar.gz" \
             --progress
