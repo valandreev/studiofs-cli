@@ -1,6 +1,6 @@
 use super::namespace::{
     DeferredNamespaceInner, DeferredNamespaceKey, DeferredNamespaceOp, DeferredNamespaceProgress,
-    DeferredNamespaceWait,
+    DeferredNamespaceState, DeferredNamespaceWait,
 };
 use super::{
     ATTR_CACHE_TTL, AccessLevel, Arc, ChunkId, DEFAULT_CHUNK_SIZE, DentryCacheValue,
@@ -35,6 +35,27 @@ const DEFERRED_NAMESPACE_BACKLOG_MAX_BYTES: usize = 1024 * 1024;
 const RMDIR_SETTLE_RETRY_ATTEMPTS: u16 = 80;
 const RMDIR_INFLIGHT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const RMDIR_CLEANUP_RETRY_ATTEMPTS: u16 = 200;
+
+/// Registers a waiting barrier for its lifetime, including cancellation.
+struct DeferredNamespaceBarrierWaiter<'a> {
+    deferred: &'a DeferredNamespaceState,
+}
+
+impl<'a> DeferredNamespaceBarrierWaiter<'a> {
+    fn register(deferred: &'a DeferredNamespaceState) -> Self {
+        deferred.barrier_waiters.fetch_add(1, Ordering::AcqRel);
+        // Wake a background drainer lingering for more admissions.
+        deferred.notify.notify_waiters();
+        Self { deferred }
+    }
+}
+
+impl Drop for DeferredNamespaceBarrierWaiter<'_> {
+    fn drop(&mut self) {
+        self.deferred.barrier_waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     static RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -755,7 +776,18 @@ impl StudioVfs {
         }));
     }
 
+    fn deferred_namespace_barrier_waiting(&self) -> bool {
+        self.state
+            .namespace
+            .deferred
+            .barrier_waiters
+            .load(Ordering::Acquire)
+            != 0
+    }
+
     pub(super) async fn drain_deferred_namespace_metadata_for_barrier(&self) -> VfsResult<()> {
+        let _barrier_waiter =
+            DeferredNamespaceBarrierWaiter::register(&self.state.namespace.deferred);
         let cutoff = self
             .state
             .namespace
@@ -904,6 +936,22 @@ impl StudioVfs {
         self.state.namespace.deferred.notify.notify_waiters();
     }
 
+    fn deferred_namespace_batch_linger_delay(&self) -> Duration {
+        #[cfg(test)]
+        {
+            let override_ms = self
+                .state
+                .namespace
+                .deferred
+                .batch_linger_override_ms
+                .load(Ordering::Acquire);
+            if override_ms != 0 {
+                return Duration::from_millis(override_ms);
+            }
+        }
+        DEFERRED_NAMESPACE_BATCH_LINGER_DELAY
+    }
+
     async fn drain_deferred_namespace_metadata(&self, cutoff: Option<u64>) {
         let mut batch = Vec::with_capacity(DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS);
         loop {
@@ -945,10 +993,16 @@ impl StudioVfs {
                 continue;
             }
 
-            let sleep = tokio::time::sleep(DEFERRED_NAMESPACE_BATCH_LINGER_DELAY);
+            // Linger for more admissions only when nobody waits on this batch.
+            // A barrier-owned drain commits up to its cutoff immediately, and a
+            // barrier arriving mid-linger cuts the background linger short.
+            let sleep = tokio::time::sleep(self.deferred_namespace_batch_linger_delay());
             tokio::pin!(sleep);
-            while batch.len() < DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS {
+            while cutoff.is_none() && batch.len() < DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS {
                 let notified = self.state.namespace.deferred.notify.notified();
+                if self.deferred_namespace_barrier_waiting() {
+                    break;
+                }
                 tokio::select! {
                     _ = notified => {
                         let room = DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS - batch.len();
@@ -1287,11 +1341,24 @@ impl StudioVfs {
         args: SetattrArgs,
         defer_handle_growth_flush: bool,
     ) -> VfsResult<InodeAttr> {
+        // A lingering deferred materialization task holds the materialize gate.
+        // Like flush and fsync, a strict size change interrupts and waits for
+        // it. Deferred handle growth may overtake materialization, so it only
+        // asks the task to stop lingering while it waits for the gate.
+        let materialize_interrupt = if defer_handle_growth_flush {
+            self.state
+                .deferred_materialize_inflight
+                .request_interrupt(ino)
+        } else {
+            self.wait_for_deferred_materialization_inflight(ino).await;
+            None
+        };
         let session = self
             .state
             .file_session
             .enter_op(ino, FileSessionOperation::Flush)
             .await;
+        drop(materialize_interrupt);
         let result: VfsResult<InodeAttr> = async {
             let candidate_old_attr = if defer_handle_growth_flush {
                 Some(self.getattr_async(ino).await?)

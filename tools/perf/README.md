@@ -73,6 +73,17 @@ starting services. See
 [`docs/perf/sfs-718-pg-sync-thresholds.md`](../../docs/perf/sfs-718-pg-sync-thresholds.md)
 for the SFS-718 decision and retained evidence.
 
+For per-thread CPU attribution of Linux mounted metadata operations
+(`pg-meta-poll`, FUSE threads, tokio workers), use
+`linux-metadata-profile.sh` with a `perf` built for the running kernel. It runs
+the rename, create, parallel, and large-directory rename phases against a
+mounted volume and writes `summary.tsv` plus per-phase `perf.data` under the
+chosen output directory. See
+[`docs/perf/linux-perf-profiling.md`](../../docs/perf/linux-perf-profiling.md)
+for the `perf` build and
+[`docs/perf/sfs-905-linux-metadata-profile.md`](../../docs/perf/sfs-905-linux-metadata-profile.md)
+for the SFS-905 results.
+
 For SFS-893 Linux sustained sequential write attribution, use
 `linux-sustained-write.sh` against an already-mounted volume or a raw directory
 on the cache disk. It runs back-to-back fio sequential writes with

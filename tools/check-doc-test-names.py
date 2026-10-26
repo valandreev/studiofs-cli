@@ -17,6 +17,7 @@ DEFAULT_DOCS = (
 )
 
 EXCLUDED_NAMES = {
+    "sem_wait",
     "serial_test",
     "temp_env",
     "workflow_dispatch",

@@ -232,6 +232,12 @@ client, runs `discover` for peers, mounts each client with a separate
 tracing logs, and owns graceful unmount, forced kill, and restart/remount
 lifecycle transitions.
 
+## Profiling
+
+To profile a Linux mount with `perf`, including building `perf` for a WSL2
+kernel and a symbolized `studiofs` binary, follow
+[Profiling a Linux Mount With `perf`](perf/linux-perf-profiling.md).
+
 ## Related Docs
 
 - [Contributing](contributing.md) — contribution rules

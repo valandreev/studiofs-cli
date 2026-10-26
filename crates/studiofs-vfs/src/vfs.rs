@@ -3745,6 +3745,12 @@ impl DeferredInodeGate {
         self.entries.lock().contains_key(&ino)
     }
 
+    /// Ask the current task for `ino` to stop lingering without waiting for it.
+    fn request_interrupt(&self, ino: Ino) -> Option<DeferredInodeInterruptGuard> {
+        let task_state = self.entries.lock().get(&ino).cloned()?;
+        Some(DeferredInodeInterruptGuard::new(task_state))
+    }
+
     #[cfg(test)]
     fn replace_if_current(
         &self,

@@ -174,8 +174,14 @@ pub(super) struct DeferredNamespaceState {
     /// Non-owning VFS handle used only to resume the background drainer after
     /// a synchronous barrier reaches its admission cutoff.
     owner: OnceLock<Weak<StudioVfs>>,
+    /// Barriers waiting for deferred operations; the background drainer stops
+    /// lingering for more admissions while any barrier waits.
+    pub(super) barrier_waiters: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(super) barrier_cutoff: AtomicU64,
+    /// Test override for the batch linger delay in milliseconds; 0 keeps the default.
+    #[cfg(test)]
+    pub(super) batch_linger_override_ms: AtomicU64,
 }
 
 impl DeferredNamespaceState {
@@ -187,8 +193,11 @@ impl DeferredNamespaceState {
             draining: AtomicBool::new(false),
             degraded: AtomicBool::new(false),
             owner: OnceLock::new(),
+            barrier_waiters: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             barrier_cutoff: AtomicU64::new(0),
+            #[cfg(test)]
+            batch_linger_override_ms: AtomicU64::new(0),
         }
     }
 
