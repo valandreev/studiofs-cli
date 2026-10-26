@@ -130,7 +130,7 @@ Every mount in this matrix returned `EACCES` for a create in the mount root for
 about 400 ms after `.studiofs-runtime-stats` became readable. That was two
 failed probes per mount, then success, with 17 failures in total. The series
 driver waits for a successful create before starting fio. This is unrelated to
-throughput and needs its own issue.
+throughput and is tracked as SFS-902.
 
 ## Limits
 
