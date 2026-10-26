@@ -574,6 +574,7 @@ impl VfsBootstrap {
                 ),
             ))),
             coherence_pending_invalidations: Mutex::new(VecDeque::new()),
+            metadata_reconcile_counters: Default::default(),
             janitor_interval: plan.janitor_interval,
             janitor_skip_newer_than: plan.janitor_skip_newer_than,
             janitor_max_deletes_per_run: plan.janitor_max_deletes_per_run,

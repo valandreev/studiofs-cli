@@ -10,6 +10,20 @@ use crate::schema::counters::{self, LOCAL_PG_FLUSHED_EVENT_SEQ, NEXT_EVENT_SEQ};
 use std::sync::Arc;
 use std::thread;
 
+thread_local! {
+    /// Parent-scoped case-insensitive dentry scans after an exact-key miss.
+    pub(super) static CASE_FALLBACK_DENTRY_SCANS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Merged serving/base case-insensitive scans after an exact-key miss.
+    pub(super) static CASE_FALLBACK_MERGED_SCANS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Takes the merged case-insensitive fallback scan count on this thread.
+pub(crate) fn take_case_fallback_merged_scans() -> usize {
+    CASE_FALLBACK_MERGED_SCANS.with(|count| count.replace(0))
+}
+
 fn invalidate_local_storage_page_stats(engine: &RedbMetaEngine) {
     *engine
         .local_storage_page_stats
@@ -92,6 +106,451 @@ fn coherence_journal_directory_rename_and_removal_retain_descendant_paths() {
         ancestors: Some(vec![b"new".to_vec(), b"nested".to_vec()]),
         ino: Some(file.ino)
     }));
+}
+
+#[test]
+fn suppressed_replica_base_mirror_skips_invalidation_derivation_reads() {
+    let engine = temp_engine();
+    let dir = engine
+        .create_dir(ROOT_INO, b"old", 1000, 1000, 0o755)
+        .unwrap();
+    let file = engine
+        .create_file(dir.ino, b"child", 1000, 1000, 0o644)
+        .unwrap();
+    let rename = MetaEvent::RenameEntry {
+        parent: ROOT_INO,
+        name: b"old".to_vec(),
+        new_parent: ROOT_INO,
+        new_name: b"new".to_vec(),
+        entry: DirEntryValue {
+            ino: dir.ino,
+            kind: FileType::Directory,
+        },
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: None,
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    };
+    let events = [
+        MetaEvent::SetAttr { attr: dir.clone() },
+        MetaEvent::SetAttr { attr: file.clone() },
+        rename,
+    ];
+    engine.take_invalidation_batches();
+    replication::take_replica_invalidation_derivations();
+
+    // Self-batch base mirroring discards its intents, so it must not derive them.
+    let txn = engine.begin_write_txn().unwrap();
+    txn.without_invalidations(|| {
+        RedbMetaEngine::apply_replica_events_to_base_in_txn(&txn, &events, &HashSet::new())
+    })
+    .unwrap();
+    txn.commit().unwrap();
+    assert_eq!(replication::take_replica_invalidation_derivations(), 0);
+    assert!(engine.take_invalidation_batches().is_empty());
+
+    // Control: the same mirror outside suppression still derives and journals intents.
+    let txn = engine.begin_write_txn().unwrap();
+    RedbMetaEngine::apply_replica_events_to_base_in_txn(&txn, &events, &HashSet::new()).unwrap();
+    txn.commit().unwrap();
+    assert!(replication::take_replica_invalidation_derivations() > 0);
+    assert!(!engine.take_invalidation_batches().is_empty());
+}
+
+#[test]
+fn serving_rename_reconcile_reduces_local_journal_once_per_replay_pass() {
+    let engine = temp_engine();
+    let mut renames = Vec::new();
+    for index in 0..8 {
+        let name = format!("src-{index}").into_bytes();
+        let file = engine
+            .create_file(ROOT_INO, &name, 1000, 1000, 0o644)
+            .unwrap();
+        renames.push(MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name,
+            new_parent: ROOT_INO,
+            new_name: format!("dst-{index}").into_bytes(),
+            entry: DirEntryValue {
+                ino: file.ino,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        });
+    }
+    // Base already holds every destination, so each rename consults local removal state.
+    engine.apply_replica_events_to_base(&renames).unwrap();
+    replication::take_local_dentry_journal_scans();
+
+    engine.apply_replica_serving_state(&renames).unwrap();
+
+    assert_eq!(replication::take_local_dentry_journal_scans(), 1);
+    for index in 0..8 {
+        let name = format!("dst-{index}").into_bytes();
+        assert!(engine.lookup(ROOT_INO, &name).is_ok());
+    }
+}
+
+#[test]
+fn serving_dentry_reconcile_uses_exact_base_keys_without_directory_scans() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"Source", 1000, 1000, 0o644)
+        .unwrap();
+    let setup_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = engine.read_events_range(0, setup_end).unwrap();
+    engine.apply_replica_events_to_base(&setup).unwrap();
+    engine
+        .create_file(ROOT_INO, b"absent", 1000, 1000, 0o644)
+        .unwrap();
+    engine
+        .rename(ROOT_INO, b"Source", ROOT_INO, b"destination")
+        .unwrap();
+    let protected = encode_dentry_key(ROOT_INO, b"destination");
+    let keys = HashSet::from([
+        encode_dentry_key(ROOT_INO, b"Source"),
+        encode_dentry_key(ROOT_INO, b"source"),
+        encode_dentry_key(ROOT_INO, b"absent"),
+        protected.clone(),
+    ]);
+    CASE_FALLBACK_DENTRY_SCANS.set(0);
+
+    engine
+        .reconcile_serving_dentries_from_base(&keys, &HashSet::from([protected]))
+        .unwrap();
+
+    assert_eq!(
+        CASE_FALLBACK_DENTRY_SCANS.get(),
+        0,
+        "exact event keys must not scan the parent directory"
+    );
+    let entries = engine.readdir(ROOT_INO).unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == b"Source" && entry.ino == file.ino),
+        "base binding `Source` must be restored: {entries:?}"
+    );
+    // Base has no `destination`, so only protection keeps the local binding.
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.name == b"destination" && entry.ino == file.ino),
+        "protected local binding `destination` must survive: {entries:?}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.name == b"source" || entry.name == b"absent"),
+        "missing base keys must not leave `source`/`absent` in serving: {entries:?}"
+    );
+}
+
+#[test]
+fn base_rename_prior_keys_use_exact_lookup_for_stale_index_entries() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"Source", 1000, 1000, 0o644)
+        .unwrap();
+    let setup_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = engine.read_events_range(0, setup_end).unwrap();
+    engine.apply_replica_events_to_base(&setup).unwrap();
+    let entry = DirEntryValue {
+        ino: file.ino,
+        kind: FileType::RegularFile,
+    };
+    // A by-inode index key without its exact base dentry must not resolve to `Source`.
+    let txn = engine.begin_write_txn().unwrap();
+    RedbMetaEngine::insert_dentry_index_in_txn(
+        &txn,
+        BASE_DENTRIES_BY_INODE_TABLE,
+        ROOT_INO,
+        b"source",
+        &entry,
+    )
+    .unwrap();
+    txn.commit().unwrap();
+
+    // The event source does not match base, so the prior key comes from the index.
+    CASE_FALLBACK_DENTRY_SCANS.set(0);
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"elsewhere".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"renamed".to_vec(),
+            entry: entry.clone(),
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        }])
+        .unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let base = txn.open_table(BASE_DENTRIES_TABLE).unwrap();
+    let source =
+        RedbMetaEngine::lookup_exact_in_opened_dentry_table(&base, ROOT_INO, b"Source").unwrap();
+    let renamed =
+        RedbMetaEngine::lookup_exact_in_opened_dentry_table(&base, ROOT_INO, b"renamed").unwrap();
+    assert_eq!(
+        source, None,
+        "single exact prior key `Source` must be removed"
+    );
+    assert_eq!(renamed, Some(entry), "rename destination must be installed");
+    assert_eq!(
+        CASE_FALLBACK_DENTRY_SCANS.get(),
+        0,
+        "an exact source miss must not scan the parent directory"
+    );
+}
+
+#[test]
+fn base_rename_case_variant_source_resolves_exact_prior_key() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"Source", 1000, 1000, 0o644)
+        .unwrap();
+    let setup_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = engine.read_events_range(0, setup_end).unwrap();
+    engine.apply_replica_events_to_base(&setup).unwrap();
+    let entry = DirEntryValue {
+        ino: file.ino,
+        kind: FileType::RegularFile,
+    };
+    CASE_FALLBACK_DENTRY_SCANS.set(0);
+
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::RenameEntry {
+            parent: ROOT_INO,
+            name: b"source".to_vec(),
+            new_parent: ROOT_INO,
+            new_name: b"renamed".to_vec(),
+            entry: entry.clone(),
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        }])
+        .unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let base = txn.open_table(BASE_DENTRIES_TABLE).unwrap();
+    let source =
+        RedbMetaEngine::lookup_exact_in_opened_dentry_table(&base, ROOT_INO, b"Source").unwrap();
+    let renamed =
+        RedbMetaEngine::lookup_exact_in_opened_dentry_table(&base, ROOT_INO, b"renamed").unwrap();
+    assert_eq!(
+        source, None,
+        "case-variant source must not keep `Source` as a duplicate binding"
+    );
+    assert_eq!(renamed, Some(entry), "rename destination must be installed");
+    assert_eq!(
+        CASE_FALLBACK_DENTRY_SCANS.get(),
+        0,
+        "the replica rename source check must not scan the parent directory"
+    );
+}
+
+#[test]
+fn regular_file_serving_install_skips_stale_case_alias_index_key() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"Source", 1000, 1000, 0o644)
+        .unwrap();
+    let setup_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = engine.read_events_range(0, setup_end).unwrap();
+    engine.apply_replica_events_to_base(&setup).unwrap();
+    let txn = engine.begin_write_txn().unwrap();
+    RedbMetaEngine::insert_dentry_index_in_txn(
+        &txn,
+        BASE_DENTRIES_BY_INODE_TABLE,
+        ROOT_INO,
+        b"source",
+        &DirEntryValue {
+            ino: file.ino,
+            kind: FileType::RegularFile,
+        },
+    )
+    .unwrap();
+    txn.commit().unwrap();
+
+    engine
+        .reconcile_regular_file_serving_from_base_with_protected_dentries(
+            &HashSet::from([file.ino]),
+            &HashSet::new(),
+        )
+        .unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    let serving = txn.open_table(DENTRIES_TABLE).unwrap();
+    let alias =
+        RedbMetaEngine::lookup_exact_in_opened_dentry_table(&serving, ROOT_INO, b"source").unwrap();
+    assert_eq!(
+        alias, None,
+        "a stale index key must not install a serving alias"
+    );
+}
+
+#[test]
+fn self_rename_mirror_reconcile_uses_exact_dentry_keys() {
+    let engine = temp_engine();
+    let dir = engine
+        .create_dir(ROOT_INO, b"big", 1000, 1000, 0o755)
+        .unwrap();
+    for index in 0..64 {
+        engine
+            .create_file(
+                dir.ino,
+                format!("sibling-{index}").as_bytes(),
+                1000,
+                1000,
+                0o644,
+            )
+            .unwrap();
+    }
+    let file = engine
+        .create_file(dir.ino, b"src", 1000, 1000, 0o644)
+        .unwrap();
+    let setup_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = engine.read_events_range(0, setup_end).unwrap();
+    engine.apply_replica_events_to_base(&setup).unwrap();
+    // The local rename already moved serving; the self-ack then mirrors it to base.
+    engine.rename(dir.ino, b"src", dir.ino, b"dst").unwrap();
+    let rename = MetaEvent::RenameEntry {
+        parent: dir.ino,
+        name: b"src".to_vec(),
+        new_parent: dir.ino,
+        new_name: b"dst".to_vec(),
+        entry: DirEntryValue {
+            ino: file.ino,
+            kind: FileType::RegularFile,
+        },
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: None,
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    };
+    let txn = engine.begin_write_txn().unwrap();
+    txn.without_invalidations(|| {
+        RedbMetaEngine::apply_replica_events_to_base_in_txn(
+            &txn,
+            std::slice::from_ref(&rename),
+            &HashSet::new(),
+        )
+    })
+    .unwrap();
+    CASE_FALLBACK_DENTRY_SCANS.set(0);
+
+    RedbMetaEngine::reconcile_serving_rename_from_base_in_txn(
+        &txn,
+        dir.ino,
+        b"src",
+        dir.ino,
+        b"dst",
+        &DirEntryValue {
+            ino: file.ino,
+            kind: FileType::RegularFile,
+        },
+        &mut replication::ReplayLocalJournal::default(),
+    )
+    .unwrap();
+    txn.commit().unwrap();
+
+    // Mirror maintenance acts on the exact keys events carry; a miss must not scan the parent.
+    assert_eq!(CASE_FALLBACK_DENTRY_SCANS.get(), 0);
+    assert_eq!(engine.lookup(dir.ino, b"dst").unwrap().ino, file.ino);
+    assert!(matches!(
+        engine.lookup(dir.ino, b"src"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+}
+
+#[test]
+fn pending_rename_replay_reduces_alias_journal_once_and_uses_exact_keys() {
+    let engine = temp_engine();
+    let dir = engine
+        .create_dir(ROOT_INO, b"big", 1000, 1000, 0o755)
+        .unwrap();
+    for index in 0..32 {
+        engine
+            .create_file(
+                dir.ino,
+                format!("sibling-{index}").as_bytes(),
+                1000,
+                1000,
+                0o644,
+            )
+            .unwrap();
+    }
+    let mut files = Vec::new();
+    for index in 0..8 {
+        files.push(
+            engine
+                .create_file(
+                    dir.ino,
+                    format!("src-{index}").as_bytes(),
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .unwrap(),
+        );
+    }
+    let flushed = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let setup = engine.read_events_range(0, flushed).unwrap();
+    engine.apply_replica_events_to_base(&setup).unwrap();
+    engine
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, flushed)
+        .unwrap();
+    let mut renames = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        let name = format!("src-{index}").into_bytes();
+        let new_name = format!("dst-{index}").into_bytes();
+        engine.rename(dir.ino, &name, dir.ino, &new_name).unwrap();
+        renames.push(MetaEvent::RenameEntry {
+            parent: dir.ino,
+            name,
+            new_parent: dir.ino,
+            new_name,
+            entry: DirEntryValue {
+                ino: file.ino,
+                kind: FileType::RegularFile,
+            },
+            displaced_set_attr: Box::new(None),
+            displaced_remove_attr_ino: None,
+            moved_dir_attr: Box::new(None),
+            old_parent_attr: Box::new(None),
+            new_parent_attr: Box::new(None),
+        });
+    }
+    let unflushed = engine.get_counter(NEXT_EVENT_SEQ).unwrap() - flushed;
+    RedbMetaEngine::reset_pending_local_alias_event_scan_count_for_test();
+    CASE_FALLBACK_DENTRY_SCANS.set(0);
+
+    // Unpublished renames: base lacks every destination, so each one is a stale candidate.
+    engine
+        .apply_replica_serving_state_for_pending_replay(&renames)
+        .unwrap();
+
+    let scanned = RedbMetaEngine::pending_local_alias_event_scan_count_for_test();
+    assert!(
+        scanned as u64 <= unflushed,
+        "one alias reduction per pass, scanned {scanned} rows of {unflushed}"
+    );
+    assert_eq!(CASE_FALLBACK_DENTRY_SCANS.get(), 0);
+    for (index, file) in files.iter().enumerate() {
+        let name = format!("dst-{index}").into_bytes();
+        assert_eq!(engine.lookup(dir.ino, &name).unwrap().ino, file.ino);
+    }
 }
 
 #[test]

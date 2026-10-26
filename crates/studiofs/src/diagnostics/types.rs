@@ -58,8 +58,12 @@ pub(crate) struct DiagnosticsHealthSnapshot {
     pub file_sessions: VfsFileSessionStats,
     pub foreground_reads: VfsForegroundReadProtectionStats,
     pub write_path: VfsWritePathObservabilitySnapshot,
+    /// Mount-local replication backlog and file-session telemetry.
     #[serde(default)]
-    pub zeroio: VfsZeroIoRuntimeSnapshot,
+    pub synchronization: DiagnosticsSynchronizationSnapshot,
+    /// Missing legacy telemetry cannot certify synchronization completion.
+    #[serde(default)]
+    pub sync_safety: studiofs_vfs::VfsSyncSafetySnapshot,
     /// Mount-local replication and invalidation coherence health.
     #[serde(default)]
     pub coherence: CoherenceHealthSnapshot,
@@ -111,24 +115,15 @@ impl DiagnosticsRuntimeSnapshot {
         Self {
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,
-            sync_safety: studiofs_vfs::VfsSyncSafetySnapshot::default(),
+            sync_safety: health.sync_safety,
             process: DiagnosticsProcessSnapshot::default(),
             ingress: health.ingress,
             write_path: health.write_path,
             cache: DiagnosticsCacheSnapshot::default(),
-            synchronization: DiagnosticsSynchronizationSnapshot {
-                state: VfsSynchronizationStateSnapshot {
-                    file_sessions: health.file_sessions,
-                    foreground_reads: health.foreground_reads,
-                    pending_metadata_ops: 0,
-                    inflight_metadata_ops: 0,
-                    coherence: health.coherence,
-                    pg_sync: studiofs_meta::PgSyncDiagnostics::default(),
-                },
-            },
+            synchronization: health.synchronization,
             coherence: health.coherence,
             upload: health.upload,
-            zeroio: health.zeroio,
+            zeroio: VfsZeroIoRuntimeSnapshot::default(),
         }
     }
 }

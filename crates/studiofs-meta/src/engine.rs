@@ -1680,6 +1680,25 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
         object_id: u64,
     ) -> MetaResult<bool>;
 
+    /// Batch form of [`Self::has_regular_file_overlay_object_if_matches`].
+    ///
+    /// Returns, in input order, the object ids still referenced by the inode's
+    /// local regular-file overlay for `expected_epoch`.
+    fn regular_file_overlay_objects_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> MetaResult<Vec<u64>> {
+        let mut referenced = Vec::new();
+        for &object_id in object_ids {
+            if self.has_regular_file_overlay_object_if_matches(ino, expected_epoch, object_id)? {
+                referenced.push(object_id);
+            }
+        }
+        Ok(referenced)
+    }
+
     /// Mark a still-referenced overlay object as remote-visible for the current
     /// unpublished epoch, even when its logical block is represented by
     /// multiple slice records and cannot be synthesized into a single

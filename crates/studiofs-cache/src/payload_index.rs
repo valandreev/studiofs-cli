@@ -285,6 +285,26 @@ impl CacheIndex {
             .map(|entry| entry.into_public(object_id)))
     }
 
+    /// Look up a batch of object ids using one read snapshot.
+    pub(crate) fn get_entries(
+        &self,
+        object_ids: &[u64],
+    ) -> Result<Vec<Option<CacheIndexEntry>>, CacheIndexError> {
+        #[cfg(test)]
+        self.note_lookup_read_for_test()?;
+        let txn = self.db.begin_read().map_err(storage_error)?;
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
+        object_ids
+            .iter()
+            .map(|&object_id| {
+                Ok(read_entry_from_payloads(&payloads, object_id)?
+                    .map(|entry| entry.into_public(object_id)))
+            })
+            .collect()
+    }
+
     /// Checks a batch for any indexed object using one read snapshot.
     pub(crate) fn any_present(&self, object_ids: &[u64]) -> Result<bool, CacheIndexError> {
         #[cfg(test)]

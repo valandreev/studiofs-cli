@@ -44,6 +44,9 @@ use tracing::{debug, info, warn};
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_RECORD_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 const DAEMON_RECORD_PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// After the daemon attaches, wait this long for startup sync to grant write
+/// authority (`live`) or settle as `degraded` before `--detach` returns.
+const DAEMON_WRITE_AUTHORITY_TIMEOUT: Duration = Duration::from_secs(10);
 const MOUNT_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // StudioVfs::shutdown bounds each admission wait at two seconds; five attempts cap this at ten.
 const MOUNT_VFS_SHUTDOWN_ADMISSION_MAX_ATTEMPTS: usize = 5;
@@ -1523,6 +1526,7 @@ impl PreparedMount {
                 &self.plan.command.name,
                 &self.plan.actual_mount_path,
                 &self.plan.command.meta_dir,
+                self.plan.command.read_only,
             );
             drop(self.mount_lock.take());
             return result;
@@ -2397,7 +2401,12 @@ fn resolve_mount_meta_session(
 
 /// Re-execute the current process without `-d`/`--detach`, detached from the
 /// terminal. The child enables daily-rotated tracing logs under the client root.
-fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Result<()> {
+fn spawn_daemon(
+    name: &str,
+    mount_point: &str,
+    meta_dir: &Path,
+    read_only: bool,
+) -> anyhow::Result<()> {
     let logs_dir = utils::get_logs_dir()?;
     let log_stem = daemon_log_stem(name, meta_dir)?;
     let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -2453,8 +2462,11 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
         mount_point,
         pid,
         &mut child,
-        DAEMON_RECORD_PUBLISH_TIMEOUT,
-        DAEMON_RECORD_PUBLISH_POLL_INTERVAL,
+        DaemonRecordWait {
+            publish_timeout: DAEMON_RECORD_PUBLISH_TIMEOUT,
+            write_authority_timeout: DAEMON_WRITE_AUTHORITY_TIMEOUT,
+            poll_interval: DAEMON_RECORD_PUBLISH_POLL_INTERVAL,
+        },
     )
     .with_context(|| format!("check daemon log file at '{}'", plan.log_path.display()))?;
 
@@ -2467,34 +2479,52 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
         status,
         record.sync_lifecycle.as_deref().unwrap_or("unknown")
     );
+    if status != utils::MountRecordStatus::Live && !read_only {
+        println!(
+            "  Write access is not granted yet: new files and writes fail with permission denied until sync reaches 'live'."
+        );
+    }
     println!("  Log file: {}", plan.log_path.display());
     println!("  To unmount: studiofs umount \"{}\"", mount_point);
 
     Ok(())
 }
 
+/// Bounds for waiting on the daemon's mount record after `--detach` spawns it.
+#[derive(Debug, Clone, Copy)]
+struct DaemonRecordWait {
+    /// Deadline for the daemon to attach the native mount.
+    publish_timeout: Duration,
+    /// Extra wait after attachment for write authority or a settled lifecycle.
+    write_authority_timeout: Duration,
+    poll_interval: Duration,
+}
+
 fn wait_for_daemon_mount_record(
     mount_point: &str,
     expected_pid: u32,
     child: &mut std::process::Child,
-    timeout: Duration,
-    poll_interval: Duration,
+    wait: DaemonRecordWait,
 ) -> anyhow::Result<utils::MountRecordInfo> {
     wait_for_daemon_mount_record_with(
         mount_point,
         expected_pid,
-        timeout,
-        poll_interval,
+        wait,
         utils::read_mount_record,
         || Ok(child.try_wait()?.is_none()),
     )
 }
 
+/// Wait until the daemon reports a mount state that callers can act on.
+///
+/// `mounted` proves native attachment, but a fresh client rejects new
+/// mutations until startup sync is `live`. Keep polling through that window so
+/// a create right after `--detach` returns does not fail with EACCES; a mount
+/// still pending after the bounded wait is returned as `mounted`.
 fn wait_for_daemon_mount_record_with<ReadPid, IsChildAlive>(
     mount_point: &str,
     expected_pid: u32,
-    timeout: Duration,
-    poll_interval: Duration,
+    wait: DaemonRecordWait,
     read_pid_file: ReadPid,
     mut is_child_alive: IsChildAlive,
 ) -> anyhow::Result<utils::MountRecordInfo>
@@ -2502,22 +2532,23 @@ where
     ReadPid: Fn(&str) -> anyhow::Result<utils::MountRecordInfo>,
     IsChildAlive: FnMut() -> anyhow::Result<bool>,
 {
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = std::time::Instant::now() + wait.publish_timeout;
+    let mut write_authority_deadline = None;
+    let mut attached = None;
     loop {
+        let mut settled = None;
         if let Ok(record) = read_pid_file(mount_point)
             && record.pid == expected_pid
         {
             match record.status {
-                utils::MountRecordStatus::Mounted
-                | utils::MountRecordStatus::Live
-                | utils::MountRecordStatus::Degraded => {
-                    if is_child_alive()? {
-                        return Ok(record);
-                    }
-                    anyhow::bail!(
-                        "background mount process exited after publishing mount state for '{}'",
-                        mount_point
-                    );
+                utils::MountRecordStatus::Live | utils::MountRecordStatus::Degraded => {
+                    settled = Some(record);
+                }
+                utils::MountRecordStatus::Mounted => {
+                    write_authority_deadline.get_or_insert_with(|| {
+                        std::time::Instant::now() + wait.write_authority_timeout
+                    });
+                    attached = Some(record);
                 }
                 utils::MountRecordStatus::Failed => {
                     anyhow::bail!(
@@ -2528,23 +2559,36 @@ where
                 utils::MountRecordStatus::Starting => {}
             }
         }
+        // Checked even when this poll could not read the record, so a record
+        // that disappears after attachment cannot extend the wait unbounded.
+        if settled.is_none()
+            && write_authority_deadline
+                .is_some_and(|authority_deadline| std::time::Instant::now() >= authority_deadline)
+        {
+            settled = attached.take();
+        }
 
+        let published = settled.is_some() || write_authority_deadline.is_some();
         if !is_child_alive()? {
+            let phase = if published { "after" } else { "before" };
             anyhow::bail!(
-                "background mount process exited before publishing mount state for '{}'",
+                "background mount process exited {phase} publishing mount state for '{}'",
                 mount_point
             );
         }
+        if let Some(record) = settled {
+            return Ok(record);
+        }
 
-        if std::time::Instant::now() >= deadline {
+        if !published && std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "background mount process did not publish mount state for '{}' within {}s",
                 mount_point,
-                timeout.as_secs()
+                wait.publish_timeout.as_secs()
             );
         }
 
-        std::thread::sleep(poll_interval);
+        std::thread::sleep(wait.poll_interval);
     }
 }
 
@@ -3632,13 +3676,12 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_daemon_mount_record_accepts_child_record_once_mounted() {
+    fn wait_for_daemon_mount_record_continues_past_mounted_to_live() {
         let attempts = Arc::new(Mutex::new(0usize));
-        wait_for_daemon_mount_record_with(
+        let record = wait_for_daemon_mount_record_with(
             "/tmp/demo",
             4242,
-            Duration::from_secs(1),
-            Duration::ZERO,
+            test_record_wait(Duration::from_secs(1)),
             {
                 let attempts = attempts.clone();
                 move |_| {
@@ -3668,6 +3711,158 @@ mod tests {
             || Ok(true),
         )
         .expect("daemon record should eventually appear");
+
+        assert_eq!(record.status, utils::MountRecordStatus::Live);
+    }
+
+    fn test_record_wait(write_authority_timeout: Duration) -> DaemonRecordWait {
+        DaemonRecordWait {
+            publish_timeout: Duration::from_secs(1),
+            write_authority_timeout,
+            poll_interval: Duration::ZERO,
+        }
+    }
+
+    fn test_mount_record(
+        status: utils::MountRecordStatus,
+        sync_lifecycle: Option<&str>,
+    ) -> utils::MountRecordInfo {
+        utils::MountRecordInfo {
+            record_version: 2,
+            pid: 4242,
+            mount_point: "/tmp/demo".to_string(),
+            volume: "demo".to_string(),
+            cache_path: None,
+            instance_id: Some("test-instance".to_string()),
+            status,
+            sync_lifecycle: sync_lifecycle.map(ToString::to_string),
+            diagnostics: None,
+        }
+    }
+
+    #[test]
+    fn wait_for_daemon_mount_record_waits_for_write_authority_after_mount() {
+        let reads = Arc::new(Mutex::new(0usize));
+        let record = wait_for_daemon_mount_record_with(
+            "/tmp/demo",
+            4242,
+            test_record_wait(Duration::from_secs(60)),
+            {
+                let reads = reads.clone();
+                move |_| {
+                    let mut reads = reads.lock().expect("lock reads");
+                    *reads += 1;
+                    Ok(match *reads {
+                        1 => test_mount_record(
+                            utils::MountRecordStatus::Mounted,
+                            Some("local_ready"),
+                        ),
+                        2 => test_mount_record(
+                            utils::MountRecordStatus::Mounted,
+                            Some("catching_up"),
+                        ),
+                        _ => test_mount_record(utils::MountRecordStatus::Live, Some("live")),
+                    })
+                }
+            },
+            || Ok(true),
+        )
+        .expect("daemon should report live write authority");
+
+        assert_eq!(record.status, utils::MountRecordStatus::Live);
+        assert_eq!(*reads.lock().expect("lock reads"), 3);
+    }
+
+    #[test]
+    fn wait_for_daemon_mount_record_accepts_degraded_without_write_authority_wait() {
+        let record = wait_for_daemon_mount_record_with(
+            "/tmp/demo",
+            4242,
+            test_record_wait(Duration::from_secs(60)),
+            |_| {
+                Ok(test_mount_record(
+                    utils::MountRecordStatus::Degraded,
+                    Some("degraded"),
+                ))
+            },
+            || Ok(true),
+        )
+        .expect("degraded mount is a settled state");
+
+        assert_eq!(record.status, utils::MountRecordStatus::Degraded);
+    }
+
+    #[test]
+    fn wait_for_daemon_mount_record_returns_mounted_after_write_authority_timeout() {
+        let record = wait_for_daemon_mount_record_with(
+            "/tmp/demo",
+            4242,
+            test_record_wait(Duration::ZERO),
+            |_| {
+                Ok(test_mount_record(
+                    utils::MountRecordStatus::Mounted,
+                    Some("catching_up"),
+                ))
+            },
+            || Ok(true),
+        )
+        .expect("pending write authority should not fail the mount");
+
+        assert_eq!(record.status, utils::MountRecordStatus::Mounted);
+        assert_eq!(record.sync_lifecycle.as_deref(), Some("catching_up"));
+    }
+
+    #[test]
+    fn wait_for_daemon_mount_record_bounds_wait_when_record_disappears_after_mount() {
+        let reads = Arc::new(Mutex::new(0usize));
+        let record = wait_for_daemon_mount_record_with(
+            "/tmp/demo",
+            4242,
+            test_record_wait(Duration::from_millis(20)),
+            {
+                let reads = reads.clone();
+                move |_| {
+                    let mut reads = reads.lock().expect("lock reads");
+                    *reads += 1;
+                    if *reads == 1 {
+                        Ok(test_mount_record(
+                            utils::MountRecordStatus::Mounted,
+                            Some("local_ready"),
+                        ))
+                    } else {
+                        Err(anyhow::anyhow!("record removed"))
+                    }
+                }
+            },
+            || Ok(true),
+        )
+        .expect("attached mount should return after the write-authority bound");
+
+        assert_eq!(record.status, utils::MountRecordStatus::Mounted);
+        assert_eq!(record.sync_lifecycle.as_deref(), Some("local_ready"));
+    }
+
+    #[test]
+    fn wait_for_daemon_mount_record_reports_exit_while_awaiting_write_authority() {
+        let err = wait_for_daemon_mount_record_with(
+            "/tmp/demo",
+            4242,
+            test_record_wait(Duration::from_secs(60)),
+            |_| {
+                Ok(test_mount_record(
+                    utils::MountRecordStatus::Mounted,
+                    Some("local_ready"),
+                ))
+            },
+            || Ok(false),
+        )
+        .expect_err("dead child should fail while awaiting write authority");
+
+        assert!(
+            err.to_string()
+                .contains("exited after publishing mount state"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -3675,8 +3870,7 @@ mod tests {
         let err = wait_for_daemon_mount_record_with(
             "/tmp/demo",
             4242,
-            Duration::from_secs(1),
-            Duration::ZERO,
+            test_record_wait(Duration::from_secs(1)),
             |_| {
                 Ok(utils::MountRecordInfo {
                     record_version: 2,
@@ -3705,8 +3899,7 @@ mod tests {
         let err = wait_for_daemon_mount_record_with(
             "/tmp/demo",
             4242,
-            Duration::from_secs(1),
-            Duration::ZERO,
+            test_record_wait(Duration::from_secs(1)),
             |_| Err(anyhow::anyhow!("record not ready")),
             || Ok(false),
         )
@@ -3724,8 +3917,7 @@ mod tests {
         let err = wait_for_daemon_mount_record_with(
             "/tmp/demo",
             4242,
-            Duration::from_secs(1),
-            Duration::ZERO,
+            test_record_wait(Duration::from_secs(1)),
             |_| {
                 Ok(utils::MountRecordInfo {
                     record_version: 2,

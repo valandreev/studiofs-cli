@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::Duration;
-use studiofs_cache::CachedStoreWriterConfig;
+use studiofs_cache::{CachedStoreWriterConfig, ObjectFileMapping};
 use studiofs_meta::engine::{MetaEngineCore, MetaInodes, MetaPayloadObjects};
 use studiofs_meta::engine::{MetadataAuthorityStatus, PgSyncLifecycle, PgSyncWriteAuthorityReason};
 use studiofs_meta::schema::{
@@ -2589,6 +2589,93 @@ fn invalidation_worker_retries_writer_deferred_generation_without_new_metadata()
 }
 
 #[test]
+fn local_namespace_change_reconciles_by_scope_without_walking_the_volume() {
+    use super::workers::{
+        MetadataInvalidationWakeReason, MetadataReconcileOutcome, MetadataReconcileState,
+    };
+    use studiofs_meta::MetaEvent;
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "semantic-scoped-reconcile");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let mut files = Vec::new();
+        for dir_index in 0..8 {
+            let dir = vfs
+                .mkdir(ROOT_INO, format!("dir-{dir_index}").as_bytes(), 0, 0, 0o755)
+                .expect("mkdir");
+            for file_index in 0..32 {
+                let name = format!("file-{file_index}");
+                vfs.create(dir.ino, name.as_bytes(), 0, 0, 0o644)
+                    .expect("create");
+                files.push((dir.ino, name));
+            }
+        }
+        vfs.set_kernel_invalidator(Arc::new(AlwaysQueueKernelInvalidator));
+        let counters = &vfs.metadata_reconcile_counters;
+        let mut state = MetadataReconcileState::default();
+        // Drives the worker's per-change step directly: each local commit is
+        // drained from the journal, then reconciled as one pass.
+        let pass = MetadataInvalidationWakeReason::BackendNotify;
+        vfs.drain_semantic_invalidations_into(&mut state.scope);
+        let outcome = vfs
+            .reconcile_metadata_pass(&mut state, pass, true, true)
+            .await;
+        assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
+        assert_eq!(
+            counters.full_walks(),
+            1,
+            "the first pass establishes the baseline"
+        );
+
+        let (parent, name) = &files[0];
+        vfs.rename(*parent, name.as_bytes(), ROOT_INO, b"renamed", false)
+            .expect("rename");
+        vfs.drain_semantic_invalidations_into(&mut state.scope);
+        let outcome = vfs
+            .reconcile_metadata_pass(&mut state, pass, true, false)
+            .await;
+        assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
+
+        let (parent, name) = &files[1];
+        vfs.unlink(*parent, name.as_bytes()).expect("unlink");
+        vfs.drain_semantic_invalidations_into(&mut state.scope);
+        let outcome = vfs
+            .reconcile_metadata_pass(&mut state, pass, true, false)
+            .await;
+        assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
+
+        // A replicated change is journaled; its scope is consumed by inode.
+        let (parent, name) = &files[2];
+        let entry = meta.lookup(*parent, name.as_bytes()).expect("lookup");
+        let mut changed = meta.get_attr(entry.ino).expect("attr");
+        changed.mtime += 1;
+        meta.apply_replica_serving_state(&[MetaEvent::SetAttr { attr: changed }])
+            .expect("commit replicated change");
+        vfs.drain_semantic_invalidations_into(&mut state.scope);
+        assert!(
+            !state.scope.is_empty(),
+            "replicated change must name its scope"
+        );
+        let outcome = vfs
+            .reconcile_metadata_pass(&mut state, pass, false, true)
+            .await;
+        assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
+        assert!(
+            state.scope.is_empty(),
+            "scoped pass must consume the drained scope"
+        );
+
+        assert_eq!(counters.scoped_passes(), 3);
+        assert_eq!(
+            counters.full_walks(),
+            1,
+            "a local rename or unlink must not trigger a whole-volume traversal"
+        );
+    });
+}
+
+#[test]
 fn upload_dirty_state_without_an_open_writer_does_not_defer_invalidation() {
     use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
 
@@ -3605,6 +3692,9 @@ fn read_only_flush_does_not_wait_for_deferred_release_materialization() {
         vfs.release_fh(reader).await.unwrap();
     });
 }
+
+/// Upper bound for a write admission that must not wait at all.
+const WRITE_ADMISSION_FAST_PATH_BOUND_MS: u64 = 20;
 
 const RAM_READAHEAD_TEST_MIB: usize = 1024 * 1024;
 
@@ -4955,7 +5045,7 @@ fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
-        object_file_offset: 0,
+        file_mapping: Some(ObjectFileMapping::whole(0, 4096)),
         object_id: 7001,
         payload_len: 4096,
         content_epoch: 4,
@@ -5368,7 +5458,7 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
-        object_file_offset: 0,
+        file_mapping: Some(ObjectFileMapping::whole(0, 4096)),
         object_id: 7001,
         payload_len: 4096,
         content_epoch: 5,
@@ -5573,7 +5663,7 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
-        object_file_offset: 0,
+        file_mapping: Some(ObjectFileMapping::whole(0, 4096)),
         object_id: 9002,
         payload_len: 4096,
         content_epoch: 5,
@@ -9387,12 +9477,8 @@ fn deferred_sparse_tail_rebases_when_size_growth_overtakes_materialization() {
                     .into_iter()
                     .map(|(offset, _, content_epoch)| (offset, content_epoch))
                     .collect::<BTreeSet<_>>();
-                if pending_offsets
-                    == BTreeSet::from([
-                        (0, grown_attr.content_epoch),
-                        (tail_offset, grown_attr.content_epoch),
-                    ])
-                {
+                // Head and tail pack into one payload object queued at its first file offset.
+                if pending_offsets == BTreeSet::from([(0, grown_attr.content_epoch)]) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -9487,7 +9573,8 @@ fn explicit_flush_sparse_extend_retains_kernel_zero_filled_tail_write() {
             "zero-filled write is queued from the start of the uploaded object"
         );
         assert_eq!(
-            tail_upload_before_extend.object_file_offset, 0,
+            tail_upload_before_extend.file_mapping,
+            Some(ObjectFileMapping::whole(0, tail_offset + tail.len() as u64)),
             "tail payload is embedded in a larger zero-filled object that starts at file offset 0"
         );
         assert_eq!(
@@ -9511,7 +9598,8 @@ fn explicit_flush_sparse_extend_retains_kernel_zero_filled_tail_write() {
             "set_len requeue must preserve the queued object extent offset"
         );
         assert_eq!(
-            tail_upload_after_extend.object_file_offset, 0,
+            tail_upload_after_extend.file_mapping,
+            Some(ObjectFileMapping::whole(0, tail_offset + tail.len() as u64)),
             "set_len requeue must preserve the uploaded object's file start"
         );
         assert_eq!(
@@ -9750,7 +9838,8 @@ fn zero_filled_sparse_extend_requeues_retained_overlay_when_runtime_queue_is_emp
             "requeued sparse object must keep the original file start so an in-flight upload can be updated"
         );
         assert_eq!(
-            full_zero_filled_upload.object_file_offset, 0,
+            full_zero_filled_upload.file_mapping,
+            Some(ObjectFileMapping::whole(0, tail_offset + tail.len() as u64)),
             "requeued sparse object must read from the start of the retained payload"
         );
     });
@@ -10859,7 +10948,7 @@ fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
     let pending_uploads = vec![PendingUpload {
         ino,
         offset: 0,
-        object_file_offset: 0,
+        file_mapping: Some(ObjectFileMapping::whole(0, u64::from(block.length))),
         object_id: block.object_id,
         payload_len: u64::from(block.length),
         content_epoch: attr.content_epoch,
@@ -11165,7 +11254,7 @@ fn write_admission_first_sample_below_budget_without_pacing() {
             .unwrap();
 
         tokio::time::timeout(
-            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
+            Duration::from_millis(WRITE_ADMISSION_FAST_PATH_BOUND_MS / 2),
             vfs.maybe_throttle_write_admission(1),
         )
         .await
@@ -11219,7 +11308,7 @@ fn write_admission_does_not_sleep_for_soft_pressure_below_hard_window() {
         }
 
         tokio::time::timeout(
-            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
+            Duration::from_millis(WRITE_ADMISSION_FAST_PATH_BOUND_MS / 2),
             vfs.maybe_throttle_write_admission(buffer_budget_bytes / 10),
         )
         .await
@@ -11248,7 +11337,7 @@ fn write_admission_admits_oversized_write_when_pressure_is_empty() {
         vfs.set_max_dirty_bytes(buffer_budget_bytes);
 
         tokio::time::timeout(
-            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2),
+            Duration::from_millis(WRITE_ADMISSION_FAST_PATH_BOUND_MS * 2),
             vfs.maybe_throttle_write_admission(buffer_budget_bytes * 2 + 1),
         )
         .await
@@ -11294,11 +11383,119 @@ fn write_admission_ignores_pending_upload_backlog_for_hard_window() {
         );
 
         tokio::time::timeout(
-            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
+            Duration::from_millis(WRITE_ADMISSION_FAST_PATH_BOUND_MS / 2),
             vfs.maybe_throttle_write_admission(1),
         )
         .await
         .expect("pending upload backlog must not trigger hard admission wait");
+    });
+}
+
+/// Records whether a hand-polled future was woken, so wake tests need no sleeps.
+#[derive(Default)]
+struct WakeFlag(AtomicBool);
+
+impl WakeFlag {
+    fn is_set(&self) -> bool {
+        self.0.load(AtomicOrdering::Acquire)
+    }
+}
+
+impl std::task::Wake for WakeFlag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, AtomicOrdering::Release);
+    }
+}
+
+/// Writes past the hard admission window into the writer stack.
+fn seed_writer_stack_above_hard_window(vfs: &StudioVfs, fh: u64, attr: &InodeAttr) {
+    let buffer_budget_bytes = vfs.block_size as usize;
+    vfs.set_max_dirty_bytes(buffer_budget_bytes);
+    vfs.state
+        .writer_stack
+        .write_bytes(
+            super::writer_stack::WriterWriteSpec {
+                fh,
+                ino: attr.ino,
+                current_size: 0,
+                content_epoch: attr.content_epoch,
+                first_object_id: 0,
+                offset: 0,
+            },
+            Bytes::from(vec![0xAB; buffer_budget_bytes * 2 + 1]),
+        )
+        .unwrap();
+}
+
+#[test]
+fn write_admission_rechecks_hard_window_when_dirty_limit_is_raised() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-limit-raised");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"admission-limit-raised.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        seed_writer_stack_above_hard_window(&vfs, fh, &attr);
+
+        let woken = Arc::new(WakeFlag::default());
+        let waker = std::task::Waker::from(Arc::clone(&woken));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut admission = std::pin::pin!(vfs.maybe_throttle_write_admission(1));
+        assert!(std::future::Future::poll(admission.as_mut(), &mut cx).is_pending());
+
+        vfs.set_max_dirty_bytes(vfs.block_size as usize * 4);
+        assert!(
+            woken.is_set(),
+            "raising the dirty limit should wake the parked admission waiter"
+        );
+        assert!(
+            std::future::Future::poll(admission.as_mut(), &mut cx).is_ready(),
+            "admission should be measured against the raised hard window"
+        );
+
+        vfs.state.writer_stack.clear_inode(attr.ino);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn write_admission_hard_wait_observes_shutdown_request() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-shutdown-wake");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"admission-shutdown-wake.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        seed_writer_stack_above_hard_window(&vfs, fh, &attr);
+
+        let woken = Arc::new(WakeFlag::default());
+        let waker = std::task::Waker::from(Arc::clone(&woken));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut admission = std::pin::pin!(vfs.maybe_throttle_write_admission(1));
+        assert!(std::future::Future::poll(admission.as_mut(), &mut cx).is_pending());
+
+        // The first poll of shutdown claims it and wakes parked writers before
+        // its first await point.
+        let mut shutdown = std::pin::pin!(vfs.shutdown(Duration::ZERO));
+        let _ = std::future::Future::poll(
+            shutdown.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        );
+        assert!(
+            woken.is_set(),
+            "a shutdown request should wake the parked admission waiter"
+        );
+        assert!(
+            std::future::Future::poll(admission.as_mut(), &mut cx).is_ready(),
+            "admission should stop waiting once shutdown is requested"
+        );
+
+        vfs.state.writer_stack.clear_inode(attr.ino);
+        let _ = shutdown.await;
     });
 }
 
@@ -11329,26 +11526,27 @@ fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
             )
             .unwrap();
 
-        let admission_vfs = Arc::clone(&vfs);
-        let wait_task =
-            tokio::spawn(async move { admission_vfs.maybe_throttle_write_admission(1).await });
-        tokio::time::sleep(Duration::from_millis(
-            WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 3 + 10,
-        ))
-        .await;
+        let woken = Arc::new(WakeFlag::default());
+        let waker = std::task::Waker::from(Arc::clone(&woken));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut admission = std::pin::pin!(vfs.maybe_throttle_write_admission(1));
         assert!(
-            !wait_task.is_finished(),
-            "admission should keep waiting while writer-stack pressure remains above the hard window"
+            std::future::Future::poll(admission.as_mut(), &mut cx).is_pending(),
+            "admission should park while writer-stack pressure remains above the hard window"
         );
+        assert!(!woken.is_set());
 
+        // Draining capacity must wake the parked writer directly, not after a
+        // re-check quantum: the drain itself signals the waker.
         vfs.state.writer_stack.clear_inode(attr.ino);
-        tokio::time::timeout(
-            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2),
-            wait_task,
-        )
-        .await
-        .expect("admission should unblock after writer-stack pressure drops")
-        .expect("admission task should not panic");
+        assert!(
+            woken.is_set(),
+            "writer-stack drain should wake the parked admission waiter"
+        );
+        assert!(
+            std::future::Future::poll(admission.as_mut(), &mut cx).is_ready(),
+            "admission should complete once writer-stack pressure drops"
+        );
         assert!(
             vfs.state
                 .metrics
@@ -13570,6 +13768,108 @@ fn aggressive_materialization_threshold_is_half_of_dirty_budget() {
     assert_eq!(aggressive_materialization_threshold_bytes(1), 1);
     assert_eq!(aggressive_materialization_threshold_bytes(8), 4);
     assert_eq!(hard_backpressure_threshold_bytes(8), 16);
+}
+
+#[test]
+fn packed_upload_geometry_uses_object_bytes_across_commit_replay_and_truncate() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "packed-upload-geometry");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let mut attr = vfs.create(1, b"packed.bin", 0, 0, 0o644).unwrap();
+        attr.size = 64;
+        attr.content_epoch = 1;
+        meta.set_attr(&attr).unwrap();
+        let object_id = 900_001;
+        vfs.payload_store_put_async(object_id, Bytes::from_static(b"aaaabbbbTAIL"), false)
+            .await
+            .unwrap();
+        for (seq, file_offset, initial_object_offset) in [(1, 0, 0), (2, 32, 4)] {
+            vfs.install_persisted_pending_local_dirty_slice(
+                attr.ino,
+                super::local_dirty::PersistedPendingLocalDirtySliceSpec {
+                    block_index: 0,
+                    file_offset,
+                    len: 4,
+                    seq,
+                    object_id,
+                    initial_object_offset,
+                },
+            );
+        }
+        vfs.flush(attr.ino).await.unwrap();
+        let pending = vfs.pending_uploads_snapshot_for_inode(attr.ino);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].payload_len, 12,
+            "file gaps must not enlarge the upload"
+        );
+        assert_eq!(pending[0].file_mapping, None);
+        vfs.cancel_pending_uploads_for_inode(attr.ino);
+        vfs.replay_dirty_uploads_from_local_backend(&[], &[meta.get_attr(attr.ino).unwrap()]);
+        let pending = vfs.pending_uploads_snapshot_for_inode(attr.ino);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].payload_len, 12,
+            "replay must preserve the whole object"
+        );
+        assert_eq!(pending[0].file_mapping, None);
+        vfs.setattr(attr.ino, SetattrArgs::size_only(36)).unwrap();
+        let pending = vfs.pending_uploads_snapshot_for_inode(attr.ino);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].payload_len, 12,
+            "truncate must retain real payload length"
+        );
+        assert_eq!(pending[0].file_mapping, None);
+        assert!(
+            !meta
+                .get_pending_deletions()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == object_id),
+            "truncate below a packed object's last segment keeps it out of GC"
+        );
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, b"xxxx")
+            .await
+            .unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+        assert!(
+            meta.get_regular_file_graph_object_usage(attr.ino)
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == object_id),
+            "one remaining segment keeps the shared object live"
+        );
+        assert!(vfs.cached_store.is_pinned(object_id));
+        let pending_deletion = || {
+            meta.get_pending_deletions()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == object_id)
+        };
+        assert!(
+            !pending_deletion(),
+            "superseding one segment must not schedule the shared object for deletion"
+        );
+        vfs.setattr(attr.ino, SetattrArgs::size_only(4)).unwrap();
+        assert!(
+            !meta
+                .get_regular_file_graph_object_usage(attr.ino)
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == object_id)
+        );
+        assert!(
+            !vfs.cached_store.is_pinned(object_id),
+            "last segment removal releases the upload pin"
+        );
+        assert!(
+            pending_deletion(),
+            "removing the last segment schedules the shared object for deletion"
+        );
+    });
 }
 
 #[test]
@@ -19035,8 +19335,14 @@ fn concurrent_shutdown_callers_observe_first_error() {
         .deferred
         .degraded
         .store(true, AtomicOrdering::Release);
-    vfs.cached_store
-        .submit_upload_with_payload(ROOT_INO, 0, 0, 9_900_001, 1, 1);
+    vfs.cached_store.submit_upload_with_payload(
+        ROOT_INO,
+        0,
+        Some(ObjectFileMapping::whole(0, 1)),
+        9_900_001,
+        1,
+        1,
+    );
 
     rt.block_on(async {
         let owner_vfs = Arc::clone(&vfs);
@@ -19205,6 +19511,80 @@ fn shutdown_waits_for_admitted_mutation_that_registers_cleanup() {
             "mutations must be rejected after shutdown starts"
         );
     });
+}
+
+#[test]
+fn sync_namespace_ops_from_foreign_thread_run_on_mount_runtime() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sync-future-mount-runtime");
+    {
+        let _guard = rt.enter();
+        vfs.create(ROOT_INO, b"rename-source.txt", 0, 0, 0o644)
+            .expect("create rename source");
+        vfs.create(ROOT_INO, b"unlink-target.txt", 0, 0, 0o644)
+            .expect("create unlink target");
+    }
+
+    let mount_runtime_id = rt.handle().id();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (spawned_done_tx, spawned_done_rx) = std::sync::mpsc::channel();
+    let worker_vfs = Arc::clone(&vfs);
+    let operation_runtime_id = std::thread::spawn(move || {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "the libfuse-like worker must start outside any Tokio context"
+        );
+        worker_vfs
+            .rename(
+                ROOT_INO,
+                b"rename-source.txt",
+                ROOT_INO,
+                b"rename-target.txt",
+                true,
+            )
+            .expect("rename from a foreign thread");
+        worker_vfs
+            .unlink(ROOT_INO, b"unlink-target.txt")
+            .expect("unlink from a foreign thread");
+        worker_vfs
+            .run_sync_future(async move {
+                tokio::spawn(async move {
+                    let _ = release_rx.await;
+                    let _ = spawned_done_tx.send(());
+                });
+                Ok(tokio::runtime::Handle::current().id())
+            })
+            .expect("sync future from a foreign thread")
+    })
+    .join()
+    .expect("foreign worker must not panic");
+
+    assert_eq!(
+        vfs.sync_future_runtime_fallbacks(),
+        0,
+        "synchronous VFS operations must not construct a temporary runtime"
+    );
+    assert_eq!(
+        operation_runtime_id, mount_runtime_id,
+        "synchronous VFS operations must run on the mount runtime"
+    );
+    release_tx
+        .send(())
+        .expect("a task spawned by the operation must outlive the call");
+    spawned_done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the spawned task must keep running on the mount runtime");
+    {
+        let _guard = rt.enter();
+        assert!(
+            vfs.lookup(ROOT_INO, b"rename-target.txt").is_ok(),
+            "rename must take effect"
+        );
+        assert!(
+            vfs.lookup(ROOT_INO, b"unlink-target.txt").is_err(),
+            "unlink must take effect"
+        );
+    }
 }
 
 #[test]
@@ -20437,6 +20817,50 @@ fn linux_trash_rename_deletes_directory_subtree() {
     assert!(
         vfs.lookup(trash_files.ino, b"delete-tree").is_err(),
         "Linux trash directory rename must delete, not preserve a trash entry"
+    );
+}
+
+#[test]
+fn trash_ancestor_check_follows_current_root_child_binding() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "trash-ancestor-root-child-binding");
+
+    let trash_root = vfs
+        .mkdir(ROOT_INO, b".Trash-1000", 1000, 1000, 0o755)
+        .expect("create trash root");
+    let deep = vfs
+        .mkdir(trash_root.ino, b"files", 1000, 1000, 0o755)
+        .expect("create trash files");
+    let deep = vfs
+        .mkdir(deep.ino, b"nested", 1000, 1000, 0o755)
+        .expect("create nested trash directory");
+    let plain = vfs
+        .mkdir(ROOT_INO, b"plain", 1000, 1000, 0o755)
+        .expect("create plain directory");
+    let plain_child = vfs
+        .mkdir(plain.ino, b"child", 1000, 1000, 0o755)
+        .expect("create plain child");
+
+    assert!(!vfs.directory_has_probable_trash_ancestor(ROOT_INO).unwrap());
+    assert!(
+        vfs.directory_has_probable_trash_ancestor(trash_root.ino)
+            .unwrap()
+    );
+    assert!(vfs.directory_has_probable_trash_ancestor(deep.ino).unwrap());
+    assert!(
+        !vfs.directory_has_probable_trash_ancestor(plain_child.ino)
+            .unwrap()
+    );
+
+    // Renaming the root child changes the answer for its whole subtree.
+    vfs.rename(ROOT_INO, b".Trash-1000", ROOT_INO, b"restored", false)
+        .expect("rename trash root away");
+    vfs.rename(ROOT_INO, b"plain", ROOT_INO, b".Trash", false)
+        .expect("rename plain directory to a trash name");
+    assert!(!vfs.directory_has_probable_trash_ancestor(deep.ino).unwrap());
+    assert!(
+        vfs.directory_has_probable_trash_ancestor(plain_child.ino)
+            .unwrap()
     );
 }
 

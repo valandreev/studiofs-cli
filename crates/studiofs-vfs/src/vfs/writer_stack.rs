@@ -1,6 +1,6 @@
 use crate::lock_order::LockOrderSubtier;
 use crate::{LockTier, OrderedMutex};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use smallvec::{SmallVec, smallvec};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -189,6 +189,7 @@ struct FileWriter {
     chunks: BTreeMap<ChunkId, ChunkWriter>,
     dirty_bytes: usize,
     last_write: Instant,
+    dirty_since: Instant,
     sticky_error: Option<StickyError>,
 }
 
@@ -202,6 +203,7 @@ impl FileWriter {
                 chunks: BTreeMap::new(),
                 dirty_bytes: 0,
                 last_write: Instant::now(),
+                dirty_since: Instant::now(),
                 sticky_error: None,
             },
             LockTier::LocalDirty,
@@ -266,6 +268,8 @@ pub(super) struct MountedWriterStack {
     handle_shards: Box<[OrderedMutex<HandleShard>]>,
     next_seq: AtomicU64,
     dirty_bytes: AtomicUsize,
+    /// Wakes hard write-admission waiters whenever buffered dirty bytes drop.
+    dirty_drained: tokio::sync::Notify,
 }
 
 impl MountedWriterStack {
@@ -295,6 +299,7 @@ impl MountedWriterStack {
                 .collect(),
             next_seq: AtomicU64::new(1),
             dirty_bytes: AtomicUsize::new(0),
+            dirty_drained: tokio::sync::Notify::new(),
         }
     }
 
@@ -448,6 +453,9 @@ impl MountedWriterStack {
             };
             throttled |= segment_throttled;
             file.visible_len = file.visible_len.max(end);
+            if file.dirty_bytes == 0 {
+                file.dirty_since = Instant::now();
+            }
             file.dirty_bytes = file.dirty_bytes.saturating_add(accepted_delta);
             accepted_dirty_bytes = accepted_dirty_bytes.saturating_add(accepted_delta);
             self.dirty_bytes.fetch_add(accepted_delta, Ordering::AcqRel);
@@ -742,18 +750,44 @@ impl MountedWriterStack {
         if file.ino != ino {
             return Ok(0);
         };
-        if min_idle.is_some_and(|idle| file.last_write.elapsed() < idle) {
+        let superseded_bytes = drop_superseded_dirty_slices(&mut file);
+        if superseded_bytes > 0 {
+            file.dirty_bytes = file.dirty_bytes.saturating_sub(superseded_bytes);
+            self.subtract_dirty(superseded_bytes);
+        }
+        // Sustained scattered writes never go idle, so their dirty bytes drain once older than
+        // the idle window. An appender grows one slice and waits for idle instead.
+        let scattered = || {
+            file.chunks
+                .values()
+                .flat_map(|chunk| &chunk.slices)
+                .filter(|slice| slice.writer.dirty_bytes() > 0)
+                .nth(1)
+                .is_some()
+        };
+        if min_idle.is_some_and(|idle| {
+            file.last_write.elapsed() < idle && (file.dirty_since.elapsed() < idle || !scattered())
+        }) {
             return Ok(0);
         }
         let mut object_count = 0u64;
+        let mut packed_len = 0;
+        let capacity = self.config.block_size as usize;
+        // Match next-fit packing in pack_finished_slices, including detach_finish block boundaries.
         for chunk in file.chunks.values_mut() {
             for slice in &mut chunk.slices {
-                if slice.writer.dirty_bytes() > 0 {
+                let mut remaining = slice.writer.dirty_bytes();
+                if remaining > 0 {
                     slice.frozen = true;
-                    object_count = object_count.saturating_add(staged_object_count(
-                        slice.writer.dirty_bytes(),
-                        self.config.block_size,
-                    ));
+                }
+                while remaining > 0 {
+                    let len = remaining.min(capacity);
+                    if packed_len == 0 || len > capacity - packed_len {
+                        object_count = object_count.saturating_add(1);
+                        packed_len = 0;
+                    }
+                    packed_len += len;
+                    remaining -= len;
                 }
             }
         }
@@ -789,6 +823,7 @@ impl MountedWriterStack {
         let mut staged_dirty_bytes = 0usize;
         let chunk_size = self.config.chunk_size;
         let mut next_object_id = first_object_id;
+        let mut newly_detached = Vec::new();
         for chunk in file.chunks.values_mut() {
             chunk.slices.sort_by_key(|slice| slice.seq);
             for slice in &mut chunk.slices {
@@ -802,12 +837,6 @@ impl MountedWriterStack {
                 }
                 if slice.writer.dirty_bytes() == 0 {
                     continue;
-                }
-                if let Some(object_id) = next_object_id {
-                    let object_count =
-                        staged_object_count(slice.writer.dirty_bytes(), self.config.block_size);
-                    slice.writer.set_next_object_id(object_id);
-                    next_object_id = Some(object_id.saturating_add(object_count));
                 }
                 slice.frozen = true;
                 let detached = slice.writer.detach_finish()?;
@@ -823,14 +852,36 @@ impl MountedWriterStack {
                         detached,
                     })
                     .collect::<Vec<_>>();
+                staged_dirty_bytes = staged_dirty_bytes.saturating_add(
+                    converted
+                        .iter()
+                        .map(|entry| entry.finished.len as usize)
+                        .sum::<usize>(),
+                );
+                newly_detached.extend(converted);
+            }
+        }
+        pack_finished_slices(
+            &mut newly_detached,
+            self.config.block_size,
+            &mut next_object_id,
+        );
+        let mut by_seq = HashMap::<u64, Vec<DetachedFinishedWriterSlice>>::new();
+        for entry in newly_detached {
+            by_seq.entry(entry.finished.seq).or_default().push(entry);
+        }
+        for chunk in file.chunks.values_mut() {
+            for slice in &mut chunk.slices {
+                let Some(converted) = by_seq.remove(&slice.seq) else {
+                    continue;
+                };
                 slice.materializing.extend(converted.iter().map(|entry| {
-                    materializing_read_span_from_detached(slice.seq, &entry.detached)
+                    materializing_read_span_from_detached(
+                        slice.seq,
+                        &entry.detached,
+                        &entry.finished,
+                    )
                 }));
-                let staged_len: usize = converted
-                    .iter()
-                    .map(|entry| entry.finished.len as usize)
-                    .sum();
-                staged_dirty_bytes = staged_dirty_bytes.saturating_add(staged_len);
                 let converted_finished = converted
                     .iter()
                     .map(|entry| entry.finished.clone())
@@ -842,6 +893,8 @@ impl MountedWriterStack {
             }
         }
         file.dirty_bytes = file.dirty_bytes.saturating_sub(staged_dirty_bytes);
+        // Bytes left behind start a new age window instead of inheriting the drained one.
+        file.dirty_since = Instant::now();
         let clean = file.dirty_bytes == 0;
         drop(file);
         self.subtract_dirty(staged_dirty_bytes);
@@ -948,7 +1001,11 @@ impl MountedWriterStack {
                     })
                     .collect::<Vec<_>>();
                 slice.materializing.extend(converted.iter().map(|entry| {
-                    materializing_read_span_from_detached(slice.seq, &entry.detached)
+                    materializing_read_span_from_detached(
+                        slice.seq,
+                        &entry.detached,
+                        &entry.finished,
+                    )
                 }));
                 let staged_len: usize = converted
                     .iter()
@@ -966,6 +1023,8 @@ impl MountedWriterStack {
             }
         }
         file.dirty_bytes = file.dirty_bytes.saturating_sub(staged_dirty_bytes);
+        // Bytes left behind start a new age window instead of inheriting the drained one.
+        file.dirty_since = Instant::now();
         let clean = file.dirty_bytes == 0;
         drop(file);
         self.subtract_dirty(staged_dirty_bytes);
@@ -1026,6 +1085,7 @@ impl MountedWriterStack {
         let Some(file) = file else {
             return;
         };
+        let object_ids: HashSet<u64> = object_ids.iter().copied().collect();
         {
             let mut file = file.lock();
             for chunk in file.chunks.values_mut() {
@@ -1096,12 +1156,28 @@ impl MountedWriterStack {
         self.dirty_bytes.load(Ordering::Acquire)
     }
 
+    /// Returns a drain notification for a waiter that re-checks
+    /// [`total_dirty_bytes`](Self::total_dirty_bytes) after enabling it.
+    pub(super) fn dirty_drained(&self) -> tokio::sync::futures::Notified<'_> {
+        self.dirty_drained.notified()
+    }
+
+    /// Wakes drain waiters so they re-check their condition, for example after
+    /// shutdown was requested.
+    pub(super) fn wake_dirty_drain_waiters(&self) {
+        self.dirty_drained.notify_waiters();
+    }
+
     fn subtract_dirty(&self, amount: usize) {
+        if amount == 0 {
+            return;
+        }
         let _ = self
             .dirty_bytes
             .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(amount))
             });
+        self.dirty_drained.notify_waiters();
     }
 
     fn persist_detached_finished_slices(
@@ -1113,8 +1189,10 @@ impl MountedWriterStack {
             .iter()
             .map(|entry| entry.finished.object_id)
             .collect::<Vec<_>>();
+        let mut seen = HashSet::new();
         let detached = detached_finished
             .into_iter()
+            .filter(|entry| seen.insert(entry.finished.object_id))
             .map(|entry| entry.detached)
             .collect::<Vec<_>>();
         if detached.is_empty() {
@@ -1144,6 +1222,7 @@ impl MountedWriterStack {
         let Some(file) = file else {
             return;
         };
+        let object_ids: HashSet<u64> = object_ids.iter().copied().collect();
         {
             let mut file = file.lock();
             for chunk in file.chunks.values_mut() {
@@ -1274,10 +1353,6 @@ fn staged_object_count(len: usize, block_size: u32) -> u64 {
     len.div_ceil(block_size) as u64
 }
 
-fn saturating_u64_from_usize(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
-}
-
 fn file_is_clean_and_materialized(file: &FileWriter) -> bool {
     file.dirty_bytes == 0
         && file.chunks.values().all(|chunk| {
@@ -1288,19 +1363,148 @@ fn file_is_clean_and_materialized(file: &FileWriter) -> bool {
         })
 }
 
+/// Drops buffered slices whose whole range a newer buffered slice of the same
+/// chunk rewrote, and returns the dirty bytes released.
+///
+/// Random small overwrites otherwise materialize every superseded version as
+/// its own local payload object and upload. Readers resolve writer data newest
+/// first, so a fully covered slice is never read. Only slices that have not
+/// started materializing are dropped or used as cover, so every dropped byte
+/// is still owned by a newer slice in this stack.
+fn drop_superseded_dirty_slices(file: &mut FileWriter) -> usize {
+    let mut released = 0usize;
+    for chunk in file.chunks.values_mut() {
+        if chunk.slices.len() < 2 {
+            continue;
+        }
+        let mut newest_first: Vec<usize> = (0..chunk.slices.len()).collect();
+        newest_first.sort_unstable_by_key(|&index| std::cmp::Reverse(chunk.slices[index].seq));
+        let mut covered = CoveredRanges::default();
+        let mut superseded = vec![false; chunk.slices.len()];
+        for index in newest_first {
+            let slice = &chunk.slices[index];
+            if !slice.finished.is_empty()
+                || !slice.materializing.is_empty()
+                || !slice.pending_materialization.is_empty()
+            {
+                continue;
+            }
+            let Some((start, end)) = slice.writer.accepted_range() else {
+                continue;
+            };
+            if covered.contains(start, end) {
+                superseded[index] = true;
+            } else {
+                covered.insert(start, end);
+            }
+        }
+        let mut index = 0;
+        chunk.slices.retain(|slice| {
+            let keep = !superseded[index];
+            index += 1;
+            if !keep {
+                // Dropping the writer releases its cached-store dirty accounting.
+                released = released.saturating_add(slice.writer.dirty_bytes());
+            }
+            keep
+        });
+    }
+    released
+}
+
+/// Disjoint, non-adjacent half-open ranges keyed by start.
+#[derive(Default)]
+struct CoveredRanges {
+    ranges: BTreeMap<u64, u64>,
+}
+
+impl CoveredRanges {
+    fn contains(&self, start: u64, end: u64) -> bool {
+        self.ranges
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(_, &covered_end)| covered_end >= end)
+    }
+
+    fn insert(&mut self, mut start: u64, mut end: u64) {
+        if let Some((&prev_start, &prev_end)) = self.ranges.range(..=start).next_back()
+            && prev_end >= start
+        {
+            start = prev_start;
+            end = end.max(prev_end);
+        }
+        let absorbed: Vec<u64> = self
+            .ranges
+            .range(start..=end)
+            .map(|(&next_start, _)| next_start)
+            .collect();
+        for next_start in absorbed {
+            if let Some(next_end) = self.ranges.remove(&next_start) {
+                end = end.max(next_end);
+            }
+        }
+        self.ranges.insert(start, end);
+    }
+}
+
+fn pack_finished_slices(
+    entries: &mut [DetachedFinishedWriterSlice],
+    block_size: u32,
+    next_object_id: &mut Option<u64>,
+) {
+    let mut start = 0;
+    while start < entries.len() {
+        let mut end = start + 1;
+        let mut len = entries[start].detached.payload.len();
+        while end < entries.len()
+            && len + entries[end].detached.payload.len() <= block_size as usize
+        {
+            len += entries[end].detached.payload.len();
+            end += 1;
+        }
+        let payload = if end == start + 1 {
+            entries[start].detached.payload.clone()
+        } else {
+            let mut payload = BytesMut::with_capacity(len);
+            for entry in &entries[start..end] {
+                payload.extend_from_slice(&entry.detached.payload);
+            }
+            payload.freeze()
+        };
+        let object_id = next_object_id.unwrap_or(entries[start].finished.object_id);
+        if let Some(next) = next_object_id {
+            *next = next.saturating_add(1);
+        }
+        let mut object_offset = 0;
+        for entry in &mut entries[start..end] {
+            entry.finished.object_id = object_id;
+            entry.finished.object_offset = object_offset;
+            entry.detached.staged.object_id = object_id;
+            entry.detached.staged.len = payload.len();
+            entry.detached.payload = payload.clone();
+            object_offset += entry.finished.len;
+        }
+        start = end;
+    }
+}
+
 fn materializing_read_span_from_detached(
     seq: u64,
     detached: &DetachedStagedSlice,
+    finished: &FinishedWriterSlice,
 ) -> MaterializingReadSpan {
     MaterializingReadSpan {
         start: detached.staged.offset,
         end: detached
             .staged
             .offset
-            .saturating_add(saturating_u64_from_usize(detached.staged.len)),
+            .saturating_add(u64::from(finished.len)),
         object_id: detached.staged.object_id,
         seq,
-        data: detached.payload.clone(),
+        data: detached.payload.slice(
+            finished.object_offset as usize
+                ..finished.object_offset as usize + finished.len as usize,
+        ),
     }
 }
 
@@ -1874,6 +2078,196 @@ mod tests {
         assert_eq!(finished[1].chunk_id, ChunkId(1));
         assert_eq!(finished[1].chunk_offset, 0);
         assert_eq!(finished[1].len, 4);
+    }
+
+    #[test]
+    fn writer_stack_packed_aged_fragments_finish_while_writes_continue() {
+        let (_dir, stack, _rx) = temp_stack(64, 16);
+        stack
+            .write_bytes(write_spec(1, 7, 32, 100), b"old")
+            .unwrap();
+        let idle = Duration::from_millis(200);
+        assert_eq!(stack.prepare_finish_inode_if_idle(7, idle).unwrap(), 0);
+        {
+            let shard = stack.shards[MountedWriterStack::inode_shard_index(7)].lock();
+            shard.files[&7].lock().dirty_since = Instant::now() - idle - Duration::from_millis(1);
+        }
+        stack.write_bytes(write_spec(1, 7, 0, 101), b"new").unwrap();
+        assert!(
+            stack.prepare_finish_inode_if_idle(7, idle).unwrap() > 0,
+            "dirty fragments older than one idle window must drain even after a recent write"
+        );
+        stack.finish_prepared_inode(7, 900).unwrap();
+
+        stack
+            .write_bytes(write_spec(1, 7, 8, 102), b"next")
+            .unwrap();
+        assert_eq!(
+            stack.prepare_finish_inode_if_idle(7, idle).unwrap(),
+            0,
+            "a drain starts a new age window"
+        );
+    }
+
+    #[test]
+    fn writer_stack_aged_overwrites_of_one_range_wait_for_idle() {
+        let (_dir, stack, _rx) = temp_stack(64, 16);
+        let idle = Duration::from_millis(200);
+        stack
+            .write_bytes(write_spec(1, 7, 0, 100), b"old!")
+            .unwrap();
+        {
+            let shard = stack.shards[MountedWriterStack::inode_shard_index(7)].lock();
+            shard.files[&7].lock().dirty_since = Instant::now() - idle - Duration::from_millis(1);
+        }
+        stack
+            .write_bytes(write_spec(1, 7, 0, 101), b"new!")
+            .unwrap();
+        assert_eq!(
+            stack.prepare_finish_inode_if_idle(7, idle).unwrap(),
+            0,
+            "superseded writes to one range are not scattered dirty data"
+        );
+        assert_eq!(stack.dirty_bytes_for_inode(7), 4);
+        let mut actual = [0; 4];
+        stack.copy_read_spans_into(7, 0, &mut actual);
+        assert_eq!(&actual, b"new!");
+        {
+            let shard = stack.shards[MountedWriterStack::inode_shard_index(7)].lock();
+            shard.files[&7].lock().last_write = Instant::now() - idle - Duration::from_millis(1);
+        }
+        assert_eq!(stack.prepare_finish_inode_if_idle(7, idle).unwrap(), 1);
+    }
+
+    #[test]
+    fn writer_stack_reserves_ids_for_packs_instead_of_fragments() {
+        for (block_size, writes, expected) in [
+            (16, vec![(0, 4), (32, 4), (64, 4), (96, 4)], 1),
+            (16, vec![(0, 12), (32, 12), (64, 4)], 2),
+            (16, vec![(0, 20), (64, 4), (96, 8)], 2),
+        ] {
+            let (_dir, stack, _rx) = temp_stack(64, block_size);
+            for (index, (offset, len)) in writes.into_iter().enumerate() {
+                stack
+                    .write_bytes(
+                        write_spec(1, 7, offset, 100 + index as u64 * 10),
+                        vec![1; len],
+                    )
+                    .unwrap();
+            }
+            assert_eq!(stack.prepare_finish_inode(7).unwrap(), expected);
+            assert_eq!(
+                stack.prepare_finish_inode(7).unwrap(),
+                expected,
+                "reservation retries must use the same packing geometry"
+            );
+            let finished = stack.finish_prepared_inode(7, 900).unwrap();
+            let ids: HashSet<_> = finished.iter().map(|slice| slice.object_id).collect();
+            assert_eq!(ids.len(), expected as usize);
+        }
+    }
+
+    #[test]
+    fn writer_stack_aged_append_waits_for_idle() {
+        let (_dir, stack, _rx) = temp_stack(64, 16);
+        let idle = Duration::from_millis(200);
+        stack
+            .write_bytes(write_spec(1, 7, 0, 100), b"log1")
+            .unwrap();
+        {
+            let shard = stack.shards[MountedWriterStack::inode_shard_index(7)].lock();
+            shard.files[&7].lock().dirty_since = Instant::now() - idle - Duration::from_millis(1);
+        }
+        stack
+            .write_bytes(write_spec(1, 7, 4, 101), b"log2")
+            .unwrap();
+        assert_eq!(
+            stack.prepare_finish_inode_if_idle(7, idle).unwrap(),
+            0,
+            "a slow appender keeps one growing slice and must not drain a tiny object per window"
+        );
+    }
+
+    #[test]
+    fn writer_stack_packed_scattered_fragments_and_preserves_materializing_reads() {
+        let (_dir, stack, _rx) = temp_stack(64, 16);
+        for (index, offset) in [112, 0, 160, 16, 8].into_iter().enumerate() {
+            stack
+                .write_bytes(
+                    write_spec(1, 7, offset, 100 + index as u64),
+                    Bytes::from(vec![index as u8 + 1; 4]),
+                )
+                .expect("accept fragment");
+        }
+        stack.prepare_finish_inode(7).expect("prepare");
+        let finished = stack.finish_prepared_inode(7, 900).expect("materialize");
+        let ids: HashSet<_> = finished.iter().map(|slice| slice.object_id).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "20 dirty bytes should use two 16-byte objects"
+        );
+        for slice in &finished {
+            let payload = stack
+                .cached_store
+                .local_payload_backend()
+                .get(slice.object_id)
+                .expect("payload exists");
+            let mut visible = vec![0; slice.len as usize];
+            stack.copy_read_spans_into(
+                7,
+                chunk_start_offset(slice.chunk_id, 64) + u64::from(slice.chunk_offset),
+                &mut visible,
+            );
+            let start = slice.object_offset as usize;
+            assert_eq!(visible, payload[start..start + slice.len as usize]);
+        }
+        assert_eq!(
+            stack.cached_store.snapshot_writer_counters().staged_slices,
+            2
+        );
+    }
+
+    #[test]
+    fn writer_stack_drops_fully_superseded_slices_before_materializing() {
+        let (_dir, stack, _rx) = temp_stack(64, 16);
+        let writes: [(u64, &'static [u8]); 7] = [
+            (0, b"aaaaaaaa"),
+            (16, b"bbbbbbbb"),
+            // Rewrites [0, 8) in one slice.
+            (0, b"cccccccc"),
+            // Rewrite [16, 24) in two newer slices that do not coalesce.
+            (20, b"eeee"),
+            (16, b"dddd"),
+            // Only partly rewrites [32, 40), so both slices stay.
+            (32, b"ffffffff"),
+            (36, b"gggggggg"),
+        ];
+        for (index, (offset, data)) in writes.into_iter().enumerate() {
+            stack
+                .write_bytes(write_spec(1, 7, offset, 100 + index as u64 * 10), data)
+                .expect("accept write");
+        }
+        let mut visible = [0_u8; 44];
+        stack.copy_read_spans_into(7, 0, &mut visible);
+
+        let finished = stack.finish_inode(7).expect("finish inode");
+
+        let mut ranges: Vec<_> = finished
+            .iter()
+            .map(|slice| (slice.chunk_offset, slice.len))
+            .collect();
+        ranges.sort_unstable();
+        assert_eq!(
+            ranges,
+            vec![(0, 8), (16, 4), (20, 4), (32, 8), (36, 8)],
+            "fully rewritten slices must not become payload objects"
+        );
+        assert_eq!(&visible[..8], b"cccccccc");
+        assert_eq!(&visible[16..24], b"ddddeeee");
+        assert_eq!(&visible[32..44], b"ffffgggggggg");
+        assert_eq!(stack.total_dirty_bytes(), 0);
+        assert_eq!(stack.cached_store.snapshot_writer_counters().dirty_bytes, 0);
     }
 
     #[test]
@@ -2503,7 +2897,7 @@ mod tests {
         let stack = MountedWriterStack::new(
             store,
             WriterStackConfig {
-                block_size: 4,
+                block_size: 8,
                 chunk_size: 16,
                 page_size: 4,
                 dirty_byte_limit: None,
@@ -2514,6 +2908,9 @@ mod tests {
         stack
             .write_bytes(write_spec(1, 7, 0, 700), Bytes::from_static(b"data"))
             .expect("write initial block");
+        stack
+            .write_bytes(write_spec(1, 7, 8, 701), b"tail")
+            .expect("write scattered fragment");
         let materialization_error = stack
             .finish_inode(7)
             .expect_err("first materialization fails");
@@ -2542,7 +2939,18 @@ mod tests {
         let retried = stack
             .finish_inode(7)
             .expect("second materialization retries detached payload");
-        assert_eq!(retried.len(), 1);
+        assert_eq!(retried.len(), 2);
+        assert_eq!(retried[1].object_id, 700);
+        assert_eq!(retried[1].object_offset, 4);
+        assert_eq!(
+            stack
+                .cached_store
+                .local_payload_backend()
+                .get(700)
+                .unwrap()
+                .as_ref(),
+            b"datatail"
+        );
         assert_eq!(retried[0].object_id, 700);
 
         stack

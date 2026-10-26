@@ -20,7 +20,7 @@ thread_local! {
     pub(super) static LOCAL_PROJECTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct RegularFileProjectionState {
     committed: bool,
     unready: bool,
@@ -31,6 +31,76 @@ struct RegularFileProjectionState {
 impl RegularFileProjectionState {
     fn hidden(&self) -> bool {
         !self.published && (self.empty_draft || (!self.committed && self.unready))
+    }
+}
+
+/// Final regular-file projection states of a local event window that projects
+/// no remote-visible operation.
+///
+/// Such a window only holds events whose visibility depends on their inode
+/// being hidden, or events that are never projected. A suffix therefore keeps
+/// the window at zero visible operations when it hides no fewer inodes and its
+/// own projectable events belong to hidden inodes, which lets the pending-state
+/// tracker extend the window without decoding it again.
+#[derive(Clone, Default)]
+pub(super) struct HiddenWindowProjection {
+    states: HashMap<Ino, RegularFileProjectionState>,
+}
+
+impl HiddenWindowProjection {
+    pub(super) fn from_events(events: &[MetaEvent]) -> Self {
+        let mut states = HashMap::new();
+        for event in events {
+            RemoteApplyCoordinator::update_local_projection_state(&mut states, event);
+        }
+        Self { states }
+    }
+
+    /// Folds `suffix` into the window when it provably adds no remote-visible
+    /// operation and cannot let the window be acknowledged; returns `false`
+    /// and leaves the window unchanged otherwise.
+    pub(super) fn extend_if_suffix_stays_hidden(&mut self, suffix: &[MetaEvent]) -> bool {
+        let mut touched: HashMap<Ino, RegularFileProjectionState> = HashMap::new();
+        for event in suffix {
+            let Some(ino) = RemoteApplyCoordinator::projection_event_inode(event) else {
+                continue;
+            };
+            let state = touched
+                .entry(ino)
+                .or_insert_with(|| self.states.get(&ino).copied().unwrap_or_default());
+            RemoteApplyCoordinator::fold_local_projection_event(state, event);
+        }
+        // An inode that stops being hidden would expose its earlier events.
+        if touched.iter().any(|(ino, state)| {
+            self.states.get(ino).is_some_and(|old| old.hidden()) && !state.hidden()
+        }) {
+            return false;
+        }
+        let hidden_after = |ino: &Ino| {
+            touched
+                .get(ino)
+                .or_else(|| self.states.get(ino))
+                .is_some_and(RegularFileProjectionState::hidden)
+        };
+        let suffix_hidden = suffix.iter().all(|event| {
+            !RemoteApplyCoordinator::remote_event_is_projectable(event)
+                || match event {
+                    MetaEvent::SetAttr { attr } => {
+                        attr.kind == FileType::RegularFile && hidden_after(&attr.ino)
+                    }
+                    MetaEvent::AddEntry { entry, .. } => {
+                        entry.kind == FileType::RegularFile && hidden_after(&entry.ino)
+                    }
+                    // A deletion can leave nothing to replay, so the window
+                    // may be acknowledged; only a full projection decides that.
+                    _ => false,
+                }
+        });
+        if !suffix_hidden {
+            return false;
+        }
+        self.states.extend(touched);
+        true
     }
 }
 
@@ -231,28 +301,55 @@ impl<'a> RemoteApplyCoordinator<'a> {
         hidden: &mut HashSet<Ino>,
         event: &MetaEvent,
     ) -> Option<Ino> {
+        let (ino, is_hidden) = Self::update_local_projection_state(states, event)?;
+        let changed = if is_hidden {
+            hidden.insert(ino)
+        } else {
+            hidden.remove(&ino)
+        };
+        changed.then_some(ino)
+    }
+
+    /// Inode whose regular-file projection state `event` updates, if any.
+    fn projection_event_inode(event: &MetaEvent) -> Option<Ino> {
+        match event {
+            MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => Some(attr.ino),
+            MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+            | MetaEvent::PublishRegularFileBaseSlices { ino, .. } => Some(*ino),
+            _ => None,
+        }
+    }
+
+    /// Folds `event` into the projection state of its inode and returns the
+    /// inode with its resulting hidden status.
+    fn update_local_projection_state(
+        states: &mut HashMap<Ino, RegularFileProjectionState>,
+        event: &MetaEvent,
+    ) -> Option<(Ino, bool)> {
         #[cfg(test)]
         LOCAL_PROJECTION_WORK.with(|work| work.set(work.get() + 1));
-        let (ino, is_hidden) = match event {
+        let ino = Self::projection_event_inode(event)?;
+        let state = states.entry(ino).or_default();
+        Self::fold_local_projection_event(state, event);
+        Some((ino, state.hidden()))
+    }
+
+    fn fold_local_projection_event(state: &mut RegularFileProjectionState, event: &MetaEvent) {
+        match event {
             MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
-                let state = states.entry(attr.ino).or_default();
                 state.committed |= attr.committed_content_epoch > 0;
                 state.unready |= !Self::regular_file_attr_is_ready_for_serving(attr);
                 // Latest attr wins: a draft rewritten and published in one window is no longer empty.
                 state.empty_draft = attr.is_unpublished_empty_draft();
-                (attr.ino, state.hidden())
             }
-            MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
-                let state = states.entry(*ino).or_default();
+            MetaEvent::SetRegularFileOverlaySlices { chunk_slices, .. } => {
                 state.unready |= chunk_slices.iter().any(|(_, slices)| {
                     slices
                         .iter()
                         .any(|slice| slice.payload_state != PayloadRefState::Published)
                 });
-                (*ino, state.hidden())
             }
-            MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
-                let state = states.entry(*ino).or_default();
+            MetaEvent::PublishRegularFileBaseSlices { chunk_slices, .. } => {
                 state.published |= chunk_slices.is_empty()
                     || chunk_slices.iter().any(|(_, slices)| {
                         slices.iter().any(|slice| {
@@ -260,16 +357,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                                 && slice.payload.is_some()
                         })
                     });
-                (*ino, state.hidden())
             }
-            _ => return None,
-        };
-        let changed = if is_hidden {
-            hidden.insert(ino)
-        } else {
-            hidden.remove(&ino)
-        };
-        changed.then_some(ino)
+            _ => {}
+        }
     }
 
     fn local_events_need_serving_replay(
@@ -1760,6 +1850,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             )
         })?;
         let mut changed = false;
+        let mut local_removals = crate::redb_engine::ReplayLocalJournal::default();
         for event in &batch_events {
             if let MetaEvent::RenameEntry {
                 parent,
@@ -1777,6 +1868,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     *new_parent,
                     new_name,
                     entry,
+                    &mut local_removals,
                 )?;
                 changed = true;
             }
@@ -2155,7 +2247,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 continue;
             }
             let (parent, name) = decode_dentry_key(key)?;
-            let Some(entry) = RedbMetaEngine::lookup_merged_in_write_txn(txn, parent, name)? else {
+            // Reconcile keys come from replayed events and name exactly one binding.
+            let Some(entry) = RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)?
+            else {
                 continue;
             };
             if entry.kind == FileType::RegularFile

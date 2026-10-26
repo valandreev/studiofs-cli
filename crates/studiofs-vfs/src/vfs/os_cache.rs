@@ -56,9 +56,9 @@ pub enum OsCacheReason {
 impl OsCacheReason {
     /// Return whether the decision compared an observed content generation.
     ///
-    /// Only these decisions describe content that platform bridges may serve
-    /// through kernel-buffered reads; every other reason reflects local,
-    /// unknown, or non-regular state.
+    /// Every other reason reflects local, unknown, or non-regular state. Each
+    /// bridge decides which reasons it serves through kernel-buffered reads;
+    /// Linux also buffers [`Self::LocalDirty`] reads (ADR 0011).
     pub const fn observes_generation(self) -> bool {
         matches!(
             self,

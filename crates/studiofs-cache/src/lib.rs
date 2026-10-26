@@ -29,7 +29,7 @@ pub const DEFAULT_MEMORY_CACHE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 // --- Re-exports ---
 pub use cached_store::{
     CachedStore, CachedStoreConfig, CachedStoreWriterConfig, CachedStoreWriterCountersSnapshot,
-    CachedStoreWriterError, CachedStoreWriterSlice, DetachedStagedSlice, StagedSlice,
+    CachedStoreWriterError, CachedStoreWriterSlice, DetachedStagedSlice, StagedSlice, UploadOp,
     WriterWriteResult,
 };
 pub use runtime::{
@@ -39,7 +39,7 @@ pub use runtime::{
     LocalPayloadReadMode, LocalPayloadRuntimeDetection, LocalPayloadSyncMode,
     LocalPayloadWriteMode,
 };
-pub use upload_queue::PendingUpload;
+pub use upload_queue::{ObjectFileMapping, PendingUpload, PendingUploadSummary};
 
 const LOCAL_PAYLOAD_OPEN_LOCK_RETRY_ATTEMPTS: usize = 40;
 const LOCAL_PAYLOAD_OPEN_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);

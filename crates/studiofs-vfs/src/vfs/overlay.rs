@@ -2,11 +2,54 @@ use super::{ResolvedSliceSource, StudioVfs, VfsResult};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use studiofs_cache::upload_queue::PendingUpload;
+use studiofs_cache::upload_queue::{ObjectFileMapping, PendingUpload};
 use studiofs_meta::types::Ino;
 
 use crate::VfsMeta;
 use crate::runtime::run_meta;
+
+#[derive(Clone, Copy)]
+pub(super) struct ObjectUploadGeometry {
+    pub(super) offset: u64,
+    pub(super) payload_len: u64,
+    end: u64,
+    origin: Option<u64>,
+    referenced_bytes: u64,
+}
+
+impl ObjectUploadGeometry {
+    pub(super) fn new(file_offset: u64, object_offset: u32, len: u32) -> Self {
+        Self {
+            offset: file_offset,
+            payload_len: u64::from(object_offset) + u64::from(len),
+            end: file_offset.saturating_add(u64::from(len)),
+            origin: file_offset.checked_sub(u64::from(object_offset)),
+            referenced_bytes: u64::from(len),
+        }
+    }
+
+    pub(super) fn include(&mut self, other: Self) {
+        self.offset = self.offset.min(other.offset);
+        self.payload_len = self.payload_len.max(other.payload_len);
+        self.end = self.end.max(other.end);
+        if self.origin != other.origin {
+            self.origin = None;
+        }
+        self.referenced_bytes = self.referenced_bytes.saturating_add(other.referenced_bytes);
+    }
+
+    /// Only bytes with a known file position may be reattached: a packed object's
+    /// unreferenced bytes belong to file offsets that no surviving segment records.
+    pub(super) fn file_mapping(self) -> Option<ObjectFileMapping> {
+        let origin = self.origin?;
+        let len = self.end - self.offset;
+        (self.referenced_bytes == len).then_some(ObjectFileMapping {
+            file_offset: self.offset,
+            object_offset: self.offset - origin,
+            len,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ExtentRecordId {
@@ -298,8 +341,41 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtentRecordId, PendingUploadCatalog};
-    use studiofs_cache::upload_queue::PendingUpload;
+    use super::{ExtentRecordId, ObjectUploadGeometry, PendingUploadCatalog};
+    use studiofs_cache::upload_queue::{ObjectFileMapping, PendingUpload};
+
+    #[test]
+    fn packed_geometry_maps_only_gapless_references_with_one_origin() {
+        let mut contiguous = ObjectUploadGeometry::new(100, 0, 4);
+        contiguous.include(ObjectUploadGeometry::new(104, 4, 4));
+        assert_eq!(
+            contiguous.file_mapping(),
+            Some(ObjectFileMapping::whole(100, 8))
+        );
+
+        // Head overwrite and tail truncation of a contiguous object keep their mapping.
+        assert_eq!(
+            ObjectUploadGeometry::new(104, 4, 4).file_mapping(),
+            Some(ObjectFileMapping {
+                file_offset: 104,
+                object_offset: 4,
+                len: 4,
+            })
+        );
+
+        let mut packed = ObjectUploadGeometry::new(100, 0, 4);
+        packed.include(ObjectUploadGeometry::new(200, 4, 4));
+        assert_eq!(packed.file_mapping(), None, "scattered origins");
+
+        let mut gap = ObjectUploadGeometry::new(100, 0, 4);
+        gap.include(ObjectUploadGeometry::new(108, 8, 4));
+        assert_eq!(
+            gap.file_mapping(),
+            None,
+            "superseded middle bytes are unmapped"
+        );
+        assert_eq!(gap.payload_len, 12);
+    }
 
     #[test]
     fn pending_upload_catalog_prefers_latest_pending_upload_for_block() {
@@ -309,7 +385,7 @@ mod tests {
             PendingUpload {
                 ino,
                 offset: block_offset,
-                object_file_offset: block_offset,
+                file_mapping: None,
                 object_id: 101,
                 payload_len: 0,
                 content_epoch: 3,
@@ -320,7 +396,7 @@ mod tests {
             PendingUpload {
                 ino,
                 offset: block_offset,
-                object_file_offset: block_offset,
+                file_mapping: None,
                 object_id: 202,
                 payload_len: 0,
                 content_epoch: 5,

@@ -4,6 +4,77 @@ use tempfile::TempDir;
 // Max TTL: multi-step workflow tests fsync heavily and can exceed a short lease under suite load.
 const DIAGNOSTICS_TEST_LEASE_TTL_MS: u64 = MAX_LEASE_TTL_MS;
 
+#[test]
+fn live_health_omits_inode_details_while_explicit_runtime_retains_them() {
+    use studiofs_meta::schema::ROOT_INO;
+    use studiofs_vfs::contract_harness::ContractVfsFixture;
+
+    let fixture = ContractVfsFixture::new("sfs-891-health").expect("local VFS fixture");
+    let file = fixture
+        .vfs()
+        .create(ROOT_INO, b"unpublished.txt", 0, 0, 0o644)
+        .expect("create local-only lifecycle");
+    let source = LiveMountDiagnosticsSource::new(
+        fixture.core().format_info(),
+        "/sfs-891",
+        fixture.cache_dir(),
+        std::process::id(),
+        false,
+        LiveMountRuntimeFingerprint {
+            bridge: "test".to_string(),
+            cache_size: None,
+            endpoint_override: None,
+            snapshot_id: None,
+            vfs_config: serde_json::Value::Null,
+        },
+        fixture.vfs(),
+    );
+
+    let snapshots_before = fixture.vfs().upload_stats().pending_upload_snapshot_calls;
+    for _ in 0..3 {
+        source.health_snapshot();
+    }
+    assert_eq!(
+        fixture.vfs().upload_stats().pending_upload_snapshot_calls,
+        snapshots_before,
+        "Health must not enter the full ZeroIO lifecycle scan, even if its result is discarded"
+    );
+    let health = serde_json::to_value(source.health_snapshot()).expect("serialize health");
+    assert!(
+        health.get("zeroio").is_none(),
+        "polling Health must not compute or return lifecycle diagnostics"
+    );
+    let runtime = source.runtime_snapshot();
+    assert_eq!(
+        fixture.vfs().upload_stats().pending_upload_snapshot_calls,
+        snapshots_before + 1,
+        "only an explicit RuntimeSnapshot should collect the full ZeroIO view"
+    );
+    assert!(
+        runtime
+            .zeroio
+            .drilldown
+            .iter()
+            .any(|entry| entry.ino == file.ino)
+    );
+    assert!(runtime.zeroio.unpublished_files > 0);
+}
+
+#[test]
+fn legacy_health_cannot_certify_sync_completion() {
+    let mut legacy = serde_json::to_value(DiagnosticsHealthSnapshot::default()).unwrap();
+    let fields = legacy.as_object_mut().unwrap();
+    fields.remove("synchronization");
+    fields.remove("sync_safety");
+    fields.insert("zeroio".to_string(), serde_json::json!({}));
+
+    let health: DiagnosticsHealthSnapshot = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        health.sync_safety.state,
+        studiofs_vfs::VfsSyncSafetyState::Unknown
+    );
+}
+
 #[derive(Clone)]
 struct StaticDiagnosticsSource {
     session: DiagnosticsSessionInfo,
@@ -500,7 +571,21 @@ fn mutating_safe_action_requests_require_current_controller_lease() {
 
 #[test]
 fn runtime_snapshot_request_returns_structured_sections() {
-    let source = static_source();
+    let mut source = static_source();
+    source.health.synchronization.state.pending_metadata_ops = 7;
+    source.health.synchronization.state.inflight_metadata_ops = 3;
+    source
+        .health
+        .synchronization
+        .state
+        .file_sessions
+        .open_handles = 11;
+    source
+        .health
+        .synchronization
+        .state
+        .foreground_reads
+        .speedometer_samples = 13;
     let lease_manager = ControllerLeaseManager::default();
     let service = test_session_service(&source, &lease_manager, None, None);
     let snapshot = service.runtime_snapshot().expect("runtime snapshot");
@@ -511,8 +596,8 @@ fn runtime_snapshot_request_returns_structured_sections() {
         source.health.upload.pending_uploads
     );
     assert_eq!(
-        snapshot.synchronization.state.file_sessions.open_handles,
-        source.health.file_sessions.open_handles
+        serde_json::to_value(&snapshot.synchronization).expect("runtime synchronization"),
+        serde_json::to_value(&source.health.synchronization).expect("health synchronization")
     );
 }
 

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -12,8 +12,8 @@ use crate::async_writes::{
     DEFAULT_MAX_PENDING_BYTES, DEFAULT_MAX_PENDING_WRITES,
 };
 use crate::cache_policy::{
-    LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBuffer, SyncReadBufferPool,
-    SystemMemorySampler, decide_open_cache,
+    CachePolicySelection, LinuxFuseCachePolicy, OpenCacheDecision, ReadAheadIntent, SyncReadBuffer,
+    SyncReadBufferPool, SystemMemorySampler, decide_open_cache,
 };
 use crate::directory_cache::{DirectorySnapshot, DirectorySnapshotCache, linux_observation};
 use crate::invalidation::{
@@ -31,8 +31,9 @@ use studiofs_bridge::posix::{
 use studiofs_meta::{FileType, InodeAttr, SetattrArgs, TimeSpec};
 use studiofs_vfs::vfs::OsCacheParticipation;
 use studiofs_vfs::{
-    KernelInvalidator, LocalSyncPolicy, OpenFlags, ReadAheadOwner, StatFs, StudioVfs,
-    VfsFuseAsyncWriteSnapshot, VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot,
+    DirectoryEnumerationObservation, KernelInvalidator, LocalSyncPolicy, OpenFlags, ReadAheadOwner,
+    StatFs, StudioVfs, VfsFuseAsyncWriteSnapshot, VfsFuseConnectionSnapshot,
+    VfsFuseInvalidationSnapshot, read_runtime_stats_buffer,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, warn};
@@ -43,6 +44,8 @@ const LINUX_FUSE_MAX_READ_SIZE: usize = 4 * 1024 * 1024;
 const INVALIDATION_SHUTDOWN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const NAMESPACE_ATTR_INVALIDATION_TIMEOUT: Duration = Duration::from_secs(2);
 const ASYNC_WRITE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Ledger-tracked writes up to this size run on the callback thread.
+const INLINE_WRITE_MAX_BYTES: usize = 64 * 1024;
 // Raw invalidation, lookup/open liveness, and generation retirement are wired,
 // so unset Linux mounts can safely use the requested adaptive default.
 const LINUX_FUSE_ADAPTIVE_DEFAULT_READY: bool = true;
@@ -142,6 +145,14 @@ pub(crate) mod raw {
             stbuf: *const stat,
             off: off_t,
         ) -> size_t;
+        pub(crate) fn fuse_add_direntry_plus(
+            req: *mut FuseReq,
+            buf: *mut c_char,
+            bufsize: size_t,
+            name: *const c_char,
+            entry: *const FuseEntryParam,
+            off: off_t,
+        ) -> size_t;
         pub(crate) fn fuse_opt_free_args(args: *mut FuseArgs);
         pub(crate) fn fuse_session_mount(
             session: *mut FuseSession,
@@ -165,6 +176,12 @@ unsafe extern "C" {
         ops_size: libc::size_t,
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
+    fn studiofs_linux_fuse_wrap_exit_signal(sig: c_int) -> c_int;
+    fn studiofs_linux_fuse_unwrap_exit_signal(sig: c_int);
+    #[cfg(test)]
+    fn studiofs_linux_fuse_enter_loop_thread();
+    #[cfg(test)]
+    fn studiofs_linux_fuse_leave_loop_thread();
     fn studiofs_linux_fuse_session_loop_mt(
         session: *mut raw::FuseSession,
         max_threads: c_uint,
@@ -259,8 +276,15 @@ pub(crate) struct SessionState {
     inode_liveness: FuseInodeLiveness,
     open_liveness: [Mutex<HashMap<u64, FuseOpenHandleGuard>>; LIVENESS_SHARDS],
     invalidation_queue: FuseInvalidationQueue,
+    /// Runtime stats text captured at open, keyed by VFS file handle.
+    runtime_stats_snapshots: Mutex<HashMap<u64, Arc<[u8]>>>,
     #[cfg(test)]
     getattr_calls: AtomicU64,
+    #[cfg(test)]
+    lookup_calls: Arc<AtomicU64>,
+    /// Inline writes hold a callback worker; at most this many run at once.
+    inline_write_limit: usize,
+    inline_writes: AtomicUsize,
 }
 
 const _: fn() = assert_send_sync_static::<SessionState>;
@@ -307,8 +331,19 @@ impl SessionState {
             inode_liveness: FuseInodeLiveness::default(),
             open_liveness: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             invalidation_queue: FuseInvalidationQueue::default(),
+            runtime_stats_snapshots: Mutex::new(HashMap::new()),
             #[cfg(test)]
             getattr_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            lookup_calls: Arc::new(AtomicU64::new(0)),
+            // Leave half the callback workers for metadata and reads while
+            // inline writes wait on VFS backpressure.
+            inline_write_limit: usize::try_from(
+                connection_config.worker_thread_count(has_worker_limit()) / 2,
+            )
+            .unwrap_or(usize::MAX)
+            .max(1),
+            inline_writes: AtomicUsize::new(0),
         }
     }
 }
@@ -361,9 +396,9 @@ struct FuseWriteCallbackMetrics {
     started: Instant,
 }
 
-#[derive(Clone, Copy)]
-struct FuseWriteCallbackContext {
-    req: *mut raw::FuseReq,
+/// The write reply is consumed only when the request is accepted for async handling.
+struct FuseWriteCallbackContext<R> {
+    reply: R,
     started: Instant,
 }
 
@@ -546,14 +581,11 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_async_dio(
 pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_writeback_cache(
     userdata: *mut c_void,
 ) -> c_int {
-    let cache_policy = callback_state_from_userdata(userdata)
-        .map(|state| state.cache_policy)
-        .unwrap_or_else(linux_fuse_cache_policy_from_env);
-    if cache_policy == LinuxFuseCachePolicy::Kernel {
-        1
-    } else {
-        0
-    }
+    // Without a session there is no chosen policy; never request writeback.
+    fuse_flag(
+        callback_state_from_userdata(userdata)
+            .is_some_and(|state| state.cache_policy.wants_writeback_cache()),
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -620,26 +652,28 @@ fn current_gid() -> u32 {
 
 fn linux_fuse_cache_policy_from_env() -> LinuxFuseCachePolicy {
     let value = std::env::var("STUDIOFS_LINUX_FUSE_CACHE_POLICY").ok();
-    let selection = LinuxFuseCachePolicy::parse(value.as_deref());
+    let selection = linux_fuse_cache_policy_selection_for_value(
+        value.as_deref(),
+        LINUX_FUSE_ADAPTIVE_DEFAULT_READY,
+    );
     if selection.warning_required {
         warn!(
             value = value.as_deref().unwrap_or_default(),
             "unknown STUDIOFS_LINUX_FUSE_CACHE_POLICY; using adaptive policy"
         );
     }
-    linux_fuse_effective_cache_policy_for_value(value.as_deref(), LINUX_FUSE_ADAPTIVE_DEFAULT_READY)
+    selection.policy
 }
 
-fn linux_fuse_effective_cache_policy_for_value(
+fn linux_fuse_cache_policy_selection_for_value(
     value: Option<&str>,
     adaptive_default_ready: bool,
-) -> LinuxFuseCachePolicy {
-    let selection = LinuxFuseCachePolicy::parse(value);
+) -> CachePolicySelection {
+    let mut selection = LinuxFuseCachePolicy::parse(value);
     if !adaptive_default_ready && value.is_none() {
-        LinuxFuseCachePolicy::Direct
-    } else {
-        selection.policy
+        selection.policy = LinuxFuseCachePolicy::Direct;
     }
+    selection
 }
 
 fn linux_fuse_env_flag(name: &str) -> bool {
@@ -689,18 +723,7 @@ fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
 }
 
 fn argv_strings(volume_name: &str, read_only: bool) -> Vec<String> {
-    let mut args = argv_strings_for_cache_policy(volume_name, linux_fuse_cache_policy_from_env());
-    if read_only {
-        args.extend(["-o".to_owned(), "ro".to_owned()]);
-    }
-    args
-}
-
-fn argv_strings_for_cache_policy(
-    volume_name: &str,
-    _cache_policy: LinuxFuseCachePolicy,
-) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "studiofs-linux-fuse".to_owned(),
         "-o".to_owned(),
         format!("fsname={volume_name}"),
@@ -712,7 +735,11 @@ fn argv_strings_for_cache_policy(
         "default_permissions".to_owned(),
         "-o".to_owned(),
         format!("max_read={LINUX_FUSE_MAX_READ_SIZE}"),
-    ]
+    ];
+    if read_only {
+        args.extend(["-o".to_owned(), "ro".to_owned()]);
+    }
+    args
 }
 
 fn path_to_cstring(path: &std::path::Path) -> io::Result<CString> {
@@ -872,6 +899,11 @@ impl Session {
         let result = unsafe { raw::fuse_set_signal_handlers(self.raw.as_ptr()) };
         if result == 0 {
             self.signal_handlers_installed = true;
+            for signal in FUSE_EXIT_SIGNALS {
+                // SAFETY: wrapping only replaces the plain handler libfuse just
+                // installed; the wrapper chains to it.
+                unsafe { studiofs_linux_fuse_wrap_exit_signal(signal) };
+            }
             Ok(())
         } else {
             Err(io::Error::last_os_error())
@@ -949,6 +981,12 @@ impl Session {
         }
     }
 }
+
+/// Signals whose libfuse handler exits the session loop.
+///
+/// The handler only sets a flag that the loop thread sees when the signal
+/// interrupts its own wait, so the C shim forwards these signals to that thread.
+const FUSE_EXIT_SIGNALS: [c_int; 3] = [libc::SIGHUP, libc::SIGINT, libc::SIGTERM];
 
 /// Hold kernel invalidations until the kernel has applied real root attributes.
 ///
@@ -1482,7 +1520,10 @@ pub extern "C" fn studiofs_linux_fuse_write(
     };
     let started = Instant::now();
     match state.queue_async_write(
-        FuseWriteCallbackContext { req, started },
+        FuseWriteCallbackContext {
+            reply: FuseReqPtr(req),
+            started,
+        },
         ino,
         buf,
         size,
@@ -1611,6 +1652,36 @@ pub extern "C" fn studiofs_linux_fuse_readdir(
             let bytes = buffer.as_slice();
             // SAFETY: `bytes` is valid for this synchronous reply.
             unsafe { raw::fuse_reply_buf(req, bytes.as_ptr().cast::<c_char>(), bytes.len()) };
+        }
+        Err(errno) => reply_error(req, errno),
+    }
+    state.directory_buffers.put(buffer);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn studiofs_linux_fuse_readdirplus(
+    req: *mut raw::FuseReq,
+    ino: raw::FuseIno,
+    size: size_t,
+    off: off_t,
+    fi: *mut raw::FuseFileInfo,
+) {
+    let Some(state) = callback_state(req) else {
+        reply_error(req, libc::EIO);
+        return;
+    };
+    let Some(handle) = dir_handle(fi) else {
+        reply_error(req, libc::EBADF);
+        return;
+    };
+    let mut buffer = state.directory_buffers.take(size);
+    match state.readdirplus(req, ino, handle, off, &mut buffer) {
+        Ok(reservations) => {
+            let bytes = buffer.as_slice();
+            reply_reserved_entries_with(state, reservations, || {
+                // SAFETY: `bytes` is valid for this synchronous reply.
+                unsafe { raw::fuse_reply_buf(req, bytes.as_ptr().cast::<c_char>(), bytes.len()) }
+            });
         }
         Err(errno) => reply_error(req, errno),
     }
@@ -1822,6 +1893,8 @@ impl SessionState {
     }
 
     fn lookup(&self, parent: u64, name: &[u8]) -> Result<ObservedInodeAttr, i32> {
+        #[cfg(test)]
+        self.lookup_calls.fetch_add(1, Ordering::Relaxed);
         self.observe_attr(|| {
             self.vfs
                 .lookup(parent, name)
@@ -2062,6 +2135,10 @@ impl SessionState {
         if self.read_only && (trunc || open_flags.write_access_requested()) {
             return Err(libc::EROFS);
         }
+        let runtime_stats = self.vfs.is_runtime_stats_file_ino(ino);
+        if runtime_stats && (trunc || open_flags.write_access_requested()) {
+            return Err(libc::EACCES);
+        }
         let fh = self
             .vfs
             .open_file_with_known_attr_and_read_ahead_owner(
@@ -2074,6 +2151,11 @@ impl SessionState {
         // Establish kernel liveness before generation preparation or any
         // operation that can publish an invalidation for this handle.
         self.install_open_liveness(ino, fh);
+        if runtime_stats {
+            // Each open reads one consistent snapshot, matching WinFSP and macFUSE.
+            let snapshot = Arc::from(self.vfs.runtime_stats_file_text().into_bytes());
+            self.runtime_stats_snapshots_guard().insert(fh, snapshot);
+        }
         Ok(LinuxFuseAllocatedOpen {
             observed,
             fh,
@@ -2207,6 +2289,7 @@ impl SessionState {
 
     fn reject_prepared_open(&self, ino: u64, fh: u64) {
         debug!(ino, fh, "Linux FUSE rolls back rejected open reply");
+        self.runtime_stats_snapshots_guard().remove(&fh);
         self.remove_open_liveness(fh);
         self.vfs.abort_os_cache_open(fh);
         let _ = self
@@ -2268,6 +2351,9 @@ impl SessionState {
         let fh = file_handle(fi).ok_or(libc::EBADF)?;
         let offset = u64::try_from(offset).map_err(|_| libc::EINVAL)?;
         let size = clamp_read_size(size);
+        if self.vfs.is_runtime_stats_file_ino(ino) {
+            return self.read_runtime_stats(fh, offset, size);
+        }
         let mut buffer = self.read_buffers.take(size);
         let read = match self.runtime_handle.block_on(self.vfs.read_into_fh(
             fh,
@@ -2283,6 +2369,24 @@ impl SessionState {
         };
         buffer.truncate(read as usize);
         Ok(buffer)
+    }
+
+    fn read_runtime_stats(&self, fh: u64, offset: u64, size: usize) -> Result<SyncReadBuffer, i32> {
+        let snapshot = self
+            .runtime_stats_snapshots_guard()
+            .get(&fh)
+            .cloned()
+            .ok_or(libc::EBADF)?;
+        let mut buffer = self.read_buffers.take(size);
+        let read = read_runtime_stats_buffer(&snapshot, offset, buffer.as_mut());
+        buffer.truncate(read as usize);
+        Ok(buffer)
+    }
+
+    fn runtime_stats_snapshots_guard(&self) -> MutexGuard<'_, HashMap<u64, Arc<[u8]>>> {
+        self.runtime_stats_snapshots
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     fn readlink(&self, ino: u64) -> Result<Vec<u8>, i32> {
@@ -2313,9 +2417,9 @@ impl SessionState {
         .map_err(|error| vfs_err_to_errno(&error))
     }
 
-    fn queue_async_write(
+    fn queue_async_write<R: FuseWriteReply + 'static>(
         &self,
-        callback: FuseWriteCallbackContext,
+        callback: FuseWriteCallbackContext<R>,
         ino: u64,
         buf: *const c_char,
         size: usize,
@@ -2341,15 +2445,58 @@ impl SessionState {
             ticket.complete(Err(errno));
             return Err(errno);
         }
+        let fh = request.fh;
+        let write_offset = request.offset;
+        let sequence = ticket.sequence();
+        if size <= INLINE_WRITE_MAX_BYTES
+            && let Some(_inline) =
+                InlineWriteSlot::acquire(&self.inline_writes, self.inline_write_limit)
+        {
+            let task_guard = FuseWriteTaskGuard::with_metrics(
+                callback.reply,
+                ticket,
+                Arc::clone(&self.vfs),
+                size,
+                callback.started,
+            );
+            // The kernel waits for this reply either way, so for a small write a
+            // runtime hand-off only adds a copy, a spawn, and a cross-thread reply.
+            // The ticket keeps barrier, shutdown, and capacity accounting unchanged.
+            if !self.async_writes.mark_task_non_cancellable(sequence) {
+                // Shutdown cancelled the request; dropping the guard replies EIO.
+                return Ok(true);
+            }
+            let result = with_write_data_slice(buf, size, |data| {
+                catch_inline_write_panic(|| {
+                    self.runtime_handle
+                        .block_on(self.vfs.write_fh_with_deferred_materialize(
+                            fh,
+                            ino,
+                            write_offset,
+                            data,
+                            LocalSyncPolicy::Opportunistic,
+                        ))
+                        .map_err(|error| vfs_err_to_errno(&error))
+                })
+            })
+            .and_then(|result| result);
+            let reply_result = task_guard.complete(result);
+            if reply_result != 0 {
+                debug!(
+                    ino,
+                    fh,
+                    result = reply_result,
+                    "Linux FUSE inline write reply was rejected"
+                );
+            }
+            return Ok(true);
+        }
         // The request buffer remains owned by libfuse while this callback is
         // blocked on admission. Copy only after bounded capacity is reserved.
         let data = with_write_data_slice(buf, size, Bytes::copy_from_slice)?;
-        let fh = request.fh;
-        let write_offset = request.offset;
         let vfs = self.vfs.clone();
-        let sequence = ticket.sequence();
         let task_guard = FuseWriteTaskGuard::with_metrics(
-            FuseReqPtr(callback.req),
+            callback.reply,
             ticket,
             Arc::clone(&self.vfs),
             size,
@@ -2453,6 +2600,7 @@ impl SessionState {
     }
 
     fn release(&self, fh: u64) -> Result<(), i32> {
+        self.runtime_stats_snapshots_guard().remove(&fh);
         let local_sync_policy = self.local_sync_policy_for_handle(fh);
         let watermark = self.async_writes.close_handle(fh);
         let outcome = self.async_writes.wait_handle(watermark);
@@ -2495,25 +2643,58 @@ impl SessionState {
         offset: off_t,
         buffer: &mut DirectoryEntryBuffer,
     ) -> Result<(), i32> {
+        self.read_directory(req, ino, handle, offset, buffer, None)
+    }
+
+    /// Returns one lookup reservation per entry that carries a kernel entry.
+    fn readdirplus(
+        &self,
+        req: *mut raw::FuseReq,
+        ino: u64,
+        handle: NonNull<DirectoryHandle>,
+        offset: off_t,
+        buffer: &mut DirectoryEntryBuffer,
+    ) -> Result<Vec<(u64, FuseLookupReservation)>, i32> {
+        let mut reservations = Vec::new();
+        self.read_directory(req, ino, handle, offset, buffer, Some(&mut reservations))?;
+        Ok(reservations)
+    }
+
+    /// `plus` selects `readdirplus` encoding and collects its lookup reservations.
+    fn read_directory(
+        &self,
+        req: *mut raw::FuseReq,
+        ino: u64,
+        handle: NonNull<DirectoryHandle>,
+        offset: off_t,
+        buffer: &mut DirectoryEntryBuffer,
+        mut plus: Option<&mut Vec<(u64, FuseLookupReservation)>>,
+    ) -> Result<(), i32> {
         let mut idx = usize::try_from(offset).map_err(|_| libc::EINVAL)?;
         let dir_attr = minimal_dir_stat(ino);
         // SAFETY: `handle` comes from `opendir` and remains owned by the
         // matching directory handle until `releasedir`.
         let handle = unsafe { handle.as_ref() };
         let entries = &handle.entries;
+        let encoding = if plus.is_some() {
+            DirectoryEntryEncoding::Plus
+        } else {
+            DirectoryEntryEncoding::Plain
+        };
         if idx == 0 {
             // Like WinFSP's marker-less read, a rewind starts a fresh enumeration.
             *entries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            if !buffer.push(req, OsStr::new("."), &dir_attr, 1)? {
+            if !buffer.push_name_only(req, encoding, OsStr::new("."), &dir_attr, 1)? {
                 return Ok(());
             }
             idx = 1;
         }
         if idx == 1 {
-            if !buffer.push(
+            if !buffer.push_name_only(
                 req,
+                encoding,
                 OsStr::new(".."),
                 &minimal_dir_stat(handle.parent_ino),
                 2,
@@ -2523,56 +2704,101 @@ impl SessionState {
             idx = 2;
         }
 
-        // SAFETY: a null buffer queries size only; name and attr are valid, req is ignored.
-        let minimum_entry_size = unsafe {
-            raw::fuse_add_direntry(req, std::ptr::null_mut(), 0, c".".as_ptr(), &dir_attr, 0)
-        };
+        let minimum_entry_size = encoding.minimum_entry_size(req, &dir_attr);
         if buffer.capacity.saturating_sub(buffer.len) < minimum_entry_size {
             return Ok(());
         }
-        let mut snapshot = entries
+        let mut captured = entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Capture once per enumeration; namespace changes must not shift existing offsets.
-        let entries = match snapshot.as_ref() {
-            Some(entries) => entries,
-            None => snapshot.insert(self.directory_snapshot(ino)?),
+        let (captured, fresh) = match captured.as_ref() {
+            Some(captured) => (captured, false),
+            None => (&*captured.insert(self.directory_snapshot(ino)?), true),
         };
-        for (i, entry) in entries.iter().enumerate().skip(idx.saturating_sub(2)) {
+        // Offsets stay on the captured snapshot, but kernel dentries must not:
+        // after a namespace change, a later chunk sends names only. A fresh
+        // capture already compared observations before and after its build.
+        let reply_entries = plus.is_some()
+            && if fresh {
+                captured.observation.is_some()
+            } else {
+                self.directory_snapshot_is_current(ino, captured)
+            };
+        for (i, entry) in captured
+            .entries
+            .iter()
+            .enumerate()
+            .skip(idx.saturating_sub(2))
+        {
             let entry_idx = i + 2;
             let attr = minimal_entry_stat(entry.ino, entry.kind);
             let next_offset = off_t::try_from(entry_idx + 1).map_err(|_| libc::EOVERFLOW)?;
-            if !buffer.push(req, OsStr::from_bytes(&entry.name), &attr, next_offset)? {
+            let name = OsStr::from_bytes(&entry.name);
+            let pushed = match plus.as_deref_mut() {
+                Some(reservations) if reply_entries => {
+                    let reservation = self.inode_liveness.reserve_lookup(entry.ino);
+                    // Read after reservation: later invalidations mark the pending reply.
+                    match self.getattr_attr(entry.ino) {
+                        Ok(entry_attr) => {
+                            let param = entry_param(self.attr_to_stat(&entry_attr), TTL_SECONDS);
+                            let pushed = buffer.push_plus(req, name, &param, next_offset)?;
+                            if pushed {
+                                reservations.push((entry.ino, reservation));
+                            }
+                            pushed
+                        }
+                        Err(_) => buffer.push_name_only(req, encoding, name, &attr, next_offset)?,
+                    }
+                }
+                _ => buffer.push_name_only(req, encoding, name, &attr, next_offset)?,
+            };
+            if !pushed {
                 break;
             }
         }
         Ok(())
     }
 
+    fn directory_snapshot_is_current(&self, ino: u64, captured: &CapturedDirectory) -> bool {
+        captured.observation.is_some_and(|observation| {
+            self.vfs
+                .directory_enumeration_observation(ino)
+                .is_ok_and(|current| linux_observation(current) == linux_observation(observation))
+        })
+    }
+
     /// Reuses a session-cached snapshot while the directory observation is unchanged.
     // shortcut: an uncached capture still holds O(N) names per handle, as WinFSP's
     // DirBuffer does; use metadata cursors if large directories need bounded memory.
-    fn directory_snapshot(&self, ino: u64) -> Result<DirectorySnapshot, i32> {
+    fn directory_snapshot(&self, ino: u64) -> Result<CapturedDirectory, i32> {
         let observe = || {
             self.vfs
                 .directory_enumeration_observation(ino)
                 .map_err(|error| vfs_err_to_errno(&error))
         };
         let observation = observe()?;
-        if let Some(snapshot) = self.directory_snapshots.lookup(ino, observation) {
-            return Ok(snapshot);
+        if let Some(entries) = self.directory_snapshots.lookup(ino, observation) {
+            return Ok(CapturedDirectory {
+                entries,
+                observation: Some(observation),
+            });
         }
-        let snapshot = DirectorySnapshot::from(
+        let entries = DirectorySnapshot::from(
             self.vfs
                 .readdir(ino)
                 .map_err(|error| vfs_err_to_errno(&error))?,
         );
         // Never cache a build that crossed an invalidation.
-        if linux_observation(observe()?) == linux_observation(observation) {
+        let unchanged = linux_observation(observe()?) == linux_observation(observation);
+        if unchanged {
             self.directory_snapshots
-                .insert(ino, observation, Arc::clone(&snapshot));
+                .insert(ino, observation, Arc::clone(&entries));
         }
-        Ok(snapshot)
+        Ok(CapturedDirectory {
+            entries,
+            observation: unchanged.then_some(observation),
+        })
     }
 
     fn statfs(&self) -> Result<statvfs, i32> {
@@ -2630,8 +2856,15 @@ impl SessionState {
 
 struct DirectoryHandle {
     parent_ino: u64,
-    entries: Mutex<Option<DirectorySnapshot>>,
+    entries: Mutex<Option<CapturedDirectory>>,
     _liveness: FuseOpenHandleGuard,
+}
+
+/// One handle's enumeration and the observation it was built under.
+struct CapturedDirectory {
+    entries: DirectorySnapshot,
+    /// `None` when the build crossed a namespace change.
+    observation: Option<DirectoryEnumerationObservation>,
 }
 
 fn dir_handle(fi: *const raw::FuseFileInfo) -> Option<NonNull<DirectoryHandle>> {
@@ -2789,6 +3022,35 @@ fn clamp_read_size(size: usize) -> usize {
     size.min(LINUX_FUSE_MAX_READ_SIZE)
 }
 
+/// Counts one inline write against the session limit until dropped.
+struct InlineWriteSlot<'a>(&'a AtomicUsize);
+
+impl<'a> InlineWriteSlot<'a> {
+    fn acquire(in_flight: &'a AtomicUsize, limit: usize) -> Option<Self> {
+        in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < limit).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self(in_flight))
+    }
+}
+
+impl Drop for InlineWriteSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// An unwind must not cross the `extern "C"` write callback; the async path
+/// confines the same panic to its task, so the inline path replies EIO.
+fn catch_inline_write_panic(write: impl FnOnce() -> Result<u32, i32>) -> Result<u32, i32> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(write)).unwrap_or_else(|_| {
+        warn!("Linux FUSE inline write panicked");
+        Err(libc::EIO)
+    })
+}
+
 fn with_write_data_slice<T>(
     buf: *const c_char,
     size: usize,
@@ -2912,14 +3174,7 @@ fn reply_reserved_entry_with_timeout(
     attr_timeout: f64,
     reply: impl FnOnce(*const raw::FuseEntryParam) -> c_int,
 ) -> c_int {
-    let stat = state.attr_to_stat(attr);
-    let entry = raw::FuseEntryParam {
-        ino: attr.ino,
-        generation: 1,
-        attr: stat,
-        attr_timeout,
-        entry_timeout: TTL_SECONDS,
-    };
+    let entry = entry_param(state.attr_to_stat(attr), attr_timeout);
     let began = reservation.begin_reply();
     debug_assert!(began, "fresh lookup reservation must begin exactly once");
     let result = reply(&entry);
@@ -2933,6 +3188,41 @@ fn reply_reserved_entry_with_timeout(
     } else {
         reservation.rollback();
     }
+    result
+}
+
+fn entry_param(attr: stat, attr_timeout: f64) -> raw::FuseEntryParam {
+    raw::FuseEntryParam {
+        ino: attr.st_ino,
+        generation: 1,
+        attr,
+        attr_timeout,
+        entry_timeout: TTL_SECONDS,
+    }
+}
+
+/// Commits every `readdirplus` entry the kernel accepted, or none of them.
+fn reply_reserved_entries_with(
+    state: &SessionState,
+    reservations: Vec<(u64, FuseLookupReservation)>,
+    reply: impl FnOnce() -> c_int,
+) -> c_int {
+    for (_, reservation) in &reservations {
+        let began = reservation.begin_reply();
+        debug_assert!(began, "fresh lookup reservation must begin exactly once");
+    }
+    let result = reply();
+    if result == 0 {
+        for (ino, reservation) in reservations {
+            if reservation
+                .commit()
+                .is_some_and(|outcome| outcome.follow_up_invalidation_required())
+            {
+                state.enqueue_follow_up_invalidation(ino);
+            }
+        }
+    }
+    // A rejected reply drops the reservations, rolling each one back.
     result
 }
 
@@ -3131,6 +3421,42 @@ impl DirectoryEntryBufferPool {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DirectoryEntryEncoding {
+    Plain,
+    Plus,
+}
+
+impl DirectoryEntryEncoding {
+    /// Queries libfuse for the size of a one-byte-name entry; no ABI is hardcoded.
+    fn minimum_entry_size(self, req: *mut raw::FuseReq, attr: &stat) -> size_t {
+        // SAFETY: a null buffer queries size only; name and attr are valid, req is ignored.
+        unsafe {
+            match self {
+                Self::Plain => {
+                    raw::fuse_add_direntry(req, std::ptr::null_mut(), 0, c".".as_ptr(), attr, 0)
+                }
+                Self::Plus => raw::fuse_add_direntry_plus(
+                    req,
+                    std::ptr::null_mut(),
+                    0,
+                    c".".as_ptr(),
+                    &name_only_entry_param(attr),
+                    0,
+                ),
+            }
+        }
+    }
+}
+
+/// The kernel links no dentry and takes no lookup reference for inode zero.
+fn name_only_entry_param(attr: &stat) -> raw::FuseEntryParam {
+    raw::FuseEntryParam {
+        ino: 0,
+        ..entry_param(*attr, 0.0)
+    }
+}
+
 struct DirectoryEntryBuffer {
     // Keep Vec length zero; libfuse initializes bytes tracked by `len` in spare storage.
     words: Vec<MaybeUninit<u64>>,
@@ -3161,6 +3487,60 @@ impl DirectoryEntryBuffer {
         attr: &stat,
         next_offset: off_t,
     ) -> Result<bool, i32> {
+        // SAFETY: libfuse's `fuse_add_direntry` meets the `push_with` contract;
+        // attr is valid and libfuse ignores req.
+        unsafe {
+            self.push_with(name, |buf, available, name| {
+                raw::fuse_add_direntry(req, buf, available, name, attr, next_offset)
+            })
+        }
+    }
+
+    /// Encodes a `readdirplus` entry; a zero `entry.ino` creates no kernel dentry.
+    fn push_plus(
+        &mut self,
+        req: *mut raw::FuseReq,
+        name: &OsStr,
+        entry: &raw::FuseEntryParam,
+        next_offset: off_t,
+    ) -> Result<bool, i32> {
+        // SAFETY: libfuse's `fuse_add_direntry_plus` meets the `push_with`
+        // contract; entry is valid and libfuse ignores req.
+        unsafe {
+            self.push_with(name, |buf, available, name| {
+                raw::fuse_add_direntry_plus(req, buf, available, name, entry, next_offset)
+            })
+        }
+    }
+
+    /// Encodes a dirent that never transfers a kernel lookup reference.
+    fn push_name_only(
+        &mut self,
+        req: *mut raw::FuseReq,
+        encoding: DirectoryEntryEncoding,
+        name: &OsStr,
+        attr: &stat,
+        next_offset: off_t,
+    ) -> Result<bool, i32> {
+        match encoding {
+            DirectoryEntryEncoding::Plain => self.push(req, name, attr, next_offset),
+            DirectoryEntryEncoding::Plus => {
+                self.push_plus(req, name, &name_only_entry_param(attr), next_offset)
+            }
+        }
+    }
+
+    /// `add` receives an aligned buffer writable for `available` bytes and a
+    /// NUL-terminated name.
+    ///
+    /// # Safety
+    /// Like libfuse, `add` must return the entry's required size and, when that
+    /// size fits in `available`, initialize exactly that many bytes.
+    unsafe fn push_with(
+        &mut self,
+        name: &OsStr,
+        add: impl FnOnce(*mut c_char, size_t, *const c_char) -> size_t,
+    ) -> Result<bool, i32> {
         let name_bytes = name.as_bytes();
         if name_bytes.contains(&0) {
             return Err(libc::EINVAL);
@@ -3174,22 +3554,15 @@ impl DirectoryEntryBuffer {
         self.scratch_name.push(0);
         let start = self.len;
         // SAFETY: words has `available` writable bytes at `start`, aligned for libfuse.
-        // The name is NUL-terminated, attr is valid, and libfuse ignores req.
         // Libfuse writes only if the entry fits, initializing the entry and padding.
-        let required = unsafe {
-            raw::fuse_add_direntry(
-                req,
-                self.words
-                    .as_mut_ptr()
-                    .cast::<u8>()
-                    .add(start)
-                    .cast::<c_char>(),
-                available,
-                self.scratch_name.as_ptr().cast::<c_char>(),
-                attr,
-                next_offset,
-            )
+        let buf = unsafe {
+            self.words
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(start)
+                .cast::<c_char>()
         };
+        let required = add(buf, available, self.scratch_name.as_ptr().cast::<c_char>());
         if required > available {
             return Ok(false);
         }
@@ -3306,6 +3679,11 @@ impl Session {
         detach_raw_session_with(
             signal_handlers_installed,
             || {
+                for signal in FUSE_EXIT_SIGNALS {
+                    // SAFETY: restores libfuse's own handler so its removal
+                    // recognizes it; a no-op for signals that were not wrapped.
+                    unsafe { studiofs_linux_fuse_unwrap_exit_signal(signal) };
+                }
                 // SAFETY: handlers were installed for this retained live session.
                 unsafe { raw::fuse_remove_signal_handlers(raw.as_ptr()) };
                 // libfuse restores SIG_DFL, but `studiofs umount` sends SIGTERM after
@@ -3472,6 +3850,81 @@ mod tests {
     use std::time::{Duration, Instant};
     use studiofs_meta::MetaInodes;
 
+    static EXIT_SIGNAL_TEST_HITS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn record_exit_signal_for_test(_signal: libc::c_int) {
+        EXIT_SIGNAL_TEST_HITS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn exit_signal_on_another_thread_wakes_the_session_loop_thread() {
+        // SIGUSR2 stands in for SIGINT so the test never touches the harness's
+        // own interrupt handling; the shim wraps any plain handler the same way.
+        let signal = libc::SIGUSR2;
+        // SAFETY: plain sigaction calls on a zeroed, then kernel-filled struct.
+        let previous = unsafe {
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = record_exit_signal_for_test as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(libc::sigaction(signal, &action, &mut previous), 0);
+            previous
+        };
+        // SAFETY: the current handler is the plain test handler installed above.
+        assert_eq!(
+            unsafe { super::studiofs_linux_fuse_wrap_exit_signal(signal) },
+            1
+        );
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (woke_tx, woke_rx) = mpsc::channel();
+        let loop_thread = thread::spawn(move || {
+            // Model the libfuse loop: block the signal, then wait with
+            // sigsuspend until the exit flag is set, without a lost wakeup.
+            // SAFETY: per-thread signal mask manipulation on local sets.
+            unsafe {
+                let mut blocked: libc::sigset_t = std::mem::zeroed();
+                let mut waiting: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut blocked);
+                libc::sigaddset(&mut blocked, signal);
+                libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut waiting);
+                libc::sigdelset(&mut waiting, signal);
+                super::studiofs_linux_fuse_enter_loop_thread();
+                ready_tx.send(()).expect("test receiver remains alive");
+                while EXIT_SIGNAL_TEST_HITS.load(Ordering::SeqCst) == 0 {
+                    libc::sigsuspend(&waiting);
+                }
+                super::studiofs_linux_fuse_leave_loop_thread();
+            }
+            let _ = woke_tx.send(());
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("loop thread registers itself");
+
+        // Deliver the signal to this thread, as the kernel does when it picks
+        // the main thread for a process-directed Ctrl+C.
+        // SAFETY: raise targets the calling thread, which leaves it unblocked.
+        assert_eq!(unsafe { libc::raise(signal) }, 0);
+        let woke = woke_rx.recv_timeout(Duration::from_secs(5));
+
+        // SAFETY: restores the wrapped handler, then the original disposition.
+        let restored_handler = unsafe {
+            super::studiofs_linux_fuse_unwrap_exit_signal(signal);
+            let mut current: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &mut current);
+            libc::sigaction(signal, &previous, std::ptr::null_mut());
+            current.sa_sigaction
+        };
+        woke.expect("an exit signal on another thread must wake the loop thread");
+        loop_thread.join().expect("loop thread must not panic");
+        assert!(EXIT_SIGNAL_TEST_HITS.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            restored_handler, record_exit_signal_for_test as *const () as libc::sighandler_t,
+            "unwrap must reinstall the original handler so libfuse can remove it"
+        );
+    }
+
     fn decode_directory_reply(buffer: &super::DirectoryEntryBuffer) -> Vec<(Vec<u8>, u64, u32)> {
         let mut bytes = buffer.as_slice();
         let mut entries = Vec::new();
@@ -3611,7 +4064,14 @@ mod tests {
             state.directory_buffers.put(buffer);
             // SAFETY: this test exclusively owns the handle returned by open_dir.
             let handle = unsafe { Box::from_raw(raw.as_ptr()) };
-            handle.entries.lock().unwrap().clone().unwrap()
+            handle
+                .entries
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .entries
+                .clone()
         };
         let first = capture();
         let second = capture();
@@ -3700,6 +4160,161 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Decodes `(nodeid, dirent ino, offset, name)` from a `readdirplus` reply.
+    fn decode_directory_plus_reply(
+        buffer: &super::DirectoryEntryBuffer,
+    ) -> Vec<(u64, u64, u64, Vec<u8>)> {
+        // fuse_entry_out is 128 bytes; fuse_dirent follows it.
+        let mut bytes = buffer.as_slice();
+        let mut entries = Vec::new();
+        while !bytes.is_empty() {
+            let word = |at: usize| u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap());
+            let name_len = u32::from_ne_bytes(bytes[144..148].try_into().unwrap()) as usize;
+            entries.push((
+                word(0),
+                word(128),
+                word(136),
+                bytes[152..152 + name_len].to_vec(),
+            ));
+            bytes = &bytes[(152 + name_len).next_multiple_of(8)..];
+        }
+        entries
+    }
+
+    #[test]
+    fn readdirplus_replies_entries_and_reserves_one_lookup_per_child() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-dirplus")
+            .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let dir = fixture.vfs().mkdir(1, b"dir", 0, 0, 0o755).unwrap();
+        let a = fixture.vfs().create(dir.ino, b"a", 0, 0, 0o644).unwrap();
+        let b = fixture.vfs().mkdir(dir.ino, b"b", 0, 0, 0o755).unwrap();
+        let raw_handle = state.open_dir(dir.ino, 1).unwrap();
+        // SAFETY: this test owns the handle and keeps the box alive through every read.
+        let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
+        let mut buffer = state.directory_buffers.take(4096);
+        let reservations = state
+            .readdirplus(std::ptr::null_mut(), dir.ino, raw_handle, 0, &mut buffer)
+            .unwrap();
+        assert_eq!(
+            decode_directory_plus_reply(&buffer),
+            vec![
+                (0, dir.ino, 1, b".".to_vec()),
+                (0, 1, 2, b"..".to_vec()),
+                (a.ino, a.ino, 3, b"a".to_vec()),
+                (b.ino, b.ino, 4, b"b".to_vec()),
+            ],
+            "dot entries must not transfer lookup references"
+        );
+        assert_eq!(
+            reservations.iter().map(|(ino, _)| *ino).collect::<Vec<_>>(),
+            vec![a.ino, b.ino]
+        );
+        assert_eq!(
+            super::reply_reserved_entries_with(&state, reservations, || 0),
+            0
+        );
+        assert!(state.inode_liveness.is_live(a.ino));
+        assert!(state.inode_liveness.is_live(b.ino));
+        state.directory_buffers.put(buffer);
+        drop(handle);
+    }
+
+    #[test]
+    fn readdirplus_rejected_reply_rolls_back_every_reservation() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-dirplus-reject")
+                .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let a = fixture.vfs().create(1, b"a", 0, 0, 0o644).unwrap();
+        let raw_handle = state.open_dir(1, 1).unwrap();
+        // SAFETY: this test owns the handle and keeps the box alive through the read.
+        let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
+        let mut buffer = state.directory_buffers.take(4096);
+        let reservations = state
+            .readdirplus(std::ptr::null_mut(), 1, raw_handle, 2, &mut buffer)
+            .unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(
+            super::reply_reserved_entries_with(&state, reservations, || -libc::ENOENT),
+            -libc::ENOENT
+        );
+        assert!(
+            !state.inode_liveness.is_live(a.ino),
+            "a rejected reply must not leave a lookup reference"
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn readdirplus_after_namespace_change_replies_names_without_entries() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-dirplus-stale")
+                .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let dir = fixture.vfs().mkdir(1, b"dir", 0, 0, 0o755).unwrap();
+        let a = fixture.vfs().create(dir.ino, b"a", 0, 0, 0o644).unwrap();
+        let b = fixture.vfs().create(dir.ino, b"b", 0, 0, 0o644).unwrap();
+        let raw_handle = state.open_dir(dir.ino, 1).unwrap();
+        // SAFETY: this test owns the handle and keeps the box alive through every read.
+        let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
+        let read = |offset| {
+            let mut buffer = state.directory_buffers.take(4096);
+            let reservations = state
+                .readdirplus(
+                    std::ptr::null_mut(),
+                    dir.ino,
+                    raw_handle,
+                    offset,
+                    &mut buffer,
+                )
+                .unwrap();
+            let entries = decode_directory_plus_reply(&buffer);
+            state.directory_buffers.put(buffer);
+            (entries, reservations.len())
+        };
+        // A plain readdir captures the snapshot before the rename.
+        let mut buffer = state.directory_buffers.take(4096);
+        state
+            .readdir(std::ptr::null_mut(), dir.ino, raw_handle, 0, &mut buffer)
+            .unwrap();
+        state.directory_buffers.put(buffer);
+        fixture
+            .vfs()
+            .rename(dir.ino, b"b", dir.ino, b"renamed", false)
+            .unwrap();
+        assert_eq!(
+            read(3),
+            (vec![(0, b.ino, 4, b"b".to_vec())], 0),
+            "a stale snapshot name must not become a kernel dentry"
+        );
+        let (fresh, reserved) = read(0);
+        assert_eq!(reserved, 2, "a rewind captures a current snapshot");
+        assert_eq!(
+            fresh[2..],
+            [
+                (a.ino, a.ino, 3, b"a".to_vec()),
+                (b.ino, b.ino, 4, b"renamed".to_vec()),
+            ]
+        );
+        drop(handle);
     }
 
     #[test]
@@ -3939,7 +4554,7 @@ mod tests {
         // SAFETY: this test exclusively owns the handle returned by open_dir.
         let handle = unsafe { Box::from_raw(handle.as_ptr()) };
         let snapshot = handle.entries.lock().unwrap();
-        let entries = snapshot.as_deref().unwrap();
+        let entries = &snapshot.as_ref().unwrap().entries[..];
         assert_eq!(entries.len(), 1024);
         let names: usize = entries.iter().map(|entry| entry.name.capacity()).sum();
         let retained = crate::directory_cache::snapshot_byte_size(entries);
@@ -4304,14 +4919,6 @@ mod tests {
         );
         // SAFETY: the non-null session is uniquely owned by this test.
         unsafe { super::raw::fuse_session_destroy(session) };
-    }
-
-    #[test]
-    fn argv_kernel_cache_policy_keeps_mount_options_portable() {
-        let args =
-            super::argv_strings_for_cache_policy("demo", super::LinuxFuseCachePolicy::Kernel);
-
-        assert!(!args.iter().any(|arg| arg == "writeback_cache"));
     }
 
     #[test]
@@ -5091,6 +5698,171 @@ mod tests {
         );
     }
 
+    type ThreadReplies = Arc<Mutex<Vec<(std::thread::ThreadId, Result<u32, i32>)>>>;
+
+    struct ThreadRecordingWriteReply {
+        replies: ThreadReplies,
+    }
+
+    impl super::FuseWriteReply for ThreadRecordingWriteReply {
+        fn reply_write(&mut self, written: libc::size_t) -> libc::c_int {
+            self.replies
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((thread::current().id(), Ok(written as u32)));
+            0
+        }
+
+        fn reply_error(&mut self, errno: libc::c_int) -> libc::c_int {
+            self.replies
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((thread::current().id(), Err(errno)));
+            0
+        }
+    }
+
+    #[test]
+    fn inline_write_panic_replies_eio_instead_of_unwinding_into_libfuse() {
+        assert_eq!(
+            super::catch_inline_write_panic(|| panic!("simulated VFS write panic")),
+            Err(libc::EIO)
+        );
+        assert_eq!(super::catch_inline_write_panic(|| Ok(7)), Ok(7));
+    }
+
+    #[test]
+    fn inline_write_slots_are_bounded_and_released_on_drop() {
+        let in_flight = std::sync::atomic::AtomicUsize::new(0);
+        let first = super::InlineWriteSlot::acquire(&in_flight, 2).expect("first slot");
+        let second = super::InlineWriteSlot::acquire(&in_flight, 2).expect("second slot");
+        assert!(super::InlineWriteSlot::acquire(&in_flight, 2).is_none());
+        drop(first);
+        let third = super::InlineWriteSlot::acquire(&in_flight, 2).expect("released slot");
+        drop((second, third));
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn small_async_writes_run_inline_and_large_writes_keep_the_runtime_hand_off() {
+        if !super::linux_fuse_async_write_enabled() {
+            eprintln!("skipped: async writes are disabled by the environment");
+            return;
+        }
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-inline-write")
+                .expect("create VFS fixture");
+        fixture.start().expect("start VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .create(1, b"inline.bin", 1000, 1000, 0o644)
+            .expect("create file");
+        let fh = fixture
+            .vfs()
+            .open_file(attr.ino, studiofs_vfs::OpenFlags::RDWR, false)
+            .expect("open file");
+        // SAFETY: the C shim allocates a zeroed file info that this test frees below.
+        let fi = unsafe { super::studiofs_linux_fuse_file_info_new_for_test(fh) };
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let write = |data: &[u8], offset: libc::off_t| {
+            state.queue_async_write(
+                super::FuseWriteCallbackContext {
+                    reply: ThreadRecordingWriteReply {
+                        replies: Arc::clone(&replies),
+                    },
+                    started: Instant::now(),
+                },
+                attr.ino,
+                data.as_ptr().cast(),
+                data.len(),
+                offset,
+                fi,
+            )
+        };
+        let small = vec![1_u8; super::INLINE_WRITE_MAX_BYTES];
+        assert_eq!(write(&small, 0), Ok(true));
+        assert_eq!(
+            *replies.lock().unwrap(),
+            [(thread::current().id(), Ok(small.len() as u32))],
+            "a small write must reply before the callback returns"
+        );
+        assert_eq!(state.async_writes.metrics_snapshot().pending_writes, 0);
+
+        let large = vec![2_u8; super::INLINE_WRITE_MAX_BYTES + 1];
+        assert_eq!(write(&large, small.len() as libc::off_t), Ok(true));
+        assert_eq!(
+            state.async_writes.wait_all(Duration::from_secs(10)),
+            crate::async_writes::BarrierOutcome::Complete(None)
+        );
+        let replies = replies.lock().unwrap().clone();
+        assert_eq!(replies.len(), 2);
+        assert_ne!(
+            replies[1].0,
+            thread::current().id(),
+            "a large write keeps the runtime hand-off"
+        );
+        assert_eq!(replies[1].1, Ok(large.len() as u32));
+
+        // With every inline slot taken, a small write falls back to the hand-off.
+        let held = (0..state.inline_write_limit)
+            .map(|_| {
+                super::InlineWriteSlot::acquire(&state.inline_writes, state.inline_write_limit)
+                    .expect("free inline slot")
+            })
+            .collect::<Vec<_>>();
+        let replies_before = replies.len();
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        assert_eq!(
+            state.queue_async_write(
+                super::FuseWriteCallbackContext {
+                    reply: ThreadRecordingWriteReply {
+                        replies: Arc::clone(&replies),
+                    },
+                    started: Instant::now(),
+                },
+                attr.ino,
+                small.as_ptr().cast(),
+                small.len(),
+                0,
+                fi,
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            state.async_writes.wait_all(Duration::from_secs(10)),
+            crate::async_writes::BarrierOutcome::Complete(None)
+        );
+        drop(held);
+        assert_eq!(replies_before, 2);
+        let fallback = replies.lock().unwrap().clone();
+        assert_eq!(fallback.len(), 1);
+        assert_ne!(
+            fallback[0].0,
+            thread::current().id(),
+            "a write beyond the inline limit must not hold the callback worker"
+        );
+        // SAFETY: allocated by the C shim with calloc and no longer used.
+        unsafe { libc::free(fi.cast()) };
+        let mut read_back = vec![0_u8; small.len() + large.len()];
+        let read = fixture
+            .runtime()
+            .block_on(fixture.vfs().read_into_fh(fh, attr.ino, 0, &mut read_back))
+            .expect("read back");
+        assert_eq!(read as usize, read_back.len());
+        assert!(read_back[..small.len()].iter().all(|byte| *byte == 1));
+        assert!(read_back[small.len()..].iter().all(|byte| *byte == 2));
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(Duration::ZERO))
+            .expect("VFS shutdown");
+    }
+
     #[test]
     fn async_dio_session_reads_configuration_at_initialization() {
         const CHILD_EXPECTED: &str = "STUDIOFS_TEST_ASYNC_DIO_EXPECTED";
@@ -5427,7 +6199,7 @@ mod tests {
     #[test]
     fn runtime_cache_policy_keeps_unset_default_direct_until_adaptive_is_ready() {
         assert_eq!(
-            super::linux_fuse_effective_cache_policy_for_value(None, false),
+            super::linux_fuse_cache_policy_selection_for_value(None, false).policy,
             crate::cache_policy::LinuxFuseCachePolicy::Direct
         );
     }
@@ -5435,7 +6207,7 @@ mod tests {
     #[test]
     fn runtime_cache_policy_honors_explicit_adaptive_before_default_switch() {
         assert_eq!(
-            super::linux_fuse_effective_cache_policy_for_value(Some("adaptive"), false),
+            super::linux_fuse_cache_policy_selection_for_value(Some("adaptive"), false).policy,
             crate::cache_policy::LinuxFuseCachePolicy::Adaptive
         );
     }
@@ -5443,7 +6215,7 @@ mod tests {
     #[test]
     fn runtime_cache_policy_uses_adaptive_after_readiness_gate() {
         assert_eq!(
-            super::linux_fuse_effective_cache_policy_for_value(None, true),
+            super::linux_fuse_cache_policy_selection_for_value(None, true).policy,
             crate::cache_policy::LinuxFuseCachePolicy::Adaptive
         );
     }
@@ -5498,6 +6270,100 @@ mod tests {
                 memory_bypassed: true,
             }
         );
+    }
+
+    /// Start a sampler reporting ample memory and wait for its first snapshot.
+    fn published_memory_sampler() -> crate::cache_policy::SystemMemorySampler {
+        let sampler = crate::cache_policy::SystemMemorySampler::start(|| Some(1 << 40));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sampler.available_memory().is_none() {
+            assert!(Instant::now() < deadline, "memory sampler never published");
+            thread::yield_now();
+        }
+        sampler
+    }
+
+    #[test]
+    fn adaptive_local_dirty_reader_stays_direct_with_active_writer_and_caches_after_release() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-local-dirty-page-cache",
+        )
+        .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+        state.available_memory = Some(published_memory_sampler());
+        let attr = fixture
+            .vfs()
+            .create(1, b"local-dirty-page-cache.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let open = |flags| {
+            let mut prepared = None;
+            let result = state
+                .run_open_reply_transaction(
+                    attr.ino,
+                    || state.open_with_flags(attr.ino, flags),
+                    |open| {
+                        prepared = Some(open);
+                        0
+                    },
+                )
+                .expect("open transaction");
+            assert_eq!(result, 0);
+            prepared.expect("accepted open")
+        };
+
+        let writer = open(libc::O_RDWR);
+        assert!(writer.cache.direct_io);
+        fixture
+            .runtime()
+            .block_on(
+                fixture
+                    .vfs()
+                    .write_fh(writer.fh, attr.ino, 0, b"written locally"),
+            )
+            .expect("local write");
+
+        let concurrent = open(libc::O_RDONLY);
+        assert_eq!(
+            concurrent.reason,
+            studiofs_vfs::vfs::OsCacheReason::ActiveWriter
+        );
+        assert!(
+            concurrent.cache.direct_io,
+            "a reader beside an open writer must not cache pages"
+        );
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(concurrent.fh))
+            .expect("release concurrent reader");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(writer.fh))
+            .expect("release writer");
+
+        // The fixture is not started, so the upload stays pending.
+        let reader = open(libc::O_RDONLY);
+        assert_eq!(reader.reason, studiofs_vfs::vfs::OsCacheReason::LocalDirty);
+        assert_eq!(
+            reader.cache,
+            super::LinuxFuseOpenCachePolicy {
+                direct_io: false,
+                keep_cache: false,
+                parallel_direct_writes: false,
+                read_ahead_owner: studiofs_vfs::ReadAheadOwner::Kernel,
+                memory_bypassed: false,
+            },
+            "a closed writer's bytes may use kernel readahead, but the open must purge older pages"
+        );
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(reader.fh))
+            .expect("release reader");
     }
 
     #[test]
@@ -5791,6 +6657,86 @@ mod tests {
             });
         }
         state.release(open.fh).unwrap();
+    }
+
+    #[test]
+    fn runtime_stats_open_serves_captured_snapshot_until_release() {
+        struct FileInfo(*mut super::raw::FuseFileInfo);
+        impl Drop for FileInfo {
+            fn drop(&mut self) {
+                // SAFETY: the C test helper allocated this pointer with calloc.
+                unsafe { libc::free(self.0.cast()) };
+            }
+        }
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-runtime-stats")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let ino = state.vfs.runtime_stats_file_attr().ino;
+        for flags in [libc::O_WRONLY, libc::O_RDWR, libc::O_RDONLY | libc::O_TRUNC] {
+            assert_eq!(
+                state.open_with_flags(ino, flags).err(),
+                Some(libc::EACCES),
+                "the stats surface is read-only for flags {flags:#x}"
+            );
+        }
+
+        let open = state.open_with_flags(ino, libc::O_RDONLY).unwrap();
+        // SAFETY: the helper allocates and initializes the native header's layout.
+        let fi = FileInfo(unsafe { super::studiofs_linux_fuse_file_info_new_for_test(open.fh) });
+        assert!(!fi.0.is_null(), "allocate native file info");
+
+        let mut text = Vec::new();
+        loop {
+            let offset = libc::off_t::try_from(text.len()).unwrap();
+            let chunk = state.read(ino, 512, offset, fi.0).unwrap();
+            let len = chunk.as_ref().len();
+            text.extend_from_slice(chunk.as_ref());
+            state.read_buffers.put(chunk);
+            if len == 0 {
+                break;
+            }
+        }
+        let text = String::from_utf8(text).expect("stats text is UTF-8");
+        assert!(
+            text.starts_with("# studiofs_runtime_stats"),
+            "unexpected stats text: {text:?}"
+        );
+
+        // Later reads at any offset come from the same captured snapshot.
+        let middle = text.len() / 2;
+        let tail = state
+            .read(
+                ino,
+                text.len(),
+                libc::off_t::try_from(middle).unwrap(),
+                fi.0,
+            )
+            .unwrap();
+        assert_eq!(tail.as_ref(), &text.as_bytes()[middle..]);
+        state.read_buffers.put(tail);
+        let past_eof = state
+            .read(
+                ino,
+                64,
+                libc::off_t::try_from(text.len() + 4096).unwrap(),
+                fi.0,
+            )
+            .unwrap();
+        assert!(past_eof.as_ref().is_empty(), "reads past EOF are empty");
+        state.read_buffers.put(past_eof);
+
+        state.release(open.fh).unwrap();
+        assert!(
+            state.runtime_stats_snapshots.lock().unwrap().is_empty(),
+            "release drops the captured snapshot"
+        );
     }
 
     #[test]
@@ -7239,5 +8185,181 @@ mod tests {
         drop(session);
         drop(fixture);
         std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_stat_after_readdir_needs_no_lookup() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-dirplus")
+            .expect("create VFS fixture");
+        fixture.start().expect("start VFS fixture");
+        let dir = fixture.vfs().mkdir(1, b"dir", 0, 0, 0o755).unwrap();
+        for index in 0..64 {
+            fixture
+                .vfs()
+                .create(dir.ino, format!("file-{index:02}").as_bytes(), 0, 0, 0o644)
+                .unwrap();
+        }
+        let mount_point = std::env::temp_dir().join(format!(
+            "studiofs-linux-fuse-dirplus-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&mount_point).expect("create mount point");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-dirplus").expect("mount");
+        let lookup_calls = Arc::clone(
+            &session
+                .state
+                .as_deref()
+                .expect("mounted state")
+                .lookup_calls,
+        );
+        let mount_point_for_worker = mount_point.clone();
+        let worker = std::thread::spawn(
+            move || -> std::io::Result<(u64, std::process::ExitStatus)> {
+                let guard = UnmountGuard::new(mount_point_for_worker.clone());
+                let dir = mount_point_for_worker.join("dir");
+                assert!(std::fs::metadata(&dir)?.is_dir());
+                let before = lookup_calls.load(Ordering::Relaxed);
+                let mut entries = 0;
+                for entry in std::fs::read_dir(&dir)? {
+                    assert!(std::fs::symlink_metadata(entry?.path())?.is_file());
+                    entries += 1;
+                }
+                assert_eq!(entries, 64);
+                let lookups = lookup_calls.load(Ordering::Relaxed) - before;
+                let status = Command::new("fusermount3")
+                    .arg("-u")
+                    .arg(&mount_point_for_worker)
+                    .status();
+                guard.disarm();
+                Ok((lookups, status?))
+            },
+        );
+
+        session.run().expect("run libfuse3 session");
+        let (lookups, unmount_status) = worker
+            .join()
+            .expect("mounted readdirplus worker should not panic")
+            .expect("mounted readdirplus worker should complete");
+        assert!(unmount_status.success());
+        assert_eq!(lookups, 0, "readdirplus must prime every child dentry");
+        drop(session);
+        drop(fixture);
+        std::fs::remove_dir_all(&mount_point).expect("remove mount point");
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_local_dirty_reads_use_kernel_readahead_and_purge_on_reopen() {
+        const FILE_LEN: usize = 1024 * 1024;
+        const READ_LEN: usize = 4096;
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-dirty-readahead")
+                .expect("create VFS fixture");
+        // Leave the fixture unstarted so uploads stay pending and reads are LocalDirty.
+        let mount_point = std::env::temp_dir().join(format!(
+            "studiofs-linux-fuse-dirty-readahead-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&mount_point).expect("create mount point");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+        state.available_memory = Some(published_memory_sampler());
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-dirty-readahead").expect("mount");
+        let vfs = fixture.vfs();
+        let mount_point_for_worker = mount_point.clone();
+        let worker = std::thread::spawn(
+            move || -> std::io::Result<(u64, std::process::ExitStatus)> {
+                let guard = UnmountGuard::new(mount_point_for_worker.clone());
+                let path = mount_point_for_worker.join("dirty.bin");
+                let read_all = |file: &mut std::fs::File| -> std::io::Result<Vec<u8>> {
+                    file.seek(SeekFrom::Start(0))?;
+                    let mut bytes = Vec::with_capacity(FILE_LEN);
+                    let mut chunk = [0_u8; READ_LEN];
+                    loop {
+                        let read = file.read(&mut chunk)?;
+                        if read == 0 {
+                            return Ok(bytes);
+                        }
+                        bytes.extend_from_slice(&chunk[..read]);
+                    }
+                };
+                std::fs::write(&path, vec![b'a'; FILE_LEN])?;
+
+                // The writer is closed but its bytes are still local; this
+                // reader keeps its page-cache handle open across the rewrite.
+                // FUSE RELEASE is asynchronous, so an open can still observe
+                // the closing writer and stay direct.
+                let local_dirty_kernel_opens = || {
+                    let cache = vfs
+                        .write_path_observability_snapshot()
+                        .linux_fuse_open_cache;
+                    (cache.local_dirty, cache.kernel_opens)
+                };
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut held = loop {
+                    let (dirty_before, kernel_before) = local_dirty_kernel_opens();
+                    let file = std::fs::File::open(&path)?;
+                    let (dirty_after, kernel_after) = local_dirty_kernel_opens();
+                    if dirty_after > dirty_before && kernel_after > kernel_before {
+                        break file;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "locally dirty read-only open never used the kernel page cache"
+                    );
+                    drop(file);
+                    thread::yield_now();
+                };
+                let before = vfs.write_path_observability_snapshot().vfs_read_path.calls;
+                assert!(read_all(&mut held)?.iter().all(|byte| *byte == b'a'));
+                let read_calls =
+                    vfs.write_path_observability_snapshot().vfs_read_path.calls - before;
+
+                let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
+                writer.write_all(&vec![b'b'; FILE_LEN])?;
+                drop(writer);
+                let mut reopened = std::fs::File::open(&path)?;
+                assert!(read_all(&mut reopened)?.iter().all(|byte| *byte == b'b'));
+                // The reopen replied without keep_cache, which purged the
+                // inode mapping shared with the still-open handle.
+                assert!(read_all(&mut held)?.iter().all(|byte| *byte == b'b'));
+                drop((held, reopened));
+
+                let status = Command::new("fusermount3")
+                    .arg("-u")
+                    .arg(&mount_point_for_worker)
+                    .status();
+                guard.disarm();
+                Ok((read_calls, status?))
+            },
+        );
+
+        session.run().expect("run libfuse3 session");
+        let (read_calls, unmount_status) = worker
+            .join()
+            .expect("mounted readahead worker should not panic")
+            .expect("mounted readahead worker should complete");
+        assert!(unmount_status.success());
+        assert!(
+            read_calls < (FILE_LEN / READ_LEN / 4) as u64,
+            "kernel readahead must coalesce 4 KiB reads; saw {read_calls} VFS reads"
+        );
+        drop(session);
+        drop(fixture);
+        std::fs::remove_dir_all(&mount_point).expect("remove mount point");
     }
 }

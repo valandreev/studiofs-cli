@@ -132,8 +132,9 @@ Reads resolve data in this order:
 Metadata lookups are served from local `redb`; PostgreSQL is not part of the
 foreground read path.
 
-On Linux, adaptive page-cache participation is decided per file handle. Clean
-read-only handles let the kernel own readahead; direct or memory-bypassed
+On Linux, adaptive page-cache participation is decided per file handle.
+Read-only handles of stable generations, and locally dirty ones without an
+open writer, let the kernel own readahead; direct or memory-bypassed
 handles retain VFS prefetch. A generation identity built from content epoch,
 logical size, and the ordered resolved-slice graph prevents `keep_cache` from
 reusing stale content. Writer opens and inode invalidation synchronously retire

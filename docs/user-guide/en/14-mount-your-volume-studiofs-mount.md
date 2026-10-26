@@ -69,6 +69,8 @@ studiofs mount myvolume /mnt/StudioFS -d
 
 `-d` is short for `--detach`. StudioFS starts a separate process, leaving you free to use the terminal again. You cannot pass `--foreground` and `--detach` together.
 
+The command returns once the volume accepts writes, usually within a second or two. If synchronization with the server takes longer than 10 seconds, the command returns anyway and says that write access is pending. Until then you can read files, but creating or changing them fails with "Permission denied".
+
 Background mode does not install a system service or configure automatic mounting after a reboot. Background process logs are stored in the `logs` directory under the client root, which defaults to `~/.studiofs/logs/`.
 
 ## Checking that you are looking at the volume

@@ -330,6 +330,245 @@ cargo test -p studiofs-bridge --lib posix::tests:: -- --nocapture
 Windows cannot execute the POSIX module guarded by `cfg(unix)`. These focused
 tests do not establish live mounted disk-full acceptance.
 
+### SFS-900 Packed Random-Write Payloads
+
+Finished writer fragments share block-sized payload objects across an inode's
+chunks. Each overlay slice retains its own file range, object offset and write
+sequence. Upload lengths describe physical payload bytes, including unreferenced
+tails. Stale-epoch reattachment receives only a gapless file mapping with one
+origin and maps exactly those referenced bytes; scattered references, as in a
+packed object or a gapped spill batch, refuse it. Replay and truncate rebuild the
+same geometry; the last surviving segment retains the shared object's upload pin
+and only its removal schedules pending deletion. Scattered dirty writer state
+older than the 1.2 s idle window drains through the existing background worker
+even while writes continue; an appender's single growing slice waits for idle.
+
+Focused checks (no remote services):
+
+```sh
+cargo test -p studiofs-vfs --lib -- packed_ writer_stack_retries_transient_materialization_failure vfs_upload_meta_reattaches buffered_write_spill_batches deferred_sparse_tail_rebases writer_stack_aged --nocapture
+cargo test -p studiofs-cache --lib -- upload_queue:: cached_store::tests::sfs752_ submit_uploads_batch --nocapture
+cargo test -p studiofs-e2e --lib random_write_packing -- --nocapture
+```
+
+For live Linux acceptance, rebuild the product and use the registered runner:
+
+```sh
+cargo build -p studiofs -p studiofs-e2e
+target/debug/studiofs-e2e run mounted-random-write-packing --studiofs-bin target/debug/studiofs --run-id sfs900-random-packing --retain always --timeout 180s
+```
+
+The scenario performs 15 seconds of random 4 KiB writes over a 256 MiB file and
+samples the upload queue every 100 ms. It fails unless an active upload with a
+pending backlog appears within 5 s, fsync stays within three times the local
+metadata commit time it spans plus 500 ms, readback matches, and physical payload
+objects stay within accepted bytes divided by pack size plus partial drains.
+`random-write-packing.json` retains these values, the upload samples and public
+runtime snapshots before/after fsync. Unit tests alone do not establish mounted
+latency acceptance.
+
+### SFS-892 Linux FUSE Small I/O Regressions
+
+Linux registered no `readdirplus` callback, so `ls -l` and `find` sent one
+`LOOKUP` per directory entry, and every write-capable 4 KiB write was copied
+and handed to the Tokio runtime even though the kernel waits for the reply.
+These tests pin the `readdirplus` entries and their lookup references, the
+names-only fallback after a namespace change, and the inline small-write path:
+
+```sh
+cargo test -p studiofs-linux-fuse --lib readdirplus -- --nocapture
+cargo test -p studiofs-linux-fuse --lib small_async_writes_run_inline_and_large_writes_keep_the_runtime_hand_off -- --nocapture
+cargo test -p studiofs-linux-fuse --lib mounted_stat_after_readdir_needs_no_lookup -- --ignored --nocapture
+```
+
+The mounted test needs `/dev/fuse` and `fusermount3`; it uses the VFS contract
+fixture, not a PostgreSQL/S3 mount. On that fixture (WSL2, release build),
+`scandir` plus `lstat` over 2,000 entries fell from 42-73 to 6-12 µs per entry,
+and single-job fio `psync` 4 KiB sequential writes rose from 12-15k to
+19-21k IOPS (four jobs: 11k to 22-24k). Kernel page-cache reads of locally
+dirty or newly changed files are unchanged by this work; SFS-901 covers them.
+
+### SFS-901 Linux Page-Cache Reads After Local Writes
+
+Read-only opens of locally dirty files used direct I/O, so every 4 KiB
+`read()` after a local write was one FUSE request. They now use the page cache
+with `keep_cache=false`; first or changed generations stay direct. The race
+analysis is in the ADR 0011 amendment. These tests pin the decision table, the
+direct reader beside an open writer, and, on a mount, kernel readahead plus the
+open-time purge seen by a handle that stays open across a rewrite:
+
+```sh
+cargo test -p studiofs-linux-fuse --lib cache_policy -- --nocapture
+cargo test -p studiofs-linux-fuse --lib adaptive_local_dirty_reader_stays_direct_with_active_writer_and_caches_after_release -- --nocapture
+cargo test -p studiofs-linux-fuse --lib mounted_local_dirty_reads_use_kernel_readahead_and_purge_on_reopen -- --ignored --nocapture
+```
+
+The mounted test uses the VFS contract fixture and needs `/dev/fuse` and
+`fusermount3`. On that fixture (WSL2 6.6, release build), single-job fio
+`psync` 4 KiB sequential reads right after a 256 MiB local write rose from
+29-31k to 360-420k IOPS. The PostgreSQL/S3 mounted coherence scenarios are
+the release gate for this change.
+
+### SFS-897 Random-Write fsync and Upload Pipeline Regressions
+
+After random 4 KiB overwrites, `fsync` materialized every superseded write as
+its own payload object, the PostgreSQL pending-state tracker re-decoded the
+whole unpublished event window on every mutation, upload completion batches
+were split into one transaction per object, and upload statistics walked every
+pending operation. These tests pin the writer-stack supersede, the
+constant-cost hidden-window extension, the forwarded and coalesced overlay
+batches, and the copy-free pending-upload summary:
+
+```sh
+cargo test -p studiofs-vfs --lib writer_stack_drops_fully_superseded_slices_before_materializing -- --nocapture
+cargo test -p studiofs-meta --lib hidden_pending_window_grows_without_reprojecting_unpublished_overlay_history -- --nocapture
+cargo test -p studiofs-meta --lib poisoned_hidden_window_cache_falls_back_without_failing_the_mutation -- --nocapture
+cargo test -p studiofs-vfs --lib runtime_meta_handle_forwards_batched_overlay_upload_marks -- --nocapture
+cargo test -p studiofs-vfs --lib process_upload_marks_fragmented_overlay_object_uploaded_before_local_cleanup -- --nocapture
+cargo test -p studiofs-meta --lib overlay_objects_if_match_answers_a_batch_across_chunks_in_input_order -- --nocapture
+cargo test -p studiofs-cache --lib pending_summary_aggregates_without_copying_operations -- --nocapture
+```
+
+These focused tests do not establish mounted acceptance. The mounted check is
+`fio --rw=randwrite --bs=4k --size=256M --runtime=15 --time_based` on a Linux
+mount without the tray, followed by `fsync` of the file and the upload pipeline
+log line.
+
+### SFS-891 Tray Health Polling Without Lifecycle Scans
+
+Health polling must not enter the full ZeroIO collection path. The live-source
+regression uses existing upload-queue snapshot counters to detect that path,
+including a computed-but-discarded result, and checks that explicit runtime
+snapshots retain inode details. Cache tests show storage stats and pending
+upload summaries read incrementally maintained totals instead of probing the
+cache index per pinned object or walking the queue. Tray tests cover idle backoff and conservative
+synchronization status, including stale and legacy telemetry:
+
+```sh
+cargo test -p studiofs --bin studiofs diagnostics:: -- --nocapture
+cargo test -p studiofs --bin studiofs tray:: -- --nocapture
+cargo test -p studiofs-cache --lib -- sfs891 local_runtime_pins pending_summary
+STUDIOFS_CLIENT_ROOT="$PWD/target/sfs-891-client-root" cargo test -p studiofs --bin studiofs prepared_mount_launch_publishes_live_diagnostics_and_supports_attach -- --nocapture
+```
+
+These focused checks do not establish mounted performance acceptance. Rebuild
+the product binary and use the registered `studiofs-e2e` scenario runner on a
+host with FUSE, storage services, and a GUI tray session. Retain the mounted
+write profile under `target/`; tray Health polling must no longer appear beneath
+`StudioVfs::zeroio_runtime_snapshot` in the profile.
+
+### SFS-890 PostgreSQL Replication Flush Cost per Namespace Operation
+
+The `pg-meta-poll` flush and self-acknowledgement path used to cost more CPU
+per local rename than the rename itself, inside the redb writer transaction.
+These tests pin the removed per-event work: intent derivation under suppressed
+invalidations, per-rename reductions of the local journal, serving replay on
+flush-only restores, and case-insensitive directory scans on exact-key misses:
+
+```sh
+cargo test -p studiofs-meta --lib suppressed_replica_base_mirror_skips_invalidation_derivation_reads -- --nocapture
+cargo test -p studiofs-meta --lib serving_rename_reconcile_reduces_local_journal_once_per_replay_pass -- --nocapture
+cargo test -p studiofs-meta --lib flush_path_pending_restore_recomputes_counters_without_serving_replay -- --nocapture
+cargo test -p studiofs-meta --lib self_rename_mirror_reconcile_uses_exact_dentry_keys -- --nocapture
+cargo test -p studiofs-meta --lib pending_rename_replay_reduces_alias_journal_once_and_uses_exact_keys -- --nocapture
+cargo test -p studiofs-meta --lib serving_dentry_overlay_check_uses_exact_merged_keys -- --nocapture
+```
+
+These focused tests do not establish mounted acceptance. The mounted check is
+a create/rename/unlink microbenchmark on a Linux mount with 1 and 8 processes
+that attributes `pg-meta-poll` CPU per operation until the thread goes idle;
+that CPU must stay below the operation's own foreground cost.
+
+### SFS-899 Exact Base Dentry Reconciliation
+
+Exact event keys must not trigger a case-insensitive directory scan while
+reconciling base dentries into serving. This regression checks present and
+missing keys, a differently cased base sibling, and a protected local binding:
+
+```sh
+cargo test -p studiofs-meta --lib serving_dentry_reconcile_uses_exact_base_keys_without_directory_scans -- --nocapture
+```
+
+Replica rename prior keys come from the exact base by-inode index. A stale
+index key must not resolve to a differently cased base dentry and turn a single
+prior binding into a preserved duplicate:
+
+```sh
+cargo test -p studiofs-meta --lib base_rename_prior_keys_use_exact_lookup_for_stale_index_entries -- --nocapture
+```
+
+This does not prove rename throughput scaling. Mounted acceptance still needs
+1-process versus 8-process measurements in separate directories, including
+writer-lock wait, self-ack writer hold time, and `pg-meta-poll` CPU per rename.
+The existing metadata `begin_write` timing starts after the engine writer mutex
+is acquired and therefore excludes its wait time.
+
+### SFS-887 Synchronous Namespace Operations on the Mount Runtime
+
+Platform dispatcher threads (libfuse, macFUSE, WinFSP) call `rename`,
+`unlink`, `rmdir`, and `link` outside any Tokio context. These calls used to
+build and drop a temporary multi-thread runtime per operation, which cost about
+1.5 ms each and cancelled any task the operation spawned. `start()` now records
+the mount runtime and synchronous entry points block on it:
+
+```sh
+cargo test -p studiofs-vfs --lib sync_namespace_ops_from_foreign_thread_run_on_mount_runtime -- --nocapture
+```
+
+This focused test does not establish mounted acceptance. The mounted check is
+a per-op `rename`/`unlink` latency microbenchmark on a Linux mount, compared
+with the audit baseline of about 1.5 ms per unlink and 4.2 ms per rename.
+
+### Linux FUSE Exit Signals Off the Loop Thread
+
+libfuse's exit handler only sets the session's exited flag. The multi-thread
+loop sees it when the signal interrupts its own `sem_wait()`, and libfuse
+workers block exit signals. With the tray active, the main thread runs the tray
+event loop and receives a terminal Ctrl+C, so the loop never woke. The C shim
+now wraps libfuse's SIGHUP/SIGINT/SIGTERM handler and re-sends the signal to the
+loop thread:
+
+```sh
+cargo test -p studiofs-linux-fuse --lib exit_signal_on_another_thread_wakes_the_session_loop_thread -- --nocapture
+```
+
+This focused test does not establish mounted acceptance. The mounted check is
+Ctrl+C (or `kill -INT <pid>`) on `studiofs mount` with the tray active on Linux,
+which must log `VFS shutdown: complete` and unmount.
+
+### SFS-886 Linux Runtime Stats Surface
+
+The Linux FUSE bridge used to send reads of `.studiofs-runtime-stats` to the
+VFS data path, which returned `ENOENT`. Open now captures one stats snapshot
+per handle, reads serve slices of it until EOF, and release drops it. Write or
+truncating opens fail with `EACCES`:
+
+```sh
+cargo test -p studiofs-linux-fuse --lib runtime_stats_open_serves_captured_snapshot_until_release -- --nocapture
+```
+
+This focused test does not establish mounted acceptance. The mounted check is
+`studiofs perf <mount> --json --count 1` on a Linux mount, which must succeed.
+
+### SFS-885 Fragmented Overlay Mutation Regressions
+
+Random small writes used to leave one overlay record per write, so the
+per-inode overlay mutation outgrew the 4 MiB shared queue budget and every
+drain and `fsync` failed. These tests cover superseding fully overwritten
+records without orphaning their payload objects, admitting an oversized
+mutation alone instead of rejecting it, the waiter's cancellation accounting,
+and the indexed redb-engine checks that replaced per-chunk pairwise scans:
+
+```sh
+cargo test -p studiofs-vfs --lib build_overlay_slice_records_supersedes_fully_overwritten_slices -- --nocapture
+cargo test -p studiofs-vfs --lib oversized_overlay -- --nocapture
+cargo test -p studiofs-meta --lib overlay_index_tests -- --nocapture
+```
+
+These focused tests do not establish mounted acceptance. The mounted check
+is `fio --rw=randwrite --bs=4k --size=256M --runtime=15 --time_based` on a
+Linux mount followed by `fsync` of the file, which must succeed.
+
 ### SFS-752 Upload Queue Pin Ownership
 
 These focused tests use the real local payload backend without S3 or PostgreSQL.

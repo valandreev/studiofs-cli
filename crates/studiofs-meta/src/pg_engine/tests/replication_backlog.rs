@@ -2616,6 +2616,62 @@ fn permanent_event_size_error_does_not_restore_claimed_pending_batch() {
 }
 
 #[test]
+fn serving_dentry_overlay_check_uses_exact_merged_keys() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let dir = pg
+        .create_dir(ROOT_INO, b"big", 0, 0, 0o755)
+        .expect("create directory");
+    for index in 0..32 {
+        pg.create_file(dir.ino, format!("sibling-{index}").as_bytes(), 0, 0, 0o644)
+            .expect("create sibling");
+    }
+    // A rename source name is an exact reconcile key that no longer binds anything.
+    let mut keys = HashSet::new();
+    keys.insert(encode_dentry_key(dir.ino, b"renamed-away"));
+    crate::redb_engine::take_case_fallback_merged_scans();
+
+    RemoteApplyCoordinator::new(&pg.local)
+        .reconcile_serving_dentries_from_base_with_overlay(&keys, &OverlayConflictSets::default())
+        .expect("reconcile serving dentries");
+
+    assert_eq!(crate::redb_engine::take_case_fallback_merged_scans(), 0);
+}
+
+#[test]
+fn flush_path_pending_restore_recomputes_counters_without_serving_replay() {
+    let (_dir, mut pg) = temp_pg_engine_for_unit();
+    pg.remote_format_validated.store(true, Ordering::Release);
+    pg.sync_max_response_bytes_per_page = 1;
+
+    pg.create_dir(ROOT_INO, b"still-pending", 0, 0, 0o755)
+        .expect("create independent pending event");
+    pg.set_xattr(ROOT_INO, b"user.sfs890.oversized", &[b'x'; 128], 0)
+        .expect("create oversized pending event");
+    let claimed = pg
+        .claim_pending_batch(true)
+        .expect("oversized event should be claimable");
+    crate::redb_engine::take_pending_serving_replays();
+
+    // Nothing rewrote serving state since the mutations: the flush only
+    // rejects and re-selects local journal ranges.
+    assert!(matches!(
+        pg.flush_pending_claimed_batch_with_restore(claimed),
+        Err(MetaError::EventTooLarge { .. })
+    ));
+    assert_eq!(crate::redb_engine::take_pending_serving_replays(), 0);
+    assert!(
+        pg.replication_backlog().pending_ops > 0,
+        "the independent directory create must stay pending"
+    );
+    assert!(pg.lookup(ROOT_INO, b"still-pending").is_ok());
+
+    // Replaying after a serving rewrite still runs.
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending local log");
+    assert!(crate::redb_engine::take_pending_serving_replays() > 0);
+}
+
+#[test]
 fn oversized_event_rejects_only_its_sequence_and_restores_independent_events() {
     let (_dir, mut pg) = temp_pg_engine_for_unit();
     pg.remote_format_validated.store(true, Ordering::Release);
@@ -3717,4 +3773,130 @@ fn hidden_flush_tail_is_republished_in_next_batch_and_acknowledged_after_remount
         "already-published events must not be republished"
     );
     reopened.prepare_for_close().expect("close reopened writer");
+}
+
+#[test]
+fn hidden_pending_window_grows_without_reprojecting_unpublished_overlay_history() {
+    use crate::engine::MetaEngine;
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+    use crate::schema::{
+        ChunkId, PayloadRef, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord,
+    };
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let mut attr = pg
+        .create_file(ROOT_INO, b"hidden-window.bin", 0, 0, 0o644)
+        .expect("create unpublished file");
+    attr.content_epoch = 1;
+    let window_start = pg
+        .pending_state
+        .lock()
+        .expect("pending state")
+        .event_start
+        .expect("create keeps a local-only window");
+
+    let mut work_per_round = Vec::new();
+    for round in 0..32u32 {
+        let start = round * 4096;
+        let object_id = 97_000 + u64::from(round);
+        attr.size = u64::from(start + 4096);
+        let slice = SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range: SliceRange::new(start, start + 4096).expect("slice range"),
+            payload: Some(PayloadRef::new_partial(object_id, 4096)),
+            payload_state: PayloadRefState::LocalOnly,
+        };
+        LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+        pg.flush_regular_file_overlay_slices_with_attr(
+            attr.ino,
+            &[(ChunkId(0), vec![slice])],
+            Some(&attr),
+        )
+        .expect("flush random-write overlay");
+        assert!(
+            pg.mark_regular_file_overlay_object_uploaded_if_matches(attr.ino, 1, object_id)
+                .expect("mark uploaded")
+        );
+        work_per_round.push(LOCAL_PROJECTION_WORK.with(std::cell::Cell::get));
+    }
+
+    let after_seq = pg.local.get_counter(NEXT_EVENT_SEQ).expect("after seq");
+    {
+        let state = pg.pending_state.lock().expect("pending state");
+        assert_eq!(
+            state.ops, 0,
+            "an unpublished file has no remote-visible work"
+        );
+        assert_eq!(state.event_start, Some(window_start));
+        assert_eq!(
+            state.event_end, after_seq,
+            "the window must keep every event"
+        );
+    }
+    let first = work_per_round[1];
+    let last = *work_per_round.last().expect("rounds ran");
+    assert!(
+        last <= first,
+        "each mutation must cost the same projection work however long the hidden window \
+         grows: {work_per_round:?}"
+    );
+
+    pg.create_dir(ROOT_INO, b"visible-after-hidden-window", 0, 0, 0o755)
+        .expect("create visible directory");
+    assert!(
+        pg.pending_state.lock().expect("pending state").ops > 0,
+        "a remote-visible mutation after the hidden window must still be counted"
+    );
+}
+
+#[test]
+fn poisoned_hidden_window_cache_falls_back_without_failing_the_mutation() {
+    use crate::engine::MetaEngine;
+    use crate::schema::{
+        ChunkId, PayloadRef, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord,
+    };
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let mut attr = pg
+        .create_file(ROOT_INO, b"poisoned-window.bin", 0, 0, 0o644)
+        .expect("create unpublished file");
+    attr.content_epoch = 1;
+    let flush = |round: u32, attr: &mut InodeAttr| {
+        let start = round * 4096;
+        attr.size = u64::from(start + 4096);
+        let slice = SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range: SliceRange::new(start, start + 4096).expect("slice range"),
+            payload: Some(PayloadRef::new_partial(98_000 + u64::from(round), 4096)),
+            payload_state: PayloadRefState::LocalOnly,
+        };
+        pg.flush_regular_file_overlay_slices_with_attr(
+            attr.ino,
+            &[(ChunkId(0), vec![slice])],
+            Some(attr),
+        )
+    };
+    flush(0, &mut attr).expect("first flush caches the hidden window");
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = pg.pending_hidden_window.lock().expect("window cache");
+        panic!("poison the hidden-window cache");
+    }));
+
+    flush(1, &mut attr).expect("a poisoned optimization cache must not fail the mutation");
+    flush(2, &mut attr).expect("the rebuilt cache keeps serving later mutations");
+
+    let after_seq = pg.local.get_counter(NEXT_EVENT_SEQ).expect("after seq");
+    let state = pg.pending_state.lock().expect("pending state");
+    assert_eq!(state.ops, 0);
+    assert_eq!(
+        state.event_end, after_seq,
+        "the window must keep every event"
+    );
+    drop(state);
+    assert!(
+        !pg.pending_hidden_window.is_poisoned(),
+        "the fallback must clear the poison"
+    );
 }

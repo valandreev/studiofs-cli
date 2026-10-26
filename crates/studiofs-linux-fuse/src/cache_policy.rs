@@ -32,6 +32,11 @@ impl LinuxFuseCachePolicy {
         };
         CachePolicySelection::recognized(policy)
     }
+
+    /// Only the kernel policy may enable FUSE writeback caching (ADR 0011).
+    pub(crate) const fn wants_writeback_cache(self) -> bool {
+        matches!(self, Self::Kernel)
+    }
 }
 
 /// Parsed policy plus an indicator that the original value was unknown.
@@ -123,6 +128,10 @@ pub(crate) fn decide_open_cache(
     let generation = generation.into();
     let stable_generation = generation.disposition == OsCacheDisposition::Reuse
         && generation.reason == OsCacheReason::StableGeneration;
+    // Locally dirty bytes were written through this mount, so the kernel's
+    // cached size already covers them; the open reply without `keep_cache`
+    // purges older pages (ADR 0011, SFS-901 amendment).
+    let local_dirty = generation.reason == OsCacheReason::LocalDirty;
 
     match policy {
         LinuxFuseCachePolicy::Direct => LinuxOpenCacheDecision::direct(false),
@@ -132,17 +141,17 @@ pub(crate) fn decide_open_cache(
         {
             LinuxOpenCacheDecision::direct(true)
         }
-        LinuxFuseCachePolicy::Adaptive if stable_generation && available_memory.is_none() => {
+        LinuxFuseCachePolicy::Adaptive if !stable_generation && !local_dirty => {
+            // A first or changed generation can follow a peer change whose
+            // inode invalidation is still queued. The open purges cached pages
+            // but not the kernel's cached size, and page-cache reads stop at
+            // that size, so read through VFS until the generation is stable.
+            LinuxOpenCacheDecision::direct(false)
+        }
+        LinuxFuseCachePolicy::Adaptive if available_memory.is_none() => {
             // Without fresh memory telemetry, conservatively bypass the page cache
             // and count it as a memory bypass so a dead sampler is visible.
             LinuxOpenCacheDecision::direct(true)
-        }
-        LinuxFuseCachePolicy::Adaptive if !stable_generation => {
-            // A new generation must be read through VFS before the kernel may
-            // retain pages for reuse. This closes the race where an open
-            // arrives before the asynchronous inode invalidation reaches the
-            // kernel page cache.
-            LinuxOpenCacheDecision::direct(false)
         }
         LinuxFuseCachePolicy::Adaptive => LinuxOpenCacheDecision::kernel(stable_generation, false),
         LinuxFuseCachePolicy::Kernel => {
@@ -386,6 +395,13 @@ mod tests {
     }
 
     #[test]
+    fn only_kernel_policy_requests_writeback_cache() {
+        assert!(LinuxFuseCachePolicy::Kernel.wants_writeback_cache());
+        assert!(!LinuxFuseCachePolicy::Adaptive.wants_writeback_cache());
+        assert!(!LinuxFuseCachePolicy::Direct.wants_writeback_cache());
+    }
+
+    #[test]
     fn direct_policy_always_bypasses_kernel_cache() {
         let decision = decide_open_cache(
             LinuxFuseCachePolicy::Direct,
@@ -410,7 +426,6 @@ mod tests {
             OsCacheReason::UnknownState,
             OsCacheReason::UnknownHandle,
             OsCacheReason::NonRegular,
-            OsCacheReason::LocalDirty,
             OsCacheReason::ActiveWriter,
         ];
 
@@ -439,30 +454,22 @@ mod tests {
 
     #[test]
     fn adaptive_clean_generation_uses_vfs_until_generation_is_stable() {
-        let first = decide_open_cache(
-            LinuxFuseCachePolicy::Adaptive,
-            false,
-            generation(OsCacheDisposition::Replace, OsCacheReason::FirstObservation),
-            64,
-            Some(1024),
-        );
-        assert!(first.direct_io);
-        assert!(!first.keep_cache);
-        assert_eq!(first.readahead, ReadAheadIntent::Vfs);
-
-        let changed = decide_open_cache(
-            LinuxFuseCachePolicy::Adaptive,
-            false,
-            generation(
-                OsCacheDisposition::Replace,
-                OsCacheReason::GenerationChanged,
-            ),
-            64,
-            Some(1024),
-        );
-        assert!(changed.direct_io);
-        assert!(!changed.keep_cache);
-        assert_eq!(changed.readahead, ReadAheadIntent::Vfs);
+        for reason in [
+            OsCacheReason::FirstObservation,
+            OsCacheReason::GenerationChanged,
+        ] {
+            let decision = decide_open_cache(
+                LinuxFuseCachePolicy::Adaptive,
+                false,
+                generation(OsCacheDisposition::Replace, reason),
+                64,
+                Some(1024),
+            );
+            assert!(decision.direct_io, "{reason:?}");
+            assert!(!decision.keep_cache, "{reason:?}");
+            assert_eq!(decision.readahead, ReadAheadIntent::Vfs, "{reason:?}");
+            assert!(!decision.memory_bypassed, "{reason:?}");
+        }
 
         let stable = decide_open_cache(
             LinuxFuseCachePolicy::Adaptive,
@@ -471,8 +478,41 @@ mod tests {
             64,
             Some(1024),
         );
+        assert!(!stable.direct_io);
         assert!(stable.keep_cache);
         assert!(!stable.writeback_capable);
+    }
+
+    #[test]
+    fn adaptive_local_dirty_read_uses_kernel_readahead_without_reuse() {
+        let decision = decide_open_cache(
+            LinuxFuseCachePolicy::Adaptive,
+            false,
+            generation(OsCacheDisposition::Replace, OsCacheReason::LocalDirty),
+            64,
+            Some(1024),
+        );
+
+        assert!(!decision.direct_io);
+        assert!(!decision.keep_cache, "the open must purge earlier pages");
+        assert_eq!(decision.readahead, ReadAheadIntent::Kernel);
+        assert!(!decision.writeback_capable);
+        assert!(!decision.memory_bypassed);
+    }
+
+    #[test]
+    fn adaptive_local_dirty_file_larger_than_available_memory_is_direct() {
+        let decision = decide_open_cache(
+            LinuxFuseCachePolicy::Adaptive,
+            false,
+            generation(OsCacheDisposition::Replace, OsCacheReason::LocalDirty),
+            1025,
+            Some(1024),
+        );
+
+        assert!(decision.direct_io);
+        assert!(decision.memory_bypassed);
+        assert_eq!(decision.readahead, ReadAheadIntent::Vfs);
     }
 
     #[test]
@@ -518,6 +558,22 @@ mod tests {
         assert!(!decision.keep_cache);
         assert_eq!(decision.readahead, ReadAheadIntent::Vfs);
         assert!(!decision.memory_bypassed);
+    }
+
+    #[test]
+    fn adaptive_memory_measurement_failure_bypasses_local_dirty_read() {
+        let decision = decide_open_cache(
+            LinuxFuseCachePolicy::Adaptive,
+            false,
+            generation(OsCacheDisposition::Replace, OsCacheReason::LocalDirty),
+            64,
+            None,
+        );
+
+        assert!(decision.direct_io);
+        assert!(!decision.keep_cache);
+        assert_eq!(decision.readahead, ReadAheadIntent::Vfs);
+        assert!(decision.memory_bypassed);
     }
 
     #[test]

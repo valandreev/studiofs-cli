@@ -17,6 +17,28 @@ use tracing::debug;
 /// Inode number (re-exported convenience).
 pub type Ino = u64;
 
+/// File bytes that map one-to-one onto a contiguous range of a payload object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectFileMapping {
+    /// First mapped file offset.
+    pub file_offset: u64,
+    /// Object offset holding the byte at `file_offset`.
+    pub object_offset: u64,
+    /// Mapped length in bytes.
+    pub len: u64,
+}
+
+impl ObjectFileMapping {
+    /// Maps `len` bytes of an object whose byte 0 sits at `file_offset`.
+    pub fn whole(file_offset: u64, len: u64) -> Self {
+        Self {
+            file_offset,
+            object_offset: 0,
+            len,
+        }
+    }
+}
+
 /// A pending upload operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingUpload {
@@ -24,8 +46,9 @@ pub struct PendingUpload {
     pub ino: Ino,
     /// File offset this payload object corresponds to.
     pub offset: u64,
-    /// File offset corresponding to byte 0 of the uploaded payload object.
-    pub object_file_offset: u64,
+    /// Gapless file mapping of the referenced object bytes for stale-epoch reattach;
+    /// `None` when the references are scattered, as in a packed object.
+    pub file_mapping: Option<ObjectFileMapping>,
     /// Object ID (object ID).
     pub object_id: u64,
     /// Uploaded payload length in bytes.
@@ -38,6 +61,26 @@ pub struct PendingUpload {
     pub not_before_unix_ms: u64,
     /// In-memory retry attempt counter for cooldown requeue logic.
     pub retry_count: u32,
+}
+
+/// Aggregate view of the pending uploads, computed under the queue lock
+/// without copying the operations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingUploadSummary {
+    /// Number of pending upload operations.
+    pub count: usize,
+    /// Sum of recorded payload lengths, excluding `unknown_len_object_ids`.
+    pub payload_bytes: u64,
+    /// Pending objects queued without a recorded payload length.
+    pub unknown_len_object_ids: Vec<u64>,
+    /// Enqueue time of the oldest pending operation.
+    pub oldest_created_unix_ms: Option<u64>,
+    /// Pending operations that have been retried at least once.
+    pub retrying: u64,
+    /// Sum of retry attempts across pending operations.
+    pub retry_count_sum: u64,
+    /// Largest retry attempt count among pending operations.
+    pub max_retry_count: u32,
 }
 
 /// Manages in-memory pending upload state and dispatch channel.
@@ -96,6 +139,61 @@ struct PendingState {
     canceled_inodes: HashSet<Ino>,
     canceled_dirty: BTreeSet<Ino>,
     wakeup_coalesced: u64,
+    // Maintained with every `by_object` change so summaries never walk the queue.
+    totals: PendingTotals,
+}
+
+#[derive(Debug, Default)]
+struct PendingTotals {
+    payload_bytes: u64,
+    unknown_len_object_ids: BTreeSet<u64>,
+    created_unix_ms: BTreeMap<u64, usize>,
+    retrying: u64,
+    retry_count_sum: u64,
+    nonzero_retry_counts: BTreeMap<u32, usize>,
+}
+
+impl PendingTotals {
+    fn add(&mut self, op: &PendingUpload) {
+        if op.payload_len == 0 {
+            self.unknown_len_object_ids.insert(op.object_id);
+        } else {
+            self.payload_bytes = self.payload_bytes.saturating_add(op.payload_len);
+        }
+        *self.created_unix_ms.entry(op.created_unix_ms).or_default() += 1;
+        if op.retry_count != 0 {
+            self.retrying += 1;
+            *self.nonzero_retry_counts.entry(op.retry_count).or_default() += 1;
+        }
+        self.retry_count_sum = self
+            .retry_count_sum
+            .saturating_add(u64::from(op.retry_count));
+    }
+
+    fn remove(&mut self, op: &PendingUpload) {
+        if op.payload_len == 0 {
+            self.unknown_len_object_ids.remove(&op.object_id);
+        } else {
+            self.payload_bytes = self.payload_bytes.saturating_sub(op.payload_len);
+        }
+        Self::decrement(&mut self.created_unix_ms, op.created_unix_ms);
+        if op.retry_count != 0 {
+            self.retrying = self.retrying.saturating_sub(1);
+            Self::decrement(&mut self.nonzero_retry_counts, op.retry_count);
+        }
+        self.retry_count_sum = self
+            .retry_count_sum
+            .saturating_sub(u64::from(op.retry_count));
+    }
+
+    fn decrement<K: Ord>(counts: &mut BTreeMap<K, usize>, key: K) {
+        if let Entry::Occupied(mut entry) = counts.entry(key) {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+    }
 }
 
 /// Runtime ingress state for the upload worker wakeup channel.
@@ -156,6 +254,7 @@ impl UploadQueue {
                 canceled_inodes: HashSet::new(),
                 canceled_dirty: BTreeSet::new(),
                 wakeup_coalesced: 0,
+                totals: PendingTotals::default(),
             }),
             idle_notify,
             shutdown_requested: AtomicBool::new(false),
@@ -183,7 +282,7 @@ impl UploadQueue {
         object_id: u64,
         content_epoch: u64,
     ) -> UploadSubmitOutcome {
-        self.submit_with_payload(ino, offset, offset, object_id, content_epoch, 0)
+        self.submit_with_payload(ino, offset, None, object_id, content_epoch, 0)
     }
 
     /// Submit a pending upload with explicit uploaded-payload geometry.
@@ -197,7 +296,7 @@ impl UploadQueue {
         &self,
         ino: Ino,
         offset: u64,
-        object_file_offset: u64,
+        file_mapping: Option<ObjectFileMapping>,
         object_id: u64,
         content_epoch: u64,
         payload_len: u64,
@@ -205,7 +304,7 @@ impl UploadQueue {
         self.submit_with_payload_and_pending_count(
             ino,
             offset,
-            object_file_offset,
+            file_mapping,
             object_id,
             content_epoch,
             payload_len,
@@ -220,15 +319,17 @@ impl UploadQueue {
         &self,
         ino: Ino,
         offset: u64,
-        object_file_offset: u64,
+        file_mapping: Option<ObjectFileMapping>,
         object_id: u64,
         content_epoch: u64,
         payload_len: u64,
     ) -> (UploadSubmitOutcome, usize) {
+        // Upload completion reports `payload_len` bytes; a mapping implies the object length is known.
+        debug_assert!(payload_len > 0 || file_mapping.is_none());
         let op = PendingUpload {
             ino,
             offset,
-            object_file_offset,
+            file_mapping,
             object_id,
             payload_len,
             content_epoch,
@@ -595,6 +696,73 @@ impl UploadQueue {
         ops
     }
 
+    /// Summarize the pending upload ops from incrementally maintained totals.
+    pub fn pending_summary(&self) -> PendingUploadSummary {
+        let state = self.pending_state.lock();
+        let totals = &state.totals;
+        PendingUploadSummary {
+            count: state.by_object.len(),
+            payload_bytes: totals.payload_bytes,
+            unknown_len_object_ids: totals.unknown_len_object_ids.iter().copied().collect(),
+            oldest_created_unix_ms: totals.created_unix_ms.keys().next().copied(),
+            retrying: totals.retrying,
+            retry_count_sum: totals.retry_count_sum,
+            max_retry_count: totals
+                .nonzero_retry_counts
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_summary_by_scan(&self) -> PendingUploadSummary {
+        let state = self.pending_state.lock();
+        let mut summary = PendingUploadSummary {
+            count: state.by_object.len(),
+            ..PendingUploadSummary::default()
+        };
+        for op in state.by_object.values() {
+            if op.payload_len == 0 {
+                summary.unknown_len_object_ids.push(op.object_id);
+            } else {
+                summary.payload_bytes = summary.payload_bytes.saturating_add(op.payload_len);
+            }
+            summary.oldest_created_unix_ms = Some(
+                summary
+                    .oldest_created_unix_ms
+                    .map_or(op.created_unix_ms, |oldest| oldest.min(op.created_unix_ms)),
+            );
+            if op.retry_count != 0 {
+                summary.retrying += 1;
+            }
+            summary.retry_count_sum = summary
+                .retry_count_sum
+                .saturating_add(u64::from(op.retry_count));
+            summary.max_retry_count = summary.max_retry_count.max(op.retry_count);
+        }
+        summary
+    }
+
+    /// Returns the p95 and maximum pending-operation age in milliseconds.
+    pub fn pending_age_stats_ms(&self, now_unix_ms: u64) -> (u64, u64) {
+        let mut ages: Vec<u64> = {
+            let state = self.pending_state.lock();
+            state
+                .by_object
+                .values()
+                .map(|op| now_unix_ms.saturating_sub(op.created_unix_ms))
+                .collect()
+        };
+        let Some(max) = ages.iter().copied().max() else {
+            return (0, 0);
+        };
+        let p95_index = (ages.len() - 1).saturating_mul(95) / 100;
+        let (_, p95, _) = ages.select_nth_unstable(p95_index);
+        (*p95, max)
+    }
+
     /// Snapshot currently pending upload ops for one inode.
     pub fn snapshot_pending_for_ino(&self, ino: Ino) -> Vec<PendingUpload> {
         let state = self.pending_state.lock();
@@ -637,11 +805,10 @@ impl UploadQueue {
 
     fn record_pending_or_update(state: &mut PendingState, op: &PendingUpload) -> PendingSubmit {
         if let Some(current) = state.by_object.get_mut(&op.object_id) {
-            if current.ino == op.ino
-                && current.offset == op.offset
-                && op.content_epoch > current.content_epoch
-            {
+            if current.ino == op.ino && op.content_epoch > current.content_epoch {
                 let previous = std::mem::replace(current, op.clone());
+                state.totals.remove(&previous);
+                state.totals.add(op);
                 Self::unmark_dirty(state, &previous);
                 Self::mark_dirty(state, op);
                 return PendingSubmit::Updated(previous);
@@ -651,6 +818,7 @@ impl UploadQueue {
 
         let ino = op.ino;
         state.by_object.insert(op.object_id, op.clone());
+        state.totals.add(op);
         state.by_inode.entry(ino).or_default().insert(op.object_id);
         Self::mark_dirty(state, op);
         PendingSubmit::New
@@ -706,6 +874,7 @@ impl UploadQueue {
             return (false, false);
         }
         let removed = entry.remove();
+        state.totals.remove(&removed);
         Self::remove_inode_index_entry(state, removed.ino, op.object_id);
         Self::unmark_dirty(state, &removed);
         let became_idle = state.by_object.is_empty();
@@ -724,6 +893,8 @@ impl UploadQueue {
             return None;
         }
         let previous = std::mem::replace(current, op.clone());
+        state.totals.remove(&previous);
+        state.totals.add(op);
         Self::unmark_dirty(state, &previous);
         Self::mark_dirty(state, op);
         Some(previous)
@@ -746,6 +917,8 @@ impl UploadQueue {
             return None;
         }
         let previous = std::mem::replace(current, replacement.clone());
+        state.totals.remove(&previous);
+        state.totals.add(replacement);
         Self::unmark_dirty(state, &previous);
         Self::mark_dirty(state, replacement);
         Some(previous)
@@ -761,6 +934,8 @@ impl UploadQueue {
         };
         if current == failed_op {
             *current = previous.clone();
+            state.totals.remove(failed_op);
+            state.totals.add(&previous);
             Self::unmark_dirty(state, failed_op);
             Self::mark_dirty(state, &previous);
         }
@@ -851,6 +1026,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packed_submit_newer_epoch_can_move_first_segment() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+        assert_eq!(
+            queue.submit_with_payload(1, 0, None, 77, 1, 8192),
+            UploadSubmitOutcome::New
+        );
+        let stale = recv_one(&queue, &mut rx).await;
+        let mapping = Some(ObjectFileMapping {
+            file_offset: 32768,
+            object_offset: 4096,
+            len: 4096,
+        });
+        assert_eq!(
+            queue.submit_with_payload(1, 32768, mapping, 77, 2, 8192),
+            UploadSubmitOutcome::Updated
+        );
+        let current = recv_one(&queue, &mut rx).await;
+        assert_eq!(
+            (current.offset, current.content_epoch, current.file_mapping),
+            (32768, 2, mapping)
+        );
+        assert!(
+            !queue.complete(&stale),
+            "the displaced worker cannot complete the new owner"
+        );
+        assert!(!queue.cancel(&stale));
+        assert!(!queue.requeue(stale));
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(queue.submit(2, 32768, 77, 3), UploadSubmitOutcome::Ignored);
+        assert_eq!(queue.submit(1, 0, 77, 1), UploadSubmitOutcome::Ignored);
+        assert!(queue.complete(&current));
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
     async fn duplicate_submit_updates_pending_upload_to_newer_epoch() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
@@ -890,28 +1101,70 @@ mod tests {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, rx) = UploadQueue::new(dir.path());
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 1, 7),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                0,
+                Some(ObjectFileMapping::whole(0, 7)),
+                101,
+                1,
+                7
+            ),
             (UploadSubmitOutcome::New, 1)
         );
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 2, 7),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                0,
+                Some(ObjectFileMapping::whole(0, 7)),
+                101,
+                2,
+                7
+            ),
             (UploadSubmitOutcome::Updated, 1)
         );
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 1, 7),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                0,
+                Some(ObjectFileMapping::whole(0, 7)),
+                101,
+                1,
+                7
+            ),
             (UploadSubmitOutcome::Ignored, 1)
         );
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 8, 8, 102, 1, 5),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                8,
+                Some(ObjectFileMapping::whole(8, 5)),
+                102,
+                1,
+                5
+            ),
             (UploadSubmitOutcome::New, 2)
         );
         drop(rx);
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 16, 16, 103, 1, 9),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                16,
+                Some(ObjectFileMapping::whole(16, 9)),
+                103,
+                1,
+                9
+            ),
             (UploadSubmitOutcome::Closed, 2)
         );
         assert_eq!(
-            queue.submit_with_payload_and_pending_count(1, 0, 0, 101, 3, 9),
+            queue.submit_with_payload_and_pending_count(
+                1,
+                0,
+                Some(ObjectFileMapping::whole(0, 9)),
+                101,
+                3,
+                9
+            ),
             (UploadSubmitOutcome::Closed, 2)
         );
         assert_eq!(queue.snapshot_pending()[0].content_epoch, 2);
@@ -945,7 +1198,7 @@ mod tests {
 
         let first_queue = Arc::clone(&queue);
         let first = tokio::task::spawn_blocking(move || {
-            first_queue.submit_with_payload(1, 0, 0, 77, 1, 10)
+            first_queue.submit_with_payload(1, 0, Some(ObjectFileMapping::whole(0, 10)), 77, 1, 10)
         });
         let first_paused = tokio::time::timeout(Duration::from_secs(1), entered_rx.recv())
             .await
@@ -999,12 +1252,12 @@ mod tests {
     async fn sfs752_failed_rebased_requeue_holds_state_lock_and_restores_pending() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
-        queue.submit_with_payload(1, 0, 0, 77, 1, 10);
+        queue.submit_with_payload(1, 0, Some(ObjectFileMapping::whole(0, 10)), 77, 1, 10);
         let current = recv_one(&queue, &mut rx).await;
         drop(rx);
         let mut rebased = current.clone();
         rebased.offset = 10;
-        rebased.object_file_offset = 10;
+        rebased.file_mapping = Some(ObjectFileMapping::whole(10, 10));
         rebased.content_epoch = 2;
 
         let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1139,21 +1392,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_summary_aggregates_without_copying_operations() {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit_with_payload(10, 0, Some(ObjectFileMapping::whole(0, 4096)), 100, 1, 4096);
+        queue.submit_with_payload(
+            10,
+            4096,
+            Some(ObjectFileMapping::whole(4096, 8192)),
+            101,
+            1,
+            8192,
+        );
+        queue.submit(11, 0, 102, 1);
+        let mut retry = recv_one(&queue, &mut rx).await;
+        assert_eq!(retry.object_id, 100);
+        retry.retry_count = 2;
+        assert!(queue.requeue(retry));
+
+        let snapshot = queue.snapshot_pending();
+        let summary = queue.pending_summary();
+        assert_eq!(
+            summary,
+            PendingUploadSummary {
+                count: 3,
+                payload_bytes: 4096 + 8192,
+                unknown_len_object_ids: vec![102],
+                oldest_created_unix_ms: snapshot.iter().map(|op| op.created_unix_ms).min(),
+                retrying: 1,
+                retry_count_sum: 2,
+                max_retry_count: 2,
+            }
+        );
+
+        let now = snapshot
+            .iter()
+            .map(|op| op.created_unix_ms)
+            .max()
+            .expect("pending ops")
+            + 500;
+        let mut ages: Vec<u64> = snapshot.iter().map(|op| now - op.created_unix_ms).collect();
+        ages.sort_unstable();
+        assert_eq!(queue.pending_age_stats_ms(now), (ages[1], ages[2]));
+        assert_eq!(queue.pending_count(), 3);
+        assert_eq!(summary, queue.pending_summary_by_scan());
+
+        for op in snapshot {
+            assert!(queue.complete(&op));
+            assert_eq!(queue.pending_summary(), queue.pending_summary_by_scan());
+        }
+        assert_eq!(queue.pending_summary(), PendingUploadSummary::default());
+    }
+
+    #[tokio::test]
     async fn requeue_rebased_allows_offset_change_for_same_object() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
         let (queue, mut rx) = UploadQueue::new(dir.path());
 
-        queue.submit_with_payload(10, 0, 0, 100, 1, 4096);
+        queue.submit_with_payload(10, 0, Some(ObjectFileMapping::whole(0, 4096)), 100, 1, 4096);
         let current = recv_one(&queue, &mut rx).await;
         let mut rebased = current.clone();
         rebased.offset = 4096;
-        rebased.object_file_offset = 4096;
+        rebased.file_mapping = Some(ObjectFileMapping::whole(4096, 4096));
         rebased.content_epoch = 2;
 
         assert!(queue.requeue_rebased(&current, rebased.clone()));
         let queued = recv_one(&queue, &mut rx).await;
         assert_eq!(queued.offset, 4096);
-        assert_eq!(queued.object_file_offset, 4096);
+        assert_eq!(queued.file_mapping, rebased.file_mapping);
         assert_eq!(queued.content_epoch, 2);
 
         assert!(

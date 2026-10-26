@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use studiofs_cache::upload_queue::PendingUpload;
+use studiofs_cache::upload_queue::{ObjectFileMapping, PendingUpload};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
 };
@@ -191,11 +191,12 @@ fn foreground_upload_reread_pacing_delay(foreground_active: bool, reread_bytes: 
 fn uploaded_object_reattach_slices(
     spans: &[ResolvedSliceSpan],
     object_id: u64,
-    offset: u64,
-    payload_len: u64,
+    mapping: ObjectFileMapping,
     block_size: u32,
 ) -> Option<Vec<(ChunkId, Vec<SliceRecord>)>> {
-    let request_end = offset.checked_add(payload_len)?;
+    let offset = mapping.file_offset;
+    let request_end = offset.checked_add(mapping.len)?;
+    let object_file_offset = offset.checked_sub(mapping.object_offset)?;
     let mut chunk_slices: BTreeMap<ChunkId, Vec<SliceRecord>> = BTreeMap::new();
 
     for span in spans {
@@ -224,7 +225,7 @@ fn uploaded_object_reattach_slices(
             append_uploaded_object_reattach_slices(
                 &mut chunk_slices,
                 object_id,
-                offset,
+                object_file_offset,
                 start,
                 end,
                 block_size,
@@ -301,6 +302,23 @@ trait UploadMetaPort: Clone + Send + Sync + 'static {
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool>;
+    async fn regular_file_overlay_objects_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> VfsResult<Vec<u64>> {
+        let mut referenced = Vec::new();
+        for &object_id in object_ids {
+            if self
+                .has_regular_file_overlay_object_if_matches(ino, expected_epoch, object_id)
+                .await?
+            {
+                referenced.push(object_id);
+            }
+        }
+        Ok(referenced)
+    }
     async fn mark_regular_file_overlay_object_uploaded_if_matches(
         &self,
         ino: Ino,
@@ -333,8 +351,7 @@ trait UploadMetaPort: Clone + Send + Sync + 'static {
         ino: Ino,
         content_epoch: u64,
         object_id: u64,
-        offset: u64,
-        payload_len: u64,
+        mapping: ObjectFileMapping,
         block_size: u32,
     ) -> VfsResult<Option<u64>>;
     async fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> VfsResult<()>;
@@ -704,7 +721,7 @@ where
             }
         };
 
-        let mut payload_len = if remote_object_visible {
+        let payload_len = if remote_object_visible {
             op.payload_len
         } else {
             raw_payload.len() as u64
@@ -753,24 +770,7 @@ where
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
-        let mut reconcile = self
-            .reconcile_uploaded_object_metadata(op, payload_len)
-            .await?;
-        let should_reconcile_from_local_payload =
-            reconcile.is_none() && remote_object_visible && payload_len == 0;
-        let cached_payload = if should_reconcile_from_local_payload {
-            self.local_payloads
-                .read_for_upload(op.object_id, op.payload_len)
-                .await?
-        } else {
-            None
-        };
-        if let Some(cached_payload) = cached_payload {
-            payload_len = cached_payload.len() as u64;
-            reconcile = self
-                .reconcile_uploaded_object_metadata(op, payload_len)
-                .await?;
-        }
+        let mut reconcile = self.reconcile_uploaded_object_metadata(op).await?;
         if reconcile.is_none() && !self.shutdown.uploader_shutdown_requested() {
             for _ in 0..POST_PUT_STALE_RECONCILE_ATTEMPTS {
                 let shutdown_token = self.shutdown.shutdown_token();
@@ -786,9 +786,7 @@ where
                     );
                     return Ok(SingleUploadOutcome::CancelledDeleted);
                 }
-                reconcile = self
-                    .reconcile_uploaded_object_metadata(op, payload_len)
-                    .await?;
+                reconcile = self.reconcile_uploaded_object_metadata(op).await?;
                 if reconcile.is_some() {
                     break;
                 }
@@ -852,20 +850,17 @@ where
     async fn reconcile_uploaded_object_metadata(
         &self,
         op: &PendingUpload,
-        payload_len: u64,
     ) -> VfsResult<Option<UploadedObjectReconcile>> {
+        // Marking reports whether the object is still referenced at that
+        // epoch, so a separate presence check would only repeat the scan.
         if self
             .meta
-            .has_regular_file_overlay_object_if_matches(op.ino, op.content_epoch, op.object_id)
+            .mark_regular_file_overlay_object_uploaded_if_matches(
+                op.ino,
+                op.content_epoch,
+                op.object_id,
+            )
             .await?
-            && self
-                .meta
-                .mark_regular_file_overlay_object_uploaded_if_matches(
-                    op.ino,
-                    op.content_epoch,
-                    op.object_id,
-                )
-                .await?
         {
             return Ok(Some(UploadedObjectReconcile {
                 keep_local_object: true,
@@ -875,14 +870,6 @@ where
 
         if let Some(latest_attr) = self.meta.get_attr(op.ino).await?
             && latest_attr.content_epoch != op.content_epoch
-            && self
-                .meta
-                .has_regular_file_overlay_object_if_matches(
-                    op.ino,
-                    latest_attr.content_epoch,
-                    op.object_id,
-                )
-                .await?
             && self
                 .meta
                 .mark_regular_file_overlay_object_uploaded_if_matches(
@@ -898,17 +885,17 @@ where
             }));
         }
 
-        if let Some(rebased_epoch) = self
-            .meta
-            .reattach_uploaded_object_if_uncovered(
-                op.ino,
-                op.content_epoch,
-                op.object_id,
-                op.object_file_offset,
-                payload_len,
-                self.block_size,
-            )
-            .await?
+        if let Some(mapping) = op.file_mapping
+            && let Some(rebased_epoch) = self
+                .meta
+                .reattach_uploaded_object_if_uncovered(
+                    op.ino,
+                    op.content_epoch,
+                    op.object_id,
+                    mapping,
+                    self.block_size,
+                )
+                .await?
         {
             return Ok(Some(UploadedObjectReconcile {
                 keep_local_object: true,
@@ -1016,14 +1003,16 @@ where
             return Ok(self.requeue_stale_upload_at_epoch(op, live_epoch));
         }
 
+        let Some(mapping) = op.file_mapping else {
+            return Ok(StaleUploadDisposition::Uncovered);
+        };
         let Some(rebased_epoch) = self
             .meta
             .reattach_uploaded_object_if_uncovered(
                 op.ino,
                 op.content_epoch,
                 op.object_id,
-                op.object_file_offset,
-                op.payload_len,
+                mapping,
                 self.block_size,
             )
             .await?
@@ -1102,7 +1091,7 @@ impl CachedStorePort for VfsCachedStorePort {
         self.vfs.cached_store.submit_upload_with_payload(
             op.ino,
             op.offset,
-            op.object_file_offset,
+            op.file_mapping,
             op.object_id,
             op.content_epoch,
             op.payload_len,
@@ -1374,22 +1363,91 @@ impl Drop for UploadCompletionDrainGuard<'_> {
     }
 }
 
+/// Per-object overlay queries that concurrent upload workers coalesce into one
+/// metadata call per `(ino, expected_epoch)`, so a fragmented file costs one
+/// overlay scan per batch instead of one per object.
+#[derive(Clone, Copy)]
+enum OverlayObjectBatchKind {
+    /// Pre-PUT check that the object is still referenced (read-only).
+    Presence,
+    /// Post-PUT upload completion (write transaction).
+    Completion,
+}
+
+impl OverlayObjectBatchKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Presence => "upload presence",
+            Self::Completion => "upload completion",
+        }
+    }
+}
+
 impl VfsUploadMetaPort {
-    async fn drain_upload_completion_batch(&self) {
+    fn overlay_object_batch(
+        &self,
+        kind: OverlayObjectBatchKind,
+    ) -> (
+        &tokio::sync::Mutex<super::super::UploadCompletionBatch>,
+        &std::sync::atomic::AtomicBool,
+    ) {
+        let upload = &self.vfs.state.upload;
+        match kind {
+            OverlayObjectBatchKind::Presence => (
+                &upload.overlay_presence_batch,
+                &upload.overlay_presence_draining,
+            ),
+            OverlayObjectBatchKind::Completion => (
+                &upload.upload_completion_batch,
+                &upload.upload_completion_draining,
+            ),
+        }
+    }
+
+    /// Queues one object; the first caller to find the batch idle drains it.
+    async fn run_overlay_object_batched(
+        &self,
+        kind: OverlayObjectBatchKind,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> VfsResult<bool> {
+        let (batch, draining) = self.overlay_object_batch(kind);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let should_drain = {
+            let mut batch = batch.lock().await;
+            batch
+                .pending
+                .push(super::super::UploadCompletionBatchEntry {
+                    ino,
+                    expected_epoch,
+                    object_id,
+                    result_tx,
+                });
+            draining
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        };
+        if should_drain {
+            self.drain_overlay_object_batch(kind).await;
+        }
+        result_rx
+            .await
+            .map_err(|_| VfsError::Other(format!("{} batch result was dropped", kind.label())))?
+    }
+
+    async fn drain_overlay_object_batch(&self, kind: OverlayObjectBatchKind) {
+        let (batch, draining) = self.overlay_object_batch(kind);
         let mut guard = UploadCompletionDrainGuard {
-            draining: &self.vfs.state.upload.upload_completion_draining,
+            draining,
             armed: true,
         };
         loop {
             tokio::task::yield_now().await;
             let entries = {
-                let mut batch = self.vfs.state.upload.upload_completion_batch.lock().await;
+                let mut batch = batch.lock().await;
                 if batch.pending.is_empty() {
-                    self.vfs
-                        .state
-                        .upload
-                        .upload_completion_draining
-                        .store(false, Ordering::Release);
+                    draining.store(false, Ordering::Release);
                     guard.disarm();
                     return;
                 }
@@ -1407,18 +1465,25 @@ impl VfsUploadMetaPort {
 
             for ((ino, expected_epoch), entries) in groups {
                 let object_ids: Vec<u64> = entries.iter().map(|entry| entry.object_id).collect();
-                match self
-                    .mark_regular_file_overlay_objects_uploaded_if_match(
-                        ino,
-                        expected_epoch,
-                        &object_ids,
-                    )
-                    .await
-                {
-                    Ok(marked) => {
-                        let marked: HashSet<u64> = marked.into_iter().collect();
+                let result = match kind {
+                    OverlayObjectBatchKind::Presence => {
+                        self.regular_file_overlay_objects_if_match(ino, expected_epoch, &object_ids)
+                            .await
+                    }
+                    OverlayObjectBatchKind::Completion => {
+                        self.mark_regular_file_overlay_objects_uploaded_if_match(
+                            ino,
+                            expected_epoch,
+                            &object_ids,
+                        )
+                        .await
+                    }
+                };
+                match result {
+                    Ok(matched) => {
+                        let matched: HashSet<u64> = matched.into_iter().collect();
                         for entry in entries {
-                            let _ = entry.result_tx.send(Ok(marked.contains(&entry.object_id)));
+                            let _ = entry.result_tx.send(Ok(matched.contains(&entry.object_id)));
                         }
                     }
                     Err(error) => {
@@ -1449,9 +1514,28 @@ impl UploadMetaPort for VfsUploadMetaPort {
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool> {
+        self.run_overlay_object_batched(
+            OverlayObjectBatchKind::Presence,
+            ino,
+            expected_epoch,
+            object_id,
+        )
+        .await
+    }
+
+    async fn regular_file_overlay_objects_if_match(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_ids: &[u64],
+    ) -> VfsResult<Vec<u64>> {
+        if object_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let meta = self.vfs.meta.clone();
+        let object_ids = object_ids.to_vec();
         run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.has_regular_file_overlay_object_if_matches(ino, expected_epoch, object_id)
+            engine.regular_file_overlay_objects_if_match(ino, expected_epoch, &object_ids)
         })
         .await
     }
@@ -1462,31 +1546,13 @@ impl UploadMetaPort for VfsUploadMetaPort {
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool> {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let should_drain = {
-            let mut batch = self.vfs.state.upload.upload_completion_batch.lock().await;
-            batch
-                .pending
-                .push(super::super::UploadCompletionBatchEntry {
-                    ino,
-                    expected_epoch,
-                    object_id,
-                    result_tx,
-                });
-            self.vfs
-                .state
-                .upload
-                .upload_completion_draining
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        };
-        if should_drain {
-            let port = self.clone();
-            port.drain_upload_completion_batch().await;
-        }
-        result_rx.await.map_err(|_| {
-            VfsError::Other("upload completion batch result was dropped".to_string())
-        })?
+        self.run_overlay_object_batched(
+            OverlayObjectBatchKind::Completion,
+            ino,
+            expected_epoch,
+            object_id,
+        )
+        .await
     }
 
     async fn mark_regular_file_overlay_objects_uploaded_if_match(
@@ -1515,14 +1581,18 @@ impl UploadMetaPort for VfsUploadMetaPort {
         ino: Ino,
         content_epoch: u64,
         object_id: u64,
-        offset: u64,
-        payload_len: u64,
+        mapping: ObjectFileMapping,
         block_size: u32,
     ) -> VfsResult<Option<u64>> {
+        let offset = mapping.file_offset;
+        let payload_len = mapping.len;
         if payload_len == 0 {
             return Ok(None);
         }
-        let Some(end_offset) = offset.checked_add(payload_len) else {
+        let (Some(end_offset), Some(object_file_offset)) = (
+            offset.checked_add(payload_len),
+            offset.checked_sub(mapping.object_offset),
+        ) else {
             return Ok(None);
         };
         let meta = self.vfs.meta.clone();
@@ -1542,33 +1612,28 @@ impl UploadMetaPort for VfsUploadMetaPort {
             }
 
             let spans = engine.lookup_regular_file_slices(ino, offset, payload_len)?;
-            let chunk_slices = match uploaded_object_reattach_slices(
-                &spans,
-                object_id,
-                offset,
-                payload_len,
-                block_size,
-            ) {
-                Some(chunk_slices) => chunk_slices,
-                None if can_restore_stale_sparse_growth => {
-                    let mut chunk_slices = BTreeMap::new();
-                    append_uploaded_object_reattach_slices(
-                        &mut chunk_slices,
-                        object_id,
-                        offset,
-                        offset,
-                        end_offset,
-                        block_size,
-                    )
-                    .ok_or_else(|| {
-                        studiofs_meta::MetaError::Storage(
-                            "failed to rebuild stale sparse upload slices".to_string(),
+            let chunk_slices =
+                match uploaded_object_reattach_slices(&spans, object_id, mapping, block_size) {
+                    Some(chunk_slices) => chunk_slices,
+                    None if can_restore_stale_sparse_growth => {
+                        let mut chunk_slices = BTreeMap::new();
+                        append_uploaded_object_reattach_slices(
+                            &mut chunk_slices,
+                            object_id,
+                            object_file_offset,
+                            offset,
+                            end_offset,
+                            block_size,
                         )
-                    })?;
-                    chunk_slices.into_iter().collect()
-                }
-                None => return Ok(None),
-            };
+                        .ok_or_else(|| {
+                            studiofs_meta::MetaError::Storage(
+                                "failed to rebuild stale sparse upload slices".to_string(),
+                            )
+                        })?;
+                        chunk_slices.into_iter().collect()
+                    }
+                    None => return Ok(None),
+                };
 
             let mut rebased_attr = latest_attr;
             if can_restore_stale_sparse_growth {
@@ -2860,8 +2925,7 @@ mod tests {
         let reattached = uploaded_object_reattach_slices(
             &spans,
             object_id,
-            0,
-            u64::from(block_size * 2),
+            ObjectFileMapping::whole(0, u64::from(block_size * 2)),
             block_size,
         )
         .expect("full block should reattach over a hole");
@@ -3031,13 +3095,14 @@ mod tests {
     }
 
     type UploadedOverlayObjectRecord = (Ino, u64, u64);
-    type ReattachedUploadRecord = (Ino, u64, u64, u64, u64, u32);
+    type ReattachedUploadRecord = (Ino, u64, u64, ObjectFileMapping, u32);
 
     #[derive(Clone)]
     struct FakeMeta {
         trace: FakeUploadTrace,
         attrs: Arc<Mutex<HashMap<Ino, Option<InodeAttr>>>>,
         overlay_objects: Arc<Mutex<HashMap<Ino, HashSet<u64>>>>,
+        presence_checks: Arc<AtomicUsize>,
         pending_deletions: Arc<Mutex<Vec<u64>>>,
         uploaded_overlay_objects: Arc<Mutex<Vec<UploadedOverlayObjectRecord>>>,
         reattached_uploads: Arc<Mutex<Vec<ReattachedUploadRecord>>>,
@@ -3051,6 +3116,7 @@ mod tests {
                 trace: FakeUploadTrace::default(),
                 attrs: Arc::new(Mutex::new(HashMap::new())),
                 overlay_objects: Arc::new(Mutex::new(HashMap::new())),
+                presence_checks: Arc::new(AtomicUsize::new(0)),
                 pending_deletions: Arc::new(Mutex::new(Vec::new())),
                 uploaded_overlay_objects: Arc::new(Mutex::new(Vec::new())),
                 reattached_uploads: Arc::new(Mutex::new(Vec::new())),
@@ -3071,6 +3137,7 @@ mod tests {
             expected_epoch: u64,
             object_id: u64,
         ) -> VfsResult<bool> {
+            self.presence_checks.fetch_add(1, Ordering::Relaxed);
             let epoch_matches = self
                 .attrs
                 .lock()
@@ -3120,19 +3187,17 @@ mod tests {
             ino: Ino,
             content_epoch: u64,
             object_id: u64,
-            offset: u64,
-            payload_len: u64,
+            mapping: ObjectFileMapping,
             block_size: u32,
         ) -> VfsResult<Option<u64>> {
             self.reattached_uploads.lock().push((
                 ino,
                 content_epoch,
                 object_id,
-                offset,
-                payload_len,
+                mapping,
                 block_size,
             ));
-            if payload_len == 0 {
+            if mapping.len == 0 {
                 return Ok(None);
             }
             let mut sequence = self.reattach_epoch_sequence.lock();
@@ -3539,8 +3604,7 @@ mod tests {
                 ready_attr.ino,
                 3,
                 6,
-                1_048_569,
-                262,
+                ObjectFileMapping::whole(1_048_569, 262),
                 vfs.block_size,
             ))
             .expect("reattach uploaded payload");
@@ -3621,8 +3685,7 @@ mod tests {
                 ready_attr.ino,
                 3,
                 materialized_upload_object,
-                0,
-                materialized_len,
+                ObjectFileMapping::whole(0, materialized_len),
                 vfs.block_size,
             ))
             .expect("reattach materialized sparse upload");
@@ -3737,8 +3800,7 @@ mod tests {
                 updating_attr.ino,
                 3,
                 6,
-                1_048_569,
-                262,
+                ObjectFileMapping::whole(1_048_569, 262),
                 vfs.block_size,
             ))
             .expect("reattach uploaded payload");
@@ -3783,8 +3845,7 @@ mod tests {
                 short_attr.ino,
                 2,
                 object_id,
-                tail_offset,
-                tail_len,
+                ObjectFileMapping::whole(tail_offset, tail_len),
                 vfs.block_size,
             ))
             .expect("reattach stale sparse growth");
@@ -3801,6 +3862,64 @@ mod tests {
             meta.has_regular_file_overlay_object_if_matches(short_attr.ino, 2, object_id)
                 .expect("rebased sparse object present"),
             "stale sparse upload must be retained in the rebased overlay"
+        );
+    }
+
+    #[test]
+    fn vfs_upload_meta_reattaches_only_known_bytes_of_a_packed_object() {
+        use crate::vfs::overlay::ObjectUploadGeometry;
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-packed-survivor");
+        let mut attr = vfs
+            .create(1, b"reattach-packed-survivor.bin", 0, 0, 0o644)
+            .expect("create packed file");
+        attr.size = 64;
+        attr.content_epoch = 1;
+        meta.set_attr(&attr).expect("seed holes at the stale epoch");
+
+        // Object 7 packs file 0, 32 and 16 at object offsets 0, 4 and 8.
+        let mut packed = ObjectUploadGeometry::new(0, 0, 4);
+        packed.include(ObjectUploadGeometry::new(32, 4, 4));
+        packed.include(ObjectUploadGeometry::new(16, 8, 4));
+        assert_eq!(packed.file_mapping(), None);
+        // Only the file-32 segment survived, so only its bytes have a known position.
+        let mapping = ObjectUploadGeometry::new(32, 4, 4)
+            .file_mapping()
+            .expect("one segment maps");
+
+        let port = VfsUploadMetaPort { vfs: vfs.clone() };
+        let rebased_epoch = rt
+            .block_on(port.reattach_uploaded_object_if_uncovered(
+                attr.ino,
+                2,
+                7,
+                mapping,
+                vfs.block_size,
+            ))
+            .expect("reattach packed survivor");
+
+        assert_eq!(rebased_epoch, Some(2));
+        let mapped = meta
+            .lookup_regular_file_slices(attr.ino, 0, 64)
+            .expect("lookup rebased slices")
+            .into_iter()
+            .filter_map(|span| {
+                span.payload.map(|payload| {
+                    (
+                        chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE)
+                            + u64::from(span.range.start),
+                        span.range.end - span.range.start,
+                        payload.object_id,
+                        payload.offset,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mapped,
+            vec![(32, 4, 7, 4)],
+            "holes beside the survivor must not receive other segments' bytes"
         );
     }
 
@@ -3867,7 +3986,7 @@ mod tests {
         PendingUpload {
             ino: 11,
             offset: 0,
-            object_file_offset: 0,
+            file_mapping: Some(ObjectFileMapping::whole(0, b"hello".len() as u64)),
             object_id: 77,
             payload_len: b"hello".len() as u64,
             content_epoch: 3,
@@ -4219,6 +4338,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn packed_upload_never_reattaches_a_contiguous_file_range() {
+        let (processor, _coordinator, _local_payloads, meta, _remote, _shutdown, _policy) =
+            processor_fixture();
+        let op = PendingUpload {
+            file_mapping: None,
+            ..make_pending_upload()
+        };
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch + 1)));
+        *meta.reattach_epoch.lock() = Some(op.content_epoch + 1);
+
+        assert!(
+            processor
+                .reconcile_uploaded_object_metadata(&op)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            processor
+                .protect_stale_upload_if_covered(&op, None, None)
+                .await
+                .unwrap(),
+            StaleUploadDisposition::Uncovered
+        );
+        assert!(
+            meta.reattached_uploads.lock().is_empty(),
+            "packed bytes have no contiguous file mapping"
+        );
+    }
+
+    #[tokio::test]
     async fn process_upload_requeues_pre_put_stale_content_epoch_when_payload_can_reattach() {
         let (processor, coordinator, local_payloads, meta, _remote, shutdown, _policy) =
             processor_fixture();
@@ -4243,8 +4395,7 @@ mod tests {
                 op.ino,
                 op.content_epoch,
                 op.object_id,
-                op.object_file_offset,
-                op.payload_len,
+                op.file_mapping.unwrap(),
                 4096
             )]
         );
@@ -4843,6 +4994,11 @@ mod tests {
             &[(11, 3, 77)],
             "fragmented overlay upload should persist progress against the referenced object id"
         );
+        assert_eq!(
+            meta.presence_checks.load(Ordering::Relaxed),
+            1,
+            "only the pre-PUT check scans the overlay; the completion mark reports presence itself"
+        );
         assert!(
             meta.pending_deletions.lock().is_empty(),
             "still-referenced fragmented objects must remain live"
@@ -4947,7 +5103,7 @@ mod tests {
             processor_fixture();
         let op = PendingUpload {
             offset: 1024,
-            object_file_offset: 1024,
+            file_mapping: Some(ObjectFileMapping::whole(1024, b"hello".len() as u64)),
             ..make_pending_upload()
         };
         let rebased_epoch = op.content_epoch + 1;
@@ -4975,8 +5131,7 @@ mod tests {
                 op.ino,
                 op.content_epoch,
                 op.object_id,
-                op.offset,
-                "rebased stale payload".len() as u64,
+                op.file_mapping.unwrap(),
                 4096
             )],
             "post-PUT stale payloads should be offered for same/newer-epoch rebase before deletion"
@@ -5004,7 +5159,7 @@ mod tests {
         let payload = Bytes::from_static(b"already uploaded retry payload");
         let op = PendingUpload {
             offset: 1024,
-            object_file_offset: 1024,
+            file_mapping: Some(ObjectFileMapping::whole(1024, payload.len() as u64)),
             payload_len: payload.len() as u64,
             retry_count: 1,
             ..make_pending_upload()
@@ -5035,8 +5190,7 @@ mod tests {
                 op.ino,
                 op.content_epoch,
                 op.object_id,
-                op.object_file_offset,
-                op.payload_len,
+                op.file_mapping.unwrap(),
                 4096
             )],
             "remote-visible retry must use the queued payload geometry for stale reattach"
@@ -5060,7 +5214,7 @@ mod tests {
             processor_fixture();
         let op = PendingUpload {
             offset: 1_048_569,
-            object_file_offset: 0,
+            file_mapping: Some(ObjectFileMapping::whole(0, 1_048_831)),
             payload_len: 1_048_831,
             retry_count: 1,
             ..make_pending_upload()
@@ -5090,8 +5244,7 @@ mod tests {
                 op.ino,
                 op.content_epoch,
                 op.object_id,
-                op.object_file_offset,
-                op.payload_len,
+                op.file_mapping.unwrap(),
                 4096
             )],
             "remote-visible retry must not depend on rereading an evicted local payload"
@@ -5494,7 +5647,7 @@ mod tests {
             ready.push_back(PendingUpload {
                 ino,
                 offset: 0,
-                object_file_offset: 0,
+                file_mapping: None,
                 object_id,
                 payload_len: 0,
                 content_epoch: 1,

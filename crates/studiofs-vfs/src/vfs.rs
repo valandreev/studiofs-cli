@@ -245,7 +245,8 @@ const WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS: u64 = 100;
 const WRITE_ADMISSION_RUNWAY_TARGET_MS: u64 = 2_500;
 const WRITE_ADMISSION_MAX_DELAY_MS: u64 = 10;
 const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
-const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
+/// Safety-net re-check while a hard admission wait sleeps on the drain signal.
+const WRITE_ADMISSION_HARD_WAIT_RECHECK: Duration = Duration::from_millis(250);
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
 const SUSTAINED_WRITE_DELAY_START_MS: u64 = 1_500;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
@@ -1650,6 +1651,8 @@ struct UploadState {
     upload_sticky_errors: OrderedMutex<std::collections::HashMap<Ino, String>>,
     upload_completion_batch: tokio::sync::Mutex<UploadCompletionBatch>,
     upload_completion_draining: AtomicBool,
+    overlay_presence_batch: tokio::sync::Mutex<UploadCompletionBatch>,
+    overlay_presence_draining: AtomicBool,
     startup_replay_counts: OrderedMutex<HashMap<(Ino, u64), u64>>,
     active_upload_workers: AtomicUsize,
     upload_requeues: AtomicU64,
@@ -1909,6 +1912,10 @@ impl UploadState {
                 pending: Vec::new(),
             }),
             upload_completion_draining: AtomicBool::new(false),
+            overlay_presence_batch: tokio::sync::Mutex::new(UploadCompletionBatch {
+                pending: Vec::new(),
+            }),
+            overlay_presence_draining: AtomicBool::new(false),
             startup_replay_counts: OrderedMutex::new(HashMap::new(), LockTier::Upload),
             active_upload_workers: AtomicUsize::new(0),
             upload_requeues: AtomicU64::new(0),
@@ -3372,6 +3379,9 @@ impl VfsState {
             file_lock: FileLockState::new(),
             shutdown: ShutdownState::new(),
             sync_safety_activity: Arc::new(SyncSafetyActivity::default()),
+            mount_runtime: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            sync_future_runtime_fallbacks: AtomicU64::new(0),
             metrics: MetricsState::new(),
             fuse_async_write_diagnostics: Mutex::new(FuseAsyncWriteDiagnostics::default()),
             fuse_async_read_snapshot: Mutex::new(VfsFuseAsyncReadSnapshot::default()),
@@ -3445,6 +3455,11 @@ struct VfsState {
     file_lock: FileLockState,
     shutdown: ShutdownState,
     sync_safety_activity: Arc<SyncSafetyActivity>,
+    /// Runtime registered by `start()`; synchronous entry points called from
+    /// platform dispatcher threads outside any Tokio context run on it.
+    mount_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+    #[cfg(test)]
+    sync_future_runtime_fallbacks: AtomicU64,
     metrics: MetricsState,
     fuse_async_write_diagnostics: Mutex<FuseAsyncWriteDiagnostics>,
     fuse_async_read_snapshot: Mutex<VfsFuseAsyncReadSnapshot>,
@@ -4124,6 +4139,8 @@ pub struct StudioVfs {
     coherence_health: Arc<Mutex<CoherenceHealthTracker>>,
     /// Failed or partially admitted semantic generations awaiting retry.
     coherence_pending_invalidations: Mutex<VecDeque<PendingCoherenceInvalidation>>,
+    /// Whole-volume versus scoped metadata reconciliation passes.
+    metadata_reconcile_counters: workers::MetadataReconcileCounters,
     janitor_interval: Duration,
     janitor_skip_newer_than: Duration,
     janitor_max_deletes_per_run: u64,
@@ -5601,10 +5618,13 @@ impl StudioVfs {
     /// and other maintenance tasks.
     pub fn start(self: &Arc<Self>) -> VfsResult<()> {
         self.ensure_can_start()?;
+        let _ = self
+            .state
+            .mount_runtime
+            .set(tokio::runtime::Handle::current());
         if self.read_only_mount {
             return Ok(());
         }
-        self.register_overlay_batch_runtime(tokio::runtime::Handle::current());
         self.state
             .namespace
             .deferred
@@ -7038,30 +7058,30 @@ impl StudioVfs {
     }
 
     /// Return upload queue and throughput statistics for diagnostics.
-    pub fn upload_stats(&self) -> VfsUploadStats {
-        let pending_uploads = self.pending_uploads_snapshot();
-        let now_ms = now_unix_millis();
-        let (
-            pending_upload_bytes,
-            oldest_pending_upload_age_ms,
-            pending_retry_count,
-            max_pending_retry_count,
-        ) = pending_uploads.iter().fold(
-            (0u64, 0u64, 0u64, 0u32),
-            |(bytes, oldest_age, retries, max_retries), op| {
-                let payload_len = self
-                    .local_payload_backend
-                    .object_stats(op.object_id)
+    /// Pending upload bytes from recorded payload lengths. Only operations
+    /// queued without one fall back to the local payload index.
+    pub(crate) fn pending_upload_bytes(
+        &self,
+        pending: &studiofs_cache::PendingUploadSummary,
+    ) -> u64 {
+        pending
+            .unknown_len_object_ids
+            .iter()
+            .map(|&object_id| {
+                self.local_payload_backend
+                    .object_stats(object_id)
                     .map(|stats| stats.payload_len)
-                    .unwrap_or(u64::from(self.block_size));
-                (
-                    bytes.saturating_add(payload_len),
-                    oldest_age.max(now_ms.saturating_sub(op.created_unix_ms)),
-                    retries.saturating_add(u64::from(op.retry_count)),
-                    max_retries.max(op.retry_count),
-                )
-            },
-        );
+                    .unwrap_or(u64::from(self.block_size))
+            })
+            .fold(pending.payload_bytes, u64::saturating_add)
+    }
+
+    pub fn upload_stats(&self) -> VfsUploadStats {
+        let pending = self.cached_store.pending_upload_summary();
+        let pending_upload_bytes = self.pending_upload_bytes(&pending);
+        let oldest_pending_upload_age_ms = pending
+            .oldest_created_unix_ms
+            .map_or(0, |created| now_unix_millis().saturating_sub(created));
         let cache_metrics = self.cached_store.cache_pipeline_metrics();
         let completed_uploads = cache_metrics.upload_queue.completed;
         let completed_upload_bytes = cache_metrics.upload_queue.completed_bytes;
@@ -7071,7 +7091,7 @@ impl StudioVfs {
         let upload_metrics = &self.upload_scheduler.metrics;
 
         VfsUploadStats {
-            pending_uploads: pending_uploads.len(),
+            pending_uploads: pending.count,
             pending_upload_bytes,
             oldest_pending_upload_age_ms,
             active_uploads: self.upload_scheduler.in_flight(),
@@ -7080,8 +7100,8 @@ impl StudioVfs {
                 .upload
                 .active_upload_workers
                 .load(Ordering::Relaxed),
-            pending_retry_count,
-            max_pending_retry_count,
+            pending_retry_count: pending.retry_count_sum,
+            max_pending_retry_count: pending.max_retry_count,
             completed_uploads,
             completed_upload_bytes,
             completed_uploads_per_sec,
@@ -7340,6 +7360,8 @@ impl StudioVfs {
     /// Update the dirty-buffer memory limit at runtime.
     pub fn set_max_dirty_bytes(&self, value: usize) {
         self.max_dirty_bytes.store(value, Ordering::Release);
+        // Writers parked on the hard window re-check it against the new limit.
+        self.state.writer_stack.wake_dirty_drain_waiters();
     }
 
     /// Number of foreground reads and OS-cache read handles currently in flight.
@@ -7574,14 +7596,16 @@ impl StudioVfs {
     }
 
     fn record_write_admission_wait(&self, waited: Duration) {
-        let waited_ms = waited.as_millis().min(u128::from(u64::MAX)) as u64;
-        if waited_ms == 0 {
-            return;
-        }
+        // A drain-signalled wake can finish within a millisecond; it is still
+        // a hard admission wait event.
         self.state
             .metrics
             .drain_lag_pacing_events
             .fetch_add(1, Ordering::Relaxed);
+        let waited_ms = waited.as_millis().min(u128::from(u64::MAX)) as u64;
+        if waited_ms == 0 {
+            return;
+        }
         self.state
             .metrics
             .drain_lag_pacing_total_ms
@@ -7592,27 +7616,44 @@ impl StudioVfs {
             .fetch_max(waited_ms, Ordering::Relaxed);
     }
 
+    fn write_admission_hard_window_exceeded(
+        &self,
+        buffer_budget_bytes: usize,
+        pressure: &WriteAdmissionPressure,
+    ) -> bool {
+        let hard_window_bytes =
+            buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
+        pressure.writer_stack_dirty_bytes > hard_window_bytes && !self.shutdown_requested()
+    }
+
     async fn maybe_throttle_write_admission(&self, next_bytes: usize) {
         if next_bytes == 0 || self.shutdown_requested() {
             return;
         }
 
-        let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
-        let pressure = self.write_admission_pressure();
-        let mut pressure_bytes = pressure.total_bytes();
-
-        let hard_window_bytes =
-            buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
-        let mut writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
         let mut hard_wait_started = None;
-        while writer_stack_pressure_bytes > hard_window_bytes && !self.shutdown_requested() {
-            hard_wait_started.get_or_insert_with(Instant::now);
-
-            tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)).await;
+        // Re-read the budget on every check: `set_max_dirty_bytes` may raise
+        // the hard window while this writer is parked.
+        let (buffer_budget_bytes, pressure_bytes) = loop {
+            let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
             let pressure = self.write_admission_pressure();
-            pressure_bytes = pressure.total_bytes();
-            writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
-        }
+            if !self.write_admission_hard_window_exceeded(buffer_budget_bytes, &pressure) {
+                break (buffer_budget_bytes, pressure.total_bytes());
+            }
+            // Register for the drain signal before re-checking so a drain that
+            // lands between the check and the await still wakes this writer.
+            let drained = self.state.writer_stack.dirty_drained();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if !self.write_admission_hard_window_exceeded(
+                self.write_admission_buffer_budget_bytes(),
+                &self.write_admission_pressure(),
+            ) {
+                continue;
+            }
+            hard_wait_started.get_or_insert_with(Instant::now);
+            let _ = tokio::time::timeout(WRITE_ADMISSION_HARD_WAIT_RECHECK, drained).await;
+        };
         if let Some(started) = hard_wait_started {
             self.record_write_admission_wait(started.elapsed());
             self.state.write_admission_governor.lock().reset_stats();
@@ -10192,9 +10233,9 @@ impl StudioVfs {
                 // state while the upload/publication is still pending. The
                 // publication step can then promote the overlay into the
                 // local base graph before the runtime upload queue drains.
-                // Neither state is a stable generation for the kernel page
-                // cache, so keep the read on the VFS path until publication
-                // and upload completion.
+                // Neither state is a stable generation, so report one that
+                // must never be reused; the platform bridge decides whether
+                // the read bypasses the OS cache or purges earlier pages.
                 if self.inode_has_local_dirty_state(ino)
                     || self.inode_has_pending_uploads(ino)
                     || self.inode_has_unmaterialized_overlay_for_finalize(ino)

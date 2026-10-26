@@ -1,5 +1,45 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static REPLICA_INVALIDATION_DERIVATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Counts replica invalidation derivations that read redb on this thread.
+#[cfg(test)]
+pub(crate) fn take_replica_invalidation_derivations() -> usize {
+    REPLICA_INVALIDATION_DERIVATIONS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+fn record_replica_invalidation_derivation() {
+    REPLICA_INVALIDATION_DERIVATIONS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOCAL_DENTRY_JOURNAL_SCANS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static PENDING_SERVING_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts non-empty pending-log serving replays on this thread.
+#[cfg(test)]
+pub(crate) fn take_pending_serving_replays() -> usize {
+    PENDING_SERVING_REPLAYS.with(|count| count.replace(0))
+}
+
+/// Counts full local-journal reductions for dentry removal state on this thread.
+#[cfg(test)]
+pub(crate) fn take_local_dentry_journal_scans() -> usize {
+    LOCAL_DENTRY_JOURNAL_SCANS.with(|count| count.replace(0))
+}
+
 fn collect_prefix_keys<V: redb::Value + 'static>(
     table: &impl ReadableTable<&'static [u8], V>,
     prefix: &[u8],
@@ -201,6 +241,117 @@ impl LocalDentryMutationReducer {
     }
 }
 
+/// Local journal reductions shared by the renames of one replay pass.
+///
+/// Each reduction runs at most once, on the first rename that needs it,
+/// instead of once per rename. The pass must not append local journal events,
+/// move the flushed cursor or rewrite the dentry mutation baseline while this
+/// value is alive; replica serving and self-batch reconciliation write only
+/// namespace mirror tables.
+#[derive(Default)]
+pub(crate) struct ReplayLocalJournal {
+    reducer: Option<LocalDentryMutationReducer>,
+    pending_aliases: Option<PendingLocalAliases>,
+}
+
+impl ReplayLocalJournal {
+    fn is_removed(&mut self, txn: &redb::WriteTransaction, dentry_key: &[u8]) -> MetaResult<bool> {
+        let reducer = match &mut self.reducer {
+            Some(reducer) => reducer,
+            empty => empty.insert(RedbMetaEngine::reduce_local_dentry_mutations_in_txn(txn)?),
+        };
+        // Keys the journal never touched keep their baseline state.
+        let baseline = txn
+            .open_table(LOCAL_DENTRY_MUTATIONS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        reducer.load_key_from_table(&baseline, dentry_key)?;
+        Ok(reducer.is_removed(dentry_key))
+    }
+
+    /// Dentry keys the unflushed local journal still binds to `entry`.
+    fn pending_aliases(
+        &mut self,
+        txn: &redb::WriteTransaction,
+        entry: &DirEntryValue,
+    ) -> MetaResult<&HashSet<Vec<u8>>> {
+        let aliases = match &mut self.pending_aliases {
+            Some(aliases) => aliases,
+            empty => empty.insert(RedbMetaEngine::reduce_pending_local_aliases_in_txn(txn)?),
+        };
+        Ok(aliases.for_entry(entry))
+    }
+}
+
+/// Unflushed local dentry aliases for every inode, reduced in one journal pass.
+#[derive(Default)]
+struct PendingLocalAliases {
+    by_entry: HashMap<(Ino, u8), HashSet<Vec<u8>>>,
+    entries_by_key: HashMap<Vec<u8>, HashSet<(Ino, u8)>>,
+    empty: HashSet<Vec<u8>>,
+}
+
+impl PendingLocalAliases {
+    fn identity(entry: &DirEntryValue) -> (Ino, u8) {
+        (entry.ino, entry.kind as u8)
+    }
+
+    fn insert(&mut self, identity: (Ino, u8), key: Vec<u8>) {
+        self.entries_by_key
+            .entry(key.clone())
+            .or_default()
+            .insert(identity);
+        self.by_entry.entry(identity).or_default().insert(key);
+    }
+
+    fn apply(&mut self, event: &crate::events::MetaEvent) {
+        use crate::events::MetaEvent;
+
+        match event {
+            MetaEvent::AddEntry {
+                parent,
+                name,
+                entry,
+            } => self.insert(Self::identity(entry), encode_dentry_key(*parent, name)),
+            MetaEvent::RemoveEntry { parent, name } => {
+                let key = encode_dentry_key(*parent, name);
+                for identity in self.entries_by_key.remove(&key).unwrap_or_default() {
+                    if let Some(keys) = self.by_entry.get_mut(&identity) {
+                        keys.remove(&key);
+                    }
+                }
+            }
+            MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                ..
+            } => {
+                let identity = Self::identity(entry);
+                let old_key = encode_dentry_key(*parent, name);
+                let moved = self
+                    .by_entry
+                    .get_mut(&identity)
+                    .is_some_and(|keys| keys.remove(&old_key));
+                if moved {
+                    if let Some(entries) = self.entries_by_key.get_mut(&old_key) {
+                        entries.remove(&identity);
+                    }
+                    self.insert(identity, encode_dentry_key(*new_parent, new_name));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn for_entry(&self, entry: &DirEntryValue) -> &HashSet<Vec<u8>> {
+        self.by_entry
+            .get(&Self::identity(entry))
+            .unwrap_or(&self.empty)
+    }
+}
+
 /// An inode's merged attributes plus the dentries bound to it, keyed by dentry key.
 type ServingInodeView = (Option<InodeAttr>, BTreeMap<Vec<u8>, DirEntryValue>);
 
@@ -338,6 +489,11 @@ impl RedbMetaEngine {
         txn: &RedbWriteTransaction<'_>,
         ino: Ino,
     ) -> MetaResult<()> {
+        if txn.invalidations_suppressed() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        record_replica_invalidation_derivation();
         let mut pending = vec![(ino, Self::invalidation_ancestors(txn, ino)?, 0usize)];
         let mut visited = HashSet::new();
         let mut remaining = crate::coherence::MAX_INVALIDATION_INTENTS;
@@ -422,6 +578,11 @@ impl RedbMetaEngine {
         name: &[u8],
         new_ino: Option<Ino>,
     ) -> MetaResult<()> {
+        if txn.invalidations_suppressed() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        record_replica_invalidation_derivation();
         txn.invalidate(InvalidationIntent::Entry {
             parent,
             name: name.to_vec(),
@@ -437,7 +598,7 @@ impl RedbMetaEngine {
             let table = txn
                 .open_table(table)
                 .map_err(|error| MetaError::Storage(error.to_string()))?;
-            if let Some(entry) = Self::lookup_in_opened_dentry_table(&table, parent, name)? {
+            if let Some(entry) = Self::lookup_exact_in_opened_dentry_table(&table, parent, name)? {
                 txn.invalidate(InvalidationIntent::Attributes { ino: entry.ino });
             }
         }
@@ -449,6 +610,11 @@ impl RedbMetaEngine {
         ino: Ino,
         content: bool,
     ) -> MetaResult<()> {
+        if txn.invalidations_suppressed() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        record_replica_invalidation_derivation();
         txn.invalidate(InvalidationIntent::Attributes { ino });
         if content {
             txn.invalidate(InvalidationIntent::Content { ino });
@@ -485,6 +651,10 @@ impl RedbMetaEngine {
         txn: &RedbWriteTransaction<'_>,
         event: &crate::events::MetaEvent,
     ) -> MetaResult<()> {
+        // Intent derivation only reads; skip it when the journal would drop the result.
+        if txn.invalidations_suppressed() {
+            return Ok(());
+        }
         use crate::events::MetaEvent;
         match event {
             MetaEvent::SetAttr { attr } => {
@@ -1282,8 +1452,9 @@ impl RedbMetaEngine {
                     old_parent_attr,
                     new_parent_attr,
                 } => {
+                    // The event names one exact binding; a case sibling is resolved below.
                     let src_matches =
-                        Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, *parent, name)?
+                        Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, *parent, name)?
                             .map(|current| current.ino == entry.ino && current.kind == entry.kind)
                             .unwrap_or(false);
                     if src_matches {
@@ -1436,6 +1607,8 @@ impl RedbMetaEngine {
         if events.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        PENDING_SERVING_REPLAYS.with(|count| count.set(count.get() + 1));
 
         let txn = self.begin_write_txn()?;
         let live_events = {
@@ -1644,6 +1817,7 @@ impl RedbMetaEngine {
         events: &[E],
         reject_stale_ready_growth: bool,
     ) -> MetaResult<()> {
+        let mut local_removals = ReplayLocalJournal::default();
         for event in events {
             let event = event.borrow();
             Self::invalidate_replica_event(txn, event)?;
@@ -1783,6 +1957,7 @@ impl RedbMetaEngine {
                         *new_parent,
                         new_name,
                         entry,
+                        &mut local_removals,
                     )?;
 
                     if let Some(attr) = displaced_set_attr.as_ref() {
@@ -1854,8 +2029,10 @@ impl RedbMetaEngine {
                         // the newer local state for the same payload reference.
                         let mut slices = slices.clone();
                         if let Some(current) = current.get(chunk_id) {
+                            let completed =
+                                super::payload_objects::CompletedOverlayPayloads::new(current);
                             for slice in &mut slices {
-                                Self::preserve_completed_overlay_payload_state(current, slice);
+                                completed.preserve(slice);
                             }
                         }
                         let next = Self::set_regular_file_chunk_state_in_txn(
@@ -1948,6 +2125,7 @@ impl RedbMetaEngine {
                 .collect::<MetaResult<HashMap<Ino, Option<InodeAttr>>>>()?
         };
 
+        let mut local_journal = ReplayLocalJournal::default();
         for ino in inodes {
             let invalidation_scope = txn.invalidation_scope();
             let view_before = Self::serving_view_of_inode(txn, *ino)?;
@@ -1965,6 +2143,7 @@ impl RedbMetaEngine {
                             kind: attr.kind,
                         },
                         protected_dentry_keys,
+                        &mut local_journal,
                     )?;
                     Self::install_base_dentries_for_entry_in_txn(
                         txn,
@@ -2162,32 +2341,17 @@ impl RedbMetaEngine {
             return Ok(false);
         }
         let mut changed = false;
-        let base_entries = {
-            let base = txn
-                .open_table(BASE_DENTRIES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            dentry_keys
-                .iter()
-                .map(|key| {
-                    let (parent, name) = decode_dentry_key(key)?;
-                    let entry = Self::lookup_in_opened_dentry_table(&base, parent, name)?;
-                    Ok((key.as_slice(), entry))
-                })
-                .collect::<MetaResult<HashMap<&[u8], Option<DirEntryValue>>>>()?
-        };
-
         for key in dentry_keys {
             if protected_dentry_keys.contains(key) {
                 continue;
             }
             let (parent, name) = decode_dentry_key(key)?;
+            let base_entry =
+                Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?;
             let invalidation_scope = txn.invalidation_scope();
             let binding_before = Self::invalidation_binding(txn, key)?;
             Self::invalidate_replica_entry(txn, parent, name, None)?;
-            let base_entry = base_entries
-                .get(key.as_slice())
-                .and_then(|entry| entry.as_ref());
-            if let Some(entry) = base_entry {
+            if let Some(entry) = &base_entry {
                 Self::set_dentry_in_txn(txn, parent, name, entry)?;
                 Self::invalidate_replica_inode(txn, entry.ino, false)?;
             } else {
@@ -2345,7 +2509,13 @@ impl RedbMetaEngine {
     ) -> MetaResult<()> {
         let txn = self.begin_write_txn()?;
         Self::reconcile_serving_rename_from_base_in_txn(
-            &txn, parent, name, new_parent, new_name, entry,
+            &txn,
+            parent,
+            name,
+            new_parent,
+            new_name,
+            entry,
+            &mut ReplayLocalJournal::default(),
         )?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -2359,6 +2529,7 @@ impl RedbMetaEngine {
         new_parent: Ino,
         new_name: &[u8],
         entry: &DirEntryValue,
+        local_removals: &mut ReplayLocalJournal,
     ) -> MetaResult<()> {
         if entry.kind == FileType::Directory {
             Self::invalidate_directory_descendants(txn, entry.ino)?;
@@ -2368,7 +2539,13 @@ impl RedbMetaEngine {
         Self::invalidate_replica_inode(txn, entry.ino, false)?;
 
         Self::reconcile_serving_rename_from_base_in_write_txn(
-            txn, parent, name, new_parent, new_name, entry,
+            txn,
+            parent,
+            name,
+            new_parent,
+            new_name,
+            entry,
+            local_removals,
         )?;
 
         Ok(())
@@ -2381,15 +2558,17 @@ impl RedbMetaEngine {
         new_parent: Ino,
         new_name: &[u8],
         entry: &DirEntryValue,
+        local_removals: &mut ReplayLocalJournal,
     ) -> MetaResult<()> {
-        let src_in_base = Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?
-            .map(|value| value.ino == entry.ino && value.kind == entry.kind)
-            .unwrap_or(false);
-        let dst_in_base =
-            Self::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
+        let src_in_base =
+            Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
-        Self::remove_stale_dentries_for_base_entry(txn, entry, &HashSet::new())?;
+        let dst_in_base =
+            Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
+                .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+                .unwrap_or(false);
+        Self::remove_stale_dentries_for_base_entry(txn, entry, &HashSet::new(), local_removals)?;
 
         if dst_in_base {
             let destination_key = encode_dentry_key(new_parent, new_name);
@@ -2399,7 +2578,7 @@ impl RedbMetaEngine {
             // and inode protection are handled separately from namespace
             // visibility.
             Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
-            if Self::local_dentry_removed_in_txn(txn, &destination_key)? {
+            if local_removals.is_removed(txn, &destination_key)? {
                 Self::remove_dentry_overlay_in_txn(txn, new_parent, new_name)?;
             } else {
                 Self::set_dentry_in_txn(txn, new_parent, new_name, entry)?;
@@ -2415,10 +2594,11 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn local_dentry_removed_in_txn(
+    /// Reduce the dentry baseline and the whole retained local journal into
+    /// per-key local mutation state. The result answers any dentry key.
+    fn reduce_local_dentry_mutations_in_txn(
         txn: &redb::WriteTransaction,
-        dentry_key: &[u8],
-    ) -> MetaResult<bool> {
+    ) -> MetaResult<LocalDentryMutationReducer> {
         let counters = txn
             .open_table(COUNTERS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -2443,7 +2623,8 @@ impl RedbMetaEngine {
             .open_table(LOCAL_DENTRY_MUTATIONS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut reducer = LocalDentryMutationReducer::default();
-        reducer.load_key_from_table(&baseline, dentry_key)?;
+        #[cfg(test)]
+        LOCAL_DENTRY_JOURNAL_SCANS.with(|count| count.set(count.get() + 1));
         let events = txn
             .open_table(EVENT_LOG_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -2453,7 +2634,7 @@ impl RedbMetaEngine {
             .map(|(seq, _)| seq.value())
             .unwrap_or(end_seq);
         if end_seq <= start_seq {
-            return Ok(reducer.is_removed(dentry_key));
+            return Ok(reducer);
         }
         for row in events
             .range(start_seq..end_seq)
@@ -2463,7 +2644,7 @@ impl RedbMetaEngine {
             let event = crate::events::decode_event(bytes.value())?;
             reducer.apply_retained_to_table(&baseline, &event)?;
         }
-        Ok(reducer.is_removed(dentry_key))
+        Ok(reducer)
     }
 
     fn remove_dentry_mirror_if_matches_in_txn(
@@ -2472,7 +2653,7 @@ impl RedbMetaEngine {
         name: &[u8],
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
-        let matches = Self::lookup_in_write_table(txn, DENTRIES_TABLE, parent, name)?
+        let matches = Self::lookup_exact_in_write_table(txn, DENTRIES_TABLE, parent, name)?
             .map(|current| current.ino == entry.ino && current.kind == entry.kind)
             .unwrap_or(false);
         if matches {
@@ -2485,6 +2666,7 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         entry: &DirEntryValue,
         protected_dentry_keys: &HashSet<Vec<u8>>,
+        local_journal: &mut ReplayLocalJournal,
     ) -> MetaResult<()> {
         let keys =
             Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, entry.ino)?;
@@ -2500,15 +2682,17 @@ impl RedbMetaEngine {
                 continue;
             }
 
+            // Keys come from the by-inode index, so they are exact by construction.
             let (parent, name) = decode_dentry_key(&key)?;
-            let current_matches = Self::lookup_in_opened_dentry_table(&current, parent, name)?
-                .map(|value| value.ino == entry.ino && value.kind == entry.kind)
-                .unwrap_or(false);
+            let current_matches =
+                Self::lookup_exact_in_opened_dentry_table(&current, parent, name)?
+                    .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+                    .unwrap_or(false);
             if !current_matches {
                 continue;
             }
 
-            let base_matches = Self::lookup_in_opened_dentry_table(&base, parent, name)?
+            let base_matches = Self::lookup_exact_in_opened_dentry_table(&base, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
             if !base_matches {
@@ -2522,7 +2706,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let protected = Self::pending_local_alias_dentry_keys_for_inode_in_txn(txn, entry)?;
+        let protected = local_journal.pending_aliases(txn, entry)?.clone();
         for key in candidates {
             if protected.contains(&key) {
                 continue;
@@ -2551,10 +2735,9 @@ impl RedbMetaEngine {
 
     // Pending local AddEntry aliases are local namespace state, not stale
     // remote rename losers, so foreign rename reconciliation must preserve them.
-    fn pending_local_alias_dentry_keys_for_inode_in_txn(
+    fn reduce_pending_local_aliases_in_txn(
         txn: &redb::WriteTransaction,
-        entry: &DirEntryValue,
-    ) -> MetaResult<HashSet<Vec<u8>>> {
+    ) -> MetaResult<PendingLocalAliases> {
         let counters = txn
             .open_table(COUNTERS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -2570,7 +2753,7 @@ impl RedbMetaEngine {
             .unwrap_or(1);
         drop(counters);
 
-        let mut aliases = HashSet::new();
+        let mut aliases = PendingLocalAliases::default();
         if end_seq <= start_seq {
             return Ok(aliases);
         }
@@ -2586,32 +2769,7 @@ impl RedbMetaEngine {
             PENDING_LOCAL_ALIAS_EVENT_SCAN_COUNT
                 .set(PENDING_LOCAL_ALIAS_EVENT_SCAN_COUNT.get().saturating_add(1));
             let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            match crate::events::decode_event(bytes.value())? {
-                crate::events::MetaEvent::AddEntry {
-                    parent,
-                    name,
-                    entry: added,
-                } if added.ino == entry.ino && added.kind == entry.kind => {
-                    aliases.insert(encode_dentry_key(parent, &name));
-                }
-                crate::events::MetaEvent::RemoveEntry { parent, name } => {
-                    aliases.remove(&encode_dentry_key(parent, &name));
-                }
-                crate::events::MetaEvent::RenameEntry {
-                    parent,
-                    name,
-                    new_parent,
-                    new_name,
-                    entry: renamed,
-                    ..
-                } if renamed.ino == entry.ino && renamed.kind == entry.kind => {
-                    let old_key = encode_dentry_key(parent, &name);
-                    if aliases.remove(&old_key) {
-                        aliases.insert(encode_dentry_key(new_parent, &new_name));
-                    }
-                }
-                _ => {}
-            }
+            aliases.apply(&crate::events::decode_event(bytes.value())?);
         }
         Ok(aliases)
     }
@@ -2631,7 +2789,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         for key in keys {
             let (parent, name) = decode_dentry_key(&key)?;
-            let base_matches = Self::lookup_in_opened_dentry_table(&base, parent, name)?
+            let base_matches = Self::lookup_exact_in_opened_dentry_table(&base, parent, name)?
                 .map(|value| value.ino == entry.ino && value.kind == entry.kind)
                 .unwrap_or(false);
             if base_matches {

@@ -757,6 +757,11 @@ impl RedbWriteTransaction<'_> {
         }
     }
 
+    /// Whether scopes recorded now would be dropped by [`Self::without_invalidations`].
+    pub(crate) fn invalidations_suppressed(&self) -> bool {
+        self.invalidations_suppressed.get()
+    }
+
     /// Runs `apply` without journaling the invalidation scopes it records.
     ///
     /// Only for writes that cannot change what the local serving view already
@@ -1286,6 +1291,11 @@ mod namespace_merge;
 mod payload_objects;
 mod recovery;
 mod replication;
+pub(crate) use replication::ReplayLocalJournal;
+#[cfg(test)]
+pub(crate) use replication::take_pending_serving_replays;
+#[cfg(test)]
+pub(crate) use tests::take_case_fallback_merged_scans;
 mod snapshots;
 mod symlink;
 mod txn;

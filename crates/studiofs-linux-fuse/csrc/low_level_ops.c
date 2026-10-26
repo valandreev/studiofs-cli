@@ -1,4 +1,6 @@
 #include <errno.h> /* IWYU pragma: keep */
+#include <pthread.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -52,6 +54,7 @@ extern void studiofs_linux_fuse_fsync(fuse_req_t req, fuse_ino_t ino, int datasy
 extern void studiofs_linux_fuse_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi);
+extern void studiofs_linux_fuse_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
 extern void studiofs_linux_fuse_statfs(fuse_req_t req, fuse_ino_t ino);
 extern void studiofs_linux_fuse_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags);
@@ -83,6 +86,7 @@ static const struct fuse_lowlevel_ops STUDIOFS_LOW_LEVEL_OPS = {
     .release = studiofs_linux_fuse_release,
     .opendir = studiofs_linux_fuse_opendir,
     .readdir = studiofs_linux_fuse_readdir,
+    .readdirplus = studiofs_linux_fuse_readdirplus,
     .releasedir = studiofs_linux_fuse_releasedir,
     .statfs = studiofs_linux_fuse_statfs,
     .setxattr = studiofs_linux_fuse_setxattr,
@@ -192,9 +196,80 @@ struct fuse_session *studiofs_linux_fuse_session_new(struct fuse_args *args,
     return fuse_session_new(args, ops, ops_size, userdata);
 }
 
-int studiofs_linux_fuse_session_loop_mt(struct fuse_session *session,
-                                        unsigned int max_threads,
-                                        unsigned int max_idle_threads) {
+/*
+ * libfuse's exit handler only sets the session's exited flag. The multi-thread
+ * loop notices it when the signal interrupts its own sem_wait(), and libfuse
+ * workers block exit signals. A process-directed signal usually lands on the
+ * main thread instead (for example the tray event loop), leaving the loop
+ * asleep. The wrapper chains to libfuse's handler and then re-sends the signal
+ * to the loop thread so its sem_wait() returns EINTR.
+ */
+static void (*studiofs_linux_fuse_exit_handlers[NSIG])(int);
+static pthread_t studiofs_linux_fuse_loop_thread;
+static volatile sig_atomic_t studiofs_linux_fuse_loop_thread_active;
+
+static void studiofs_linux_fuse_forward_exit_signal(int sig) {
+    int saved_errno = errno;
+    void (*handler)(int) = studiofs_linux_fuse_exit_handlers[sig];
+    if (handler != NULL) {
+        handler(sig);
+    }
+    if (studiofs_linux_fuse_loop_thread_active &&
+        !pthread_equal(pthread_self(), studiofs_linux_fuse_loop_thread)) {
+        /* pthread_kill() is async-signal-safe. */
+        (void)pthread_kill(studiofs_linux_fuse_loop_thread, sig);
+    }
+    errno = saved_errno;
+}
+
+/* Wrap the plain handler installed for `sig`; returns 1 when wrapped. */
+int studiofs_linux_fuse_wrap_exit_signal(int sig) {
+    struct sigaction current;
+    if (sig <= 0 || sig >= NSIG || sigaction(sig, NULL, &current) != 0) {
+        return 0;
+    }
+    if ((current.sa_flags & SA_SIGINFO) != 0 || current.sa_handler == SIG_DFL ||
+        current.sa_handler == SIG_IGN ||
+        current.sa_handler == studiofs_linux_fuse_forward_exit_signal) {
+        return 0;
+    }
+    studiofs_linux_fuse_exit_handlers[sig] = current.sa_handler;
+    struct sigaction wrapped = current;
+    wrapped.sa_handler = studiofs_linux_fuse_forward_exit_signal;
+    if (sigaction(sig, &wrapped, NULL) != 0) {
+        studiofs_linux_fuse_exit_handlers[sig] = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+/* Reinstall the wrapped handler so libfuse can recognize and remove it. */
+void studiofs_linux_fuse_unwrap_exit_signal(int sig) {
+    struct sigaction current;
+    if (sig <= 0 || sig >= NSIG || studiofs_linux_fuse_exit_handlers[sig] == NULL ||
+        sigaction(sig, NULL, &current) != 0) {
+        return;
+    }
+    if ((current.sa_flags & SA_SIGINFO) == 0 &&
+        current.sa_handler == studiofs_linux_fuse_forward_exit_signal) {
+        current.sa_handler = studiofs_linux_fuse_exit_handlers[sig];
+        (void)sigaction(sig, &current, NULL);
+    }
+    studiofs_linux_fuse_exit_handlers[sig] = NULL;
+}
+
+void studiofs_linux_fuse_enter_loop_thread(void) {
+    studiofs_linux_fuse_loop_thread = pthread_self();
+    studiofs_linux_fuse_loop_thread_active = 1;
+}
+
+void studiofs_linux_fuse_leave_loop_thread(void) {
+    studiofs_linux_fuse_loop_thread_active = 0;
+}
+
+static int studiofs_linux_fuse_run_session_loop_mt(struct fuse_session *session,
+                                                   unsigned int max_threads,
+                                                   unsigned int max_idle_threads) {
 #if FUSE_USE_VERSION >= FUSE_MAKE_VERSION(3, 12)
     struct fuse_loop_config *config = fuse_loop_cfg_create();
     if (config == NULL) {
@@ -215,6 +290,16 @@ int studiofs_linux_fuse_session_loop_mt(struct fuse_session *session,
     };
     return fuse_session_loop_mt(session, &config);
 #endif
+}
+
+int studiofs_linux_fuse_session_loop_mt(struct fuse_session *session,
+                                        unsigned int max_threads,
+                                        unsigned int max_idle_threads) {
+    studiofs_linux_fuse_enter_loop_thread();
+    int result =
+        studiofs_linux_fuse_run_session_loop_mt(session, max_threads, max_idle_threads);
+    studiofs_linux_fuse_leave_loop_thread();
+    return result;
 }
 
 int studiofs_linux_fuse_loop_has_worker_limit(void) {
@@ -272,7 +357,8 @@ int studiofs_linux_fuse_file_info_flags(const struct fuse_file_info *info) {
 
 int studiofs_linux_fuse_low_level_ops_has_metadata_callbacks(const struct fuse_lowlevel_ops *ops) {
     return ops->lookup && ops->getattr && ops->setattr && ops->opendir &&
-           ops->readdir && ops->releasedir && ops->statfs && ops->access == NULL;
+           ops->readdir && ops->readdirplus && ops->releasedir && ops->statfs &&
+           ops->access == NULL;
 }
 
 int studiofs_linux_fuse_low_level_ops_has_forget_callback(const struct fuse_lowlevel_ops *ops) {

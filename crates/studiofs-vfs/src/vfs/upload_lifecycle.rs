@@ -12,7 +12,6 @@ use futures::FutureExt as _;
 use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use studiofs_cache::upload_queue::PendingUpload;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -613,23 +612,6 @@ impl StudioVfs {
         guard.handle.take();
     }
 
-    pub(super) fn pending_age_stats_ms(&self, pending_uploads: &[PendingUpload]) -> (u64, u64) {
-        let now_ms = now_unix_millis();
-        let mut ages: Vec<u64> = pending_uploads
-            .iter()
-            .map(|op| now_ms.saturating_sub(op.created_unix_ms))
-            .collect();
-        if ages.is_empty() {
-            return (0, 0);
-        }
-        ages.sort_unstable();
-        // Safe percentile calculation: use checked arithmetic to avoid overflow
-        let p95_idx = ((ages.len() - 1).saturating_mul(95)) / 100;
-        let p95 = ages[p95_idx];
-        let max = *ages.last().unwrap_or(&0);
-        (p95, max)
-    }
-
     pub(super) fn upload_pipeline_is_idle(
         &self,
         pending_uploads: usize,
@@ -741,6 +723,9 @@ impl StudioVfs {
                 ShutdownClaim::Completed(error) => return replay_shutdown_result(error),
             }
         };
+        // Release writes parked on hard admission so they observe the request
+        // and drop the mutating-operation gate that shutdown acquires next.
+        self.state.writer_stack.wake_dirty_drain_waiters();
         let background_join_timeout = Duration::from_secs(2);
         let _mutating_operation_admission = tokio::time::timeout(
             background_join_timeout,
