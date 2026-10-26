@@ -180,7 +180,7 @@ use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::upload_stage::UploadStageStoreError;
 use studiofs_cache::{CachedStore, CachedStoreConfig};
 use studiofs_data::object::{
-    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys,
+    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys, format_object_key,
     parse_object_id_from_key,
 };
 use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
@@ -5602,9 +5602,11 @@ impl StudioVfs {
 
     fn spawn_janitor_worker(self: &Arc<Self>) {
         let vfs = self.clone();
-        self.track_background_task(tokio::spawn(async move {
+        // The janitor may hold the global PG lock and object-deletion claims;
+        // shutdown must let it finish those claims and explicitly release the lock.
+        self.spawn_background_cleanup_task_on(&tokio::runtime::Handle::current(), async move {
             vfs.background_janitor().await;
-        }));
+        });
     }
 
     fn spawn_local_metadata_compaction_worker(self: &Arc<Self>) {
