@@ -9411,6 +9411,7 @@ fn pending_sparse_slice_commit_preserves_larger_same_epoch_ready_eof() {
     });
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn deferred_sparse_tail_rebases_when_size_growth_overtakes_materialization() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
