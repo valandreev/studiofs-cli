@@ -75,5 +75,8 @@ jobs:
           : "${RCLONE_CONFIG_WASABI_REGION:?Set repository variable WASABI_REGION}"
           : "${RCLONE_CONFIG_WASABI_ENDPOINT:?Set repository variable WASABI_ENDPOINT}"
           rclone copyto "$ARCHIVE_PATH" \
-            "wasabi:${WASABI_BUCKET}/repo-studiofs-cli/${GITHUB_SHA}.tar.gz" \
+            "wasabi:${WASABI_BUCKET}/repo-studiofs-cli/commits/${GITHUB_SHA}.tar.gz" \
+            --progress
+          rclone copyto "$ARCHIVE_PATH" \
+            "wasabi:${WASABI_BUCKET}/repo-studiofs-cli/latest/repository.tar.gz" \
             --progress
