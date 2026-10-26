@@ -7082,6 +7082,7 @@ impl StudioVfs {
             .fold(pending.payload_bytes, u64::saturating_add)
     }
 
+    /// Returns the current upload counters and throughput metrics.
     pub fn upload_stats(&self) -> VfsUploadStats {
         let pending = self.cached_store.pending_upload_summary();
         let pending_upload_bytes = self.pending_upload_bytes(&pending);
