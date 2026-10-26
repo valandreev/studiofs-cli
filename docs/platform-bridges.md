@@ -451,8 +451,12 @@ With async writes enabled (the default), every write takes an async-write
 ledger ticket and capacity reservation. A write of at most 64 KiB then runs
 the VFS write on the libfuse callback thread and replies there, because the
 kernel waits for the reply either way; larger writes copy the buffer and
-reply from a runtime task. Both paths share the barrier, shutdown, and
-capacity accounting below.
+reply from a runtime task. At most half of the callback workers (at least
+one) run inline writes at once, so writers blocked on VFS backpressure leave
+workers for metadata and reads; a small write beyond that limit uses the
+runtime hand-off. A panic in an inline write replies `EIO` instead of
+unwinding into libfuse. Both paths share the barrier, shutdown, and capacity
+accounting below.
 
 Linux ordinary `flush` and final `release` admit state to the shared volatile
 metadata worker; the batch age is bounded to one second. An async-write ledger

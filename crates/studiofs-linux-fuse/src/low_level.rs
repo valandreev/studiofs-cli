@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -281,7 +281,10 @@ pub(crate) struct SessionState {
     #[cfg(test)]
     getattr_calls: AtomicU64,
     #[cfg(test)]
-    lookup_calls: AtomicU64,
+    lookup_calls: Arc<AtomicU64>,
+    /// Inline writes hold a callback worker; at most this many run at once.
+    inline_write_limit: usize,
+    inline_writes: AtomicUsize,
 }
 
 const _: fn() = assert_send_sync_static::<SessionState>;
@@ -332,7 +335,15 @@ impl SessionState {
             #[cfg(test)]
             getattr_calls: AtomicU64::new(0),
             #[cfg(test)]
-            lookup_calls: AtomicU64::new(0),
+            lookup_calls: Arc::new(AtomicU64::new(0)),
+            // Leave half the callback workers for metadata and reads while
+            // inline writes wait on VFS backpressure.
+            inline_write_limit: usize::try_from(
+                connection_config.worker_thread_count(has_worker_limit()) / 2,
+            )
+            .unwrap_or(usize::MAX)
+            .max(1),
+            inline_writes: AtomicUsize::new(0),
         }
     }
 }
@@ -2437,7 +2448,10 @@ impl SessionState {
         let fh = request.fh;
         let write_offset = request.offset;
         let sequence = ticket.sequence();
-        if size <= INLINE_WRITE_MAX_BYTES {
+        if size <= INLINE_WRITE_MAX_BYTES
+            && let Some(_inline) =
+                InlineWriteSlot::acquire(&self.inline_writes, self.inline_write_limit)
+        {
             let task_guard = FuseWriteTaskGuard::with_metrics(
                 callback.reply,
                 ticket,
@@ -2453,15 +2467,17 @@ impl SessionState {
                 return Ok(true);
             }
             let result = with_write_data_slice(buf, size, |data| {
-                self.runtime_handle
-                    .block_on(self.vfs.write_fh_with_deferred_materialize(
-                        fh,
-                        ino,
-                        write_offset,
-                        data,
-                        LocalSyncPolicy::Opportunistic,
-                    ))
-                    .map_err(|error| vfs_err_to_errno(&error))
+                catch_inline_write_panic(|| {
+                    self.runtime_handle
+                        .block_on(self.vfs.write_fh_with_deferred_materialize(
+                            fh,
+                            ino,
+                            write_offset,
+                            data,
+                            LocalSyncPolicy::Opportunistic,
+                        ))
+                        .map_err(|error| vfs_err_to_errno(&error))
+                })
             })
             .and_then(|result| result);
             let reply_result = task_guard.complete(result);
@@ -2696,13 +2712,19 @@ impl SessionState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Capture once per enumeration; namespace changes must not shift existing offsets.
-        let captured = match captured.as_ref() {
-            Some(captured) => captured,
-            None => captured.insert(self.directory_snapshot(ino)?),
+        let (captured, fresh) = match captured.as_ref() {
+            Some(captured) => (captured, false),
+            None => (&*captured.insert(self.directory_snapshot(ino)?), true),
         };
         // Offsets stay on the captured snapshot, but kernel dentries must not:
-        // after a namespace change, a later chunk sends names only.
-        let reply_entries = plus.is_some() && self.directory_snapshot_is_current(ino, captured);
+        // after a namespace change, a later chunk sends names only. A fresh
+        // capture already compared observations before and after its build.
+        let reply_entries = plus.is_some()
+            && if fresh {
+                captured.observation.is_some()
+            } else {
+                self.directory_snapshot_is_current(ino, captured)
+            };
         for (i, entry) in captured
             .entries
             .iter()
@@ -2998,6 +3020,35 @@ fn require_file_info(fi: *const raw::FuseFileInfo) -> Result<(), i32> {
 
 fn clamp_read_size(size: usize) -> usize {
     size.min(LINUX_FUSE_MAX_READ_SIZE)
+}
+
+/// Counts one inline write against the session limit until dropped.
+struct InlineWriteSlot<'a>(&'a AtomicUsize);
+
+impl<'a> InlineWriteSlot<'a> {
+    fn acquire(in_flight: &'a AtomicUsize, limit: usize) -> Option<Self> {
+        in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < limit).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self(in_flight))
+    }
+}
+
+impl Drop for InlineWriteSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// An unwind must not cross the `extern "C"` write callback; the async path
+/// confines the same panic to its task, so the inline path replies EIO.
+fn catch_inline_write_panic(write: impl FnOnce() -> Result<u32, i32>) -> Result<u32, i32> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(write)).unwrap_or_else(|_| {
+        warn!("Linux FUSE inline write panicked");
+        Err(libc::EIO)
+    })
 }
 
 fn with_write_data_slice<T>(
@@ -3436,10 +3487,13 @@ impl DirectoryEntryBuffer {
         attr: &stat,
         next_offset: off_t,
     ) -> Result<bool, i32> {
-        // SAFETY: `add` receives the libfuse buffer contract described in `push_with`.
-        self.push_with(name, |buf, available, name| unsafe {
-            raw::fuse_add_direntry(req, buf, available, name, attr, next_offset)
-        })
+        // SAFETY: libfuse's `fuse_add_direntry` meets the `push_with` contract;
+        // attr is valid and libfuse ignores req.
+        unsafe {
+            self.push_with(name, |buf, available, name| {
+                raw::fuse_add_direntry(req, buf, available, name, attr, next_offset)
+            })
+        }
     }
 
     /// Encodes a `readdirplus` entry; a zero `entry.ino` creates no kernel dentry.
@@ -3450,10 +3504,13 @@ impl DirectoryEntryBuffer {
         entry: &raw::FuseEntryParam,
         next_offset: off_t,
     ) -> Result<bool, i32> {
-        // SAFETY: `add` receives the libfuse buffer contract described in `push_with`.
-        self.push_with(name, |buf, available, name| unsafe {
-            raw::fuse_add_direntry_plus(req, buf, available, name, entry, next_offset)
-        })
+        // SAFETY: libfuse's `fuse_add_direntry_plus` meets the `push_with`
+        // contract; entry is valid and libfuse ignores req.
+        unsafe {
+            self.push_with(name, |buf, available, name| {
+                raw::fuse_add_direntry_plus(req, buf, available, name, entry, next_offset)
+            })
+        }
     }
 
     /// Encodes a dirent that never transfers a kernel lookup reference.
@@ -3474,9 +3531,12 @@ impl DirectoryEntryBuffer {
     }
 
     /// `add` receives an aligned buffer writable for `available` bytes and a
-    /// NUL-terminated name; like libfuse, it returns the required size and
-    /// writes only when the entry fits.
-    fn push_with(
+    /// NUL-terminated name.
+    ///
+    /// # Safety
+    /// Like libfuse, `add` must return the entry's required size and, when that
+    /// size fits in `available`, initialize exactly that many bytes.
+    unsafe fn push_with(
         &mut self,
         name: &OsStr,
         add: impl FnOnce(*mut c_char, size_t, *const c_char) -> size_t,
@@ -5663,7 +5723,32 @@ mod tests {
     }
 
     #[test]
+    fn inline_write_panic_replies_eio_instead_of_unwinding_into_libfuse() {
+        assert_eq!(
+            super::catch_inline_write_panic(|| panic!("simulated VFS write panic")),
+            Err(libc::EIO)
+        );
+        assert_eq!(super::catch_inline_write_panic(|| Ok(7)), Ok(7));
+    }
+
+    #[test]
+    fn inline_write_slots_are_bounded_and_released_on_drop() {
+        let in_flight = std::sync::atomic::AtomicUsize::new(0);
+        let first = super::InlineWriteSlot::acquire(&in_flight, 2).expect("first slot");
+        let second = super::InlineWriteSlot::acquire(&in_flight, 2).expect("second slot");
+        assert!(super::InlineWriteSlot::acquire(&in_flight, 2).is_none());
+        drop(first);
+        let third = super::InlineWriteSlot::acquire(&in_flight, 2).expect("released slot");
+        drop((second, third));
+        assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn small_async_writes_run_inline_and_large_writes_keep_the_runtime_hand_off() {
+        if !super::linux_fuse_async_write_enabled() {
+            eprintln!("skipped: async writes are disabled by the environment");
+            return;
+        }
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-inline-write")
                 .expect("create VFS fixture");
@@ -5723,6 +5808,45 @@ mod tests {
             "a large write keeps the runtime hand-off"
         );
         assert_eq!(replies[1].1, Ok(large.len() as u32));
+
+        // With every inline slot taken, a small write falls back to the hand-off.
+        let held = (0..state.inline_write_limit)
+            .map(|_| {
+                super::InlineWriteSlot::acquire(&state.inline_writes, state.inline_write_limit)
+                    .expect("free inline slot")
+            })
+            .collect::<Vec<_>>();
+        let replies_before = replies.len();
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        assert_eq!(
+            state.queue_async_write(
+                super::FuseWriteCallbackContext {
+                    reply: ThreadRecordingWriteReply {
+                        replies: Arc::clone(&replies),
+                    },
+                    started: Instant::now(),
+                },
+                attr.ino,
+                small.as_ptr().cast(),
+                small.len(),
+                0,
+                fi,
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            state.async_writes.wait_all(Duration::from_secs(10)),
+            crate::async_writes::BarrierOutcome::Complete(None)
+        );
+        drop(held);
+        assert_eq!(replies_before, 2);
+        let fallback = replies.lock().unwrap().clone();
+        assert_eq!(fallback.len(), 1);
+        assert_ne!(
+            fallback[0].0,
+            thread::current().id(),
+            "a write beyond the inline limit must not hold the callback worker"
+        );
         // SAFETY: allocated by the C shim with calloc and no longer used.
         unsafe { libc::free(fi.cast()) };
         let mut read_back = vec![0_u8; small.len() + large.len()];
@@ -7995,24 +8119,27 @@ mod tests {
         );
         let mut session =
             super::Session::mount(state, &mount_point, "studiofs-dirplus").expect("mount");
-        let state_address = session.state.as_deref().expect("mounted state") as *const _ as usize;
+        let lookup_calls = Arc::clone(
+            &session
+                .state
+                .as_deref()
+                .expect("mounted state")
+                .lookup_calls,
+        );
         let mount_point_for_worker = mount_point.clone();
         let worker = std::thread::spawn(
             move || -> std::io::Result<(u64, std::process::ExitStatus)> {
                 let guard = UnmountGuard::new(mount_point_for_worker.clone());
-                // SAFETY: the session owns this state until `run` returns after unmount,
-                // and the worker reads only an atomic counter before unmounting.
-                let state = unsafe { &*(state_address as *const super::SessionState) };
                 let dir = mount_point_for_worker.join("dir");
                 assert!(std::fs::metadata(&dir)?.is_dir());
-                let before = state.lookup_calls.load(Ordering::Relaxed);
+                let before = lookup_calls.load(Ordering::Relaxed);
                 let mut entries = 0;
                 for entry in std::fs::read_dir(&dir)? {
                     assert!(std::fs::symlink_metadata(entry?.path())?.is_file());
                     entries += 1;
                 }
                 assert_eq!(entries, 64);
-                let lookups = state.lookup_calls.load(Ordering::Relaxed) - before;
+                let lookups = lookup_calls.load(Ordering::Relaxed) - before;
                 let status = Command::new("fusermount3")
                     .arg("-u")
                     .arg(&mount_point_for_worker)
