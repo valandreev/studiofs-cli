@@ -385,6 +385,20 @@ impl PgMetaEngine {
             &batches,
             target_version,
         )?;
+        // A page of only this client's own batches mirrors events the local
+        // serving view already exposes; see
+        // `restore_pending_state_after_self_page_with_state`.
+        let self_page_cleared_inodes = batches.iter().all(|batch| batch.is_self_batch).then(|| {
+            batches
+                .iter()
+                .flat_map(|batch| &batch.events)
+                .filter_map(|event| match event {
+                    crate::events::MetaEvent::RemoveAttr { ino }
+                    | crate::events::MetaEvent::RemoveRegularFileGraph { ino } => Some(*ino),
+                    _ => None,
+                })
+                .collect::<std::collections::HashSet<_>>()
+        });
         // Keep the cursor snapshot, serving-state reconcile, and pending replay
         // atomic with local metadata mutations after decoding the remote page.
         let apply_started = Instant::now();
@@ -419,7 +433,14 @@ impl PgMetaEngine {
         // Only an acknowledged self-batch advances the local journal cursor;
         // foreign batches update the base view without changing pending events.
         if outcome.flushed_event_seq.is_some() {
-            self.restore_pending_state_from_local_log_with_state(&mut pending_state)?;
+            match &self_page_cleared_inodes {
+                Some(cleared_inodes) if !outcome.serving_reconciled => self
+                    .restore_pending_state_after_self_page_with_state(
+                        &mut pending_state,
+                        cleared_inodes,
+                    )?,
+                _ => self.restore_pending_state_from_local_log_with_state(&mut pending_state)?,
+            }
         }
         drop(pending_state);
         drop(position_guard);
@@ -468,6 +489,7 @@ impl PgMetaEngine {
                 max_version: context.last_seq,
                 max_namespace_version: context.current_namespace_version,
                 flushed_event_seq: None,
+                serving_reconciled: false,
             });
         }
         let local_event_ack_barrier = self

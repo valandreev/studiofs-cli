@@ -57,6 +57,10 @@ pub(crate) struct PendingInvalidations {
 }
 
 impl PendingInvalidations {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.intents.is_empty()
+    }
+
     pub(crate) fn push(&mut self, intent: InvalidationIntent) {
         if matches!(self.intents.first(), Some(InvalidationIntent::Reset)) {
             return;

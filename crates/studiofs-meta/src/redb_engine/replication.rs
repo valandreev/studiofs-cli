@@ -2522,6 +2522,74 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    /// Reconciles serving state toward base for this client's own
+    /// acknowledged renames and keeps their intents only when the reconcile
+    /// changed what the serving view exposes.
+    ///
+    /// The mounted kernel already performed these renames through the local
+    /// serving view, so re-announcing an unchanged result would only purge
+    /// cache state and mark the page as a serving correction. The scope covers
+    /// both names and the moved inode with every name bound to it, which is
+    /// everything the rename reconcile may rewrite.
+    pub(crate) fn reconcile_own_serving_renames_from_base_in_txn<'event>(
+        txn: &RedbWriteTransaction<'_>,
+        events: impl IntoIterator<Item = &'event crate::events::MetaEvent>,
+        local_removals: &mut ReplayLocalJournal,
+    ) -> MetaResult<bool> {
+        let renames: Vec<_> = events
+            .into_iter()
+            .filter(|event| matches!(event, crate::events::MetaEvent::RenameEntry { .. }))
+            .collect();
+        if renames.is_empty() {
+            return Ok(false);
+        }
+        let mut scope = ReplayScope::default();
+        for event in &renames {
+            if let crate::events::MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                ..
+            } = event
+            {
+                scope.inodes.extend([*parent, *new_parent, entry.ino]);
+                scope.dentry_keys.insert(encode_dentry_key(*parent, name));
+                scope
+                    .dentry_keys
+                    .insert(encode_dentry_key(*new_parent, new_name));
+            }
+        }
+        let invalidation_scope = txn.invalidation_scope();
+        let before = Self::replay_scope_view(txn, &scope)?;
+        for event in renames {
+            if let crate::events::MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                ..
+            } = event
+            {
+                Self::reconcile_serving_rename_from_base_in_txn(
+                    txn,
+                    *parent,
+                    name,
+                    *new_parent,
+                    new_name,
+                    entry,
+                    local_removals,
+                )?;
+            }
+        }
+        if Self::replay_scope_view(txn, &scope)? == before {
+            invalidation_scope.discard();
+        }
+        Ok(true)
+    }
+
     pub(crate) fn reconcile_serving_rename_from_base_in_txn(
         txn: &RedbWriteTransaction<'_>,
         parent: Ino,

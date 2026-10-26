@@ -757,6 +757,12 @@ impl RedbWriteTransaction<'_> {
         }
     }
 
+    /// Whether this transaction has journaled any invalidation intent, i.e.
+    /// changed something the local serving view exposes.
+    pub(crate) fn has_journaled_invalidations(&self) -> bool {
+        !self.invalidations.borrow().is_empty()
+    }
+
     /// Whether scopes recorded now would be dropped by [`Self::without_invalidations`].
     pub(crate) fn invalidations_suppressed(&self) -> bool {
         self.invalidations_suppressed.get()

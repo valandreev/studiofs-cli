@@ -240,6 +240,9 @@ pub(super) struct RemoteReplayApplyOutcome {
     pub(super) max_version: i64,
     pub(super) max_namespace_version: i64,
     pub(super) flushed_event_seq: Option<u64>,
+    /// Whether applying the page changed the local serving view, which the
+    /// coherence contract makes observable as a journaled invalidation.
+    pub(super) serving_reconciled: bool,
 }
 
 pub(super) struct RemoteReplayApplyContext {
@@ -608,7 +611,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok(overlay)
     }
 
-    fn add_event_overlay_conflicts(overlay: &mut OverlayConflictSets, event: &MetaEvent) {
+    pub(super) fn add_event_overlay_conflicts(
+        overlay: &mut OverlayConflictSets,
+        event: &MetaEvent,
+    ) {
         match event {
             MetaEvent::SetAttr { attr } => {
                 overlay.attr_inodes.insert(attr.ino);
@@ -1952,30 +1958,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 &partial_publish_inodes,
             )
         })?;
-        let mut changed = false;
         let mut local_removals = crate::redb_engine::ReplayLocalJournal::default();
-        for event in &batch_events {
-            if let MetaEvent::RenameEntry {
-                parent,
-                name,
-                new_parent,
-                new_name,
-                entry,
-                ..
-            } = event
-            {
-                RedbMetaEngine::reconcile_serving_rename_from_base_in_txn(
-                    txn,
-                    *parent,
-                    name,
-                    *new_parent,
-                    new_name,
-                    entry,
-                    &mut local_removals,
-                )?;
-                changed = true;
-            }
-        }
+        let mut changed = RedbMetaEngine::reconcile_own_serving_renames_from_base_in_txn(
+            txn,
+            &batch_events,
+            &mut local_removals,
+        )?;
         let mut aux_events = batch_events
             .iter()
             .filter(|event| {
@@ -2403,6 +2391,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 max_version: context.last_seq,
                 max_namespace_version: context.current_namespace_version,
                 flushed_event_seq: None,
+                serving_reconciled: false,
             });
         }
 
@@ -2509,6 +2498,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             max_version,
             max_namespace_version,
             flushed_event_seq: acknowledged_flushed_event_seq,
+            serving_reconciled: txn.has_journaled_invalidations(),
         })
     }
 

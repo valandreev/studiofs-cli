@@ -31,6 +31,50 @@ pub(super) enum PendingServingReplay {
     Skip,
 }
 
+/// How a pending-state restore decides on [`PendingServingReplay`].
+#[derive(Clone, Copy)]
+enum PendingServingReplayMode<'a> {
+    Fixed(PendingServingReplay),
+    /// Replay only when a pending event touches one of these inodes.
+    UnlessTouching(&'a HashSet<Ino>),
+}
+
+impl PendingServingReplayMode<'_> {
+    fn resolve(self, pending_events: &[MetaEvent]) -> PendingServingReplay {
+        match self {
+            Self::Fixed(serving_replay) => serving_replay,
+            Self::UnlessTouching(inodes) if inodes.is_empty() => PendingServingReplay::Skip,
+            Self::UnlessTouching(inodes) => {
+                if pending_events
+                    .iter()
+                    .any(|event| event_touches_any_inode(event, inodes))
+                {
+                    PendingServingReplay::Replay
+                } else {
+                    PendingServingReplay::Skip
+                }
+            }
+        }
+    }
+}
+
+fn event_touches_any_inode(event: &MetaEvent, inodes: &HashSet<Ino>) -> bool {
+    let mut keys = super::remote_apply::OverlayConflictSets::default();
+    RemoteApplyCoordinator::add_event_overlay_conflicts(&mut keys, event);
+    let entry_ino = match event {
+        MetaEvent::AddEntry { entry, .. } | MetaEvent::RenameEntry { entry, .. } => Some(entry.ino),
+        _ => None,
+    };
+    keys.attr_inodes
+        .iter()
+        .chain(&keys.block_inodes)
+        .chain(&keys.remove_attr_inodes)
+        .chain(&keys.symlink_inodes)
+        .chain(&keys.xattr_inodes)
+        .chain(entry_ino.iter())
+        .any(|ino| inodes.contains(ino))
+}
+
 struct SelectedLocalEvents<'a> {
     events: Cow<'a, [MetaEvent]>,
     ranges: Vec<LocalEventRange>,
@@ -387,10 +431,44 @@ impl PgMetaEngine {
         self.restore_pending_state_from_local_log_locked(state, PendingServingReplay::Replay)
     }
 
+    /// Restore pending state after a replay page of only this client's own
+    /// batches that left the serving view unchanged, while the caller holds
+    /// both locks in canonical order.
+    ///
+    /// Such a page mirrors already-served events into `base_*`; serving
+    /// reconciliation journals an intent for every real correction, so with
+    /// none journaled the local mutations' serving rows are intact and the
+    /// pending events need no replay. The one serving write a self page makes
+    /// without an intent is clearing the regular-file graph of a removed
+    /// inode, so a pending event on such an inode still forces the replay.
+    /// Skipping it keeps the page from re-applying the whole unflushed
+    /// backlog while every foreground mutation waits on `pending_state`.
+    pub(super) fn restore_pending_state_after_self_page_with_state(
+        &self,
+        state: &mut PendingReplicationState,
+        cleared_inodes: &HashSet<Ino>,
+    ) -> MetaResult<()> {
+        self.restore_pending_state_from_local_log_with_mode(
+            state,
+            PendingServingReplayMode::UnlessTouching(cleared_inodes),
+        )
+    }
+
     fn restore_pending_state_from_local_log_locked(
         &self,
         state: &mut PendingReplicationState,
         serving_replay: PendingServingReplay,
+    ) -> MetaResult<()> {
+        self.restore_pending_state_from_local_log_with_mode(
+            state,
+            PendingServingReplayMode::Fixed(serving_replay),
+        )
+    }
+
+    fn restore_pending_state_from_local_log_with_mode(
+        &self,
+        state: &mut PendingReplicationState,
+        mode: PendingServingReplayMode<'_>,
     ) -> MetaResult<()> {
         let mut event_start = self.flushed_event_seq.load(Ordering::SeqCst);
         let event_end = self
@@ -435,6 +513,7 @@ impl PgMetaEngine {
             Self::clear_pending_state(state);
             return Ok(());
         }
+        let serving_replay = mode.resolve(pending_events);
         let selected = self.select_unprocessed_local_events(event_start, pending_events)?;
         let projected = RemoteApplyCoordinator::project_local_batch(selected.events.as_ref());
         // Retire local-only completion snapshots before replay can resurrect their overlays.

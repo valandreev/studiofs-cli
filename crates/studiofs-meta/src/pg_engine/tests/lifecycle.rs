@@ -5746,6 +5746,7 @@ fn replay_position_does_not_regress_flushed_event_seq() {
         max_version: 7,
         max_namespace_version: 3,
         flushed_event_seq: Some(19),
+        serving_reconciled: true,
     })
     .expect("persist replay position");
 

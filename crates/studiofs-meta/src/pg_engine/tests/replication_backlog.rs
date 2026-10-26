@@ -3851,6 +3851,106 @@ fn hidden_pending_window_grows_without_reprojecting_unpublished_overlay_history(
 }
 
 #[test]
+fn own_rename_self_batch_leaves_serving_view_unreconciled() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let dir = pg
+        .create_dir(ROOT_INO, b"own-rename-dir", 0, 0, 0o755)
+        .expect("create directory");
+    pg.create_dir(dir.ino, b"child", 0, 0, 0o755)
+        .expect("create child");
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.local
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, start)
+        .unwrap();
+    pg.rename(dir.ino, b"child", dir.ino, b"child-moved")
+        .expect("rename child");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let projected = RemoteApplyCoordinator::project_local_batch(
+        &pg.local.read_events_range(start, end).unwrap(),
+    );
+    assert!(
+        projected
+            .events
+            .iter()
+            .any(|event| matches!(event, MetaEvent::RenameEntry { .. }))
+    );
+    let prefix = vec![LocalEventRange { start, end }];
+    pg.mark_local_event_ranges_published_with_prefix(&prefix, None)
+        .unwrap();
+
+    let outcome = pg
+        .apply_replay_page_atomically(
+            vec![DecodedReplayBatch {
+                batch_version: pg.local_version.load(Ordering::SeqCst) + 1,
+                events: projected.events,
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: pg.local_version.load(Ordering::SeqCst),
+                current_namespace_version: pg.namespace_version.load(Ordering::SeqCst),
+                flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
+                next_event_seq: end,
+                initial_overlay: pg.local_overlay_conflicts().unwrap(),
+            },
+        )
+        .expect("apply own rename batch");
+
+    assert!(
+        !outcome.serving_reconciled,
+        "mirroring this client's own rename must not count as a serving correction"
+    );
+    assert!(pg.local.lookup(dir.ino, b"child-moved").is_ok());
+    assert!(pg.local.lookup(dir.ino, b"child").is_err());
+}
+
+#[test]
+fn unchanged_self_page_restore_skips_serving_replay_unless_a_cleared_inode_is_pending() {
+    use crate::redb_engine::take_pending_serving_replays;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let mut pending_inodes = Vec::new();
+    for index in 0..16u32 {
+        let attr = pg
+            .create_dir(ROOT_INO, format!("backlog-{index}").as_bytes(), 0, 0, 0o755)
+            .expect("create backlog directory");
+        pending_inodes.push(attr.ino);
+    }
+    let expected_ops = pg.pending_state.lock().expect("pending state").ops;
+    assert!(expected_ops > 0);
+
+    let (position_guard, mut state) = pg
+        .lock_local_position_and_pending_state()
+        .expect("replay locks");
+    take_pending_serving_replays();
+    pg.restore_pending_state_after_self_page_with_state(&mut state, &HashSet::from([u64::MAX]))
+        .expect("restore after an unchanged self page");
+    assert_eq!(
+        take_pending_serving_replays(),
+        0,
+        "pending events already served must not be replayed"
+    );
+    assert_eq!(
+        state.ops, expected_ops,
+        "pending accounting is still restored"
+    );
+
+    pg.restore_pending_state_after_self_page_with_state(
+        &mut state,
+        &HashSet::from([pending_inodes[3]]),
+    )
+    .expect("restore after a page that cleared a pending inode");
+    assert_eq!(
+        take_pending_serving_replays(),
+        1,
+        "a pending event on an inode whose graph the page cleared must be replayed"
+    );
+    drop(state);
+    drop(position_guard);
+    assert!(pg.local.lookup(ROOT_INO, b"backlog-15").is_ok());
+}
+
+#[test]
 fn visible_pending_window_extends_over_events_of_an_unmarked_concurrent_mutation() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     for index in 0..8u32 {
