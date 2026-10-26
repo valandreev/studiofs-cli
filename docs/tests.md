@@ -479,6 +479,23 @@ a create/rename/unlink microbenchmark on a Linux mount with 1 and 8 processes
 that attributes `pg-meta-poll` CPU per operation until the thread goes idle;
 that CPU must stay below the operation's own foreground cost.
 
+### SFS-905 Foreground Waits on Background Lingers
+
+`open(O_CREAT|O_TRUNC)` and size changes right after a write used to wait out
+background batching lingers: the deferred namespace batch linger (about 10 ms)
+and the deferred materialization linger (1.2 s). Barriers must cut both short:
+
+```sh
+cargo test -p studiofs-vfs --lib deferred_namespace_barrier_drain_commits_without_batch_linger -- --nocapture
+cargo test -p studiofs-vfs --lib deferred_namespace_barrier_cuts_background_batch_linger_short -- --nocapture
+cargo test -p studiofs-vfs --lib truncate_after_deferred_write_interrupts_materialization_linger -- --nocapture
+cargo test -p studiofs-vfs --lib handle_growth_after_deferred_write_interrupts_materialization_linger -- --nocapture
+```
+
+These tests do not establish mounted acceptance. The mounted measurement is
+[`tools/perf/linux-metadata-profile.sh`](../tools/perf/linux-metadata-profile.sh);
+see [the SFS-905 report](perf/sfs-905-linux-metadata-profile.md).
+
 ### SFS-899 Exact Base Dentry Reconciliation
 
 Exact event keys must not trigger a case-insensitive directory scan while
