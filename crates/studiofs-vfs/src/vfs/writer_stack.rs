@@ -268,6 +268,8 @@ pub(super) struct MountedWriterStack {
     handle_shards: Box<[OrderedMutex<HandleShard>]>,
     next_seq: AtomicU64,
     dirty_bytes: AtomicUsize,
+    /// Wakes hard write-admission waiters whenever buffered dirty bytes drop.
+    dirty_drained: tokio::sync::Notify,
 }
 
 impl MountedWriterStack {
@@ -297,6 +299,7 @@ impl MountedWriterStack {
                 .collect(),
             next_seq: AtomicU64::new(1),
             dirty_bytes: AtomicUsize::new(0),
+            dirty_drained: tokio::sync::Notify::new(),
         }
     }
 
@@ -1153,12 +1156,28 @@ impl MountedWriterStack {
         self.dirty_bytes.load(Ordering::Acquire)
     }
 
+    /// Returns a drain notification for a waiter that re-checks
+    /// [`total_dirty_bytes`](Self::total_dirty_bytes) after enabling it.
+    pub(super) fn dirty_drained(&self) -> tokio::sync::futures::Notified<'_> {
+        self.dirty_drained.notified()
+    }
+
+    /// Wakes drain waiters so they re-check their condition, for example after
+    /// shutdown was requested.
+    pub(super) fn wake_dirty_drain_waiters(&self) {
+        self.dirty_drained.notify_waiters();
+    }
+
     fn subtract_dirty(&self, amount: usize) {
+        if amount == 0 {
+            return;
+        }
         let _ = self
             .dirty_bytes
             .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 Some(current.saturating_sub(amount))
             });
+        self.dirty_drained.notify_waiters();
     }
 
     fn persist_detached_finished_slices(
