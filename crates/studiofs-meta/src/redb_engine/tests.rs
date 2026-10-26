@@ -14,8 +14,11 @@ thread_local! {
     /// Parent-scoped case-insensitive dentry scans after an exact-key miss.
     pub(super) static CASE_FALLBACK_DENTRY_SCANS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    /// Merged serving/base case-insensitive scans after an exact-key miss.
+    /// Merged serving/base case-insensitive fallbacks after an exact-key miss.
     pub(super) static CASE_FALLBACK_MERGED_SCANS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Case-folded index rows visited by merged case-insensitive lookups.
+    pub(super) static FOLDED_DENTRY_INDEX_ROWS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -268,7 +271,7 @@ fn base_rename_prior_keys_use_exact_lookup_for_stale_index_entries() {
     let txn = engine.begin_write_txn().unwrap();
     RedbMetaEngine::insert_dentry_index_in_txn(
         &txn,
-        BASE_DENTRIES_BY_INODE_TABLE,
+        BASE_DENTRY_TABLES,
         ROOT_INO,
         b"source",
         &entry,
@@ -371,7 +374,7 @@ fn regular_file_serving_install_skips_stale_case_alias_index_key() {
     let txn = engine.begin_write_txn().unwrap();
     RedbMetaEngine::insert_dentry_index_in_txn(
         &txn,
-        BASE_DENTRIES_BY_INODE_TABLE,
+        BASE_DENTRY_TABLES,
         ROOT_INO,
         b"source",
         &DirEntryValue {

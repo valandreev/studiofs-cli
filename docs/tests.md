@@ -496,6 +496,23 @@ These tests do not establish mounted acceptance. The mounted measurement is
 [`tools/perf/linux-metadata-profile.sh`](../tools/perf/linux-metadata-profile.sh);
 see [the SFS-905 report](perf/sfs-905-linux-metadata-profile.md).
 
+### SFS-904 Case-Insensitive Lookup Misses in Large Directories
+
+A rename looks up its not-yet-existing target name twice (FUSE `lookup` and
+`rename_atomic`). That miss used to scan every serving and base entry of the
+parent. The case-folded dentry indexes must keep it to the folded candidates,
+and opening an older database must rebuild them:
+
+```sh
+cargo test -p studiofs-meta --lib rename_in_large_directory_visits_no_unrelated_dentry_rows -- --nocapture
+cargo test -p studiofs-meta --lib case_insensitive_lookup_visits_only_folded_candidates_in_large_directory -- --nocapture
+cargo test -p studiofs-meta --lib folded_dentry_names_match_case_insensitive_name_equality -- --nocapture
+cargo test -p studiofs-meta --lib without_studiofs_format_migration -- --nocapture
+```
+
+These tests do not establish mounted acceptance: rename latency at 8,000 extra
+entries must stay within about 20% of the empty-directory case on a Linux mount.
+
 ### SFS-899 Exact Base Dentry Reconciliation
 
 Exact event keys must not trigger a case-insensitive directory scan while

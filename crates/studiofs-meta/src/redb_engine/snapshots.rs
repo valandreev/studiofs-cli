@@ -700,7 +700,7 @@ impl RedbMetaEngine {
                 }
             }
         }
-        Self::rebuild_dentry_index_in_txn(&txn, DENTRIES_TABLE, DENTRIES_BY_INODE_TABLE)?;
+        Self::rebuild_dentry_index_in_txn(&txn, SERVING_DENTRY_TABLES)?;
         {
             if !preserve_local_state {
                 Self::clear_table_in_txn(&txn, DENTRY_TOMBSTONES_TABLE)?;
@@ -719,7 +719,7 @@ impl RedbMetaEngine {
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
-        Self::rebuild_dentry_index_in_txn(&txn, BASE_DENTRIES_TABLE, BASE_DENTRIES_BY_INODE_TABLE)?;
+        Self::rebuild_dentry_index_in_txn(&txn, BASE_DENTRY_TABLES)?;
         {
             let mut settings = txn
                 .open_table(SETTINGS_TABLE)

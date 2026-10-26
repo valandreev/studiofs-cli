@@ -674,6 +674,15 @@ For regular files:
 2. If it is `Tombstone`, return `EntryNotFound`.
 3. If it is `Present(entry)`, return that entry.
 4. Else fall back to `base_dentries[(parent, name)]`.
+5. If no exact key matches, fall back to a case-insensitive match. Candidates
+   come from the case-folded indexes `dentries_by_folded_name` and
+   `base_dentries_by_folded_name`, keyed by `(parent, folded name, name)`, so a
+   miss visits only names that fold to the requested name, never the whole
+   directory. Each candidate resolves through steps 1–4 by its stored name.
+
+Both folded indexes are maintained with the by-inode indexes by every dentry
+write helper and rebuilt on snapshot restore. Opening a database whose
+`dentry_by_inode_index_version` is not current rebuilds both index families.
 
 ### `readdir(parent)`
 

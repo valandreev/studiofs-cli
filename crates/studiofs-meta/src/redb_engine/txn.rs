@@ -1,5 +1,8 @@
 use super::*;
 
+/// A case-folded dentry index opened for writing.
+type FoldedDentryIndex<'txn> = redb::Table<'txn, &'static [u8], u8>;
+
 impl RedbMetaEngine {
     /// Enable or disable filtering that hides remote-only namespace rows locally.
     pub fn set_remote_namespace_visibility_filter(&self, enabled: bool) -> MetaResult<()> {
@@ -74,12 +77,8 @@ impl RedbMetaEngine {
         };
 
         if current_version.as_deref() != Some(CURRENT_DENTRY_BY_INODE_INDEX_VERSION) {
-            Self::rebuild_dentry_index_in_txn(&txn, DENTRIES_TABLE, DENTRIES_BY_INODE_TABLE)?;
-            Self::rebuild_dentry_index_in_txn(
-                &txn,
-                BASE_DENTRIES_TABLE,
-                BASE_DENTRIES_BY_INODE_TABLE,
-            )?;
+            Self::rebuild_dentry_index_in_txn(&txn, SERVING_DENTRY_TABLES)?;
+            Self::rebuild_dentry_index_in_txn(&txn, BASE_DENTRY_TABLES)?;
             let mut settings = txn
                 .open_table(SETTINGS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -101,7 +100,7 @@ impl RedbMetaEngine {
         Ok(table.get(ino)?.is_some())
     }
 
-    fn names_equal_case_insensitive(
+    pub(super) fn names_equal_case_insensitive(
         left: &[u8],
         right: &[u8],
         right_lower: &mut Option<String>,
@@ -114,17 +113,12 @@ impl RedbMetaEngine {
             return false;
         }
 
-        let right_lower = right_lower.get_or_insert_with(|| {
-            #[cfg(test)]
-            super::tests::QUERY_NAME_LOWERINGS.with(|count| count.set(count.get() + 1));
-            String::from_utf8_lossy(right).to_lowercase()
-        });
+        let right_lower =
+            right_lower.get_or_insert_with(|| String::from_utf8_lossy(right).to_lowercase());
         if left.is_ascii() {
             return left.eq_ignore_ascii_case(right_lower.as_bytes());
         }
 
-        #[cfg(test)]
-        super::tests::UNICODE_NAME_LOWERINGS.with(|count| count.set(count.get() + 1));
         String::from_utf8_lossy(left).to_lowercase() == right_lower.as_str()
     }
 
@@ -346,10 +340,23 @@ impl RedbMetaEngine {
         Ok((None, false))
     }
 
-    pub(super) fn lookup_merged_from_opened_tables<TBase, TCurrent, TTombstones>(
+    /// Merged lookup with the case-insensitive fallback.
+    ///
+    /// `open_folded` opens the serving and base case-folded indexes; it runs only
+    /// after an exact-key miss, so a hit pays no extra table opens and a miss
+    /// visits only the stored names that fold to `name`.
+    pub(super) fn lookup_merged_from_opened_tables<
+        TBase,
+        TCurrent,
+        TTombstones,
+        TCurrentFolded,
+        TBaseFolded,
+        F,
+    >(
         base: &TBase,
         current: &TCurrent,
         tombstones: &TTombstones,
+        open_folded: F,
         parent: Ino,
         name: &[u8],
     ) -> MetaResult<(Option<DirEntryValue>, bool)>
@@ -357,6 +364,9 @@ impl RedbMetaEngine {
         TBase: ReadableTable<&'static [u8], &'static [u8]>,
         TCurrent: ReadableTable<&'static [u8], &'static [u8]>,
         TTombstones: ReadableTable<&'static [u8], u8>,
+        TCurrentFolded: ReadableTable<&'static [u8], u8>,
+        TBaseFolded: ReadableTable<&'static [u8], u8>,
+        F: FnOnce() -> MetaResult<(TCurrentFolded, TBaseFolded)>,
     {
         let key = encode_dentry_key(parent, name);
         let exact =
@@ -367,33 +377,33 @@ impl RedbMetaEngine {
 
         #[cfg(test)]
         super::tests::CASE_FALLBACK_MERGED_SCANS.with(|count| count.set(count.get() + 1));
-        let mut name_lower = None;
-        let prefix = dentry_prefix(parent);
-        let end = prefix_successor(&prefix);
-        let current_rows = match end.as_ref() {
-            Some(end) => current.range(prefix.as_slice()..end.as_ref()),
-            None => current.range(prefix.as_slice()..),
-        }
-        .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let base_rows = match end.as_ref() {
-            Some(end) => base.range(prefix.as_slice()..end.as_ref()),
-            None => base.range(prefix.as_slice()..),
-        }
-        .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let (current_folded, base_folded) = open_folded()?;
+        let prefix = folded_dentry_prefix(parent, name)?;
+        let current_rows = current_folded
+            .range(prefix.as_slice()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_rows = base_folded
+            .range(prefix.as_slice()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-        // Resolve each candidate by its stored key so tombstones, equality, and
-        // local authority follow the same rules as an exact lookup.
-        for row in current_rows.chain(base_rows) {
-            let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let (stored_parent, stored_name) = decode_dentry_key(key.value())?;
-            if stored_parent == parent
-                && Self::names_equal_case_insensitive(stored_name, name, &mut name_lower)
-            {
+        // Serving candidates come before base ones, each in stored-name order, as
+        // a directory scan would visit them. Each candidate resolves by its stored
+        // key so tombstones, equality, and local authority follow exact lookup.
+        for rows in [current_rows, base_rows] {
+            for row in rows {
+                let (folded_key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                if !folded_key.value().starts_with(&prefix) {
+                    break;
+                }
+                #[cfg(test)]
+                super::tests::FOLDED_DENTRY_INDEX_ROWS.with(|count| count.set(count.get() + 1));
+                let stored_name = decode_folded_dentry_name(folded_key.value(), &prefix)?;
+                let stored_key = encode_dentry_key(parent, stored_name);
                 let resolved = Self::lookup_merged_exact_key_from_opened_tables(
                     base,
                     current,
                     tombstones,
-                    key.value(),
+                    &stored_key,
                 )?;
                 if resolved.0.is_some() {
                     return Ok(resolved);
@@ -726,6 +736,18 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    fn open_folded_dentry_indexes_in_write_txn(
+        txn: &redb::WriteTransaction,
+    ) -> MetaResult<(FoldedDentryIndex<'_>, FoldedDentryIndex<'_>)> {
+        let current = txn
+            .open_table(DENTRIES_BY_FOLDED_NAME_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_DENTRIES_BY_FOLDED_NAME_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok((current, base))
+    }
+
     pub(crate) fn lookup_merged_in_write_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
@@ -763,7 +785,14 @@ impl RedbMetaEngine {
             let key = encode_dentry_key(parent, name);
             Self::lookup_merged_exact_key_from_opened_tables(&base, &current, &tombstones, &key)?
         } else {
-            Self::lookup_merged_from_opened_tables(&base, &current, &tombstones, parent, name)?
+            Self::lookup_merged_from_opened_tables(
+                &base,
+                &current,
+                &tombstones,
+                || Self::open_folded_dentry_indexes_in_write_txn(txn),
+                parent,
+                name,
+            )?
         };
         let Some(entry) = entry else {
             return Ok(None);
@@ -1194,14 +1223,8 @@ impl RedbMetaEngine {
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
-        Self::remove_existing_dentry_index_in_txn(
-            txn,
-            DENTRIES_TABLE,
-            DENTRIES_BY_INODE_TABLE,
-            parent,
-            name,
-        )?;
-        Self::insert_dentry_index_in_txn(txn, DENTRIES_BY_INODE_TABLE, parent, name, entry)?;
+        Self::remove_existing_dentry_index_in_txn(txn, SERVING_DENTRY_TABLES, parent, name)?;
+        Self::insert_dentry_index_in_txn(txn, SERVING_DENTRY_TABLES, parent, name, entry)?;
 
         let mut tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
@@ -1223,13 +1246,7 @@ impl RedbMetaEngine {
         name: &[u8],
     ) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
-        Self::remove_existing_dentry_index_in_txn(
-            txn,
-            DENTRIES_TABLE,
-            DENTRIES_BY_INODE_TABLE,
-            parent,
-            name,
-        )?;
+        Self::remove_existing_dentry_index_in_txn(txn, SERVING_DENTRY_TABLES, parent, name)?;
 
         let mut dentries = txn
             .open_table(DENTRIES_TABLE)
@@ -1277,13 +1294,7 @@ impl RedbMetaEngine {
         name: &[u8],
     ) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
-        Self::remove_existing_dentry_index_in_txn(
-            txn,
-            DENTRIES_TABLE,
-            DENTRIES_BY_INODE_TABLE,
-            parent,
-            name,
-        )?;
+        Self::remove_existing_dentry_index_in_txn(txn, SERVING_DENTRY_TABLES, parent, name)?;
 
         let mut dentries = txn
             .open_table(DENTRIES_TABLE)
@@ -1305,14 +1316,8 @@ impl RedbMetaEngine {
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
-        Self::remove_existing_dentry_index_in_txn(
-            txn,
-            BASE_DENTRIES_TABLE,
-            BASE_DENTRIES_BY_INODE_TABLE,
-            parent,
-            name,
-        )?;
-        Self::insert_dentry_index_in_txn(txn, BASE_DENTRIES_BY_INODE_TABLE, parent, name, entry)?;
+        Self::remove_existing_dentry_index_in_txn(txn, BASE_DENTRY_TABLES, parent, name)?;
+        Self::insert_dentry_index_in_txn(txn, BASE_DENTRY_TABLES, parent, name, entry)?;
 
         let data = encode(entry)?;
         let mut dentries = txn
@@ -1328,13 +1333,7 @@ impl RedbMetaEngine {
         name: &[u8],
     ) -> MetaResult<()> {
         let key = encode_dentry_key(parent, name);
-        Self::remove_existing_dentry_index_in_txn(
-            txn,
-            BASE_DENTRIES_TABLE,
-            BASE_DENTRIES_BY_INODE_TABLE,
-            parent,
-            name,
-        )?;
+        Self::remove_existing_dentry_index_in_txn(txn, BASE_DENTRY_TABLES, parent, name)?;
         let mut dentries = txn
             .open_table(BASE_DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1342,17 +1341,21 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    /// Rebuilds every secondary index of `tables` from its dentry rows.
     pub(super) fn rebuild_dentry_index_in_txn(
         txn: &redb::WriteTransaction,
-        dentry_table_def: TableDefinition<&[u8], &[u8]>,
-        index_table_def: TableDefinition<&[u8], u8>,
+        tables: DentryTables,
     ) -> MetaResult<()> {
-        Self::clear_table_in_txn(txn, index_table_def)?;
+        Self::clear_table_in_txn(txn, tables.by_inode)?;
+        Self::clear_table_in_txn(txn, tables.by_folded_name)?;
         let dentries = txn
-            .open_table(dentry_table_def)
+            .open_table(tables.dentries)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut index = txn
-            .open_table(index_table_def)
+        let mut by_inode = txn
+            .open_table(tables.by_inode)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut by_folded_name = txn
+            .open_table(tables.by_folded_name)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         for row in dentries
@@ -1363,43 +1366,58 @@ impl RedbMetaEngine {
             let (parent, name) = decode_dentry_key(key.value())?;
             let entry: DirEntryValue = decode(value.value())?;
             let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
-            index.insert(index_key.as_slice(), 1)?;
+            by_inode.insert(index_key.as_slice(), 1)?;
+            let folded_key = encode_folded_dentry_key(parent, name)?;
+            by_folded_name.insert(folded_key.as_slice(), 1)?;
         }
         Ok(())
     }
 
     pub(super) fn insert_dentry_index_in_txn(
         txn: &redb::WriteTransaction,
-        index_table_def: TableDefinition<&[u8], u8>,
+        tables: DentryTables,
         parent: Ino,
         name: &[u8],
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
         let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
         let mut index = txn
-            .open_table(index_table_def)
+            .open_table(tables.by_inode)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         index.insert(index_key.as_slice(), 1)?;
+        drop(index);
+
+        let folded_key = encode_folded_dentry_key(parent, name)?;
+        let mut by_folded_name = txn
+            .open_table(tables.by_folded_name)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        by_folded_name.insert(folded_key.as_slice(), 1)?;
         Ok(())
     }
 
     pub(super) fn remove_existing_dentry_index_in_txn(
         txn: &redb::WriteTransaction,
-        dentry_table_def: TableDefinition<&[u8], &[u8]>,
-        index_table_def: TableDefinition<&[u8], u8>,
+        tables: DentryTables,
         parent: Ino,
         name: &[u8],
     ) -> MetaResult<()> {
-        // Only the exact key is removed below, so only its own index row may go with it.
-        let Some(entry) = Self::lookup_exact_in_write_table(txn, dentry_table_def, parent, name)?
+        // Only the exact key is removed below, so only its own index rows may go with it.
+        let Some(entry) = Self::lookup_exact_in_write_table(txn, tables.dentries, parent, name)?
         else {
             return Ok(());
         };
         let index_key = encode_dentry_by_inode_key(entry.ino, parent, name);
         let mut index = txn
-            .open_table(index_table_def)
+            .open_table(tables.by_inode)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         index.remove(index_key.as_slice())?;
+        drop(index);
+
+        let folded_key = encode_folded_dentry_key(parent, name)?;
+        let mut by_folded_name = txn
+            .open_table(tables.by_folded_name)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        by_folded_name.remove(folded_key.as_slice())?;
         Ok(())
     }
 

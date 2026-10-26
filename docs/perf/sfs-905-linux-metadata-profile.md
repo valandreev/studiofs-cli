@@ -15,7 +15,7 @@ of the SFS-904 rename growth.
 - A size change right after a write on an open handle waited out the whole
   deferred-materialization linger (6 × 200 ms). Fixed: 1,216 ms to 10 ms.
 - Rename cost in a large directory comes from a case-insensitive directory scan
-  on every negative lookup. Tracked in SFS-904.
+  on every negative lookup. Fixed in SFS-904: 3.34 ms to 0.26 ms.
 
 ## Stand
 
@@ -139,7 +139,7 @@ Strict size changes now interrupt and wait for the task, like flush and fsync.
 Handle-backed growth, which may overtake materialization, only asks the task to
 stop lingering while it waits for the gate.
 
-## Tracked: rename cost grows with directory size (SFS-904)
+## Fixed in SFS-904: rename cost grows with directory size
 
 In `rename-big`, 50% of FUSE-thread samples are under
 `RedbMetaEngine::lookup`, mostly `redb::table::Range::next`. A lookup that
@@ -150,6 +150,18 @@ target name, so each rename scans the directory twice (FUSE `lookup` and
 `rename_atomic`). The fix needs a persistent case-folded dentry index
 maintained by local writes and replication apply, so it is tracked in SFS-904
 instead of being fixed here.
+
+SFS-904 added the case-folded dentry indexes `dentries_by_folded_name` and
+`base_dentries_by_folded_name`, so a miss visits only names that fold to the
+requested name. With a stub in place of `perf` (wall and `/proc` CPU only, same
+script, release build, fresh volume, remote S3 and PostgreSQL), two runs gave:
+
+| Phase | Wall ms/op | FUSE |
+|---|---|---|
+| rename | 0.228 / 0.245 | 0.13 / 0.14 |
+| rename-big | 0.258 / 0.261 | 0.17 / 0.17 |
+
+Rename with 8,000 extra entries is within 7–13% of the empty-directory case.
 
 ## Regression tests
 
