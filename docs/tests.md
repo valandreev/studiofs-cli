@@ -38,7 +38,7 @@ Run the four focused contract checks:
 ```powershell
 cargo test -p studiofs --test architecture_vocabulary_test pg_sync_contract_contains_required_invariants -- --nocapture
 cargo test -p studiofs --test architecture_vocabulary_test related_docs_link_to_canonical_pg_sync_contract -- --nocapture
-cargo test -p studiofs --test architecture_vocabulary_test configuration_docs_label_pg_sync_target_behavior -- --nocapture
+cargo test -p studiofs --test architecture_vocabulary_test configuration_docs_describe_pg_sync_checkpoint_bootstrap -- --nocapture
 cargo test -p studiofs --test architecture_vocabulary_test active_docs_drop_superseded_pg_startup_wording -- --nocapture
 ```
 
@@ -216,14 +216,14 @@ Run these focused checks when changing PostgreSQL worker ownership, startup
 schema validation, or foreground lock schema behavior:
 
 ```bash
-cargo test -p studiofs-meta prepare_for_close_does_not_block_forever_on_slow_background_thread -- --nocapture
+cargo test -p studiofs-meta prepare_for_close_retains_timed_out_worker_for_successful_retry -- --nocapture
 cargo test -p studiofs-meta prepare_for_close_serializes_lazy_worker_registration -- --nocapture
-cargo test -p studiofs-meta shutdown_releases_worker_state_before_joining_workers -- --nocapture
+cargo test -p studiofs-meta successful_shutdown_joins_every_registered_worker_type -- --nocapture
 cargo test -p studiofs-meta concurrent_shutdown_callers_wait_for_terminal_result -- --nocapture
 cargo test -p studiofs-meta metadata_notify_start_skips_start_lock_when_already_registered -- --nocapture
 cargo test -p studiofs-meta prepare_for_close_is_idempotent_when_no_workers_are_running -- --nocapture
 cargo test -p studiofs-meta dropping_engine_signals_background_workers_without_waiting -- --nocapture
-cargo test -p studiofs-meta postgres_startup_fallback_keeps_timeout_typed -- --nocapture
+cargo test -p studiofs-meta postgres_startup_reachability_classification_keeps_timeout_typed -- --nocapture
 cargo test -p studiofs-meta test_pg_foreground_file_lock_does_not_repair_missing_schema -- --ignored --nocapture
 cargo test -p studiofs-meta test_pg_lock_notify_listener_releases_engine_after_drop -- --ignored --nocapture
 cargo test -p studiofs init_pg_schema_provisions_volume_encryption_metadata -- --nocapture
@@ -270,7 +270,7 @@ PostgreSQL retention regressions:
 cargo test -p studiofs-meta event_log_pruning --lib -- --nocapture
 cargo test -p studiofs-meta pg_event_log_prune_deletes_complete_batches_in_bounded_transactions --lib -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-meta pg_event_log_prune_preserves_retained_snapshot_source_events --lib -- --ignored --nocapture --test-threads=1
-cargo test -p studiofs-meta pg_event_log_prune_defers_when_the_janitor_lock_is_contended --lib -- --ignored --nocapture --test-threads=1
+cargo test -p studiofs-meta pg_event_log_prune_defers_when_its_lock_is_contended --lib -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-meta pg_foreign_event_page_rejects_a_pruned_replay_gap --lib -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-meta pg_foreign_event_page_rejects_an_empty_replay_window --lib -- --ignored --nocapture --test-threads=1
 cargo test -p studiofs-meta decoded_replay_batches_reject_an_intra_page_gap --lib -- --nocapture
@@ -293,7 +293,7 @@ startup timeout classification, or metadata error mappings:
 cargo test -p studiofs-meta studio_pg_dsns_debug_omits_credentials_and_full_dsns -- --nocapture
 cargo test -p studiofs-meta invalid_dsn_errors_omit_the_original_dsn -- --nocapture
 cargo test -p studiofs-meta credential_bearing_format_debug_omits_all_secret_values -- --nocapture
-cargo test -p studiofs-meta postgres_startup_fallback_keeps_timeout_typed -- --nocapture
+cargo test -p studiofs-meta postgres_startup_reachability_classification_keeps_timeout_typed -- --nocapture
 cargo test -p studiofs-meta transport_unavailability_excludes_reachable_session_mismatch -- --nocapture
 cargo test -p studiofs-vfs classify_vfs_error_preserves_repair_category -- --nocapture
 cargo test -p studiofs-vfs classify_vfs_error_preserves_remote_unavailable_category -- --nocapture
@@ -727,7 +727,7 @@ Focused harness checks:
 cargo test -p studiofs-meta contract_core_harness_runs_ops_and_reopens_with_invariants -- --nocapture
 cargo test -p studiofs-meta contract_core_harness -- --nocapture
 cargo test -p studiofs-meta sfs314_ -- --nocapture
-cargo test -p studiofs-meta sfs315_ -- --nocapture
+cargo test -p studiofs-meta sfs623_ -- --nocapture
 cargo test -p studiofs-meta sfs316_ -- --nocapture
 cargo test -p studiofs-vfs contract_vfs_harness_reopens_fixture_and_runs_core_invariants -- --nocapture
 cargo test -p studiofs-vfs sfs312_ -- --nocapture
@@ -1308,7 +1308,7 @@ regressions:
   - `many_snapshots_do_not_grow_serving_checkpoint_or_event_payloads`
   - `test_pg_reopen_after_publish_before_local_persist_recovers_without_discover`
   - `test_pg_reopen_after_unpublished_local_create_flushes_without_discover`
-  - `sfs315_reopen_consumes_persisted_inode_and_object_headroom_without_pg`
+  - `sfs623_allocator_state_restarts_after_the_reserved_tail`
   - `sfs316_reachability_reports_active_base_and_overlay`
   - `sfs316_publish_queues_displaced_objects_and_reachability_scan_is_idempotent`
   - `sfs316_delete_before_publish_tombstone_does_not_publish_deleted_content`
@@ -1326,8 +1326,7 @@ regressions:
   - `regular_file_overlay_batch_rolls_back_on_middle_failure`
 
 - Metadata authority and headroom
-  - `sfs315_failed_object_batch_preserves_smaller_inode_headroom`
-  - `sfs315_large_object_batch_replaces_undersized_prefetched_window`
+  - `sfs623_allocator_state_reserves_a_final_partial_batch`
   - `sfs623_read_only_allocator_blocks_new_mutations_but_keeps_reads_open`
 
 - Payload-object identifier layout
