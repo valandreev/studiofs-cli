@@ -245,7 +245,10 @@ const WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS: u64 = 100;
 const WRITE_ADMISSION_RUNWAY_TARGET_MS: u64 = 2_500;
 const WRITE_ADMISSION_MAX_DELAY_MS: u64 = 10;
 const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
+#[cfg(test)]
 const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
+/// Safety-net re-check while a hard admission wait sleeps on the drain signal.
+const WRITE_ADMISSION_HARD_WAIT_RECHECK: Duration = Duration::from_millis(250);
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
 const SUSTAINED_WRITE_DELAY_START_MS: u64 = 1_500;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
@@ -7593,14 +7596,16 @@ impl StudioVfs {
     }
 
     fn record_write_admission_wait(&self, waited: Duration) {
-        let waited_ms = waited.as_millis().min(u128::from(u64::MAX)) as u64;
-        if waited_ms == 0 {
-            return;
-        }
+        // A drain-signalled wake can finish within a millisecond; it is still
+        // a hard admission wait event.
         self.state
             .metrics
             .drain_lag_pacing_events
             .fetch_add(1, Ordering::Relaxed);
+        let waited_ms = waited.as_millis().min(u128::from(u64::MAX)) as u64;
+        if waited_ms == 0 {
+            return;
+        }
         self.state
             .metrics
             .drain_lag_pacing_total_ms
@@ -7627,7 +7632,18 @@ impl StudioVfs {
         while writer_stack_pressure_bytes > hard_window_bytes && !self.shutdown_requested() {
             hard_wait_started.get_or_insert_with(Instant::now);
 
-            tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)).await;
+            // Register for the drain signal before re-sampling so a drain that
+            // lands between the sample and the await still wakes this writer.
+            let drained = self.state.writer_stack.dirty_drained();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            let pressure = self.write_admission_pressure();
+            pressure_bytes = pressure.total_bytes();
+            writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
+            if writer_stack_pressure_bytes <= hard_window_bytes || self.shutdown_requested() {
+                break;
+            }
+            let _ = tokio::time::timeout(WRITE_ADMISSION_HARD_WAIT_RECHECK, drained).await;
             let pressure = self.write_admission_pressure();
             pressure_bytes = pressure.total_bytes();
             writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;

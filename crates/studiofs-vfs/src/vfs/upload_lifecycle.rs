@@ -723,6 +723,9 @@ impl StudioVfs {
                 ShutdownClaim::Completed(error) => return replay_shutdown_result(error),
             }
         };
+        // Release writes parked on hard admission so they observe the request
+        // and drop the mutating-operation gate that shutdown acquires next.
+        self.state.writer_stack.wake_dirty_drain_waiters();
         let background_join_timeout = Duration::from_secs(2);
         let _mutating_operation_admission = tokio::time::timeout(
             background_join_timeout,

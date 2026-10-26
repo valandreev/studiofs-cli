@@ -11415,26 +11415,33 @@ fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
             )
             .unwrap();
 
-        let admission_vfs = Arc::clone(&vfs);
-        let wait_task =
-            tokio::spawn(async move { admission_vfs.maybe_throttle_write_admission(1).await });
-        tokio::time::sleep(Duration::from_millis(
-            WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 3 + 10,
-        ))
-        .await;
+        struct WakeFlag(std::sync::atomic::AtomicBool);
+        impl std::task::Wake for WakeFlag {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let woken = Arc::new(WakeFlag(std::sync::atomic::AtomicBool::new(false)));
+        let waker = std::task::Waker::from(Arc::clone(&woken));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut admission = std::pin::pin!(vfs.maybe_throttle_write_admission(1));
         assert!(
-            !wait_task.is_finished(),
-            "admission should keep waiting while writer-stack pressure remains above the hard window"
+            std::future::Future::poll(admission.as_mut(), &mut cx).is_pending(),
+            "admission should park while writer-stack pressure remains above the hard window"
         );
+        assert!(!woken.0.load(Ordering::Acquire));
 
+        // Draining capacity must wake the parked writer directly, not after a
+        // re-check quantum: the drain itself signals the waker.
         vfs.state.writer_stack.clear_inode(attr.ino);
-        tokio::time::timeout(
-            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2),
-            wait_task,
-        )
-        .await
-        .expect("admission should unblock after writer-stack pressure drops")
-        .expect("admission task should not panic");
+        assert!(
+            woken.0.load(Ordering::Acquire),
+            "writer-stack drain should wake the parked admission waiter"
+        );
+        assert!(
+            std::future::Future::poll(admission.as_mut(), &mut cx).is_ready(),
+            "admission should complete once writer-stack pressure drops"
+        );
         assert!(
             vfs.state
                 .metrics
