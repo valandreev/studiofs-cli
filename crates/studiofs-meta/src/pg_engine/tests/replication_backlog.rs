@@ -3851,6 +3851,46 @@ fn hidden_pending_window_grows_without_reprojecting_unpublished_overlay_history(
 }
 
 #[test]
+fn visible_pending_window_extends_over_events_of_an_unmarked_concurrent_mutation() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    for index in 0..8u32 {
+        pg.create_dir(ROOT_INO, format!("dir-{index}").as_bytes(), 0, 0, 0o755)
+            .expect("create visible directory");
+    }
+    pg.rename(ROOT_INO, b"dir-0", ROOT_INO, b"moved-0")
+        .expect("rename seeds the visible window cache");
+    // A concurrent mutation commits but has not marked its range yet.
+    pg.local
+        .rename(ROOT_INO, b"dir-1", ROOT_INO, b"moved-1")
+        .expect("unmarked local rename");
+    pg.rename(ROOT_INO, b"dir-2", ROOT_INO, b"moved-2")
+        .expect("rename after the unmarked mutation");
+
+    let (event_start, event_end, ops) = {
+        let state = pg.pending_state.lock().expect("pending state");
+        (
+            state.event_start.expect("visible window"),
+            state.event_end,
+            state.ops,
+        )
+    };
+    let after_seq = pg.local.get_counter(NEXT_EVENT_SEQ).expect("after seq");
+    assert_eq!(
+        event_end, after_seq,
+        "the window must cover the unmarked events"
+    );
+    let events = pg
+        .local
+        .read_events_range(event_start, after_seq)
+        .expect("read window");
+    assert_eq!(
+        ops,
+        RemoteApplyCoordinator::project_local_batch(&events).visible_ops,
+        "the extended count must match a full projection of the window"
+    );
+}
+
+#[test]
 fn visible_pending_window_grows_without_reprojecting_published_namespace_history() {
     use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
 

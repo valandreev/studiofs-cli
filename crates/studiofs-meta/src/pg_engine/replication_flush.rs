@@ -749,7 +749,7 @@ impl PgMetaEngine {
             return Ok(false);
         }
         if let Some(needs_eager_flush) =
-            self.extend_visible_pending_window(&mut state, before_seq, after_seq, now)?
+            self.extend_visible_pending_window(&mut state, after_seq, now)?
         {
             return Ok(needs_eager_flush);
         }
@@ -831,9 +831,9 @@ impl PgMetaEngine {
         Ok(projected.needs_eager_flush)
     }
 
-    /// Extends a remote-visible pending window by the mutation
-    /// `[before_seq, after_seq)` without decoding the window again, and
-    /// returns whether the window needs an eager flush.
+    /// Extends a remote-visible pending window through `after_seq` without
+    /// decoding the window again, and returns whether the window needs an
+    /// eager flush.
     ///
     /// Concurrent writers keep extending the window while a flush is
     /// in flight, so re-projecting it on every mutation is quadratic in the
@@ -844,26 +844,29 @@ impl PgMetaEngine {
     fn extend_visible_pending_window(
         &self,
         state: &mut PendingReplicationState,
-        before_seq: u64,
         after_seq: u64,
         now: Instant,
     ) -> MetaResult<Option<bool>> {
         let Some(event_start) = state.event_start else {
             return Ok(None);
         };
-        if state.ops == 0 || before_seq != state.event_end {
+        // Concurrent mutations mark in any order and their ranges may
+        // overlap, so extend from the window's end: `[event_end, after_seq)`
+        // holds only committed events, whichever mutation wrote them.
+        let window_end = state.event_end;
+        if state.ops == 0 || after_seq <= window_end {
             return Ok(None);
         }
         let mut cached = self.lock_pending_visible_window();
         let Some(window) = cached.as_mut().filter(|window| {
             window.event_start == event_start
-                && window.event_end == before_seq
+                && window.event_end == window_end
                 && window.projection.visible_ops() == state.ops
         }) else {
             return Ok(None);
         };
-        let suffix = self.local.read_events_range(before_seq, after_seq)?;
-        let complete = u64::try_from(suffix.len()).ok() == Some(after_seq - before_seq);
+        let suffix = self.local.read_events_range(window_end, after_seq)?;
+        let complete = u64::try_from(suffix.len()).ok() == Some(after_seq - window_end);
         if !complete || !window.projection.extend(&suffix) {
             *cached = None;
             return Ok(None);
