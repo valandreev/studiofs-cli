@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - feature/wasabi-repo-snapshot-check
   workflow_dispatch:
 
 permissions:
