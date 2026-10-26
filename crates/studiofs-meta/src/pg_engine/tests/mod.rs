@@ -511,6 +511,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         inflight_replication_ops: AtomicU32::new(0),
         pending_state: Mutex::new(PendingReplicationState::default()),
         pending_hidden_window: Mutex::new(None),
+        pending_visible_window: Mutex::new(None),
         remote_runtime: PgRemoteRuntime::new("studiofs-pg-remote-runtime-test")
             .expect("unit test remote runtime"),
         allocator_runtime: Mutex::new(AllocatorRuntime::default()),

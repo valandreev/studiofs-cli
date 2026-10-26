@@ -239,6 +239,9 @@ pub struct PgMetaEngine {
     /// Projection of the pending window while it holds no remote-visible
     /// operation. Locked only while `pending_state` is held.
     pending_hidden_window: Mutex<Option<PendingHiddenWindow>>,
+    /// Projection of the pending window while it holds remote-visible
+    /// operations. Locked only while `pending_state` is held.
+    pending_visible_window: Mutex<Option<PendingVisibleWindow>>,
     remote_runtime: runtime::PgRemoteRuntime,
     allocator_runtime: Mutex<inode_allocator::AllocatorRuntime>,
     allocator_refill_lock: Mutex<()>,
@@ -425,6 +428,15 @@ struct PendingHiddenWindow {
     event_start: u64,
     event_end: u64,
     projection: remote_apply::HiddenWindowProjection,
+}
+
+/// Cached projection of a remote-visible pending event window
+/// `[event_start, event_end)`, valid under the same rule as
+/// [`PendingHiddenWindow`].
+struct PendingVisibleWindow {
+    event_start: u64,
+    event_end: u64,
+    projection: remote_apply::VisibleWindowProjection,
 }
 
 /// Half-open local journal sequence range: `start` is included and `end` is excluded.
@@ -1621,6 +1633,7 @@ impl PgMetaEngine {
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
             pending_hidden_window: Mutex::new(None),
+            pending_visible_window: Mutex::new(None),
             remote_runtime: runtime::PgRemoteRuntime::new("studiofs-pg-remote-runtime")?,
             allocator_runtime: Mutex::new(inode_allocator::AllocatorRuntime::default()),
             allocator_refill_lock: Mutex::new(()),

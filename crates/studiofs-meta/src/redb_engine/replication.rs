@@ -2348,17 +2348,35 @@ impl RedbMetaEngine {
             let (parent, name) = decode_dentry_key(key)?;
             let base_entry =
                 Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)?;
-            let invalidation_scope = txn.invalidation_scope();
+            let serving_entry =
+                Self::lookup_exact_in_write_table(txn, DENTRIES_TABLE, parent, name)?;
             let binding_before = Self::invalidation_binding(txn, key)?;
-            Self::invalidate_replica_entry(txn, parent, name, None)?;
-            if let Some(entry) = &base_entry {
-                Self::set_dentry_in_txn(txn, parent, name, entry)?;
-                Self::invalidate_replica_inode(txn, entry.ino, false)?;
-            } else {
-                Self::remove_dentry_mirror_in_txn(txn, parent, name)?;
-            }
-            if Self::invalidation_binding(txn, key)? == binding_before {
-                invalidation_scope.discard();
+            // Most keys already serve their base binding, so write first and
+            // derive intents only for a binding that actually changed; they
+            // match what journaling before the write would have recorded.
+            txn.without_invalidations(|| match &base_entry {
+                Some(entry) => Self::set_dentry_in_txn(txn, parent, name, entry),
+                None => Self::remove_dentry_mirror_in_txn(txn, parent, name),
+            })?;
+            if Self::invalidation_binding(txn, key)? != binding_before
+                && !txn.invalidations_suppressed()
+            {
+                #[cfg(test)]
+                record_replica_invalidation_derivation();
+                txn.invalidate(InvalidationIntent::Entry {
+                    parent,
+                    name: name.to_vec(),
+                    ancestors: Self::invalidation_ancestors(txn, parent)?,
+                    ino: binding_before.as_ref().map(|entry| entry.ino),
+                });
+                txn.invalidate(InvalidationIntent::Directory { ino: parent });
+                txn.invalidate(InvalidationIntent::Attributes { ino: parent });
+                for displaced in [&serving_entry, &base_entry].into_iter().flatten() {
+                    txn.invalidate(InvalidationIntent::Attributes { ino: displaced.ino });
+                }
+                if let Some(entry) = &base_entry {
+                    Self::invalidate_replica_inode(txn, entry.ino, false)?;
+                }
             }
             changed = true;
         }
@@ -2519,6 +2537,160 @@ impl RedbMetaEngine {
         )?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Reconciles serving state toward base for this client's own
+    /// acknowledged renames and keeps their intents only when the reconcile
+    /// changed what the serving view exposes.
+    ///
+    /// The mounted kernel already performed these renames through the local
+    /// serving view, so re-announcing an unchanged result would only purge
+    /// cache state and mark the page as a serving correction. The scope covers
+    /// both names and the moved inode with every name bound to it, which is
+    /// everything the rename reconcile may rewrite.
+    pub(crate) fn reconcile_own_serving_renames_from_base_in_txn<'event>(
+        txn: &RedbWriteTransaction<'_>,
+        events: impl IntoIterator<Item = &'event crate::events::MetaEvent>,
+        local_removals: &mut ReplayLocalJournal,
+    ) -> MetaResult<bool> {
+        let renames: Vec<_> = events
+            .into_iter()
+            .filter(|event| matches!(event, crate::events::MetaEvent::RenameEntry { .. }))
+            .collect();
+        if renames.is_empty() {
+            return Ok(false);
+        }
+        let mut scope = ReplayScope::default();
+        for event in &renames {
+            if let crate::events::MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                ..
+            } = event
+            {
+                scope.inodes.extend([*parent, *new_parent, entry.ino]);
+                scope.dentry_keys.insert(encode_dentry_key(*parent, name));
+                scope
+                    .dentry_keys
+                    .insert(encode_dentry_key(*new_parent, new_name));
+            }
+        }
+        let before = Self::replay_scope_view(txn, &scope)?;
+        // Descendant paths are not part of the captured view, and their
+        // historical ancestry is what the kernel cached, so a directory
+        // rename derives them before writing and keeps them only on a real
+        // change.
+        let descendant_scope = txn.invalidation_scope();
+        for event in &renames {
+            if let crate::events::MetaEvent::RenameEntry { entry, .. } = event
+                && entry.kind == FileType::Directory
+            {
+                Self::invalidate_directory_descendants(txn, entry.ino)?;
+            }
+        }
+        // Reconcile without deriving the remaining intents up front: for this
+        // client's own renames the view almost never changes. A real
+        // correction journals the intents the reconcile would have derived
+        // before writing, from the captured pre-write view.
+        txn.without_invalidations(|| -> MetaResult<()> {
+            for event in &renames {
+                if let crate::events::MetaEvent::RenameEntry {
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    entry,
+                    ..
+                } = event
+                {
+                    Self::reconcile_serving_rename_from_base_in_txn(
+                        txn,
+                        *parent,
+                        name,
+                        *new_parent,
+                        new_name,
+                        entry,
+                        local_removals,
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+        if Self::replay_scope_view(txn, &scope)? != before && !txn.invalidations_suppressed() {
+            Self::journal_rename_reconcile_intents(txn, &renames, &scope, &before)?;
+        } else {
+            descendant_scope.discard();
+        }
+        Ok(true)
+    }
+
+    /// Journals, after the write, the name and inode intents
+    /// [`Self::reconcile_serving_rename_from_base_in_txn`] derives before it,
+    /// using the bindings captured in `before`. Directory descendants are
+    /// derived by the caller before the write.
+    fn journal_rename_reconcile_intents(
+        txn: &RedbWriteTransaction<'_>,
+        renames: &[&crate::events::MetaEvent],
+        scope: &ReplayScope,
+        before: &ReplayScopeView,
+    ) -> MetaResult<()> {
+        let bindings_before: HashMap<&Vec<u8>, &Option<DirEntryValue>> =
+            scope.dentry_keys.iter().zip(&before.dentries).collect();
+        let inode_names_before: HashMap<Ino, &BTreeMap<Vec<u8>, DirEntryValue>> = scope
+            .inodes
+            .iter()
+            .zip(&before.inodes)
+            .map(|(ino, ((_, dentries), _))| (*ino, dentries))
+            .collect();
+        let journal_entry = |parent: Ino, name: &[u8], ino: Option<Ino>| -> MetaResult<()> {
+            #[cfg(test)]
+            record_replica_invalidation_derivation();
+            txn.invalidate(InvalidationIntent::Entry {
+                parent,
+                name: name.to_vec(),
+                ancestors: Self::invalidation_ancestors(txn, parent)?,
+                ino,
+            });
+            txn.invalidate(InvalidationIntent::Directory { ino: parent });
+            txn.invalidate(InvalidationIntent::Attributes { ino: parent });
+            if let Some(ino) = ino {
+                txn.invalidate(InvalidationIntent::Attributes { ino });
+            }
+            Ok(())
+        };
+        for event in renames {
+            let crate::events::MetaEvent::RenameEntry {
+                parent,
+                name,
+                new_parent,
+                new_name,
+                entry,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            for (parent, name) in [(*parent, name), (*new_parent, new_name)] {
+                let key = encode_dentry_key(parent, name);
+                let ino = bindings_before
+                    .get(&key)
+                    .and_then(|binding| binding.as_ref())
+                    .map(|binding| binding.ino)
+                    .or(Some(entry.ino));
+                journal_entry(parent, name, ino)?;
+            }
+            txn.invalidate(InvalidationIntent::Attributes { ino: entry.ino });
+            if let Some(names) = inode_names_before.get(&entry.ino) {
+                for key in names.keys() {
+                    let (parent, name) = decode_dentry_key(key)?;
+                    journal_entry(parent, name, Some(entry.ino))?;
+                }
+            }
+        }
         Ok(())
     }
 

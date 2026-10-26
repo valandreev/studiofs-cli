@@ -54,9 +54,22 @@ pub(crate) struct PendingInvalidations {
     intents: Vec<InvalidationIntent>,
     bytes: usize,
     seen: HashSet<InvalidationIntent>,
+    /// Classified on journaling, before deduplication or an overflow to
+    /// `Reset` can hide which intent was recorded.
+    serving_correction: bool,
 }
 
 impl PendingInvalidations {
+    /// Records that an intent journaled into this scope announces a
+    /// serving correction rather than cleanup of an exempt inode.
+    pub(crate) fn note_serving_correction(&mut self) {
+        self.serving_correction = true;
+    }
+
+    pub(crate) fn has_serving_correction(&self) -> bool {
+        self.serving_correction
+    }
+
     pub(crate) fn push(&mut self, intent: InvalidationIntent) {
         if matches!(self.intents.first(), Some(InvalidationIntent::Reset)) {
             return;
@@ -101,6 +114,7 @@ impl PendingInvalidations {
 
     /// Appends every intent of `scoped`, as if each had been pushed here.
     pub(crate) fn absorb(&mut self, scoped: Self) {
+        self.serving_correction |= scoped.serving_correction;
         for intent in scoped.intents {
             self.push(intent);
         }

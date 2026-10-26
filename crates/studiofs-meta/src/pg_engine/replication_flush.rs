@@ -1,9 +1,10 @@
 //! Owns local event replication backlog claims and flush completion.
 
-use super::remote_apply::HiddenWindowProjection;
+use super::remote_apply::{HiddenWindowProjection, VisibleWindowProjection};
 use super::{
     ClaimedPendingBatch, LocalEventRange, PendingHiddenWindow, PendingMutationHint,
-    PendingReplicationState, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
+    PendingReplicationState, PendingVisibleWindow, PgMetaEngine, RecentFlush,
+    RemoteApplyCoordinator,
 };
 use crate::engine::{MetaError, MetaInodes, MetaNamespace, MetaResult};
 use crate::events::MetaEvent;
@@ -28,6 +29,50 @@ pub(super) enum PendingServingReplay {
     /// Only local journal progress changed since the local mutations wrote
     /// serving state themselves, as after a flush push or rejection.
     Skip,
+}
+
+/// How a pending-state restore decides on [`PendingServingReplay`].
+#[derive(Clone, Copy)]
+enum PendingServingReplayMode<'a> {
+    Fixed(PendingServingReplay),
+    /// Replay only when a pending event touches one of these inodes.
+    UnlessTouching(&'a HashSet<Ino>),
+}
+
+impl PendingServingReplayMode<'_> {
+    fn resolve(self, pending_events: &[MetaEvent]) -> PendingServingReplay {
+        match self {
+            Self::Fixed(serving_replay) => serving_replay,
+            Self::UnlessTouching(inodes) if inodes.is_empty() => PendingServingReplay::Skip,
+            Self::UnlessTouching(inodes) => {
+                if pending_events
+                    .iter()
+                    .any(|event| event_touches_any_inode(event, inodes))
+                {
+                    PendingServingReplay::Replay
+                } else {
+                    PendingServingReplay::Skip
+                }
+            }
+        }
+    }
+}
+
+fn event_touches_any_inode(event: &MetaEvent, inodes: &HashSet<Ino>) -> bool {
+    let mut keys = super::remote_apply::OverlayConflictSets::default();
+    RemoteApplyCoordinator::add_event_overlay_conflicts(&mut keys, event);
+    let entry_ino = match event {
+        MetaEvent::AddEntry { entry, .. } | MetaEvent::RenameEntry { entry, .. } => Some(entry.ino),
+        _ => None,
+    };
+    keys.attr_inodes
+        .iter()
+        .chain(&keys.block_inodes)
+        .chain(&keys.remove_attr_inodes)
+        .chain(&keys.symlink_inodes)
+        .chain(&keys.xattr_inodes)
+        .chain(entry_ino.iter())
+        .any(|ino| inodes.contains(ino))
 }
 
 struct SelectedLocalEvents<'a> {
@@ -386,10 +431,44 @@ impl PgMetaEngine {
         self.restore_pending_state_from_local_log_locked(state, PendingServingReplay::Replay)
     }
 
+    /// Restore pending state after a replay page of only this client's own
+    /// batches that left the serving view unchanged, while the caller holds
+    /// both locks in canonical order.
+    ///
+    /// Such a page mirrors already-served events into `base_*`; serving
+    /// reconciliation journals an intent for every real correction, so with
+    /// none journaled the local mutations' serving rows are intact and the
+    /// pending events need no replay. The one serving write a self page makes
+    /// without an intent is clearing the regular-file graph of a removed
+    /// inode, so a pending event on such an inode still forces the replay.
+    /// Skipping it keeps the page from re-applying the whole unflushed
+    /// backlog while every foreground mutation waits on `pending_state`.
+    pub(super) fn restore_pending_state_after_self_page_with_state(
+        &self,
+        state: &mut PendingReplicationState,
+        cleared_inodes: &HashSet<Ino>,
+    ) -> MetaResult<()> {
+        self.restore_pending_state_from_local_log_with_mode(
+            state,
+            PendingServingReplayMode::UnlessTouching(cleared_inodes),
+        )
+    }
+
     fn restore_pending_state_from_local_log_locked(
         &self,
         state: &mut PendingReplicationState,
         serving_replay: PendingServingReplay,
+    ) -> MetaResult<()> {
+        self.restore_pending_state_from_local_log_with_mode(
+            state,
+            PendingServingReplayMode::Fixed(serving_replay),
+        )
+    }
+
+    fn restore_pending_state_from_local_log_with_mode(
+        &self,
+        state: &mut PendingReplicationState,
+        mode: PendingServingReplayMode<'_>,
     ) -> MetaResult<()> {
         let mut event_start = self.flushed_event_seq.load(Ordering::SeqCst);
         let event_end = self
@@ -434,6 +513,7 @@ impl PgMetaEngine {
             Self::clear_pending_state(state);
             return Ok(());
         }
+        let serving_replay = mode.resolve(pending_events);
         let selected = self.select_unprocessed_local_events(event_start, pending_events)?;
         let projected = RemoteApplyCoordinator::project_local_batch(selected.events.as_ref());
         // Retire local-only completion snapshots before replay can resurrect their overlays.
@@ -747,6 +827,11 @@ impl PgMetaEngine {
         if self.extend_hidden_pending_window(&mut state, before_seq, after_seq, now)? {
             return Ok(false);
         }
+        if let Some(needs_eager_flush) =
+            self.extend_visible_pending_window(&mut state, after_seq, now)?
+        {
+            return Ok(needs_eager_flush);
+        }
         if state.ops > 0 && state.event_start.is_some() && before_seq >= state.event_end {
             // A local-only suffix cannot change the already projected remote
             // operation count. Keep it in the range so a later flush can
@@ -815,7 +900,75 @@ impl PgMetaEngine {
         state.event_start = Some(event_start);
         state.event_end = state.event_end.max(after_seq);
         state.force_flush = projected.needs_eager_flush || state.ops >= self.flush_ops_threshold;
+        if state.event_end == after_seq {
+            *self.lock_pending_visible_window() = Some(PendingVisibleWindow {
+                event_start,
+                event_end: after_seq,
+                projection: VisibleWindowProjection::from_events(&events, &projected),
+            });
+        }
         Ok(projected.needs_eager_flush)
+    }
+
+    /// Extends a remote-visible pending window through `after_seq` without
+    /// decoding the window again, and returns whether the window needs an
+    /// eager flush.
+    ///
+    /// Concurrent writers keep extending the window while a flush is
+    /// in flight, so re-projecting it on every mutation is quadratic in the
+    /// window and serializes every writer on `pending_state`. Returns `None`
+    /// when the cached projection does not name this window or cannot prove
+    /// that the earlier events keep their projection; the caller then
+    /// re-projects the whole window.
+    fn extend_visible_pending_window(
+        &self,
+        state: &mut PendingReplicationState,
+        after_seq: u64,
+        now: Instant,
+    ) -> MetaResult<Option<bool>> {
+        let Some(event_start) = state.event_start else {
+            return Ok(None);
+        };
+        // Concurrent mutations mark in any order and their ranges may
+        // overlap, so extend from the window's end: `[event_end, after_seq)`
+        // holds only committed events, whichever mutation wrote them.
+        let window_end = state.event_end;
+        if state.ops == 0 || after_seq <= window_end {
+            return Ok(None);
+        }
+        let mut cached = self.lock_pending_visible_window();
+        let Some(window) = cached.as_mut().filter(|window| {
+            window.event_start == event_start
+                && window.event_end == window_end
+                && window.projection.visible_ops() == state.ops
+        }) else {
+            return Ok(None);
+        };
+        let suffix = self.local.read_events_range(window_end, after_seq)?;
+        let complete = u64::try_from(suffix.len()).ok() == Some(after_seq - window_end);
+        if !complete || !window.projection.extend(&suffix) {
+            *cached = None;
+            return Ok(None);
+        }
+        window.event_end = after_seq;
+        let needs_eager_flush = window.projection.needs_eager_flush();
+        state.ops = window.projection.visible_ops();
+        state.last_mutation_at = Some(now);
+        state.event_end = after_seq;
+        state.force_flush = needs_eager_flush || state.ops >= self.flush_ops_threshold;
+        Ok(Some(needs_eager_flush))
+    }
+
+    /// Same poisoning rule as [`Self::lock_pending_hidden_window`].
+    fn lock_pending_visible_window(&self) -> MutexGuard<'_, Option<PendingVisibleWindow>> {
+        self.pending_visible_window
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                self.pending_visible_window.clear_poison();
+                let mut cached = poisoned.into_inner();
+                *cached = None;
+                cached
+            })
     }
 
     /// Extends a pending window that projects no remote-visible operation by
