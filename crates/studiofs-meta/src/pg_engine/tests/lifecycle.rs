@@ -4330,6 +4330,16 @@ fn permanent_allocator_bootstrap_failure_is_not_retried() {
     engine
         .try_complete_catchup_sync()
         .expect("permanent allocator failure remains read-only");
+    assert_eq!(
+        engine.pg_sync_diagnostics().last_sync_error,
+        Some(PgSyncFailure::Storage)
+    );
+    engine
+        .remote_identity_validated
+        .store(true, std::sync::atomic::Ordering::Release);
+    engine
+        .remote_format_validated
+        .store(true, std::sync::atomic::Ordering::Release);
     engine.retry_allocator_bootstrap_now_for_test();
     let sync_result = Ok(false);
     engine.record_metadata_sync_result(MetadataSyncSource::FallbackPoll, &sync_result, false);
