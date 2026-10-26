@@ -40,7 +40,8 @@ The script records per run:
 
 - fio throughput;
 - foreground write time (sum of psync request latency) and `end_fsync` time;
-- sectors written to the cache block device and host `Dirty+Writeback`;
+- sectors written to the cache block device (blank when the cache is not a
+  block device, such as tmpfs) and host `Dirty+Writeback`;
 - upload pending bytes from `.studiofs-runtime-stats`;
 - write-admission wait, hard-backpressure events, and local cache I/O time
   (`write_path_observability.json`).

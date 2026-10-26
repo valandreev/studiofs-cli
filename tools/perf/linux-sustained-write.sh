@@ -42,15 +42,19 @@ BLOCK_SIZE=1M
 OUT=""
 KEEP_FILES=0
 SYNC_BETWEEN=0
+# Fail with usage, not an unbound-variable error, when a flag lacks its value.
+need_value() {
+  [ "$2" -ge 2 ] || { echo "missing value for $1" >&2; usage >&2; exit 2; }
+}
 while [ $# -gt 0 ]; do
   case "$1" in
-    --target) TARGET=$2; shift 2 ;;
-    --mount-root) MOUNT_ROOT=$2; shift 2 ;;
-    --cache-root) CACHE_ROOT=$2; shift 2 ;;
-    --runs) RUNS=$2; shift 2 ;;
-    --size) SIZE=$2; shift 2 ;;
-    --block-size) BLOCK_SIZE=$2; shift 2 ;;
-    --out) OUT=$2; shift 2 ;;
+    --target) need_value "$1" $#; TARGET=$2; shift 2 ;;
+    --mount-root) need_value "$1" $#; MOUNT_ROOT=$2; shift 2 ;;
+    --cache-root) need_value "$1" $#; CACHE_ROOT=$2; shift 2 ;;
+    --runs) need_value "$1" $#; RUNS=$2; shift 2 ;;
+    --size) need_value "$1" $#; SIZE=$2; shift 2 ;;
+    --block-size) need_value "$1" $#; BLOCK_SIZE=$2; shift 2 ;;
+    --out) need_value "$1" $#; OUT=$2; shift 2 ;;
     --keep-files) KEEP_FILES=1; shift ;;
     --sync-between) SYNC_BETWEEN=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -59,6 +63,10 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$TARGET" ] || { usage >&2; exit 2; }
 [ -d "$TARGET" ] || { echo "target is not a directory: $TARGET" >&2; exit 2; }
+if [ -n "$CACHE_ROOT" ] && [ ! -d "$CACHE_ROOT" ]; then
+  echo "cache root is not a directory: $CACHE_ROOT" >&2
+  exit 2
+fi
 command -v fio >/dev/null || { echo "fio is required" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 2; }
 
@@ -76,9 +84,17 @@ fi
 
 # Block device that backs the cache root (or the target for raw runs).
 disk_probe=${CACHE_ROOT:-$TARGET}
-DISK_DEV=$(basename "$(df --output=source "$disk_probe" | tail -1)")
+disk_source=$(df --output=source "$disk_probe" | tail -1)
+# Resolve /dev/mapper/* and /dev/disk/by-* links to the kernel name diskstats uses.
+DISK_DEV=$(basename "$(readlink -f "$disk_source" 2>/dev/null || echo "$disk_source")")
+if ! awk -v dev="$DISK_DEV" '$3==dev {found=1} END {exit !found}' /proc/diskstats; then
+  echo "warning: $disk_probe is on '$disk_source' with no /proc/diskstats row; disk_written_mib is not measured" >&2
+  DISK_DEV=""
+fi
+# Prints nothing when the device is not a block device in /proc/diskstats.
 disk_sectors_written() {
-  awk -v dev="$DISK_DEV" '$3==dev {print $10; found=1} END {if (!found) print 0}' /proc/diskstats
+  [ -n "$DISK_DEV" ] || return 0
+  awk -v dev="$DISK_DEV" '$3==dev {print $10}' /proc/diskstats
 }
 
 now_ms() { date +%s%3N; }
@@ -111,7 +127,7 @@ PY
 {
   echo "target=$TARGET"
   echo "cache_root=${CACHE_ROOT:-none}"
-  echo "disk_device=$DISK_DEV"
+  echo "disk_device=${DISK_DEV:-unmeasured ($disk_source)}"
   echo "target_fs=$(df -T "$TARGET" | tail -1 | awk '{print $2}')"
   echo "cache_fs=$(df -T "$disk_probe" | tail -1 | awk '{print $2}')"
   echo "runs=$RUNS size=$SIZE block_size=$BLOCK_SIZE sync_between=$SYNC_BETWEEN"
@@ -151,7 +167,10 @@ for i in $(seq 1 "$RUNS"); do
   copy_fresh_wpo "$OUT/wpo-after-$i.json" "$finished_ms"
   python3 - "$OUT" "$i" "$sectors_before" "$sectors_after" "$dirty_kib" <<'PY' >>"$OUT/summary.tsv"
 import json, os, sys
-out, run, before, after = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+out, run = sys.argv[1], sys.argv[2]
+# Empty sector counts mean the cache disk is not a measurable block device.
+before = int(sys.argv[3]) if sys.argv[3] else None
+after = int(sys.argv[4]) if sys.argv[4] else None
 dirty_kib = int(sys.argv[5])
 job = json.load(open(os.path.join(out, f"fio-{run}.json")))["jobs"][0]
 write = job["write"]
@@ -188,7 +207,7 @@ print("\t".join([
     f"{max(runtime_ms - write_ms, 0):.0f}",
     f"{write['lat_ns']['mean'] / 1e3:.1f}",
     f"{write['lat_ns']['max'] / 1e6:.1f}",
-    f"{(after - before) * 512 / 2**20:.0f}",
+    f"{(after - before) * 512 / 2**20:.0f}" if before is not None and after is not None else "",
     f"{dirty_kib / 1024:.0f}",
     pending,
     admission,
