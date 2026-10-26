@@ -128,26 +128,26 @@ pub(crate) fn decide_open_cache(
     let generation = generation.into();
     let stable_generation = generation.disposition == OsCacheDisposition::Reuse
         && generation.reason == OsCacheReason::StableGeneration;
+    // Read-only content the VFS can serve coherently on every kernel read.
+    // Without `keep_cache`, the kernel purges the inode mapping after the open
+    // reply, so only reads issued after this decision populate pages (ADR 0011).
+    let kernel_readable =
+        generation.reason.observes_generation() || generation.reason == OsCacheReason::LocalDirty;
 
     match policy {
         LinuxFuseCachePolicy::Direct => LinuxOpenCacheDecision::direct(false),
-        LinuxFuseCachePolicy::Adaptive if write_capable => LinuxOpenCacheDecision::direct(false),
+        LinuxFuseCachePolicy::Adaptive if write_capable || !kernel_readable => {
+            LinuxOpenCacheDecision::direct(false)
+        }
         LinuxFuseCachePolicy::Adaptive
             if available_memory.is_some_and(|available| file_size > available) =>
         {
             LinuxOpenCacheDecision::direct(true)
         }
-        LinuxFuseCachePolicy::Adaptive if stable_generation && available_memory.is_none() => {
+        LinuxFuseCachePolicy::Adaptive if available_memory.is_none() => {
             // Without fresh memory telemetry, conservatively bypass the page cache
             // and count it as a memory bypass so a dead sampler is visible.
             LinuxOpenCacheDecision::direct(true)
-        }
-        LinuxFuseCachePolicy::Adaptive if !stable_generation => {
-            // A new generation must be read through VFS before the kernel may
-            // retain pages for reuse. This closes the race where an open
-            // arrives before the asynchronous inode invalidation reaches the
-            // kernel page cache.
-            LinuxOpenCacheDecision::direct(false)
         }
         LinuxFuseCachePolicy::Adaptive => LinuxOpenCacheDecision::kernel(stable_generation, false),
         LinuxFuseCachePolicy::Kernel => {
@@ -422,7 +422,6 @@ mod tests {
             OsCacheReason::UnknownState,
             OsCacheReason::UnknownHandle,
             OsCacheReason::NonRegular,
-            OsCacheReason::LocalDirty,
             OsCacheReason::ActiveWriter,
         ];
 
@@ -450,31 +449,25 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_clean_generation_uses_vfs_until_generation_is_stable() {
-        let first = decide_open_cache(
-            LinuxFuseCachePolicy::Adaptive,
-            false,
-            generation(OsCacheDisposition::Replace, OsCacheReason::FirstObservation),
-            64,
-            Some(1024),
-        );
-        assert!(first.direct_io);
-        assert!(!first.keep_cache);
-        assert_eq!(first.readahead, ReadAheadIntent::Vfs);
-
-        let changed = decide_open_cache(
-            LinuxFuseCachePolicy::Adaptive,
-            false,
-            generation(
-                OsCacheDisposition::Replace,
-                OsCacheReason::GenerationChanged,
-            ),
-            64,
-            Some(1024),
-        );
-        assert!(changed.direct_io);
-        assert!(!changed.keep_cache);
-        assert_eq!(changed.readahead, ReadAheadIntent::Vfs);
+    fn adaptive_unstable_read_only_opens_use_kernel_readahead_without_reuse() {
+        for reason in [
+            OsCacheReason::FirstObservation,
+            OsCacheReason::GenerationChanged,
+            OsCacheReason::LocalDirty,
+        ] {
+            let decision = decide_open_cache(
+                LinuxFuseCachePolicy::Adaptive,
+                false,
+                generation(OsCacheDisposition::Replace, reason),
+                64,
+                Some(1024),
+            );
+            assert!(!decision.direct_io, "{reason:?}");
+            assert!(!decision.keep_cache, "{reason:?} must purge earlier pages");
+            assert_eq!(decision.readahead, ReadAheadIntent::Kernel, "{reason:?}");
+            assert!(!decision.writeback_capable, "{reason:?}");
+            assert!(!decision.memory_bypassed, "{reason:?}");
+        }
 
         let stable = decide_open_cache(
             LinuxFuseCachePolicy::Adaptive,
@@ -483,8 +476,24 @@ mod tests {
             64,
             Some(1024),
         );
+        assert!(!stable.direct_io);
         assert!(stable.keep_cache);
         assert!(!stable.writeback_capable);
+    }
+
+    #[test]
+    fn adaptive_local_dirty_file_larger_than_available_memory_is_direct() {
+        let decision = decide_open_cache(
+            LinuxFuseCachePolicy::Adaptive,
+            false,
+            generation(OsCacheDisposition::Replace, OsCacheReason::LocalDirty),
+            1025,
+            Some(1024),
+        );
+
+        assert!(decision.direct_io);
+        assert!(decision.memory_bypassed);
+        assert_eq!(decision.readahead, ReadAheadIntent::Vfs);
     }
 
     #[test]
@@ -517,19 +526,25 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_memory_measurement_failure_uses_vfs_for_first_read() {
-        let decision = decide_open_cache(
-            LinuxFuseCachePolicy::Adaptive,
-            false,
-            generation(OsCacheDisposition::Replace, OsCacheReason::FirstObservation),
-            u64::MAX,
-            None,
-        );
+    fn adaptive_memory_measurement_failure_bypasses_unstable_generations() {
+        for reason in [
+            OsCacheReason::FirstObservation,
+            OsCacheReason::GenerationChanged,
+            OsCacheReason::LocalDirty,
+        ] {
+            let decision = decide_open_cache(
+                LinuxFuseCachePolicy::Adaptive,
+                false,
+                generation(OsCacheDisposition::Replace, reason),
+                u64::MAX,
+                None,
+            );
 
-        assert!(decision.direct_io);
-        assert!(!decision.keep_cache);
-        assert_eq!(decision.readahead, ReadAheadIntent::Vfs);
-        assert!(!decision.memory_bypassed);
+            assert!(decision.direct_io, "{reason:?}");
+            assert!(!decision.keep_cache, "{reason:?}");
+            assert_eq!(decision.readahead, ReadAheadIntent::Vfs, "{reason:?}");
+            assert!(decision.memory_bypassed, "{reason:?}");
+        }
     }
 
     #[test]
