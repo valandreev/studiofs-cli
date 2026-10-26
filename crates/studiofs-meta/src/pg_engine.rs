@@ -1309,12 +1309,8 @@ impl PgMetaEngine {
             .map_err(|_| MetaError::Storage("pg remote validation lock poisoned".to_string()))?;
         if !self.remote_format_validated.load(Ordering::Acquire) {
             let result = self.validate_remote_format_version();
-            if let Err(error) = &result {
-                self.record_metadata_source_result(&result);
-                self.invalidate_remote_validation();
-                self.remote_transport_unavailable
-                    .store(error.is_reachability_error(), Ordering::Release);
-                return result;
+            if result.is_err() {
+                return self.record_remote_operation_result(result);
             }
             self.remote_transport_unavailable
                 .store(false, Ordering::Release);

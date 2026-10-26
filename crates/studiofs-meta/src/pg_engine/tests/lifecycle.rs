@@ -337,6 +337,27 @@ fn pg_sync_diagnostics_tracks_redacted_error_and_page_completion() {
 }
 
 #[test]
+fn worker_shutdown_during_format_validation_preserves_remote_state() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    engine
+        .remote_transport_unavailable
+        .store(true, Ordering::Release);
+    engine.background_workers.signal_stop();
+    let result = {
+        let _scope = super::super::runtime::WorkerRemoteCancellationScope::enter();
+        engine.ensure_remote_format_validated()
+    };
+
+    assert!(
+        matches!(result, Err(MetaError::WorkerShutdownCancelled)),
+        "{result:?}"
+    );
+    assert!(engine.remote_identity_validated.load(Ordering::Acquire));
+    assert!(!engine.metadata_source_connected.load(Ordering::Acquire));
+    assert!(engine.remote_transport_unavailable.load(Ordering::Acquire));
+}
+
+#[test]
 fn checkpoint_worker_shutdown_cancellation_preserves_remote_validation() {
     let (_dir, engine) = temp_pg_engine_for_unit();
     engine
@@ -2295,6 +2316,85 @@ fn fresh_client_empty_volume_reaches_live_at_zero_target() {
             .expect("read assigned fresh-client slot")
             .is_some()
     );
+}
+
+#[test]
+fn prepare_for_close_cancels_poll_metadata_sync() {
+    for lifecycle in [PgSyncLifecycle::Live, PgSyncLifecycle::CatchingUp] {
+        let (_dir, engine) = temp_pg_engine_for_unit();
+        engine
+            .remote_format_validated
+            .store(true, Ordering::Release);
+        engine
+            .metadata_startup_target_version
+            .store(1, Ordering::Release);
+        engine
+            .pg_sync_lifecycle
+            .store(lifecycle as u8, Ordering::Release);
+        let engine = Arc::new(engine);
+        let weak = Arc::downgrade(&engine);
+        let release = tokio_util::sync::CancellationToken::new();
+        let release_step = release.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        engine.set_catch_up_fault_hook(Arc::new(move |point| {
+            if !matches!(point, CatchUpFaultPoint::BeforePageFetch { .. }) {
+                return Ok(());
+            }
+            let started_tx = started_tx.clone();
+            let release_step = release_step.clone();
+            let result = weak
+                .upgrade()
+                .expect("poll owns engine")
+                .run_async(async move {
+                    started_tx.send(()).expect("signal in-flight remote step");
+                    release_step.cancelled().await;
+                    Ok(())
+                });
+            result_tx.send(result.clone()).expect("send remote result");
+            result
+        }));
+        let handle = PgMetaEngine::start_background_poll(
+            Arc::downgrade(&engine),
+            Duration::from_secs(3600),
+            engine.background_workers.poll_shutdown(),
+            engine.background_workers.poll_wakeup(),
+        )
+        .expect("start poll worker");
+        engine
+            .background_workers
+            .install_handle(PgBackgroundWorker::Poll, handle)
+            .expect("install poll worker");
+        engine.background_workers.signal_poll_wakeup();
+        let started = started_rx.recv_timeout(Duration::from_secs(2));
+        let closed = engine
+            .background_workers
+            .shutdown(Duration::from_millis(200));
+        // Unblock the old implementation before asserting, so red runs retain no worker.
+        release.cancel();
+        engine
+            .background_workers
+            .shutdown(Duration::from_secs(2))
+            .expect("join released worker");
+        started.expect("poll reaches the remote step");
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("remote result");
+        assert!(
+            closed.is_ok(),
+            "{lifecycle:?} poll must cancel before close deadline: {closed:?}"
+        );
+        assert!(
+            matches!(result, Err(MetaError::WorkerShutdownCancelled)),
+            "{result:?}"
+        );
+        assert_eq!(engine.metadata_invalidation_diagnostics().sync_errors, 0);
+        assert_eq!(
+            engine.pg_sync_diagnostics().last_sync_error,
+            Some(PgSyncFailure::Cancelled)
+        );
+        assert!(engine.remote_format_validated.load(Ordering::Acquire));
+    }
 }
 
 #[test]

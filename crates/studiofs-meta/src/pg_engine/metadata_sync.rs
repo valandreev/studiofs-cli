@@ -145,6 +145,9 @@ impl PgMetaEngine {
                     );
                 }
             }
+            Err(error @ MetaError::WorkerShutdownCancelled) => {
+                self.record_pg_sync_failure(error);
+            }
             Err(error) => {
                 if !matches!(error, MetaError::CatchUpCancelled) {
                     self.metadata_sync_errors.fetch_add(1, Ordering::Relaxed);

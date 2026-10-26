@@ -50,6 +50,7 @@ impl PgMetaEngine {
         std::thread::Builder::new()
             .name("pg-meta-notify".into())
             .spawn(move || {
+                let _cancellation = super::runtime::WorkerRemoteCancellationScope::enter();
                 let mut attempted_listen = false;
                 let mut reconnect_delay =
                     Duration::from_millis(Self::METADATA_NOTIFY_RECONNECT_MIN_DELAY_MS);

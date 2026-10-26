@@ -595,6 +595,7 @@ impl PgMetaEngine {
         std::thread::Builder::new()
             .name("pg-meta-poll".into())
             .spawn(move || {
+                let _cancellation = super::runtime::WorkerRemoteCancellationScope::enter();
                 loop {
                     if shutdown.load(Ordering::Acquire) {
                         break;
@@ -678,7 +679,10 @@ impl PgMetaEngine {
                             );
                         }
                     } else if let Err(error) = sync_result
-                        && !matches!(&error, MetaError::CatchUpCancelled)
+                        && !matches!(
+                            &error,
+                            MetaError::CatchUpCancelled | MetaError::WorkerShutdownCancelled
+                        )
                     {
                         warn!(
                             error = %error,

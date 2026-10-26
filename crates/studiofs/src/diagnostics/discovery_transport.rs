@@ -6,8 +6,17 @@ pub(crate) fn discover_local_sessions() -> Result<Vec<LocalDiagnosticsDiscovery>
 
 fn is_expected_diagnostics_client_disconnect(error: &anyhow::Error) -> bool {
     // One-shot diagnostics clients close the pipe after their response (or
-    // after their timeout). Windows reports that peer disconnect as
-    // ERROR_NO_DATA instead of clean EOF.
+    // after their timeout). Unix reports a late response write as BrokenPipe;
+    // Windows reports the peer disconnect as ERROR_NO_DATA.
+    #[cfg(unix)]
+    {
+        error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::BrokenPipe)
+        })
+    }
+
     #[cfg(windows)]
     {
         error.chain().any(|cause| {
@@ -17,7 +26,7 @@ fn is_expected_diagnostics_client_disconnect(error: &anyhow::Error) -> bool {
         })
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = error;
         false
@@ -719,5 +728,20 @@ mod tests {
         assert!(!is_expected_diagnostics_client_disconnect(
             &other_pipe_error
         ));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn unix_client_broken_pipe_is_expected() {
+        let disconnect = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        let other_error =
+            anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+
+        assert!(is_expected_diagnostics_client_disconnect(&disconnect));
+        assert!(!is_expected_diagnostics_client_disconnect(&other_error));
     }
 }

@@ -59,8 +59,9 @@ If a worker already starting under that lock subsequently has its registration
 rejected, the manager retains its handle in the vacant worker slot for the next
 close attempt. A retry cannot report success before joining that worker.
 
-Remote checkpoint client futures respond to the shared shutdown token. This
-does not undo a remote statement PostgreSQL has already executed. Foreground
+Remote client futures on checkpoint, fallback-poll, and metadata-notify workers
+respond to the shared shutdown token. This does not undo a remote statement
+PostgreSQL has already executed. Foreground
 remote transactions retain their existing command timeout behavior. Checkpoint
 lock waits and local export, projection, encoding, and hashing check shutdown
 and the configured command timeout cooperatively. Cancellation may leave a
