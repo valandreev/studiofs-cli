@@ -73,6 +73,20 @@ starting services. See
 [`docs/perf/sfs-718-pg-sync-thresholds.md`](../../docs/perf/sfs-718-pg-sync-thresholds.md)
 for the SFS-718 decision and retained evidence.
 
+For SFS-893 Linux sustained sequential write attribution, use
+`linux-sustained-write.sh` against an already-mounted volume or a raw directory
+on the cache disk. It runs back-to-back fio sequential writes with
+`end_fsync=1` and splits each run into foreground write and `end_fsync` time.
+It also records cache-disk writes, host dirty pages, upload backlog,
+write-admission wait, and hard-backpressure events under
+`target/perf/linux-sustained-write-*`:
+
+    bash ./tools/perf/linux-sustained-write.sh --target /mnt/studio/myvolume --cache-root "$STUDIOFS_CLIENT_ROOT" --runs 4 --size 2G
+
+See
+[`docs/perf/sfs-893-linux-sustained-write.md`](../../docs/perf/sfs-893-linux-sustained-write.md)
+for the attribution report.
+
 ## Scope
 
 For this pass we care about two focused scenarios:
