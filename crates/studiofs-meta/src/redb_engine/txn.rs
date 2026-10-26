@@ -100,6 +100,8 @@ impl RedbMetaEngine {
         Ok(table.get(ino)?.is_some())
     }
 
+    /// Reference case-insensitive name equality; [`fold_dentry_name`] must agree with it.
+    #[cfg(test)]
     pub(super) fn names_equal_case_insensitive(
         left: &[u8],
         right: &[u8],
@@ -141,46 +143,6 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?
             .map(|entry| decode(entry.value()))
             .transpose()
-    }
-
-    pub(super) fn lookup_in_opened_dentry_table<T>(
-        table: &T,
-        parent: Ino,
-        name: &[u8],
-    ) -> MetaResult<Option<DirEntryValue>>
-    where
-        T: ReadableTable<&'static [u8], &'static [u8]>,
-    {
-        let key = encode_dentry_key(parent, name);
-
-        if let Ok(Some(entry)) = table.get(key.as_slice()) {
-            return decode(entry.value()).map(Some);
-        }
-
-        #[cfg(test)]
-        super::tests::CASE_FALLBACK_DENTRY_SCANS.with(|count| count.set(count.get() + 1));
-        let mut name_lower = None;
-        let prefix = dentry_prefix(parent);
-        let range_end = prefix_successor(&prefix);
-        let iter = match range_end.as_ref() {
-            Some(end) => table.range(prefix.as_slice()..end.as_ref()),
-            None => table.range(prefix.as_slice()..),
-        }
-        .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        for result in iter {
-            let (k, v) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let key_bytes = k.value();
-            let (decoded_parent, stored_name) = decode_dentry_key(key_bytes)?;
-            if decoded_parent != parent {
-                break;
-            }
-            if Self::names_equal_case_insensitive(stored_name, name, &mut name_lower) {
-                return decode(v.value()).map(Some);
-            }
-        }
-
-        Ok(None)
     }
 
     pub(super) fn readdir_from_opened_dentry_table<T>(
@@ -392,12 +354,11 @@ impl RedbMetaEngine {
         for rows in [current_rows, base_rows] {
             for row in rows {
                 let (folded_key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                if !folded_key.value().starts_with(&prefix) {
+                let Some(stored_name) = folded_key.value().strip_prefix(prefix.as_slice()) else {
                     break;
-                }
+                };
                 #[cfg(test)]
                 super::tests::FOLDED_DENTRY_INDEX_ROWS.with(|count| count.set(count.get() + 1));
-                let stored_name = decode_folded_dentry_name(folded_key.value(), &prefix)?;
                 let stored_key = encode_dentry_key(parent, stored_name);
                 let resolved = Self::lookup_merged_exact_key_from_opened_tables(
                     base,
@@ -546,7 +507,7 @@ impl RedbMetaEngine {
             }
             if !base_names.contains(overlay_name)
                 && let Some(entry) =
-                    Self::lookup_in_opened_dentry_table(current, parent, overlay_name)?
+                    Self::lookup_exact_in_opened_dentry_table(current, parent, overlay_name)?
             {
                 merged.insert(
                     overlay_name.to_vec(),
@@ -558,7 +519,8 @@ impl RedbMetaEngine {
                 );
             }
             if base_names.contains(overlay_name)
-                && Self::lookup_in_opened_dentry_table(current, parent, overlay_name)?.is_none()
+                && Self::lookup_exact_in_opened_dentry_table(current, parent, overlay_name)?
+                    .is_none()
             {
                 merged.remove(overlay_name);
             }
@@ -672,16 +634,44 @@ impl RedbMetaEngine {
             .ok_or(MetaError::InodeNotFound(ino))
     }
 
+    /// Looks up `(parent, name)` in one dentry table, falling back to a
+    /// case-insensitive match through that table's case-folded index.
     pub(super) fn lookup_in_write_table(
         txn: &redb::WriteTransaction,
-        table_def: TableDefinition<&[u8], &[u8]>,
+        tables: DentryTables,
         parent: Ino,
         name: &[u8],
     ) -> MetaResult<Option<DirEntryValue>> {
         let table = txn
-            .open_table(table_def)
+            .open_table(tables.dentries)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Self::lookup_in_opened_dentry_table(&table, parent, name)
+        if let Some(entry) = Self::lookup_exact_in_opened_dentry_table(&table, parent, name)? {
+            return Ok(Some(entry));
+        }
+
+        #[cfg(test)]
+        super::tests::CASE_FALLBACK_DENTRY_SCANS.with(|count| count.set(count.get() + 1));
+        let folded = txn
+            .open_table(tables.by_folded_name)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let prefix = folded_dentry_prefix(parent, name)?;
+        for row in folded
+            .range(prefix.as_slice()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (folded_key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let Some(stored_name) = folded_key.value().strip_prefix(prefix.as_slice()) else {
+                break;
+            };
+            #[cfg(test)]
+            super::tests::FOLDED_DENTRY_INDEX_ROWS.with(|count| count.set(count.get() + 1));
+            if let Some(entry) =
+                Self::lookup_exact_in_opened_dentry_table(&table, parent, stored_name)?
+            {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
     }
 
     /// Exact-key form of [`Self::lookup_in_write_table`] for mirror maintenance.

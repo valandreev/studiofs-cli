@@ -281,13 +281,6 @@ pub(super) fn encode_folded_dentry_key(parent: Ino, name: &[u8]) -> MetaResult<V
     Ok(key)
 }
 
-/// Decode the stored name from a case-folded index key under `prefix`.
-pub(super) fn decode_folded_dentry_name<'a>(key: &'a [u8], prefix: &[u8]) -> MetaResult<&'a [u8]> {
-    key.strip_prefix(prefix).ok_or_else(|| {
-        invalid_redb_key_len("dentry-by-folded-name", "the folded-name prefix", key.len())
-    })
-}
-
 fn invalid_redb_key_len(key_kind: &str, expected: &str, actual: usize) -> MetaError {
     MetaError::Storage(format!(
         "invalid redb {key_kind} key length: expected {expected}, got {actual}"

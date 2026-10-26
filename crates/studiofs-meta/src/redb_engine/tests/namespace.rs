@@ -1032,6 +1032,41 @@ fn case_insensitive_lookup_visits_only_folded_candidates_in_large_directory() {
 }
 
 #[test]
+fn single_table_case_insensitive_lookup_visits_only_folded_candidates() {
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    for index in 0..8_000 {
+        let entry = DirEntryValue {
+            ino: 1_000 + index,
+            kind: FileType::RegularFile,
+        };
+        let name = format!("entry-{index}");
+        RedbMetaEngine::set_base_dentry_in_txn(&txn, ROOT_INO, name.as_bytes(), &entry).unwrap();
+    }
+    for (name, expected, rows) in [
+        ("missing", None, 0),
+        ("ENTRY-7999", Some(8_999), 1),
+        ("entry-0", Some(1_000), 0),
+    ] {
+        FOLDED_DENTRY_INDEX_ROWS.set(0);
+        assert_eq!(
+            RedbMetaEngine::lookup_in_write_table(
+                &txn,
+                BASE_DENTRY_TABLES,
+                ROOT_INO,
+                name.as_bytes()
+            )
+            .unwrap()
+            .map(|entry| entry.ino),
+            expected,
+            "{name:?}"
+        );
+        assert_eq!(FOLDED_DENTRY_INDEX_ROWS.get(), rows, "{name:?}");
+    }
+    txn.abort().unwrap();
+}
+
+#[test]
 fn folded_dentry_names_match_case_insensitive_name_equality() {
     let names: [&[u8]; 14] = [
         b"abc",

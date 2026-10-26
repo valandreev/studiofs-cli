@@ -506,6 +506,7 @@ and opening an older database must rebuild them:
 ```sh
 cargo test -p studiofs-meta --lib rename_in_large_directory_visits_no_unrelated_dentry_rows -- --nocapture
 cargo test -p studiofs-meta --lib case_insensitive_lookup_visits_only_folded_candidates_in_large_directory -- --nocapture
+cargo test -p studiofs-meta --lib single_table_case_insensitive_lookup_visits_only_folded_candidates -- --nocapture
 cargo test -p studiofs-meta --lib folded_dentry_names_match_case_insensitive_name_equality -- --nocapture
 cargo test -p studiofs-meta --lib without_studiofs_format_migration -- --nocapture
 ```

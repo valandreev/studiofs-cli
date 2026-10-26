@@ -204,7 +204,7 @@ impl<'a> NamespaceCreateTxn<'a> {
             && matches!(spec.kind(), FileType::Directory | FileType::RegularFile)
             && RedbMetaEngine::lookup_in_write_table(
                 self.txn,
-                BASE_DENTRIES_TABLE,
+                BASE_DENTRY_TABLES,
                 spec.parent,
                 spec.name,
             )?
