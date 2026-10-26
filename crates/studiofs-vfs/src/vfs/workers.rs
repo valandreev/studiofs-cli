@@ -37,6 +37,36 @@ fn elapsed_ms(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Clock skew can date a pending deletion in the future; treat it as young
+/// instead of letting a negative age wrap to an arbitrarily old one.
+fn pending_deletion_is_old_enough(now_unix: i64, deleted_at_unix: i64, grace: Duration) -> bool {
+    u64::try_from(now_unix.saturating_sub(deleted_at_unix)).is_ok_and(|age| age >= grace.as_secs())
+}
+
+/// A `Retryable` finish releases the object-level reconciliation lease, so run
+/// every `RemoteConfirmed` finish for an object first and keep only one
+/// `Retryable` finish per object; later ones would match no leased row.
+fn order_reconciliation_finishes(
+    outcomes: &mut Vec<(
+        studiofs_meta::snapshot_ports::UploadedFragmentReconciliationClaim,
+        studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome,
+    )>,
+) {
+    use studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable;
+    outcomes.sort_by_key(|(claim, outcome)| {
+        (
+            claim.entry.object_id,
+            *outcome == Retryable,
+            claim.entry.fragment_index,
+        )
+    });
+    outcomes.dedup_by(|later, earlier| {
+        later.0.entry.object_id == earlier.0.entry.object_id
+            && later.1 == Retryable
+            && earlier.1 == Retryable
+    });
+}
+
 fn janitor_object_delete_keys(
     data_prefix: &str,
     object_id: u64,
@@ -3060,22 +3090,6 @@ impl StudioVfs {
     ) -> ControlFlow<()> {
         let cycle_started = Instant::now();
         self.janitor_shutdown_gate()?;
-
-        let meta = self.meta.clone();
-        let mut global_snapshot_pins =
-            match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.get_global_snapshot_pins()
-            })
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(cycle, error = %e, "janitor cycle skipped: snapshot pin query failed");
-                    return ControlFlow::Continue(());
-                }
-            };
-
-        self.janitor_shutdown_gate()?;
         let meta = self.meta.clone();
         let reconciliation_owner = format!("janitor-{cycle}");
         let claim_owner = reconciliation_owner.clone();
@@ -3103,12 +3117,13 @@ impl StudioVfs {
         debug!(
             cycle,
             claims = reconciliation_claim_count,
-            elapsed_ms = reconciliation_claims_started.elapsed().as_millis() as u64,
+            elapsed_ms = elapsed_ms(reconciliation_claims_started.elapsed()),
             "janitor reconciliation claims loaded"
         );
-        for claim in &reconciliation_claims {
-            global_snapshot_pins.insert(claim.entry.object_id);
-        }
+        let reconciliation_object_ids: Vec<u64> = reconciliation_claims
+            .iter()
+            .map(|claim| claim.entry.object_id)
+            .collect();
         let reconciliation_data_store = self.fetch_scheduler.data_store().clone();
         let reconciliation_proof_started = Instant::now();
         debug!(
@@ -3116,7 +3131,7 @@ impl StudioVfs {
             phase = "reconciliation_proof",
             "janitor phase started"
         );
-        let reconciliation_outcomes = futures::stream::iter(
+        let mut reconciliation_outcomes = futures::stream::iter(
             reconciliation_claims.into_iter().map(|claim| {
                 let shutdown = shutdown.clone();
                 let data_store = reconciliation_data_store.clone();
@@ -3127,21 +3142,52 @@ impl StudioVfs {
                         data_store.get_payload_by_key_with_stats(&claim.entry.object_key),
                     )
                     .await;
-                    let outcome = match proof {
+                    let entry = &claim.entry;
+                    let retry_reason = match proof {
                         TimeoutOrCancel::Completed(Ok((remote_payload, _))) => {
-                            let remote_bytes = remote_payload.to_bytes();
-                            let remote_sha256: [u8; 32] = Sha256::digest(&remote_bytes).into();
-                            if remote_bytes.len() as u64 == claim.entry.expected_byte_length
-                                && remote_sha256 == claim.entry.expected_sha256
-                            {
-                                studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed
+                            let actual_byte_length = remote_payload.len() as u64;
+                            if actual_byte_length != entry.expected_byte_length {
+                                debug!(
+                                    cycle,
+                                    object_id = entry.object_id,
+                                    fragment_index = entry.fragment_index,
+                                    expected_byte_length = entry.expected_byte_length,
+                                    actual_byte_length,
+                                    "janitor: reconciliation proof length mismatch"
+                                );
+                                Some("length_mismatch")
                             } else {
-                                studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
+                                let mut hasher = Sha256::new();
+                                for chunk in remote_payload {
+                                    hasher.update(&chunk);
+                                }
+                                let remote_sha256: [u8; 32] = hasher.finalize().into();
+                                (remote_sha256 != entry.expected_sha256).then_some("sha256_mismatch")
                             }
                         }
-                        TimeoutOrCancel::Completed(Err(_))
-                        | TimeoutOrCancel::TimedOut
-                        | TimeoutOrCancel::Cancelled => {
+                        TimeoutOrCancel::Completed(Err(error)) => {
+                            debug!(
+                                cycle,
+                                object_id = entry.object_id,
+                                fragment_index = entry.fragment_index,
+                                error = %error,
+                                "janitor: reconciliation proof read failed"
+                            );
+                            Some("read_failed")
+                        }
+                        TimeoutOrCancel::TimedOut => Some("timed_out"),
+                        TimeoutOrCancel::Cancelled => Some("cancelled"),
+                    };
+                    let outcome = match retry_reason {
+                        None => studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::RemoteConfirmed,
+                        Some(reason) => {
+                            debug!(
+                                cycle,
+                                object_id = entry.object_id,
+                                fragment_index = entry.fragment_index,
+                                reason,
+                                "janitor: reconciliation proof retryable"
+                            );
                             studiofs_meta::snapshot_ports::UploadedFragmentReconciliationOutcome::Retryable
                         }
                     };
@@ -3155,7 +3201,7 @@ impl StudioVfs {
         debug!(
             cycle,
             claims = reconciliation_outcomes.len(),
-            elapsed_ms = reconciliation_proof_started.elapsed().as_millis() as u64,
+            elapsed_ms = elapsed_ms(reconciliation_proof_started.elapsed()),
             "janitor reconciliation proofs completed"
         );
         let mut upload_reconciliation_confirmed: u64 = 0;
@@ -3172,6 +3218,7 @@ impl StudioVfs {
                 }
             }
         }
+        order_reconciliation_finishes(&mut reconciliation_outcomes);
         let reconciliation_finish_started = Instant::now();
         debug!(
             cycle,
@@ -3218,7 +3265,7 @@ impl StudioVfs {
             retryable = upload_reconciliation_retryable,
             finish_errors = upload_reconciliation_completion_errors,
             unfinished_claims,
-            elapsed_ms = reconciliation_finish_started.elapsed().as_millis() as u64,
+            elapsed_ms = elapsed_ms(reconciliation_finish_started.elapsed()),
             "janitor reconciliation claims finished"
         );
         self.janitor_shutdown_gate()?;
@@ -3254,9 +3301,28 @@ impl StudioVfs {
         debug!(
             cycle,
             referenced = referenced.len(),
-            elapsed_ms = references_started.elapsed().as_millis() as u64,
+            elapsed_ms = elapsed_ms(references_started.elapsed()),
             "janitor metadata references loaded"
         );
+        self.janitor_shutdown_gate()?;
+
+        // Load pins after references: a snapshot can only pin an object that
+        // was referenced when it was taken, so an object absent from both
+        // sets read in this order cannot be pinned by a concurrent snapshot.
+        let meta = self.meta.clone();
+        let mut global_snapshot_pins =
+            match run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.get_global_snapshot_pins()
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(cycle, error = %e, "janitor cycle skipped: snapshot pin query failed");
+                    return ControlFlow::Continue(());
+                }
+            };
+        global_snapshot_pins.extend(reconciliation_object_ids);
         self.janitor_shutdown_gate()?;
         let meta = self.meta.clone();
         let pending_map: HashMap<u64, i64> =
@@ -3348,7 +3414,7 @@ impl StudioVfs {
             TimeoutOrCancel::TimedOut | TimeoutOrCancel::Cancelled => {
                 debug!(
                     cycle,
-                    elapsed_ms = listing_started.elapsed().as_millis() as u64,
+                    elapsed_ms = elapsed_ms(listing_started.elapsed()),
                     "janitor object listing stopped before stream creation"
                 );
                 return self.janitor_shutdown_gate();
@@ -3356,7 +3422,7 @@ impl StudioVfs {
         };
         debug!(
             cycle,
-            elapsed_ms = listing_started.elapsed().as_millis() as u64,
+            elapsed_ms = elapsed_ms(listing_started.elapsed()),
             "janitor object listing stream opened"
         );
         let mut lister = std::pin::pin!(lister);
@@ -3441,22 +3507,17 @@ impl StudioVfs {
                 continue;
             }
             orphan_candidates = orphan_candidates.saturating_add(1);
-            let mut is_old_enough = false;
-            if let Some(ts) = pending_map.get(&object_id) {
-                let age = now_unix.saturating_sub(*ts) as u64;
-                if age >= self.janitor_skip_newer_than.as_secs() {
-                    is_old_enough = true;
-                }
+            let is_old_enough = if let Some(ts) = pending_map.get(&object_id) {
+                pending_deletion_is_old_enough(now_unix, *ts, self.janitor_skip_newer_than)
             } else if let Some(last_modified_st) = entry.last_modified {
                 let age = now
                     .duration_since(last_modified_st)
-                    .unwrap_or_else(|_| Duration::from_secs(0));
-                if age >= self.janitor_skip_newer_than {
-                    is_old_enough = true;
-                }
+                    .unwrap_or(Duration::ZERO);
+                age >= self.janitor_skip_newer_than
             } else {
                 skipped_unknown_age = skipped_unknown_age.saturating_add(1);
-            }
+                continue;
+            };
 
             if !is_old_enough {
                 skipped_young = skipped_young.saturating_add(1);
@@ -3464,10 +3525,15 @@ impl StudioVfs {
             }
 
             if shutdown.is_cancelled() {
+                shutdown_cancelled = true;
                 break;
             }
             deletion_queue.wait_for_slot().await;
-            if shutdown.is_cancelled() || deletion_queue.reached_cap() {
+            if shutdown.is_cancelled() {
+                shutdown_cancelled = true;
+                break;
+            }
+            if deletion_queue.reached_cap() {
                 break;
             }
 
@@ -3494,7 +3560,7 @@ impl StudioVfs {
         if listing_timed_out {
             warn!(
                 cycle,
-                elapsed_ms = scan_started.elapsed().as_millis() as u64,
+                elapsed_ms = elapsed_ms(scan_started.elapsed()),
                 "janitor object listing stream timed out"
             );
         }
@@ -3537,7 +3603,7 @@ impl StudioVfs {
             delete_errors,
             "janitor cycle complete"
         );
-        ControlFlow::Continue(())
+        self.janitor_shutdown_gate()
     }
 }
 
@@ -3650,6 +3716,57 @@ mod tests {
         assert_eq!(
             started_rx.try_recv().unwrap_err(),
             mpsc::error::TryRecvError::Disconnected
+        );
+    }
+
+    #[test]
+    fn future_dated_pending_deletion_is_not_old_enough() {
+        let grace = Duration::from_secs(900);
+        assert!(!pending_deletion_is_old_enough(1_000, 2_000, grace));
+        assert!(!pending_deletion_is_old_enough(1_000, 200, grace));
+        assert!(pending_deletion_is_old_enough(1_000, 100, grace));
+    }
+
+    #[test]
+    fn reconciliation_finishes_confirm_before_releasing_the_object_lease() {
+        use studiofs_meta::snapshot_ports::{
+            UploadedFragmentLedgerEntry, UploadedFragmentReconciliationClaim,
+            UploadedFragmentReconciliationOutcome::{RemoteConfirmed, Retryable},
+        };
+        let claim = |object_id, fragment_index| UploadedFragmentReconciliationClaim {
+            entry: UploadedFragmentLedgerEntry {
+                volume_id: 1,
+                object_id,
+                fragment_index,
+                object_key: String::new(),
+                expected_byte_length: 0,
+                expected_sha256: [0; 32],
+            },
+            fencing_token: 1,
+        };
+        // Completion order from buffer_unordered: fast failures arrive first.
+        let mut outcomes = vec![
+            (claim(7, 2), Retryable),
+            (claim(8, 0), Retryable),
+            (claim(7, 0), Retryable),
+            (claim(7, 1), RemoteConfirmed),
+            (claim(8, 1), RemoteConfirmed),
+        ];
+
+        order_reconciliation_finishes(&mut outcomes);
+
+        let order: Vec<_> = outcomes
+            .iter()
+            .map(|(claim, outcome)| (claim.entry.object_id, claim.entry.fragment_index, *outcome))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                (7, 1, RemoteConfirmed),
+                (7, 0, Retryable),
+                (8, 1, RemoteConfirmed),
+                (8, 0, Retryable),
+            ]
         );
     }
 
