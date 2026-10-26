@@ -283,7 +283,7 @@ impl StudioVfs {
         !self.shutdown_requested() && self.handle_table.write_open_count(ino) > 0
     }
 
-    fn deferred_materialization_linger_duration() -> Duration {
+    pub(super) fn deferred_materialization_linger_duration() -> Duration {
         Duration::from_millis(
             super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS
                 * super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES as u64,

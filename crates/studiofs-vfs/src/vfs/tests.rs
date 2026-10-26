@@ -19160,6 +19160,76 @@ fn deferred_namespace_barrier_takes_over_after_drain_stops_with_queued_work() {
 }
 
 #[test]
+fn deferred_namespace_barrier_drain_commits_without_batch_linger() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-namespace-barrier-no-linger");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        // A linger the barrier cannot outwait: it must commit without lingering.
+        vfs.state
+            .namespace
+            .deferred
+            .batch_linger_override_ms
+            .store(3_600_000, AtomicOrdering::Release);
+        let attr = InodeAttr::new_file(9_000_061, ROOT_INO, 0, 0, 0o644);
+        enqueue_deferred_namespace_create(&vfs, &attr, b"barrier-no-linger.txt");
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.drain_deferred_namespace_metadata_for_barrier(),
+        )
+        .await
+        .expect("barrier-owned drain must not linger for more admissions")
+        .expect("barrier should persist its operation");
+        assert_eq!(
+            meta.lookup(ROOT_INO, b"barrier-no-linger.txt")
+                .expect("load persisted entry")
+                .ino,
+            attr.ino
+        );
+    });
+}
+
+#[test]
+fn deferred_namespace_barrier_cuts_background_batch_linger_short() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-namespace-barrier-cuts-linger");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        vfs.state
+            .namespace
+            .deferred
+            .batch_linger_override_ms
+            .store(3_600_000, AtomicOrdering::Release);
+        let attr = InodeAttr::new_file(9_000_071, ROOT_INO, 0, 0, 0o644);
+        enqueue_deferred_namespace_create(&vfs, &attr, b"background-linger.txt");
+        vfs.schedule_deferred_namespace_metadata_drain(&tokio::runtime::Handle::current());
+        // The background drainer has popped the batch and is lingering.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !vfs.state.namespace.deferred.inner.lock().queue.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background drainer should pop the admitted operation");
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.drain_deferred_namespace_metadata_for_barrier(),
+        )
+        .await
+        .expect("barrier must cut the background batch linger short")
+        .expect("barrier should observe the committed operation");
+        assert_eq!(
+            meta.lookup(ROOT_INO, b"background-linger.txt")
+                .expect("load persisted entry")
+                .ino,
+            attr.ino
+        );
+    });
+}
+
+#[test]
 fn deferred_namespace_barrier_ignores_admissions_after_its_cutoff() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-namespace-barrier-cutoff");
@@ -25248,4 +25318,67 @@ fn pg_sync_catching_up_blocks_new_mutations_but_keeps_known_reads_open() {
         ),
         "unexpected fatal lifecycle statfs error: {fatal_statfs_error}"
     );
+}
+
+fn assert_size_change_after_deferred_write_interrupts_linger(name: &[u8], new_size: u64) {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "size-change-interrupts-materialize-linger");
+    let handle = rt.handle().clone();
+    let attr = vfs
+        .create_with_deferred_metadata_admission(ROOT_INO, name, 0, 0, 0o644, &handle)
+        .expect("create through deferred admission");
+    let ino = attr.ino;
+    let fh = vfs
+        .open_created_file_with_known_attr_and_read_ahead_owner(
+            &attr,
+            OpenFlags::WRONLY,
+            false,
+            ReadAheadOwner::Kernel,
+        )
+        .expect("open created file");
+    handle
+        .block_on(vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &[b'x'; 4096],
+            LocalSyncPolicy::Opportunistic,
+        ))
+        .expect("write through the FUSE deferred-materialize path");
+    // The deferred materialization task holds its session while it lingers.
+    let lingering = std::time::Instant::now();
+    while vfs
+        .state
+        .file_session
+        .debug_snapshot(ino)
+        .is_none_or(|session| session.active_shared_locks == 0)
+    {
+        assert!(
+            lingering.elapsed() < Duration::from_secs(10),
+            "the write must leave a lingering deferred materialization task"
+        );
+        std::thread::yield_now();
+    }
+
+    // Without an interrupt the size change waits out every linger retry.
+    let started = std::time::Instant::now();
+    let updated = vfs
+        .setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(new_size))
+        .expect("size change after write");
+    let elapsed = started.elapsed();
+    assert_eq!(updated.size, new_size);
+    assert!(
+        elapsed < StudioVfs::deferred_materialization_linger_duration(),
+        "size change must interrupt the deferred materialization linger, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn truncate_after_deferred_write_interrupts_materialization_linger() {
+    assert_size_change_after_deferred_write_interrupts_linger(b"truncate-after-write.bin", 100);
+}
+
+#[test]
+fn handle_growth_after_deferred_write_interrupts_materialization_linger() {
+    assert_size_change_after_deferred_write_interrupts_linger(b"grow-after-write.bin", 8192);
 }
