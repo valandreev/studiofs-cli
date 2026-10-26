@@ -6284,7 +6284,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_reader_stays_direct_with_active_writer_and_purges_pages_after_release() {
+    fn adaptive_local_dirty_reader_stays_direct_with_active_writer_and_caches_after_release() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "linux-fuse-local-dirty-page-cache",
         )
@@ -6346,16 +6346,9 @@ mod tests {
             .block_on(fixture.vfs().release_fh(writer.fh))
             .expect("release writer");
 
+        // The fixture is not started, so the upload stays pending.
         let reader = open(libc::O_RDONLY);
-        assert!(
-            matches!(
-                reader.reason,
-                studiofs_vfs::vfs::OsCacheReason::LocalDirty
-                    | studiofs_vfs::vfs::OsCacheReason::FirstObservation
-            ),
-            "unexpected reason {:?}",
-            reader.reason
-        );
+        assert_eq!(reader.reason, studiofs_vfs::vfs::OsCacheReason::LocalDirty);
         assert_eq!(
             reader.cache,
             super::LinuxFuseOpenCachePolicy {
@@ -8270,7 +8263,7 @@ mod tests {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-dirty-readahead")
                 .expect("create VFS fixture");
-        fixture.start().expect("start VFS fixture");
+        // Leave the fixture unstarted so uploads stay pending and reads are LocalDirty.
         let mount_point = std::env::temp_dir().join(format!(
             "studiofs-linux-fuse-dirty-readahead-{}",
             std::process::id()
@@ -8310,21 +8303,23 @@ mod tests {
                 // reader keeps its page-cache handle open across the rewrite.
                 // FUSE RELEASE is asynchronous, so an open can still observe
                 // the closing writer and stay direct.
-                let kernel_opens = || {
-                    vfs.write_path_observability_snapshot()
-                        .linux_fuse_open_cache
-                        .kernel_opens
+                let local_dirty_kernel_opens = || {
+                    let cache = vfs
+                        .write_path_observability_snapshot()
+                        .linux_fuse_open_cache;
+                    (cache.local_dirty, cache.kernel_opens)
                 };
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let mut held = loop {
-                    let before = kernel_opens();
+                    let (dirty_before, kernel_before) = local_dirty_kernel_opens();
                     let file = std::fs::File::open(&path)?;
-                    if kernel_opens() > before {
+                    let (dirty_after, kernel_after) = local_dirty_kernel_opens();
+                    if dirty_after > dirty_before && kernel_after > kernel_before {
                         break file;
                     }
                     assert!(
                         Instant::now() < deadline,
-                        "read-only open never used the kernel page cache"
+                        "locally dirty read-only open never used the kernel page cache"
                     );
                     drop(file);
                     thread::yield_now();

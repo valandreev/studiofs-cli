@@ -128,21 +128,25 @@ pub(crate) fn decide_open_cache(
     let generation = generation.into();
     let stable_generation = generation.disposition == OsCacheDisposition::Reuse
         && generation.reason == OsCacheReason::StableGeneration;
-    // Read-only content the VFS can serve coherently on every kernel read.
-    // Without `keep_cache`, the kernel purges the inode mapping after the open
-    // reply, so only reads issued after this decision populate pages (ADR 0011).
-    let kernel_readable =
-        generation.reason.observes_generation() || generation.reason == OsCacheReason::LocalDirty;
+    // Locally dirty bytes were written through this mount, so the kernel's
+    // cached size already covers them; the open reply without `keep_cache`
+    // purges older pages (ADR 0011, SFS-901 amendment).
+    let local_dirty = generation.reason == OsCacheReason::LocalDirty;
 
     match policy {
         LinuxFuseCachePolicy::Direct => LinuxOpenCacheDecision::direct(false),
-        LinuxFuseCachePolicy::Adaptive if write_capable || !kernel_readable => {
-            LinuxOpenCacheDecision::direct(false)
-        }
+        LinuxFuseCachePolicy::Adaptive if write_capable => LinuxOpenCacheDecision::direct(false),
         LinuxFuseCachePolicy::Adaptive
             if available_memory.is_some_and(|available| file_size > available) =>
         {
             LinuxOpenCacheDecision::direct(true)
+        }
+        LinuxFuseCachePolicy::Adaptive if !stable_generation && !local_dirty => {
+            // A first or changed generation can follow a peer change whose
+            // inode invalidation is still queued. The open purges cached pages
+            // but not the kernel's cached size, and page-cache reads stop at
+            // that size, so read through VFS until the generation is stable.
+            LinuxOpenCacheDecision::direct(false)
         }
         LinuxFuseCachePolicy::Adaptive if available_memory.is_none() => {
             // Without fresh memory telemetry, conservatively bypass the page cache
@@ -449,11 +453,10 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_unstable_read_only_opens_use_kernel_readahead_without_reuse() {
+    fn adaptive_clean_generation_uses_vfs_until_generation_is_stable() {
         for reason in [
             OsCacheReason::FirstObservation,
             OsCacheReason::GenerationChanged,
-            OsCacheReason::LocalDirty,
         ] {
             let decision = decide_open_cache(
                 LinuxFuseCachePolicy::Adaptive,
@@ -462,10 +465,9 @@ mod tests {
                 64,
                 Some(1024),
             );
-            assert!(!decision.direct_io, "{reason:?}");
-            assert!(!decision.keep_cache, "{reason:?} must purge earlier pages");
-            assert_eq!(decision.readahead, ReadAheadIntent::Kernel, "{reason:?}");
-            assert!(!decision.writeback_capable, "{reason:?}");
+            assert!(decision.direct_io, "{reason:?}");
+            assert!(!decision.keep_cache, "{reason:?}");
+            assert_eq!(decision.readahead, ReadAheadIntent::Vfs, "{reason:?}");
             assert!(!decision.memory_bypassed, "{reason:?}");
         }
 
@@ -479,6 +481,23 @@ mod tests {
         assert!(!stable.direct_io);
         assert!(stable.keep_cache);
         assert!(!stable.writeback_capable);
+    }
+
+    #[test]
+    fn adaptive_local_dirty_read_uses_kernel_readahead_without_reuse() {
+        let decision = decide_open_cache(
+            LinuxFuseCachePolicy::Adaptive,
+            false,
+            generation(OsCacheDisposition::Replace, OsCacheReason::LocalDirty),
+            64,
+            Some(1024),
+        );
+
+        assert!(!decision.direct_io);
+        assert!(!decision.keep_cache, "the open must purge earlier pages");
+        assert_eq!(decision.readahead, ReadAheadIntent::Kernel);
+        assert!(!decision.writeback_capable);
+        assert!(!decision.memory_bypassed);
     }
 
     #[test]
@@ -526,25 +545,35 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_memory_measurement_failure_bypasses_unstable_generations() {
-        for reason in [
-            OsCacheReason::FirstObservation,
-            OsCacheReason::GenerationChanged,
-            OsCacheReason::LocalDirty,
-        ] {
-            let decision = decide_open_cache(
-                LinuxFuseCachePolicy::Adaptive,
-                false,
-                generation(OsCacheDisposition::Replace, reason),
-                u64::MAX,
-                None,
-            );
+    fn adaptive_memory_measurement_failure_uses_vfs_for_first_read() {
+        let decision = decide_open_cache(
+            LinuxFuseCachePolicy::Adaptive,
+            false,
+            generation(OsCacheDisposition::Replace, OsCacheReason::FirstObservation),
+            u64::MAX,
+            None,
+        );
 
-            assert!(decision.direct_io, "{reason:?}");
-            assert!(!decision.keep_cache, "{reason:?}");
-            assert_eq!(decision.readahead, ReadAheadIntent::Vfs, "{reason:?}");
-            assert!(decision.memory_bypassed, "{reason:?}");
-        }
+        assert!(decision.direct_io);
+        assert!(!decision.keep_cache);
+        assert_eq!(decision.readahead, ReadAheadIntent::Vfs);
+        assert!(!decision.memory_bypassed);
+    }
+
+    #[test]
+    fn adaptive_memory_measurement_failure_bypasses_local_dirty_read() {
+        let decision = decide_open_cache(
+            LinuxFuseCachePolicy::Adaptive,
+            false,
+            generation(OsCacheDisposition::Replace, OsCacheReason::LocalDirty),
+            64,
+            None,
+        );
+
+        assert!(decision.direct_io);
+        assert!(!decision.keep_cache);
+        assert_eq!(decision.readahead, ReadAheadIntent::Vfs);
+        assert!(decision.memory_bypassed);
     }
 
     #[test]

@@ -390,16 +390,16 @@ dirty or newly changed files are unchanged by this work; SFS-901 covers them.
 
 ### SFS-901 Linux Page-Cache Reads After Local Writes
 
-Read-only opens of locally dirty, first-observed, or changed files used direct
-I/O, so every 4 KiB `read()` after a local write was one FUSE request. They now
-use the page cache with `keep_cache=false`; the race analysis is in the ADR 0011
-amendment. These tests pin the decision table, the direct reader beside an
-open writer, and, on a mount, kernel readahead plus the open-time purge seen by
-a handle that stays open across a rewrite:
+Read-only opens of locally dirty files used direct I/O, so every 4 KiB
+`read()` after a local write was one FUSE request. They now use the page cache
+with `keep_cache=false`; first or changed generations stay direct. The race
+analysis is in the ADR 0011 amendment. These tests pin the decision table, the
+direct reader beside an open writer, and, on a mount, kernel readahead plus the
+open-time purge seen by a handle that stays open across a rewrite:
 
 ```sh
 cargo test -p studiofs-linux-fuse --lib cache_policy -- --nocapture
-cargo test -p studiofs-linux-fuse --lib adaptive_reader_stays_direct_with_active_writer_and_purges_pages_after_release -- --nocapture
+cargo test -p studiofs-linux-fuse --lib adaptive_local_dirty_reader_stays_direct_with_active_writer_and_caches_after_release -- --nocapture
 cargo test -p studiofs-linux-fuse --lib mounted_local_dirty_reads_use_kernel_readahead_and_purge_on_reopen -- --ignored --nocapture
 ```
 

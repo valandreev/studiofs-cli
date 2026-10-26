@@ -498,12 +498,15 @@ errors to errno; queue draining and the redb barrier remain in shared VFS and
 metadata code.
 
 Linux regular-file opens use the adaptive cache policy by default. Read-only
-handles use the kernel page cache when they fit available memory, including
-locally dirty files that no write-capable handle has open; write-capable,
-actively written, unknown, and larger-than-memory files use direct I/O. A
-stable content generation enables `keep_cache`; a first or changed generation
-and locally dirty content open without it, so the kernel purges the inode's
-cached pages before serving the handle (ADR 0011, SFS-901 amendment). Set
+handles of stable generations or of locally dirty files that no write-capable
+handle has open use the kernel page cache when they fit available memory;
+write-capable, actively written, unknown, and larger-than-memory files use
+direct I/O. A
+stable content generation enables `keep_cache`. Locally dirty content opens
+without it, so the kernel purges the inode's cached pages before serving the
+handle. A first or changed generation is read with direct I/O until it is
+stable, because a queued peer invalidation may not have refreshed the kernel's
+cached file size yet (ADR 0011, SFS-901 amendment). Set
 `STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct` and remount for the operational
 rollback.
 
