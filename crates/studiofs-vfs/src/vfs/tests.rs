@@ -3693,6 +3693,9 @@ fn read_only_flush_does_not_wait_for_deferred_release_materialization() {
     });
 }
 
+/// Upper bound for a write admission that must not wait at all.
+const WRITE_ADMISSION_FAST_PATH_BOUND_MS: u64 = 20;
+
 const RAM_READAHEAD_TEST_MIB: usize = 1024 * 1024;
 
 /// Position-dependent bytes, so a misplaced chunk copy cannot match.
@@ -11251,7 +11254,7 @@ fn write_admission_first_sample_below_budget_without_pacing() {
             .unwrap();
 
         tokio::time::timeout(
-            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
+            Duration::from_millis(WRITE_ADMISSION_FAST_PATH_BOUND_MS / 2),
             vfs.maybe_throttle_write_admission(1),
         )
         .await
@@ -11305,7 +11308,7 @@ fn write_admission_does_not_sleep_for_soft_pressure_below_hard_window() {
         }
 
         tokio::time::timeout(
-            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
+            Duration::from_millis(WRITE_ADMISSION_FAST_PATH_BOUND_MS / 2),
             vfs.maybe_throttle_write_admission(buffer_budget_bytes / 10),
         )
         .await
@@ -11334,7 +11337,7 @@ fn write_admission_admits_oversized_write_when_pressure_is_empty() {
         vfs.set_max_dirty_bytes(buffer_budget_bytes);
 
         tokio::time::timeout(
-            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2),
+            Duration::from_millis(WRITE_ADMISSION_FAST_PATH_BOUND_MS * 2),
             vfs.maybe_throttle_write_admission(buffer_budget_bytes * 2 + 1),
         )
         .await
@@ -11380,11 +11383,119 @@ fn write_admission_ignores_pending_upload_backlog_for_hard_window() {
         );
 
         tokio::time::timeout(
-            Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS / 2),
+            Duration::from_millis(WRITE_ADMISSION_FAST_PATH_BOUND_MS / 2),
             vfs.maybe_throttle_write_admission(1),
         )
         .await
         .expect("pending upload backlog must not trigger hard admission wait");
+    });
+}
+
+/// Records whether a hand-polled future was woken, so wake tests need no sleeps.
+#[derive(Default)]
+struct WakeFlag(AtomicBool);
+
+impl WakeFlag {
+    fn is_set(&self) -> bool {
+        self.0.load(AtomicOrdering::Acquire)
+    }
+}
+
+impl std::task::Wake for WakeFlag {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, AtomicOrdering::Release);
+    }
+}
+
+/// Writes past the hard admission window into the writer stack.
+fn seed_writer_stack_above_hard_window(vfs: &StudioVfs, fh: u64, attr: &InodeAttr) {
+    let buffer_budget_bytes = vfs.block_size as usize;
+    vfs.set_max_dirty_bytes(buffer_budget_bytes);
+    vfs.state
+        .writer_stack
+        .write_bytes(
+            super::writer_stack::WriterWriteSpec {
+                fh,
+                ino: attr.ino,
+                current_size: 0,
+                content_epoch: attr.content_epoch,
+                first_object_id: 0,
+                offset: 0,
+            },
+            Bytes::from(vec![0xAB; buffer_budget_bytes * 2 + 1]),
+        )
+        .unwrap();
+}
+
+#[test]
+fn write_admission_rechecks_hard_window_when_dirty_limit_is_raised() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-limit-raised");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"admission-limit-raised.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        seed_writer_stack_above_hard_window(&vfs, fh, &attr);
+
+        let woken = Arc::new(WakeFlag::default());
+        let waker = std::task::Waker::from(Arc::clone(&woken));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut admission = std::pin::pin!(vfs.maybe_throttle_write_admission(1));
+        assert!(std::future::Future::poll(admission.as_mut(), &mut cx).is_pending());
+
+        vfs.set_max_dirty_bytes(vfs.block_size as usize * 4);
+        assert!(
+            woken.is_set(),
+            "raising the dirty limit should wake the parked admission waiter"
+        );
+        assert!(
+            std::future::Future::poll(admission.as_mut(), &mut cx).is_ready(),
+            "admission should be measured against the raised hard window"
+        );
+
+        vfs.state.writer_stack.clear_inode(attr.ino);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn write_admission_hard_wait_observes_shutdown_request() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-shutdown-wake");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"admission-shutdown-wake.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        seed_writer_stack_above_hard_window(&vfs, fh, &attr);
+
+        let woken = Arc::new(WakeFlag::default());
+        let waker = std::task::Waker::from(Arc::clone(&woken));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut admission = std::pin::pin!(vfs.maybe_throttle_write_admission(1));
+        assert!(std::future::Future::poll(admission.as_mut(), &mut cx).is_pending());
+
+        // The first poll of shutdown claims it and wakes parked writers before
+        // its first await point.
+        let mut shutdown = std::pin::pin!(vfs.shutdown(Duration::ZERO));
+        let _ = std::future::Future::poll(
+            shutdown.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        );
+        assert!(
+            woken.is_set(),
+            "a shutdown request should wake the parked admission waiter"
+        );
+        assert!(
+            std::future::Future::poll(admission.as_mut(), &mut cx).is_ready(),
+            "admission should stop waiting once shutdown is requested"
+        );
+
+        vfs.state.writer_stack.clear_inode(attr.ino);
+        let _ = shutdown.await;
     });
 }
 
@@ -11415,13 +11526,7 @@ fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
             )
             .unwrap();
 
-        struct WakeFlag(std::sync::atomic::AtomicBool);
-        impl std::task::Wake for WakeFlag {
-            fn wake(self: Arc<Self>) {
-                self.0.store(true, Ordering::Release);
-            }
-        }
-        let woken = Arc::new(WakeFlag(std::sync::atomic::AtomicBool::new(false)));
+        let woken = Arc::new(WakeFlag::default());
         let waker = std::task::Waker::from(Arc::clone(&woken));
         let mut cx = std::task::Context::from_waker(&waker);
         let mut admission = std::pin::pin!(vfs.maybe_throttle_write_admission(1));
@@ -11429,13 +11534,13 @@ fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
             std::future::Future::poll(admission.as_mut(), &mut cx).is_pending(),
             "admission should park while writer-stack pressure remains above the hard window"
         );
-        assert!(!woken.0.load(Ordering::Acquire));
+        assert!(!woken.is_set());
 
         // Draining capacity must wake the parked writer directly, not after a
         // re-check quantum: the drain itself signals the waker.
         vfs.state.writer_stack.clear_inode(attr.ino);
         assert!(
-            woken.0.load(Ordering::Acquire),
+            woken.is_set(),
             "writer-stack drain should wake the parked admission waiter"
         );
         assert!(

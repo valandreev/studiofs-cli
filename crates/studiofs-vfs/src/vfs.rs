@@ -245,8 +245,6 @@ const WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS: u64 = 100;
 const WRITE_ADMISSION_RUNWAY_TARGET_MS: u64 = 2_500;
 const WRITE_ADMISSION_MAX_DELAY_MS: u64 = 10;
 const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
-#[cfg(test)]
-const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 20;
 /// Safety-net re-check while a hard admission wait sleeps on the drain signal.
 const WRITE_ADMISSION_HARD_WAIT_RECHECK: Duration = Duration::from_millis(250);
 const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
@@ -7362,6 +7360,8 @@ impl StudioVfs {
     /// Update the dirty-buffer memory limit at runtime.
     pub fn set_max_dirty_bytes(&self, value: usize) {
         self.max_dirty_bytes.store(value, Ordering::Release);
+        // Writers parked on the hard window re-check it against the new limit.
+        self.state.writer_stack.wake_dirty_drain_waiters();
     }
 
     /// Number of foreground reads and OS-cache read handles currently in flight.
@@ -7616,38 +7616,44 @@ impl StudioVfs {
             .fetch_max(waited_ms, Ordering::Relaxed);
     }
 
+    fn write_admission_hard_window_exceeded(
+        &self,
+        buffer_budget_bytes: usize,
+        pressure: &WriteAdmissionPressure,
+    ) -> bool {
+        let hard_window_bytes =
+            buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
+        pressure.writer_stack_dirty_bytes > hard_window_bytes && !self.shutdown_requested()
+    }
+
     async fn maybe_throttle_write_admission(&self, next_bytes: usize) {
         if next_bytes == 0 || self.shutdown_requested() {
             return;
         }
 
-        let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
-        let pressure = self.write_admission_pressure();
-        let mut pressure_bytes = pressure.total_bytes();
-
-        let hard_window_bytes =
-            buffer_budget_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER);
-        let mut writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
         let mut hard_wait_started = None;
-        while writer_stack_pressure_bytes > hard_window_bytes && !self.shutdown_requested() {
-            hard_wait_started.get_or_insert_with(Instant::now);
-
-            // Register for the drain signal before re-sampling so a drain that
-            // lands between the sample and the await still wakes this writer.
+        // Re-read the budget on every check: `set_max_dirty_bytes` may raise
+        // the hard window while this writer is parked.
+        let (buffer_budget_bytes, pressure_bytes) = loop {
+            let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
+            let pressure = self.write_admission_pressure();
+            if !self.write_admission_hard_window_exceeded(buffer_budget_bytes, &pressure) {
+                break (buffer_budget_bytes, pressure.total_bytes());
+            }
+            // Register for the drain signal before re-checking so a drain that
+            // lands between the check and the await still wakes this writer.
             let drained = self.state.writer_stack.dirty_drained();
             tokio::pin!(drained);
             drained.as_mut().enable();
-            let pressure = self.write_admission_pressure();
-            pressure_bytes = pressure.total_bytes();
-            writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
-            if writer_stack_pressure_bytes <= hard_window_bytes || self.shutdown_requested() {
-                break;
+            if !self.write_admission_hard_window_exceeded(
+                self.write_admission_buffer_budget_bytes(),
+                &self.write_admission_pressure(),
+            ) {
+                continue;
             }
+            hard_wait_started.get_or_insert_with(Instant::now);
             let _ = tokio::time::timeout(WRITE_ADMISSION_HARD_WAIT_RECHECK, drained).await;
-            let pressure = self.write_admission_pressure();
-            pressure_bytes = pressure.total_bytes();
-            writer_stack_pressure_bytes = pressure.writer_stack_dirty_bytes;
-        }
+        };
         if let Some(started) = hard_wait_started {
             self.record_write_admission_wait(started.elapsed());
             self.state.write_admission_governor.lock().reset_stats();
