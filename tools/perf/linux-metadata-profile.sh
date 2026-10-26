@@ -47,6 +47,16 @@ done
 mkdir -p "$OUT"
 CLK_TCK=$(getconf CLK_TCK)
 
+# libfuse request workers inherit the name of the thread that runs the mount.
+# With the tray that is the `studiofs-mount` thread; without it (headless host,
+# tray initialization failed) the mount runs on the main thread, so workers
+# carry the process name.
+FUSE_COMM=$(cat /proc/"$PID"/comm)
+if grep -qx 'studiofs-mount' /proc/"$PID"/task/*/comm 2>/dev/null; then
+  FUSE_COMM=studiofs-mount
+fi
+echo "FUSE worker thread name: $FUSE_COMM" >&2
+
 # Prints "<group>\t<ticks>" for every thread of the mount process.
 # Groups: pg-meta-poll, fuse (libfuse request threads), tokio (runtime
 # workers), other.
@@ -63,8 +73,7 @@ thread_ticks() {
     case "$comm" in
       pg-meta-poll) group=pg-meta-poll ;;
       tokio-runtime-w*|tokio-rt-worker*) group=tokio ;;
-      # libfuse request workers inherit the mount thread's name.
-      studiofs-mount) group=fuse ;;
+      "$FUSE_COMM") group=fuse ;;
       *) group="other:$comm" ;;
     esac
     printf '%s\t%s\n' "$group" "$ticks"

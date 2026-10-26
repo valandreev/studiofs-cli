@@ -63,7 +63,7 @@ unit test to locate the wait.
 
 | Group | Thread names |
 |---|---|
-| `fuse` | `studiofs-mount` (libfuse request workers inherit the mount thread name) |
+| `fuse` | libfuse request workers, which inherit the mount thread's name: `studiofs-mount` with the tray, the process name (`studiofs`) when the mount runs without a tray. The script detects which one applies. |
 | `tokio` | `tokio-rt-worker` |
 | `pg-meta-poll` | `pg-meta-poll` |
 | `other` | every other thread, such as `pg-meta-notify` and tray threads |
