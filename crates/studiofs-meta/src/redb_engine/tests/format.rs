@@ -58,6 +58,8 @@ fn check_redb_fixture(version: &str, expected_writer_marker: Option<&[u8]>) {
     );
     let entry = engine.lookup(ROOT_INO, b"compat.txt").unwrap();
     assert_eq!(entry.kind, FileType::RegularFile);
+    // Fixtures predate the case-folded dentry index; open must rebuild it.
+    assert_eq!(engine.lookup(ROOT_INO, b"COMPAT.TXT").unwrap().ino, entry.ino);
 
     let created = engine
         .create_file(ROOT_INO, b"new_under_current_redb.txt", 1000, 1000, 0o644)

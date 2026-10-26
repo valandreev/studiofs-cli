@@ -46,6 +46,36 @@ pub(super) const BASE_DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(super) const BASE_DENTRIES_BY_INODE_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("base_dentries_by_inode");
 
+/// Case-folded index for serving dentries: (parent_ino, folded name, name) -> marker.
+pub(super) const DENTRIES_BY_FOLDED_NAME_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("dentries_by_folded_name");
+
+/// Case-folded index for base dentries: (parent_ino, folded name, name) -> marker.
+pub(super) const BASE_DENTRIES_BY_FOLDED_NAME_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("base_dentries_by_folded_name");
+
+/// A dentry table together with the secondary indexes derived from its rows.
+#[derive(Clone, Copy)]
+pub(super) struct DentryTables {
+    pub(super) dentries: TableDefinition<'static, &'static [u8], &'static [u8]>,
+    pub(super) by_inode: TableDefinition<'static, &'static [u8], u8>,
+    pub(super) by_folded_name: TableDefinition<'static, &'static [u8], u8>,
+}
+
+/// Serving (overlay and mirror) dentries.
+pub(super) const SERVING_DENTRY_TABLES: DentryTables = DentryTables {
+    dentries: DENTRIES_TABLE,
+    by_inode: DENTRIES_BY_INODE_TABLE,
+    by_folded_name: DENTRIES_BY_FOLDED_NAME_TABLE,
+};
+
+/// Remote-visible base dentries.
+pub(super) const BASE_DENTRY_TABLES: DentryTables = DentryTables {
+    dentries: BASE_DENTRIES_TABLE,
+    by_inode: BASE_DENTRIES_BY_INODE_TABLE,
+    by_folded_name: BASE_DENTRIES_BY_FOLDED_NAME_TABLE,
+};
+
 /// Replay-derived merges: a directory created concurrently under an existing
 /// directory's name (alias) -> the directory that kept the name (canonical).
 pub(super) const DIRECTORY_ALIASES_TABLE: TableDefinition<u64, u64> =
@@ -155,7 +185,8 @@ pub(super) const LOCAL_UPLOAD_LEDGER_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(super) const REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING: &str =
     "remote_namespace_visibility_filter";
 pub(super) const DENTRY_BY_INODE_INDEX_VERSION_SETTING: &str = "dentry_by_inode_index_version";
-pub(super) const CURRENT_DENTRY_BY_INODE_INDEX_VERSION: &[u8] = b"1";
+/// Version 2 adds the case-folded name indexes; any other value rebuilds both.
+pub(super) const CURRENT_DENTRY_BY_INODE_INDEX_VERSION: &[u8] = b"2";
 
 /// Serializable full snapshot of redb metadata state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -205,6 +236,49 @@ pub(super) fn encode_dentry_by_inode_key(ino: Ino, parent: Ino, name: &[u8]) -> 
     key.extend_from_slice(&parent.to_le_bytes());
     key.extend_from_slice(name);
     key
+}
+
+/// Case-folds a dentry name for case-insensitive lookup.
+///
+/// Two names fold equal exactly when the foreground lookup treats them as the
+/// same name: ASCII names compare ignoring ASCII case, and any other name
+/// compares by the Unicode lowercase of its lossy UTF-8 decoding.
+pub(super) fn fold_dentry_name(name: &[u8]) -> Cow<'_, [u8]> {
+    if name.is_ascii() {
+        if name.iter().any(u8::is_ascii_uppercase) {
+            Cow::Owned(name.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(name)
+        }
+    } else {
+        Cow::Owned(String::from_utf8_lossy(name).to_lowercase().into_bytes())
+    }
+}
+
+/// The prefix shared by every stored name that folds to the same name as `name`.
+///
+/// Layout: parent (8 bytes LE) + folded length (4 bytes BE) + folded name. The
+/// length keeps one folded name from prefixing a longer one.
+pub(super) fn folded_dentry_prefix(parent: Ino, name: &[u8]) -> MetaResult<Vec<u8>> {
+    let folded = fold_dentry_name(name);
+    let folded_len = u32::try_from(folded.len()).map_err(|_| {
+        MetaError::Storage(format!(
+            "dentry name too long to index: {} folded bytes",
+            folded.len()
+        ))
+    })?;
+    let mut key = Vec::with_capacity(12 + folded.len() + name.len());
+    key.extend_from_slice(&parent.to_le_bytes());
+    key.extend_from_slice(&folded_len.to_be_bytes());
+    key.extend_from_slice(&folded);
+    Ok(key)
+}
+
+/// Encode a case-folded index key: [`folded_dentry_prefix`] + the stored name.
+pub(super) fn encode_folded_dentry_key(parent: Ino, name: &[u8]) -> MetaResult<Vec<u8>> {
+    let mut key = folded_dentry_prefix(parent, name)?;
+    key.extend_from_slice(name);
+    Ok(key)
 }
 
 fn invalid_redb_key_len(key_kind: &str, expected: &str, actual: usize) -> MetaError {

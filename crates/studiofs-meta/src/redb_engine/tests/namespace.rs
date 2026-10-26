@@ -526,9 +526,7 @@ fn test_readdir_merged_in_write_txn_matches_read_readdir() {
 }
 
 thread_local! {
-    pub(super) static QUERY_NAME_LOWERINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static VISIBILITY_SETTINGS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(super) static UNICODE_NAME_LOWERINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static VISIBILITY_TABLE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static OVERLAY_DENTRY_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static PARENT_OVERLAY_DENTRY_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -732,17 +730,16 @@ fn merged_dentry_point_lookups_preserve_overlay_and_visibility_semantics() {
 fn merged_dentry_point_lookups_preserve_case_insensitive_local_authority() {
     let engine = temp_engine();
     let txn = engine.begin_write_txn().unwrap();
-    let key = encode_dentry_key(ROOT_INO, b"MiXeD");
-    for (definition, ino) in [(BASE_DENTRIES_TABLE, 77), (DENTRIES_TABLE, 88)] {
-        let value = encode(&DirEntryValue {
+    for (base, ino) in [(true, 77), (false, 88)] {
+        let entry = DirEntryValue {
             ino,
             kind: FileType::Directory,
-        })
-        .unwrap();
-        txn.open_table(definition)
-            .unwrap()
-            .insert(key.as_slice(), value.as_slice())
-            .unwrap();
+        };
+        if base {
+            RedbMetaEngine::set_base_dentry_in_txn(&txn, ROOT_INO, b"MiXeD", &entry).unwrap();
+        } else {
+            RedbMetaEngine::set_dentry_in_txn(&txn, ROOT_INO, b"MiXeD", &entry).unwrap();
+        }
     }
     // Local replacements retain authority regardless of the requested casing.
     for (name, expected) in [(b"MiXeD".as_slice(), 88), (b"mixed".as_slice(), 88)] {
@@ -773,21 +770,13 @@ fn merged_dentry_case_insensitive_lookup_respects_tombstones_and_visibility() {
             .unwrap();
         let txn = engine.begin_write_txn().unwrap();
         let key = encode_dentry_key(ROOT_INO, b"MiXeD");
-        for (definition, ino) in [
-            (BASE_DENTRIES_TABLE, Some(77)),
-            (DENTRIES_TABLE, current_ino),
-        ] {
-            if let Some(ino) = ino {
-                let value = encode(&DirEntryValue {
-                    ino,
-                    kind: FileType::RegularFile,
-                })
-                .unwrap();
-                txn.open_table(definition)
-                    .unwrap()
-                    .insert(key.as_slice(), value.as_slice())
-                    .unwrap();
-            }
+        let entry = |ino| DirEntryValue {
+            ino,
+            kind: FileType::RegularFile,
+        };
+        RedbMetaEngine::set_base_dentry_in_txn(&txn, ROOT_INO, b"MiXeD", &entry(77)).unwrap();
+        if let Some(ino) = current_ino {
+            RedbMetaEngine::set_dentry_in_txn(&txn, ROOT_INO, b"MiXeD", &entry(ino)).unwrap();
         }
         if tombstone {
             txn.open_table(DENTRY_TOMBSTONES_TABLE)
@@ -831,6 +820,12 @@ fn merged_dentry_case_insensitive_current_only_entry_stays_locally_visible() {
         &base,
         &current,
         &tombstones,
+        || {
+            Ok(Some((
+                read_txn.open_table(DENTRIES_BY_FOLDED_NAME_TABLE).unwrap(),
+                read_txn.open_table(BASE_DENTRIES_BY_FOLDED_NAME_TABLE).unwrap(),
+            )))
+        },
         ROOT_INO,
         b"local",
     )
@@ -991,56 +986,215 @@ fn merged_dentry_visibility_skips_settings_and_inode_tables_when_unneeded() {
 }
 
 #[test]
-fn ascii_name_mismatches_skip_unicode_lowering_without_changing_unicode_matches() {
+fn case_insensitive_lookup_visits_only_folded_candidates_in_large_directory() {
     let engine = temp_engine();
-    let value = encode(&DirEntryValue {
-        ino: 77,
+    let entry = |ino| DirEntryValue {
+        ino,
         kind: FileType::Directory,
-    })
-    .unwrap();
+    };
     let txn = engine.begin_write_txn().unwrap();
-    {
-        let mut current = txn.open_table(DENTRIES_TABLE).unwrap();
-        for index in 0..10_000 {
-            let key = encode_dentry_key(ROOT_INO, format!("entry-{index}").as_bytes());
-            current.insert(key.as_slice(), value.as_slice()).unwrap();
+    for index in 0..10_000 {
+        let name = format!("entry-{index}");
+        if index % 2 == 0 {
+            RedbMetaEngine::set_base_dentry_in_txn(&txn, ROOT_INO, name.as_bytes(), &entry(77))
+                .unwrap();
+        } else {
+            RedbMetaEngine::set_dentry_in_txn(&txn, ROOT_INO, name.as_bytes(), &entry(77))
+                .unwrap();
         }
     }
+    for name in ["\u{212a}", "\u{130}"] {
+        RedbMetaEngine::set_dentry_in_txn(&txn, ROOT_INO, name.as_bytes(), &entry(78)).unwrap();
+    }
     txn.commit().unwrap();
-    UNICODE_NAME_LOWERINGS.set(0);
+
+    for (name, expected, rows) in [
+        ("missing", None, 0),
+        ("ENTRY-9999", Some(77), 1),
+        ("ENTRY-9998", Some(77), 1),
+        ("отсутствует", None, 0),
+        // The Kelvin sign folds to ASCII `k`; a dotted capital I folds to `i` + U+0307.
+        ("k", Some(78), 1),
+        ("i\u{307}", Some(78), 1),
+    ] {
+        FOLDED_DENTRY_INDEX_ROWS.set(0);
+        CASE_FALLBACK_MERGED_SCANS.set(0);
+        match expected {
+            Some(ino) => assert_eq!(engine.lookup(ROOT_INO, name.as_bytes()).unwrap().ino, ino),
+            None => assert!(matches!(
+                engine.lookup(ROOT_INO, name.as_bytes()),
+                Err(MetaError::EntryNotFound { .. })
+            )),
+        }
+        assert_eq!(CASE_FALLBACK_MERGED_SCANS.get(), 1, "{name:?} misses its exact key");
+        assert_eq!(FOLDED_DENTRY_INDEX_ROWS.get(), rows, "{name:?}");
+    }
+}
+
+#[test]
+fn single_table_case_insensitive_lookup_visits_only_folded_candidates() {
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    for index in 0..8_000 {
+        let entry = DirEntryValue {
+            ino: 1_000 + index,
+            kind: FileType::RegularFile,
+        };
+        let name = format!("entry-{index}");
+        RedbMetaEngine::set_base_dentry_in_txn(&txn, ROOT_INO, name.as_bytes(), &entry).unwrap();
+    }
+    for (name, expected, rows) in [
+        ("missing", None, 0),
+        ("ENTRY-7999", Some(8_999), 1),
+        ("entry-0", Some(1_000), 0),
+    ] {
+        FOLDED_DENTRY_INDEX_ROWS.set(0);
+        assert_eq!(
+            RedbMetaEngine::lookup_in_write_table(
+                &txn,
+                BASE_DENTRY_TABLES,
+                ROOT_INO,
+                name.as_bytes()
+            )
+            .unwrap()
+            .map(|entry| entry.ino),
+            expected,
+            "{name:?}"
+        );
+        assert_eq!(FOLDED_DENTRY_INDEX_ROWS.get(), rows, "{name:?}");
+    }
+    txn.abort().unwrap();
+}
+
+#[test]
+fn read_only_artifact_without_folded_indexes_keeps_case_insensitive_lookup() {
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("legacy.db");
+    let file_ino = {
+        let engine = RedbMetaEngine::open(&path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+        let file = engine
+            .create_file(ROOT_INO, b"MiXeD", 1000, 1000, 0o644)
+            .unwrap();
+        // Shape the file like an artifact written before the folded indexes existed.
+        let txn = engine.begin_write_txn().unwrap();
+        for table in [
+            DENTRIES_BY_FOLDED_NAME_TABLE,
+            BASE_DENTRIES_BY_FOLDED_NAME_TABLE,
+        ] {
+            assert!(txn.delete_table(table).unwrap());
+        }
+        txn.open_table(SETTINGS_TABLE)
+            .unwrap()
+            .insert(DENTRY_BY_INODE_INDEX_VERSION_SETTING, b"1".as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        engine.prepare_for_close().unwrap();
+        file.ino
+    };
+
+    let engine = RedbMetaEngine::open_read_only(&path).unwrap();
+    assert_eq!(engine.lookup(ROOT_INO, b"MiXeD").unwrap().ino, file_ino);
+    assert_eq!(engine.lookup(ROOT_INO, b"mixed").unwrap().ino, file_ino);
     assert!(matches!(
         engine.lookup(ROOT_INO, b"missing"),
         Err(MetaError::EntryNotFound { .. })
     ));
-    assert_eq!(engine.lookup(ROOT_INO, b"ENTRY-9999").unwrap().ino, 77);
-    assert_eq!(UNICODE_NAME_LOWERINGS.get(), 0);
+}
 
-    UNICODE_NAME_LOWERINGS.set(0);
-    assert!(matches!(
-        engine.lookup(ROOT_INO, "отсутствует".as_bytes()),
-        Err(MetaError::EntryNotFound { .. })
-    ));
-    assert_eq!(
-        UNICODE_NAME_LOWERINGS.get(),
-        0,
-        "non-ASCII queries must not lower ASCII candidates"
-    );
+#[test]
+fn folded_dentry_names_match_case_insensitive_name_equality() {
+    let names: [&[u8]; 14] = [
+        b"abc",
+        b"ABC",
+        b"aBc",
+        b"abd",
+        b"k",
+        b"K",
+        "\u{212a}".as_bytes(),
+        "\u{130}".as_bytes(),
+        "i\u{307}".as_bytes(),
+        "Привет".as_bytes(),
+        "пРИВЕТ".as_bytes(),
+        "ΣΑΣ".as_bytes(),
+        &[0xff, b'A'],
+        &[0xfe, b'a'],
+    ];
+    for left in names {
+        for right in names {
+            assert_eq!(
+                fold_dentry_name(left) == fold_dentry_name(right),
+                RedbMetaEngine::names_equal_case_insensitive(left, right, &mut None),
+                "{:?} vs {:?}",
+                String::from_utf8_lossy(left),
+                String::from_utf8_lossy(right)
+            );
+        }
+    }
+}
 
-    let txn = engine.begin_write_txn().unwrap();
-    for name in ["K", "İ"] {
-        let key = encode_dentry_key(ROOT_INO, name.as_bytes());
-        txn.open_table(DENTRIES_TABLE)
-            .unwrap()
-            .insert(key.as_slice(), value.as_slice())
+#[test]
+fn rename_in_large_directory_visits_no_unrelated_dentry_rows() {
+    let engine = temp_engine();
+    let dir = engine
+        .create_dir(ROOT_INO, b"big", 1000, 1000, 0o755)
+        .unwrap();
+    let mut sources = Vec::new();
+    for index in 0..20 {
+        let name = format!("src-{index}");
+        engine
+            .create_file(dir.ino, name.as_bytes(), 1000, 1000, 0o644)
             .unwrap();
+        sources.push(name);
+    }
+    // Filler rows use the same index-maintaining helpers as the namespace writes.
+    let txn = engine.begin_write_txn().unwrap();
+    for index in 0..8_000 {
+        let name = format!("filler-{index}");
+        let entry = DirEntryValue {
+            ino: 1_000_000 + index,
+            kind: FileType::RegularFile,
+        };
+        if index % 2 == 0 {
+            RedbMetaEngine::set_base_dentry_in_txn(&txn, dir.ino, name.as_bytes(), &entry)
+                .unwrap();
+        } else {
+            RedbMetaEngine::set_dentry_in_txn(&txn, dir.ino, name.as_bytes(), &entry).unwrap();
+        }
     }
     txn.commit().unwrap();
-    assert_eq!(engine.lookup(ROOT_INO, b"k").unwrap().ino, 77);
-    assert_eq!(
-        engine.lookup(ROOT_INO, "i\u{307}".as_bytes()).unwrap().ino,
-        77
-    );
-    assert!(UNICODE_NAME_LOWERINGS.get() > 0);
+
+    FOLDED_DENTRY_INDEX_ROWS.set(0);
+    CASE_FALLBACK_MERGED_SCANS.set(0);
+    for source in &sources {
+        let target = source.replace("src", "dst");
+        assert!(matches!(
+            engine.lookup(dir.ino, target.as_bytes()),
+            Err(MetaError::EntryNotFound { .. })
+        ));
+        engine
+            .rename_atomic(
+                dir.ino,
+                source.as_bytes(),
+                dir.ino,
+                target.as_bytes(),
+                true,
+                false,
+            )
+            .unwrap();
+    }
+    // Each rename misses its target twice: once in lookup, once in rename_atomic.
+    assert_eq!(CASE_FALLBACK_MERGED_SCANS.get(), 2 * sources.len());
+    assert_eq!(FOLDED_DENTRY_INDEX_ROWS.get(), 0);
+
+    // The index follows the rename: the new name resolves by case, the old one is gone.
+    FOLDED_DENTRY_INDEX_ROWS.set(0);
+    assert!(engine.lookup(dir.ino, b"DST-0").is_ok());
+    assert!(matches!(
+        engine.lookup(dir.ino, b"SRC-0"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert_eq!(FOLDED_DENTRY_INDEX_ROWS.get(), 1);
 }
 
 #[test]
@@ -1049,36 +1203,10 @@ fn unicode_query_lowercase_matches_ascii_stored_name() {
     let attr = engine
         .create_file(ROOT_INO, b"K", 1000, 1000, 0o644)
         .unwrap();
-    UNICODE_NAME_LOWERINGS.set(0);
+    FOLDED_DENTRY_INDEX_ROWS.set(0);
     assert_eq!(
         engine.lookup(ROOT_INO, "K".as_bytes()).unwrap().ino,
         attr.ino
     );
-    assert_eq!(UNICODE_NAME_LOWERINGS.get(), 0);
-}
-
-#[test]
-fn case_insensitive_fallback_lowers_query_only_when_needed() {
-    let engine = temp_engine();
-    QUERY_NAME_LOWERINGS.set(0);
-    assert!(matches!(
-        engine.lookup(ROOT_INO, "пусто".as_bytes()),
-        Err(MetaError::EntryNotFound { .. })
-    ));
-    assert_eq!(QUERY_NAME_LOWERINGS.get(), 0);
-    engine
-        .create_file(ROOT_INO, b"ASCII", 1000, 1000, 0o644)
-        .unwrap();
-    QUERY_NAME_LOWERINGS.set(0);
-    assert!(engine.lookup(ROOT_INO, b"ascii").is_ok());
-    assert!(matches!(
-        engine.lookup(ROOT_INO, b"missing"),
-        Err(MetaError::EntryNotFound { .. })
-    ));
-    assert_eq!(QUERY_NAME_LOWERINGS.get(), 0);
-    assert!(matches!(
-        engine.lookup(ROOT_INO, "нет".as_bytes()),
-        Err(MetaError::EntryNotFound { .. })
-    ));
-    assert_eq!(QUERY_NAME_LOWERINGS.get(), 1);
+    assert_eq!(FOLDED_DENTRY_INDEX_ROWS.get(), 1);
 }

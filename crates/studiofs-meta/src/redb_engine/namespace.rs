@@ -84,8 +84,28 @@ impl MetaNamespace for RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let (entry, is_overlay) =
-            Self::lookup_merged_from_opened_tables(&base, &current, &tombstones, parent, name)?;
+        let open_folded = || {
+            // A writable database rebuilds its indexes on open; a read-only
+            // snapshot artifact may predate them, so check its index version.
+            if self.read_only_db.is_some() && !Self::dentry_indexes_current_in_read_txn(&txn)? {
+                return Ok(None);
+            }
+            let current = txn
+                .open_table(DENTRIES_BY_FOLDED_NAME_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let base = txn
+                .open_table(BASE_DENTRIES_BY_FOLDED_NAME_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Ok(Some((current, base)))
+        };
+        let (entry, is_overlay) = Self::lookup_merged_from_opened_tables(
+            &base,
+            &current,
+            &tombstones,
+            open_folded,
+            parent,
+            name,
+        )?;
         let visible = match entry {
             Some(entry)
                 if is_overlay

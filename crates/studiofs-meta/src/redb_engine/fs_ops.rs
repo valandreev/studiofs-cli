@@ -204,7 +204,7 @@ impl<'a> NamespaceCreateTxn<'a> {
             && matches!(spec.kind(), FileType::Directory | FileType::RegularFile)
             && RedbMetaEngine::lookup_in_write_table(
                 self.txn,
-                BASE_DENTRIES_TABLE,
+                BASE_DENTRY_TABLES,
                 spec.parent,
                 spec.name,
             )?
@@ -295,14 +295,13 @@ impl<'a> NamespaceCreateTxn<'a> {
         let (parent, name) = decode_dentry_key(dentry_key)?;
         RedbMetaEngine::remove_existing_dentry_index_in_txn(
             self.txn,
-            DENTRIES_TABLE,
-            DENTRIES_BY_INODE_TABLE,
+            SERVING_DENTRY_TABLES,
             parent,
             name,
         )?;
         RedbMetaEngine::insert_dentry_index_in_txn(
             self.txn,
-            DENTRIES_BY_INODE_TABLE,
+            SERVING_DENTRY_TABLES,
             parent,
             name,
             entry,

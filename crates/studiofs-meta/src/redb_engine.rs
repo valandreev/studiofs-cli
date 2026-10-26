@@ -1117,6 +1117,8 @@ impl RedbMetaEngine {
             let _ = txn.open_table(DENTRIES_BY_INODE_TABLE);
             let _ = txn.open_table(BASE_DENTRIES_TABLE);
             let _ = txn.open_table(BASE_DENTRIES_BY_INODE_TABLE);
+            let _ = txn.open_table(DENTRIES_BY_FOLDED_NAME_TABLE);
+            let _ = txn.open_table(BASE_DENTRIES_BY_FOLDED_NAME_TABLE);
             let _ = txn.open_table(DENTRY_TOMBSTONES_TABLE);
             let _ = txn.open_table(DIRECTORY_ALIASES_TABLE);
             let _ = txn.open_table(REGULAR_FILE_OVERLAY_TABLE);

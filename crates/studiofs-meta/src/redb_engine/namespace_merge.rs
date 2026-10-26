@@ -253,7 +253,7 @@ impl BatchMerge {
         if let Some(entry) = self.dentries.get(&(parent, name.to_vec())) {
             return Ok(entry.clone());
         }
-        RedbMetaEngine::lookup_in_write_table(txn, BASE_DENTRIES_TABLE, parent, name)
+        RedbMetaEngine::lookup_in_write_table(txn, BASE_DENTRY_TABLES, parent, name)
     }
 
     fn alias_target_if_any(
