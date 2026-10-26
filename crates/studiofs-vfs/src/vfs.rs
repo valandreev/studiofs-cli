@@ -10211,9 +10211,9 @@ impl StudioVfs {
                 // state while the upload/publication is still pending. The
                 // publication step can then promote the overlay into the
                 // local base graph before the runtime upload queue drains.
-                // Neither state is a stable generation for the kernel page
-                // cache, so keep the read on the VFS path until publication
-                // and upload completion.
+                // Neither state is a stable generation, so report one that
+                // must never be reused; the platform bridge decides whether
+                // the read bypasses the OS cache or purges earlier pages.
                 if self.inode_has_local_dirty_state(ino)
                     || self.inode_has_pending_uploads(ino)
                     || self.inode_has_unmaterialized_overlay_for_finalize(ino)

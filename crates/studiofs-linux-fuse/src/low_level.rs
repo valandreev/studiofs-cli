@@ -6272,6 +6272,100 @@ mod tests {
         );
     }
 
+    /// Start a sampler reporting ample memory and wait for its first snapshot.
+    fn published_memory_sampler() -> crate::cache_policy::SystemMemorySampler {
+        let sampler = crate::cache_policy::SystemMemorySampler::start(|| Some(1 << 40));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sampler.available_memory().is_none() {
+            assert!(Instant::now() < deadline, "memory sampler never published");
+            thread::yield_now();
+        }
+        sampler
+    }
+
+    #[test]
+    fn adaptive_local_dirty_reader_stays_direct_with_active_writer_and_caches_after_release() {
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+            "linux-fuse-local-dirty-page-cache",
+        )
+        .expect("create VFS fixture");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+        state.available_memory = Some(published_memory_sampler());
+        let attr = fixture
+            .vfs()
+            .create(1, b"local-dirty-page-cache.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let open = |flags| {
+            let mut prepared = None;
+            let result = state
+                .run_open_reply_transaction(
+                    attr.ino,
+                    || state.open_with_flags(attr.ino, flags),
+                    |open| {
+                        prepared = Some(open);
+                        0
+                    },
+                )
+                .expect("open transaction");
+            assert_eq!(result, 0);
+            prepared.expect("accepted open")
+        };
+
+        let writer = open(libc::O_RDWR);
+        assert!(writer.cache.direct_io);
+        fixture
+            .runtime()
+            .block_on(
+                fixture
+                    .vfs()
+                    .write_fh(writer.fh, attr.ino, 0, b"written locally"),
+            )
+            .expect("local write");
+
+        let concurrent = open(libc::O_RDONLY);
+        assert_eq!(
+            concurrent.reason,
+            studiofs_vfs::vfs::OsCacheReason::ActiveWriter
+        );
+        assert!(
+            concurrent.cache.direct_io,
+            "a reader beside an open writer must not cache pages"
+        );
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(concurrent.fh))
+            .expect("release concurrent reader");
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(writer.fh))
+            .expect("release writer");
+
+        // The fixture is not started, so the upload stays pending.
+        let reader = open(libc::O_RDONLY);
+        assert_eq!(reader.reason, studiofs_vfs::vfs::OsCacheReason::LocalDirty);
+        assert_eq!(
+            reader.cache,
+            super::LinuxFuseOpenCachePolicy {
+                direct_io: false,
+                keep_cache: false,
+                parallel_direct_writes: false,
+                read_ahead_owner: studiofs_vfs::ReadAheadOwner::Kernel,
+                memory_bypassed: false,
+            },
+            "a closed writer's bytes may use kernel readahead, but the open must purge older pages"
+        );
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().release_fh(reader.fh))
+            .expect("release reader");
+    }
+
     #[test]
     fn direct_linux_decision_restores_vfs_owner_after_prepared_open() {
         let fixture =
@@ -8156,6 +8250,114 @@ mod tests {
             .expect("mounted readdirplus worker should complete");
         assert!(unmount_status.success());
         assert_eq!(lookups, 0, "readdirplus must prime every child dentry");
+        drop(session);
+        drop(fixture);
+        std::fs::remove_dir_all(&mount_point).expect("remove mount point");
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_local_dirty_reads_use_kernel_readahead_and_purge_on_reopen() {
+        const FILE_LEN: usize = 1024 * 1024;
+        const READ_LEN: usize = 4096;
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-dirty-readahead")
+                .expect("create VFS fixture");
+        // Leave the fixture unstarted so uploads stay pending and reads are LocalDirty.
+        let mount_point = std::env::temp_dir().join(format!(
+            "studiofs-linux-fuse-dirty-readahead-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&mount_point).expect("create mount point");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+        state.available_memory = Some(published_memory_sampler());
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-dirty-readahead").expect("mount");
+        let vfs = fixture.vfs();
+        let mount_point_for_worker = mount_point.clone();
+        let worker = std::thread::spawn(
+            move || -> std::io::Result<(u64, std::process::ExitStatus)> {
+                let guard = UnmountGuard::new(mount_point_for_worker.clone());
+                let path = mount_point_for_worker.join("dirty.bin");
+                let read_all = |file: &mut std::fs::File| -> std::io::Result<Vec<u8>> {
+                    file.seek(SeekFrom::Start(0))?;
+                    let mut bytes = Vec::with_capacity(FILE_LEN);
+                    let mut chunk = [0_u8; READ_LEN];
+                    loop {
+                        let read = file.read(&mut chunk)?;
+                        if read == 0 {
+                            return Ok(bytes);
+                        }
+                        bytes.extend_from_slice(&chunk[..read]);
+                    }
+                };
+                std::fs::write(&path, vec![b'a'; FILE_LEN])?;
+
+                // The writer is closed but its bytes are still local; this
+                // reader keeps its page-cache handle open across the rewrite.
+                // FUSE RELEASE is asynchronous, so an open can still observe
+                // the closing writer and stay direct.
+                let local_dirty_kernel_opens = || {
+                    let cache = vfs
+                        .write_path_observability_snapshot()
+                        .linux_fuse_open_cache;
+                    (cache.local_dirty, cache.kernel_opens)
+                };
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut held = loop {
+                    let (dirty_before, kernel_before) = local_dirty_kernel_opens();
+                    let file = std::fs::File::open(&path)?;
+                    let (dirty_after, kernel_after) = local_dirty_kernel_opens();
+                    if dirty_after > dirty_before && kernel_after > kernel_before {
+                        break file;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "locally dirty read-only open never used the kernel page cache"
+                    );
+                    drop(file);
+                    thread::yield_now();
+                };
+                let before = vfs.write_path_observability_snapshot().vfs_read_path.calls;
+                assert!(read_all(&mut held)?.iter().all(|byte| *byte == b'a'));
+                let read_calls =
+                    vfs.write_path_observability_snapshot().vfs_read_path.calls - before;
+
+                let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
+                writer.write_all(&vec![b'b'; FILE_LEN])?;
+                drop(writer);
+                let mut reopened = std::fs::File::open(&path)?;
+                assert!(read_all(&mut reopened)?.iter().all(|byte| *byte == b'b'));
+                // The reopen replied without keep_cache, which purged the
+                // inode mapping shared with the still-open handle.
+                assert!(read_all(&mut held)?.iter().all(|byte| *byte == b'b'));
+                drop((held, reopened));
+
+                let status = Command::new("fusermount3")
+                    .arg("-u")
+                    .arg(&mount_point_for_worker)
+                    .status();
+                guard.disarm();
+                Ok((read_calls, status?))
+            },
+        );
+
+        session.run().expect("run libfuse3 session");
+        let (read_calls, unmount_status) = worker
+            .join()
+            .expect("mounted readahead worker should not panic")
+            .expect("mounted readahead worker should complete");
+        assert!(unmount_status.success());
+        assert!(
+            read_calls < (FILE_LEN / READ_LEN / 4) as u64,
+            "kernel readahead must coalesce 4 KiB reads; saw {read_calls} VFS reads"
+        );
         drop(session);
         drop(fixture);
         std::fs::remove_dir_all(&mount_point).expect("remove mount point");
