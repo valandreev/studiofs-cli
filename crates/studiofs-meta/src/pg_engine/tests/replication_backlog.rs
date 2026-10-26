@@ -3851,6 +3851,59 @@ fn hidden_pending_window_grows_without_reprojecting_unpublished_overlay_history(
 }
 
 #[test]
+fn visible_pending_window_grows_without_reprojecting_published_namespace_history() {
+    use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    for index in 0..64u32 {
+        pg.create_dir(ROOT_INO, format!("dir-{index}").as_bytes(), 0, 0, 0o755)
+            .expect("create visible directory");
+    }
+    let window_start = pg
+        .pending_state
+        .lock()
+        .expect("pending state")
+        .event_start
+        .expect("directories keep a visible window");
+
+    let mut work_per_rename = Vec::new();
+    for index in 0..64u32 {
+        LOCAL_PROJECTION_WORK.with(|work| work.set(0));
+        pg.rename(
+            ROOT_INO,
+            format!("dir-{index}").as_bytes(),
+            ROOT_INO,
+            format!("moved-{index}").as_bytes(),
+        )
+        .expect("rename visible directory");
+        work_per_rename.push(LOCAL_PROJECTION_WORK.with(std::cell::Cell::get));
+    }
+
+    let after_seq = pg.local.get_counter(NEXT_EVENT_SEQ).expect("after seq");
+    let events = pg
+        .local
+        .read_events_range(window_start, after_seq)
+        .expect("read window");
+    let full = RemoteApplyCoordinator::project_local_batch(&events);
+    {
+        let state = pg.pending_state.lock().expect("pending state");
+        assert_eq!(state.event_start, Some(window_start));
+        assert_eq!(state.event_end, after_seq);
+        assert_eq!(
+            state.ops, full.visible_ops,
+            "the incremental count must match a full projection of the window"
+        );
+    }
+    let first = work_per_rename[1];
+    let last = *work_per_rename.last().expect("renames ran");
+    assert!(
+        last <= first,
+        "each mutation must cost the same projection work however long the visible window \
+         grows: {work_per_rename:?}"
+    );
+}
+
+#[test]
 fn poisoned_hidden_window_cache_falls_back_without_failing_the_mutation() {
     use crate::engine::MetaEngine;
     use crate::schema::{

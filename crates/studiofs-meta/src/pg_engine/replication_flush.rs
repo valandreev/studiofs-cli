@@ -1,9 +1,10 @@
 //! Owns local event replication backlog claims and flush completion.
 
-use super::remote_apply::HiddenWindowProjection;
+use super::remote_apply::{HiddenWindowProjection, VisibleWindowProjection};
 use super::{
     ClaimedPendingBatch, LocalEventRange, PendingHiddenWindow, PendingMutationHint,
-    PendingReplicationState, PgMetaEngine, RecentFlush, RemoteApplyCoordinator,
+    PendingReplicationState, PendingVisibleWindow, PgMetaEngine, RecentFlush,
+    RemoteApplyCoordinator,
 };
 use crate::engine::{MetaError, MetaInodes, MetaNamespace, MetaResult};
 use crate::events::MetaEvent;
@@ -747,6 +748,11 @@ impl PgMetaEngine {
         if self.extend_hidden_pending_window(&mut state, before_seq, after_seq, now)? {
             return Ok(false);
         }
+        if let Some(needs_eager_flush) =
+            self.extend_visible_pending_window(&mut state, before_seq, after_seq, now)?
+        {
+            return Ok(needs_eager_flush);
+        }
         if state.ops > 0 && state.event_start.is_some() && before_seq >= state.event_end {
             // A local-only suffix cannot change the already projected remote
             // operation count. Keep it in the range so a later flush can
@@ -815,7 +821,72 @@ impl PgMetaEngine {
         state.event_start = Some(event_start);
         state.event_end = state.event_end.max(after_seq);
         state.force_flush = projected.needs_eager_flush || state.ops >= self.flush_ops_threshold;
+        if state.event_end == after_seq {
+            *self.lock_pending_visible_window() = Some(PendingVisibleWindow {
+                event_start,
+                event_end: after_seq,
+                projection: VisibleWindowProjection::from_events(&events, &projected),
+            });
+        }
         Ok(projected.needs_eager_flush)
+    }
+
+    /// Extends a remote-visible pending window by the mutation
+    /// `[before_seq, after_seq)` without decoding the window again, and
+    /// returns whether the window needs an eager flush.
+    ///
+    /// Concurrent writers keep extending the window while a flush is
+    /// in flight, so re-projecting it on every mutation is quadratic in the
+    /// window and serializes every writer on `pending_state`. Returns `None`
+    /// when the cached projection does not name this window or cannot prove
+    /// that the earlier events keep their projection; the caller then
+    /// re-projects the whole window.
+    fn extend_visible_pending_window(
+        &self,
+        state: &mut PendingReplicationState,
+        before_seq: u64,
+        after_seq: u64,
+        now: Instant,
+    ) -> MetaResult<Option<bool>> {
+        let Some(event_start) = state.event_start else {
+            return Ok(None);
+        };
+        if state.ops == 0 || before_seq != state.event_end {
+            return Ok(None);
+        }
+        let mut cached = self.lock_pending_visible_window();
+        let Some(window) = cached.as_mut().filter(|window| {
+            window.event_start == event_start
+                && window.event_end == before_seq
+                && window.projection.visible_ops() == state.ops
+        }) else {
+            return Ok(None);
+        };
+        let suffix = self.local.read_events_range(before_seq, after_seq)?;
+        let complete = u64::try_from(suffix.len()).ok() == Some(after_seq - before_seq);
+        if !complete || !window.projection.extend(&suffix) {
+            *cached = None;
+            return Ok(None);
+        }
+        window.event_end = after_seq;
+        let needs_eager_flush = window.projection.needs_eager_flush();
+        state.ops = window.projection.visible_ops();
+        state.last_mutation_at = Some(now);
+        state.event_end = after_seq;
+        state.force_flush = needs_eager_flush || state.ops >= self.flush_ops_threshold;
+        Ok(Some(needs_eager_flush))
+    }
+
+    /// Same poisoning rule as [`Self::lock_pending_hidden_window`].
+    fn lock_pending_visible_window(&self) -> MutexGuard<'_, Option<PendingVisibleWindow>> {
+        self.pending_visible_window
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                self.pending_visible_window.clear_poison();
+                let mut cached = poisoned.into_inner();
+                *cached = None;
+                cached
+            })
     }
 
     /// Extends a pending window that projects no remote-visible operation by

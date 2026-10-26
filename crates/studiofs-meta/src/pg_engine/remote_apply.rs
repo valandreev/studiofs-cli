@@ -104,6 +104,109 @@ impl HiddenWindowProjection {
     }
 }
 
+/// Projection summary of a local event window that projects at least one
+/// remote-visible operation.
+///
+/// A suffix that leaves the hidden status of every inode unchanged cannot
+/// change how the window's earlier events project, so the window's visible
+/// operation count and eager-flush need grow by the suffix's own projection.
+/// This keeps the pending-state tracker from decoding the whole window again
+/// on every mutation while concurrent writers extend it.
+#[derive(Clone)]
+pub(super) struct VisibleWindowProjection {
+    states: HashMap<Ino, RegularFileProjectionState>,
+    visible_ops: u32,
+    needs_eager_flush: bool,
+    /// Inode of the window's last event when it is a `SetAttr`, whose
+    /// visibility depends on the event that follows it.
+    trailing_set_attr: Option<Ino>,
+}
+
+impl VisibleWindowProjection {
+    pub(super) fn from_events(events: &[MetaEvent], projected: &ProjectedRemoteBatch) -> Self {
+        let mut states = HashMap::new();
+        for event in events {
+            RemoteApplyCoordinator::update_local_projection_state(&mut states, event);
+        }
+        Self {
+            states,
+            visible_ops: projected.visible_ops,
+            needs_eager_flush: projected.needs_eager_flush,
+            trailing_set_attr: Self::trailing_set_attr(events),
+        }
+    }
+
+    pub(super) fn visible_ops(&self) -> u32 {
+        self.visible_ops
+    }
+
+    pub(super) fn needs_eager_flush(&self) -> bool {
+        self.needs_eager_flush
+    }
+
+    fn trailing_set_attr(events: &[MetaEvent]) -> Option<Ino> {
+        match events.last() {
+            Some(MetaEvent::SetAttr { attr }) => Some(attr.ino),
+            _ => None,
+        }
+    }
+
+    /// Folds `suffix` into the window when the window's earlier events keep
+    /// their projection; returns `false` and leaves the window unchanged
+    /// otherwise, so the caller re-projects the whole window.
+    pub(super) fn extend(&mut self, suffix: &[MetaEvent]) -> bool {
+        let mut touched: HashMap<Ino, RegularFileProjectionState> = HashMap::new();
+        for event in suffix {
+            let Some(ino) = RemoteApplyCoordinator::projection_event_inode(event) else {
+                continue;
+            };
+            let state = touched
+                .entry(ino)
+                .or_insert_with(|| self.states.get(&ino).copied().unwrap_or_default());
+            RemoteApplyCoordinator::fold_local_projection_event(state, event);
+        }
+        // A hidden status flip would change how earlier events project.
+        if touched.iter().any(|(ino, state)| {
+            self.states.get(ino).copied().unwrap_or_default().hidden() != state.hidden()
+        }) {
+            return false;
+        }
+        let hidden_after = |ino: &Ino| {
+            touched
+                .get(ino)
+                .or_else(|| self.states.get(ino))
+                .is_some_and(RegularFileProjectionState::hidden)
+        };
+        let hidden: HashSet<Ino> = suffix
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::AddEntry { entry, .. } => Some(entry.ino),
+                MetaEvent::RemoveAttr { ino } => Some(*ino),
+                MetaEvent::SetAttr { attr } => Some(attr.ino),
+                _ => None,
+            })
+            .filter(hidden_after)
+            .collect();
+        // The window's trailing `SetAttr` is hidden by a following hidden
+        // regular-file `AddEntry` under it; only a full projection recounts it.
+        if let (Some(parent_ino), Some(MetaEvent::AddEntry { parent, entry, .. })) =
+            (self.trailing_set_attr, suffix.first())
+            && *parent == parent_ino
+            && entry.kind == FileType::RegularFile
+            && hidden.contains(&entry.ino)
+        {
+            return false;
+        }
+        let projected = RemoteApplyCoordinator::project_local_events(suffix, &hidden, None);
+        let suffix_ops = u32::try_from(projected.len()).unwrap_or(u32::MAX);
+        self.needs_eager_flush |= RemoteApplyCoordinator::local_events_need_eager_flush(&projected);
+        self.visible_ops = self.visible_ops.saturating_add(suffix_ops);
+        self.states.extend(touched);
+        self.trailing_set_attr = Self::trailing_set_attr(suffix);
+        true
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct OverlayConflictSets {
     pub(super) block_inodes: HashSet<Ino>,
