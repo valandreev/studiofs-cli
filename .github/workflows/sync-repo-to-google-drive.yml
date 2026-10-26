@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - feature/wasabi-repo-snapshot-check
   workflow_dispatch:
 
 permissions:
@@ -16,7 +17,6 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    environment: copilot
 
     steps:
       - name: Checkout repository
