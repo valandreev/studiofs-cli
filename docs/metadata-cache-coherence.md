@@ -188,10 +188,17 @@ state and, for active writers or removed inodes, failed adapter admission and
 kept the coherence gate closed. Serving-view reconciliation after a self batch
 (rename reconciliation and regular-file serving from base) still journals its
 intents, except that rename, regular-file and dentry reconciliation discard them
-when the merged attributes and dentries they expose are unchanged. A self-only
-replay page that journals no intent therefore left the serving view unchanged,
-so restoring pending state after it skips the pending serving replay unless a
-pending event touches an inode whose regular-file graph the page cleared. Reconciling toward
+when the merged attributes and dentries they expose are unchanged. Dentry and
+own-rename reconciliation write first and derive intents only when the binding
+or view changed, journaling the intents the pre-write derivation would have
+recorded. Each intent is classified as it is journaled: on a self-only replay
+page, intents that only concern inodes the page removed (their attributes,
+content and names, and the directory and attributes of those names' parents)
+are cleanup, any other intent is a serving correction, and a discarded scope
+drops its classification with its intents. A self-only page without a serving
+correction left local state served as it was, so restoring pending state after
+it skips the pending serving replay unless a pending event touches an inode
+whose regular-file graph the page cleared. Reconciling toward
 base is a no-op for this client's own acknowledged writes, such as replacing an
 uploaded file by name, so only a real serving correction is announced. The same holds for replaying this client's own pending local events into serving after a flush or acknowledgement: it journals nothing when the touched inodes, dentries and file rows end up unchanged.
 

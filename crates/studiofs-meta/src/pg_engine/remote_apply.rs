@@ -2405,6 +2405,24 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let mut acknowledged_flushed_event_seq = None;
         let mut overlay_is_dirty = false;
         let empty_protected_base_inodes = HashSet::new();
+        // Inodes this client's own batches removed. Serving cleanup of their
+        // rows is not a correction of other local state: a later pending
+        // event on them already forces the pending replay.
+        let self_removed_inodes: Option<HashSet<Ino>> =
+            batches.iter().all(|batch| batch.is_self_batch).then(|| {
+                batches
+                    .iter()
+                    .flat_map(|batch| &batch.events)
+                    .filter_map(|event| match event {
+                        MetaEvent::RemoveAttr { ino }
+                        | MetaEvent::RemoveRegularFileGraph { ino } => Some(*ino),
+                        _ => None,
+                    })
+                    .collect()
+            });
+        if let Some(inodes) = self_removed_inodes {
+            txn.exempt_from_serving_corrections(inodes);
+        }
         for batch in batches {
             if let Some(execution) = execution {
                 execution.check()?;
@@ -2498,7 +2516,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             max_version,
             max_namespace_version,
             flushed_event_seq: acknowledged_flushed_event_seq,
-            serving_reconciled: txn.has_journaled_invalidations(),
+            serving_reconciled: txn.has_serving_corrections(),
         })
     }
 

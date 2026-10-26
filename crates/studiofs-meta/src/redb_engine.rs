@@ -482,6 +482,7 @@ pub(crate) struct RedbWriteTransaction<'a> {
     invalidation_journal: &'a Mutex<InvalidationJournal>,
     invalidation_notify: &'a tokio::sync::Notify,
     invalidations: RefCell<PendingInvalidations>,
+    serving_correction_exempt: RefCell<Option<ServingCorrectionExempt>>,
     invalidations_suppressed: Cell<bool>,
 }
 
@@ -711,6 +712,13 @@ impl Deref for RedbWriteTransaction<'_> {
     }
 }
 
+/// Inodes whose cleanup intents are not serving corrections; see
+/// [`RedbWriteTransaction::exempt_from_serving_corrections`].
+struct ServingCorrectionExempt {
+    inodes: HashSet<Ino>,
+    parents: HashSet<Ino>,
+}
+
 /// Guard returned by [`RedbWriteTransaction::invalidation_scope`].
 pub(crate) struct InvalidationScope<'t, 'db> {
     txn: &'t RedbWriteTransaction<'db>,
@@ -741,7 +749,12 @@ impl RedbWriteTransaction<'_> {
         if self.invalidations_suppressed.get() {
             return;
         }
-        self.invalidations.borrow_mut().push(intent);
+        let correction = self.is_serving_correction(&intent);
+        let mut invalidations = self.invalidations.borrow_mut();
+        if correction {
+            invalidations.note_serving_correction();
+        }
+        invalidations.push(intent);
     }
 
     /// Journals the following scopes separately until the returned guard is
@@ -757,10 +770,46 @@ impl RedbWriteTransaction<'_> {
         }
     }
 
-    /// Whether this transaction has journaled any invalidation intent, i.e.
-    /// changed something the local serving view exposes.
-    pub(crate) fn has_journaled_invalidations(&self) -> bool {
-        !self.invalidations.borrow().is_empty()
+    /// Whether an intent journaled so far announces a serving correction;
+    /// see [`Self::exempt_from_serving_corrections`].
+    pub(crate) fn has_serving_corrections(&self) -> bool {
+        self.invalidations.borrow().has_serving_correction()
+    }
+
+    /// Classifies later intents that only concern `inodes` (their
+    /// attributes, content or names, and the directory and attributes of a
+    /// parent of such a name) as cleanup rather than serving corrections.
+    /// Without an exemption every journaled intent is a correction.
+    pub(crate) fn exempt_from_serving_corrections(&self, inodes: HashSet<Ino>) {
+        *self.serving_correction_exempt.borrow_mut() = Some(ServingCorrectionExempt {
+            inodes,
+            parents: HashSet::new(),
+        });
+    }
+
+    fn is_serving_correction(&self, intent: &InvalidationIntent) -> bool {
+        let mut exempt = self.serving_correction_exempt.borrow_mut();
+        let Some(exempt) = exempt.as_mut() else {
+            return true;
+        };
+        match intent {
+            InvalidationIntent::Entry {
+                parent,
+                ino: Some(ino),
+                ..
+            } if exempt.inodes.contains(ino) => {
+                // Entry intents precede their parent's directory and
+                // attribute intents.
+                exempt.parents.insert(*parent);
+                false
+            }
+            InvalidationIntent::Attributes { ino } => {
+                !exempt.inodes.contains(ino) && !exempt.parents.contains(ino)
+            }
+            InvalidationIntent::Content { ino } => !exempt.inodes.contains(ino),
+            InvalidationIntent::Directory { ino } => !exempt.parents.contains(ino),
+            InvalidationIntent::Entry { .. } | InvalidationIntent::Reset => true,
+        }
     }
 
     /// Whether scopes recorded now would be dropped by [`Self::without_invalidations`].
@@ -792,6 +841,7 @@ impl RedbWriteTransaction<'_> {
             invalidation_notify,
             invalidations,
             invalidations_suppressed: _,
+            serving_correction_exempt: _,
         } = self;
         let commit_started = Instant::now();
         MetadataWriteMetrics::observe(&write_metrics.mutation, commit_started - mutation_started);
@@ -983,6 +1033,7 @@ impl RedbMetaEngine {
             invalidation_journal: &self.invalidation_journal,
             invalidation_notify: &self.invalidation_notify,
             invalidations: RefCell::default(),
+            serving_correction_exempt: RefCell::default(),
             invalidations_suppressed: Cell::new(false),
         })
     }
@@ -1015,6 +1066,7 @@ impl RedbMetaEngine {
             invalidation_journal: &self.invalidation_journal,
             invalidation_notify: &self.invalidation_notify,
             invalidations: RefCell::default(),
+            serving_correction_exempt: RefCell::default(),
             invalidations_suppressed: Cell::new(false),
         })
     }
