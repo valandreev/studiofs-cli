@@ -3124,7 +3124,7 @@ mod tests {
             .into_iter()
             .find(|op| op.object_id == 101)
             .unwrap();
-        for (ino, offset, epoch) in [(1, 0, 3), (1, 0, 2), (2, 0, 4), (1, 8, 4)] {
+        for (ino, offset, epoch) in [(1, 0, 3), (1, 0, 2), (2, 0, 4), (1, 8, 3)] {
             store.submit_staged_upload(ino, offset, 101, epoch, 99);
             assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 12);
             assert_eq!(
@@ -3132,9 +3132,19 @@ mod tests {
                 Some(&7)
             );
         }
-        store.submit_staged_upload(1, 0, 101, 4, 9);
-        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 14);
+        store.submit_staged_upload(1, 8, 101, 4, 99);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 104);
+        let moved = store
+            .snapshot_pending_uploads()
+            .into_iter()
+            .find(|op| op.object_id == 101)
+            .unwrap();
+        assert_eq!(moved.offset, 8);
         store.complete_upload(&previous);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 104);
+        store.submit_staged_upload(1, 0, 101, 5, 9);
+        assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 14);
+        store.complete_upload(&moved);
         assert_eq!(store.snapshot_writer_counters().pending_upload_bytes, 14);
         let current = store
             .snapshot_pending_uploads()
