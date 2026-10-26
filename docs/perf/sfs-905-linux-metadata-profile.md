@@ -161,7 +161,10 @@ script, release build, fresh volume, remote S3 and PostgreSQL), two runs gave:
 | rename | 0.228 / 0.245 | 0.13 / 0.14 |
 | rename-big | 0.258 / 0.261 | 0.17 / 0.17 |
 
-Rename with 8,000 extra entries is within 7–13% of the empty-directory case.
+Rename with 8,000 extra entries is within 7–13% of the empty-directory case. A
+third run under `perf` (sampling adds wall time) gave 0.393 and 0.415 ms/op;
+`redb::table::Range::next` fell from about 50% to 3.4% of FUSE-thread samples
+in `rename-big`.
 
 ## Regression tests
 
