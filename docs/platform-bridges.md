@@ -431,7 +431,7 @@ Current Linux callbacks:
 | `open` | `open_file_with_known_attr()` |
 | `read` | `read_into_fh()` |
 | `readlink` | `readlink()` |
-| `write` | `write_fh_with_deferred_materialize()` |
+| `write` | `write_fh_with_deferred_materialize()`; writes up to 64 KiB run on the callback thread |
 | `flush` | async-write inode watermark + `flush_volatile_writeback_with_outcome()` |
 | `fsync` | `fsync_fh()` when handle-backed, otherwise `fsync()` |
 | `release` | close handle admission, wait its write watermark, then `release_fh_with_deferred_last_handle_barrier()` |
@@ -440,11 +440,23 @@ Current Linux callbacks:
 | `access(2)` | Native kernel permission check (`default_permissions`); no userspace access callback |
 | `opendir` | `getattr()` directory check |
 | `readdir` | lazy per-handle `readdir()` snapshot |
+| `readdirplus` | the same snapshot plus `getattr()` per child entry |
 | `releasedir` | success reply |
 | `getxattr` | `get_xattr()`; missing attributes return `ENODATA` |
 | `setxattr` | `set_xattr()` |
 | `listxattr` | `list_xattrs()` as NUL-separated names |
 | `removexattr` | `remove_xattr()`; missing attributes return `ENODATA` |
+
+With async writes enabled (the default), every write takes an async-write
+ledger ticket and capacity reservation. A write of at most 64 KiB then runs
+the VFS write on the libfuse callback thread and replies there, because the
+kernel waits for the reply either way; larger writes copy the buffer and
+reply from a runtime task. At most half of the callback workers (at least
+one) run inline writes at once, so writers blocked on VFS backpressure leave
+workers for metadata and reads; a small write beyond that limit uses the
+runtime hand-off. A panic in an inline write replies `EIO` instead of
+unwinding into libfuse. Both paths share the barrier, shutdown, and capacity
+accounting below.
 
 Linux ordinary `flush` and final `release` admit state to the shared volatile
 metadata worker; the batch age is bounded to one second. An async-write ledger
@@ -518,6 +530,16 @@ Fresh-create handle allocation can itself retire the original snapshot.
 attribute read cache, so their uncached snapshots conservatively refresh.
 Missing or expired source deadlines skip reuse validation and go directly to
 the normal local getattr access and freshness checks.
+`readdirplus` uses the same handle snapshot and offsets as `readdir`. Each
+child entry carries attributes read after a lookup reservation, so it returns
+a lookup reference exactly like a `lookup` reply: references commit only when
+libfuse accepts the whole reply, and an invalidation that crosses the reply
+queues the usual follow-up. `.` and `..`, children whose `getattr` fails, and
+every child after the directory's namespace observation has changed since
+capture are sent as names only (inode zero), so a stale snapshot never becomes
+a kernel dentry. libfuse negotiates `READDIRPLUS` and `READDIRPLUS_AUTO` by
+default when the callback is registered.
+
 Directory replies intentionally leave libfuse3's `cache_readdir` disabled:
 remote namespace changes currently arrive through inode invalidation rather than
 individual dirent notifications, so caching a kernel-side directory snapshot

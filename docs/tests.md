@@ -367,6 +367,27 @@ objects stay within accepted bytes divided by pack size plus partial drains.
 runtime snapshots before/after fsync. Unit tests alone do not establish mounted
 latency acceptance.
 
+### SFS-892 Linux FUSE Small I/O Regressions
+
+Linux registered no `readdirplus` callback, so `ls -l` and `find` sent one
+`LOOKUP` per directory entry, and every write-capable 4 KiB write was copied
+and handed to the Tokio runtime even though the kernel waits for the reply.
+These tests pin the `readdirplus` entries and their lookup references, the
+names-only fallback after a namespace change, and the inline small-write path:
+
+```sh
+cargo test -p studiofs-linux-fuse --lib readdirplus -- --nocapture
+cargo test -p studiofs-linux-fuse --lib small_async_writes_run_inline_and_large_writes_keep_the_runtime_hand_off -- --nocapture
+cargo test -p studiofs-linux-fuse --lib mounted_stat_after_readdir_needs_no_lookup -- --ignored --nocapture
+```
+
+The mounted test needs `/dev/fuse` and `fusermount3`; it uses the VFS contract
+fixture, not a PostgreSQL/S3 mount. On that fixture (WSL2, release build),
+`scandir` plus `lstat` over 2,000 entries fell from 42-73 to 6-12 µs per entry,
+and single-job fio `psync` 4 KiB sequential writes rose from 12-15k to
+19-21k IOPS (four jobs: 11k to 22-24k). Kernel page-cache reads of locally
+dirty or newly changed files are unchanged by this work.
+
 ### SFS-897 Random-Write fsync and Upload Pipeline Regressions
 
 After random 4 KiB overwrites, `fsync` materialized every superseded write as
