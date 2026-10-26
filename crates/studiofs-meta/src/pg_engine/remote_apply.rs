@@ -104,6 +104,109 @@ impl HiddenWindowProjection {
     }
 }
 
+/// Projection summary of a local event window that projects at least one
+/// remote-visible operation.
+///
+/// A suffix that leaves the hidden status of every inode unchanged cannot
+/// change how the window's earlier events project, so the window's visible
+/// operation count and eager-flush need grow by the suffix's own projection.
+/// This keeps the pending-state tracker from decoding the whole window again
+/// on every mutation while concurrent writers extend it.
+#[derive(Clone)]
+pub(super) struct VisibleWindowProjection {
+    states: HashMap<Ino, RegularFileProjectionState>,
+    visible_ops: u32,
+    needs_eager_flush: bool,
+    /// Inode of the window's last event when it is a `SetAttr`, whose
+    /// visibility depends on the event that follows it.
+    trailing_set_attr: Option<Ino>,
+}
+
+impl VisibleWindowProjection {
+    pub(super) fn from_events(events: &[MetaEvent], projected: &ProjectedRemoteBatch) -> Self {
+        let mut states = HashMap::new();
+        for event in events {
+            RemoteApplyCoordinator::update_local_projection_state(&mut states, event);
+        }
+        Self {
+            states,
+            visible_ops: projected.visible_ops,
+            needs_eager_flush: projected.needs_eager_flush,
+            trailing_set_attr: Self::trailing_set_attr(events),
+        }
+    }
+
+    pub(super) fn visible_ops(&self) -> u32 {
+        self.visible_ops
+    }
+
+    pub(super) fn needs_eager_flush(&self) -> bool {
+        self.needs_eager_flush
+    }
+
+    fn trailing_set_attr(events: &[MetaEvent]) -> Option<Ino> {
+        match events.last() {
+            Some(MetaEvent::SetAttr { attr }) => Some(attr.ino),
+            _ => None,
+        }
+    }
+
+    /// Folds `suffix` into the window when the window's earlier events keep
+    /// their projection; returns `false` and leaves the window unchanged
+    /// otherwise, so the caller re-projects the whole window.
+    pub(super) fn extend(&mut self, suffix: &[MetaEvent]) -> bool {
+        let mut touched: HashMap<Ino, RegularFileProjectionState> = HashMap::new();
+        for event in suffix {
+            let Some(ino) = RemoteApplyCoordinator::projection_event_inode(event) else {
+                continue;
+            };
+            let state = touched
+                .entry(ino)
+                .or_insert_with(|| self.states.get(&ino).copied().unwrap_or_default());
+            RemoteApplyCoordinator::fold_local_projection_event(state, event);
+        }
+        // A hidden status flip would change how earlier events project.
+        if touched.iter().any(|(ino, state)| {
+            self.states.get(ino).copied().unwrap_or_default().hidden() != state.hidden()
+        }) {
+            return false;
+        }
+        let hidden_after = |ino: &Ino| {
+            touched
+                .get(ino)
+                .or_else(|| self.states.get(ino))
+                .is_some_and(RegularFileProjectionState::hidden)
+        };
+        let hidden: HashSet<Ino> = suffix
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::AddEntry { entry, .. } => Some(entry.ino),
+                MetaEvent::RemoveAttr { ino } => Some(*ino),
+                MetaEvent::SetAttr { attr } => Some(attr.ino),
+                _ => None,
+            })
+            .filter(hidden_after)
+            .collect();
+        // The window's trailing `SetAttr` is hidden by a following hidden
+        // regular-file `AddEntry` under it; only a full projection recounts it.
+        if let (Some(parent_ino), Some(MetaEvent::AddEntry { parent, entry, .. })) =
+            (self.trailing_set_attr, suffix.first())
+            && *parent == parent_ino
+            && entry.kind == FileType::RegularFile
+            && hidden.contains(&entry.ino)
+        {
+            return false;
+        }
+        let projected = RemoteApplyCoordinator::project_local_events(suffix, &hidden, None);
+        let suffix_ops = u32::try_from(projected.len()).unwrap_or(u32::MAX);
+        self.needs_eager_flush |= RemoteApplyCoordinator::local_events_need_eager_flush(&projected);
+        self.visible_ops = self.visible_ops.saturating_add(suffix_ops);
+        self.states.extend(touched);
+        self.trailing_set_attr = Self::trailing_set_attr(suffix);
+        true
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct OverlayConflictSets {
     pub(super) block_inodes: HashSet<Ino>,
@@ -137,6 +240,9 @@ pub(super) struct RemoteReplayApplyOutcome {
     pub(super) max_version: i64,
     pub(super) max_namespace_version: i64,
     pub(super) flushed_event_seq: Option<u64>,
+    /// Whether applying the page changed the local serving view, which the
+    /// coherence contract makes observable as a journaled invalidation.
+    pub(super) serving_reconciled: bool,
 }
 
 pub(super) struct RemoteReplayApplyContext {
@@ -505,7 +611,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok(overlay)
     }
 
-    fn add_event_overlay_conflicts(overlay: &mut OverlayConflictSets, event: &MetaEvent) {
+    pub(super) fn add_event_overlay_conflicts(
+        overlay: &mut OverlayConflictSets,
+        event: &MetaEvent,
+    ) {
         match event {
             MetaEvent::SetAttr { attr } => {
                 overlay.attr_inodes.insert(attr.ino);
@@ -1849,30 +1958,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 &partial_publish_inodes,
             )
         })?;
-        let mut changed = false;
         let mut local_removals = crate::redb_engine::ReplayLocalJournal::default();
-        for event in &batch_events {
-            if let MetaEvent::RenameEntry {
-                parent,
-                name,
-                new_parent,
-                new_name,
-                entry,
-                ..
-            } = event
-            {
-                RedbMetaEngine::reconcile_serving_rename_from_base_in_txn(
-                    txn,
-                    *parent,
-                    name,
-                    *new_parent,
-                    new_name,
-                    entry,
-                    &mut local_removals,
-                )?;
-                changed = true;
-            }
-        }
+        let mut changed = RedbMetaEngine::reconcile_own_serving_renames_from_base_in_txn(
+            txn,
+            &batch_events,
+            &mut local_removals,
+        )?;
         let mut aux_events = batch_events
             .iter()
             .filter(|event| {
@@ -2300,6 +2391,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 max_version: context.last_seq,
                 max_namespace_version: context.current_namespace_version,
                 flushed_event_seq: None,
+                serving_reconciled: false,
             });
         }
 
@@ -2313,6 +2405,24 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let mut acknowledged_flushed_event_seq = None;
         let mut overlay_is_dirty = false;
         let empty_protected_base_inodes = HashSet::new();
+        // Inodes this client's own batches removed. Serving cleanup of their
+        // rows is not a correction of other local state: a later pending
+        // event on them already forces the pending replay.
+        let self_removed_inodes: Option<HashSet<Ino>> =
+            batches.iter().all(|batch| batch.is_self_batch).then(|| {
+                batches
+                    .iter()
+                    .flat_map(|batch| &batch.events)
+                    .filter_map(|event| match event {
+                        MetaEvent::RemoveAttr { ino }
+                        | MetaEvent::RemoveRegularFileGraph { ino } => Some(*ino),
+                        _ => None,
+                    })
+                    .collect()
+            });
+        if let Some(inodes) = self_removed_inodes {
+            txn.exempt_from_serving_corrections(inodes);
+        }
         for batch in batches {
             if let Some(execution) = execution {
                 execution.check()?;
@@ -2406,6 +2516,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             max_version,
             max_namespace_version,
             flushed_event_seq: acknowledged_flushed_event_seq,
+            serving_reconciled: txn.has_serving_corrections(),
         })
     }
 

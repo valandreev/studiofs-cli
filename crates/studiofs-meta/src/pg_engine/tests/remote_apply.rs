@@ -3522,6 +3522,47 @@ fn visible_self_rename_still_journals_serving_namespace_reconciliation() {
 }
 
 #[test]
+fn visible_self_directory_rename_invalidates_descendants_at_their_historical_path() {
+    use crate::coherence::InvalidationIntent;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let dir = pg
+        .create_dir(ROOT_INO, b"dir-from", 0, 0, 0o755)
+        .expect("create directory");
+    pg.create_dir(dir.ino, b"child", 0, 0, 0o755)
+        .expect("create child");
+    journaled_invalidation_intents(&pg);
+    let rename = MetaEvent::RenameEntry {
+        parent: ROOT_INO,
+        name: b"dir-from".to_vec(),
+        new_parent: ROOT_INO,
+        new_name: b"dir-to".to_vec(),
+        entry: DirEntryValue {
+            ino: dir.ino,
+            kind: FileType::Directory,
+        },
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: None,
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    };
+
+    assert!(apply_visible_self_batch(&pg, &[rename]).expect("apply visible self rename"));
+
+    let intents = journaled_invalidation_intents(&pg);
+    let historical = Some(vec![b"dir-from".to_vec()]);
+    assert!(
+        intents.iter().any(|intent| matches!(
+            intent,
+            InvalidationIntent::Entry { parent, name, ancestors, .. }
+                if *parent == dir.ino && name.as_slice() == b"child" && *ancestors == historical
+        )),
+        "descendants must be invalidated at the path the kernel cached: {intents:?}"
+    );
+}
+
+#[test]
 fn protected_attr_merge_preserves_larger_size_for_newer_remote_payload_publish() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 

@@ -2069,6 +2069,61 @@ fn coherence_journal_discarded_overflow_keeps_earlier_intents() {
 }
 
 #[test]
+fn serving_corrections_exclude_cleanup_of_exempt_inodes() {
+    use crate::coherence::InvalidationIntent;
+    let removed: Ino = 4_242;
+    let parent: Ino = 4_000;
+    let entry = |name: &[u8], ino| InvalidationIntent::Entry {
+        parent,
+        name: name.to_vec(),
+        ancestors: None,
+        ino,
+    };
+    let engine = temp_engine();
+    let txn = engine.begin_write_txn().unwrap();
+    txn.exempt_from_serving_corrections(HashSet::from([removed]));
+    txn.invalidate(entry(b"gone", Some(removed)));
+    txn.invalidate(InvalidationIntent::Directory { ino: parent });
+    txn.invalidate(InvalidationIntent::Attributes { ino: parent });
+    txn.invalidate(InvalidationIntent::Attributes { ino: removed });
+    txn.invalidate(InvalidationIntent::Content { ino: removed });
+    assert!(
+        !txn.has_serving_corrections(),
+        "cleanup of an exempt inode and its parent is not a serving correction"
+    );
+
+    let scope = txn.invalidation_scope();
+    txn.invalidate(InvalidationIntent::Attributes { ino: 7 });
+    scope.discard();
+    assert!(
+        !txn.has_serving_corrections(),
+        "a discarded scope must not leave a serving correction behind"
+    );
+
+    // Overflowing the journal to `Reset` must not hide what was recorded.
+    for index in 0..20_000u32 {
+        txn.invalidate(entry(format!("gone-{index}").as_bytes(), Some(removed)));
+    }
+    assert!(!txn.has_serving_corrections());
+    let scope = txn.invalidation_scope();
+    txn.invalidate(entry(b"kept", Some(9)));
+    drop(scope);
+    assert!(
+        txn.has_serving_corrections(),
+        "a name bound to another inode is a serving correction"
+    );
+    txn.abort().unwrap();
+
+    let txn = engine.begin_write_txn().unwrap();
+    txn.invalidate(InvalidationIntent::Attributes { ino: removed });
+    assert!(
+        txn.has_serving_corrections(),
+        "without an exemption every intent is a serving correction"
+    );
+    txn.abort().unwrap();
+}
+
+#[test]
 fn coherence_journal_kept_scope_reset_subsumes_earlier_intents() {
     use crate::coherence::InvalidationIntent;
     let engine = temp_engine();
