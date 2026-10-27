@@ -4,6 +4,9 @@ name: Linux mounted E2E
 # the full run takes up to 30 minutes.
 
 on:
+  # TEMP: validate on this branch before the workflow exists on main; remove before merge.
+  push:
+    branches: [ci/linux-github-actions]
   workflow_dispatch:
     inputs:
       target:
