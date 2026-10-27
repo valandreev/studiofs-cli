@@ -1,6 +1,6 @@
 # StudioFS release downloads and builds
 
-StudioFS 0.2.0 is prepared for these five native targets:
+StudioFS 0.2.1 targets these five native platforms:
 
 | Download suffix | System | GitHub builder |
 | --- | --- | --- |
@@ -33,11 +33,18 @@ On Ubuntu 24.04, install the runtime packages from your distribution:
 
 ```bash
 sudo apt-get update
-sudo apt-get install fuse3 libgtk-3-0t64 libxdo3 libayatana-appindicator3-1
+sudo apt-get install fuse3 libfuse3-3
 ```
 
 Other distributions use their corresponding packages. StudioFS dynamically
-links libfuse3 and desktop libraries; it does not ship these shared libraries.
+links libfuse3; it does not ship system shared libraries. Since 0.2.1 the Linux
+tray uses KSNI over session D-Bus, without GTK3/GLib/libxdo/AppIndicator libraries.
+A StatusNotifierItem host such as KDE Plasma is required for an icon. GNOME needs
+a compatible AppIndicator/KStatusNotifierItem extension and may not display
+tooltips. Without a usable desktop/session bus, mounts continue without the
+tray. A watcher appearing or restarting on an existing bus is handled by the
+upstream backend. See [tray details](tray.md). Older 0.2.0 binaries still need
+the GTK/AppIndicator packages listed in that release's installation instructions.
 
 macOS users install [macFUSE](https://macfuse.github.io/) themselves and follow
 its platform setup requirements. The v0.2.0 release uses its legacy libfuse
@@ -57,7 +64,7 @@ command-line tools on macOS, or a C compiler, make and pkg-config on Linux.
 Ubuntu builders also need:
 
 ```bash
-sudo apt-get install pkg-config libfuse3-dev libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+sudo apt-get install pkg-config libfuse3-dev
 ```
 
 macOS builders need the headers from the separately installed macFUSE package.

@@ -1,7 +1,8 @@
 # Platform Native Distribution Terms
 
 Status: engineering license review for SFS-850 (Release 0.2.0), checked
-2026-10-22. This is not legal advice. It records the native components each
+2026-10-22, updated for the 0.2.1 KSNI migration (SFS-884) on 2026-10-27.
+This is not legal advice. It records the native components each
 StudioFS build loads, the upstream terms that apply to them, and the packaging
 decisions that keep StudioFS distributable as GPL-3.0-only. Items marked
 **Escalation** need a legal or upstream answer before the related decision may
@@ -14,7 +15,7 @@ change.
 | Windows | WinFsp DLL `winfsp-<arch>.dll` + driver | Delay-loaded at runtime from the installed WinFsp | GPLv3 with a FLOSS exception | **Separate install.** Release archives contain no WinFsp DLL or installer. |
 | Windows | `winfsp` / `winfsp-sys` crates 0.12 (`+winfsp-2.1`) | Rust bindings; import library linked into `studiofs.exe` | GPL-3.0 | Ships inside `studiofs.exe` under GPLv3; StudioFS source is published. |
 | Linux | libfuse3 `libfuse.so.3` (≥ 3.2) | Dynamically linked via the C shim in `studiofs-linux-fuse` | LGPL-2.1 (`lib/`, `include/`); GPL-2.0 utilities | **System package.** Never vendored or statically linked (ADR 0008). |
-| Linux | GTK 3, GLib, libxdo, Ayatana AppIndicator | Tray UI; dynamically linked or `dlopen`ed | LGPL-2.1+ / LGPL-2.1-or-3 / BSD-3-Clause | **System packages.** Never bundled. |
+| Linux | Session D-Bus and a StatusNotifierItem desktop host | KSNI tray service; no GTK3/GLib/AppIndicator library dependency | Rust crate terms in the reviewed inventory; desktop services installed separately | **System services.** Never bundled. |
 | macOS | macFUSE `libfuse.2.dylib` + kernel extension | Dynamically linked; kernel extension reached through `mount_macfuse` | macFUSE license (BSD-3-Clause + no commercial bundling); libfuse LGPL | **Separate install by the user.** Never bundled, downloaded, or installed automatically. |
 | macOS | macFUSE `MFMount.framework` (FSKit backend) | Linked only when present at build time; experimental | macFUSE package license; component terms not separately published | **Excluded from 0.2.0 release binaries.** Opt-in developer builds only. |
 
@@ -86,7 +87,7 @@ proprietary software. Commercial licenses are available from the author.
 - Rust's default MSVC target uses the dynamic MSVC runtime; do not
   redistribute the Visual C++ Redistributable inside StudioFS archives.
 
-## Linux: libfuse3 and desktop libraries
+## Linux: libfuse3 and KSNI tray
 
 ### What is linked
 
@@ -94,9 +95,13 @@ proprietary software. Commercial licenses are available from the author.
   requires libfuse3 ≥ 3.2, and compiles `csrc/low_level_ops.c` against the
   system headers; `src/low_level.rs` declares `#[link(name = "fuse3")]`
   (dynamic). ADR 0008 forbids vendoring, bundling, or building libfuse3.
-- The tray UI (`tray-icon` → `muda`, `gtk`) dynamically links GTK 3, GLib,
-  GDK, Pango, Cairo, ATK, and libxdo; `libappindicator-sys` `dlopen`s
-  `libayatana-appindicator3.so.1` or `libappindicator3.so.1` at runtime.
+- Since 0.2.1, the tray uses `tray-icon` with only its `ksni` feature on Linux.
+  `ksni`/`zbus` implement StatusNotifierItem over session D-Bus in Rust.
+  The product graph no longer includes GTK3, GLib, AppIndicator or libxdo
+  through the tray; no corresponding system libraries are required. A desktop
+  StatusNotifierItem host is needed to display the icon. GNOME needs a compatible
+  extension and may omit tooltips. Missing desktop/bus support is non-fatal.
+  Dependency presence and native linkage are verified separately below.
 - `fusermount3` (GPL-2.0, part of the `fuse3` package) is executed by libfuse
   as a separate program; StudioFS does not distribute it.
 
@@ -105,9 +110,10 @@ proprietary software. Commercial licenses are available from the author.
 libfuse (<https://github.com/libfuse/libfuse/blob/master/LICENSE>) licenses
 `lib/`, `include/`, and `meson.build` under LGPL-2.1; everything else
 (including `fusermount3` and examples) is GPL-2.0. LGPL-2.1 is compatible with
-a GPL-3.0-only program. GTK 3 and GLib are LGPL-2.1-or-later (with
-permissive parts), the Ayatana AppIndicator library is LGPL-2.1 or LGPL-3,
-and libxdo is BSD-3-Clause.
+a GPL-3.0-only program. The Rust tray and D-Bus dependency license expressions,
+archive checksums and notice evidence are recorded in the reviewed
+[rust-dependency-inventory.json](rust-dependency-inventory.json). The historical
+0.2.0 GTK/AppIndicator terms below remain relevant to those older binaries.
 
 ### Decision
 
@@ -122,11 +128,15 @@ and libxdo is BSD-3-Clause.
 - **Static linking of libfuse3 or any LGPL library is not allowed** without
   first adding object-file relinking material and revising this document.
 - A future `.deb`/`.rpm` must declare runtime dependencies (`fuse3`,
-  `libfuse3-3` / `fuse3-libs`, GTK 3, libxdo, Ayatana AppIndicator) instead of
+  `libfuse3-3` / `fuse3-libs`) instead of
   bundling them, and install the license and notice files under
   `/usr/share/doc/studiofs/` (Debian `copyright` format for `.deb`).
 
-### Linkage evidence
+### Historical 0.2.0 linkage evidence
+
+These GTK dependencies describe the older release, not the 0.2.1 KSNI graph.
+Fresh 0.2.1 artifact checks must retain libfuse3 and exclude the old tray stack;
+the release workflow checks the actual Linux executable before packaging.
 
 Observed on 2026-10-22 with `cargo build --locked -p studiofs --release` in an
 `ubuntu:24.04` container (Ubuntu 24.04.5 LTS, aarch64, Rust 1.95.0,
@@ -249,9 +259,10 @@ WinFsp is licensed under GPLv3 with a FLOSS exception and is installed
 separately; StudioFS does not redistribute it.
 
 Linux: StudioFS dynamically links libfuse3 (https://github.com/libfuse/libfuse),
-licensed under the GNU Lesser General Public License version 2.1, and uses
-the system GTK 3, GLib, libxdo, and AppIndicator libraries. These are
-installed from your distribution and are not redistributed by StudioFS.
+licensed under the GNU Lesser General Public License version 2.1. It is
+installed from your distribution and is not redistributed by StudioFS.
+The Linux tray uses KSNI/StatusNotifierItem over a separately supplied session
+D-Bus and compatible desktop host; StudioFS does not bundle these services.
 
 macOS: StudioFS requires macFUSE (https://macfuse.github.io/),
 Copyright (c) 2011-2026 Benjamin Fleischer, which is installed separately

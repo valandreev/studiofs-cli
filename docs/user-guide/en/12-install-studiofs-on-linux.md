@@ -19,8 +19,7 @@ Open a terminal and run:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y fuse3 libfuse3-3 libgtk-3-0t64 libxdo3 \
-  libayatana-appindicator3-1
+sudo apt-get install -y fuse3 libfuse3-3
 ```
 
 These are system libraries and tools needed to run the program and mount FUSE3.
@@ -32,10 +31,14 @@ Some required packages come from additional repositories. The commands below ena
 ```bash
 sudo dnf install -y dnf-plugins-core epel-release
 sudo dnf config-manager --set-enabled crb
-sudo dnf install -y gtk3 libappindicator-gtk3 fuse3 fuse3-libs libxdo
+sudo dnf install -y fuse3 fuse3-libs
 ```
 
 If a package cannot be found, first check repository availability and your system version. Do not replace FUSE3 with the older FUSE2: StudioFS uses version 3.
+
+## Desktop indicator in 0.2.1
+
+The Linux tray uses KSNI/StatusNotifierItem over your session D-Bus; GTK3, GLib, libxdo and AppIndicator libraries are no longer StudioFS prerequisites. A compatible desktop host, such as KDE Plasma, displays the icon. On GNOME, enable an AppIndicator/KStatusNotifierItem extension; tooltips may not be displayed. If the watcher starts later or restarts on the same bus, the backend registers again. Without a graphical session or session bus, mounting continues without the tray. An absent icon does not confirm that synchronization has finished. Older 0.2.0 binaries retain their GTK/AppIndicator requirements.
 
 ## Checking FUSE3
 

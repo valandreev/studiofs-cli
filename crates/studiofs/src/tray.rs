@@ -704,6 +704,7 @@ mod supported {
         stop.store(true, Ordering::Release);
         join_optional_thread("tray ticker", ticker);
         join_optional_thread("tray monitor", monitor);
+        drop(app.tray_icon.take());
 
         match mount_handle.join() {
             Ok(result) => result,
@@ -979,6 +980,47 @@ mod supported {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore = "run under dbus-run-session with no StatusNotifierWatcher; see docs/tray.md"]
+        fn linux_backend_updates_and_stops_without_a_watcher() {
+            let mask = IconMask::load().expect("load tray asset");
+            let tray = TrayIconBuilder::new()
+                .with_icon(mask.tinted_icon([COLOR_BLACK; 2]).expect("boot icon"))
+                .with_tooltip("starting mount")
+                .build()
+                .expect("a watcher may appear after tray startup");
+            for mode in [
+                TrayPulseMode::Booting,
+                TrayPulseMode::Active,
+                TrayPulseMode::Idle,
+                TrayPulseMode::Unavailable,
+            ] {
+                tray.set_icon(Some(
+                    mask.tinted_icon(pulse_colors(mode, ANIMATION_TICK))
+                        .expect("status icon"),
+                ))
+                .expect("update icon without a watcher");
+                tray.set_tooltip(Some(format!("{mode:?}")))
+                    .expect("update tooltip without a watcher");
+            }
+            drop(tray);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore = "requires an invalid DBUS_SESSION_BUS_ADDRESS; see docs/tray.md"]
+        fn linux_backend_returns_error_without_a_session_bus() {
+            let mask = IconMask::load().expect("load tray asset");
+            assert!(
+                TrayIconBuilder::new()
+                    .with_icon(mask.tinted_icon([COLOR_BLACK; 2]).expect("boot icon"))
+                    .build()
+                    .is_err(),
+                "missing session bus must allow the initialization-error fallback"
+            );
+        }
 
         #[test]
         fn pulse_colors_at_peak() {

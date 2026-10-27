@@ -1,7 +1,23 @@
 # Mount tray indicator
 
-Run a mount with `--tray` to show its synchronization status in the system tray
-or menu bar. The indicator describes work accepted by that mount.
+Foreground mounts automatically try to show synchronization status in the system
+tray or menu bar. No `--tray` option is needed. Detached mounts bypass the tray.
+The indicator describes work accepted by that mount.
+
+On Linux, StudioFS 0.2.1 uses the GTK-free KSNI/StatusNotifierItem backend over
+the user's session D-Bus. A desktop host such as KDE Plasma is needed to display
+the icon. GNOME needs a compatible AppIndicator/KStatusNotifierItem extension;
+GNOME hosts may not display tooltips even though StudioFS supplies the data.
+GTK3, GLib, libxdo and AppIndicator libraries are no longer StudioFS tray
+prerequisites. Windows and macOS retain their native backends.
+
+Without a graphical session or session bus, tray initialization falls back to
+mounting without an indicator. If the bus is usable but its StatusNotifierWatcher
+is absent, the upstream backend waits for it and registers when it appears or
+restarts. An absent icon does not confirm synchronization. A tray
+initialization error does not dispatch a second mount: the existing mount thread
+continues, and its result is returned after the tray helpers stop. Dropping the
+tray shuts down its backend workers.
 
 The red pulse means local changes still need synchronization: writer data,
 staged or retrying uploads, file-version publication, or metadata acknowledgement.
@@ -40,3 +56,27 @@ checking writer, staging, upload and publication owners. Activity leases remain
 visible while work moves between those owners, including delayed publication
 retries. Overlapping activity, incomplete startup or missing proof prevents a
 safe result even when the visible queues happen to be empty.
+
+## Focused Linux backend checks
+
+The opt-in tests below need `dbus-run-session` and GNU `timeout`. They exercise
+real backend startup, icon/tooltip updates and shutdown without a watcher, and
+the initialization-error path without a session bus. Run from the repository root:
+
+```bash
+cargo test --locked -p studiofs --bin studiofs tray::supported::tests:: -- --nocapture
+timeout 20s dbus-run-session -- cargo test --locked -p studiofs --bin studiofs \
+  tray::supported::tests::linux_backend_updates_and_stops_without_a_watcher \
+  -- --exact --ignored --nocapture
+timeout 20s env DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/studiofs-sfs-884 \
+  cargo test --locked -p studiofs --bin studiofs \
+  tray::supported::tests::linux_backend_returns_error_without_a_session_bus \
+  -- --exact --ignored --nocapture
+```
+
+Build the test binary first so compilation does not consume the timeout. These
+checks do not establish rendering, watcher restart behavior or mounted lifecycle.
+Before release, rebuild `studiofs`, check all four states on a real KDE/SNI host
+and GNOME with its extension, start/restart the watcher, and exercise foreground
+mount exit/error propagation and detached/headless operation. Record the host,
+extension and actual tooltip behavior separately from compile/test results.

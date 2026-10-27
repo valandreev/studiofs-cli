@@ -19,8 +19,7 @@ StudioFS тестували на **Ubuntu 24.04** і **Rocky Linux 9.4**. На �
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y fuse3 libfuse3-3 libgtk-3-0t64 libxdo3 \
-  libayatana-appindicator3-1
+sudo apt-get install -y fuse3 libfuse3-3
 ```
 
 Це системні бібліотеки й утиліти, потрібні для запуску програми та підключення FUSE3.
@@ -32,10 +31,14 @@ sudo apt-get install -y fuse3 libfuse3-3 libgtk-3-0t64 libxdo3 \
 ```bash
 sudo dnf install -y dnf-plugins-core epel-release
 sudo dnf config-manager --set-enabled crb
-sudo dnf install -y gtk3 libappindicator-gtk3 fuse3 fuse3-libs libxdo
+sudo dnf install -y fuse3 fuse3-libs
 ```
 
 Якщо пакунок не знаходиться, спочатку перевірте доступність репозиторіїв і версію системи. Не замінюйте FUSE3 на старий FUSE2: StudioFS використовує саме третю версію.
+
+## Індикатор робочого столу у 0.2.1
+
+Трей Linux використовує KSNI/StatusNotifierItem через сеансову шину D-Bus; бібліотеки GTK3, GLib, libxdo та AppIndicator більше не потрібні StudioFS. Іконку показує сумісне середовище, наприклад KDE Plasma. У GNOME увімкніть розширення AppIndicator/KStatusNotifierItem; спливні підказки можуть не відображатися. Якщо watcher запускається пізніше або перезапускається на тій самій шині, бекенд реєструється знову. Без графічного сеансу або сеансової шини підключення працює без трею. Відсутність іконки не підтверджує завершення синхронізації. Старі збірки 0.2.0 зберігають вимоги до GTK/AppIndicator.
 
 ## Перевіряємо FUSE3
 
