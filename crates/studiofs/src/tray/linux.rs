@@ -38,11 +38,22 @@ pub(crate) fn dispatch_mount_with_auto_tray(args: MountArgs) -> anyhow::Result<(
 struct TrayProcess(Child);
 
 impl TrayProcess {
+    /// Must run on the thread that outlives the mount: PR_SET_PDEATHSIG fires
+    /// when the spawning thread exits, not when the process exits.
     fn spawn(command: &mut Command) -> std::io::Result<Self> {
         let parent_id = std::process::id();
         // SAFETY: the child closure uses only Linux syscalls and allocation-free errno results.
         unsafe {
-            command.pre_exec(move || terminate_with_parent(parent_id));
+            command.pre_exec(move || {
+                // Terminal Ctrl+C/hangup must not remove the icon while the mount is still
+                // shutting down; stdin EOF and parent death own the helper's lifetime.
+                for signal in [libc::SIGINT, libc::SIGHUP] {
+                    if libc::signal(signal, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                terminate_with_parent(parent_id)
+            });
         }
         command.stdin(Stdio::piped()).spawn().map(Self)
     }
@@ -147,6 +158,16 @@ mod tests {
     fn tray_owner_allows_a_helper_to_exit_on_eof() {
         let mut child =
             TrayProcess::spawn(Command::new("sh").args(["-c", "read line; exit 0"])).unwrap();
+        child.stop();
+        assert!(child.0.try_wait().unwrap().unwrap().success());
+    }
+
+    #[test]
+    fn tray_helper_survives_terminal_interrupt_and_hangup() {
+        let mut child = TrayProcess::spawn(
+            Command::new("sh").args(["-c", "kill -INT $$; kill -HUP $$; read line; exit 0"]),
+        )
+        .unwrap();
         child.stop();
         assert!(child.0.try_wait().unwrap().unwrap().success());
     }

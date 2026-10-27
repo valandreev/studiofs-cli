@@ -26,11 +26,9 @@ sudo apt-get install -y fuse3 libfuse3-3
 
 ### Rocky Linux 9.4
 
-Частина потрібних пакунків надходить із додаткових репозиторіїв. Команди нижче вмикають EPEL та CRB, тобто змінюють системні джерела пакунків. На робочій станції, яку адмініструє студія, узгодьте це із системним адміністратором.
+Потрібні пакунки надходять зі стандартних репозиторіїв Rocky Linux; EPEL та CRB не потрібні.
 
 ```bash
-sudo dnf install -y dnf-plugins-core epel-release
-sudo dnf config-manager --set-enabled crb
 sudo dnf install -y fuse3 fuse3-libs
 ```
 

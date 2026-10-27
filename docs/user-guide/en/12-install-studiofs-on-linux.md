@@ -26,11 +26,9 @@ These are system libraries and tools needed to run the program and mount FUSE3.
 
 ### Rocky Linux 9.4
 
-Some required packages come from additional repositories. The commands below enable EPEL and CRB, which changes the system's package sources. On a workstation managed by your studio, coordinate this with your system administrator.
+The required packages come from the standard Rocky Linux repositories; EPEL and CRB are not needed.
 
 ```bash
-sudo dnf install -y dnf-plugins-core epel-release
-sudo dnf config-manager --set-enabled crb
 sudo dnf install -y fuse3 fuse3-libs
 ```
 
