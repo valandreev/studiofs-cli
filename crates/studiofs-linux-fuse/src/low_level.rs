@@ -3028,7 +3028,7 @@ struct InlineWriteSlot<'a>(&'a AtomicUsize);
 impl<'a> InlineWriteSlot<'a> {
     fn acquire(in_flight: &'a AtomicUsize, limit: usize) -> Option<Self> {
         in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < limit).then_some(count + 1)
             })
             .ok()
