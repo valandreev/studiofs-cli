@@ -294,7 +294,10 @@ jobs:
   rocky-tests:
     name: Rocky Linux workspace tests
     runs-on: ubuntu-24.04
-    container: rockylinux:9
+    container:
+      image: rockylinux:9
+      # Reap orphaned zombies; the default PID 1 does not, which breaks process-group kill tests.
+      options: --init
     timeout-minutes: 60
     steps:
       - name: Install Rocky packages
