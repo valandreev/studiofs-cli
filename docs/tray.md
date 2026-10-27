@@ -79,8 +79,7 @@ cargo test --locked -p studiofs --bin studiofs --no-run --message-format=json > 
 timeout 20s dbus-run-session -- cargo test --locked -p studiofs --bin studiofs \
   tray::supported::tests::linux_backend_updates_and_stops_without_a_watcher \
   -- --exact --ignored --nocapture
-timeout 20s env DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/studiofs-sfs-884 \
-  cargo test --locked -p studiofs --bin studiofs \
+timeout 20s cargo test --locked -p studiofs --bin studiofs \
   tray::supported::tests::linux_backend_returns_error_without_a_session_bus \
   -- --exact --ignored --nocapture
 cargo test --locked -p studiofs --bin studiofs tray::linux::tests:: -- --nocapture
@@ -88,9 +87,10 @@ cargo build --locked -p studiofs
 timeout 30s dbus-run-session -- /usr/bin/python3 tools/test-linux-tray.py target/debug/studiofs target/tray-test-artifacts.json
 ```
 
-Build the test binary first so compilation does not consume the timeout. Run the
-tests separately: one needs a working isolated bus, the other an invalid bus
-address. The raw backend timeouts bound each test process, including destruction.
+Build the test binary first so compilation does not consume the timeout. The
+missing-session-bus test supplies an invalid bus address to a child test process,
+so it also works when the parent has a working desktop session bus. The raw
+backend timeouts bound each test process, including destruction.
 The `owned_backend_fixture` and `backend_drop_fixture` tests are subprocess
 fixtures controlled by the Python runner, which sets `STUDIOFS_TRAY_TEST_FIXTURE=1`
 only for their processes. Without that opt-in, including during a general

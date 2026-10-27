@@ -1059,8 +1059,32 @@ mod supported {
 
         #[cfg(target_os = "linux")]
         #[test]
-        #[ignore = "requires an invalid DBUS_SESSION_BUS_ADDRESS; see docs/tray.md"]
+        #[ignore = "runs the real Linux tray backend in an isolated subprocess; see docs/tray.md"]
         fn linux_backend_returns_error_without_a_session_bus() {
+            const INVALID_BUS: &str = "unix:path=/nonexistent/studiofs-tray-test-bus";
+            if std::env::var("DBUS_SESSION_BUS_ADDRESS").as_deref() != Ok(INVALID_BUS) {
+                // The child relies on the backend's own D-Bus timeouts; no extra deadline here.
+                let output = std::process::Command::new(
+                    std::env::current_exe().expect("current test executable"),
+                )
+                .args([
+                    "--exact",
+                    "tray::supported::tests::linux_backend_returns_error_without_a_session_bus",
+                    "--ignored",
+                ])
+                .env("DBUS_SESSION_BUS_ADDRESS", INVALID_BUS)
+                .output()
+                .expect("run tray backend without a session bus");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // A renamed test would match nothing and still exit zero.
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "missing-session-bus child test failed or did not run: {}\n{stdout}\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
             let mask = IconMask::load().expect("load tray asset");
             assert!(
                 TrayIconBuilder::new()

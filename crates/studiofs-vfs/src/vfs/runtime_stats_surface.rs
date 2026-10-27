@@ -1458,6 +1458,35 @@ mod tests {
     }
 
     #[test]
+    fn local_storage_page_gauges_follow_sample_availability() {
+        for (allocated_pages, tree_height) in [(None, None), (Some(23), Some(3))] {
+            let diagnostics = LocalStorageDiagnostics {
+                allocated_pages,
+                tree_height,
+                ..LocalStorageDiagnostics::default()
+            };
+            let mut snapshot = RuntimeStatsSnapshot::default();
+            insert_local_storage_diagnostics(&mut snapshot.metadata, &diagnostics);
+            let parsed = RuntimeStatsSnapshot::parse_text(&snapshot.to_text())
+                .expect("parse local storage diagnostics");
+
+            for (name, expected) in [
+                ("metadata_redb_allocated_pages", allocated_pages),
+                (
+                    "metadata_redb_btree_tree_height",
+                    tree_height.map(u64::from),
+                ),
+            ] {
+                let metric = parsed.metadata.gauges.get(name);
+                assert_eq!(metric.map(|metric| metric.value), expected, "{name}");
+                if let Some(metric) = metric {
+                    assert_eq!(metric.unit, "count", "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn local_event_prune_runtime_stats_use_documented_units() {
         let diagnostics = LocalStorageDiagnostics {
             local_dentry_mutation_baseline_rows: Some(4),
