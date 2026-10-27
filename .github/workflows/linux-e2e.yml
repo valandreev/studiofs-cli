@@ -4,9 +4,6 @@ name: Linux mounted E2E
 # the full run takes up to 30 minutes.
 
 on:
-  # TEMP: validate the full run on this branch; remove before merge.
-  push:
-    branches: [ci/linux-github-actions]
   workflow_dispatch:
     inputs:
       target:
@@ -59,7 +56,7 @@ jobs:
 
       - name: Run mounted E2E
         env:
-          E2E_TARGET: ${{ inputs.target || 'full' }}
+          E2E_TARGET: ${{ inputs.target }}
         run: |
           set -euo pipefail
           RUN_ID="gha-${E2E_TARGET}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
