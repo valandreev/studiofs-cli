@@ -29,6 +29,6 @@ exceptions = [
 ]
 
 # No unknown/custom-license exceptions. AND/WITH obligations remain intact.
-# cargo-audit remains a separate security gate in .rwx/ci.yml.
+# cargo-audit remains a separate security gate in .github/workflows/linux.yml.
 [licenses.private]
 ignore = false

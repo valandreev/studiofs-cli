@@ -123,17 +123,18 @@ fn run_scenario_selection_expands_comma_separated_numbers() {
     assert_eq!(args.scenario_names(), scenario_names_by_index(&[2, 5, 10]));
 }
 
-/// Registered scenarios deliberately left out of the RWX full mounted gate.
-const RWX_FULL_E2E_OPT_IN_SCENARIOS: &[&str] = &[];
+/// Registered scenarios deliberately left out of the full mounted gate.
+const FULL_E2E_OPT_IN_SCENARIOS: &[&str] = &[];
 
 #[test]
-fn rwx_full_e2e_selects_every_registered_scenario() {
-    let workflow =
-        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.rwx/e2e.yml"))
-            .unwrap();
+fn full_e2e_selects_every_registered_scenario() {
+    let workflow = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/linux-e2e.yml"),
+    )
+    .unwrap();
     let full_job = workflow
-        .split_once("- key: e2e-full")
-        .expect("e2e-full task must exist")
+        .split_once(r#"if [[ "${E2E_TARGET}" == "full" ]]; then"#)
+        .expect("full E2E target branch must exist")
         .1;
     let tokens = full_job.split_whitespace().collect::<Vec<_>>();
     let mut argv = vec!["studiofs-e2e", "run"];
@@ -150,13 +151,13 @@ fn rwx_full_e2e_selects_every_registered_scenario() {
     let mut expected = studiofs_e2e::scenario::available_scenarios()
         .iter()
         .map(|scenario| scenario.name.to_string())
-        .filter(|name| !RWX_FULL_E2E_OPT_IN_SCENARIOS.contains(&name.as_str()))
+        .filter(|name| !FULL_E2E_OPT_IN_SCENARIOS.contains(&name.as_str()))
         .collect::<Vec<_>>();
     expected.sort();
 
     assert_eq!(
         selected, expected,
-        "the e2e-full job must select each registered scenario exactly once, except the opt-in allowlist"
+        "the full E2E target must select each registered scenario exactly once, except the opt-in allowlist"
     );
 }
 

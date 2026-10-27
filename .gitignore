@@ -28,7 +28,6 @@ test*.txt
 .worktrees/
 /.claude/
 deslop*.txt
-.rwx/bin/
 .codebase-memory/
 .antigravitycli/
 

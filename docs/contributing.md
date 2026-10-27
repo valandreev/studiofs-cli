@@ -31,23 +31,23 @@ are not distribution notices.
 
 StudioFS is a cross-platform filesystem product. It targets Linux, macOS, and
 Windows. The CI model reflects that — a green signal from Ubuntu alone is not
-sufficient. Linux PR verification runs in RWX on Ubuntu and Rocky Linux.
-GitHub Actions remains available for hosted macOS and Windows checks, but those
-workflows are manual-only while Windows work is primarily validated locally.
+sufficient. Linux PR verification runs automatically in GitHub Actions
+(`.github/workflows/linux.yml`) on Ubuntu and Rocky Linux. Hosted macOS and
+Windows checks are manual-only while Windows work is primarily validated locally.
 
 ### What is verified automatically vs manually
 
-| Check | Linux (RWX Ubuntu + Rocky) | macOS (`macos-latest`) | Windows (`windows-latest`) |
+| Check | Linux (Ubuntu + Rocky) | macOS (`macos-latest`) | Windows (`windows-latest`) |
 |-------|----------------------------|----------------------|----------------------------|
-| `cargo fmt` | Auto (RWX Ubuntu quality) | — | — |
-| `cargo clippy` (workspace) | Auto (RWX Ubuntu quality) | Manual GitHub Action | Manual GitHub Action |
-| `cargo clippy` (all features) | Auto (RWX Ubuntu quality) | Manual GitHub Action | Manual GitHub Action |
-| `cargo doc` | Auto (RWX Ubuntu quality) | — | — |
-| `cargo audit` ¹ | Auto (RWX Ubuntu quality) | — | — |
+| `cargo fmt` | Auto (Ubuntu quality) | — | — |
+| `cargo clippy` (workspace) | Auto (Ubuntu quality) | Manual GitHub Action | Manual GitHub Action |
+| `cargo clippy` (all features) | Auto (Ubuntu quality) | Manual GitHub Action | Manual GitHub Action |
+| `cargo doc` | Auto (Ubuntu quality) | — | — |
+| `cargo audit` ¹ | Auto (Ubuntu) | — | — |
 | Workspace unit + compile tests | Auto (Ubuntu + Rocky) | Manual GitHub Action | Manual GitHub Action |
 | Local-first VFS fast checks | Auto (explicit Ubuntu step; covered by Rocky workspace run) | — | — |
-| PostgreSQL metadata + CLI regressions | Auto (RWX Ubuntu; PostgreSQL 18) | — | — |
-| Linux mount bridge | Manual RWX release gate (`studiofs-linux-fuse` ignored mounted tests) | — | — |
+| PostgreSQL metadata + CLI regressions | Auto (Ubuntu; PostgreSQL 18) | — | — |
+| Linux mount bridge | Manual release gate (`studiofs-linux-fuse` ignored mounted tests) | — | — |
 | `studiofs-winfsp` unit tests | — | — | Manual GitHub Action |
 
 ### What is NOT verified automatically (manual / self-hosted only)
@@ -57,11 +57,11 @@ workflows are manual-only while Windows work is primarily validated locally.
 | Platform bridge smoke tests (mount/unmount) | Require `/dev/fuse` or WinFSP kernel driver; marked `#[ignore]`. See [smoke workflow](#smoke-test-workflow) |
 | S3-backed integration tests | Require live RustFS; the PostgreSQL-only metadata and CLI gate does not cover them |
 | Mounted multi-client convergence tests | Require multi-process infrastructure and mounted filesystem setup |
-| Real mounted E2E smoke/full run | Manual RWX only via `.rwx/e2e.yml`; requires Docker plus `/dev/fuse` and uploads runner artifacts |
+| Real mounted E2E smoke/full run | Manual GitHub Action via `.github/workflows/linux-e2e.yml`; requires Docker plus `/dev/fuse` and uploads runner artifacts |
 
 <a name="footnote-audit"></a>
 ¹ `cargo audit` reads the single workspace `Cargo.lock` and reports
-vulnerabilities regardless of target platform. Running it once in RWX covers
+vulnerabilities regardless of target platform. Running it once in Linux CI covers
 the full dependency graph, including platform-specific crates such as
 `studiofs-winfsp`. Platform-conditional vulnerabilities (e.g. a Windows-only
 advisory on a `windows-sys` crate) are surfaced in the same audit run.
@@ -72,9 +72,9 @@ printed but do not fail the gate.
 
 **Compile/unit/smoke distinctions:**
 
-- **Portable compile + clippy** — `cargo clippy` runs automatically in the RWX Ubuntu quality gate. Hosted macOS and Windows clippy runs are available as manual GitHub Actions. Linux compile coverage comes from RWX Ubuntu and Rocky workspace `cargo test` runs.
+- **Portable compile + clippy** — `cargo clippy` runs automatically in the Ubuntu quality gate. Hosted macOS and Windows clippy runs are available as manual GitHub Actions. Linux compile coverage comes from Ubuntu and Rocky workspace `cargo test` runs.
 - **Portable unit tests** — the workspace `cargo test` run on each platform. Covers all crates except the platform-specific backend crate, which has a dedicated step.
-- **PostgreSQL metadata and CLI regressions** — the RWX Ubuntu gate starts an ephemeral PostgreSQL 18 service and runs the ignored metadata `pg_engine` and CLI binary tests serially, excluding the SFS-720 scalability benchmark. It prints the selected count and Cargo's pass/failure totals; a missing service or zero-test selection fails the gate.
+- **PostgreSQL metadata and CLI regressions** — the Ubuntu gate starts an ephemeral PostgreSQL 18 service and runs the ignored metadata `pg_engine` and CLI binary tests serially, excluding the SFS-720 scalability benchmark. It prints the selected count and Cargo's pass/failure totals; a missing service or zero-test selection fails the gate.
 - **Platform unit tests** — the named backend step in each platform lane (`studiofs-macfuse` on manual macOS, `studiofs-winfsp` on manual Windows). This is the primary signal for platform-specific code paths.
 - **Platform smoke tests** — `mount_sanity` integration tests marked `#[ignore]`. These include both minimal lifecycle tests (session create/drop) and full I/O tests (mount → write → read → readdir → delete → unmount). Run via the `smoke.yml` workflow or manually on self-hosted runners with the full kernel driver available. Not a PR gate.
 - **Other infra integration tests** — S3-backed, mounted, and multi-process tests still need their respective services or platform support and remain outside this gate.
@@ -104,38 +104,36 @@ issue and focused cleanup plan rather than being folded into unrelated PRs.
 
 ## CI Ownership
 
-### Manual PR verification
+### PR verification
 
-RWX Linux, GitHub Actions macOS, and GitHub Actions Windows verification are
-manual-only and do not run automatically on PRs. Required checks, if enabled,
-are enforced via **GitHub Branch Protection Rules** (Settings → Branches →
-require status checks) — it is not a property of the workflow YAML itself. The
-high-level execution model is:
+Linux CI runs automatically on every pull request and `main` push. Mounted
+E2E, macOS, and Windows verification are manual-only. Required checks, if
+enabled, are enforced via **GitHub Branch Protection Rules** (Settings →
+Branches → require status checks) — it is not a property of the workflow YAML
+itself. The high-level execution model is:
 
 ```
-Manual RWX linux  →  ubuntu-linux
-                  →  rocky-linux
+PR / main push (linux.yml)  →  Quality gates, cargo audit
+                            →  Ubuntu workspace tests, S3 and PostgreSQL tests
+                            →  Rocky Linux workspace tests
 
-Manual GitHub Actions  →  macOS
+Manual GitHub Actions  →  Linux mounted E2E (linux-e2e.yml)
+                       →  macOS
                        →  Windows
 ```
 
 | Job | Runner | Gate status |
 |-----|--------|-------------|
-| **Linux** | RWX `ubuntu:24.04` + `rockylinux:9` | Manual only |
-| **Real mounted E2E** | RWX `ubuntu:24.04` with Docker + `/dev/fuse` | Manual only |
+| **Linux** | `ubuntu-24.04` + `rockylinux:9` container | Automatic |
+| **Real mounted E2E** | `ubuntu-24.04` with Docker + `/dev/fuse` | Manual only |
 | **macOS** | `macos-latest` | Manual only |
 | **Windows** | `windows-latest` | Manual only |
 
 ### Reading CI failures
 
-For RWX task logs, see
-[development.md#rwx-local-cli-and-logs](development.md#rwx-local-cli-and-logs)
-for the local CLI location and `.rwx/downloads/` log layout.
-
-- **RWX quality failed** → fix formatting, clippy, doc, or audit issue.
-- **RWX Ubuntu failed** → a regression in portable Linux behavior, Ubuntu package/runtime compatibility, or the explicit local-first VFS fast checks.
-- **RWX Rocky failed** → a regression in Rocky/RHEL-family package/runtime compatibility or a Linux backend compile/unit path that differs from Ubuntu.
+- **Quality gates / cargo audit failed** → fix formatting, clippy, doc, or audit issue.
+- **Ubuntu tests failed** → a regression in portable Linux behavior, Ubuntu package/runtime compatibility, or the explicit local-first VFS fast checks.
+- **Rocky tests failed** → a regression in Rocky/RHEL-family package/runtime compatibility or a Linux backend compile/unit path that differs from Ubuntu.
 - **Linux failed, mounted backend** → inspect the
   `studiofs-linux-fuse`/libfuse3 callback, invalidation, async-write, and
   unmount logs; confirm the runner exposed `/dev/fuse` and `fusermount3`.

@@ -1,6 +1,8 @@
 //! Mounted random-write packing and upload-progress acceptance.
 
 use super::*;
+use std::collections::BTreeSet;
+use std::ffi::OsString;
 use studiofs_vfs::RuntimeStatsSnapshot;
 
 const SUMMARY: &str = "random-write-packing.json";
@@ -102,6 +104,10 @@ fn measure(
     context: &ScenarioContext,
     controller: &mut MultiClientController<SystemClientProcessExecutor>,
 ) -> Result<(), ScenarioError> {
+    let preexisting_caches = cache_entries(&crate::client::client_cache_dir(
+        &context.sandbox,
+        "client-a",
+    ))?;
     controller.bootstrap_volume(VolumeBootstrapOptions {
         client_names: vec!["client-a".into()],
         clean_existing_local_metadata: true,
@@ -178,7 +184,10 @@ fn measure(
             )
         },
     )?;
-    summary["payload_objects"] = json!(count_payload_objects(&client.cache_dir)?);
+    summary["payload_objects"] = json!(count_new_volume_payload_objects(
+        &client.cache_dir,
+        &preexisting_caches
+    )?);
     fs::write(
         context.scenario_dir.join(SUMMARY),
         serde_json::to_vec_pretty(&summary)?,
@@ -195,6 +204,27 @@ fn metadata_commit_ms(stats_text: &str) -> io::Result<f64> {
         .get("commit")
         .ok_or_else(|| io::Error::other("runtime stats lack the metadata.commit histogram"))?;
     Ok(histogram.sum as f64 / 1_000_000.0)
+}
+
+fn cache_entries(cache_dir: &Path) -> io::Result<BTreeSet<OsString>> {
+    fs::read_dir(cache_dir)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect()
+}
+
+/// A full run shares the client cache dir across scenarios; earlier volumes stay retained there.
+fn count_new_volume_payload_objects(
+    cache_dir: &Path,
+    preexisting: &BTreeSet<OsString>,
+) -> io::Result<u64> {
+    let mut count = 0;
+    for entry in fs::read_dir(cache_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && !preexisting.contains(&entry.file_name()) {
+            count += count_payload_objects(&entry.path())?;
+        }
+    }
+    Ok(count)
 }
 
 fn count_payload_objects(root: &Path) -> io::Result<u64> {
@@ -221,6 +251,21 @@ mod tests {
         fs::write(tmp.path().join("ab/1.object"), b"payload").unwrap();
         fs::write(tmp.path().join("ab/2.stage"), b"stage").unwrap();
         assert_eq!(count_payload_objects(tmp.path()).unwrap(), 1);
+    }
+
+    #[test]
+    fn counts_only_volume_caches_created_after_the_snapshot() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("packing-count-");
+        fs::create_dir_all(tmp.path().join("earlier-volume/ab")).unwrap();
+        fs::write(tmp.path().join("earlier-volume/ab/1.object"), b"old").unwrap();
+        let preexisting = cache_entries(tmp.path()).unwrap();
+        fs::create_dir_all(tmp.path().join("scenario-volume/cd")).unwrap();
+        fs::write(tmp.path().join("scenario-volume/cd/2.object"), b"new").unwrap();
+        fs::write(tmp.path().join("scenario-volume/cd/3.object"), b"new").unwrap();
+        assert_eq!(
+            count_new_volume_payload_objects(tmp.path(), &preexisting).unwrap(),
+            2
+        );
     }
 
     #[test]

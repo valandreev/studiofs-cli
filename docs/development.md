@@ -82,20 +82,20 @@ process.
 
 ## CI Matrix
 
-Linux verification is defined in RWX (`.rwx/ci.yml`) and is manual-only; it
-does not run automatically on PRs. GitHub Actions (`.github/workflows/rust.yml`)
-remains responsible for hosted macOS and Windows verification that RWX does
-not currently provide; its broad platform jobs are also manual-only. The focused
+Linux verification is defined in `.github/workflows/linux.yml` and runs
+automatically on pull requests and `main` pushes. `.github/workflows/rust.yml`
+holds the hosted macOS and Windows verification; its broad platform jobs are
+manual-only. The focused
 GitHub Actions workflow `.github/workflows/payload-read-regression.yml` runs
 automatically on PRs touching the cache crate, test-support crate, workspace
 manifest/lockfile, or that workflow, and also supports manual dispatch.
 
 | Job | Runner | Purpose |
 |-----|--------|---------|
-| **Quality Gates** | RWX `ubuntu:24.04` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, `cargo audit`, `cargo deny` license policy, and generated third-party notice validation |
-| **License compliance** | RWX `ubuntu:24.04`, GitHub Actions `ubuntu-24.04` | Dependency license policy, notice generator self-check, downloadable review bundle, and post-publication release evidence check |
-| **Ubuntu Linux** | RWX `ubuntu:24.04` | Workspace tests, local-first VFS checks, and operator-run mounted libfuse3 E2E |
-| **Rocky Linux** | RWX `rockylinux:9` | Workspace tests; mounted libfuse3 release validation is required on Rocky 9.4+ |
+| **Quality Gates** | `ubuntu-24.04` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, and `cargo audit` |
+| **License compliance** | `ubuntu-24.04` | Dependency license policy, notice generator self-check, downloadable review bundle, and post-publication release evidence check |
+| **Ubuntu Linux** | `ubuntu-24.04` | Workspace tests, local-first VFS checks, S3/PostgreSQL service-backed tests, and manual mounted libfuse3 E2E (`linux-e2e.yml`) |
+| **Rocky Linux** | `rockylinux:9` container | Workspace tests; mounted libfuse3 release validation is required on Rocky 9.4+ |
 | **macOS** | `macos-latest` | Clippy + tests for macOS-owned crates |
 | **Windows** | `windows-latest` | Clippy + tests — explicit `studiofs-winfsp` unit step (exercises `cfg(windows)` code paths) |
 | **Payload read regression** | `windows-latest`, `macos-latest` | Automatic Windows read-advice regression and cache Clippy; macOS concurrency regression and public unbuffered-read API test; commands in [tests.md](tests.md#payload-read-regression-gate) |
@@ -106,46 +106,19 @@ attributable in the CI job log rather than buried inside the broad workspace
 run. Linux links the system libfuse3 development package and exercises
 `studiofs-linux-fuse` in the workspace tests.
 
-The GitHub-hosted macOS and Windows jobs are independent from RWX. Start the
-RWX Linux gate manually when Linux signal is needed; hosted macOS and Windows
-Actions can be started manually from the GitHub Actions UI when needed.
-
-### RWX local CLI and logs
-
-RWX workflow definitions live in `.rwx/`:
-
-- `.rwx/ci.yml` — Ubuntu quality gates and Ubuntu Linux tests.
-- `.rwx/rocky.yml` — Rocky Linux tests.
-- `.rwx/e2e.yml` — operator-run Linux mounted E2E targets; the runner must
-  expose `/dev/fuse` and install libfuse3 plus `fusermount3`.
-
-When diagnosing RWX failures locally, keep the RWX CLI binary under
-`.rwx/bin/`. That directory is ignored by Git and is only a local tool cache;
-do not vendor the binary into commits. On Windows the local path is typically:
-
-```powershell
-.\.rwx\bin\rwx-windows-x86_64.exe
-```
-
-Fetch task logs with the local binary:
-
-```powershell
-.\.rwx\bin\rwx-windows-x86_64.exe logs <task-id> --output-dir .rwx\downloads\current\<task-name>
-```
-
-Downloaded logs belong under `.rwx/downloads/`; that directory has its own
-`.gitignore` and should remain uncommitted. If `.rwx/bin/` is empty, download
-the matching RWX CLI release binary from the official RWX GitHub release before
-running `rwx logs`.
+Hosted macOS and Windows Actions and the Linux mounted E2E workflow can be
+started from the GitHub Actions UI, or with
+`gh workflow run linux-e2e.yml -f target=smoke|full`. The E2E run uploads
+`target/e2e-runs/` as a workflow artifact.
 
 The hosted Linux real mounted E2E targets fail preflight when `/dev/fuse` is
 unavailable. That is an infrastructure failure, not a test skip.
 
-The RWX quality gate pins `cargo-deny` 0.20.2 and checks the full locked
-workspace dependency graph. It also runs the third-party notice generator's
-self-test and license-policy negative probe before generating the review bundle
-under `target/license-compliance/`. GitHub Actions runs the same gate for pull
-requests and publishes that review bundle as a CI artifact. Before publishing,
+The license compliance workflow pins `cargo-deny` 0.20.2 and checks the full
+locked workspace dependency graph. It also runs the third-party notice
+generator's self-test and license-policy negative probe before generating the
+review bundle under `target/license-compliance/`, and publishes that review
+bundle as a CI artifact on relevant pull requests. Before publishing,
 run the generator locally with `--release`; it fails while release notice
 evidence remains unresolved. The `release: published` workflow run checks the
 already-published release and uploads its bundle when the evidence gate passes;
