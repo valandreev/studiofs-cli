@@ -26,6 +26,8 @@ allow = [
 exceptions = [
     { crate = "winfsp@=0.12.4+winfsp-2.1", allow = ["GPL-3.0"] },
     { crate = "winfsp-sys@=0.12.1+winfsp-2.1", allow = ["GPL-3.0"] },
+    # SFS-884 reviewed the packaged public-domain dedication and disclaimer.
+    { crate = "ksni@=0.3.7", allow = ["Unlicense"] },
 ]
 
 # No unknown/custom-license exceptions. AND/WITH obligations remain intact.

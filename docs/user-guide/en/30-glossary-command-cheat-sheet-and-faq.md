@@ -73,7 +73,7 @@ Fetching missing data requires access to S3; propagating shared state requires a
 
 ### Where is the “Sync now” button?
 
-Transfers happen in the background; there is no separate public `studiofs sync` command. Check `status`, activity, and errors. On Windows and macOS, `mount` automatically attempts to show a system tray or menu bar indicator when a graphical environment is available; no separate `--tray` flag is needed. If the indicator fails to start, the mount continues to work through the CLI.
+Transfers happen in the background; there is no separate public `studiofs sync` command. Check `status`, activity, and errors. On Windows, macOS and Linux, `mount` automatically attempts to show a system tray or menu bar indicator when a graphical environment is available; no separate `--tray` flag is needed. If the indicator fails to start, the mount continues to work through the CLI.
 
 ### The file is saved. Can I shut down the computer?
 

@@ -19,6 +19,16 @@ pub(crate) struct InternalArgs {
 impl InternalArgs {
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
         match self.action {
+            #[cfg(target_os = "linux")]
+            InternalAction::Tray {
+                process_id,
+                volume_name,
+            } => {
+                if let Err(error) = crate::tray::run_linux_tray_helper(process_id, volume_name) {
+                    tracing::debug!(error = %error, "tray helper unavailable; mount continues without tray");
+                }
+                Ok(())
+            }
             InternalAction::WinfspBootstrapMountmgr => {
                 #[cfg(windows)]
                 {
@@ -87,6 +97,12 @@ impl InternalArgs {
 
 #[derive(Debug, Subcommand)]
 enum InternalAction {
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    Tray {
+        process_id: u32,
+        volume_name: String,
+    },
     #[command(name = "winfsp-bootstrap-mountmgr", hide = true)]
     WinfspBootstrapMountmgr,
     #[command(name = "diagnostics-discover", hide = true)]
@@ -880,6 +896,17 @@ mod tests {
                 action: InternalAction::WinfspBootstrapMountmgr
             })
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hidden_internal_tray_subcommand_parses_parent_identity() {
+        let cli = crate::cli::parse_for_test(&["internal", "tray", "--", "123", "studio"]).unwrap();
+        assert!(
+            matches!(cli.command, crate::cli::Commands::Internal(InternalArgs {
+            action: InternalAction::Tray { process_id: 123, volume_name }
+        }) if volume_name == "studio")
+        );
     }
 
     #[test]

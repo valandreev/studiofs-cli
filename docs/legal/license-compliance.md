@@ -14,8 +14,10 @@ python docs/legal/generate-third-party-notices.py --output-dir target/license-co
 [dependency audit](rust-dependency-audit.md). It checks all platforms and all
 features, including build and development dependencies. The two exact WinFsp
 versions have documented exceptions for their deprecated `GPL-3.0` identifier;
-this means GPLv3 only and does not waive any notice obligation. Unknown or
-unapproved licenses fail. `AND` and `WITH` requirements retain their meaning.
+this means GPLv3 only and does not waive any notice obligation. SFS-884 also
+permits `Unlicense` for exactly `ksni 0.3.7` after reviewing its packaged
+dedication and disclaimer; see the [KSNI review](sfs-884-ksni-license-review.md).
+Unknown or unapproved licenses fail. `AND` and `WITH` requirements retain their meaning.
 The probe uses the real policy: MIT must pass, while AGPL-3.0-only and missing
 license declarations must fail specifically on licensing. Existing `cargo audit`
 security checks remain independent and enabled.
@@ -42,8 +44,9 @@ line endings are deterministic and exclude timestamps and local source paths.
 Native platform acknowledgements and statically linked component information
 are included from [platform-distribution.md](platform-distribution.md). Cargo
 metadata alone cannot discover the terms of separately installed WinFsp,
-libfuse3, GTK/GLib/libxdo/AppIndicator, or macFUSE. That document remains the
-packaging contract: no bundled drivers or system shared libraries, and no
+libfuse3 or macFUSE, or of the desktop services used by the KSNI tray.
+The 0.2.1 Linux tray no longer requires GTK/GLib/libxdo/AppIndicator libraries.
+That document remains the packaging contract: no bundled drivers or system shared libraries, and no
 MFMount/FSKit in v0.2.0 release binaries. Ring, mimalloc and jemalloc also require
 their embedded native notices, independently of wrapper manifest licenses.
 

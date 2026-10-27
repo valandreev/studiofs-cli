@@ -1,7 +1,11 @@
 use crate::cli::mount::MountArgs;
 
+#[cfg(target_os = "linux")]
+mod linux;
+
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod supported {
+    #[cfg(not(target_os = "linux"))]
     use super::MountArgs;
     use crate::diagnostics::{
         DiagnosticsHealthSnapshot, LocalDiagnosticsClient, LocalDiagnosticsDiscovery,
@@ -30,10 +34,13 @@ mod supported {
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
     #[cfg(target_os = "macos")]
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+    #[cfg(not(target_os = "linux"))]
     use winit::application::ApplicationHandler;
+    #[cfg(not(target_os = "linux"))]
     use winit::event::StartCause;
     #[cfg(target_os = "macos")]
     use winit::event_loop::EventLoopBuilder;
+    #[cfg(not(target_os = "linux"))]
     use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
     #[cfg(target_os = "macos")]
     use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
@@ -222,33 +229,30 @@ mod supported {
             }
         }
 
-        fn create_tray(&mut self, event_loop: &ActiveEventLoop) {
-            let icon = match self.icon_mask.tinted_icon([COLOR_BLACK; 2]) {
-                Ok(icon) => icon,
-                Err(error) => {
-                    tracing::warn!(error = %error, "failed to build boot tray icon");
-                    event_loop.exit();
-                    return;
-                }
-            };
+        fn initialize_tray(&mut self) -> anyhow::Result<()> {
+            let icon = self.icon_mask.tinted_icon([COLOR_BLACK; 2])?;
+            self.tray_icon = Some(
+                TrayIconBuilder::new()
+                    .with_icon(icon)
+                    .with_tooltip(self.tooltip_for(self.mode, None))
+                    .build()?,
+            );
+            self.last_colors = Some([COLOR_BLACK; 2]);
+            Ok(())
+        }
 
-            match TrayIconBuilder::new()
-                .with_icon(icon)
-                .with_tooltip(self.tooltip_for(self.mode, None))
-                .build()
-            {
-                Ok(tray_icon) => {
-                    self.tray_icon = Some(tray_icon);
-                    self.last_colors = Some([COLOR_BLACK; 2]);
+        fn observe_activity(&mut self, activity: TrayActivity, observed_at: Instant) {
+            let activity = if observed_at.elapsed() > DIAGNOSTICS_MAX_AGE {
+                TrayActivity {
+                    mode: TrayPulseMode::Unavailable,
+                    pending_upload_bytes: None,
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "tray initialization failed; continuing without tray"
-                    );
-                    event_loop.exit();
-                }
-            }
+            } else {
+                activity
+            };
+            self.set_activity(activity);
+            self.last_activity_at = observed_at;
+            self.render_frame();
         }
 
         fn tooltip_for(&self, mode: TrayPulseMode, pending_upload_bytes: Option<u64>) -> String {
@@ -288,7 +292,6 @@ mod supported {
         }
 
         fn set_activity(&mut self, activity: TrayActivity) {
-            self.last_activity_at = Instant::now();
             let mode_changed = self.mode != activity.mode;
             let active_uploads_changed = activity.mode == TrayPulseMode::Active
                 && self.pending_upload_bytes != activity.pending_upload_bytes;
@@ -551,12 +554,16 @@ mod supported {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     impl ApplicationHandler<TrayUserEvent> for TrayApp {
         fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
 
         fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-            if matches!(cause, StartCause::Init) {
-                self.create_tray(event_loop);
+            if matches!(cause, StartCause::Init)
+                && let Err(error) = self.initialize_tray()
+            {
+                tracing::warn!(error = %error, "tray initialization failed; continuing without tray");
+                event_loop.exit();
             }
         }
 
@@ -564,17 +571,7 @@ mod supported {
             match event {
                 TrayUserEvent::Tick => self.render_frame(),
                 TrayUserEvent::Activity(activity, observed_at) => {
-                    let activity = if observed_at.elapsed() > DIAGNOSTICS_MAX_AGE {
-                        TrayActivity {
-                            mode: TrayPulseMode::Unavailable,
-                            pending_upload_bytes: None,
-                        }
-                    } else {
-                        activity
-                    };
-                    self.set_activity(activity);
-                    self.last_activity_at = observed_at;
-                    self.render_frame();
+                    self.observe_activity(activity, observed_at);
                 }
                 #[cfg(target_os = "macos")]
                 TrayUserEvent::HoverChanged(tray_rect) => self.set_hovered(tray_rect),
@@ -614,6 +611,7 @@ mod supported {
             .with_activate_ignoring_other_apps(config.activate_ignoring_other_apps);
     }
 
+    #[cfg(not(target_os = "linux"))]
     pub(crate) fn dispatch_mount_with_auto_tray(args: MountArgs) -> anyhow::Result<()> {
         if args.should_detach() {
             return args.dispatch();
@@ -673,7 +671,13 @@ mod supported {
             .map_err(|error| anyhow::anyhow!("failed to spawn mount thread: {error}"))?;
 
         let ticker = spawn_ticker_thread(stop.clone(), proxy.clone());
-        let monitor = spawn_activity_monitor(stop.clone(), proxy.clone(), process_id, volume_name);
+        let activity_proxy = proxy.clone();
+        let monitor = spawn_activity_monitor(
+            stop.clone(),
+            move |event| activity_proxy.send_event(event).is_ok(),
+            process_id,
+            volume_name,
+        );
         let mut app = TrayApp::new(icon_mask, args.volume_name().to_string());
         #[cfg(target_os = "macos")]
         TrayIconEvent::set_event_handler(Some(Box::new({
@@ -704,6 +708,7 @@ mod supported {
         stop.store(true, Ordering::Release);
         join_optional_thread("tray ticker", ticker);
         join_optional_thread("tray monitor", monitor);
+        drop(app.tray_icon.take());
 
         match mount_handle.join() {
             Ok(result) => result,
@@ -724,6 +729,7 @@ mod supported {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn spawn_ticker_thread(
         stop: Arc<AtomicBool>,
         proxy: EventLoopProxy<TrayUserEvent>,
@@ -747,7 +753,7 @@ mod supported {
 
     fn spawn_activity_monitor(
         stop: Arc<AtomicBool>,
-        proxy: EventLoopProxy<TrayUserEvent>,
+        send_event: impl Fn(TrayUserEvent) -> bool + Send + 'static,
         process_id: u32,
         volume_name: String,
     ) -> Option<JoinHandle<()>> {
@@ -768,10 +774,7 @@ mod supported {
                         .unwrap_or_else(|| fallback_activity(monitor_started_at));
 
                     // Send a heartbeat even when unchanged so the UI can expire a stuck monitor.
-                    if proxy
-                        .send_event(TrayUserEvent::Activity(next_activity, Instant::now()))
-                        .is_err()
-                    {
+                    if !send_event(TrayUserEvent::Activity(next_activity, Instant::now())) {
                         break;
                     }
 
@@ -787,6 +790,53 @@ mod supported {
                 tracing::warn!(error = %error, "failed to spawn tray monitor thread");
                 None
             })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn run_linux_tray_helper(
+        process_id: u32,
+        volume_name: String,
+    ) -> anyhow::Result<()> {
+        use std::io::Read;
+        use std::sync::mpsc::{RecvTimeoutError, TrySendError, sync_channel};
+
+        super::linux::terminate_with_parent(process_id)?;
+        let mut app = TrayApp::new(IconMask::load()?, volume_name.clone());
+        app.initialize_tray()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (events, receiver) = sync_channel(1);
+        let shutdown_events = events.clone();
+        let parent = std::thread::Builder::new()
+            .name("studiofs-tray-parent".into())
+            .spawn(move || {
+                let _ = std::io::stdin().read_exact(&mut [0u8; 1]);
+                let _ = shutdown_events.send(TrayUserEvent::MountFinished);
+            })?;
+        let monitor = spawn_activity_monitor(
+            stop.clone(),
+            move |event| !matches!(events.try_send(event), Err(TrySendError::Disconnected(_))),
+            process_id,
+            volume_name,
+        );
+        loop {
+            let event = match receiver.recv_timeout(ANIMATION_TICK) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => TrayUserEvent::Tick,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            match event {
+                TrayUserEvent::Tick => app.render_frame(),
+                TrayUserEvent::Activity(activity, observed_at) => {
+                    app.observe_activity(activity, observed_at)
+                }
+                TrayUserEvent::MountFinished => break,
+            }
+        }
+        stop.store(true, Ordering::Release);
+        join_optional_thread("tray monitor", monitor);
+        join_optional_thread("tray parent", Some(parent));
+        drop(app);
+        Ok(())
     }
 
     fn join_optional_thread(name: &str, handle: Option<JoinHandle<()>>) {
@@ -980,6 +1030,47 @@ mod supported {
     mod tests {
         use super::*;
 
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore = "run under dbus-run-session with no StatusNotifierWatcher; see docs/tray.md"]
+        fn linux_backend_updates_and_stops_without_a_watcher() {
+            let mask = IconMask::load().expect("load tray asset");
+            let tray = TrayIconBuilder::new()
+                .with_icon(mask.tinted_icon([COLOR_BLACK; 2]).expect("boot icon"))
+                .with_tooltip("starting mount")
+                .build()
+                .expect("a watcher may appear after tray startup");
+            for mode in [
+                TrayPulseMode::Booting,
+                TrayPulseMode::Active,
+                TrayPulseMode::Idle,
+                TrayPulseMode::Unavailable,
+            ] {
+                tray.set_icon(Some(
+                    mask.tinted_icon(pulse_colors(mode, ANIMATION_TICK))
+                        .expect("status icon"),
+                ))
+                .expect("update icon without a watcher");
+                tray.set_tooltip(Some(format!("{mode:?}")))
+                    .expect("update tooltip without a watcher");
+            }
+            drop(tray);
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        #[ignore = "requires an invalid DBUS_SESSION_BUS_ADDRESS; see docs/tray.md"]
+        fn linux_backend_returns_error_without_a_session_bus() {
+            let mask = IconMask::load().expect("load tray asset");
+            assert!(
+                TrayIconBuilder::new()
+                    .with_icon(mask.tinted_icon([COLOR_BLACK; 2]).expect("boot icon"))
+                    .build()
+                    .is_err(),
+                "missing session bus must allow the initialization-error fallback"
+            );
+        }
+
         #[test]
         fn pulse_colors_at_peak() {
             assert_eq!(
@@ -1170,7 +1261,12 @@ mod supported {
                 app.set_activity(activity);
                 app.last_activity_at =
                     Instant::now() - DIAGNOSTICS_MAX_AGE - Duration::from_millis(1);
+                let last_observation = app.last_activity_at;
                 app.render_frame();
+                assert_eq!(
+                    app.last_activity_at, last_observation,
+                    "rendering must not invent a diagnostics heartbeat"
+                );
 
                 assert_eq!(app.mode, TrayPulseMode::Unavailable);
                 assert_eq!(app.pending_upload_bytes, None);
@@ -1306,8 +1402,13 @@ mod supported {
     }
 }
 
-#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) use supported::dispatch_mount_with_auto_tray;
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::dispatch_mount_with_auto_tray;
+#[cfg(target_os = "linux")]
+pub(crate) use supported::run_linux_tray_helper;
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub(crate) fn dispatch_mount_with_auto_tray(args: MountArgs) -> anyhow::Result<()> {

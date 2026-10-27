@@ -1,7 +1,32 @@
 # Mount tray indicator
 
-Run a mount with `--tray` to show its synchronization status in the system tray
-or menu bar. The indicator describes work accepted by that mount.
+Foreground mounts automatically try to show synchronization status in the system
+tray or menu bar. No `--tray` option is needed. With `mount --detach`, the
+background mount process owns its tray; it remains after the launching command
+returns and closes when that mount exits.
+The indicator describes work accepted by that mount.
+
+On Linux, StudioFS 0.2.1 uses the GTK-free KSNI/StatusNotifierItem backend over
+the user's session D-Bus. A desktop host such as KDE Plasma is needed to display
+the icon. GNOME needs a compatible AppIndicator/KStatusNotifierItem extension;
+GNOME hosts may not display tooltips even though StudioFS supplies the data.
+GTK3, GLib, libxdo and AppIndicator libraries are no longer StudioFS tray
+prerequisites. Windows and macOS retain their native backends.
+
+Without a usable session bus, Linux mounts continue without an indicator.
+The Linux tray runs in a separate, owned helper process and needs no X11/Wayland
+event loop. It observes the mount parent's local Health diagnostics using the
+same classifier and animation as the native Windows/macOS tray. If the bus is usable but its StatusNotifierWatcher
+is absent, the upstream backend waits for it and registers when it appears or
+restarts. An absent icon does not confirm synchronization. A tray
+initialization error never dispatches a second mount. The parent serves the mount
+independently of tray startup, updates and destruction. After mount completion it
+closes the helper's control pipe, allows two seconds for normal shutdown, then
+terminates a helper blocked in D-Bus and allows another 500 ms to reap it. If the
+kernel still cannot complete its exit, a warning is logged and the original
+mount result is returned. Linux also kills the helper if its mount parent dies. For detached
+mounts, that parent is the serving daemon, so the tray survives the launcher's
+exit. Windows/macOS retain their native event-loop lifecycle.
 
 The red pulse means local changes still need synchronization: writer data,
 staged or retrying uploads, file-version publication, or metadata acknowledgement.
@@ -40,3 +65,43 @@ checking writer, staging, upload and publication owners. Activity leases remain
 visible while work moves between those owners, including delayed publication
 retries. Overlapping activity, incomplete startup or missing proof prevents a
 safe result even when the visible queues happen to be empty.
+
+## Focused Linux backend checks
+
+The tests below need `dbus-run-session` (`dbus-daemon` on Ubuntu) and GNU
+`timeout`. They exercise real backend startup, icon/tooltip updates and shutdown
+without a watcher, and the initialization-error path without a session bus. The Ubuntu CI job runs both
+explicitly despite their `#[ignore]` attributes. Run from the repository root:
+
+```bash
+mkdir -p target
+cargo test --locked -p studiofs --bin studiofs --no-run --message-format=json > target/tray-test-artifacts.json
+timeout 20s dbus-run-session -- cargo test --locked -p studiofs --bin studiofs \
+  tray::supported::tests::linux_backend_updates_and_stops_without_a_watcher \
+  -- --exact --ignored --nocapture
+timeout 20s env DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/studiofs-sfs-884 \
+  cargo test --locked -p studiofs --bin studiofs \
+  tray::supported::tests::linux_backend_returns_error_without_a_session_bus \
+  -- --exact --ignored --nocapture
+cargo test --locked -p studiofs --bin studiofs tray::linux::tests:: -- --nocapture
+cargo build --locked -p studiofs
+timeout 30s dbus-run-session -- /usr/bin/python3 tools/test-linux-tray.py target/debug/studiofs target/tray-test-artifacts.json
+```
+
+Build the test binary first so compilation does not consume the timeout. Run the
+tests separately: one needs a working isolated bus, the other an invalid bus
+address. The raw backend timeouts bound each test process, including destruction.
+The process-owner tests check normal EOF exit and forced cleanup of a stopped
+helper. The Python fault tests use `python3-dbus` and `python3-gi`: an isolated
+socket never answers authentication, or a private watcher never replies to
+registration. They verify that the rebuilt CLI still returns its mount error
+and releases the helper. A separate readiness-controlled fixture finishes backend
+startup without a watcher, introduces a nonreplying late watcher, then verifies
+that the process owner kills and reaps the backend blocked in destruction.
+The daemon re-execution case also verifies that detached mounts start their tray.
+These checks do not
+establish rendering, watcher restart behavior or mounted lifecycle.
+Before release, rebuild `studiofs`, check all four states on a real KDE/SNI host
+and GNOME with its extension, start/restart the watcher, and exercise foreground
+mount exit/error propagation and detached/headless operation. Record the host,
+extension and actual tooltip behavior separately from compile/test results.

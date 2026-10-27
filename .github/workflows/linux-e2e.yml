@@ -34,8 +34,7 @@ jobs:
       - name: Install Linux packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y ca-certificates curl fuse3 jq libfuse3-dev libgtk-3-dev libxdo-dev pkg-config python3
-          sudo apt-get install -y libappindicator3-dev || sudo apt-get install -y libayatana-appindicator3-dev
+          sudo apt-get install -y ca-certificates curl fuse3 jq libfuse3-dev pkg-config python3
 
       - name: Preflight
         run: |
