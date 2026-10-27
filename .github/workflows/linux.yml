@@ -107,9 +107,20 @@ jobs:
       - name: Install Linux packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-dev
+          sudo apt-get install -y dbus-daemon fuse3 libfuse3-dev
       - name: cargo test (workspace)
         run: cargo test --workspace --all-targets -- --nocapture
+      - name: Linux tray backend lifecycle
+        run: |
+          set -euo pipefail
+          cargo test --locked -p studiofs --bin studiofs --no-run
+          timeout 20s dbus-run-session -- cargo test --locked -p studiofs --bin studiofs \
+            tray::supported::tests::linux_backend_updates_and_stops_without_a_watcher \
+            -- --exact --ignored --nocapture
+          timeout 20s env DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/studiofs-sfs-884 \
+            cargo test --locked -p studiofs --bin studiofs \
+            tray::supported::tests::linux_backend_returns_error_without_a_session_bus \
+            -- --exact --ignored --nocapture
       - name: Local-first offline VFS fast checks
         run: |
           set -euo pipefail

@@ -59,12 +59,13 @@ safe result even when the visible queues happen to be empty.
 
 ## Focused Linux backend checks
 
-The opt-in tests below need `dbus-run-session` and GNU `timeout`. They exercise
-real backend startup, icon/tooltip updates and shutdown without a watcher, and
-the initialization-error path without a session bus. Run from the repository root:
+The tests below need `dbus-run-session` (`dbus-daemon` on Ubuntu) and GNU
+`timeout`. They exercise real backend startup, icon/tooltip updates and shutdown
+without a watcher, and the initialization-error path without a session bus. The Ubuntu CI job runs both
+explicitly despite their `#[ignore]` attributes. Run from the repository root:
 
 ```bash
-cargo test --locked -p studiofs --bin studiofs tray::supported::tests:: -- --nocapture
+cargo test --locked -p studiofs --bin studiofs --no-run
 timeout 20s dbus-run-session -- cargo test --locked -p studiofs --bin studiofs \
   tray::supported::tests::linux_backend_updates_and_stops_without_a_watcher \
   -- --exact --ignored --nocapture
@@ -74,8 +75,11 @@ timeout 20s env DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent/studiofs-sfs-884
   -- --exact --ignored --nocapture
 ```
 
-Build the test binary first so compilation does not consume the timeout. These
-checks do not establish rendering, watcher restart behavior or mounted lifecycle.
+Build the test binary first so compilation does not consume the timeout. Run the
+tests separately: one needs a working isolated bus, the other an invalid bus
+address. The timeouts bound each test process, including tray destruction; they
+do not bound production shutdown on an unresponsive bus. These checks do not
+establish rendering, watcher restart behavior or mounted lifecycle.
 Before release, rebuild `studiofs`, check all four states on a real KDE/SNI host
 and GNOME with its extension, start/restart the watcher, and exercise foreground
 mount exit/error propagation and detached/headless operation. Record the host,
