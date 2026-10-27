@@ -2,8 +2,8 @@
 
 ## Verification Matrix
 
-StudioFS runs Linux PR verification in RWX. GitHub Actions macOS, Windows, and
-smoke workflows are manual-only and can be started from the GitHub Actions UI
+StudioFS runs Linux PR verification automatically in GitHub Actions
+(`.github/workflows/linux.yml`). The macOS, Windows, and smoke workflows are manual-only and can be started from the GitHub Actions UI
 when hosted signal is useful.
 
 The authoritative matrix — what each job checks, what is not covered
@@ -47,8 +47,8 @@ cargo test -p studiofs --test architecture_vocabulary_test active_docs_drop_supe
 ## Test Layers
 
 1. Fast local/unit tests (default).
-2. PostgreSQL-only ignored metadata and CLI regressions, run automatically in RWX.
-3. Selected live S3 and combined S3/PostgreSQL regressions, run automatically in RWX.
+2. PostgreSQL-only ignored metadata and CLI regressions, run automatically in Linux CI.
+3. Selected live S3 and combined S3/PostgreSQL regressions, run automatically in Linux CI.
 4. Other ignored integration tests that need RustFS/S3, mounted filesystems, or multiple processes.
 
 ### SFS-864 upload deletion dispatch
@@ -76,7 +76,7 @@ required for these checks.
 
 ### Lock-order guard doctests
 
-The Ubuntu `cargo-test-local-first-offline-vfs-fast` task in `.rwx/ci.yml`
+The Ubuntu "Local-first offline VFS fast checks" step in `.github/workflows/linux.yml`
 runs the focused `LockOrderGuard` doctests:
 
 ```powershell
@@ -96,7 +96,7 @@ and the manual macOS/Windows jobs do not run this doctest command.
 
 ### PostgreSQL CI gate
 
-The automatic Linux gate in `.rwx/ci.yml` starts an ephemeral `postgres:18-alpine`
+The automatic Linux gate in `.github/workflows/linux.yml` starts an ephemeral `postgres:18-alpine`
 service and runs the ignored tests in `studiofs-meta`'s `pg_engine` module and
 the `studiofs` CLI binary, serially. It skips the SFS-720 scalability benchmark,
 which remains a separate [performance measurement](plans/sfs-720-validate-monolithic-bootstrap-checkpoint-scalability.md).
@@ -117,7 +117,7 @@ cargo test -p studiofs --bin studiofs cli:: -- --ignored --test-threads=1 --noca
 
 ### SFS-772 Live S3 and Combined S3/PostgreSQL CI Gate
 
-The automatic Linux gate in `.rwx/ci.yml` starts the repository-pinned
+The automatic Linux gate in `.github/workflows/linux.yml` starts the repository-pinned
 `rustfs/rustfs:1.0.0-alpha.94` image on a loopback-only dynamic port, then checks
 service health before running tests. The DataStore tests create the disposable
 `studiofs-test` bucket before the later VFS and combined tests use it. The gate
@@ -1215,8 +1215,8 @@ STUDIOFS_LINUX_FUSE_WORKER_THREADS=32 target/debug/studiofs-e2e run --scenario m
 ```
 
 ```powershell
-rwx run .rwx/e2e.yml --target e2e-smoke --wait --open
-rwx run .rwx/e2e.yml --target e2e-full --wait --open
+gh workflow run linux-e2e.yml -f target=smoke
+gh workflow run linux-e2e.yml -f target=full
 ```
 
 Focused runner skeleton check:

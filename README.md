@@ -303,7 +303,8 @@ Workspace tests (excluding ignored tests; some tests require local services):
 cargo test --workspace --all-targets -- --nocapture
 ```
 
-The main RWX Linux lanes and hosted macOS/Windows verification workflow are
+The [Linux CI workflow](.github/workflows/linux.yml) runs automatically on
+pull requests and `main` pushes; hosted macOS/Windows verification is
 manually triggered. The focused
 [payload-read regression workflow](.github/workflows/payload-read-regression.yml)
 also runs automatically on matching pull requests. See
@@ -315,7 +316,8 @@ platform-specific changes. macOS and Windows jobs include explicit named steps
 for their backend crates (`studiofs-macfuse` on macOS, `studiofs-winfsp` on
 Windows) so regressions in platform-specific code are immediately attributable
 in the CI log. Linux mounts use the `studiofs-linux-fuse` libfuse3 low-level
-bridge. RWX mounted E2E targets run on Ubuntu; the Rocky lane runs workspace tests.
+bridge. Mounted E2E targets run manually on Ubuntu via
+[`linux-e2e.yml`](.github/workflows/linux-e2e.yml); the Rocky lane runs workspace tests.
 
 Infra-heavy ignored suite:
 

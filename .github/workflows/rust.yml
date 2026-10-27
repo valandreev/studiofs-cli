@@ -12,9 +12,9 @@ env:
 #  macos     — clippy + tests on macOS; explicit studiofs-macfuse unit step
 #  windows   — clippy + tests on Windows; explicit studiofs-winfsp unit step
 #
-# Linux verification, fmt, docs, audit, and Ubuntu/Rocky coverage run in RWX
-# via .rwx/ci.yml. This GitHub Actions workflow keeps only the hosted macOS
-# and Windows gates that RWX does not currently provide.
+# Linux verification, fmt, docs, audit, and Ubuntu/Rocky coverage run
+# automatically in linux.yml. This workflow keeps the hosted macOS and
+# Windows gates.
 #
 # These jobs are intentionally manual-only. Start them from the GitHub Actions
 # UI when hosted macOS or Windows signal is useful.

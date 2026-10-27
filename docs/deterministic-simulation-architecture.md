@@ -121,7 +121,7 @@ Out of scope:
 - full S3/RustFS/OpenDAL behavior, multipart upload details, bucket policy, or
   network timing;
 - wall-clock sleeps, Tokio runtime fairness, real async networking, Docker, or
-  RWX worker behavior;
+  CI runner behavior;
 - throughput, latency, cache hit-rate, memory pressure, or performance
   regression coverage.
 
@@ -175,7 +175,7 @@ StudioFS should keep three distinct correctness layers:
 |---|---|---|
 | Contract/Core | Fast local metadata, VFS, and cache contract checks using focused fixtures such as `ContractCoreFixture` and `ContractVfsFixture` | Multi-client interleaving search, mounted OS behavior, Docker infrastructure, or exhaustive schedule exploration |
 | Deterministic simulation | Seeded exploration of logical multi-client interleavings across metadata replication, object upload, publication, cache/replay, restart, and invariant validation | Real FUSE/WinFSP mounts, PostgreSQL, RustFS, Docker, wall-clock timing, or performance |
-| Real E2E / Multi-client | Product CLI, real mounted clients, Docker Compose infrastructure, mounted tree convergence, platform preflight, and CI/RWX artifacts | Exhaustive interleaving search or internal logical-state mutation outside public mounted surfaces |
+| Real E2E / Multi-client | Product CLI, real mounted clients, Docker Compose infrastructure, mounted tree convergence, platform preflight, and CI artifacts | Exhaustive interleaving search or internal logical-state mutation outside public mounted surfaces |
 
 The simulation layer should reuse Contract/Core invariants where they can be
 expressed over logical state. It should reuse Real E2E operation artifacts where
@@ -248,7 +248,7 @@ case remain reproducible.
 
 Counterexample artifacts should use forward-slash relative paths and stable JSON
 or NDJSON. This keeps them compatible with existing E2E report upload and makes
-future CI/RWX collection straightforward without depending on the real E2E
+future CI collection straightforward without depending on the real E2E
 runner.
 
 ## Initial Module Plan

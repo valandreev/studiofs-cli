@@ -1,4 +1,4 @@
-//! Deterministic simulation seed corpus used by RWX simulation targets.
+//! Deterministic simulation seed corpus used by CI simulation targets.
 
 use std::collections::BTreeMap;
 use std::fs;

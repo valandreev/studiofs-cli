@@ -49,8 +49,8 @@ their embedded native notices, independently of wrapper manifest licenses.
 
 ## CI and release staging
 
-RWX includes the policy, negative probes, generator self-check and generation in
-its quality gate. The dedicated GitHub Actions workflow runs on relevant pull
+The dedicated GitHub Actions workflow runs the policy, negative probes,
+generator self-check and generation. It runs on relevant pull
 requests/main pushes and offers the directory as a downloadable **review**
 artifact. A successful review run does not clear a binary for distribution.
 
