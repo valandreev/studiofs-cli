@@ -8,6 +8,7 @@ use super::MountArgs;
 use crate::cli::umount::reap_child_with_timeout;
 
 const TRAY_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const TRAY_KILL_REAP_GRACE: Duration = Duration::from_millis(500);
 
 pub(crate) fn dispatch_mount_with_auto_tray(args: MountArgs) -> anyhow::Result<()> {
     if args.should_detach() {
@@ -49,15 +50,13 @@ impl TrayProcess {
     fn stop(&mut self) {
         drop(self.0.stdin.take());
         if !reap_child_with_timeout(&mut self.0, TRAY_SHUTDOWN_GRACE) {
-            tracing::warn!(
-                "tray helper did not stop; terminating it without delaying mount completion"
-            );
+            tracing::warn!("tray helper did not stop; terminating it after shutdown grace period");
             if let Err(error) = self.0.kill() {
                 tracing::warn!(error = %error, "failed to terminate tray helper");
             }
-        }
-        if let Err(error) = self.0.wait() {
-            tracing::warn!(error = %error, "failed to reap tray helper");
+            if !reap_child_with_timeout(&mut self.0, TRAY_KILL_REAP_GRACE) {
+                tracing::warn!("tray helper did not exit within post-kill reap deadline");
+            }
         }
     }
 }

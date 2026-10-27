@@ -43,7 +43,8 @@ A StatusNotifierItem host such as KDE Plasma is required for an icon. GNOME need
 a compatible AppIndicator/KStatusNotifierItem extension and may not display
 tooltips. Without a compatible host/session bus, mounts continue without the
 tray. Linux isolates the tray in an owned helper; an unresponsive D-Bus cannot
-hold mount completion beyond its two-second helper shutdown grace period. A watcher appearing or restarting on an existing bus is handled by the
+hold mount completion beyond the helper's two-second shutdown grace and
+500 ms post-kill reap window. A watcher appearing or restarting on an existing bus is handled by the
 upstream backend. See [tray details](tray.md). Older 0.2.0 binaries still need
 the GTK/AppIndicator packages listed in that release's installation instructions.
 

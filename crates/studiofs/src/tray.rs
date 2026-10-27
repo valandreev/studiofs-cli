@@ -292,7 +292,6 @@ mod supported {
         }
 
         fn set_activity(&mut self, activity: TrayActivity) {
-            self.last_activity_at = Instant::now();
             let mode_changed = self.mode != activity.mode;
             let active_uploads_changed = activity.mode == TrayPulseMode::Active
                 && self.pending_upload_bytes != activity.pending_upload_bytes;
@@ -810,7 +809,7 @@ mod supported {
         let parent = std::thread::Builder::new()
             .name("studiofs-tray-parent".into())
             .spawn(move || {
-                let _ = std::io::stdin().read_exact(&mut [0]);
+                let _ = std::io::stdin().read_exact(&mut [0u8; 1]);
                 let _ = shutdown_events.send(TrayUserEvent::MountFinished);
             })?;
         let monitor = spawn_activity_monitor(
@@ -1262,7 +1261,12 @@ mod supported {
                 app.set_activity(activity);
                 app.last_activity_at =
                     Instant::now() - DIAGNOSTICS_MAX_AGE - Duration::from_millis(1);
+                let last_observation = app.last_activity_at;
                 app.render_frame();
+                assert_eq!(
+                    app.last_activity_at, last_observation,
+                    "rendering must not invent a diagnostics heartbeat"
+                );
 
                 assert_eq!(app.mode, TrayPulseMode::Unavailable);
                 assert_eq!(app.pending_upload_bytes, None);

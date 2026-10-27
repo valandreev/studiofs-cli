@@ -12,6 +12,9 @@ import tempfile
 import time
 import unittest
 
+if len(sys.argv) < 3:
+    sys.exit("usage: test-linux-tray.py <binary> <artifacts.json> [unittest options]")
+
 import dbus
 import dbus.service
 from dbus.mainloop.glib import DBusGMainLoop

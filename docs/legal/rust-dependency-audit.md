@@ -1,5 +1,20 @@
 # Rust dependency license audit for v0.2.0
 
+## SFS-884 Linux event-loop scope renewal, 2026-10-27
+
+After isolating the Linux KSNI tray, `winit` is needed only by Windows/macOS.
+The reviewed inventory was renewed for that target declaration: Linux product
+scope drops from 417 to 373 packages; Windows remains at 333 and macOS at 365.
+All 649 registry identities, archive checksums, license expressions and packaged
+notice evidence are unchanged, as is Cargo.lock. The full-lockfile notices still
+include `winit` and its dependencies for the remaining platform declarations.
+The Linux normal/build/feature graph contains no `winit`, X11 or Wayland client
+path; existing independent consumers of `polling`/`rustix` remain through KSNI.
+Strict release notice generation passes with zero unresolved evidence.
+Reproduction used `cargo metadata --locked --offline --format-version 1` saved
+as `target/sfs-884/review3/metadata.json`, then the inventory generator with that
+explicit `--metadata` path. The historical snapshot label in the JSON is unchanged.
+
 ## SFS-884 KSNI renewal for 0.2.1, 2026-10-27
 
 The committed inventory now contains 649 registry packages and 12 workspace

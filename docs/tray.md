@@ -22,8 +22,9 @@ restarts. An absent icon does not confirm synchronization. A tray
 initialization error never dispatches a second mount. The parent serves the mount
 independently of tray startup, updates and destruction. After mount completion it
 closes the helper's control pipe, allows two seconds for normal shutdown, then
-terminates and reaps a helper blocked in D-Bus. The original mount result is
-preserved. Linux also kills the helper if its mount parent dies. For detached
+terminates a helper blocked in D-Bus and allows another 500 ms to reap it. If the
+kernel still cannot complete its exit, a warning is logged and the original
+mount result is returned. Linux also kills the helper if its mount parent dies. For detached
 mounts, that parent is the serving daemon, so the tray survives the launcher's
 exit. Windows/macOS retain their native event-loop lifecycle.
 

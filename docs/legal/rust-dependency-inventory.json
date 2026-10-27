@@ -20,7 +20,7 @@
     "linux-x86_64": {
       "triple": "x86_64-unknown-linux-gnu",
       "selection_source": "cargo tree -e normal,build package set and features; roles propagated through target-filtered metadata restricted to that set",
-      "package_count": 417
+      "package_count": 373
     },
     "macos-aarch64": {
       "triple": "aarch64-apple-darwin",
@@ -70,7 +70,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:2af71558e438db0b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -87,19 +87,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "default",
-            "gvar-alloc",
-            "std",
-            "variable-fonts"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "ab_glyph_rasterizer",
@@ -137,7 +125,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:2af71558e438db0b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -154,17 +142,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "default",
-            "std"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "addr2line",
@@ -530,7 +508,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -562,20 +540,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "default",
-            "getrandom",
-            "no-rng",
-            "runtime-rng",
-            "std"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "aho-corasick",
@@ -1947,7 +1912,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:248dd895a2f89e28",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -1977,14 +1942,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "arrayvec",
@@ -2134,7 +2092,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -2151,17 +2109,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "alloc",
-            "default"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "async-broadcast",
@@ -7131,7 +7079,6 @@
             "runtime"
           ],
           "enabled_features": [
-            "aarch64_simd",
             "extern_crate_alloc"
           ]
         },
@@ -8028,7 +7975,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -8073,14 +8020,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "calloop-wayland-source",
@@ -8118,7 +8058,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -8135,14 +8075,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "cc",
@@ -9043,12 +8976,6 @@
       ],
       "targets": {
         "windows-x86_64": {
-          "roles": [
-            "host-build"
-          ],
-          "enabled_features": []
-        },
-        "linux-x86_64": {
           "roles": [
             "host-build"
           ],
@@ -13099,16 +13026,6 @@
             "std"
           ]
         },
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "alloc",
-            "default",
-            "std"
-          ]
-        },
         "macos-aarch64": {
           "roles": [
             "runtime"
@@ -14189,7 +14106,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -14219,14 +14136,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "dlv-list",
@@ -14470,7 +14380,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:ec5c82d846feaa2a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -14487,17 +14397,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "default",
-            "std"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "dpi",
@@ -19256,7 +19156,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:2af71558e438db0b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -19273,14 +19173,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "getrandom",
@@ -27244,12 +27137,6 @@
             "host-build"
           ],
           "enabled_features": []
-        },
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
         }
       }
     },
@@ -27515,7 +27402,6 @@
             "netlink",
             "no_std",
             "prctl",
-            "system",
             "xdp"
           ]
         }
@@ -27575,7 +27461,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:0ba40231f7ee15be",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -27598,22 +27484,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "elf",
-            "errno",
-            "general",
-            "ioctl",
-            "no_std",
-            "prctl",
-            "system"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "litemap",
@@ -36185,7 +36056,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:2af71558e438db0b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -36202,22 +36073,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "apple-layout",
-            "default",
-            "glyph-names",
-            "gvar-alloc",
-            "opentype-layout",
-            "std",
-            "variable-fonts"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "parking",
@@ -40886,7 +40742,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -40903,16 +40759,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "host-build"
-          ],
-          "enabled_features": [
-            "default"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "quinn",
@@ -42810,15 +42657,6 @@
             "std"
           ]
         },
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "alloc",
-            "std"
-          ]
-        },
         "macos-aarch64": {
           "roles": [
             "runtime"
@@ -44502,7 +44340,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:0ba40231f7ee15be",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -44560,27 +44398,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "alloc",
-            "default",
-            "event",
-            "fs",
-            "libc-extra-traits",
-            "pipe",
-            "process",
-            "shm",
-            "std",
-            "system",
-            "thread",
-            "use-libc-auxv"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "rustix",
@@ -44798,9 +44616,7 @@
             "net",
             "pipe",
             "process",
-            "shm",
             "std",
-            "system",
             "time"
           ]
         },
@@ -45721,7 +45537,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:ec5c82d846feaa2a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -45738,14 +45554,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "scopeguard",
@@ -45864,7 +45673,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -45883,17 +45692,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "ab_glyph",
-            "memmap2"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "security-framework",
@@ -48982,8 +48781,7 @@
           ],
           "enabled_features": [
             "const_generics",
-            "const_new",
-            "union"
+            "const_new"
           ]
         },
         "macos-aarch64": {
@@ -49033,7 +48831,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -49065,17 +48863,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "calloop",
-            "calloop-wayland-source"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "smol_str",
@@ -49138,15 +48926,6 @@
       ],
       "targets": {
         "windows-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "default",
-            "std"
-          ]
-        },
-        "linux-x86_64": {
           "roles": [
             "runtime"
           ],
@@ -49753,7 +49532,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -49770,14 +49549,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "stringprep",
@@ -49944,12 +49716,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs/Cargo.toml",
-        "sha256": "a3caf8b0a640a22b19558eb237a11a38dfdd5f5b4c03b7086377777ebdbcadc4"
+        "sha256": "a700bb6d6413f623d772bd125670c0485f57331c0a11635ed078c803b09c6dce"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "a3caf8b0a640a22b19558eb237a11a38dfdd5f5b4c03b7086377777ebdbcadc4"
+          "sha256": "a700bb6d6413f623d772bd125670c0485f57331c0a11635ed078c803b09c6dce"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -52546,7 +52318,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -52589,14 +52361,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "thiserror",
@@ -53025,7 +52790,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -53042,14 +52807,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "host-build"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "thiserror-impl",
@@ -53771,7 +53529,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:118dbcd2d5c9f9b2",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -53788,17 +53546,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "simd",
-            "std"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "tiny-skia-path",
@@ -53836,7 +53584,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:118dbcd2d5c9f9b2",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -53853,16 +53601,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "std"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "tinystr",
@@ -57292,7 +57031,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -57309,21 +57048,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "apple-layout",
-            "glyph-names",
-            "gvar-alloc",
-            "opentype-layout",
-            "std",
-            "variable-fonts"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "typenum",
@@ -60470,7 +60195,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -60580,17 +60305,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "client_system",
-            "dlopen"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "wayland-client",
@@ -60628,7 +60343,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -60725,14 +60440,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "wayland-csd-frame",
@@ -60770,7 +60478,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -60787,14 +60495,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "wayland-cursor",
@@ -60832,7 +60533,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -60849,14 +60550,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "wayland-protocols",
@@ -60900,7 +60594,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -60958,19 +60652,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "client",
-            "staging",
-            "unstable",
-            "wayland-client"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "wayland-protocols-plasma",
@@ -61014,7 +60696,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -61033,17 +60715,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "client",
-            "wayland-client"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "wayland-protocols-wlr",
@@ -61081,7 +60753,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -61098,17 +60770,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "client",
-            "wayland-client"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "wayland-scanner",
@@ -61146,7 +60808,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -61215,14 +60877,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "host-build"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "wayland-sys",
@@ -61260,7 +60915,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -61277,18 +60932,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "client",
-            "dlopen",
-            "once_cell"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "web-sys",
@@ -65971,38 +65615,13 @@
           "dependency_kinds": [
             {
               "kind": "normal",
-              "target": "cfg(any(windows, target_os = \"macos\", target_os = \"linux\"))"
+              "target": "cfg(any(windows, target_os = \"macos\"))"
             }
           ]
         }
       ],
       "targets": {
         "windows-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "ahash",
-            "bytemuck",
-            "default",
-            "memmap2",
-            "percent-encoding",
-            "rwh_06",
-            "sctk",
-            "sctk-adwaita",
-            "wayland",
-            "wayland-backend",
-            "wayland-client",
-            "wayland-csd-adwaita",
-            "wayland-dlopen",
-            "wayland-protocols",
-            "wayland-protocols-plasma",
-            "x11",
-            "x11-dl",
-            "x11rb"
-          ]
-        },
-        "linux-x86_64": {
           "roles": [
             "runtime"
           ],
@@ -66807,7 +66426,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -66826,14 +66445,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "x11rb",
@@ -66877,7 +66489,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -66896,28 +66508,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "allow-unsafe-code",
-            "as-raw-xcb-connection",
-            "dl-libxcb",
-            "libc",
-            "libloading",
-            "once_cell",
-            "randr",
-            "render",
-            "resource_manager",
-            "shape",
-            "xfixes",
-            "xinput",
-            "xkb"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "x11rb-protocol",
@@ -66961,7 +66552,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -66978,23 +66569,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "randr",
-            "render",
-            "resource_manager",
-            "shape",
-            "std",
-            "xfixes",
-            "xinput",
-            "xkb"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "xcursor",
@@ -67032,7 +66607,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -67049,14 +66624,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "xkbcommon-dl",
@@ -67094,7 +66662,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [
         "has-target-conditioned-edge"
       ],
@@ -67113,16 +66681,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "x11"
-          ]
-        }
-      }
+      "targets": {}
     },
     {
       "name": "xkeysym",
@@ -67172,7 +66731,7 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:c0fb98161c4fbc6e",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "selected-for-studiofs-target",
+      "target_scope_classification": "outside-selected-studiofs-targets",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
@@ -67202,14 +66761,7 @@
           ]
         }
       ],
-      "targets": {
-        "linux-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": []
-        }
-      }
+      "targets": {}
     },
     {
       "name": "xmlparser",
