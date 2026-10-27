@@ -276,7 +276,10 @@ fn send_unix_signal(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
 const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(unix)]
-fn reap_child_with_timeout(child: &mut std::process::Child, timeout: std::time::Duration) -> bool {
+pub(crate) fn reap_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> bool {
     use std::time::Instant;
 
     let deadline = Instant::now() + timeout;

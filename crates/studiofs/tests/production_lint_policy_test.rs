@@ -42,6 +42,7 @@ fn production_rust_sources() -> Vec<PathBuf> {
     // adopted the no-panic policy and their production/test boundaries are
     // represented by an AST-based checker.
     [
+        "crates/studiofs/src/tray/linux.rs",
         "crates/studiofs-cache/src/cached_store.rs",
         "crates/studiofs-cache/src/payload_index.rs",
         "crates/studiofs-macfuse/src/adapter.rs",

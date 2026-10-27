@@ -38,7 +38,7 @@ If a package cannot be found, first check repository availability and your syste
 
 ## Desktop indicator in 0.2.1
 
-The Linux tray uses KSNI/StatusNotifierItem over your session D-Bus; GTK3, GLib, libxdo and AppIndicator libraries are no longer StudioFS prerequisites. A compatible desktop host, such as KDE Plasma, displays the icon. On GNOME, enable an AppIndicator/KStatusNotifierItem extension; tooltips may not be displayed. If the watcher starts later or restarts on the same bus, the backend registers again. Without a graphical session or session bus, mounting continues without the tray. An absent icon does not confirm that synchronization has finished. Older 0.2.0 binaries retain their GTK/AppIndicator requirements.
+The Linux tray uses KSNI/StatusNotifierItem over your session D-Bus; GTK3, GLib, libxdo and AppIndicator libraries are no longer StudioFS prerequisites. A compatible desktop host, such as KDE Plasma, displays the icon. On GNOME, enable an AppIndicator/KStatusNotifierItem extension; tooltips may not be displayed. If the watcher starts later or restarts on the same bus, the backend registers again. Without a compatible host or session bus, mounting continues without the tray. A tray helper blocked in D-Bus is terminated after a two-second shutdown grace period; the mount result is preserved. An absent icon does not confirm that synchronization has finished. Older 0.2.0 binaries retain their GTK/AppIndicator requirements.
 
 ## Checking FUSE3
 

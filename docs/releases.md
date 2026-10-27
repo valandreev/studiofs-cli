@@ -41,8 +41,9 @@ links libfuse3; it does not ship system shared libraries. Since 0.2.1 the Linux
 tray uses KSNI over session D-Bus, without GTK3/GLib/libxdo/AppIndicator libraries.
 A StatusNotifierItem host such as KDE Plasma is required for an icon. GNOME needs
 a compatible AppIndicator/KStatusNotifierItem extension and may not display
-tooltips. Without a usable desktop/session bus, mounts continue without the
-tray. A watcher appearing or restarting on an existing bus is handled by the
+tooltips. Without a compatible host/session bus, mounts continue without the
+tray. Linux isolates the tray in an owned helper; an unresponsive D-Bus cannot
+hold mount completion beyond its two-second helper shutdown grace period. A watcher appearing or restarting on an existing bus is handled by the
 upstream backend. See [tray details](tray.md). Older 0.2.0 binaries still need
 the GTK/AppIndicator packages listed in that release's installation instructions.
 

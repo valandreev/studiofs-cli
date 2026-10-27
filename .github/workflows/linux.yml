@@ -107,13 +107,13 @@ jobs:
       - name: Install Linux packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y dbus-daemon fuse3 libfuse3-dev
+          sudo apt-get install -y dbus-daemon fuse3 libfuse3-dev python3-dbus python3-gi
       - name: cargo test (workspace)
         run: cargo test --workspace --all-targets -- --nocapture
       - name: Linux tray backend lifecycle
         run: |
           set -euo pipefail
-          cargo test --locked -p studiofs --bin studiofs --no-run
+          cargo test --locked -p studiofs --bin studiofs --no-run --message-format=json > target/tray-test-artifacts.json
           timeout 20s dbus-run-session -- cargo test --locked -p studiofs --bin studiofs \
             tray::supported::tests::linux_backend_updates_and_stops_without_a_watcher \
             -- --exact --ignored --nocapture
@@ -121,6 +121,8 @@ jobs:
             cargo test --locked -p studiofs --bin studiofs \
             tray::supported::tests::linux_backend_returns_error_without_a_session_bus \
             -- --exact --ignored --nocapture
+          cargo build --locked -p studiofs
+          timeout 30s dbus-run-session -- /usr/bin/python3 tools/test-linux-tray.py target/debug/studiofs target/tray-test-artifacts.json
       - name: Local-first offline VFS fast checks
         run: |
           set -euo pipefail
