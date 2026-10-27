@@ -101,6 +101,10 @@ mod tests {
     #[ignore = "controlled by tools/test-linux-tray.py"]
     fn owned_backend_fixture() {
         use std::io::{BufRead, Read, Write};
+        if std::env::var("STUDIOFS_TRAY_TEST_FIXTURE").as_deref() != Ok("1") {
+            eprintln!("skipping controller-only fixture; run tools/test-linux-tray.py");
+            return;
+        }
         let mut child = TrayProcess::spawn(
             Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -131,6 +135,10 @@ mod tests {
     #[ignore = "controlled by owned_backend_fixture"]
     fn backend_drop_fixture() {
         use std::io::{Read, Write};
+        if std::env::var("STUDIOFS_TRAY_TEST_FIXTURE").as_deref() != Ok("1") {
+            eprintln!("skipping controller-only fixture; run tools/test-linux-tray.py");
+            return;
+        }
         let tray = tray_icon::TrayIconBuilder::new()
             .with_icon(tray_icon::Icon::from_rgba(vec![0, 0, 0, 255], 1, 1).unwrap())
             .build()

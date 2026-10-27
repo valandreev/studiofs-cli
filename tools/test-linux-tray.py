@@ -61,6 +61,26 @@ class TrayProcessTests(unittest.TestCase):
         self.assertIn("format info not found", stderr)
         self.assertNotIn("panicked", stderr)
 
+    def test_ignored_fixtures_exit_without_a_controller(self):
+        env = dict(os.environ)
+        env.pop("STUDIOFS_TRAY_TEST_FIXTURE", None)
+        for fixture in ("backend_drop_fixture", "owned_backend_fixture"):
+            with self.subTest(fixture=fixture):
+                child = subprocess.Popen(
+                    [TEST_BINARY, "--exact", f"tray::linux::tests::{fixture}",
+                     "--ignored", "--nocapture", "--test-threads=1"],
+                    env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self.addCleanup(self.reap, child)
+                # Keep stdin open: communicate() would hide the wait by sending EOF.
+                child.wait(timeout=5)
+                stdout, stderr = child.communicate(timeout=1)
+                self.assertEqual(child.returncode, 0, (stdout, stderr))
+                self.assertIn(b"1 passed", stdout)
+                self.assertNotIn(b"backend-ready", stdout)
+                self.assertNotIn(b"owner-ready", stdout)
+
     def assert_mount_survives_stalled_bus_authentication(self, **overrides):
         address = str(Path(self.root.name) / "bus")
         with socket.socket(socket.AF_UNIX) as listener:
@@ -148,6 +168,7 @@ class TrayProcessTests(unittest.TestCase):
         owner = subprocess.Popen(
             [TEST_BINARY, "--exact", "tray::linux::tests::owned_backend_fixture",
              "--ignored", "--nocapture"],
+            env=dict(os.environ, STUDIOFS_TRAY_TEST_FIXTURE="1"),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         self.addCleanup(self.reap, owner)

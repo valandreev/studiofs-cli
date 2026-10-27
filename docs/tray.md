@@ -91,6 +91,12 @@ timeout 30s dbus-run-session -- /usr/bin/python3 tools/test-linux-tray.py target
 Build the test binary first so compilation does not consume the timeout. Run the
 tests separately: one needs a working isolated bus, the other an invalid bus
 address. The raw backend timeouts bound each test process, including destruction.
+The `owned_backend_fixture` and `backend_drop_fixture` tests are subprocess
+fixtures controlled by the Python runner, which sets `STUDIOFS_TRAY_TEST_FIXTURE=1`
+only for their processes. Without that opt-in, including during a general
+`cargo test -- --ignored` run, they return before starting D-Bus or waiting on
+stdin. The runner also checks that both fixtures exit with stdin left open
+when no controller opts in.
 The process-owner tests check normal EOF exit and forced cleanup of a stopped
 helper. The Python fault tests use `python3-dbus` and `python3-gi`: an isolated
 socket never answers authentication, or a private watcher never replies to
