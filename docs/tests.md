@@ -21,6 +21,12 @@ For final encryption-at-rest acceptance, use the
 It collects the encrypted-object unit, integration, E2E, platform smoke, and
 performance checks that should be recorded before closing the feature.
 
+For the measured POSIX conformance of the Linux FUSE mount (pjdfstest and fsx
+against a live mount with an ext4 control, plus failure classification and
+reproduction steps), see [docs/posix-conformance.md](posix-conformance.md).
+The runners live in `tools/posix-conformance/` and are manual, root-gated
+measurements, not CI gates.
+
 ### SFS-695 PostgreSQL sync contract
 
 The PostgreSQL lifecycle contract is documented in
