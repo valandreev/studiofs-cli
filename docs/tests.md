@@ -420,8 +420,10 @@ cargo test -p studiofs-vfs --lib truncate_masks_packed_fragments_beyond_old_eof_
 Attribute-only setattr holds the inode's write session through reading the
 current attributes and committing or enqueueing its update. This preserves a
 concurrent writer's size, including after its dirty attribute has been flushed.
-Size requests compare the current size under the flush session, so an apparent
-no-op cannot miss a concurrent extension that actually requires truncation.
+Size requests compare the current size under the write session, so an apparent
+no-op cannot miss a concurrent extension that actually requires truncation. A
+request that still matches the current size takes the attribute-only path without
+a strict flush or ctime update.
 
 ```sh
 cargo test -p studiofs-vfs --lib setattr -- --nocapture

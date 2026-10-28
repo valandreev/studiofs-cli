@@ -1444,7 +1444,7 @@ impl StudioVfs {
             return Ok(attr);
         }
 
-        let mut attr = self.attr_only_setattr_base_attr(ino)?;
+        let attr = self.attr_only_setattr_base_attr(ino)?;
         // Handle-backed growth stays local (create, SetEndOfFile, write); other updates
         // must not race a pending create commit.
         let defers_handle_growth = args.size.is_some_and(|new_size| {
@@ -1455,7 +1455,6 @@ impl StudioVfs {
                 &operation,
                 self.drain_deferred_namespace_metadata_for_barrier(),
             )?;
-            attr = self.attr_only_setattr_base_attr(ino)?;
         }
         if let Some(new_size) = args.size {
             if let Some(handle) = fh {
@@ -1463,6 +1462,22 @@ impl StudioVfs {
             } else {
                 self.enforce_no_known_foreign_hard_lock(ino)?;
             }
+            // Writers are excluded while the Write session is held, so an
+            // unchanged size here is a real no-op that needs no strict flush.
+            let cleanup = self.file_session_cleanup(ino);
+            let permit = self.run_sync_future_with_admission(&operation, async {
+                Ok(self
+                    .state
+                    .file_session
+                    .enter_op(ino, FileSessionOperation::Write)
+                    .await)
+            })?;
+            let cleanup = cleanup.with_permit(permit);
+            let attr = self.attr_only_setattr_base_attr(ino)?;
+            if new_size == attr.size {
+                return self.commit_attr_only_setattr(ino, attr, &args);
+            }
+            drop(cleanup);
             let defer_handle_growth_flush =
                 handle_backed_growth_may_defer_strict_flush(fh, new_size, attr.size, &args);
             let updated = self.run_sync_future_with_admission(
@@ -1484,7 +1499,17 @@ impl StudioVfs {
                 .await)
         })?;
         let _cleanup = cleanup.with_permit(permit);
-        attr = self.attr_only_setattr_base_attr(ino)?;
+        let attr = self.attr_only_setattr_base_attr(ino)?;
+        self.commit_attr_only_setattr(ino, attr, &args)
+    }
+
+    /// Applies non-size attributes; the caller holds the inode's Write session.
+    fn commit_attr_only_setattr(
+        &self,
+        ino: Ino,
+        mut attr: InodeAttr,
+        args: &SetattrArgs,
+    ) -> VfsResult<InodeAttr> {
         if args.apply_attr_only(&mut attr) {
             attr.touch_ctime();
             self.state
@@ -3766,6 +3791,42 @@ mod tests {
             drop(permit);
             assert_eq!(task.await.unwrap().unwrap().size, 0);
             assert_eq!(vfs.state.writer_stack.dirty_bytes_for_inode(attr.ino), 0);
+        });
+    }
+
+    #[test]
+    fn same_size_setattr_skips_strict_flush_and_keeps_ctime() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("same-size-setattr-noop-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "same-size-setattr-noop");
+        rt.block_on(async {
+            let attr = vfs.create(ROOT_INO, b"file", 0, 0, 0o644).unwrap();
+            let fh = vfs
+                .open_file(attr.ino, super::super::OpenFlags::RDWR, false)
+                .unwrap();
+            vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, b"payload")
+                .await
+                .unwrap();
+            let before = vfs.getattr(attr.ino).unwrap();
+            assert_eq!(before.size, 7);
+            let dirty_before = vfs.state.writer_stack.dirty_bytes_for_inode(attr.ino);
+            assert!(dirty_before > 0);
+            let setter = vfs.clone();
+            let after = tokio::task::spawn_blocking(move || {
+                setter.setattr(attr.ino, SetattrArgs::size_only(7))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(after.size, 7);
+            assert_eq!(
+                after.ctime, before.ctime,
+                "same-size setattr must not touch ctime"
+            );
+            assert_eq!(
+                vfs.state.writer_stack.dirty_bytes_for_inode(attr.ino),
+                dirty_before,
+                "same-size setattr must not force a strict flush"
+            );
         });
     }
 
