@@ -892,7 +892,11 @@ case-sensitive like `fusermount3`) and fails with a `PermissionDenied` error
 naming the missing line before `fusermount3` runs or a detached daemon starts.
 If the mounter cannot read `/etc/fuse.conf` (for example `0640 root:fuse`),
 the check logs a warning and leaves the decision to setuid `fusermount3`.
-Snapshot `smount` sessions never request `allow_other`. The opt-in native
+Linux `create`, `mkdir`, `mknod` and `symlink` record the requesting
+caller's uid/gid from `fuse_req_ctx`, so a foreign caller owns what it
+creates. Group inheritance from setgid directories is not implemented, and
+the legacy uid/gid zero translation still reports root-created inodes as the
+mount user. Snapshot `smount` sessions never request `allow_other`. The opt-in native
 check probes a `0600` and a `0644` file as a second account through
 `sudo -n -u "${STUDIOFS_ALLOW_OTHER_PROBE_USER:-nobody}"`; that account must be
 able to search the workspace target directory:
