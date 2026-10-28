@@ -18773,10 +18773,23 @@ fn deferred_namespace_dir_conflict_abandons_child_and_retries_independent_ops_ac
         assert!(meta.get_attr(conflicted_dir.ino).is_err());
         assert!(meta.get_attr(child.ino).is_err());
         assert!(meta.lookup(conflicted_dir.ino, b"child.txt").is_err());
-        assert!(
-            vfs.state.namespace.deferred.inner.lock().queue.is_empty(),
-            "failed dependent operations must be removed from the deferred queue"
-        );
+        // Abandoned queued dependents stay queued until the drainer settles them in order.
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.drain_deferred_namespace_metadata_for_barrier(),
+        )
+        .await
+        .expect("barrier should settle abandoned queued dependents")
+        .expect("barrier should not fail");
+        {
+            let inner = vfs.state.namespace.deferred.inner.lock();
+            assert!(
+                inner.queue.is_empty(),
+                "failed dependent operations must leave the deferred queue"
+            );
+            assert!(!inner.pending_inodes.contains_key(&child.ino));
+            assert_eq!(inner.settled_operations, inner.admitted_operations);
+        }
         assert!(
             !vfs.state
                 .namespace
