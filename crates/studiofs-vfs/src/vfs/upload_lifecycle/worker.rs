@@ -358,6 +358,12 @@ trait UploadMetaPort: Clone + Send + Sync + 'static {
     /// Reports whether any overlay slice references `object_id`, regardless of
     /// the inode's current content epoch.
     async fn has_regular_file_overlay_object(&self, ino: Ino, object_id: u64) -> VfsResult<bool>;
+    /// Guard that keeps local size changes on one inode out of an upload
+    /// metadata decision until it is dropped.
+    type InodeUploadGate: Send;
+    /// Waits for the inode's upload session. A truncate holds its flush session
+    /// from tombstoning removed payloads until any rollback restores them.
+    async fn enter_inode_upload_gate(&self, ino: Ino) -> Self::InodeUploadGate;
 }
 
 trait RemoteUploadPort: Clone + Send + Sync + 'static {
@@ -796,6 +802,8 @@ where
             }
         }
 
+        // Held from the final reference check through local payload removal.
+        let mut _stale_gate = None;
         let (keep_local_object, finalize_content_epoch) = if let Some(reconcile) = reconcile {
             (
                 reconcile.keep_local_object,
@@ -807,6 +815,17 @@ where
                 .await?
                 .protects_payload()
             {
+                return Ok(SingleUploadOutcome::Requeued);
+            }
+            // Reattachment takes this gate itself, so the protect pass runs first.
+            _stale_gate = Some(self.meta.enter_inode_upload_gate(op.ino).await);
+            if let Some(attr) = self.meta.get_attr(op.ino).await?
+                && self
+                    .meta
+                    .has_regular_file_overlay_object(op.ino, op.object_id)
+                    .await?
+            {
+                self.requeue_stale_upload_at_epoch(op, attr.content_epoch);
                 return Ok(SingleUploadOutcome::Requeued);
             }
             self.shutdown.record_canceled_stale_after_put(payload_len);
@@ -942,7 +961,9 @@ where
 
     async fn cancel_stale_upload(&self, op: &PendingUpload) -> VfsResult<()> {
         // Deleting the payload is only safe once no overlay slice references
-        // it, whichever epoch the inode has advanced to meanwhile.
+        // it, whichever epoch the inode has advanced to meanwhile. The gate
+        // keeps a truncate rollback from re-referencing it before removal.
+        let _gate = self.meta.enter_inode_upload_gate(op.ino).await;
         let still_referenced = self.meta.get_attr(op.ino).await?.is_some()
             && self
                 .meta
@@ -982,7 +1003,13 @@ where
                 .has_regular_file_overlay_object(op.ino, op.object_id)
                 .await?
             {
-                return Ok(self.requeue_stale_upload_at_epoch(op, attr.content_epoch));
+                // Requeue at the epoch current after the scan, not the earlier read.
+                let content_epoch = self
+                    .meta
+                    .get_attr(op.ino)
+                    .await?
+                    .map_or(attr.content_epoch, |latest| latest.content_epoch);
+                return Ok(self.requeue_stale_upload_at_epoch(op, content_epoch));
             }
         }
 
@@ -1499,6 +1526,19 @@ impl UploadMetaPort for VfsUploadMetaPort {
         )
     }
 
+    type InodeUploadGate = super::super::file_session::FileSessionCleanup;
+
+    async fn enter_inode_upload_gate(&self, ino: Ino) -> Self::InodeUploadGate {
+        let cleanup = self.vfs.file_session_cleanup(ino);
+        let permit = self
+            .vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Upload)
+            .await;
+        cleanup.with_permit(permit)
+    }
+
     async fn has_regular_file_overlay_object(&self, ino: Ino, object_id: u64) -> VfsResult<bool> {
         let meta = self.vfs.meta.clone();
         let object_ids = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -1595,14 +1635,7 @@ impl UploadMetaPort for VfsUploadMetaPort {
         ) else {
             return Ok(None);
         };
-        let cleanup = self.vfs.file_session_cleanup(ino);
-        let permit = self
-            .vfs
-            .state
-            .file_session
-            .enter_op(ino, FileSessionOperation::Upload)
-            .await;
-        let session = cleanup.with_permit(permit);
+        let session = self.enter_inode_upload_gate(ino).await;
         let meta = self.vfs.meta.clone();
         run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
             // Cancellation must not release the gate before the blocking mutation finishes.
@@ -3119,6 +3152,7 @@ mod tests {
         reattach_epoch: Arc<Mutex<Option<u64>>>,
         reattach_epoch_sequence: Arc<Mutex<Vec<Option<u64>>>>,
         advance_epoch_after_get_attr: Arc<AtomicBool>,
+        restore_overlay_on_gate: Arc<Mutex<Option<(Ino, u64)>>>,
     }
 
     impl Default for FakeMeta {
@@ -3134,6 +3168,7 @@ mod tests {
                 reattach_epoch: Arc::new(Mutex::new(None)),
                 reattach_epoch_sequence: Arc::new(Mutex::new(Vec::new())),
                 advance_epoch_after_get_attr: Arc::new(AtomicBool::new(false)),
+                restore_overlay_on_gate: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -3173,6 +3208,19 @@ mod tests {
                 .lock()
                 .get(&ino)
                 .is_some_and(|objects| objects.contains(&object_id)))
+        }
+
+        type InodeUploadGate = ();
+
+        async fn enter_inode_upload_gate(&self, _ino: Ino) -> Self::InodeUploadGate {
+            // Models a truncate rollback that finishes before the gate is granted.
+            if let Some((ino, object_id)) = self.restore_overlay_on_gate.lock().take() {
+                self.overlay_objects
+                    .lock()
+                    .entry(ino)
+                    .or_default()
+                    .insert(object_id);
+            }
         }
 
         async fn has_regular_file_overlay_object(
@@ -4458,6 +4506,27 @@ mod tests {
         assert_eq!(local_payloads.removed.lock().as_slice(), &[77]);
         assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 1);
         assert_eq!(shutdown.released_tokens.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn process_upload_rechecks_stale_payload_reference_under_inode_gate() {
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, _policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch + 1)));
+        *meta.restore_overlay_on_gate.lock() = Some((op.ino, op.object_id));
+
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::CancelledStale);
+        assert!(
+            local_payloads.removed.lock().is_empty(),
+            "a payload a truncate rollback re-referenced must survive stale cancellation"
+        );
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

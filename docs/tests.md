@@ -385,6 +385,15 @@ referenced payload is requeued at the current epoch instead of being deleted.
 cargo test -p studiofs-vfs --lib process_upload_keeps_overlay_payload_when_epoch_advances_during_stale_checks -- --nocapture
 ```
 
+A truncate tombstone drops the slices it covers, and a failed size change
+restores them. Stale-upload cancellation therefore rechecks the reference and
+removes the payload while holding the inode's upload session, which excludes the
+truncate's flush session from tombstone through rollback:
+
+```sh
+cargo test -p studiofs-vfs --lib process_upload_rechecks_stale_payload_reference_under_inode_gate -- --nocapture
+```
+
 Upload reattachment holds the inode's upload session through its local metadata
 read and write, including when the async caller is cancelled. A concurrent size
 change therefore cannot be overwritten by a reattachment prepared from an older

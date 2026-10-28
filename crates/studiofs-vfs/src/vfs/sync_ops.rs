@@ -1773,14 +1773,15 @@ impl StudioVfs {
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         if result.is_ok() && drain_after_write {
-            self.drain_writer_stack_budget_after_write().await?;
+            self.drain_writer_stack_budget_after_write().await;
         }
         result
     }
 
     /// Waits for busy inodes skipped by the nonblocking limits sweep, once the
     /// writing inode's gate is released, so the global dirty budget still applies.
-    async fn drain_writer_stack_budget_after_write(&self) -> VfsResult<()> {
+    /// The write is already accepted, so a drain failure is logged, not returned.
+    async fn drain_writer_stack_budget_after_write(&self) {
         for dirty_ino in self.state.writer_stack.snapshot_dirty_inodes_by_bytes() {
             if self.total_pending_write_buffer_bytes() <= self.max_dirty_bytes() {
                 break;
@@ -1792,9 +1793,16 @@ impl StudioVfs {
                 .enter_op(dirty_ino, FileSessionOperation::Materialize)
                 .await;
             let _session = cleanup.with_permit(permit);
-            self.materialize_writer_stack_for_inode(dirty_ino).await?;
+            if let Err(error) = self.materialize_writer_stack_for_inode(dirty_ino).await
+                && !self.suppress_deleted_inode_materialization_error(dirty_ino, &error)
+            {
+                warn!(
+                    ino = dirty_ino,
+                    error = %error,
+                    "post-write dirty-budget materialization failed; will retry at next strict barrier"
+                );
+            }
         }
-        Ok(())
     }
 
     /// Write with deferred materialization for high-throughput streaming writes.
@@ -2032,7 +2040,7 @@ impl StudioVfs {
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         if result.is_ok() && local_sync_policy.requires_write_path_durability() {
-            self.drain_writer_stack_budget_after_write().await?;
+            self.drain_writer_stack_budget_after_write().await;
         }
         result
     }
