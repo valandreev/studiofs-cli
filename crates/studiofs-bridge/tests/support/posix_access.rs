@@ -244,17 +244,7 @@ fn run_access_checks(read_only: bool, mfmount: bool) {
     #[cfg(target_os = "linux")]
     let worker = std::thread::spawn(move || studiofs_linux_fuse::mount_with_request(request));
     let result = std::panic::catch_unwind(|| {
-        ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("native mount ready");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::fs::metadata(mount_point.join("owner-read")).is_err() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "mounted lookup did not become ready"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_mounted_entry(&ready_rx, &mount_point.join("owner-read"));
         if read_only {
             let path =
                 CString::new(mount_point.join("owner-read").as_os_str().as_bytes()).expect("path");
@@ -296,33 +286,191 @@ fn run_access_checks(read_only: bool, mfmount: bool) {
     #[cfg(target_os = "macos")]
     let unmount_result = Ok(());
     #[cfg(target_os = "linux")]
-    let unmount_result = std::process::Command::new("fusermount3")
-        .arg("-u")
-        .arg(&mount_point)
-        .status()
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err(std::io::Error::other("fusermount3 unmount failed"))
-            }
-        });
+    let unmount_result = fusermount3_unmount(&mount_point);
     // Always join before interpreting unmount errors, including failed startup.
     let mount_result = worker.join();
+    let directory_result = remove_mount_point(&mount_point);
+    finish_access_test(result, mount_result, unmount_result.and(directory_result));
+}
+
+/// Waits for the ready callback and a successful lookup through the mount.
+fn wait_for_mounted_entry(ready_rx: &std::sync::mpsc::Receiver<()>, entry: &std::path::Path) {
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("native mount ready");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::fs::metadata(entry).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mounted lookup did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fusermount3_unmount(mount_point: &std::path::Path) -> std::io::Result<()> {
+    let status = std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg(mount_point)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("fusermount3 unmount failed"))
+    }
+}
+
+/// Removes the mount point, tolerating a bounded EBUSY window after unmount.
+fn remove_mount_point(mount_point: &std::path::Path) -> std::io::Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let directory_result = loop {
-        match std::fs::remove_dir(&mount_point) {
-            Ok(()) => break Ok(()),
+    loop {
+        match std::fs::remove_dir(mount_point) {
+            Ok(()) => return Ok(()),
             Err(error)
                 if error.raw_os_error() == Some(libc::EBUSY)
                     && std::time::Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(error) => break Err(error),
+            Err(error) => return Err(error),
         }
-    };
+    }
+}
+
+/// Second local account used to probe an `allow_other` mount.
+#[cfg(target_os = "linux")]
+const ALLOW_OTHER_PROBE_USER_ENV: &str = "STUDIOFS_ALLOW_OTHER_PROBE_USER";
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a native FUSE mount, `user_allow_other` in /etc/fuse.conf (or root), \
+            passwordless `sudo -u $STUDIOFS_ALLOW_OTHER_PROBE_USER` (default nobody), \
+            and mount-point ancestors searchable by that user"]
+fn mounted_allow_other_applies_mode_bits_to_foreign_users() {
+    use std::os::unix::fs::MetadataExt;
+
+    let probe_user =
+        std::env::var(ALLOW_OTHER_PROBE_USER_ENV).unwrap_or_else(|_| "nobody".to_owned());
+    studiofs_linux_fuse::check_allow_other_permitted().expect("allow_other preflight");
+    // SAFETY: These credential queries have no pointer arguments.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let fixture = ContractVfsFixture::new("native-allow-other").expect("create fixture");
+    for (name, mode) in [("owner-only", 0o600), ("world-readable", 0o644)] {
+        fixture
+            .vfs()
+            .create(CONTRACT_ROOT_INO, name.as_bytes(), uid, gid, mode)
+            .expect("create allow_other file");
+    }
+    fixture
+        .vfs()
+        .mkdir(CONTRACT_ROOT_INO, b"shared", uid, gid, 0o777)
+        .expect("create shared directory");
+    let mount_point = native_mount_point();
+    std::fs::create_dir_all(&mount_point).expect("create mount point");
+    let parent = mount_point.parent().expect("mount point parent");
+    let traversal = run_as_probe_user(&probe_user, &["test", "-x"], parent);
+    assert!(
+        traversal.status.success(),
+        "{probe_user} must be able to search {} (sudo -n and directory modes); stderr: {}",
+        parent.display(),
+        String::from_utf8_lossy(&traversal.stderr)
+    );
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let request = studiofs_linux_fuse::LinuxFuseMountRequest::new(
+        fixture.vfs(),
+        fixture.runtime().handle().clone(),
+        &mount_point,
+        "posix-allow-other",
+        false,
+    )
+    .with_allow_other(true)
+    .with_mount_ready_callback(move || {
+        ready_tx.send(()).expect("report ready mount");
+    });
+    let worker = std::thread::spawn(move || studiofs_linux_fuse::mount_with_request(request));
+    let result = std::panic::catch_unwind(|| {
+        wait_for_mounted_entry(&ready_rx, &mount_point.join("owner-only"));
+        // Without allow_other the kernel denies every foreign lookup, so a
+        // successful stat of the 0600 file proves the mount admits the caller.
+        let stat = run_as_probe_user(&probe_user, &["stat", "--"], &mount_point.join("owner-only"));
+        assert!(
+            stat.status.success(),
+            "foreign stat must reach StudioFS; stderr: {}",
+            String::from_utf8_lossy(&stat.stderr)
+        );
+        let readable =
+            run_as_probe_user(&probe_user, &["cat", "--"], &mount_point.join("world-readable"));
+        assert!(
+            readable.status.success(),
+            "0644 must be readable by other users; stderr: {}",
+            String::from_utf8_lossy(&readable.stderr)
+        );
+        let denied = run_as_probe_user(&probe_user, &["cat", "--"], &mount_point.join("owner-only"));
+        let stderr = String::from_utf8_lossy(&denied.stderr);
+        assert!(!denied.status.success(), "0600 must deny other users");
+        assert!(
+            stderr.contains("Permission denied"),
+            "0600 must fail with EACCES; stderr: {stderr}"
+        );
+
+        // Files created by a foreign caller belong to that caller, not the mounter.
+        let private = mount_point.join("shared").join("probe-private");
+        let created = run_as_probe_user(
+            &probe_user,
+            &["sh", "-c", "umask 077 && printf secret > \"$1\"", "sh"],
+            &private,
+        );
+        assert!(
+            created.status.success(),
+            "foreign create in a 0777 directory must succeed; stderr: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let (probe_uid, probe_gid) = probe_user_ids(&probe_user);
+        let metadata = std::fs::metadata(&private).expect("stat foreign-created file");
+        assert_eq!(
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777),
+            (probe_uid, probe_gid, 0o600),
+            "foreign create must record the caller's uid/gid"
+        );
+        let own_read = run_as_probe_user(&probe_user, &["cat", "--"], &private);
+        assert_eq!(own_read.stdout, b"secret", "creator must read its 0600 file");
+        if uid != 0 {
+            let mounter_read = std::fs::read(&private).expect_err("mounter must not read");
+            assert_eq!(mounter_read.raw_os_error(), Some(libc::EACCES));
+        }
+    });
+    let unmount_result = fusermount3_unmount(&mount_point);
+    // Always join before interpreting unmount errors, including failed startup.
+    let mount_result = worker.join();
+    let directory_result = remove_mount_point(&mount_point);
     finish_access_test(result, mount_result, unmount_result.and(directory_result));
+}
+
+#[cfg(target_os = "linux")]
+fn probe_user_ids(user: &str) -> (u32, u32) {
+    let name = CString::new(user).expect("probe user name");
+    // SAFETY: `name` is NUL-terminated; the returned record is read before any
+    // other passwd call on this thread.
+    let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+    assert!(!entry.is_null(), "unknown probe user {user}");
+    // SAFETY: `entry` is a non-null passwd record from getpwnam.
+    unsafe { ((*entry).pw_uid, (*entry).pw_gid) }
+}
+
+#[cfg(target_os = "linux")]
+fn run_as_probe_user(
+    user: &str,
+    command: &[&str],
+    path: &std::path::Path,
+) -> std::process::Output {
+    std::process::Command::new("sudo")
+        .args(["-n", "-u", user, "--"])
+        .args(command)
+        .arg(path)
+        .env("LC_ALL", "C")
+        .output()
+        .expect("run probe command through sudo")
 }
 
 fn unrelated_uid(uid: u32) -> u32 {

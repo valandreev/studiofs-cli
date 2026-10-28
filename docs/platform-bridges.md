@@ -600,7 +600,8 @@ fallback). Rocky Linux 8.6+ remains best-effort.
 | Linux requested `max_read` / `max_readahead` | up to 4 MiB; negotiated values are recorded |
 | macOS `fsname` | `"studiofs"` |
 | macOS `auto_unmount` | Yes |
-| `allow_other` | macOS: yes |
+| `allow_other` | macOS: yes; Linux: opt-in via `studiofs mount --allow-other` or `studiofs settings --allow-other` (off by default) |
+| Linux `default_permissions` | Yes, also with `allow_other` |
 | Kernel `max_write` | macOS: `131072` bytes by default |
 | Kernel `max_read` | macOS mount option: `4194304` bytes |
 | Kernel `max_readahead` | macOS: `1048576` bytes by default |
@@ -879,6 +880,28 @@ caller with at least one supplementary group:
 
 Run each command on its native platform with the FUSE driver available.
 An ignored or zero-test result does not prove the permission contract.
+
+Without `allow_other`, the Linux kernel rejects every caller whose uid/gid
+differs from the mounting user, including root, before StudioFS sees the
+request. `--allow-other` adds the libfuse `allow_other` option and keeps
+`default_permissions`, so foreign callers get the same mode-bit and ownership
+decisions as the table above; StudioFS adds no separate bypass. A non-root
+mounter needs the exact line `user_allow_other` in `/etc/fuse.conf`; the
+mount checks this (comments and surrounding whitespace ignored, keyword
+case-sensitive like `fusermount3`) and fails with a `PermissionDenied` error
+naming the missing line before `fusermount3` runs or a detached daemon starts.
+If the mounter cannot read `/etc/fuse.conf` (for example `0640 root:fuse`),
+the check logs a warning and leaves the decision to setuid `fusermount3`.
+Linux `create`, `mkdir`, `mknod` and `symlink` record the requesting
+caller's uid/gid from `fuse_req_ctx`, so a foreign caller owns what it
+creates. Group inheritance from setgid directories is not implemented, and
+the legacy uid/gid zero translation still reports root-created inodes as the
+mount user. Snapshot `smount` sessions never request `allow_other`. The opt-in native
+check probes a `0600` and a `0644` file as a second account through
+`sudo -n -u "${STUDIOFS_ALLOW_OTHER_PROBE_USER:-nobody}"`; that account must be
+able to search the workspace target directory:
+
+    cargo test -p studiofs-linux-fuse --test posix_access mounted_allow_other -- --ignored --nocapture --test-threads=1
 
 Read-only Linux sessions additionally pass `ro` to libfuse. Legacy macFUSE
 passes `rdonly` to the mount channel; mount-only options must not be passed

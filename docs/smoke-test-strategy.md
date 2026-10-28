@@ -48,7 +48,7 @@ reads for recently written data without an upstream data store.
 | **Runner** | GitHub Actions Ubuntu 24.04; Rocky 9.4 release host |
 | **Driver** | `/dev/fuse` plus `fusermount3` |
 | **Mount mode** | `studiofs-linux-fuse` libfuse3 low-level session |
-| **Mount options** | `fsname`, `subtype=studiofs`, `auto_unmount`; no `allow_other` |
+| **Mount options** | `fsname`, `subtype=studiofs`, `auto_unmount`, `default_permissions`; `allow_other` only with opt-in `--allow-other` |
 | **Feasibility** | Enabled when the runner exposes `/dev/fuse` |
 | **Gating** | Manual/operator dispatch; Ubuntu first, Rocky 9.4 required |
 

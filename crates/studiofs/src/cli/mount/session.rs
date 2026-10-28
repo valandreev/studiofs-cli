@@ -92,6 +92,7 @@ struct MountPlan {
     run_in_foreground: bool,
     launch_mode: MountLaunchMode,
     read_only_mount: bool,
+    allow_other_mount: bool,
 }
 
 #[derive(Debug)]
@@ -448,6 +449,24 @@ fn resolve_cache_size_for_mount(
         .to_string()
 }
 
+fn resolve_allow_other_for_mount(
+    config: &settings::StudioFsConfig,
+    cli_allow_other: Option<bool>,
+) -> bool {
+    cli_allow_other.or(config.allow_other).unwrap_or(false)
+}
+
+/// Fail before spawning a daemon or touching metadata when `fusermount3`
+/// would reject `allow_other`.
+fn ensure_allow_other_permitted(allow_other: bool) -> anyhow::Result<()> {
+    if !allow_other {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    studiofs_linux_fuse::check_allow_other_permitted()?;
+    Ok(())
+}
+
 fn resolve_mount_runtime_settings(
     config: &settings::StudioFsConfig,
     cli_mount_point: Option<&str>,
@@ -473,6 +492,13 @@ impl MountPlan {
             command.cache_dir.as_deref(),
             command.cache_size.as_deref(),
         )?;
+        let allow_other_mount =
+            resolve_allow_other_for_mount(&settings_config, command.allow_other);
+        // A saved Linux default may be shared with other hosts; only an explicit flag warns.
+        #[cfg(not(target_os = "linux"))]
+        if command.allow_other == Some(true) {
+            warn!("--allow-other only affects Linux mounts; ignoring it on this platform");
+        }
         let ResolvedMountConfig { vfs_config } = build_mount_config_from_raw(
             settings_config.vfs,
             command.principal.as_deref(),
@@ -493,6 +519,7 @@ impl MountPlan {
             run_in_foreground: resolve_run_in_foreground(command.foreground, command.detach),
             launch_mode: resolve_mount_launch_mode(command.detach),
             read_only_mount: command.read_only,
+            allow_other_mount,
             command,
         })
     }
@@ -1216,6 +1243,7 @@ impl MountPlan {
     where
         Factory: FnOnce() -> Box<dyn MountBackend>,
     {
+        ensure_allow_other_permitted(self.allow_other_mount)?;
         if matches!(self.launch_mode, MountLaunchMode::Daemon) {
             guard_mount_pid_file(&self.actual_mount_path)?;
             return Ok(PreparedMount {
@@ -1916,6 +1944,8 @@ impl MountRuntimeGuard {
             .clone();
         let actual_mount_path = self.prepared.plan.actual_mount_path.clone();
         let read_only_mount = self.prepared.plan.read_only_mount;
+        #[cfg(target_os = "linux")]
+        let allow_other_mount = self.prepared.plan.allow_other_mount;
         #[cfg(all(unix, not(target_os = "linux")))]
         let run_in_foreground = self.prepared.plan.run_in_foreground;
         let (backend_name, runtime_handle, vfs, diagnostics_source, profiling_backend) = {
@@ -1957,6 +1987,8 @@ impl MountRuntimeGuard {
             mount_point: actual_mount_path,
             volume_name: format_info_name,
             read_only: read_only_mount,
+            #[cfg(target_os = "linux")]
+            allow_other: allow_other_mount,
             mount_ready_callback: monitor.ready_callback(),
             #[cfg(all(unix, not(target_os = "linux")))]
             run_in_foreground,
@@ -2843,6 +2875,7 @@ mod tests {
             mount_point: Some(mount_point),
             cache_dir: cache_dir.map(|path| path.to_string_lossy().into_owned()),
             cache_size: cache_size.map(str::to_string),
+            allow_other: None,
             vfs: VfsConfigRaw::default(),
         }
     }
@@ -2973,6 +3006,7 @@ mod tests {
             detach: false,
             profile: None,
             read_only: false,
+            allow_other: None,
             endpoint: None,
             runtime_tuning: PublicRuntimeTuningArgs::default(),
             snapshot_id: None,
@@ -3165,7 +3199,29 @@ mod tests {
         assert_eq!(plan.launch_mode, MountLaunchMode::Foreground);
         assert!(plan.run_in_foreground);
         assert!(!plan.read_only_mount);
+        assert!(!plan.allow_other_mount, "allow_other must stay opt-in");
         assert_eq!(plan.vfs_config.principal, "alice");
+    }
+
+    #[test]
+    fn mount_plan_allow_other_prefers_cli_over_saved_default() {
+        for (cli, saved, expected) in [
+            (None, None, false),
+            (None, Some(true), true),
+            (Some(true), None, true),
+            (Some(false), Some(true), false),
+            (Some(true), Some(false), true),
+        ] {
+            let config = settings::StudioFsConfig {
+                allow_other: saved,
+                ..Default::default()
+            };
+            assert_eq!(
+                resolve_allow_other_for_mount(&config, cli),
+                expected,
+                "cli={cli:?} saved={saved:?}"
+            );
+        }
     }
 
     #[test]

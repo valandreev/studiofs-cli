@@ -119,6 +119,15 @@ pub(crate) mod raw {
         _private: [u8; 0],
     }
 
+    /// Mirrors libfuse3 `struct fuse_ctx`.
+    #[repr(C)]
+    pub(crate) struct FuseCtx {
+        pub(crate) uid: libc::uid_t,
+        pub(crate) gid: libc::gid_t,
+        pub(crate) pid: libc::pid_t,
+        pub(crate) umask: mode_t,
+    }
+
     #[link(name = "fuse3")]
     unsafe extern "C" {
         pub(crate) fn fuse_reply_err(req: *mut FuseReq, err: c_int) -> c_int;
@@ -136,6 +145,7 @@ pub(crate) mod raw {
         pub(crate) fn fuse_reply_write(req: *mut FuseReq, count: size_t) -> c_int;
         pub(crate) fn fuse_reply_statfs(req: *mut FuseReq, stat: *const statvfs) -> c_int;
         pub(crate) fn fuse_req_userdata(req: *mut FuseReq) -> *mut c_void;
+        pub(crate) fn fuse_req_ctx(req: *mut FuseReq) -> *const FuseCtx;
         #[link_name = "fuse_add_direntry"]
         pub(crate) fn libfuse_add_direntry(
             req: *mut FuseReq,
@@ -263,6 +273,7 @@ pub(crate) struct SessionState {
     runtime_handle: Handle,
     async_writes: Arc<AsyncWriteLedger>,
     read_only: bool,
+    allow_other: bool,
     mount_uid: u32,
     mount_gid: u32,
     connection_config: LinuxFuseConnectionConfig,
@@ -317,6 +328,7 @@ impl SessionState {
             runtime_handle,
             async_writes,
             read_only,
+            allow_other: false,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             connection_config,
@@ -345,6 +357,13 @@ impl SessionState {
             .max(1),
             inline_writes: AtomicUsize::new(0),
         }
+    }
+
+    /// Requests `allow_other`; the kernel still enforces mode bits through
+    /// `default_permissions` for foreign callers.
+    pub(crate) fn with_allow_other(mut self, allow_other: bool) -> Self {
+        self.allow_other = allow_other;
+        self
     }
 }
 
@@ -722,7 +741,7 @@ fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
             || args.win_attrs.is_some())
 }
 
-fn argv_strings(volume_name: &str, read_only: bool) -> Vec<String> {
+fn argv_strings(volume_name: &str, read_only: bool, allow_other: bool) -> Vec<String> {
     let mut args = vec![
         "studiofs-linux-fuse".to_owned(),
         "-o".to_owned(),
@@ -738,6 +757,9 @@ fn argv_strings(volume_name: &str, read_only: bool) -> Vec<String> {
     ];
     if read_only {
         args.extend(["-o".to_owned(), "ro".to_owned()]);
+    }
+    if allow_other {
+        args.extend(["-o".to_owned(), "allow_other".to_owned()]);
     }
     args
 }
@@ -822,7 +844,11 @@ impl Session {
     ) -> io::Result<Self> {
         let root_prime_path = mount_point.as_ref().to_path_buf();
         let mount_point = path_to_cstring(mount_point.as_ref())?;
-        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref(), state.read_only))?;
+        let mut args = OwnedFuseArgs::new(argv_strings(
+            volume_name.as_ref(),
+            state.read_only,
+            state.allow_other,
+        ))?;
         let mut state = Box::new(state);
         let userdata = (&mut *state as *mut SessionState).cast::<c_void>();
         // SAFETY: the C shim expands libfuse's versioned session constructor.
@@ -916,7 +942,7 @@ impl Session {
         volume_name: impl AsRef<str>,
     ) -> io::Result<Self> {
         let mount_point = path_to_cstring(mount_point.as_ref())?;
-        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref(), false))?;
+        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref(), false, false))?;
         // SAFETY: the C shim returns a static ops table. Userdata is null for
         // this lifecycle-only smoke; init supports null userdata and every
         // request callback rejects a missing SessionState before dereferencing.
@@ -1276,7 +1302,8 @@ pub extern "C" fn studiofs_linux_fuse_create(
         reply_error(req, libc::EINVAL);
         return;
     }
-    let result = with_name_bytes(name, |name| state.create(parent, name, mode, fi))
+    let caller = state.request_caller(req);
+    let result = with_name_bytes(name, |name| state.create(caller, parent, name, mode, fi))
         .unwrap_or(Err(libc::EINVAL));
     match result {
         Ok(allocated) => {
@@ -1302,8 +1329,9 @@ pub extern "C" fn studiofs_linux_fuse_mkdir(
         reply_error(req, libc::EIO);
         return;
     };
-    let result =
-        with_name_bytes(name, |name| state.mkdir(parent, name, mode)).unwrap_or(Err(libc::EINVAL));
+    let caller = state.request_caller(req);
+    let result = with_name_bytes(name, |name| state.mkdir(caller, parent, name, mode))
+        .unwrap_or(Err(libc::EINVAL));
     reply_entry_result(req, state, result);
 }
 
@@ -1319,8 +1347,9 @@ pub extern "C" fn studiofs_linux_fuse_mknod(
         reply_error(req, libc::EIO);
         return;
     };
-    let result =
-        with_name_bytes(name, |name| state.mknod(parent, name, mode)).unwrap_or(Err(libc::EINVAL));
+    let caller = state.request_caller(req);
+    let result = with_name_bytes(name, |name| state.mknod(caller, parent, name, mode))
+        .unwrap_or(Err(libc::EINVAL));
     reply_entry_result(req, state, result);
 }
 
@@ -1335,8 +1364,9 @@ pub extern "C" fn studiofs_linux_fuse_symlink(
         reply_error(req, libc::EIO);
         return;
     };
+    let caller = state.request_caller(req);
     let result = with_name_bytes(link, |target| {
-        with_name_bytes(name, |name| state.symlink(parent, name, target))
+        with_name_bytes(name, |name| state.symlink(caller, parent, name, target))
     })
     .flatten()
     .unwrap_or(Err(libc::EINVAL));
@@ -1838,6 +1868,43 @@ fn callback_state_from_userdata(userdata: *mut c_void) -> Option<&'static Sessio
     }
 }
 
+/// Credentials of the process that issued a FUSE request.
+///
+/// With `allow_other`, callers other than the mounting user reach namespace
+/// creation, so new inodes must record the caller rather than the mounter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FuseCaller {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
+impl SessionState {
+    pub(crate) fn mount_caller(&self) -> FuseCaller {
+        FuseCaller {
+            uid: self.mount_uid,
+            gid: self.mount_gid,
+        }
+    }
+
+    fn request_caller(&self, req: *mut raw::FuseReq) -> FuseCaller {
+        if req.is_null() {
+            return self.mount_caller();
+        }
+        // SAFETY: `req` is the live request for this callback; libfuse owns
+        // the returned context for the duration of the callback.
+        let ctx = unsafe { raw::fuse_req_ctx(req) };
+        if ctx.is_null() {
+            return self.mount_caller();
+        }
+        // SAFETY: a non-null context points to an initialized `fuse_ctx`.
+        let ctx = unsafe { &*ctx };
+        FuseCaller {
+            uid: ctx.uid,
+            gid: ctx.gid,
+        }
+    }
+}
+
 fn with_name_bytes<T>(name: *const c_char, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
     if name.is_null() {
         return None;
@@ -1933,6 +2000,7 @@ impl SessionState {
 
     fn create(
         &self,
+        caller: FuseCaller,
         parent: u64,
         name: &[u8],
         mode: mode_t,
@@ -1942,11 +2010,12 @@ impl SessionState {
             return Err(libc::EROFS);
         }
         require_file_info(fi)?;
-        self.create_with_flags(parent, name, mode, file_info_flags(fi))
+        self.create_with_flags(caller, parent, name, mode, file_info_flags(fi))
     }
 
     fn create_with_flags(
         &self,
+        caller: FuseCaller,
         parent: u64,
         name: &[u8],
         mode: mode_t,
@@ -1962,8 +2031,8 @@ impl SessionState {
                 .create_with_deferred_metadata_admission(
                     parent,
                     name,
-                    self.mount_uid,
-                    self.mount_gid,
+                    caller.uid,
+                    caller.gid,
                     mode,
                     &self.runtime_handle,
                 )
@@ -1995,7 +2064,13 @@ impl SessionState {
         })
     }
 
-    fn mkdir(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<ObservedInodeAttr, i32> {
+    fn mkdir(
+        &self,
+        caller: FuseCaller,
+        parent: u64,
+        name: &[u8],
+        mode: mode_t,
+    ) -> Result<ObservedInodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -2004,8 +2079,8 @@ impl SessionState {
             let result = self.vfs.mkdir_with_deferred_metadata_admission(
                 parent,
                 name,
-                self.mount_uid,
-                self.mount_gid,
+                caller.uid,
+                caller.gid,
                 mode,
                 &self.runtime_handle,
             );
@@ -2013,7 +2088,13 @@ impl SessionState {
         })
     }
 
-    fn mknod(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<ObservedInodeAttr, i32> {
+    fn mknod(
+        &self,
+        caller: FuseCaller,
+        parent: u64,
+        name: &[u8],
+        mode: mode_t,
+    ) -> Result<ObservedInodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -2026,8 +2107,8 @@ impl SessionState {
             let result = self.vfs.create_with_deferred_metadata_admission(
                 parent,
                 name,
-                self.mount_uid,
-                self.mount_gid,
+                caller.uid,
+                caller.gid,
                 mode,
                 &self.runtime_handle,
             );
@@ -2035,13 +2116,19 @@ impl SessionState {
         })
     }
 
-    fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> Result<ObservedInodeAttr, i32> {
+    fn symlink(
+        &self,
+        caller: FuseCaller,
+        parent: u64,
+        name: &[u8],
+        target: &[u8],
+    ) -> Result<ObservedInodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
         self.observe_attr(|| {
             self.vfs
-                .symlink(parent, name, target, self.mount_uid, self.mount_gid)
+                .symlink(parent, name, target, caller.uid, caller.gid)
                 .map_err(|error| vfs_err_to_errno(&error))
         })
     }
@@ -4865,7 +4952,7 @@ mod tests {
 
     #[test]
     fn argv_uses_system_libfuse_mount_options() {
-        let args = super::argv_strings("demo", false);
+        let args = super::argv_strings("demo", false, false);
 
         assert!(args.iter().any(|arg| arg == "studiofs-linux-fuse"));
         assert!(args.iter().any(|arg| arg == "fsname=demo"));
@@ -4882,17 +4969,37 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "writeback_cache"));
         assert!(!args.iter().any(|arg| arg.contains("max_background")));
         assert!(!args.iter().any(|arg| arg.contains("congestion_threshold")));
+        assert!(
+            !args.iter().any(|arg| arg == "allow_other"),
+            "allow_other must stay opt-in"
+        );
+    }
+
+    #[test]
+    fn allow_other_mount_arguments_keep_kernel_permission_checks() {
+        for read_only in [false, true] {
+            let args = super::argv_strings("demo", read_only, true);
+
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| arg.as_str() == "allow_other")
+                    .count(),
+                1
+            );
+            assert!(args.iter().any(|arg| arg == "default_permissions"));
+            assert_eq!(args.iter().any(|arg| arg == "ro"), read_only);
+        }
     }
 
     #[test]
     fn read_only_mount_arguments_enable_native_read_only_policy() {
         assert!(
-            super::argv_strings("demo", true)
+            super::argv_strings("demo", true, false)
                 .iter()
                 .any(|arg| arg == "ro")
         );
         assert!(
-            !super::argv_strings("demo", false)
+            !super::argv_strings("demo", false, false)
                 .iter()
                 .any(|arg| arg == "ro")
         );
@@ -4900,25 +5007,28 @@ mod tests {
 
     #[test]
     fn generated_argv_is_accepted_by_low_level_session_parser() {
-        let mut args = super::OwnedFuseArgs::new(super::argv_strings("demo", false))
-            .expect("build FUSE arguments");
-        // SAFETY: the C shim returns a static empty ops table and this test
-        // destroys the resulting session before the stack-owned arguments drop.
-        let session = unsafe {
-            super::studiofs_linux_fuse_session_new(
-                args.as_mut_ptr(),
-                super::studiofs_linux_fuse_empty_low_level_ops(),
-                super::studiofs_linux_fuse_low_level_ops_size(),
-                std::ptr::null_mut(),
-            )
-        };
+        for allow_other in [false, true] {
+            let mut args =
+                super::OwnedFuseArgs::new(super::argv_strings("demo", false, allow_other))
+                    .expect("build FUSE arguments");
+            // SAFETY: the C shim returns a static empty ops table and this test
+            // destroys the resulting session before the stack-owned arguments drop.
+            let session = unsafe {
+                super::studiofs_linux_fuse_session_new(
+                    args.as_mut_ptr(),
+                    super::studiofs_linux_fuse_empty_low_level_ops(),
+                    super::studiofs_linux_fuse_low_level_ops_size(),
+                    std::ptr::null_mut(),
+                )
+            };
 
-        assert!(
-            !session.is_null(),
-            "generated mount options must be accepted by the low-level libfuse parser"
-        );
-        // SAFETY: the non-null session is uniquely owned by this test.
-        unsafe { super::raw::fuse_session_destroy(session) };
+            assert!(
+                !session.is_null(),
+                "generated mount options (allow_other={allow_other}) must be accepted by the low-level libfuse parser"
+            );
+            // SAFETY: the non-null session is uniquely owned by this test.
+            unsafe { super::raw::fuse_session_destroy(session) };
+        }
     }
 
     #[test]
@@ -5192,7 +5302,8 @@ mod tests {
             Some(4096)
         }));
         let pending = state.async_writes.admit(10, 100, 8).unwrap();
-        let mut args = super::OwnedFuseArgs::new(super::argv_strings("demo", false)).unwrap();
+        let mut args =
+            super::OwnedFuseArgs::new(super::argv_strings("demo", false, false)).unwrap();
         // SAFETY: the empty ops table has no callbacks; this test owns the raw session.
         let raw = std::ptr::NonNull::new(unsafe {
             super::studiofs_linux_fuse_session_new(
@@ -5241,7 +5352,7 @@ mod tests {
         );
         let ledger = Arc::clone(&state.async_writes);
         ledger.admit(10, 100, 8).unwrap().complete(Ok(()));
-        let mut args = super::OwnedFuseArgs::new(super::argv_strings("demo", false))
+        let mut args = super::OwnedFuseArgs::new(super::argv_strings("demo", false, false))
             .expect("build FUSE arguments");
         // SAFETY: the empty ops table has no callbacks; Session owns and destroys the raw session.
         let raw = std::ptr::NonNull::new(unsafe {
@@ -5989,8 +6100,8 @@ mod tests {
 
     #[test]
     fn owned_fuse_args_are_null_terminated_without_counting_sentinel() {
-        let args =
-            super::OwnedFuseArgs::new(super::argv_strings("demo", false)).expect("build args");
+        let args = super::OwnedFuseArgs::new(super::argv_strings("demo", false, false))
+            .expect("build args");
 
         assert_eq!(args.raw.argc as usize, args._strings.len());
         assert!(args._argv.last().is_some_and(|arg| arg.is_null()));
@@ -7098,11 +7209,60 @@ mod tests {
     }
 
     #[test]
+    fn namespace_creation_records_the_requesting_caller() {
+        let (fixture, state) = reply_fixture("create-caller-owner");
+        let caller = super::FuseCaller {
+            uid: 4242,
+            gid: 4343,
+        };
+        assert_ne!(caller, state.mount_caller());
+
+        let allocated = state
+            .create_with_flags(caller, 1, b"file", libc::S_IFREG | 0o600, libc::O_WRONLY)
+            .expect("create as caller");
+        let file = allocated.open.observed.attr.ino;
+        state.reject_prepared_open(file, allocated.open.fh);
+        state.inode_liveness.forget(file, 1);
+        let dir = state
+            .mkdir(caller, 1, b"dir", 0o700)
+            .expect("mkdir as caller")
+            .attr
+            .ino;
+        let node = state
+            .mknod(caller, 1, b"node", libc::S_IFREG | 0o600)
+            .expect("mknod as caller")
+            .attr
+            .ino;
+        let link = state
+            .symlink(caller, 1, b"link", b"file")
+            .expect("symlink as caller")
+            .attr
+            .ino;
+
+        for ino in [file, dir, node, link] {
+            let attr = fixture.vfs().getattr(ino).expect("getattr");
+            assert_eq!((attr.uid, attr.gid), (caller.uid, caller.gid), "ino {ino}");
+            let stat = state.attr_to_stat(&attr);
+            assert_eq!(
+                (stat.st_uid, stat.st_gid),
+                (caller.uid, caller.gid),
+                "ino {ino}"
+            );
+        }
+    }
+
+    #[test]
     fn create_reply_refreshes_invalidation_from_handle_allocation() {
         let (_fixture, mut state) = reply_fixture("create-own-invalidation");
         state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Direct;
         let allocated = state
-            .create_with_flags(1, b"new", libc::S_IFREG | 0o644, libc::O_RDONLY)
+            .create_with_flags(
+                state.mount_caller(),
+                1,
+                b"new",
+                libc::S_IFREG | 0o644,
+                libc::O_RDONLY,
+            )
             .expect("allocate create");
         let before = state.getattr_calls.load(Ordering::Relaxed);
         assert_eq!(
@@ -7327,7 +7487,12 @@ mod tests {
     fn entry_reply_refreshes_synthetic_attributes_without_cache_retirement() {
         let (fixture, state) = reply_fixture("entry-synthetic");
         let observed = state
-            .mknod(1, b"._synthetic", libc::S_IFREG | 0o644)
+            .mknod(
+                state.mount_caller(),
+                1,
+                b"._synthetic",
+                libc::S_IFREG | 0o644,
+            )
             .expect("create synthetic inode");
         fixture
             .vfs()
@@ -7544,7 +7709,13 @@ mod tests {
             default_connection_config(),
         );
         let allocated = state
-            .create_with_flags(1, b"create-gap", libc::S_IFREG | 0o644, libc::O_WRONLY)
+            .create_with_flags(
+                state.mount_caller(),
+                1,
+                b"create-gap",
+                libc::S_IFREG | 0o644,
+                libc::O_WRONLY,
+            )
             .expect("allocate created writer");
         let ino = allocated.open.observed.attr.ino;
         let fh = allocated.open.fh;
@@ -7807,7 +7978,7 @@ mod tests {
         );
 
         assert!(matches!(
-            state.create(1, b"null-fi.txt", libc::S_IFREG | 0o644, std::ptr::null()),
+            state.create(state.mount_caller(), 1, b"null-fi.txt", libc::S_IFREG | 0o644, std::ptr::null()),
             Err(errno) if errno == libc::EINVAL
         ));
         assert!(fixture.vfs().lookup(1, b"null-fi.txt").is_err());
@@ -7825,16 +7996,25 @@ mod tests {
             default_connection_config(),
         );
 
-        assert_eq!(state.mkdir(1, b"dir", 0o755).unwrap_err(), libc::EROFS);
         assert_eq!(
-            state.mknod(1, b"file", libc::S_IFREG | 0o644).unwrap_err(),
+            state
+                .mkdir(state.mount_caller(), 1, b"dir", 0o755)
+                .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            state
+                .mknod(state.mount_caller(), 1, b"file", libc::S_IFREG | 0o644)
+                .unwrap_err(),
             libc::EROFS
         );
         assert_eq!(state.unlink(1, b"file"), Err(libc::EROFS));
         assert_eq!(state.rmdir(1, b"dir"), Err(libc::EROFS));
         assert_eq!(state.rename(1, b"old", 1, b"new"), Err(libc::EROFS));
         assert_eq!(
-            state.symlink(1, b"link", b"target").unwrap_err(),
+            state
+                .symlink(state.mount_caller(), 1, b"link", b"target")
+                .unwrap_err(),
             libc::EROFS
         );
         assert_eq!(state.link(2, 1, b"hard").unwrap_err(), libc::EROFS);
@@ -7887,7 +8067,9 @@ mod tests {
         );
 
         assert_eq!(
-            state.mknod(1, b"fifo", libc::S_IFIFO | 0o644).unwrap_err(),
+            state
+                .mknod(state.mount_caller(), 1, b"fifo", libc::S_IFIFO | 0o644)
+                .unwrap_err(),
             libc::ENOTSUP
         );
     }

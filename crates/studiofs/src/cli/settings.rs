@@ -16,6 +16,8 @@ pub struct StudioFsConfig {
     pub mount_point: Option<String>,
     pub cache_dir: Option<String>,
     pub cache_size: Option<String>,
+    /// Default for `studiofs mount --allow-other` (Linux only).
+    pub allow_other: Option<bool>,
     #[serde(default)]
     pub vfs: VfsConfigRaw,
 }
@@ -27,6 +29,7 @@ Examples:
   Persist default mount + cache settings for quick mount commands:
     studiofs settings --mount-point /mnt/studio
     studiofs settings --cache-dir ~/.cache/studiofs --cache-size 1TB
+    studiofs settings --allow-other          (Linux; --allow-other=false resets)
     studiofs settings --read-buffer 4GB --readahead 256 --prefetch 192")]
 pub struct SettingsArgs {
     /// Default mount point used by `studiofs mount` when omitted.
@@ -40,6 +43,18 @@ pub struct SettingsArgs {
     /// Default max disk cache size used by `studiofs mount` when omitted.
     #[arg(long)]
     pub cache_size: Option<String>,
+
+    /// Default for `studiofs mount --allow-other` on Linux.
+    ///
+    /// Non-root mounts also need `user_allow_other` in /etc/fuse.conf.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    pub allow_other: Option<bool>,
 
     #[command(flatten, next_help_heading = "Runtime IO")]
     pub runtime_tuning: PublicRuntimeTuningArgs,
@@ -162,6 +177,11 @@ fn run_with_config_path(args: SettingsArgs, config_path: &Path) -> anyhow::Resul
         }
     }
 
+    if let Some(allow_other) = args.allow_other {
+        config.allow_other = Some(allow_other);
+        changed = true;
+    }
+
     if args.runtime_tuning.has_any() {
         args.runtime_tuning.apply_to_vfs_config(&mut config.vfs)?;
         changed = true;
@@ -189,6 +209,14 @@ fn run_with_config_path(args: SettingsArgs, config_path: &Path) -> anyhow::Resul
             .unwrap_or_else(|| DEFAULT_CACHE_SIZE.to_string())
     );
     println!("  cache-policy: auto (derived from cache-size at mount time)");
+    println!(
+        "  allow-other: {} (Linux mounts)",
+        if config.allow_other.unwrap_or(false) {
+            "on"
+        } else {
+            "off"
+        }
+    );
     for line in runtime_tuning_summary_lines(&config.vfs) {
         println!("{line}");
     }
@@ -252,6 +280,68 @@ mod tests {
             "192",
         ])
         .expect("new public runtime tuning flags should parse");
+    }
+
+    #[test]
+    fn settings_parses_allow_other_toggle() {
+        for (argv, expected) in [
+            (&["settings", "--allow-other"][..], Some(true)),
+            (&["settings", "--allow-other=false"][..], Some(false)),
+            (&["settings"][..], None),
+        ] {
+            let cli = crate::cli::parse_for_test(argv).unwrap();
+            match cli.command {
+                crate::cli::Commands::Settings(SettingsArgs { allow_other, .. }) => {
+                    assert_eq!(allow_other, expected, "{argv:?}");
+                }
+                other => panic!("expected Settings, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn settings_run_persists_and_reads_allow_other() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let config_path = temp.path().join("config.toml");
+
+        run_with_config_path(
+            SettingsArgs {
+                allow_other: Some(true),
+                ..SettingsArgs::default()
+            },
+            &config_path,
+        )
+        .expect("enable allow_other");
+        assert_eq!(
+            load_studiofs_config_from_path(&config_path)
+                .expect("load config")
+                .allow_other,
+            Some(true)
+        );
+
+        run_with_config_path(SettingsArgs::default(), &config_path).expect("no-op settings");
+        assert_eq!(
+            load_studiofs_config_from_path(&config_path)
+                .expect("load config")
+                .allow_other,
+            Some(true),
+            "unrelated settings runs must keep the saved default"
+        );
+
+        run_with_config_path(
+            SettingsArgs {
+                allow_other: Some(false),
+                ..SettingsArgs::default()
+            },
+            &config_path,
+        )
+        .expect("disable allow_other");
+        assert_eq!(
+            load_studiofs_config_from_path(&config_path)
+                .expect("load config")
+                .allow_other,
+            Some(false)
+        );
     }
 
     #[test]
