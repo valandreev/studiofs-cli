@@ -373,6 +373,27 @@ objects stay within accepted bytes divided by pack size plus partial drains.
 runtime snapshots before/after fsync. Unit tests alone do not establish mounted
 latency acceptance.
 
+### SFS-915 Stale Upload Cleanup Across Size Changes
+
+A size change advances the inode's content epoch while an upload for the old
+epoch may be in flight. The upload worker reads the attr and scans the overlay in
+separate transactions, so before deleting a stale upload's local payload it asks
+whether any overlay slice still references the object, independent of epoch. A
+referenced payload is requeued at the current epoch instead of being deleted.
+
+```sh
+cargo test -p studiofs-vfs --lib process_upload_keeps_overlay_payload_when_epoch_advances_during_stale_checks -- --nocapture
+```
+
+The opt-in fsx-shaped stress test drives random writes, truncates, flushes and
+reads through a started VFS with the real upload worker and compares every read
+with a reference buffer. It is timing-dependent and does not replace the mounted
+fsx gate:
+
+```sh
+STUDIOFS_FSX_STRESS_SEED=11 cargo test -p studiofs-vfs --lib vfs::tests::fsx_like_write_truncate_stress_keeps_overlay_payloads -- --ignored --exact --nocapture
+```
+
 ### SFS-892 Linux FUSE Small I/O Regressions
 
 Linux registered no `readdirplus` callback, so `ls -l` and `find` sent one

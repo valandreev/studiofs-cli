@@ -25591,3 +25591,104 @@ fn truncate_after_deferred_write_interrupts_materialization_linger() {
 fn handle_growth_after_deferred_write_interrupts_materialization_linger() {
     assert_size_change_after_deferred_write_interrupts_linger(b"grow-after-write.bin", 8192);
 }
+
+/// fsx-shaped random writes, truncates, and reads against a reference buffer
+/// while the real upload worker runs. Timing-dependent, so it stays opt-in.
+#[test]
+#[ignore = "timing-dependent stress run; set STUDIOFS_FSX_STRESS_SEED/OPS to vary it"]
+fn fsx_like_write_truncate_stress_keeps_overlay_payloads() {
+    let seed: u64 = std::env::var("STUDIOFS_FSX_STRESS_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(906_003);
+    let ops: usize = std::env::var("STUDIOFS_FSX_STRESS_OPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20_000);
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsx-like-stress");
+    let _guard = rt.enter();
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    rt.block_on(async {
+        let ino = vfs
+            .create(1, b"fsx-like-stress.bin", 0, 0, 0o644)
+            .expect("create file")
+            .ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open handle");
+        let max_len = 65_536u64;
+        let max_op = 4_096u64;
+        let mut model: Vec<u8> = Vec::new();
+        for step in 0..ops {
+            match next() % 10 {
+                0..=3 => {
+                    let offset = next() % max_len;
+                    let len = (next() % max_op).max(1).min(max_len - offset);
+                    let fill = (step % 251) as u8 + 1;
+                    let data: Vec<u8> = (0..len).map(|i| fill.wrapping_add(i as u8)).collect();
+                    vfs.write_fh_with_deferred_materialize(
+                        fh,
+                        ino,
+                        offset,
+                        &data,
+                        LocalSyncPolicy::Opportunistic,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("seed {seed} step {step}: write: {error}"));
+                    let end = (offset + len) as usize;
+                    if model.len() < end {
+                        model.resize(end, 0);
+                    }
+                    model[offset as usize..end].copy_from_slice(&data);
+                }
+                4..=5 => {
+                    let size = next() % max_len;
+                    vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(size))
+                        .unwrap_or_else(|error| {
+                            panic!("seed {seed} step {step}: truncate: {error}")
+                        });
+                    model.resize(size as usize, 0);
+                }
+                6 => {
+                    let result = if next() % 4 == 0 {
+                        vfs.fsync_fh(fh).await
+                    } else {
+                        vfs.flush_fh(fh).await
+                    };
+                    result
+                        .unwrap_or_else(|error| panic!("seed {seed} step {step}: flush: {error}"));
+                }
+                _ => {
+                    if model.is_empty() {
+                        continue;
+                    }
+                    let offset = next() % model.len() as u64;
+                    let len = (next() % max_op).max(1).min(model.len() as u64 - offset);
+                    let mut buffer = vec![0u8; len as usize];
+                    let read = vfs
+                        .read_into_fh(fh, ino, offset, &mut buffer)
+                        .await
+                        .unwrap_or_else(|error| panic!("seed {seed} step {step}: read: {error}"));
+                    assert_eq!(read as u64, len, "seed {seed} step {step}: short read");
+                    let expected = &model[offset as usize..(offset + len) as usize];
+                    if let Some(first) = buffer.iter().zip(expected).position(|(a, b)| a != b) {
+                        panic!(
+                            "seed {seed} step {step}: bad data at {:#x}: got {:#x}, expected {:#x}",
+                            offset + first as u64,
+                            buffer[first],
+                            expected[first]
+                        );
+                    }
+                }
+            }
+        }
+        vfs.release_fh(fh).await.expect("release");
+    });
+}

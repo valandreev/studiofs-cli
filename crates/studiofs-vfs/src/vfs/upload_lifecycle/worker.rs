@@ -355,6 +355,9 @@ trait UploadMetaPort: Clone + Send + Sync + 'static {
         block_size: u32,
     ) -> VfsResult<Option<u64>>;
     async fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> VfsResult<()>;
+    /// Reports whether any overlay slice references `object_id`, regardless of
+    /// the inode's current content epoch.
+    async fn has_regular_file_overlay_object(&self, ino: Ino, object_id: u64) -> VfsResult<bool>;
 }
 
 trait RemoteUploadPort: Clone + Send + Sync + 'static {
@@ -613,7 +616,7 @@ where
 
         if attr.content_epoch != op.content_epoch {
             if self
-                .protect_stale_upload_if_covered(op, Some(attr), None)
+                .protect_stale_upload_if_covered(op, Some(attr))
                 .await?
                 .protects_payload()
             {
@@ -630,7 +633,7 @@ where
 
         if !overlay_object_current {
             if self
-                .protect_stale_upload_if_covered(op, Some(attr), Some(overlay_object_current))
+                .protect_stale_upload_if_covered(op, Some(attr))
                 .await?
                 .protects_payload()
             {
@@ -800,7 +803,7 @@ where
             )
         } else {
             if self
-                .protect_stale_upload_if_covered(op, None, None)
+                .protect_stale_upload_if_covered(op, None)
                 .await?
                 .protects_payload()
             {
@@ -938,18 +941,13 @@ where
     }
 
     async fn cancel_stale_upload(&self, op: &PendingUpload) -> VfsResult<()> {
-        let still_referenced = match self.meta.get_attr(op.ino).await? {
-            Some(attr) => {
-                self.meta
-                    .has_regular_file_overlay_object_if_matches(
-                        op.ino,
-                        attr.content_epoch,
-                        op.object_id,
-                    )
-                    .await?
-            }
-            None => false,
-        };
+        // Deleting the payload is only safe once no overlay slice references
+        // it, whichever epoch the inode has advanced to meanwhile.
+        let still_referenced = self.meta.get_attr(op.ino).await?.is_some()
+            && self
+                .meta
+                .has_regular_file_overlay_object(op.ino, op.object_id)
+                .await?;
         if still_referenced {
             self.local_payloads.mark_upload_failed(op.object_id)?;
             self.local_payloads.clear_pending_eviction(op.object_id);
@@ -972,25 +970,18 @@ where
         &self,
         op: &PendingUpload,
         prefetched_attr: Option<InodeAttr>,
-        prefetched_overlay: Option<bool>,
     ) -> VfsResult<StaleUploadDisposition> {
         if let Some(attr) = match prefetched_attr {
             Some(attr) => Some(attr),
             None => self.meta.get_attr(op.ino).await?,
         } {
-            let covered = match prefetched_overlay {
-                Some(covered) => covered,
-                None => {
-                    self.meta
-                        .has_regular_file_overlay_object_if_matches(
-                            op.ino,
-                            attr.content_epoch,
-                            op.object_id,
-                        )
-                        .await?
-                }
-            };
-            if covered {
+            // A size change can advance the epoch after `attr` was read, so
+            // an epoch-matched scan would miss a payload the overlay still uses.
+            if self
+                .meta
+                .has_regular_file_overlay_object(op.ino, op.object_id)
+                .await?
+            {
                 return Ok(self.requeue_stale_upload_at_epoch(op, attr.content_epoch));
             }
         }
@@ -1506,6 +1497,15 @@ impl UploadMetaPort for VfsUploadMetaPort {
                 .await
                 .ok(),
         )
+    }
+
+    async fn has_regular_file_overlay_object(&self, ino: Ino, object_id: u64) -> VfsResult<bool> {
+        let meta = self.vfs.meta.clone();
+        let object_ids = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.get_regular_file_overlay_object_ids(ino)
+        })
+        .await?;
+        Ok(object_ids.contains(&object_id))
     }
 
     async fn has_regular_file_overlay_object_if_matches(
@@ -3108,6 +3108,7 @@ mod tests {
         reattached_uploads: Arc<Mutex<Vec<ReattachedUploadRecord>>>,
         reattach_epoch: Arc<Mutex<Option<u64>>>,
         reattach_epoch_sequence: Arc<Mutex<Vec<Option<u64>>>>,
+        advance_epoch_after_get_attr: Arc<AtomicBool>,
     }
 
     impl Default for FakeMeta {
@@ -3122,13 +3123,22 @@ mod tests {
                 reattached_uploads: Arc::new(Mutex::new(Vec::new())),
                 reattach_epoch: Arc::new(Mutex::new(None)),
                 reattach_epoch_sequence: Arc::new(Mutex::new(Vec::new())),
+                advance_epoch_after_get_attr: Arc::new(AtomicBool::new(false)),
             }
         }
     }
 
     impl UploadMetaPort for FakeMeta {
         async fn get_attr(&self, ino: Ino) -> VfsResult<Option<InodeAttr>> {
-            Ok(self.attrs.lock().get(&ino).cloned().flatten())
+            let mut attrs = self.attrs.lock();
+            let attr = attrs.get(&ino).cloned().flatten();
+            // Models a local size change committing right after this read.
+            if self.advance_epoch_after_get_attr.load(Ordering::Relaxed)
+                && let Some(Some(current)) = attrs.get_mut(&ino)
+            {
+                current.content_epoch += 1;
+            }
+            Ok(attr)
         }
 
         async fn has_regular_file_overlay_object_if_matches(
@@ -3148,6 +3158,19 @@ mod tests {
             if !epoch_matches {
                 return Ok(false);
             }
+            Ok(self
+                .overlay_objects
+                .lock()
+                .get(&ino)
+                .is_some_and(|objects| objects.contains(&object_id)))
+        }
+
+        async fn has_regular_file_overlay_object(
+            &self,
+            ino: Ino,
+            object_id: u64,
+        ) -> VfsResult<bool> {
+            self.presence_checks.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .overlay_objects
                 .lock()
@@ -4359,7 +4382,7 @@ mod tests {
         );
         assert_eq!(
             processor
-                .protect_stale_upload_if_covered(&op, None, None)
+                .protect_stale_upload_if_covered(&op, None)
                 .await
                 .unwrap(),
             StaleUploadDisposition::Uncovered
@@ -4436,6 +4459,35 @@ mod tests {
             meta.reattached_uploads.lock().is_empty(),
             "an object already present in the current overlay must be requeued without reattaching"
         );
+    }
+
+    #[tokio::test]
+    async fn process_upload_keeps_overlay_payload_when_epoch_advances_during_stale_checks() {
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, _policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch + 1)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        meta.advance_epoch_after_get_attr
+            .store(true, Ordering::Relaxed);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(
+            local_payloads.removed.lock().is_empty(),
+            "a payload the current overlay references must survive a concurrent epoch change"
+        );
+        assert!(coordinator.cancelled.lock().is_empty());
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 0);
+        let requeued = coordinator.requeued.lock();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].object_id, op.object_id);
     }
 
     #[tokio::test]
