@@ -8,8 +8,8 @@ use super::{
     InodeIncarnationState, Instant, LocalSyncPolicy, MetaError, NamespacePathStyle,
     PendingIncarnation, ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange,
     SliceRecord, StudioVfs, UnlinkTarget, VfsError, VfsForegroundWriteOp, VfsForegroundWriteTimer,
-    VfsMeta, VfsResult, VfsUploadState, block_index_from_offset, chunk_id_from_offset,
-    chunk_start_offset, debug, error, info, offset_within_block, validate_name, warn,
+    VfsMeta, VfsResult, VfsUploadState, block_index_from_offset, chunk_start_offset, debug, error,
+    info, offset_within_block, validate_name, warn,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -296,6 +296,8 @@ impl StudioVfs {
         op: DeferredNamespaceOp,
     ) -> VfsResult<()> {
         let op_bytes = Self::deferred_namespace_op_estimated_bytes(&op);
+        let mut attr = attr;
+        let mut op = op;
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
             let error_ino = match &op {
@@ -319,6 +321,21 @@ impl StudioVfs {
             if let Some(error) = self.deferred_namespace_admission_error(&inner, op_bytes) {
                 return Err(error);
             }
+            let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
+            if let DeferredNamespaceOp::SetAttr {
+                attr: op_attr,
+                args,
+            } = &mut op
+                && args.size.is_none()
+                && let Some(current) = dirty_attrs.get(&attr.ino)
+            {
+                attr = current.clone();
+                if args.apply_attr_only(&mut attr) {
+                    attr.touch_ctime();
+                }
+                *op_attr = attr.clone();
+            }
+            dirty_attrs.insert(attr.ino, attr.clone());
             if let Some(key) = key {
                 inner.entries.insert(key, attr.ino);
             }
@@ -330,11 +347,6 @@ impl StudioVfs {
             inner.backlog_operations += 1;
             inner.backlog_bytes += op_bytes;
         }
-        self.state
-            .namespace
-            .dirty_attrs
-            .lock()
-            .insert(attr.ino, attr);
         self.state.namespace.deferred.notify.notify_waiters();
         Ok(())
     }
@@ -1359,8 +1371,17 @@ impl StudioVfs {
             return self.setattr_with_handle(None, ino, args);
         }
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Setattr);
-        let _operation = self.try_mutating_operation_admission()?;
+        let operation = self.try_mutating_operation_admission()?;
         self.ensure_deferred_namespace_admission(std::mem::size_of::<DeferredNamespaceOp>())?;
+        let cleanup = self.file_session_cleanup(ino);
+        let permit = self.run_sync_future_with_admission(&operation, async {
+            Ok(self
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Write)
+                .await)
+        })?;
+        let _cleanup = cleanup.with_permit(permit);
         let attr = self.setattr_attr_only_deferred_local(ino, args.clone())?;
         self.enqueue_deferred_namespace_op(
             None,
@@ -1372,7 +1393,7 @@ impl StudioVfs {
         )?;
         self.invalidate_attr_read_cache([ino]);
         self.schedule_deferred_namespace_metadata_drain(runtime);
-        Ok(attr)
+        Ok(self.peek_dirty_attr(ino).unwrap_or(attr))
     }
 
     /// Update inode attributes, optionally while holding an open handle.
@@ -1423,7 +1444,7 @@ impl StudioVfs {
             return Ok(attr);
         }
 
-        let mut attr = self.attr_only_setattr_base_attr(ino)?;
+        let attr = self.attr_only_setattr_base_attr(ino)?;
         // Handle-backed growth stays local (create, SetEndOfFile, write); other updates
         // must not race a pending create commit.
         let defers_handle_growth = args.size.is_some_and(|new_size| {
@@ -1434,16 +1455,29 @@ impl StudioVfs {
                 &operation,
                 self.drain_deferred_namespace_metadata_for_barrier(),
             )?;
-            attr = self.attr_only_setattr_base_attr(ino)?;
         }
-        if let Some(new_size) = args.size
-            && new_size != attr.size
-        {
+        if let Some(new_size) = args.size {
             if let Some(handle) = fh {
                 self.enforce_mutating_handle_access(handle, ino)?;
             } else {
                 self.enforce_no_known_foreign_hard_lock(ino)?;
             }
+            // Writers are excluded while the Write session is held, so an
+            // unchanged size here is a real no-op that needs no strict flush.
+            let cleanup = self.file_session_cleanup(ino);
+            let permit = self.run_sync_future_with_admission(&operation, async {
+                Ok(self
+                    .state
+                    .file_session
+                    .enter_op(ino, FileSessionOperation::Write)
+                    .await)
+            })?;
+            let cleanup = cleanup.with_permit(permit);
+            let attr = self.attr_only_setattr_base_attr(ino)?;
+            if new_size == attr.size {
+                return self.commit_attr_only_setattr(ino, attr, &args);
+            }
+            drop(cleanup);
             let defer_handle_growth_flush =
                 handle_backed_growth_may_defer_strict_flush(fh, new_size, attr.size, &args);
             let updated = self.run_sync_future_with_admission(
@@ -1456,6 +1490,26 @@ impl StudioVfs {
             return Ok(updated);
         }
 
+        let cleanup = self.file_session_cleanup(ino);
+        let permit = self.run_sync_future_with_admission(&operation, async {
+            Ok(self
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Write)
+                .await)
+        })?;
+        let _cleanup = cleanup.with_permit(permit);
+        let attr = self.attr_only_setattr_base_attr(ino)?;
+        self.commit_attr_only_setattr(ino, attr, &args)
+    }
+
+    /// Applies non-size attributes; the caller holds the inode's Write session.
+    fn commit_attr_only_setattr(
+        &self,
+        ino: Ino,
+        mut attr: InodeAttr,
+        args: &SetattrArgs,
+    ) -> VfsResult<InodeAttr> {
         if args.apply_attr_only(&mut attr) {
             attr.touch_ctime();
             self.state
@@ -1936,25 +1990,21 @@ impl StudioVfs {
     fn truncate_tombstone_slices(
         &self,
         start_offset: u64,
-        end_offset: u64,
+        chunk_ids: &[ChunkId],
     ) -> VfsResult<ChunkSliceBatch> {
         let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
-        let mut cursor = start_offset;
-        while cursor < end_offset {
-            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+        for &chunk_id in chunk_ids {
             let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
-            let chunk_end = chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64);
-            let piece_end = end_offset.min(chunk_end);
-            let range = SliceRange::new(
-                (cursor - chunk_start) as u32,
-                (piece_end - chunk_start) as u32,
-            )
-            .ok_or_else(|| VfsError::Other("invalid truncate tombstone range".to_string()))?;
+            let start = start_offset.saturating_sub(chunk_start);
+            if start >= u64::from(DEFAULT_CHUNK_SIZE) {
+                continue;
+            }
+            let range = SliceRange::new(start as u32, DEFAULT_CHUNK_SIZE)
+                .ok_or_else(|| VfsError::Other("invalid truncate tombstone range".to_string()))?;
             chunks
                 .entry(chunk_id)
                 .or_default()
                 .push(SliceRecord::tombstone(SliceId(0), SliceOrder(0), range));
-            cursor = piece_end;
         }
         Ok(chunks.into_iter().collect())
     }
@@ -1963,7 +2013,7 @@ impl StudioVfs {
         &self,
         ino: Ino,
         new_size: u64,
-        old_size: u64,
+        chunk_ids: &[ChunkId],
     ) -> VfsResult<(ChunkSliceBatch, RemovedObjectList)> {
         let mut kept_object_ids = std::collections::HashSet::new();
         if new_size > 0 {
@@ -1980,44 +2030,47 @@ impl StudioVfs {
         let mut restore_chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
         let mut removed_objects = Vec::new();
         let mut removed_seen = std::collections::HashSet::new();
-        for span in self.sync_meta().lookup_regular_file_slices(
-            ino,
-            new_size,
-            old_size.saturating_sub(new_size),
-        )? {
-            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
-            let absolute_offset = chunk_base.saturating_add(span.range.start as u64);
-            let block_index = block_index_from_offset(absolute_offset, self.block_size);
-            match span.payload {
-                Some(block) => {
-                    if matches!(span.source, ResolvedSliceSource::Overlay)
-                        && !kept_object_ids.contains(&block.object_id)
-                        && removed_seen.insert(block.object_id)
-                    {
-                        removed_objects.push((block_index, block.object_id));
+        for &chunk_id in chunk_ids {
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            let start = new_size.max(chunk_start);
+            let end = chunk_start.saturating_add(u64::from(DEFAULT_CHUNK_SIZE));
+            if start >= end {
+                continue;
+            }
+            for span in self
+                .sync_meta()
+                .lookup_regular_file_slices(ino, start, end - start)?
+            {
+                let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+                let absolute_offset = chunk_base.saturating_add(span.range.start as u64);
+                let block_index = block_index_from_offset(absolute_offset, self.block_size);
+                match span.payload {
+                    Some(block) => {
+                        if matches!(span.source, ResolvedSliceSource::Overlay)
+                            && !kept_object_ids.contains(&block.object_id)
+                            && removed_seen.insert(block.object_id)
+                        {
+                            removed_objects.push((block_index, block.object_id));
+                        }
+                        let mut slice =
+                            SliceRecord::new(SliceId(0), SliceOrder(0), span.range, block);
+                        slice.payload_state = match span.source {
+                            ResolvedSliceSource::Base => PayloadRefState::Published,
+                            _ => PayloadRefState::LocalOnly,
+                        };
+                        restore_chunks.entry(span.chunk_id).or_default().push(slice);
                     }
-                    let mut slice = SliceRecord::new(SliceId(0), SliceOrder(0), span.range, block);
-                    slice.payload_state = match span.source {
-                        ResolvedSliceSource::Base => PayloadRefState::Published,
-                        _ => PayloadRefState::LocalOnly,
-                    };
-                    restore_chunks.entry(span.chunk_id).or_default().push(slice);
+                    None if matches!(
+                        span.source,
+                        ResolvedSliceSource::OverlayTombstone | ResolvedSliceSource::BaseTombstone
+                    ) =>
+                    {
+                        restore_chunks.entry(span.chunk_id).or_default().push(
+                            SliceRecord::tombstone(SliceId(0), SliceOrder(0), span.range),
+                        );
+                    }
+                    None => {}
                 }
-                None if matches!(
-                    span.source,
-                    ResolvedSliceSource::OverlayTombstone | ResolvedSliceSource::BaseTombstone
-                ) =>
-                {
-                    restore_chunks
-                        .entry(span.chunk_id)
-                        .or_default()
-                        .push(SliceRecord::tombstone(
-                            SliceId(0),
-                            SliceOrder(0),
-                            span.range,
-                        ));
-                }
-                None => {}
             }
         }
 
@@ -2036,15 +2089,17 @@ impl StudioVfs {
         } else {
             block_index_from_offset(new_size - 1, self.block_size) + 1
         };
+        // The stored graph can extend past visible EOF; mask its entire suffix before GC.
+        let chunk_ids = self.sync_meta().get_regular_file_chunk_ids(ino)?;
         let (restore_slices, removed_objects) =
-            self.truncate_restore_slices_and_removed_objects(ino, new_size, old_size)?;
+            self.truncate_restore_slices_and_removed_objects(ino, new_size, &chunk_ids)?;
         let mutation = TruncateMutation {
             removed_objects,
             restore_slices,
             installed_pending_tail_block: None,
         };
 
-        let tombstones = self.truncate_tombstone_slices(new_size, old_size)?;
+        let tombstones = self.truncate_tombstone_slices(new_size, &chunk_ids)?;
         if let Err(error) = self
             .sync_meta()
             .flush_regular_file_overlay_slices_with_attr(ino, &tombstones, None)
@@ -3689,6 +3744,237 @@ mod tests {
     use bytes::BytesMut;
     use studiofs_meta::schema::ROOT_INO;
     use studiofs_meta::{MetaFsOps, MetaInodes, MetaNamespace};
+
+    #[test]
+    fn same_size_setattr_rechecks_after_pending_write() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("same-size-setattr-write-race-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "same-size-setattr-write-race");
+        rt.block_on(async {
+            let attr = vfs.create(ROOT_INO, b"file", 0, 0, 0o644).unwrap();
+            let fh = vfs
+                .open_file(attr.ino, super::super::OpenFlags::RDWR, false)
+                .unwrap();
+            let permit = vfs
+                .state
+                .file_session
+                .enter_op(attr.ino, FileSessionOperation::Write)
+                .await;
+            let setter = vfs.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                setter.setattr(
+                    attr.ino,
+                    SetattrArgs {
+                        size: Some(0),
+                        ..SetattrArgs::default()
+                    },
+                )
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if vfs
+                        .state
+                        .file_session
+                        .debug_snapshot(attr.ino)
+                        .is_some_and(|s| s.queued_ops > 0)
+                    {
+                        break;
+                    }
+                    assert!(!task.is_finished(), "size setattr must wait for the writer");
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, b"payload")
+                .await
+                .unwrap();
+            drop(permit);
+            assert_eq!(task.await.unwrap().unwrap().size, 0);
+            assert_eq!(vfs.state.writer_stack.dirty_bytes_for_inode(attr.ino), 0);
+        });
+    }
+
+    #[test]
+    fn same_size_setattr_skips_strict_flush_and_keeps_ctime() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("same-size-setattr-noop-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "same-size-setattr-noop");
+        rt.block_on(async {
+            let attr = vfs.create(ROOT_INO, b"file", 0, 0, 0o644).unwrap();
+            let fh = vfs
+                .open_file(attr.ino, super::super::OpenFlags::RDWR, false)
+                .unwrap();
+            vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, b"payload")
+                .await
+                .unwrap();
+            let before = vfs.getattr(attr.ino).unwrap();
+            assert_eq!(before.size, 7);
+            let dirty_before = vfs.state.writer_stack.dirty_bytes_for_inode(attr.ino);
+            assert!(dirty_before > 0);
+            let setter = vfs.clone();
+            let after = tokio::task::spawn_blocking(move || {
+                setter.setattr(attr.ino, SetattrArgs::size_only(7))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(after.size, 7);
+            assert_eq!(
+                after.ctime, before.ctime,
+                "same-size setattr must not touch ctime"
+            );
+            assert_eq!(
+                vfs.state.writer_stack.dirty_bytes_for_inode(attr.ino),
+                dirty_before,
+                "same-size setattr must not force a strict flush"
+            );
+        });
+    }
+
+    #[test]
+    fn deferred_setattr_waits_for_flush_that_retires_dirty_attr() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("deferred-setattr-flush-race-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-setattr-flush-race");
+        let runtime = rt.handle().clone();
+        rt.block_on(async {
+            let attr = vfs.create(ROOT_INO, b"file", 0, 0, 0o644).unwrap();
+            let fh = vfs
+                .open_file(attr.ino, super::super::OpenFlags::RDWR, false)
+                .unwrap();
+            let flush = vfs
+                .state
+                .file_session
+                .enter_op(attr.ino, FileSessionOperation::Flush)
+                .await;
+            let setter = vfs.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                setter.setattr_attr_only_deferred_metadata(
+                    attr.ino,
+                    SetattrArgs {
+                        mode: Some(0o600),
+                        ..SetattrArgs::default()
+                    },
+                    &runtime,
+                )
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if vfs
+                        .state
+                        .file_session
+                        .debug_snapshot(attr.ino)
+                        .is_some_and(|s| s.queued_ops > 0)
+                    {
+                        break;
+                    }
+                    assert!(
+                        !task.is_finished(),
+                        "deferred setattr must wait for the flush"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, b"payload")
+                .await
+                .unwrap();
+            vfs.materialize_writer_stack_for_inode(attr.ino)
+                .await
+                .unwrap();
+            vfs.flush_local_dirty_state(attr.ino, LocalSyncPolicy::Strict)
+                .await
+                .unwrap();
+            assert!(vfs.peek_dirty_attr(attr.ino).is_none());
+            drop(flush);
+            let result = task.await.unwrap().unwrap();
+            assert_eq!(result.size, 7);
+            vfs.drain_deferred_namespace_metadata_for_barrier()
+                .await
+                .unwrap();
+            assert_eq!(vfs.getattr(attr.ino).unwrap().size, 7);
+        });
+    }
+
+    #[test]
+    fn synchronous_attr_only_setattr_waits_for_writer_and_keeps_size() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("sync-setattr-write-race-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sync-setattr-write-race");
+        rt.block_on(async {
+            let attr = vfs.create(ROOT_INO, b"file", 0, 0, 0o644).unwrap();
+            let permit = vfs
+                .state
+                .file_session
+                .enter_op(attr.ino, FileSessionOperation::Write)
+                .await;
+            let setter = vfs.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                setter.setattr(
+                    attr.ino,
+                    SetattrArgs {
+                        mode: Some(0o600),
+                        ..SetattrArgs::default()
+                    },
+                )
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if vfs
+                        .state
+                        .file_session
+                        .debug_snapshot(attr.ino)
+                        .is_some_and(|s| s.queued_ops > 0)
+                    {
+                        break;
+                    }
+                    assert!(!task.is_finished(), "setattr must wait for the writer");
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut updated = attr.clone();
+            updated.size = 33586;
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(attr.ino, updated);
+            drop(permit);
+            let result = task.await.unwrap().unwrap();
+            assert_eq!(result.size, 33586);
+            assert_eq!(result.mode & 0o777, 0o600);
+        });
+    }
+
+    #[test]
+    fn deferred_setattr_does_not_overwrite_newer_dirty_write_size() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("deferred-setattr-write-race-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "deferred-setattr-write-race");
+        let stale = InodeAttr::new_file(9_000_905, ROOT_INO, 0, 0, 0o644);
+        let mut current = stale.clone();
+        current.size = 33586;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(stale.ino, current);
+        let args = SetattrArgs {
+            mode: Some(0o600),
+            ..SetattrArgs::default()
+        };
+        vfs.enqueue_deferred_namespace_op(
+            None,
+            stale.clone(),
+            DeferredNamespaceOp::SetAttr {
+                attr: stale.clone(),
+                args,
+            },
+        )
+        .unwrap();
+        let attr = vfs.peek_dirty_attr(stale.ino).unwrap();
+        assert_eq!(attr.size, 33586);
+        assert_eq!(attr.mode & 0o777, 0o600);
+    }
 
     #[test]
     fn dropped_deleted_inode_setattrs_settle_only_after_their_batch() {

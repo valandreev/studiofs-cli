@@ -13777,6 +13777,67 @@ fn writer_stack_global_dirty_cap_drains_older_inodes_after_limit_drop() {
 }
 
 #[test]
+fn inline_budget_drain_waits_for_busy_inode_without_holding_writer_gate() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "inline-budget-busy");
+    rt.block_on(async {
+        let b = vfs.create(1, b"busy", 0, 0, 0o644).unwrap();
+        let a = vfs.create(1, b"writer", 0, 0, 0o644).unwrap();
+        let fh_b = vfs.open_file(b.ino, OpenFlags::RDWR, false).unwrap();
+        let fh_a = vfs.open_file(a.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.record_writer_stack_state_bytes(fh_b, b.ino, 0, b"12345678")
+            .await
+            .unwrap();
+        vfs.set_max_dirty_bytes(1);
+        let busy = vfs
+            .state
+            .file_session
+            .enter_op(b.ino, FileSessionOperation::Materialize)
+            .await;
+        let writer_vfs = vfs.clone();
+        let writer = tokio::spawn(async move {
+            writer_vfs
+                .write_fh_with_local_sync_policy(
+                    fh_a,
+                    a.ino,
+                    0,
+                    b"x",
+                    LocalSyncPolicy::Opportunistic,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if vfs
+                    .state
+                    .file_session
+                    .debug_snapshot(b.ino)
+                    .is_some_and(|s| s.queued_ops > 0)
+                {
+                    break;
+                }
+                assert!(!writer.is_finished(), "writer must wait for the busy inode");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let permit = tokio::time::timeout(
+            Duration::from_secs(5),
+            vfs.state
+                .file_session
+                .enter_op(a.ino, FileSessionOperation::Write),
+        )
+        .await
+        .unwrap();
+        drop(permit);
+        drop(busy);
+        writer.await.unwrap().unwrap();
+        assert!(vfs.state.writer_stack.total_dirty_bytes() <= vfs.max_dirty_bytes());
+    });
+}
+
+#[test]
 fn aggressive_materialization_threshold_is_half_of_dirty_budget() {
     assert_eq!(aggressive_materialization_threshold_bytes(0), 1);
     assert_eq!(aggressive_materialization_threshold_bytes(1), 1);
@@ -13882,6 +13943,66 @@ fn packed_upload_geometry_uses_object_bytes_across_commit_replay_and_truncate() 
         assert!(
             pending_deletion(),
             "removing the last segment schedules the shared object for deletion"
+        );
+    });
+}
+
+#[test]
+fn truncate_masks_packed_fragments_beyond_old_eof_before_deleting_payload() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "truncate-hidden-packed-tail");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let mut attr = vfs.create(1, b"packed-tail.bin", 0, 0, 0o644).unwrap();
+        attr.size = 64;
+        attr.content_epoch = 1;
+        meta.set_attr(&attr).unwrap();
+        let object_id = 900_002;
+        vfs.payload_store_put_async(object_id, Bytes::from_static(b"aaaabbbbcccc"), false)
+            .await
+            .unwrap();
+        let mut chunks = Vec::new();
+        for (chunk, start, object_offset) in [(0, 32, 0), (0, 96, 4), (1_000_000, 0, 8)] {
+            let mut payload = PayloadRef::new_partial(object_id, 4);
+            payload.offset = object_offset;
+            chunks.push((
+                ChunkId(chunk),
+                vec![SliceRecord::new(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(start, start + 4).unwrap(),
+                    payload,
+                )],
+            ));
+        }
+        // The serving graph can contain packed fragments past the inode's visible EOF.
+        meta.flush_regular_file_overlay_slices_with_attr(attr.ino, &chunks, None)
+            .unwrap();
+        vfs.arm_fail_next_size_change_setattr_before_flush_for_test();
+        assert!(vfs.setattr(attr.ino, SetattrArgs::size_only(16)).is_err());
+        assert_eq!(meta.get_attr(attr.ino).unwrap().size, 64);
+        assert_eq!(vfs.read(attr.ino, 32, 4).await.unwrap().as_ref(), b"aaaa");
+        let distant_offset = 1_000_000 * u64::from(DEFAULT_CHUNK_SIZE);
+        assert!(
+            meta.lookup_regular_file_slices(attr.ino, distant_offset, 4)
+                .unwrap()
+                .iter()
+                .any(|span| span.payload.is_some()),
+            "rollback must restore hidden sparse fragments before releasing their payload"
+        );
+        vfs.setattr(attr.ino, SetattrArgs::size_only(16)).unwrap();
+        vfs.setattr(attr.ino, SetattrArgs::size_only(100)).unwrap();
+        assert_eq!(
+            vfs.read(attr.ino, 96, 4).await.expect("read regrown hole"),
+            vec![0; 4],
+            "a hidden packed fragment must not reappear after truncate and growth"
+        );
+        assert!(
+            meta.lookup_regular_file_slices(attr.ino, distant_offset, 4)
+                .unwrap()
+                .iter()
+                .all(|span| span.payload.is_none()),
+            "truncate must mask stored sparse chunks without scanning logical holes"
         );
     });
 }
@@ -22274,6 +22395,97 @@ fn deferred_materialization_linger_preserves_stream_coalescing() {
 }
 
 #[test]
+fn deferred_budget_sweep_respects_other_inode_flush_gate() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "materialize-budget-gate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let a = vfs.create(1, b"a.bin", 0, 0, 0o644).unwrap();
+        let b = vfs.create(1, b"b.bin", 0, 0, 0o644).unwrap();
+        let fh_a = vfs.open_file(a.ino, OpenFlags::RDWR, false).unwrap();
+        let fh_b = vfs.open_file(b.ino, OpenFlags::RDWR, false).unwrap();
+        let payload = vec![42; vfs.block_size as usize];
+        vfs.record_writer_stack_state_bytes(fh_a, a.ino, 0, &payload)
+            .await
+            .unwrap();
+        vfs.record_writer_stack_state_bytes(fh_b, b.ino, 0, &payload)
+            .await
+            .unwrap();
+        vfs.set_max_dirty_bytes(1);
+        let flush = vfs
+            .state
+            .file_session
+            .enter_op(b.ino, FileSessionOperation::Flush)
+            .await;
+        let materialize = vfs
+            .state
+            .file_session
+            .enter_op(a.ino, FileSessionOperation::Materialize)
+            .await;
+        let (entry, guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(a.ino)
+            .unwrap();
+        vfs.run_deferred_materialization_pass(&entry, &mut 0).await;
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(b.ino),
+            payload.len()
+        );
+        assert_eq!(
+            vfs.state
+                .file_session
+                .debug_snapshot(b.ino)
+                .unwrap()
+                .queued_ops,
+            0
+        );
+        drop((entry, guard, materialize, flush));
+        vfs.flush(b.ino).await.unwrap();
+        assert_eq!(vfs.state.writer_stack.dirty_bytes_for_inode(b.ino), 0);
+    });
+}
+
+#[test]
+fn file_session_cleanup_retires_unexecuted_and_cancelled_operations() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "session-cleanup");
+    rt.block_on(async {
+        let cleanup = vfs.file_session_cleanup(91);
+        let permit = vfs
+            .state
+            .file_session
+            .enter_op(91, FileSessionOperation::Upload)
+            .await;
+        let session = cleanup.with_permit(permit);
+        let unexecuted_job = move || drop(session);
+        drop(unexecuted_job);
+        assert!(vfs.state.file_session.debug_snapshot(91).is_none());
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_vfs = vfs.clone();
+        let task = tokio::spawn(async move {
+            let cleanup = task_vfs.file_session_cleanup(92);
+            let permit = task_vfs
+                .state
+                .file_session
+                .enter_op(92, FileSessionOperation::Materialize)
+                .await;
+            let _session = cleanup.with_permit(permit);
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .expect("session operation started")
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(vfs.state.file_session.debug_snapshot(92).is_none());
+    });
+}
+
+#[test]
 fn deferred_materialization_pass_reports_idle_for_clean_inode() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "materialize-pass-idle");
@@ -25590,4 +25802,186 @@ fn truncate_after_deferred_write_interrupts_materialization_linger() {
 #[test]
 fn handle_growth_after_deferred_write_interrupts_materialization_linger() {
     assert_size_change_after_deferred_write_interrupts_linger(b"grow-after-write.bin", 8192);
+}
+
+#[test]
+fn fsx_copy_then_shrink_and_sparse_growth_zeroes_old_destination() {
+    for coalesced in [false, true] {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsx-copy-shrink");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let ino = vfs.create(1, b"file", 0, 0, 0o644).unwrap().ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                0,
+                &vec![1; 0xbd0],
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .unwrap();
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                0x2695,
+                &vec![91; 0x1000],
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .unwrap();
+            let mut source = vec![0; 0x48f];
+            assert_eq!(
+                vfs.read_into_fh(fh, ino, 0x22c1, &mut source)
+                    .await
+                    .unwrap(),
+                source.len() as u32
+            );
+            if coalesced {
+                let mut page = vec![0; 0x1332];
+                page[0xea3..].copy_from_slice(&source);
+                vfs.write_fh_with_deferred_materialize(
+                    fh,
+                    ino,
+                    0x7000,
+                    &page,
+                    LocalSyncPolicy::Opportunistic,
+                )
+                .await
+                .unwrap();
+            } else {
+                vfs.write_fh_with_deferred_materialize(
+                    fh,
+                    ino,
+                    0x7ea3,
+                    &source,
+                    LocalSyncPolicy::Opportunistic,
+                )
+                .await
+                .unwrap();
+            }
+            vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(0x7a45))
+                .unwrap();
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                0xe355,
+                &vec![3; 0x131],
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .unwrap();
+            let mut actual = vec![0xff; 0x100];
+            assert_eq!(
+                vfs.read_into_fh(fh, ino, 0x8277, &mut actual)
+                    .await
+                    .unwrap(),
+                actual.len() as u32
+            );
+            assert_eq!(actual, vec![0; actual.len()], "coalesced={coalesced}");
+            vfs.release_fh(fh).await.unwrap();
+        });
+    }
+}
+
+/// fsx-shaped random writes, truncates, and reads against a reference buffer
+/// while the real upload worker runs. Timing-dependent, so it stays opt-in.
+#[test]
+#[ignore = "timing-dependent stress run; set STUDIOFS_FSX_STRESS_SEED/OPS to vary it"]
+fn fsx_like_write_truncate_stress_keeps_overlay_payloads() {
+    let seed: u64 = std::env::var("STUDIOFS_FSX_STRESS_SEED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(906_003);
+    let ops: usize = std::env::var("STUDIOFS_FSX_STRESS_OPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20_000);
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsx-like-stress");
+    let _guard = rt.enter();
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    rt.block_on(async {
+        let ino = vfs
+            .create(1, b"fsx-like-stress.bin", 0, 0, 0o644)
+            .expect("create file")
+            .ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open handle");
+        let max_len = 65_536u64;
+        let max_op = 4_096u64;
+        let mut model: Vec<u8> = Vec::new();
+        for step in 0..ops {
+            match next() % 10 {
+                0..=3 => {
+                    let offset = next() % max_len;
+                    let len = (next() % max_op).max(1).min(max_len - offset);
+                    let fill = (step % 251) as u8 + 1;
+                    let data: Vec<u8> = (0..len).map(|i| fill.wrapping_add(i as u8)).collect();
+                    vfs.write_fh_with_deferred_materialize(
+                        fh,
+                        ino,
+                        offset,
+                        &data,
+                        LocalSyncPolicy::Opportunistic,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("seed {seed} step {step}: write: {error}"));
+                    let end = (offset + len) as usize;
+                    if model.len() < end {
+                        model.resize(end, 0);
+                    }
+                    model[offset as usize..end].copy_from_slice(&data);
+                }
+                4..=5 => {
+                    let size = next() % max_len;
+                    vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(size))
+                        .unwrap_or_else(|error| {
+                            panic!("seed {seed} step {step}: truncate: {error}")
+                        });
+                    model.resize(size as usize, 0);
+                }
+                6 => {
+                    let result = if next() % 4 == 0 {
+                        vfs.fsync_fh(fh).await
+                    } else {
+                        vfs.flush_fh(fh).await
+                    };
+                    result
+                        .unwrap_or_else(|error| panic!("seed {seed} step {step}: flush: {error}"));
+                }
+                _ => {
+                    if model.is_empty() {
+                        continue;
+                    }
+                    let offset = next() % model.len() as u64;
+                    let len = (next() % max_op).max(1).min(model.len() as u64 - offset);
+                    let mut buffer = vec![0u8; len as usize];
+                    let read = vfs
+                        .read_into_fh(fh, ino, offset, &mut buffer)
+                        .await
+                        .unwrap_or_else(|error| panic!("seed {seed} step {step}: read: {error}"));
+                    assert_eq!(read as u64, len, "seed {seed} step {step}: short read");
+                    let expected = &model[offset as usize..(offset + len) as usize];
+                    if let Some(first) = buffer.iter().zip(expected).position(|(a, b)| a != b) {
+                        panic!(
+                            "seed {seed} step {step}: bad data at {:#x}: got {:#x}, expected {:#x}",
+                            offset + first as u64,
+                            buffer[first],
+                            expected[first]
+                        );
+                    }
+                }
+            }
+        }
+        vfs.release_fh(fh).await.expect("release");
+    });
 }

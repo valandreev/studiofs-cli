@@ -3425,9 +3425,7 @@ impl StudioVfs {
                 changed = true;
             }
         }
-        if changed {
-            self.clear_pending_dirty_slices_exceeding_len(ino, block_index, new_len);
-        }
+        self.clear_pending_dirty_slices_exceeding_len(ino, block_index, new_len);
 
         Ok(changed)
     }

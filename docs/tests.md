@@ -373,6 +373,87 @@ objects stay within accepted bytes divided by pack size plus partial drains.
 runtime snapshots before/after fsync. Unit tests alone do not establish mounted
 latency acceptance.
 
+### SFS-915 Truncate, Attribute Updates and Payload Lifetime
+
+A size change advances the inode's content epoch while an upload for the old
+epoch may be in flight. The upload worker reads the attr and scans the overlay in
+separate transactions, so before deleting a stale upload's local payload it asks
+whether any overlay slice still references the object, independent of epoch. A
+referenced payload is requeued at the current epoch instead of being deleted.
+
+```sh
+cargo test -p studiofs-vfs --lib process_upload_keeps_overlay_payload_when_epoch_advances_during_stale_checks -- --nocapture
+```
+
+A truncate tombstone drops the slices it covers, and a failed size change
+restores them. Stale-upload cancellation therefore rechecks the reference and
+removes the payload while holding the inode's upload session, which excludes the
+truncate's flush session from tombstone through rollback:
+
+```sh
+cargo test -p studiofs-vfs --lib process_upload_rechecks_stale_payload_reference_under_inode_gate -- --nocapture
+```
+
+Upload reattachment holds the inode's upload session through its local metadata
+read and write, including when the async caller is cancelled. A concurrent size
+change therefore cannot be overwritten by a reattachment prepared from an older
+slice graph. Truncate also clips persisted pending slices even when no mutable
+payload buffer remains:
+
+```sh
+cargo test -p studiofs-vfs --lib reattach_waits_for_file_session_and_observes_truncate_tombstone -- --nocapture
+cargo test -p studiofs-vfs --lib trim_local_payload_staging -- --nocapture
+cargo test -p studiofs-vfs --lib deferred_budget_sweep_respects_other_inode_flush_gate -- --nocapture
+cargo test -p studiofs-vfs --lib inline_budget_drain_waits_for_busy_inode_without_holding_writer_gate -- --nocapture
+cargo test -p studiofs-vfs --lib writer_stack_global_dirty_cap_drains_older_inodes_after_limit_drop -- --nocapture
+cargo test -p studiofs-vfs --lib file_session_cleanup_retires_unexecuted_and_cancelled_operations -- --nocapture
+```
+
+Pressure-triggered inline materialization retains the writing inode's session.
+Cross-inode budget sweeps acquire each candidate's materialization permit without
+waiting, so they skip an inode held by truncate and avoid nested inode waits.
+If an inline opportunistic write still exceeds the dirty budget, it releases its
+own write session before waiting for candidate materialization permits, keeping
+the existing backpressure behavior without nested inode waits.
+
+Truncate masks the suffix of every stored base/overlay chunk, including fragments
+past the old visible EOF, before deleting removed payloads. Chunk enumeration
+visits stored rows rather than scanning sparse logical holes. The regression
+also checks that a failed size change restores those hidden fragments:
+
+```sh
+cargo test -p studiofs-meta --lib test_regular_file_chunk_ids_include_sparse_base_overlay_and_tombstones -- --nocapture
+cargo test -p studiofs-vfs --lib truncate_masks_packed_fragments_beyond_old_eof_before_deleting_payload -- --nocapture
+```
+
+Attribute-only setattr holds the inode's write session through reading the
+current attributes and committing or enqueueing its update. This preserves a
+concurrent writer's size, including after its dirty attribute has been flushed.
+Size requests compare the current size under the write session, so an apparent
+no-op cannot miss a concurrent extension that actually requires truncation. A
+request that still matches the current size takes the attribute-only path without
+a strict flush or ctime update.
+
+```sh
+cargo test -p studiofs-vfs --lib setattr -- --nocapture
+```
+
+Before the mounted SFS-915 gate, rebuild the executable with
+`cargo build --release -p studiofs --bin studiofs`. Run the `small` profile in
+`tools/posix-conformance/run-fsx.sh` ten consecutive times on a kernel-policy
+mount, retaining separate output directories and the mount log. Every fsx summary
+must contain `rc=0`; the runner logs failures without propagating their exit code.
+The mount log must contain no retained-overlay relink or missing-payload warnings.
+
+The opt-in fsx-shaped stress test drives random writes, truncates, flushes and
+reads through a started VFS with the real upload worker and compares every read
+with a reference buffer. It is timing-dependent and does not replace the mounted
+fsx gate:
+
+```sh
+STUDIOFS_FSX_STRESS_SEED=11 cargo test -p studiofs-vfs --lib vfs::tests::fsx_like_write_truncate_stress_keeps_overlay_payloads -- --ignored --exact --nocapture
+```
+
 ### SFS-892 Linux FUSE Small I/O Regressions
 
 Linux registered no `readdirplus` callback, so `ls -l` and `find` sent one

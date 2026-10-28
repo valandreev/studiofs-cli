@@ -107,6 +107,45 @@ fn remote_payload_object_ids(engine: &RedbMetaEngine, ino: Ino, length: u64) -> 
 }
 
 #[test]
+fn test_regular_file_chunk_ids_include_sparse_base_overlay_and_tombstones() {
+    let engine = temp_engine();
+    let ino = 42;
+    let mut tombstone = RegularFileChunkState::default();
+    tombstone.insert_slice(SliceRecord::tombstone(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(0, 1).unwrap(),
+    ));
+    let mut payload = RegularFileChunkState::default();
+    payload.insert_slice(local_payload_slice(100));
+    set_regular_file_chunk_rows(
+        &engine,
+        ino,
+        &[
+            (ChunkId(5), payload.clone()),
+            (ChunkId(1_000_000), tombstone),
+        ],
+        &[(ChunkId(2), payload.clone()), (ChunkId(5), payload)],
+    );
+    set_regular_file_chunk_rows(
+        &engine,
+        ino + 1,
+        &[(ChunkId(3), RegularFileChunkState::default())],
+        &[],
+    );
+    assert_eq!(
+        engine.get_regular_file_chunk_ids(ino).unwrap(),
+        vec![ChunkId(2), ChunkId(5), ChunkId(1_000_000)]
+    );
+    assert!(
+        engine
+            .get_regular_file_chunk_ids(ino + 2)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn test_regular_file_prefix_scan_is_exact_per_inode() {
     let engine = temp_engine();
 

@@ -316,6 +316,10 @@ impl MetaPayloadObjects for PgMetaEngine {
         self.local.get_regular_file_overlay_object_ids(ino)
     }
 
+    fn get_regular_file_chunk_ids(&self, ino: Ino) -> MetaResult<Vec<ChunkId>> {
+        self.local.get_regular_file_chunk_ids(ino)
+    }
+
     fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>> {
         self.local.get_regular_file_graph_object_usage(ino)
     }

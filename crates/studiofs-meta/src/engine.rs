@@ -1656,6 +1656,9 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
     /// unpublished payload references are not lost during upload/GC decisions.
     fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>>;
 
+    /// Return sorted, unique chunk IDs stored in the base or overlay graph.
+    fn get_regular_file_chunk_ids(&self, ino: Ino) -> MetaResult<Vec<ChunkId>>;
+
     /// Collect all object ids currently referenced anywhere in the inode's
     /// regular-file graph, together with their deduplicated physical byte
     /// usage.

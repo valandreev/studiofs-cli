@@ -355,6 +355,15 @@ trait UploadMetaPort: Clone + Send + Sync + 'static {
         block_size: u32,
     ) -> VfsResult<Option<u64>>;
     async fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> VfsResult<()>;
+    /// Reports whether any overlay slice references `object_id`, regardless of
+    /// the inode's current content epoch.
+    async fn has_regular_file_overlay_object(&self, ino: Ino, object_id: u64) -> VfsResult<bool>;
+    /// Guard that keeps local size changes on one inode out of an upload
+    /// metadata decision until it is dropped.
+    type InodeUploadGate: Send;
+    /// Waits for the inode's upload session. A truncate holds its flush session
+    /// from tombstoning removed payloads until any rollback restores them.
+    async fn enter_inode_upload_gate(&self, ino: Ino) -> Self::InodeUploadGate;
 }
 
 trait RemoteUploadPort: Clone + Send + Sync + 'static {
@@ -613,7 +622,7 @@ where
 
         if attr.content_epoch != op.content_epoch {
             if self
-                .protect_stale_upload_if_covered(op, Some(attr), None)
+                .protect_stale_upload_if_covered(op, Some(attr))
                 .await?
                 .protects_payload()
             {
@@ -630,7 +639,7 @@ where
 
         if !overlay_object_current {
             if self
-                .protect_stale_upload_if_covered(op, Some(attr), Some(overlay_object_current))
+                .protect_stale_upload_if_covered(op, Some(attr))
                 .await?
                 .protects_payload()
             {
@@ -793,6 +802,8 @@ where
             }
         }
 
+        // Held from the final reference check through local payload removal.
+        let mut _stale_gate = None;
         let (keep_local_object, finalize_content_epoch) = if let Some(reconcile) = reconcile {
             (
                 reconcile.keep_local_object,
@@ -800,10 +811,21 @@ where
             )
         } else {
             if self
-                .protect_stale_upload_if_covered(op, None, None)
+                .protect_stale_upload_if_covered(op, None)
                 .await?
                 .protects_payload()
             {
+                return Ok(SingleUploadOutcome::Requeued);
+            }
+            // Reattachment takes this gate itself, so the protect pass runs first.
+            _stale_gate = Some(self.meta.enter_inode_upload_gate(op.ino).await);
+            if let Some(attr) = self.meta.get_attr(op.ino).await?
+                && self
+                    .meta
+                    .has_regular_file_overlay_object(op.ino, op.object_id)
+                    .await?
+            {
+                self.requeue_stale_upload_at_epoch(op, attr.content_epoch);
                 return Ok(SingleUploadOutcome::Requeued);
             }
             self.shutdown.record_canceled_stale_after_put(payload_len);
@@ -938,18 +960,15 @@ where
     }
 
     async fn cancel_stale_upload(&self, op: &PendingUpload) -> VfsResult<()> {
-        let still_referenced = match self.meta.get_attr(op.ino).await? {
-            Some(attr) => {
-                self.meta
-                    .has_regular_file_overlay_object_if_matches(
-                        op.ino,
-                        attr.content_epoch,
-                        op.object_id,
-                    )
-                    .await?
-            }
-            None => false,
-        };
+        // Deleting the payload is only safe once no overlay slice references
+        // it, whichever epoch the inode has advanced to meanwhile. The gate
+        // keeps a truncate rollback from re-referencing it before removal.
+        let _gate = self.meta.enter_inode_upload_gate(op.ino).await;
+        let still_referenced = self.meta.get_attr(op.ino).await?.is_some()
+            && self
+                .meta
+                .has_regular_file_overlay_object(op.ino, op.object_id)
+                .await?;
         if still_referenced {
             self.local_payloads.mark_upload_failed(op.object_id)?;
             self.local_payloads.clear_pending_eviction(op.object_id);
@@ -972,26 +991,25 @@ where
         &self,
         op: &PendingUpload,
         prefetched_attr: Option<InodeAttr>,
-        prefetched_overlay: Option<bool>,
     ) -> VfsResult<StaleUploadDisposition> {
         if let Some(attr) = match prefetched_attr {
             Some(attr) => Some(attr),
             None => self.meta.get_attr(op.ino).await?,
         } {
-            let covered = match prefetched_overlay {
-                Some(covered) => covered,
-                None => {
-                    self.meta
-                        .has_regular_file_overlay_object_if_matches(
-                            op.ino,
-                            attr.content_epoch,
-                            op.object_id,
-                        )
-                        .await?
-                }
-            };
-            if covered {
-                return Ok(self.requeue_stale_upload_at_epoch(op, attr.content_epoch));
+            // A size change can advance the epoch after `attr` was read, so
+            // an epoch-matched scan would miss a payload the overlay still uses.
+            if self
+                .meta
+                .has_regular_file_overlay_object(op.ino, op.object_id)
+                .await?
+            {
+                // Requeue at the epoch current after the scan, not the earlier read.
+                let content_epoch = self
+                    .meta
+                    .get_attr(op.ino)
+                    .await?
+                    .map_or(attr.content_epoch, |latest| latest.content_epoch);
+                return Ok(self.requeue_stale_upload_at_epoch(op, content_epoch));
             }
         }
 
@@ -1508,6 +1526,28 @@ impl UploadMetaPort for VfsUploadMetaPort {
         )
     }
 
+    type InodeUploadGate = super::super::file_session::FileSessionCleanup;
+
+    async fn enter_inode_upload_gate(&self, ino: Ino) -> Self::InodeUploadGate {
+        let cleanup = self.vfs.file_session_cleanup(ino);
+        let permit = self
+            .vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Upload)
+            .await;
+        cleanup.with_permit(permit)
+    }
+
+    async fn has_regular_file_overlay_object(&self, ino: Ino, object_id: u64) -> VfsResult<bool> {
+        let meta = self.vfs.meta.clone();
+        let object_ids = run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.get_regular_file_overlay_object_ids(ino)
+        })
+        .await?;
+        Ok(object_ids.contains(&object_id))
+    }
+
     async fn has_regular_file_overlay_object_if_matches(
         &self,
         ino: Ino,
@@ -1595,8 +1635,11 @@ impl UploadMetaPort for VfsUploadMetaPort {
         ) else {
             return Ok(None);
         };
+        let session = self.enter_inode_upload_gate(ino).await;
         let meta = self.vfs.meta.clone();
         run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+            // Cancellation must not release the gate before the blocking mutation finishes.
+            let _session = session;
             let latest_attr = match engine.get_attr(ino) {
                 Ok(attr) => attr,
                 Err(studiofs_meta::MetaError::InodeNotFound(_)) => return Ok(None),
@@ -3108,6 +3151,8 @@ mod tests {
         reattached_uploads: Arc<Mutex<Vec<ReattachedUploadRecord>>>,
         reattach_epoch: Arc<Mutex<Option<u64>>>,
         reattach_epoch_sequence: Arc<Mutex<Vec<Option<u64>>>>,
+        advance_epoch_after_get_attr: Arc<AtomicBool>,
+        restore_overlay_on_gate: Arc<Mutex<Option<(Ino, u64)>>>,
     }
 
     impl Default for FakeMeta {
@@ -3122,13 +3167,23 @@ mod tests {
                 reattached_uploads: Arc::new(Mutex::new(Vec::new())),
                 reattach_epoch: Arc::new(Mutex::new(None)),
                 reattach_epoch_sequence: Arc::new(Mutex::new(Vec::new())),
+                advance_epoch_after_get_attr: Arc::new(AtomicBool::new(false)),
+                restore_overlay_on_gate: Arc::new(Mutex::new(None)),
             }
         }
     }
 
     impl UploadMetaPort for FakeMeta {
         async fn get_attr(&self, ino: Ino) -> VfsResult<Option<InodeAttr>> {
-            Ok(self.attrs.lock().get(&ino).cloned().flatten())
+            let mut attrs = self.attrs.lock();
+            let attr = attrs.get(&ino).cloned().flatten();
+            // Models a local size change committing right after this read.
+            if self.advance_epoch_after_get_attr.load(Ordering::Relaxed)
+                && let Some(Some(current)) = attrs.get_mut(&ino)
+            {
+                current.content_epoch += 1;
+            }
+            Ok(attr)
         }
 
         async fn has_regular_file_overlay_object_if_matches(
@@ -3148,6 +3203,32 @@ mod tests {
             if !epoch_matches {
                 return Ok(false);
             }
+            Ok(self
+                .overlay_objects
+                .lock()
+                .get(&ino)
+                .is_some_and(|objects| objects.contains(&object_id)))
+        }
+
+        type InodeUploadGate = ();
+
+        async fn enter_inode_upload_gate(&self, _ino: Ino) -> Self::InodeUploadGate {
+            // Models a truncate rollback that finishes before the gate is granted.
+            if let Some((ino, object_id)) = self.restore_overlay_on_gate.lock().take() {
+                self.overlay_objects
+                    .lock()
+                    .entry(ino)
+                    .or_default()
+                    .insert(object_id);
+            }
+        }
+
+        async fn has_regular_file_overlay_object(
+            &self,
+            ino: Ino,
+            object_id: u64,
+        ) -> VfsResult<bool> {
+            self.presence_checks.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .overlay_objects
                 .lock()
@@ -3821,6 +3902,116 @@ mod tests {
     }
 
     #[test]
+    fn reattach_waits_for_file_session_and_observes_truncate_tombstone() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-observes-truncate");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let mut attr = vfs
+                .create(1, b"reattach-observes-truncate.bin", 0, 0, 0o644)
+                .expect("create sparse file");
+            let ino = attr.ino;
+            attr.size = 64;
+            attr.content_epoch = 1;
+            meta.set_attr(&attr).expect("persist initial attr");
+
+            let mut payload = SliceRecord::new(
+                SliceId(0),
+                SliceOrder(0),
+                SliceRange::new(32, 36).expect("payload range"),
+                PayloadRef::new_partial(6, 4),
+            );
+            payload.payload_state = PayloadRefState::LocalOnly;
+            meta.flush_regular_file_overlay_slices_with_attr(
+                ino,
+                &[(ChunkId(0), vec![payload])],
+                None,
+            )
+            .expect("seed upload payload");
+
+            let session_guard = vfs
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Flush)
+                .await;
+            let upload_vfs = vfs.clone();
+            let block_size = vfs.block_size;
+            let reattach = tokio::spawn(async move {
+                VfsUploadMetaPort { vfs: upload_vfs }
+                    .reattach_uploaded_object_if_uncovered(
+                        ino,
+                        1,
+                        6,
+                        ObjectFileMapping::whole(32, 4),
+                        block_size,
+                    )
+                    .await
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if vfs
+                        .state
+                        .file_session
+                        .debug_snapshot(ino)
+                        .is_some_and(|snapshot| snapshot.queued_ops > 0)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reattach should queue behind the file-session flush");
+
+            let mut shrunk = meta.get_attr(ino).expect("load current attr");
+            shrunk.size = 32;
+            shrunk.content_epoch = 2;
+            let tombstone = SliceRecord::tombstone(
+                SliceId(0),
+                SliceOrder(0),
+                SliceRange::new(32, 36).expect("truncated range"),
+            );
+            meta.flush_regular_file_overlay_slices_with_attr(
+                ino,
+                &[(ChunkId(0), vec![tombstone])],
+                Some(&shrunk),
+            )
+            .expect("commit truncate tombstone");
+
+            let mut regrown = meta.get_attr(ino).expect("load truncated attr");
+            regrown.size = 64;
+            regrown.content_epoch = 3;
+            meta.set_attr(&regrown).expect("extend after truncate");
+
+            drop(session_guard);
+            assert_eq!(
+                reattach
+                    .await
+                    .expect("reattach task")
+                    .expect("reattach call"),
+                None
+            );
+
+            let final_attr = meta.get_attr(ino).expect("load final attr");
+            assert_eq!((final_attr.size, final_attr.content_epoch), (64, 3));
+            let spans = meta
+                .lookup_regular_file_slices(ino, 32, 4)
+                .expect("lookup truncated range");
+            assert!(
+                spans
+                    .iter()
+                    .all(|span| span.source == ResolvedSliceSource::OverlayTombstone),
+                "stale upload must not replace a truncate tombstone: {spans:?}"
+            );
+            assert!(
+                vfs.state.file_session.debug_snapshot(ino).is_none(),
+                "reattach must retire its idle session after releasing the permit"
+            );
+        });
+    }
+
+    #[test]
     fn vfs_upload_meta_reattaches_stale_sparse_growth_over_older_short_attr() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-stale-sparse-growth");
@@ -4318,6 +4509,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_upload_rechecks_stale_payload_reference_under_inode_gate() {
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, _policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch + 1)));
+        *meta.restore_overlay_on_gate.lock() = Some((op.ino, op.object_id));
+
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::CancelledStale);
+        assert!(
+            local_payloads.removed.lock().is_empty(),
+            "a payload a truncate rollback re-referenced must survive stale cancellation"
+        );
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
     async fn process_upload_requeues_stale_upload_when_local_cleanup_fails() {
         let (processor, coordinator, local_payloads, meta, _remote, shutdown, _policy) =
             processor_fixture();
@@ -4359,7 +4571,7 @@ mod tests {
         );
         assert_eq!(
             processor
-                .protect_stale_upload_if_covered(&op, None, None)
+                .protect_stale_upload_if_covered(&op, None)
                 .await
                 .unwrap(),
             StaleUploadDisposition::Uncovered
@@ -4436,6 +4648,35 @@ mod tests {
             meta.reattached_uploads.lock().is_empty(),
             "an object already present in the current overlay must be requeued without reattaching"
         );
+    }
+
+    #[tokio::test]
+    async fn process_upload_keeps_overlay_payload_when_epoch_advances_during_stale_checks() {
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, _policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch + 1)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        meta.advance_epoch_after_get_attr
+            .store(true, Ordering::Relaxed);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(
+            local_payloads.removed.lock().is_empty(),
+            "a payload the current overlay references must survive a concurrent epoch change"
+        );
+        assert!(coordinator.cancelled.lock().is_empty());
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 0);
+        let requeued = coordinator.requeued.lock();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].object_id, op.object_id);
     }
 
     #[tokio::test]
