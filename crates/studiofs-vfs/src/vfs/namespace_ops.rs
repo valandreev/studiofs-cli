@@ -363,7 +363,6 @@ impl StudioVfs {
 
     fn complete_deferred_namespace_op(&self, op: &DeferredNamespaceOp, committed_attr: &InodeAttr) {
         let ino = op.ino();
-        let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
             match op {
@@ -375,9 +374,7 @@ impl StudioVfs {
                 }
                 DeferredNamespaceOp::SetAttr { .. } => {}
             }
-            inner.settle_pending_inode(ino);
-            inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
-            inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
+            Self::settle_deferred_namespace_op_backlog(&mut inner, op);
         }
         self.clear_matching_dirty_attr_if_committed(ino, committed_attr);
         self.invalidate_attr_read_cache([ino]);
@@ -408,7 +405,6 @@ impl StudioVfs {
         affected_parents: &mut HashSet<Ino>,
     ) {
         let ino = op.ino();
-        let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
         affected_inodes.insert(ino);
         inner.errors.insert(ino, Arc::clone(error));
         match op {
@@ -430,9 +426,19 @@ impl StudioVfs {
             }
             DeferredNamespaceOp::SetAttr { .. } => {}
         }
-        inner.settle_pending_inode(ino);
+        Self::settle_deferred_namespace_op_backlog(inner, op);
+    }
+
+    /// Record that `op` left the deferred backlog by committing, failing, or being dropped.
+    fn settle_deferred_namespace_op_backlog(
+        inner: &mut DeferredNamespaceInner,
+        op: &DeferredNamespaceOp,
+    ) {
+        inner.settle_pending_inode(op.ino());
         inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
-        inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
+        inner.backlog_bytes = inner
+            .backlog_bytes
+            .saturating_sub(Self::deferred_namespace_op_estimated_bytes(op));
     }
 
     fn abandon_failed_deferred_namespace_batch(
@@ -1013,6 +1019,7 @@ impl StudioVfs {
             }
 
             let mut attempts = 0;
+            let mut dropped_setattrs = Vec::new();
             loop {
                 let result = self.commit_deferred_namespace_batch(&batch).await;
                 match result {
@@ -1055,12 +1062,17 @@ impl StudioVfs {
                             }
                             continue;
                         }
-                        if let Some(stale_index) = Self::deleted_inode_setattr_index(&error, &batch)
+                        if let Some(deleted_ino) =
+                            Self::deleted_inode_setattr_target(&error, &batch)
                         {
-                            let stale_operation = batch.remove(stale_index);
-                            self.drop_deleted_inode_deferred_setattr(&stale_operation);
+                            let dropped_operations = Self::take_deleted_inode_deferred_setattrs(
+                                &mut batch,
+                                deleted_ino,
+                                &mut dropped_setattrs,
+                            );
                             debug!(
-                                ino = stale_operation.ino(),
+                                ino = deleted_ino,
+                                dropped_operations,
                                 remaining_operations = batch.len(),
                                 "dropped deferred setattr for an inode deleted before commit"
                             );
@@ -1100,6 +1112,9 @@ impl StudioVfs {
                     }
                 }
             }
+            // Settle drops only after the rest of their batch settled, so the
+            // settled count never passes operations still awaiting commit.
+            self.settle_dropped_deferred_setattrs(&dropped_setattrs);
         }
     }
 
@@ -1114,17 +1129,17 @@ impl StudioVfs {
         }
     }
 
-    /// Return the batch index of a `SetAttr` whose own inode no longer exists.
+    /// Return the inode of a failed `SetAttr` whose own inode no longer exists.
     ///
     /// Attr-only setattr is admitted against an inode that exists locally, and a
     /// deferred create always precedes its dependent setattr in queue order. A
     /// missing target therefore means the inode was deleted (for example by
     /// unlink, rmdir, rename replacement, or a peer) after admission, so the
     /// update has nothing left to apply.
-    fn deleted_inode_setattr_index(
+    fn deleted_inode_setattr_target(
         error: &VfsError,
         batch: &[DeferredNamespaceOp],
-    ) -> Option<usize> {
+    ) -> Option<Ino> {
         let VfsError::Meta(MetaError::NamespaceBatchOperation { index, source }) = error else {
             return None;
         };
@@ -1132,22 +1147,47 @@ impl StudioVfs {
             return None;
         };
         match batch.get(*index) {
-            Some(DeferredNamespaceOp::SetAttr { attr, .. }) if attr.ino == *missing => Some(*index),
+            Some(DeferredNamespaceOp::SetAttr { attr, .. }) if attr.ino == *missing => {
+                Some(*missing)
+            }
             _ => None,
         }
     }
 
-    fn drop_deleted_inode_deferred_setattr(&self, op: &DeferredNamespaceOp) {
-        let ino = op.ino();
-        let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
+    /// Move every batched `SetAttr` for the deleted `ino` into `dropped` in one
+    /// pass, so one deleted inode costs a single rolled-back commit attempt.
+    ///
+    /// The moved operations stay unsettled: a barrier compares the global
+    /// settled count with its cutoff, so settling them before the remaining
+    /// batch commits could release a barrier whose earlier operations are still
+    /// in that batch.
+    fn take_deleted_inode_deferred_setattrs(
+        batch: &mut Vec<DeferredNamespaceOp>,
+        ino: Ino,
+        dropped: &mut Vec<DeferredNamespaceOp>,
+    ) -> usize {
+        let before = dropped.len();
+        let (stale, live) = std::mem::take(batch).into_iter().partition(
+            |op| matches!(op, DeferredNamespaceOp::SetAttr { attr, .. } if attr.ino == ino),
+        );
+        *batch = live;
+        dropped.extend::<Vec<_>>(stale);
+        dropped.len() - before
+    }
+
+    /// Settle `SetAttr` operations dropped because their inode was deleted.
+    fn settle_dropped_deferred_setattrs(&self, dropped: &[DeferredNamespaceOp]) {
+        if dropped.is_empty() {
+            return;
+        }
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
-            inner.settle_pending_inode(ino);
-            inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
-            inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
+            for op in dropped {
+                Self::settle_deferred_namespace_op_backlog(&mut inner, op);
+            }
         }
-        // Deleted-inode cleanup owns the remaining runtime state for `ino`.
-        self.invalidate_attr_read_cache([ino]);
+        // Deleted-inode cleanup owns the remaining runtime state for these inodes.
+        self.invalidate_attr_read_cache(dropped.iter().map(DeferredNamespaceOp::ino));
         self.state.namespace.deferred.notify.notify_waiters();
     }
 
@@ -3603,6 +3643,55 @@ mod tests {
     use bytes::BytesMut;
     use studiofs_meta::schema::ROOT_INO;
     use studiofs_meta::{MetaFsOps, MetaInodes, MetaNamespace};
+
+    #[test]
+    fn dropped_deleted_inode_setattrs_settle_only_after_their_batch() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("dropped-setattr-settle-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "dropped-setattr-settle");
+        let live = InodeAttr::new_file(9_000_901, ROOT_INO, 0, 0, 0o644);
+        let deleted = InodeAttr::new_file(9_000_902, ROOT_INO, 0, 0, 0o644);
+        for attr in [&live, &deleted, &deleted] {
+            vfs.enqueue_deferred_namespace_op(
+                None,
+                attr.clone(),
+                DeferredNamespaceOp::SetAttr {
+                    attr: attr.clone(),
+                    args: SetattrArgs {
+                        mode: Some(0o600),
+                        ..SetattrArgs::default()
+                    },
+                },
+            )
+            .expect("admit deferred setattr");
+        }
+        let mut batch: Vec<_> =
+            std::mem::take(&mut vfs.state.namespace.deferred.inner.lock().queue)
+                .into_iter()
+                .collect();
+        let settled_before = vfs.state.namespace.deferred.inner.lock().settled_operations;
+
+        let mut dropped = Vec::new();
+        let dropped_count =
+            StudioVfs::take_deleted_inode_deferred_setattrs(&mut batch, deleted.ino, &mut dropped);
+
+        assert_eq!(dropped_count, 2);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].ino(), live.ino);
+        {
+            let inner = vfs.state.namespace.deferred.inner.lock();
+            // A barrier compares this count with its cutoff; it must not move
+            // while the live operation still awaits its commit.
+            assert_eq!(inner.settled_operations, settled_before);
+            assert!(inner.pending_inodes.contains_key(&deleted.ino));
+        }
+
+        vfs.settle_dropped_deferred_setattrs(&dropped);
+        let inner = vfs.state.namespace.deferred.inner.lock();
+        assert_eq!(inner.settled_operations, settled_before + 2);
+        assert!(!inner.pending_inodes.contains_key(&deleted.ino));
+        assert!(inner.pending_inodes.contains_key(&live.ino));
+        assert_eq!(inner.backlog_operations, 1);
+    }
 
     #[test]
     fn sfs815_no_replace_missing_source_precedes_filtered_destination_rejection() {

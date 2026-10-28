@@ -17766,6 +17766,88 @@ fn unlink_after_deferred_utimens_does_not_degrade_mount() {
 }
 
 #[test]
+fn deferred_setattrs_for_deleted_inode_drop_without_losing_live_updates() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-setattr-deleted-mixed-batch");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let live_before = vfs
+            .create(ROOT_INO, b"live-before", 0, 0, 0o644)
+            .expect("create first live file");
+        let deleted = vfs
+            .create(ROOT_INO, b"deleted", 0, 0, 0o644)
+            .expect("create file to delete");
+        let live_after = vfs
+            .create(ROOT_INO, b"live-after", 0, 0, 0o644)
+            .expect("create second live file");
+        let admitted_before = vfs
+            .state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .admitted_operations;
+
+        vfs.state
+            .namespace
+            .deferred
+            .batch_linger_override_ms
+            .store(3_600_000, AtomicOrdering::Release);
+        let chmod = |mode| SetattrArgs {
+            mode: Some(mode),
+            ..SetattrArgs::default()
+        };
+        // One batch: a live update, two updates for the deleted inode, then
+        // another live update after them.
+        vfs.setattr_attr_only_deferred_metadata(live_before.ino, chmod(0o600), rt.handle())
+            .expect("defer first live chmod");
+        vfs.setattr_attr_only_deferred_metadata(deleted.ino, chmod(0o600), rt.handle())
+            .expect("defer first stale chmod");
+        vfs.setattr_attr_only_deferred_metadata(deleted.ino, chmod(0o640), rt.handle())
+            .expect("defer second stale chmod");
+        vfs.setattr_attr_only_deferred_metadata(live_after.ino, chmod(0o604), rt.handle())
+            .expect("defer second live chmod");
+        vfs.unlink(ROOT_INO, b"deleted").expect("unlink file");
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.drain_deferred_namespace_metadata_for_barrier(),
+        )
+        .await
+        .expect("mixed batch should settle")
+        .expect("stale setattrs must not fail the batch");
+        assert!(
+            !vfs.state
+                .namespace
+                .deferred
+                .degraded
+                .load(AtomicOrdering::Acquire),
+            "stale setattrs must not degrade the mount"
+        );
+        {
+            let inner = vfs.state.namespace.deferred.inner.lock();
+            assert_eq!(inner.settled_operations, admitted_before + 4);
+            assert_eq!(inner.backlog_operations, 0);
+            assert!(!inner.pending_inodes.contains_key(&deleted.ino));
+        }
+        assert_eq!(
+            meta.get_attr(live_before.ino)
+                .expect("load first live attr")
+                .mode
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            meta.get_attr(live_after.ino)
+                .expect("load second live attr")
+                .mode
+                & 0o7777,
+            0o604
+        );
+    });
+}
+
+#[test]
 fn deferred_attr_only_commit_does_not_revert_written_size() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-attr-only-keeps-written-size");
