@@ -1,0 +1,22 @@
+# pjdfstest-rs configuration for the SFS-906 Linux FUSE baseline (docs/posix-conformance.md).
+# The same file is used for the StudioFS mount and the ext4 control.
+[features]
+rename_ctime = {}
+utime_now = {}
+utimensat = {}
+# studiofs-linux-fuse has no fallocate callback; glibc posix_fallocate falls
+# back to writing zeros, so the group still measures the visible result.
+posix_fallocate = {}
+
+[settings]
+naptime = 0.01
+# EROFS cases need a read-only remount by the suite; they are skipped.
+allow_remount = false
+expected_failures = []
+
+[dummy_auth]
+# Ubuntu names the 65534 group `nogroup`; create `tests` with newusers first.
+entries = [
+  ["nobody", "nogroup"],
+  ["tests", "tests"],
+]
