@@ -20,7 +20,7 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::adapter::{CallbackState, StudioVfsAdapter};
+use crate::adapter::{CallbackState, MacFuseCaller, StudioVfsAdapter};
 use crate::{MacFuseMountRequest, low_level};
 
 const FUSE_KERNEL_VERSION: u32 = 7;
@@ -136,6 +136,14 @@ struct FuseInHeader {
     gid: u32,
     pid: u32,
     padding: u32,
+}
+
+/// FSKit forwards the requesting process credentials in every FUSE header.
+fn fuse_caller(header: &FuseInHeader) -> MacFuseCaller {
+    MacFuseCaller {
+        uid: header.uid,
+        gid: header.gid,
+    }
 }
 
 #[repr(C)]
@@ -1729,10 +1737,13 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        match self
-            .adapter
-            .mkdir(request.header().nodeid, &name, input.mode as libc::mode_t)
-        {
+        let header = request.header();
+        match self.adapter.mkdir(
+            fuse_caller(&header),
+            header.nodeid,
+            &name,
+            input.mode as libc::mode_t,
+        ) {
             Ok(attr) => {
                 let _ = request
                     .reply_struct(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
@@ -1761,10 +1772,13 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        match self
-            .adapter
-            .mknod(request.header().nodeid, &name, input.mode as libc::mode_t)
-        {
+        let header = request.header();
+        match self.adapter.mknod(
+            fuse_caller(&header),
+            header.nodeid,
+            &name,
+            input.mode as libc::mode_t,
+        ) {
             Ok(attr) => {
                 let _ = request
                     .reply_struct(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
@@ -1897,7 +1911,13 @@ impl FsKitDispatcher {
             let request_cancellation = (*cancellation_guard.token).clone();
             let _cancellation_guard = cancellation_guard;
             match adapter
-                .symlink(header.nodeid, &name, &target, request_cancellation)
+                .symlink(
+                    fuse_caller(&header),
+                    header.nodeid,
+                    &name,
+                    &target,
+                    request_cancellation,
+                )
                 .await
             {
                 Ok(attr) => {
@@ -1931,6 +1951,7 @@ impl FsKitDispatcher {
             }
         };
         match self.adapter.create_for_fskit(
+            fuse_caller(&header),
             header.nodeid,
             &name,
             input.mode as libc::mode_t,

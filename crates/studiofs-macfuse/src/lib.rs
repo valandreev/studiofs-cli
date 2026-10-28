@@ -2844,6 +2844,7 @@ mod tests {
 
         adapter
             .mkdir(
+                adapter.mount_caller(),
                 studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
                 b"empty-dir",
                 0o755,
@@ -3490,7 +3491,13 @@ mod tests {
             super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
 
         let (attr, open) = adapter
-            .create(root, b".DS_Store", 0o644, libc::O_RDWR)
+            .create(
+                adapter.mount_caller(),
+                root,
+                b".DS_Store",
+                0o644,
+                libc::O_RDWR,
+            )
             .expect("create hidden Finder metadata file");
         assert!(adapter.file_flags_contains_for_test(attr.ino));
         adapter
@@ -3579,7 +3586,13 @@ mod tests {
         let inner = Arc::new(RecordingInvalidator::default());
         let invalidator = adapter.kernel_invalidator_for_test(inner.clone());
         let (attr, writer) = adapter
-            .create(root, b"late-completion.bin", 0o644, libc::O_WRONLY)
+            .create(
+                adapter.mount_caller(),
+                root,
+                b"late-completion.bin",
+                0o644,
+                libc::O_WRONLY,
+            )
             .expect("create file through macFUSE adapter");
         adapter
             .write(attr.ino, writer.file_handle(), 0, b"pending upload")
@@ -4124,6 +4137,7 @@ mod tests {
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
         let result = fixture.runtime().block_on(adapter.symlink(
+            adapter.mount_caller(),
             studiofs_vfs::contract_harness::CONTRACT_ROOT_INO,
             b"canceled-link",
             b"target",
@@ -4155,6 +4169,7 @@ mod tests {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
                 adapter.symlink(
+                    adapter.mount_caller(),
                     u64::MAX,
                     b"link",
                     b"target",
@@ -4186,6 +4201,7 @@ mod tests {
             tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 adapter.symlink_with_retry_timeout(
+                    adapter.mount_caller(),
                     parent.ino,
                     b"child-link",
                     b"target",
@@ -4225,7 +4241,13 @@ mod tests {
         let task_cancellation = cancellation.clone();
         let task = runtime.spawn(async move {
             adapter
-                .symlink(parent.ino, b"child-link", b"target", task_cancellation)
+                .symlink(
+                    adapter.mount_caller(),
+                    parent.ino,
+                    b"child-link",
+                    b"target",
+                    task_cancellation,
+                )
                 .await
         });
         let entered = runtime.block_on(async {
@@ -4274,6 +4296,7 @@ mod tests {
         fixture
             .runtime()
             .block_on(adapter.symlink(
+                adapter.mount_caller(),
                 parent.ino,
                 b"skills",
                 b"../.agents/skills",
