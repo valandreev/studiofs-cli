@@ -303,3 +303,16 @@ int studiofs_macfuse_setattr_flags_mask(void) {
     return 0;
 #endif
 }
+
+int studiofs_macfuse_req_caller(fuse_req_t req, uid_t *uid, gid_t *gid) {
+    if (req == NULL || uid == NULL || gid == NULL) {
+        return 0;
+    }
+    const struct fuse_ctx *ctx = fuse_req_ctx(req);
+    if (ctx == NULL) {
+        return 0;
+    }
+    *uid = ctx->uid;
+    *gid = ctx->gid;
+    return 1;
+}

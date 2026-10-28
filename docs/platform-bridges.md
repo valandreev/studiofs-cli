@@ -870,6 +870,10 @@ the attributes returned by StudioFS. Directory search requires execute
 permission; owner/group checks do not fall through to a more permissive
 class. Root and capability behavior follow the native platform. Existing
 legacy uid/gid zero translation to the mount user remains in effect.
+Because macOS mounts always use `allow_other`, legacy macFUSE `create`,
+`mkdir`, `mknod` and `symlink` record the requesting caller's uid/gid from
+`fuse_req_ctx`, and FSKit records the uid/gid from the request header, so a
+foreign caller owns what it creates.
 FSKit rejects unexpected userspace access requests with `EACCES`.
 
 Native acceptance is a shared 17-row access(2) table, run as a non-root

@@ -390,6 +390,25 @@ unsafe extern "C" {
     pub(crate) fn studiofs_macfuse_setattr_chgtime_mask() -> c_int;
     pub(crate) fn studiofs_macfuse_setattr_bkuptime_mask() -> c_int;
     pub(crate) fn studiofs_macfuse_setattr_flags_mask() -> c_int;
+    fn studiofs_macfuse_req_caller(
+        req: *mut raw::FuseReq,
+        uid: *mut libc::uid_t,
+        gid: *mut libc::gid_t,
+    ) -> c_int;
+}
+
+/// Read the uid/gid of the process that issued `req`, if macFUSE exposes it.
+///
+/// # Safety
+///
+/// `req` must be null or a live macFUSE request that has not been replied to.
+pub(crate) unsafe fn request_caller_ids(req: *mut raw::FuseReq) -> Option<(u32, u32)> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: the shim checks for null and reads `fuse_req_ctx` of the live
+    // request; both out-pointers reference initialized locals.
+    let found = unsafe { studiofs_macfuse_req_caller(req, &mut uid, &mut gid) };
+    (found != 0).then_some((uid, gid))
 }
 
 /// Configure macFUSE connection-level I/O sizing for the low-level bridge.

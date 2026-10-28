@@ -42,7 +42,7 @@ use tracing::{debug, warn};
 
 use crate::low_level::{
     DirectoryEntryBuffer, Entry, OpenReply, Reply, Request, RequestCompletion,
-    catch_callback_unwind, raw,
+    catch_callback_unwind, raw, request_caller_ids,
 };
 
 mod memory_sampler;
@@ -75,6 +75,16 @@ pub(crate) struct MacFuseOpenCachePolicy {
     pub(crate) keep_cache: bool,
     /// Whether this handle can mutate the inode and must participate in writer accounting.
     pub(crate) write_capable: bool,
+}
+
+/// Credentials of the process that issued a namespace-creation request.
+///
+/// macOS mounts always use `allow_other`, so callers other than the mounting
+/// user reach create paths and new inodes must record the caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct MacFuseCaller {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
 }
 
 /// Operation adapter shared by macFUSE callbacks and fast tests.
@@ -1086,8 +1096,31 @@ impl StudioVfsAdapter {
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
+    pub(crate) fn mount_caller(&self) -> MacFuseCaller {
+        MacFuseCaller {
+            uid: self.mount_uid,
+            gid: self.mount_gid,
+        }
+    }
+
+    /// Resolve the caller of a legacy macFUSE request, falling back to the
+    /// mount user when the request carries no context.
+    fn request_caller(&self, req: *mut raw::FuseReq) -> MacFuseCaller {
+        // SAFETY: `req` is null or the live, unreplied request of the current callback.
+        unsafe { request_caller_ids(req) }.map_or_else(
+            || self.mount_caller(),
+            |(uid, gid)| MacFuseCaller { uid, gid },
+        )
+    }
+
     /// Create a directory.
-    pub(crate) fn mkdir(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
+    pub(crate) fn mkdir(
+        &self,
+        caller: MacFuseCaller,
+        parent: u64,
+        name: &[u8],
+        mode: mode_t,
+    ) -> Result<InodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -1096,8 +1129,8 @@ impl StudioVfsAdapter {
             .mkdir_with_deferred_metadata_admission(
                 parent,
                 name,
-                self.mount_uid,
-                self.mount_gid,
+                caller.uid,
+                caller.gid,
                 mode,
                 &self.runtime_handle,
             )
@@ -1110,12 +1143,14 @@ impl StudioVfsAdapter {
     /// Create a symbolic link.
     pub(crate) async fn symlink(
         &self,
+        caller: MacFuseCaller,
         parent: u64,
         name: &[u8],
         target: &[u8],
         cancellation: CancellationToken,
     ) -> Result<InodeAttr, i32> {
         self.symlink_with_retry_timeout(
+            caller,
             parent,
             name,
             target,
@@ -1127,6 +1162,7 @@ impl StudioVfsAdapter {
 
     pub(crate) async fn symlink_with_retry_timeout(
         &self,
+        caller: MacFuseCaller,
         parent: u64,
         name: &[u8],
         target: &[u8],
@@ -1146,16 +1182,19 @@ impl StudioVfsAdapter {
             let vfs = Arc::clone(&self.vfs);
             let attempt_name = Arc::clone(&name);
             let attempt_target = Arc::clone(&target);
-            let mount_uid = self.mount_uid;
-            let mount_gid = self.mount_gid;
             // The local metadata attempt is not cancellable once started; reply
             // teardown drains this task before the session releases requests.
             let attempt = self.runtime_handle.spawn_blocking(move || {
                 // Capture this before the metadata lookup so a parent commit
                 // racing the symlink attempt is still observed by the wait.
                 let parent_progress = vfs.deferred_namespace_metadata_progress(parent);
-                let result =
-                    vfs.symlink(parent, &attempt_name, &attempt_target, mount_uid, mount_gid);
+                let result = vfs.symlink(
+                    parent,
+                    &attempt_name,
+                    &attempt_target,
+                    caller.uid,
+                    caller.gid,
+                );
                 (parent_progress, result)
             });
             let (parent_progress, result) = attempt.await.map_err(|error| {
@@ -1225,24 +1264,26 @@ impl StudioVfsAdapter {
     #[cfg(test)]
     pub(crate) fn create(
         &self,
+        caller: MacFuseCaller,
         parent: u64,
         name: &[u8],
         mode: mode_t,
         flags: i32,
     ) -> Result<(InodeAttr, OpenReply), i32> {
-        let attr = self.create_attr(parent, name, mode)?;
+        let attr = self.create_attr(caller, parent, name, mode)?;
         let open = self.open_created_attr(&attr, flags)?;
         Ok((attr, open))
     }
 
     fn create_for_reply(
         &self,
+        caller: MacFuseCaller,
         parent: u64,
         name: &[u8],
         mode: mode_t,
         flags: i32,
     ) -> Result<(InodeAttr, OpenReply, FuseOpenReplyGuard), i32> {
-        let attr = self.create_attr(parent, name, mode)?;
+        let attr = self.create_attr(caller, parent, name, mode)?;
         let guard = self.open_reply_serializer.lock(attr.ino);
         let open = self.open_created_attr(&attr, flags)?;
         Ok((attr, open, guard))
@@ -1251,17 +1292,24 @@ impl StudioVfsAdapter {
     #[cfg(studiofs_fskit)]
     pub(crate) fn create_for_fskit(
         &self,
+        caller: MacFuseCaller,
         parent: u64,
         name: &[u8],
         mode: mode_t,
         flags: i32,
     ) -> Result<(InodeAttr, OpenReply), i32> {
-        let attr = self.create_attr(parent, name, mode)?;
+        let attr = self.create_attr(caller, parent, name, mode)?;
         let open = self.open_created_attr(&attr, flags)?;
         Ok((attr, open))
     }
 
-    fn create_attr(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
+    fn create_attr(
+        &self,
+        caller: MacFuseCaller,
+        parent: u64,
+        name: &[u8],
+        mode: mode_t,
+    ) -> Result<InodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -1270,8 +1318,8 @@ impl StudioVfsAdapter {
             .create_with_deferred_metadata_admission(
                 parent,
                 name,
-                self.mount_uid,
-                self.mount_gid,
+                caller.uid,
+                caller.gid,
                 mode & 0o7777,
                 &self.runtime_handle,
             )
@@ -1294,7 +1342,13 @@ impl StudioVfsAdapter {
     }
 
     /// Create a regular file through the macFUSE mknod callback.
-    pub(crate) fn mknod(&self, parent: u64, name: &[u8], mode: mode_t) -> Result<InodeAttr, i32> {
+    pub(crate) fn mknod(
+        &self,
+        caller: MacFuseCaller,
+        parent: u64,
+        name: &[u8],
+        mode: mode_t,
+    ) -> Result<InodeAttr, i32> {
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -1307,8 +1361,8 @@ impl StudioVfsAdapter {
             .create_with_deferred_metadata_admission(
                 parent,
                 name,
-                self.mount_uid,
-                self.mount_gid,
+                caller.uid,
+                caller.gid,
                 mode,
                 &self.runtime_handle,
             )
@@ -1563,6 +1617,7 @@ impl StudioVfsAdapter {
     /// kernel delivers the child symlink callback.
     pub(crate) fn queue_symlink_reply(
         self: &Arc<Self>,
+        caller: MacFuseCaller,
         parent: u64,
         name: Vec<u8>,
         target: Vec<u8>,
@@ -1574,7 +1629,10 @@ impl StudioVfsAdapter {
         request.register_interrupt_token(cancellation.clone());
         self.runtime_handle.spawn(async move {
             let _task = task;
-            match adapter.symlink(parent, &name, &target, cancellation).await {
+            match adapter
+                .symlink(caller, parent, &name, &target, cancellation)
+                .await
+            {
                 Ok(attr) => {
                     debug!(
                         parent,
@@ -2724,11 +2782,11 @@ macro_rules! macfuse_callback {
         /// # Safety
         /// Pointers must satisfy macFUSE's callback contract: any non-null
         /// request is live and unreplied; names and structs/buffers are valid for the call.
-        $vis unsafe extern "C" fn $name(raw_request: $req_type, $($arg: $arg_type),*) {
+        $vis unsafe extern "C" fn $name($req: $req_type, $($arg: $arg_type),*) {
             // SAFETY: The callback caller supplies sole ownership of a live request.
-            let request = unsafe { Request::from_raw_with_completion(raw_request, RequestCompletion::$completion) };
+            let request = unsafe { Request::from_raw_with_completion($req, RequestCompletion::$completion) };
             contain_callback_panic(request, $operation, |$pending| {
-                $(let Some($state) = callback_state(raw_request) else { return; };)?
+                $(let Some($state) = callback_state($req) else { return; };)?
                 $body
             });
         }
@@ -3257,6 +3315,7 @@ mod open_cache_snapshot_tests {
 
         let (attr, rejected, reply_guard) = adapter
             .create_for_reply(
+                adapter.mount_caller(),
                 CONTRACT_ROOT_INO,
                 b"rejected-create-reply.bin",
                 0o644,
@@ -3732,7 +3791,8 @@ macfuse_callback! {
         }
         // SAFETY: macFUSE passes a NUL-terminated entry name for mkdir callbacks.
         let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-        match state.adapter.mkdir(parent, name, mode) {
+        let caller = state.adapter.request_caller(req);
+        match state.adapter.mkdir(caller, parent, name, mode) {
             Ok(attr) => {
                 debug!(
                     parent,
@@ -3777,12 +3837,13 @@ macfuse_callback! {
         let target = unsafe { CStr::from_ptr(target) }.to_bytes();
         // SAFETY: macFUSE passes NUL-terminated symlink target and entry name strings.
         let name = unsafe { CStr::from_ptr(name) }.to_bytes();
+        let caller = state.adapter.request_caller(req);
         let Some(request) = pending.take() else {
             return;
         };
         state
             .adapter
-            .queue_symlink_reply(parent, name.to_vec(), target.to_vec(), request);
+            .queue_symlink_reply(caller, parent, name.to_vec(), target.to_vec(), request);
     }
 }
 
@@ -3802,7 +3863,8 @@ macfuse_callback! {
         }
         // SAFETY: macFUSE passes a NUL-terminated entry name for mknod callbacks.
         let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-        match state.adapter.mknod(parent, name, mode) {
+        let caller = state.adapter.request_caller(req);
+        match state.adapter.mknod(caller, parent, name, mode) {
             Ok(attr) => {
                 debug!(
                     parent,
@@ -3849,7 +3911,8 @@ macfuse_callback! {
         let name = unsafe { CStr::from_ptr(name) }.to_bytes();
         // SAFETY: macFUSE passes initialized file info for create callbacks.
         let flags = unsafe { (*fi).flags };
-        match state.adapter.create_for_reply(parent, name, mode, flags) {
+        let caller = state.adapter.request_caller(req);
+        match state.adapter.create_for_reply(caller, parent, name, mode, flags) {
             Ok((attr, open, _reply_guard)) => {
                 debug!(
                     parent,
@@ -5006,6 +5069,43 @@ mod tests {
     }
 
     #[test]
+    fn namespace_creation_records_the_requesting_caller() {
+        let fixture = ContractVfsFixture::new("macfuse-create-caller-owner").expect("fixture");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        let caller = MacFuseCaller {
+            uid: 4242,
+            gid: 4343,
+        };
+        assert_ne!(caller, adapter.mount_caller());
+
+        let (file, open) = adapter
+            .create(caller, ROOT_INO, b"file", 0o600, libc::O_WRONLY)
+            .expect("create as caller");
+        adapter.reject_prepared_open(file.ino, open.file_handle());
+        let dir = adapter
+            .mkdir(caller, ROOT_INO, b"dir", 0o700)
+            .expect("mkdir as caller");
+        let node = adapter
+            .mknod(caller, ROOT_INO, b"node", libc::S_IFREG as mode_t | 0o600)
+            .expect("mknod as caller");
+        let link = fixture
+            .runtime()
+            .block_on(adapter.symlink(caller, ROOT_INO, b"link", b"file", CancellationToken::new()))
+            .expect("symlink as caller");
+
+        for ino in [file.ino, dir.ino, node.ino, link.ino] {
+            let attr = fixture.vfs().getattr(ino).expect("getattr");
+            assert_eq!((attr.uid, attr.gid), (caller.uid, caller.gid), "ino {ino}");
+            let stat = adapter.getattr(ino).expect("adapter getattr");
+            assert_eq!(
+                (stat.st_uid, stat.st_gid),
+                (caller.uid, caller.gid),
+                "ino {ino}"
+            );
+        }
+    }
+
+    #[test]
     fn symlink_wait_releases_blocking_worker_and_stops_on_reply_drain() {
         let fixture = ContractVfsFixture::new("macfuse-symlink-deferred-interrupt")
             .expect("create VFS fixture");
@@ -5025,7 +5125,13 @@ mod tests {
         let task = runtime.spawn(async move {
             let _reply_task = reply_task;
             adapter
-                .symlink(parent.ino, b"child-link", b"target", cancellation)
+                .symlink(
+                    adapter.mount_caller(),
+                    parent.ino,
+                    b"child-link",
+                    b"target",
+                    cancellation,
+                )
                 .await
         });
         runtime
@@ -5067,7 +5173,13 @@ mod tests {
         let fixture = ContractVfsFixture::new("macfuse-flags-orphan").expect("fixture");
         let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
         let (attr, open) = adapter
-            .create(ROOT_INO, b"flags.txt", 0o644, libc::O_RDWR)
+            .create(
+                adapter.mount_caller(),
+                ROOT_INO,
+                b"flags.txt",
+                0o644,
+                libc::O_RDWR,
+            )
             .expect("create file");
         adapter
             .unlink(ROOT_INO, b"flags.txt")
