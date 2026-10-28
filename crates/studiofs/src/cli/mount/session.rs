@@ -464,8 +464,6 @@ fn ensure_allow_other_permitted(allow_other: bool) -> anyhow::Result<()> {
     }
     #[cfg(target_os = "linux")]
     studiofs_linux_fuse::check_allow_other_permitted()?;
-    #[cfg(not(target_os = "linux"))]
-    warn!("--allow-other only affects Linux mounts; ignoring it on this platform");
     Ok(())
 }
 
@@ -496,6 +494,11 @@ impl MountPlan {
         )?;
         let allow_other_mount =
             resolve_allow_other_for_mount(&settings_config, command.allow_other);
+        // A saved Linux default may be shared with other hosts; only an explicit flag warns.
+        #[cfg(not(target_os = "linux"))]
+        if command.allow_other == Some(true) {
+            warn!("--allow-other only affects Linux mounts; ignoring it on this platform");
+        }
         let ResolvedMountConfig { vfs_config } = build_mount_config_from_raw(
             settings_config.vfs,
             command.principal.as_deref(),

@@ -890,6 +890,8 @@ mounter needs the exact line `user_allow_other` in `/etc/fuse.conf`; the
 mount checks this (comments and surrounding whitespace ignored, keyword
 case-sensitive like `fusermount3`) and fails with a `PermissionDenied` error
 naming the missing line before `fusermount3` runs or a detached daemon starts.
+If the mounter cannot read `/etc/fuse.conf` (for example `0640 root:fuse`),
+the check logs a warning and leaves the decision to setuid `fusermount3`.
 Snapshot `smount` sessions never request `allow_other`. The opt-in native
 check probes a `0600` and a `0644` file as a second account through
 `sudo -n -u "${STUDIOFS_ALLOW_OTHER_PROBE_USER:-nobody}"`; that account must be

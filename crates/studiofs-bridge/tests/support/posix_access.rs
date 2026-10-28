@@ -244,17 +244,7 @@ fn run_access_checks(read_only: bool, mfmount: bool) {
     #[cfg(target_os = "linux")]
     let worker = std::thread::spawn(move || studiofs_linux_fuse::mount_with_request(request));
     let result = std::panic::catch_unwind(|| {
-        ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("native mount ready");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::fs::metadata(mount_point.join("owner-read")).is_err() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "mounted lookup did not become ready"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_mounted_entry(&ready_rx, &mount_point.join("owner-read"));
         if read_only {
             let path =
                 CString::new(mount_point.join("owner-read").as_os_str().as_bytes()).expect("path");
@@ -296,33 +286,56 @@ fn run_access_checks(read_only: bool, mfmount: bool) {
     #[cfg(target_os = "macos")]
     let unmount_result = Ok(());
     #[cfg(target_os = "linux")]
-    let unmount_result = std::process::Command::new("fusermount3")
-        .arg("-u")
-        .arg(&mount_point)
-        .status()
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err(std::io::Error::other("fusermount3 unmount failed"))
-            }
-        });
+    let unmount_result = fusermount3_unmount(&mount_point);
     // Always join before interpreting unmount errors, including failed startup.
     let mount_result = worker.join();
+    let directory_result = remove_mount_point(&mount_point);
+    finish_access_test(result, mount_result, unmount_result.and(directory_result));
+}
+
+/// Waits for the ready callback and a successful lookup through the mount.
+fn wait_for_mounted_entry(ready_rx: &std::sync::mpsc::Receiver<()>, entry: &std::path::Path) {
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("native mount ready");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::fs::metadata(entry).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mounted lookup did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fusermount3_unmount(mount_point: &std::path::Path) -> std::io::Result<()> {
+    let status = std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg(mount_point)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("fusermount3 unmount failed"))
+    }
+}
+
+/// Removes the mount point, tolerating a bounded EBUSY window after unmount.
+fn remove_mount_point(mount_point: &std::path::Path) -> std::io::Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let directory_result = loop {
-        match std::fs::remove_dir(&mount_point) {
-            Ok(()) => break Ok(()),
+    loop {
+        match std::fs::remove_dir(mount_point) {
+            Ok(()) => return Ok(()),
             Err(error)
                 if error.raw_os_error() == Some(libc::EBUSY)
                     && std::time::Instant::now() < deadline =>
             {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(error) => break Err(error),
+            Err(error) => return Err(error),
         }
-    };
-    finish_access_test(result, mount_result, unmount_result.and(directory_result));
+    }
 }
 
 /// Second local account used to probe an `allow_other` mount.
@@ -371,17 +384,7 @@ fn mounted_allow_other_applies_mode_bits_to_foreign_users() {
     });
     let worker = std::thread::spawn(move || studiofs_linux_fuse::mount_with_request(request));
     let result = std::panic::catch_unwind(|| {
-        ready_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("native mount ready");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::fs::metadata(mount_point.join("owner-only")).is_err() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "mounted lookup did not become ready"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for_mounted_entry(&ready_rx, &mount_point.join("owner-only"));
         // Without allow_other the kernel denies every foreign lookup, so a
         // successful stat of the 0600 file proves the mount admits the caller.
         let stat = run_as_probe_user(&probe_user, &["stat", "--"], &mount_point.join("owner-only"));
@@ -405,20 +408,10 @@ fn mounted_allow_other_applies_mode_bits_to_foreign_users() {
             "0600 must fail with EACCES; stderr: {stderr}"
         );
     });
-    let unmount_result = std::process::Command::new("fusermount3")
-        .arg("-u")
-        .arg(&mount_point)
-        .status()
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err(std::io::Error::other("fusermount3 unmount failed"))
-            }
-        });
+    let unmount_result = fusermount3_unmount(&mount_point);
     // Always join before interpreting unmount errors, including failed startup.
     let mount_result = worker.join();
-    let directory_result = std::fs::remove_dir(&mount_point);
+    let directory_result = remove_mount_point(&mount_point);
     finish_access_test(result, mount_result, unmount_result.and(directory_result));
 }
 

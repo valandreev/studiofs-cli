@@ -267,7 +267,8 @@ impl fmt::Display for AllowOtherPreflightError {
             Self::MissingUserAllowOther { path } => write!(
                 f,
                 "allow_other mounts by a non-root user require the line `user_allow_other` in {}; \
-                 add it (as root) or mount without --allow-other",
+                 add it (as root), or disable allow_other for this mount \
+                 (`--allow-other=false` also overrides a saved `studiofs settings` default)",
                 path.display()
             ),
             Self::UnreadableConfig { path, source } => write!(
@@ -310,9 +311,19 @@ fn check_allow_other_config(euid: u32, path: &Path) -> Result<(), AllowOtherPref
     if euid == 0 {
         return Ok(());
     }
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
+    let contents = match std::fs::read(path) {
+        // fusermount3 parses bytes; non-UTF-8 comments must not hide the keyword.
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            // Setuid-root fusermount3 can read a config this user cannot
+            // (for example 0640 root:fuse), so let it make the decision.
+            tracing::warn!(
+                path = %path.display(),
+                "cannot read FUSE configuration to preflight allow_other; deferring to fusermount3"
+            );
+            return Ok(());
+        }
         Err(source) => {
             return Err(AllowOtherPreflightError::UnreadableConfig {
                 path: path.to_path_buf(),
@@ -387,6 +398,47 @@ mod tests {
             std::io::Error::from(error).kind(),
             std::io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn allow_other_preflight_reads_non_utf8_config() {
+        let temp = studiofs_test_support::workspace_target_tempdir("fuse-conf-");
+        let path = temp.path().join("fuse.conf");
+        std::fs::write(&path, b"# caf\xe9 render nodes\nuser_allow_other\n").expect("write");
+
+        super::check_allow_other_config(1000, &path).expect("non-UTF-8 comment is ignored");
+    }
+
+    #[test]
+    fn allow_other_preflight_defers_unreadable_config_to_fusermount3() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root bypasses file mode checks");
+            return;
+        }
+        let temp = studiofs_test_support::workspace_target_tempdir("fuse-conf-");
+        let path = temp.path().join("fuse.conf");
+        std::fs::write(&path, "").expect("write fuse.conf");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("make fuse.conf unreadable");
+
+        super::check_allow_other_config(1000, &path)
+            .expect("unreadable config defers to setuid fusermount3");
+    }
+
+    #[test]
+    fn allow_other_preflight_reports_other_read_failures() {
+        let temp = studiofs_test_support::workspace_target_tempdir("fuse-conf-");
+
+        let error = super::check_allow_other_config(1000, temp.path())
+            .expect_err("a directory is not a readable config");
+
+        assert!(matches!(
+            error,
+            super::AllowOtherPreflightError::UnreadableConfig { .. }
+        ));
     }
 
     #[test]
