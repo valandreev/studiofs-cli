@@ -102,13 +102,6 @@ impl HandleTable {
         Some((open_file.clone(), previous, owner_token))
     }
 
-    /// Refresh the attribute snapshot carried by an already-open handle.
-    pub(super) fn update_open_attr(&self, fh: u64, attr: InodeAttr) {
-        if let Some(open_file) = self.handles.read().handles.get(&fh) {
-            open_file.set_open_attr(attr);
-        }
-    }
-
     /// Refresh the attribute snapshot carried by every handle for an inode.
     pub(super) fn update_open_attrs_for_inode(&self, ino: Ino, attr: &InodeAttr) {
         let handles = self.handles.read();

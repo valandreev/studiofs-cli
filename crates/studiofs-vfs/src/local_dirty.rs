@@ -1076,6 +1076,54 @@ impl<'a> LocalDirtyFlushSession<'a> {
             .collect()
     }
 
+    fn clip_pending_slices_to_eof(
+        pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+        eof: u64,
+    ) -> std::collections::BTreeMap<u64, Vec<PendingDirtySlice>> {
+        let mut retained = std::collections::BTreeMap::new();
+        for (chunk_id, slices) in pending_slices {
+            let chunk_start = studiofs_meta::schema::chunk_start_offset(
+                studiofs_meta::schema::ChunkId(*chunk_id),
+                studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+            );
+            let visible_chunk_end = u32::try_from(
+                eof.saturating_sub(chunk_start)
+                    .min(u64::from(studiofs_meta::schema::DEFAULT_CHUNK_SIZE)),
+            )
+            .unwrap_or(studiofs_meta::schema::DEFAULT_CHUNK_SIZE);
+            for slice in slices {
+                if slice.range.start >= visible_chunk_end {
+                    continue;
+                }
+
+                let mut clipped = *slice;
+                clipped.range.end = clipped.range.end.min(visible_chunk_end);
+                retained
+                    .entry(*chunk_id)
+                    .or_insert_with(Vec::new)
+                    .push(clipped);
+            }
+        }
+        retained
+    }
+
+    fn pending_slices_for_objects(
+        pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+        object_ids: &std::collections::BTreeSet<u64>,
+    ) -> std::collections::BTreeMap<u64, Vec<PendingDirtySlice>> {
+        pending_slices
+            .iter()
+            .filter_map(|(chunk_id, slices)| {
+                let unretained_slices = slices
+                    .iter()
+                    .filter(|slice| slice.object_id.is_some_and(|id| object_ids.contains(&id)))
+                    .copied()
+                    .collect::<Vec<_>>();
+                (!unretained_slices.is_empty()).then_some((*chunk_id, unretained_slices))
+            })
+            .collect()
+    }
+
     async fn cleanup_stale_pending_slice_objects(
         &self,
         pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
@@ -1197,6 +1245,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
         let mut content_epoch = content_epoch;
         let mut attr_to_persist = attr_to_persist;
         let mut rebased_dirty_attr = None;
+        let mut commit_slices = pending_slices.clone();
         match self.vfs.sync_meta().get_attr(self.ino) {
             Ok(current_attr)
                 if current_attr.content_epoch == content_epoch
@@ -1241,9 +1290,56 @@ impl<'a> LocalDirtyFlushSession<'a> {
                     // local view and must be rebased instead of discarded.
                     content_epoch = current_attr.content_epoch;
                     attr_to_persist = Some(current_attr);
-                } else {
-                    self.cleanup_stale_pending_slice_objects(&pending_slices, "metadata-precheck")
+                } else if visible_end > current_attr.size
+                    && current_attr.upload_state == MetaUploadState::Uploading
+                    && current_attr.committed_size == 0
+                    && current_attr.committed_content_epoch == 0
+                {
+                    // A newer unpublished EOF owns the visible size, but it
+                    // does not invalidate accepted bytes inside that EOF. Keep
+                    // the in-range portion and retire only objects no retained
+                    // slice still references.
+                    let clipped_slices =
+                        Self::clip_pending_slices_to_eof(&pending_slices, current_attr.size);
+                    let retained_object_ids = Self::pending_slice_object_ids(&clipped_slices)
+                        .into_iter()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    let discarded_object_ids = Self::pending_slice_object_ids(&pending_slices)
+                        .into_iter()
+                        .filter(|object_id| !retained_object_ids.contains(object_id))
+                        .collect::<std::collections::BTreeSet<_>>();
+                    if !discarded_object_ids.is_empty() {
+                        let unretained_slices = Self::pending_slices_for_objects(
+                            &pending_slices,
+                            &discarded_object_ids,
+                        );
+                        self.cleanup_stale_pending_slice_objects(
+                            &unretained_slices,
+                            "metadata-precheck-uploading-eof-tail",
+                        )
                         .await;
+                    }
+
+                    rebased_dirty_attr = attr_to_persist.clone();
+                    commit_slices = clipped_slices;
+                    content_epoch = current_attr.content_epoch;
+                    attr_to_persist = Some(current_attr);
+                    if commit_slices.is_empty() {
+                        if let (Some(expected), Some(replacement)) =
+                            (rebased_dirty_attr.as_ref(), attr_to_persist.as_ref())
+                        {
+                            self.replace_dirty_attr_if_matches(expected, replacement);
+                        }
+                        self.vfs
+                            .commit_pending_local_dirty_slices(self.ino, &pending_slices);
+                        return Ok(());
+                    }
+                } else {
+                    self.cleanup_stale_pending_slice_objects(
+                        &pending_slices,
+                        "metadata-precheck-epoch-advanced-visible-end-above-size",
+                    )
+                    .await;
                     self.vfs
                         .commit_pending_local_dirty_slices(self.ino, &pending_slices);
                     return Ok(());
@@ -1251,8 +1347,11 @@ impl<'a> LocalDirtyFlushSession<'a> {
             }
             Ok(_) => {}
             Err(studiofs_meta::MetaError::InodeNotFound(_)) => {
-                self.cleanup_stale_pending_slice_objects(&pending_slices, "metadata-precheck")
-                    .await;
+                self.cleanup_stale_pending_slice_objects(
+                    &pending_slices,
+                    "metadata-precheck-inode-missing",
+                )
+                .await;
                 self.vfs
                     .commit_pending_local_dirty_slices(self.ino, &pending_slices);
                 return Ok(());
@@ -1262,9 +1361,9 @@ impl<'a> LocalDirtyFlushSession<'a> {
 
         let chunk_slices =
             self.drain
-                .build_overlay_slice_records(self.ino, &[], pending_slices.clone())?;
+                .build_overlay_slice_records(self.ino, &[], commit_slices.clone())?;
         let mut attr_to_clear =
-            self.attr_for_pending_slice_commit(&pending_slices, content_epoch, attr_to_persist)?;
+            self.attr_for_pending_slice_commit(&commit_slices, content_epoch, attr_to_persist)?;
         // These slices are submitted for upload below, so redb must commit first.
         let mut committed_attr = self
             .drain
@@ -1293,7 +1392,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
                     Err(error) => return Err(VfsError::Meta(error)),
                 };
                 attr_to_clear = self.rebase_pending_slice_commit_attr(
-                    &pending_slices,
+                    &commit_slices,
                     content_epoch,
                     current_attr,
                 )?;
