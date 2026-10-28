@@ -1731,6 +1731,7 @@ impl StudioVfs {
             self.record_vfs_write_record_writer_stack_state(record_writer_stack_started.elapsed());
 
             if local_sync_policy.requires_write_path_durability() {
+                drain_after_write = true;
                 self.wait_for_deferred_materialization_inflight(ino).await;
                 let materialize_strict_started = Instant::now();
                 // This starts with the target inode, then only drains other dirty
@@ -1772,21 +1773,28 @@ impl StudioVfs {
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         if result.is_ok() && drain_after_write {
-            for dirty_ino in self.state.writer_stack.snapshot_dirty_inodes_by_bytes() {
-                if self.total_pending_write_buffer_bytes() <= self.max_dirty_bytes() {
-                    break;
-                }
-                let cleanup = self.file_session_cleanup(dirty_ino);
-                let permit = self
-                    .state
-                    .file_session
-                    .enter_op(dirty_ino, FileSessionOperation::Materialize)
-                    .await;
-                let _session = cleanup.with_permit(permit);
-                self.materialize_writer_stack_for_inode(dirty_ino).await?;
-            }
+            self.drain_writer_stack_budget_after_write().await?;
         }
         result
+    }
+
+    /// Waits for busy inodes skipped by the nonblocking limits sweep, once the
+    /// writing inode's gate is released, so the global dirty budget still applies.
+    async fn drain_writer_stack_budget_after_write(&self) -> VfsResult<()> {
+        for dirty_ino in self.state.writer_stack.snapshot_dirty_inodes_by_bytes() {
+            if self.total_pending_write_buffer_bytes() <= self.max_dirty_bytes() {
+                break;
+            }
+            let cleanup = self.file_session_cleanup(dirty_ino);
+            let permit = self
+                .state
+                .file_session
+                .enter_op(dirty_ino, FileSessionOperation::Materialize)
+                .await;
+            let _session = cleanup.with_permit(permit);
+            self.materialize_writer_stack_for_inode(dirty_ino).await?;
+        }
+        Ok(())
     }
 
     /// Write with deferred materialization for high-throughput streaming writes.
@@ -2023,6 +2031,9 @@ impl StudioVfs {
 
         drop(session);
         self.state.file_session.gc_if_idle(ino);
+        if result.is_ok() && local_sync_policy.requires_write_path_durability() {
+            self.drain_writer_stack_budget_after_write().await?;
+        }
         result
     }
 

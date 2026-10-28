@@ -330,12 +330,23 @@ impl MetaPayloadObjects for RedbMetaEngine {
 
     fn get_regular_file_chunk_ids(&self, ino: Ino) -> MetaResult<Vec<ChunkId>> {
         let txn = self.begin_read_txn()?;
+        let prefix = regular_file_chunk_prefix(ino);
         let mut ids = std::collections::BTreeSet::new();
-        for table in [REGULAR_FILE_BASE_TABLE, REGULAR_FILE_OVERLAY_TABLE] {
-            ids.extend(
-                Self::regular_file_chunk_states_for_inode_in_read_txn(&txn, table, ino)?
-                    .into_keys(),
-            );
+        for table_def in [REGULAR_FILE_BASE_TABLE, REGULAR_FILE_OVERLAY_TABLE] {
+            let table = txn
+                .open_table(table_def)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            // Keys alone identify stored chunks; decoding chunk states is unnecessary.
+            for row in table
+                .range(prefix.as_ref()..)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                if !key.value().starts_with(prefix.as_ref()) {
+                    break;
+                }
+                ids.insert(decode_regular_file_chunk_key(key.value())?.1);
+            }
         }
         Ok(ids.into_iter().collect())
     }
