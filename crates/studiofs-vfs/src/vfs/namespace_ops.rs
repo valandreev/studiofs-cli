@@ -407,6 +407,9 @@ impl StudioVfs {
         let ino = op.ino();
         affected_inodes.insert(ino);
         inner.errors.insert(ino, Arc::clone(error));
+        // Every operation for an abandoned inode is abandoned together, so drop its
+        // deferred attr now rather than when the backlog settles after the batch.
+        inner.attrs.remove(&ino);
         match op {
             DeferredNamespaceOp::CreateFile { parent, name, .. } => {
                 inner
@@ -426,7 +429,6 @@ impl StudioVfs {
             }
             DeferredNamespaceOp::SetAttr { .. } => {}
         }
-        Self::settle_deferred_namespace_op_backlog(inner, op);
     }
 
     /// Record that `op` left the deferred backlog by committing, failing, or being dropped.
@@ -441,10 +443,18 @@ impl StudioVfs {
             .saturating_sub(Self::deferred_namespace_op_estimated_bytes(op));
     }
 
+    /// Fail `ops` and their queued dependents, returning how many came from the queue.
+    ///
+    /// Nothing settles here: a barrier compares the global settled count with
+    /// its cutoff, so operations must settle in admission order. `ops` move
+    /// into `unsettled` for the drainer to settle after the rest of their batch.
+    /// Queued dependents get their error and cleanup now but stay queued, and
+    /// the drainer settles them when it pops them behind earlier operations.
     fn abandon_failed_deferred_namespace_batch(
         &self,
-        ops: &[DeferredNamespaceOp],
+        ops: Vec<DeferredNamespaceOp>,
         error: &VfsError,
+        unsettled: &mut Vec<DeferredNamespaceOp>,
     ) -> usize {
         let error: Arc<str> = Arc::from(error.to_string());
         let cleanup_owner = self.state.namespace.deferred.upgrade_owner();
@@ -462,7 +472,14 @@ impl StudioVfs {
         let mut queued_abandoned = 0;
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
-            for op in ops {
+            for op in &ops {
+                // The permanent-failure path also passes queued operations an
+                // earlier conflict abandoned; keep their original error.
+                if !affected_inodes.contains(&op.ino())
+                    && Self::deferred_namespace_op_abandoned(&inner, op)
+                {
+                    continue;
+                }
                 self.settle_abandoned_deferred_namespace_op(
                     &mut inner,
                     op,
@@ -477,7 +494,11 @@ impl StudioVfs {
                 let Some(op) = inner.queue.pop_front() else {
                     break;
                 };
-                if Self::deferred_namespace_op_depends_on(&op, &abandoned_inodes) {
+                let abandoned_earlier = !affected_inodes.contains(&op.ino())
+                    && Self::deferred_namespace_op_abandoned(&inner, &op);
+                if !abandoned_earlier
+                    && Self::deferred_namespace_op_depends_on(&op, &abandoned_inodes)
+                {
                     abandoned_inodes.insert(op.ino());
                     self.settle_abandoned_deferred_namespace_op(
                         &mut inner,
@@ -488,9 +509,8 @@ impl StudioVfs {
                         &mut affected_parents,
                     );
                     queued_abandoned += 1;
-                } else {
-                    inner.queue.push_back(op);
                 }
+                inner.queue.push_back(op);
             }
             if cleanup_owner.is_some() {
                 inner
@@ -577,7 +597,33 @@ impl StudioVfs {
             );
         }
         self.state.namespace.deferred.notify.notify_waiters();
+        unsettled.extend(ops);
         queued_abandoned
+    }
+
+    /// Return whether `op` was abandoned while queued and stays queued only to settle in order.
+    ///
+    /// An abandoned inode keeps its error, and admission rejects new operations
+    /// for it, so any queued operation whose inode has a stored error is abandoned.
+    fn deferred_namespace_op_abandoned(
+        inner: &DeferredNamespaceInner,
+        op: &DeferredNamespaceOp,
+    ) -> bool {
+        inner.errors.contains_key(&op.ino())
+    }
+
+    /// Move operations abandoned while queued from `batch` into `abandoned`.
+    fn take_abandoned_deferred_namespace_ops(
+        &self,
+        batch: &mut Vec<DeferredNamespaceOp>,
+        abandoned: &mut Vec<DeferredNamespaceOp>,
+    ) {
+        let inner = self.state.namespace.deferred.inner.lock();
+        let (stale, live): (Vec<_>, Vec<_>) = std::mem::take(batch)
+            .into_iter()
+            .partition(|op| Self::deferred_namespace_op_abandoned(&inner, op));
+        *batch = live;
+        abandoned.extend(stale);
     }
 
     pub(super) async fn wait_for_deferred_namespace_metadata(&self, ino: Ino) -> VfsResult<()> {
@@ -1019,8 +1065,9 @@ impl StudioVfs {
             }
 
             let mut attempts = 0;
-            let mut dropped_setattrs = Vec::new();
-            loop {
+            let mut settle_after_batch = Vec::new();
+            self.take_abandoned_deferred_namespace_ops(&mut batch, &mut settle_after_batch);
+            while !batch.is_empty() {
                 let result = self.commit_deferred_namespace_batch(&batch).await;
                 match result {
                     Ok(committed_attrs) => {
@@ -1044,22 +1091,20 @@ impl StudioVfs {
                                     batch.push(op);
                                 }
                             }
+                            let batch_abandoned = abandoned_operations.len();
                             let queued_abandoned = self.abandon_failed_deferred_namespace_batch(
-                                &abandoned_operations,
+                                abandoned_operations,
                                 &error,
+                                &mut settle_after_batch,
                             );
                             warn!(
                                 error = %error,
                                 conflict_index,
-                                abandoned_operations = abandoned_operations.len()
-                                    + queued_abandoned,
+                                abandoned_operations = batch_abandoned + queued_abandoned,
                                 queued_abandoned_operations = queued_abandoned,
                                 remaining_operations = batch.len(),
                                 "deferred namespace metadata operations lost a concurrent namespace conflict; retrying independent operations without degrading mount"
                             );
-                            if batch.is_empty() {
-                                break;
-                            }
                             continue;
                         }
                         if let Some(deleted_ino) =
@@ -1068,7 +1113,7 @@ impl StudioVfs {
                             let dropped_operations = Self::take_deleted_inode_deferred_setattrs(
                                 &mut batch,
                                 deleted_ino,
-                                &mut dropped_setattrs,
+                                &mut settle_after_batch,
                             );
                             debug!(
                                 ino = deleted_ino,
@@ -1076,9 +1121,6 @@ impl StudioVfs {
                                 remaining_operations = batch.len(),
                                 "dropped deferred setattr for an inode deleted before commit"
                             );
-                            if batch.is_empty() {
-                                break;
-                            }
                             continue;
                         }
                         attempts += 1;
@@ -1093,7 +1135,11 @@ impl StudioVfs {
                             );
                             let failed_operations = batch.len() + queued.len();
                             batch.extend(queued);
-                            self.abandon_failed_deferred_namespace_batch(&batch, &error);
+                            self.abandon_failed_deferred_namespace_batch(
+                                std::mem::take(&mut batch),
+                                &error,
+                                &mut settle_after_batch,
+                            );
                             error!(
                                 error = %error,
                                 operations = failed_operations,
@@ -1112,9 +1158,9 @@ impl StudioVfs {
                     }
                 }
             }
-            // Settle drops only after the rest of their batch settled, so the
-            // settled count never passes operations still awaiting commit.
-            self.settle_dropped_deferred_setattrs(&dropped_setattrs);
+            // Settle drops and abandons only after the rest of their batch settled,
+            // so the settled count never passes operations still awaiting commit.
+            self.settle_deferred_namespace_ops_after_batch(&settle_after_batch);
         }
     }
 
@@ -1175,19 +1221,19 @@ impl StudioVfs {
         dropped.len() - before
     }
 
-    /// Settle `SetAttr` operations dropped because their inode was deleted.
-    fn settle_dropped_deferred_setattrs(&self, dropped: &[DeferredNamespaceOp]) {
-        if dropped.is_empty() {
+    /// Settle operations dropped for a deleted inode or abandoned during their batch.
+    fn settle_deferred_namespace_ops_after_batch(&self, ops: &[DeferredNamespaceOp]) {
+        if ops.is_empty() {
             return;
         }
         {
             let mut inner = self.state.namespace.deferred.inner.lock();
-            for op in dropped {
+            for op in ops {
                 Self::settle_deferred_namespace_op_backlog(&mut inner, op);
             }
         }
-        // Deleted-inode cleanup owns the remaining runtime state for these inodes.
-        self.invalidate_attr_read_cache(dropped.iter().map(DeferredNamespaceOp::ino));
+        // Deleted-inode and abandon cleanup own the remaining runtime state for these inodes.
+        self.invalidate_attr_read_cache(ops.iter().map(DeferredNamespaceOp::ino));
         self.state.namespace.deferred.notify.notify_waiters();
     }
 
@@ -3685,12 +3731,112 @@ mod tests {
             assert!(inner.pending_inodes.contains_key(&deleted.ino));
         }
 
-        vfs.settle_dropped_deferred_setattrs(&dropped);
+        vfs.settle_deferred_namespace_ops_after_batch(&dropped);
         let inner = vfs.state.namespace.deferred.inner.lock();
         assert_eq!(inner.settled_operations, settled_before + 2);
         assert!(!inner.pending_inodes.contains_key(&deleted.ino));
         assert!(inner.pending_inodes.contains_key(&live.ino));
         assert_eq!(inner.backlog_operations, 1);
+    }
+
+    #[test]
+    fn conflict_abandoned_ops_settle_only_after_their_batch() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("conflict-abandon-settle-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "conflict-abandon-settle");
+        let live = InodeAttr::new_file(9_000_911, ROOT_INO, 0, 0, 0o644);
+        let conflicted = InodeAttr::new_file(9_000_912, ROOT_INO, 0, 0, 0o644);
+        let setattr = || DeferredNamespaceOp::SetAttr {
+            attr: conflicted.clone(),
+            args: SetattrArgs {
+                mode: Some(0o600),
+                ..SetattrArgs::default()
+            },
+        };
+        let independent = InodeAttr::new_file(9_000_913, ROOT_INO, 0, 0, 0o644);
+        for (attr, name) in [
+            (&live, b"live.txt"),
+            (&conflicted, b"lost.txt"),
+            (&independent, b"next.txt"),
+        ] {
+            vfs.enqueue_deferred_namespace_op(
+                Some(DeferredNamespaceKey::new(ROOT_INO, name)),
+                attr.clone(),
+                DeferredNamespaceOp::CreateFile {
+                    attr: attr.clone(),
+                    parent: ROOT_INO,
+                    name: name.to_vec(),
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o644,
+                },
+            )
+            .expect("admit deferred create");
+        }
+        for _ in 0..2 {
+            vfs.enqueue_deferred_namespace_op(None, conflicted.clone(), setattr())
+                .expect("admit deferred setattr");
+        }
+        // The batch holds the live and conflicted creates plus the first setattr;
+        // the independent create and the second setattr stay queued, in that order.
+        let mut batch: Vec<_> = {
+            let mut inner = vfs.state.namespace.deferred.inner.lock();
+            let mut batch: Vec<_> = inner.queue.drain(..2).collect();
+            let independent_op = inner.queue.pop_front().expect("independent create");
+            batch.extend(inner.queue.pop_front());
+            inner.queue.push_front(independent_op);
+            batch
+        };
+        let abandoned = batch.split_off(1);
+        let settled_before = vfs.state.namespace.deferred.inner.lock().settled_operations;
+
+        let _guard = rt.enter();
+        let mut unsettled = Vec::new();
+        let queued_abandoned = vfs.abandon_failed_deferred_namespace_batch(
+            abandoned,
+            &VfsError::Other("entry already exists".to_string()),
+            &mut unsettled,
+        );
+
+        assert_eq!(queued_abandoned, 1);
+        // Only the in-batch operations wait for the batch; the queued setattr
+        // follows the still-queued independent create.
+        assert_eq!(unsettled.len(), 2);
+        {
+            let inner = vfs.state.namespace.deferred.inner.lock();
+            // A barrier compares this count with its cutoff; it must not move
+            // while the live create still awaits its commit.
+            assert_eq!(inner.settled_operations, settled_before);
+            assert_eq!(inner.queue.len(), 2);
+            assert!(inner.errors.contains_key(&conflicted.ino));
+            assert!(!inner.attrs.contains_key(&conflicted.ino));
+            assert!(inner.pending_inodes.contains_key(&conflicted.ino));
+        }
+
+        vfs.settle_deferred_namespace_ops_after_batch(&unsettled);
+        assert_eq!(
+            vfs.state.namespace.deferred.inner.lock().settled_operations,
+            settled_before + 2
+        );
+        assert_eq!(batch.len(), 1);
+
+        // The next batch commits the independent create and settles the
+        // abandoned setattr behind it.
+        let mut next = Vec::new();
+        vfs.pop_deferred_namespace_batch(DEFERRED_NAMESPACE_BATCH_MAX_OPERATIONS, None, &mut next);
+        let mut abandoned_queued = Vec::new();
+        vfs.take_abandoned_deferred_namespace_ops(&mut next, &mut abandoned_queued);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].ino(), independent.ino);
+        assert_eq!(abandoned_queued.len(), 1);
+        assert_eq!(abandoned_queued[0].ino(), conflicted.ino);
+
+        vfs.settle_deferred_namespace_ops_after_batch(&abandoned_queued);
+        let inner = vfs.state.namespace.deferred.inner.lock();
+        assert_eq!(inner.settled_operations, settled_before + 3);
+        assert!(!inner.pending_inodes.contains_key(&conflicted.ino));
+        assert!(inner.pending_inodes.contains_key(&live.ino));
+        assert!(inner.pending_inodes.contains_key(&independent.ino));
+        assert_eq!(inner.backlog_operations, 2);
     }
 
     #[test]
