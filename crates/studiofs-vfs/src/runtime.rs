@@ -496,6 +496,7 @@ impl<M: ?Sized + MetaPayloadObjects> MetaPayloadObjects for RuntimeMetaHandle<M>
     forward_method!(
         fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>>
     );
+    forward_method!(fn get_regular_file_chunk_ids(&self, ino: Ino) -> MetaResult<Vec<ChunkId>>);
     forward_method!(
         fn has_regular_file_overlay_object_if_matches(
             &self,

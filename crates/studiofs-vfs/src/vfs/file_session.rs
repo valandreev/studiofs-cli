@@ -581,6 +581,36 @@ pub(super) struct FileSessionPermit {
     op: FileSessionOperation,
 }
 
+pub(super) struct FileSessionCleanup {
+    state: Arc<super::VfsState>,
+    ino: Ino,
+    permit: Option<FileSessionPermit>,
+}
+
+impl FileSessionCleanup {
+    pub(super) fn with_permit(mut self, permit: FileSessionPermit) -> Self {
+        self.permit = Some(permit);
+        self
+    }
+}
+
+impl Drop for FileSessionCleanup {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        self.state.file_session.gc_if_idle(self.ino);
+    }
+}
+
+impl super::StudioVfs {
+    pub(super) fn file_session_cleanup(&self, ino: Ino) -> FileSessionCleanup {
+        FileSessionCleanup {
+            state: self.state.clone(),
+            ino,
+            permit: None,
+        }
+    }
+}
+
 struct FileSessionQueueGuard<'a> {
     session: &'a FileSessionEntry,
     counters: &'a FileSessionCounters,

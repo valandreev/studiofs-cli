@@ -328,6 +328,18 @@ impl MetaPayloadObjects for RedbMetaEngine {
         Ok(ids.into_iter().collect())
     }
 
+    fn get_regular_file_chunk_ids(&self, ino: Ino) -> MetaResult<Vec<ChunkId>> {
+        let txn = self.begin_read_txn()?;
+        let mut ids = std::collections::BTreeSet::new();
+        for table in [REGULAR_FILE_BASE_TABLE, REGULAR_FILE_OVERLAY_TABLE] {
+            ids.extend(
+                Self::regular_file_chunk_states_for_inode_in_read_txn(&txn, table, ino)?
+                    .into_keys(),
+            );
+        }
+        Ok(ids.into_iter().collect())
+    }
+
     fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>> {
         let txn = self.begin_read_txn()?;
         let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_read_txn(

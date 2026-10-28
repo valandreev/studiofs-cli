@@ -1589,6 +1589,98 @@ mod tests {
     }
 
     #[test]
+    fn trim_local_payload_staging_trims_persisted_slices_without_pending_payload() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "trim-persisted-pending-slices");
+        let ino = 78;
+        let block_index = 3;
+        let chunk_id = 0;
+        vfs.insert_pending_local_dirty_slice_entries(
+            ino,
+            vec![
+                (
+                    chunk_id,
+                    PendingDirtySlice::persisted(
+                        studiofs_meta::schema::SliceRange::new(100, 106)
+                            .expect("clipped slice range"),
+                        block_index,
+                        2,
+                        10,
+                        123,
+                        0,
+                    ),
+                ),
+                (
+                    chunk_id,
+                    PendingDirtySlice::persisted(
+                        studiofs_meta::schema::SliceRange::new(200, 203)
+                            .expect("discarded slice range"),
+                        block_index,
+                        5,
+                        11,
+                        124,
+                        0,
+                    ),
+                ),
+            ],
+        );
+
+        assert!(
+            !vfs.state
+                .local_dirty
+                .pending_payloads
+                .lock()
+                .contains_key(&(ino, block_index)),
+            "persisted slices should not need a buffered pending payload"
+        );
+        assert_eq!(
+            vfs.state
+                .local_dirty
+                .pending_persisted_slice_bytes
+                .load(Ordering::Relaxed),
+            9
+        );
+
+        assert!(
+            !vfs.trim_local_payload_staging(ino, block_index, 5)
+                .expect("trim persisted pending slices"),
+            "the return value reports whether mutable payload bytes changed"
+        );
+
+        let pending = vfs.state.local_dirty.pending_chunk_slices.lock();
+        let remaining = pending
+            .get(&ino)
+            .and_then(|chunks| chunks.get(&chunk_id))
+            .expect("the clipped persisted slice should remain");
+        assert_eq!(remaining.len(), 1, "the out-of-EOF slice should be dropped");
+        assert_eq!(remaining[0].range.start, 100);
+        assert_eq!(remaining[0].range.end, 103);
+        assert_eq!(remaining[0].block_offset, 2);
+        assert_eq!(
+            vfs.state
+                .local_dirty
+                .pending_persisted_slice_bytes
+                .load(Ordering::Relaxed),
+            3,
+            "persisted-byte accounting should retain only the clipped prefix"
+        );
+        assert_eq!(
+            vfs.state
+                .local_dirty
+                .pending_slice_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            vfs.state
+                .local_dirty
+                .pending_persisted_slice_count
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
     fn snapshot_pending_dirty_slice_read_spans_handles_boundaries_and_offsets() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "snapshot-pending-slices");

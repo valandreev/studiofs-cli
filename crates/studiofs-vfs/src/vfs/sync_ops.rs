@@ -7,6 +7,7 @@ use super::{
     VfsResult,
 };
 use bytes::Bytes;
+use futures::FutureExt;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -1691,15 +1692,11 @@ impl StudioVfs {
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
         let _sync_safety_activity = self.state.sync_safety_activity.begin();
-        // `session` is wrapped in Option so we can release it early for opportunistic writes
-        // before local-disk materialization. Durability-required writes hold the gate through
-        // all I/O to maintain ordering guarantees with concurrent flushes on the same inode.
-        let mut session = Some(
-            self.state
-                .file_session
-                .enter_op(ino, FileSessionOperation::Write)
-                .await,
-        );
+        let session = self
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Write)
+            .await;
         let open_file = self.enforce_mutating_handle_access(fh, ino).ok();
         let _ = self.state.read.observe_write_access(
             open_file.as_ref(),
@@ -1708,6 +1705,7 @@ impl StudioVfs {
             data.len(),
             self.access_tracker,
         );
+        let mut drain_after_write = false;
         let result = async {
             self.enforce_write_access_for_handle(fh, ino)?;
             if data.is_empty() {
@@ -1731,18 +1729,6 @@ impl StudioVfs {
                 .record_writer_stack_state_bytes(fh, ino, offset, data)
                 .await?;
             self.record_vfs_write_record_writer_stack_state(record_writer_stack_started.elapsed());
-
-            // Release the per-inode write gate before local-disk materialization for
-            // opportunistic writes. This lets concurrent writes to the same inode proceed
-            // through buffering while this write's materialization is in-flight.
-            //
-            // Duplicate materialization is safe: the local payload store uses last-writer-wins
-            // for overlapping block ranges, and orphaned objects are reclaimed by the
-            // background janitor. Durability-required writes keep the gate to serialize
-            // flush/fsync callers with any concurrent materialization on the same inode.
-            if local_sync_policy.is_opportunistic() {
-                session = None;
-            }
 
             if local_sync_policy.requires_write_path_durability() {
                 self.wait_for_deferred_materialization_inflight(ino).await;
@@ -1768,6 +1754,7 @@ impl StudioVfs {
             let should_materialize_for_limits =
                 local_sync_policy.is_opportunistic() && dirty_pressure_requires_materialization;
             if should_materialize_for_limits {
+                drain_after_write = true;
                 let materialize_for_limits_started = Instant::now();
                 let limits_result = self.materialize_writer_stack_for_limits(ino).await;
                 self.record_vfs_write_materialize_for_limits(
@@ -1782,10 +1769,23 @@ impl StudioVfs {
             Ok(written)
         }
         .await;
-        // For opportunistic writes `session` is already None (gate released above).
-        // For durability-required writes `session` holds the gate until here.
         drop(session);
         self.state.file_session.gc_if_idle(ino);
+        if result.is_ok() && drain_after_write {
+            for dirty_ino in self.state.writer_stack.snapshot_dirty_inodes_by_bytes() {
+                if self.total_pending_write_buffer_bytes() <= self.max_dirty_bytes() {
+                    break;
+                }
+                let cleanup = self.file_session_cleanup(dirty_ino);
+                let permit = self
+                    .state
+                    .file_session
+                    .enter_op(dirty_ino, FileSessionOperation::Materialize)
+                    .await;
+                let _session = cleanup.with_permit(permit);
+                self.materialize_writer_stack_for_inode(dirty_ino).await?;
+            }
+        }
         result
     }
 
@@ -2497,6 +2497,17 @@ impl StudioVfs {
             if ino == preferred_ino {
                 continue;
             }
+            // Never wait for another inode while holding the preferred inode gate.
+            let cleanup = self.file_session_cleanup(ino);
+            let Some(permit) = self
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Materialize)
+                .now_or_never()
+            else {
+                continue;
+            };
+            let _session = cleanup.with_permit(permit);
             let materialized = self.materialize_writer_stack_for_inode(ino).await?;
             if materialized == 0 {
                 continue;
@@ -2521,6 +2532,17 @@ impl StudioVfs {
             if ino == preferred_ino {
                 continue;
             }
+            // Never wait for another inode while holding the preferred inode gate.
+            let cleanup = self.file_session_cleanup(ino);
+            let Some(permit) = self
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Materialize)
+                .now_or_never()
+            else {
+                continue;
+            };
+            let _session = cleanup.with_permit(permit);
             let materialized = self
                 .materialize_writer_stack_completed_blocks_for_inode(ino)
                 .await?;

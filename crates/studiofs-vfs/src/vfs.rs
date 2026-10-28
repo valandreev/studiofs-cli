@@ -189,11 +189,13 @@ use studiofs_meta::engine::PgSyncLifecycle;
 use studiofs_meta::engine::{
     MetadataAuthorityStatus, PgSyncDiagnostics, PgSyncStatus, PgSyncWriteAuthorityReason,
 };
+#[cfg(test)]
+use studiofs_meta::schema::chunk_id_from_offset;
 use studiofs_meta::schema::{
     ChunkId, DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, FormatInfoError, InodeLifecycleState,
     MAX_SUPPORTED_BLOCK_SIZE_BYTES, MIN_BLOCK_SIZE_BYTES, PayloadRetentionClass, ROOT_INO,
     ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange, SliceRecord,
-    UploadState as MetaUploadState, chunk_id_from_offset, chunk_start_offset,
+    UploadState as MetaUploadState, chunk_start_offset,
 };
 use studiofs_meta::types::{
     AccessLevel, FileType, Ino, InodeAttr, PayloadRef, block_index_from_offset, offset_within_block,

@@ -1595,8 +1595,18 @@ impl UploadMetaPort for VfsUploadMetaPort {
         ) else {
             return Ok(None);
         };
+        let cleanup = self.vfs.file_session_cleanup(ino);
+        let permit = self
+            .vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Upload)
+            .await;
+        let session = cleanup.with_permit(permit);
         let meta = self.vfs.meta.clone();
         run_meta_maintenance(meta, move |engine: Arc<dyn VfsMeta>| {
+            // Cancellation must not release the gate before the blocking mutation finishes.
+            let _session = session;
             let latest_attr = match engine.get_attr(ino) {
                 Ok(attr) => attr,
                 Err(studiofs_meta::MetaError::InodeNotFound(_)) => return Ok(None),
@@ -3841,6 +3851,116 @@ mod tests {
                 .expect("rebased overlay object present"),
             "retained stale upload must become Uploaded in the current overlay epoch"
         );
+    }
+
+    #[test]
+    fn reattach_waits_for_file_session_and_observes_truncate_tombstone() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "reattach-observes-truncate");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let mut attr = vfs
+                .create(1, b"reattach-observes-truncate.bin", 0, 0, 0o644)
+                .expect("create sparse file");
+            let ino = attr.ino;
+            attr.size = 64;
+            attr.content_epoch = 1;
+            meta.set_attr(&attr).expect("persist initial attr");
+
+            let mut payload = SliceRecord::new(
+                SliceId(0),
+                SliceOrder(0),
+                SliceRange::new(32, 36).expect("payload range"),
+                PayloadRef::new_partial(6, 4),
+            );
+            payload.payload_state = PayloadRefState::LocalOnly;
+            meta.flush_regular_file_overlay_slices_with_attr(
+                ino,
+                &[(ChunkId(0), vec![payload])],
+                None,
+            )
+            .expect("seed upload payload");
+
+            let session_guard = vfs
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Flush)
+                .await;
+            let upload_vfs = vfs.clone();
+            let block_size = vfs.block_size;
+            let reattach = tokio::spawn(async move {
+                VfsUploadMetaPort { vfs: upload_vfs }
+                    .reattach_uploaded_object_if_uncovered(
+                        ino,
+                        1,
+                        6,
+                        ObjectFileMapping::whole(32, 4),
+                        block_size,
+                    )
+                    .await
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if vfs
+                        .state
+                        .file_session
+                        .debug_snapshot(ino)
+                        .is_some_and(|snapshot| snapshot.queued_ops > 0)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("reattach should queue behind the file-session flush");
+
+            let mut shrunk = meta.get_attr(ino).expect("load current attr");
+            shrunk.size = 32;
+            shrunk.content_epoch = 2;
+            let tombstone = SliceRecord::tombstone(
+                SliceId(0),
+                SliceOrder(0),
+                SliceRange::new(32, 36).expect("truncated range"),
+            );
+            meta.flush_regular_file_overlay_slices_with_attr(
+                ino,
+                &[(ChunkId(0), vec![tombstone])],
+                Some(&shrunk),
+            )
+            .expect("commit truncate tombstone");
+
+            let mut regrown = meta.get_attr(ino).expect("load truncated attr");
+            regrown.size = 64;
+            regrown.content_epoch = 3;
+            meta.set_attr(&regrown).expect("extend after truncate");
+
+            drop(session_guard);
+            assert_eq!(
+                reattach
+                    .await
+                    .expect("reattach task")
+                    .expect("reattach call"),
+                None
+            );
+
+            let final_attr = meta.get_attr(ino).expect("load final attr");
+            assert_eq!((final_attr.size, final_attr.content_epoch), (64, 3));
+            let spans = meta
+                .lookup_regular_file_slices(ino, 32, 4)
+                .expect("lookup truncated range");
+            assert!(
+                spans
+                    .iter()
+                    .all(|span| span.source == ResolvedSliceSource::OverlayTombstone),
+                "stale upload must not replace a truncate tombstone: {spans:?}"
+            );
+            assert!(
+                vfs.state.file_session.debug_snapshot(ino).is_none(),
+                "reattach must retire its idle session after releasing the permit"
+            );
+        });
     }
 
     #[test]
