@@ -35,6 +35,8 @@ Both commands create a mount point using the volume name. Run the command for yo
 
 StudioFS tries to create the required directories itself. Choose a dedicated mount folder without your working files in it. On macOS, make sure you have write access to `/Volumes/Studiofs`; chapter 11 explains how to set it up. On Linux, use a folder your user can access.
 
+On Linux, only the user who started the mount can open it by default; even `root` and services running under another account are refused. If another local account must reach the files (for example, a render daemon or a Samba share), add `--allow-other`. Ordinary file permissions still apply to those users. Unless you mount as `root`, the line `user_allow_other` must be present in `/etc/fuse.conf`; otherwise StudioFS stops with an error naming that line. To make it the default, run `studiofs settings --allow-other`; `--allow-other=false` turns it off again.
+
 On macOS, open Finder, press **⌘⇧G**, and enter `/Volumes/Studiofs/myvolume`. On Linux, open `/mnt/StudioFS/myvolume` in your file manager. The systems use different software: macOS uses macFUSE, and Linux uses libfuse3.
 
 ## Why has the terminal not returned to the prompt?

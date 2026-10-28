@@ -23,6 +23,8 @@ pub(crate) struct MountCommand {
     pub(crate) detach: bool,
     pub(crate) profile: Option<super::mount_profile_types::MountProfileMode>,
     pub(crate) read_only: bool,
+    /// Explicit `--allow-other` choice; `None` defers to `studiofs settings`.
+    pub(crate) allow_other: Option<bool>,
     pub(crate) endpoint: Option<String>,
     pub(crate) runtime_tuning: PublicRuntimeTuningArgs,
     pub(crate) snapshot_id: Option<SnapshotId>,
@@ -42,6 +44,7 @@ impl MountCommand {
             detach: args.detach,
             profile: args.profile,
             read_only: args.read_only,
+            allow_other: args.allow_other,
             endpoint: args.endpoint,
             runtime_tuning: args.runtime_tuning,
             snapshot_id: None,
@@ -66,6 +69,8 @@ impl MountCommand {
             detach: false,
             profile: None,
             read_only: true,
+            // Snapshot mounts keep the single-user boundary regardless of settings.
+            allow_other: Some(false),
             endpoint: None,
             runtime_tuning: PublicRuntimeTuningArgs::default(),
             snapshot_id: Some(snapshot_id),
@@ -107,6 +112,10 @@ EXAMPLES:
 
   Local-First IO tuned mount:
     studiofs mount myvolume /mnt/studio --read-buffer 4GB --readahead 256 --prefetch 192
+
+  Let other local users reach a Linux mount (needs `user_allow_other` in
+  /etc/fuse.conf unless mounting as root):
+    studiofs mount myvolume /mnt/studio --allow-other
 
   Debug logging:
     studiofs --log-level debug mount myvolume /mnt/studio
@@ -181,6 +190,22 @@ pub(crate) struct MountArgs {
     /// Mount the live volume read-only.
     #[arg(long)]
     read_only: bool,
+
+    /// Let processes of other local users, including root, access a Linux mount.
+    ///
+    /// Adds the FUSE `allow_other` option; the kernel still enforces mode bits
+    /// and ownership (`default_permissions`). A non-root mounter needs the line
+    /// `user_allow_other` in /etc/fuse.conf. Defaults to the `studiofs settings`
+    /// value, otherwise off; `--allow-other=false` overrides a saved default.
+    /// Ignored on macOS and Windows.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true"
+    )]
+    allow_other: Option<bool>,
 
     /// Override the S3 endpoint URL for this mount session.
     ///
@@ -520,6 +545,41 @@ mod tests {
         };
         assert_eq!(err.kind(), ErrorKind::UnknownArgument);
         assert!(err.to_string().contains("--writeback-delay"));
+    }
+
+    #[test]
+    fn mount_parses_allow_other_and_documents_it_in_help() {
+        let mount_point = if cfg!(windows) { "Z:" } else { "/mnt/studio" };
+        for (extra, expected) in [
+            (&[][..], None),
+            (&["--allow-other"][..], Some(true)),
+            (&["--allow-other=false"][..], Some(false)),
+        ] {
+            let mut argv = vec!["mount", "demo", mount_point];
+            argv.extend_from_slice(extra);
+            let cli = crate::cli::parse_for_test(&argv).expect("parse mount");
+            let crate::cli::Commands::Mount(args) = cli.command else {
+                panic!("expected Mount for {argv:?}");
+            };
+            assert_eq!(args.allow_other, expected, "{argv:?}");
+            assert_eq!(args.mount_point.as_deref(), Some(mount_point));
+        }
+
+        // The flag must not swallow the positional mount point.
+        let cli = crate::cli::parse_for_test(&["mount", "demo", "--allow-other", mount_point])
+            .expect("flag before mount point");
+        let crate::cli::Commands::Mount(args) = cli.command else {
+            panic!("expected Mount");
+        };
+        assert_eq!(args.allow_other, Some(true));
+        assert_eq!(args.mount_point.as_deref(), Some(mount_point));
+
+        let help = match crate::cli::parse_for_test(&["mount", "--help"]) {
+            Ok(_) => panic!("--help must render help"),
+            Err(err) => err.to_string(),
+        };
+        assert!(help.contains("--allow-other"), "{help}");
+        assert!(help.contains("user_allow_other"), "{help}");
     }
 
     #[test]

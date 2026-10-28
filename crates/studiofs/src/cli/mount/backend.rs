@@ -13,6 +13,8 @@ pub(crate) struct BackendLaunch {
     pub(crate) mount_point: String,
     pub(crate) volume_name: String,
     pub(crate) read_only: bool,
+    #[cfg(target_os = "linux")]
+    pub(crate) allow_other: bool,
     pub(crate) mount_ready_callback: Box<dyn FnOnce() + Send>,
     #[cfg(all(unix, not(target_os = "linux")))]
     pub(crate) run_in_foreground: bool,
@@ -119,6 +121,7 @@ impl MountBackend for LinuxFuseMountBackend {
             mount_point,
             volume_name,
             read_only,
+            allow_other,
             mount_ready_callback,
         } = launch;
         let request = studiofs_linux_fuse::LinuxFuseMountRequest::new(
@@ -128,6 +131,7 @@ impl MountBackend for LinuxFuseMountBackend {
             volume_name,
             read_only,
         )
+        .with_allow_other(allow_other)
         .with_mount_ready_callback(mount_ready_callback);
         studiofs_linux_fuse::mount_with_request(request)
     }

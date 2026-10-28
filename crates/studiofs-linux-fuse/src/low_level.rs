@@ -263,6 +263,7 @@ pub(crate) struct SessionState {
     runtime_handle: Handle,
     async_writes: Arc<AsyncWriteLedger>,
     read_only: bool,
+    allow_other: bool,
     mount_uid: u32,
     mount_gid: u32,
     connection_config: LinuxFuseConnectionConfig,
@@ -317,6 +318,7 @@ impl SessionState {
             runtime_handle,
             async_writes,
             read_only,
+            allow_other: false,
             mount_uid: current_uid(),
             mount_gid: current_gid(),
             connection_config,
@@ -345,6 +347,13 @@ impl SessionState {
             .max(1),
             inline_writes: AtomicUsize::new(0),
         }
+    }
+
+    /// Requests `allow_other`; the kernel still enforces mode bits through
+    /// `default_permissions` for foreign callers.
+    pub(crate) fn with_allow_other(mut self, allow_other: bool) -> Self {
+        self.allow_other = allow_other;
+        self
     }
 }
 
@@ -722,7 +731,7 @@ fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
             || args.win_attrs.is_some())
 }
 
-fn argv_strings(volume_name: &str, read_only: bool) -> Vec<String> {
+fn argv_strings(volume_name: &str, read_only: bool, allow_other: bool) -> Vec<String> {
     let mut args = vec![
         "studiofs-linux-fuse".to_owned(),
         "-o".to_owned(),
@@ -738,6 +747,9 @@ fn argv_strings(volume_name: &str, read_only: bool) -> Vec<String> {
     ];
     if read_only {
         args.extend(["-o".to_owned(), "ro".to_owned()]);
+    }
+    if allow_other {
+        args.extend(["-o".to_owned(), "allow_other".to_owned()]);
     }
     args
 }
@@ -822,7 +834,11 @@ impl Session {
     ) -> io::Result<Self> {
         let root_prime_path = mount_point.as_ref().to_path_buf();
         let mount_point = path_to_cstring(mount_point.as_ref())?;
-        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref(), state.read_only))?;
+        let mut args = OwnedFuseArgs::new(argv_strings(
+            volume_name.as_ref(),
+            state.read_only,
+            state.allow_other,
+        ))?;
         let mut state = Box::new(state);
         let userdata = (&mut *state as *mut SessionState).cast::<c_void>();
         // SAFETY: the C shim expands libfuse's versioned session constructor.
@@ -916,7 +932,7 @@ impl Session {
         volume_name: impl AsRef<str>,
     ) -> io::Result<Self> {
         let mount_point = path_to_cstring(mount_point.as_ref())?;
-        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref(), false))?;
+        let mut args = OwnedFuseArgs::new(argv_strings(volume_name.as_ref(), false, false))?;
         // SAFETY: the C shim returns a static ops table. Userdata is null for
         // this lifecycle-only smoke; init supports null userdata and every
         // request callback rejects a missing SessionState before dereferencing.
@@ -4865,7 +4881,7 @@ mod tests {
 
     #[test]
     fn argv_uses_system_libfuse_mount_options() {
-        let args = super::argv_strings("demo", false);
+        let args = super::argv_strings("demo", false, false);
 
         assert!(args.iter().any(|arg| arg == "studiofs-linux-fuse"));
         assert!(args.iter().any(|arg| arg == "fsname=demo"));
@@ -4882,17 +4898,37 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "writeback_cache"));
         assert!(!args.iter().any(|arg| arg.contains("max_background")));
         assert!(!args.iter().any(|arg| arg.contains("congestion_threshold")));
+        assert!(
+            !args.iter().any(|arg| arg == "allow_other"),
+            "allow_other must stay opt-in"
+        );
+    }
+
+    #[test]
+    fn allow_other_mount_arguments_keep_kernel_permission_checks() {
+        for read_only in [false, true] {
+            let args = super::argv_strings("demo", read_only, true);
+
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| arg.as_str() == "allow_other")
+                    .count(),
+                1
+            );
+            assert!(args.iter().any(|arg| arg == "default_permissions"));
+            assert_eq!(args.iter().any(|arg| arg == "ro"), read_only);
+        }
     }
 
     #[test]
     fn read_only_mount_arguments_enable_native_read_only_policy() {
         assert!(
-            super::argv_strings("demo", true)
+            super::argv_strings("demo", true, false)
                 .iter()
                 .any(|arg| arg == "ro")
         );
         assert!(
-            !super::argv_strings("demo", false)
+            !super::argv_strings("demo", false, false)
                 .iter()
                 .any(|arg| arg == "ro")
         );
@@ -4900,25 +4936,28 @@ mod tests {
 
     #[test]
     fn generated_argv_is_accepted_by_low_level_session_parser() {
-        let mut args = super::OwnedFuseArgs::new(super::argv_strings("demo", false))
-            .expect("build FUSE arguments");
-        // SAFETY: the C shim returns a static empty ops table and this test
-        // destroys the resulting session before the stack-owned arguments drop.
-        let session = unsafe {
-            super::studiofs_linux_fuse_session_new(
-                args.as_mut_ptr(),
-                super::studiofs_linux_fuse_empty_low_level_ops(),
-                super::studiofs_linux_fuse_low_level_ops_size(),
-                std::ptr::null_mut(),
-            )
-        };
+        for allow_other in [false, true] {
+            let mut args =
+                super::OwnedFuseArgs::new(super::argv_strings("demo", false, allow_other))
+                    .expect("build FUSE arguments");
+            // SAFETY: the C shim returns a static empty ops table and this test
+            // destroys the resulting session before the stack-owned arguments drop.
+            let session = unsafe {
+                super::studiofs_linux_fuse_session_new(
+                    args.as_mut_ptr(),
+                    super::studiofs_linux_fuse_empty_low_level_ops(),
+                    super::studiofs_linux_fuse_low_level_ops_size(),
+                    std::ptr::null_mut(),
+                )
+            };
 
-        assert!(
-            !session.is_null(),
-            "generated mount options must be accepted by the low-level libfuse parser"
-        );
-        // SAFETY: the non-null session is uniquely owned by this test.
-        unsafe { super::raw::fuse_session_destroy(session) };
+            assert!(
+                !session.is_null(),
+                "generated mount options (allow_other={allow_other}) must be accepted by the low-level libfuse parser"
+            );
+            // SAFETY: the non-null session is uniquely owned by this test.
+            unsafe { super::raw::fuse_session_destroy(session) };
+        }
     }
 
     #[test]
@@ -5192,7 +5231,8 @@ mod tests {
             Some(4096)
         }));
         let pending = state.async_writes.admit(10, 100, 8).unwrap();
-        let mut args = super::OwnedFuseArgs::new(super::argv_strings("demo", false)).unwrap();
+        let mut args =
+            super::OwnedFuseArgs::new(super::argv_strings("demo", false, false)).unwrap();
         // SAFETY: the empty ops table has no callbacks; this test owns the raw session.
         let raw = std::ptr::NonNull::new(unsafe {
             super::studiofs_linux_fuse_session_new(
@@ -5241,7 +5281,7 @@ mod tests {
         );
         let ledger = Arc::clone(&state.async_writes);
         ledger.admit(10, 100, 8).unwrap().complete(Ok(()));
-        let mut args = super::OwnedFuseArgs::new(super::argv_strings("demo", false))
+        let mut args = super::OwnedFuseArgs::new(super::argv_strings("demo", false, false))
             .expect("build FUSE arguments");
         // SAFETY: the empty ops table has no callbacks; Session owns and destroys the raw session.
         let raw = std::ptr::NonNull::new(unsafe {
@@ -5989,8 +6029,8 @@ mod tests {
 
     #[test]
     fn owned_fuse_args_are_null_terminated_without_counting_sentinel() {
-        let args =
-            super::OwnedFuseArgs::new(super::argv_strings("demo", false)).expect("build args");
+        let args = super::OwnedFuseArgs::new(super::argv_strings("demo", false, false))
+            .expect("build args");
 
         assert_eq!(args.raw.argc as usize, args._strings.len());
         assert!(args._argv.last().is_some_and(|arg| arg.is_null()));

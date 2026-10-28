@@ -5,9 +5,10 @@
 //! Linux libfuse3 bridge boundary for StudioFS.
 
 use std::ffi::CString;
+use std::fmt;
 use std::io;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use studiofs_vfs::StudioVfs;
@@ -130,6 +131,7 @@ pub struct LinuxFuseMountRequest {
     mount_point: PathBuf,
     volume_name: String,
     read_only: bool,
+    allow_other: bool,
     connection_config: LinuxFuseConnectionConfig,
     mount_ready_callback: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -149,9 +151,21 @@ impl LinuxFuseMountRequest {
             mount_point: mount_point.into(),
             volume_name: volume_name.into(),
             read_only,
+            allow_other: false,
             connection_config: LinuxFuseConnectionConfig::default(),
             mount_ready_callback: None,
         }
+    }
+
+    /// Let other local users reach the mount through `-o allow_other`.
+    ///
+    /// `default_permissions` stays enabled, so the kernel still enforces mode
+    /// bits and ownership for foreign callers. Non-root mounters need
+    /// `user_allow_other` in `/etc/fuse.conf`; [`mount_with_request`] checks it
+    /// before calling `fusermount3`.
+    pub fn with_allow_other(mut self, allow_other: bool) -> Self {
+        self.allow_other = allow_other;
+        self
     }
 
     /// Set a callback invoked after libfuse has attached the mount point.
@@ -179,16 +193,21 @@ pub fn mount_with_request(request: LinuxFuseMountRequest) -> io::Result<()> {
         mount_point,
         volume_name,
         read_only,
+        allow_other,
         connection_config,
         mount_ready_callback,
     } = request;
+    if allow_other {
+        check_allow_other_permitted()?;
+    }
     let connection_config = resolve_worker_threads(
         connection_config,
         std::env::var_os("STUDIOFS_LINUX_FUSE_WORKER_THREADS"),
     )?
     .validate(low_level::has_worker_limit())?;
     let mut session = low_level::Session::mount(
-        low_level::SessionState::new(vfs, runtime_handle, read_only, connection_config),
+        low_level::SessionState::new(vfs, runtime_handle, read_only, connection_config)
+            .with_allow_other(allow_other),
         mount_point,
         volume_name,
     )?;
@@ -222,9 +241,177 @@ fn check_fusermount3_in_path(path_var: Option<std::ffi::OsString>) -> io::Result
     ))
 }
 
+/// System FUSE configuration that `fusermount3` reads for `user_allow_other`.
+pub const FUSE_CONF_PATH: &str = "/etc/fuse.conf";
+
+/// Why a non-root `allow_other` mount cannot be attempted.
+#[derive(Debug)]
+pub enum AllowOtherPreflightError {
+    /// The FUSE configuration is absent or has no `user_allow_other` line.
+    MissingUserAllowOther {
+        /// Configuration file that was checked.
+        path: PathBuf,
+    },
+    /// The FUSE configuration exists but could not be read.
+    UnreadableConfig {
+        /// Configuration file that was checked.
+        path: PathBuf,
+        /// Underlying read failure.
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for AllowOtherPreflightError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingUserAllowOther { path } => write!(
+                f,
+                "allow_other mounts by a non-root user require the line `user_allow_other` in {}; \
+                 add it (as root) or mount without --allow-other",
+                path.display()
+            ),
+            Self::UnreadableConfig { path, source } => write!(
+                f,
+                "allow_other mounts by a non-root user require `user_allow_other` in {}, \
+                 but the file could not be read: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AllowOtherPreflightError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MissingUserAllowOther { .. } => None,
+            Self::UnreadableConfig { source, .. } => Some(source),
+        }
+    }
+}
+
+impl From<AllowOtherPreflightError> for io::Error {
+    fn from(error: AllowOtherPreflightError) -> Self {
+        io::Error::new(io::ErrorKind::PermissionDenied, error)
+    }
+}
+
+/// Check that the effective user may request `allow_other`.
+///
+/// Root may always request it. Other users need `user_allow_other` in
+/// [`FUSE_CONF_PATH`]; without it `fusermount3` rejects the mount with a
+/// generic message, so callers should run this before mounting.
+pub fn check_allow_other_permitted() -> Result<(), AllowOtherPreflightError> {
+    // SAFETY: `geteuid` has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    check_allow_other_config(euid, Path::new(FUSE_CONF_PATH))
+}
+
+fn check_allow_other_config(euid: u32, path: &Path) -> Result<(), AllowOtherPreflightError> {
+    if euid == 0 {
+        return Ok(());
+    }
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(AllowOtherPreflightError::UnreadableConfig {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if fuse_conf_allows_other(&contents) {
+        Ok(())
+    } else {
+        Err(AllowOtherPreflightError::MissingUserAllowOther {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// Mirrors `fusermount3`: `#` starts a comment and the keyword is case-sensitive.
+fn fuse_conf_allows_other(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        let line = line.split_once('#').map_or(line, |(before, _)| before);
+        line.trim() == "user_allow_other"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+
+    #[test]
+    fn fuse_conf_parser_accepts_user_allow_other_with_surrounding_whitespace() {
+        for contents in [
+            "user_allow_other",
+            "user_allow_other\n",
+            "  user_allow_other\t\n",
+            "# comment\nmount_max = 1000\n user_allow_other # enabled for render nodes\n",
+        ] {
+            assert!(super::fuse_conf_allows_other(contents), "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn fuse_conf_parser_ignores_comments_and_near_misses() {
+        for contents in [
+            "",
+            "#user_allow_other\n",
+            "  # user_allow_other\n",
+            "mount_max = 1000\n",
+            "User_allow_other\n",
+            "user_allow_others\n",
+            "user_allow_other = 1\n",
+        ] {
+            assert!(!super::fuse_conf_allows_other(contents), "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn allow_other_preflight_names_the_missing_line_for_non_root() {
+        let temp = studiofs_test_support::workspace_target_tempdir("fuse-conf-");
+        let path = temp.path().join("fuse.conf");
+        std::fs::write(&path, "#user_allow_other\n").expect("write fuse.conf");
+
+        let error = super::check_allow_other_config(1000, &path).expect_err("must reject");
+
+        assert!(matches!(
+            error,
+            super::AllowOtherPreflightError::MissingUserAllowOther { .. }
+        ));
+        let message = error.to_string();
+        assert!(message.contains("`user_allow_other`"), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert_eq!(
+            std::io::Error::from(error).kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn allow_other_preflight_treats_missing_config_as_not_allowed() {
+        let temp = studiofs_test_support::workspace_target_tempdir("fuse-conf-");
+
+        let error = super::check_allow_other_config(1000, &temp.path().join("absent.conf"))
+            .expect_err("missing fuse.conf must reject");
+
+        assert!(matches!(
+            error,
+            super::AllowOtherPreflightError::MissingUserAllowOther { .. }
+        ));
+    }
+
+    #[test]
+    fn allow_other_preflight_accepts_configured_user_and_root() {
+        let temp = studiofs_test_support::workspace_target_tempdir("fuse-conf-");
+        let path = temp.path().join("fuse.conf");
+        std::fs::write(&path, "user_allow_other\n").expect("write fuse.conf");
+
+        super::check_allow_other_config(1000, &path).expect("configured user");
+        super::check_allow_other_config(0, &temp.path().join("absent.conf"))
+            .expect("root does not need user_allow_other");
+    }
 
     #[test]
     fn fusermount3_check_reports_missing_path() {
