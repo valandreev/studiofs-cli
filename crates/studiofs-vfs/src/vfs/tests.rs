@@ -17668,6 +17668,103 @@ fn attr_only_setattr_size_uses_regular_non_deferred_path() {
     });
 }
 
+/// Create a file, commit its deferred create, queue an attr-only setattr, and
+/// unlink the file before the setattr batch commits (SFS-910).
+fn assert_unlink_after_deferred_setattr_keeps_mount_writable(
+    volume_suffix: &str,
+    args: SetattrArgs,
+) {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, volume_suffix);
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let created = vfs
+            .create_with_deferred_metadata_admission(ROOT_INO, b"one", 0, 0, 0o644, rt.handle())
+            .expect("create deferred file");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.drain_deferred_namespace_metadata_for_barrier(),
+        )
+        .await
+        .expect("create commit should settle")
+        .expect("create should commit");
+
+        // Hold the setattr in a lingering background batch so the unlink
+        // overtakes it, as the next FUSE callback does within the linger window.
+        vfs.state
+            .namespace
+            .deferred
+            .batch_linger_override_ms
+            .store(3_600_000, AtomicOrdering::Release);
+        vfs.setattr_attr_only_deferred_metadata(created.ino, args, rt.handle())
+            .expect("defer attr-only setattr");
+        vfs.unlink(ROOT_INO, b"one").expect("unlink file");
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.drain_deferred_namespace_metadata_for_barrier(),
+        )
+        .await
+        .expect("setattr batch should settle")
+        .expect("a setattr for an unlinked inode must not fail the batch");
+        assert!(
+            !vfs.state
+                .namespace
+                .deferred
+                .degraded
+                .load(AtomicOrdering::Acquire),
+            "a setattr for an unlinked inode must not degrade the mount"
+        );
+        vfs.wait_for_deferred_namespace_metadata(created.ino)
+            .await
+            .expect("the dropped setattr must not record an inode error");
+        assert!(matches!(
+            meta.lookup(ROOT_INO, b"one"),
+            Err(MetaError::EntryNotFound { .. })
+        ));
+
+        let after = vfs
+            .create_with_deferred_metadata_admission(ROOT_INO, b"after", 0, 0, 0o644, rt.handle())
+            .expect("the mount should stay writable");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.drain_deferred_namespace_metadata_for_barrier(),
+        )
+        .await
+        .expect("later create should settle")
+        .expect("later create should commit");
+        assert_eq!(
+            meta.lookup(ROOT_INO, b"after")
+                .expect("load later entry")
+                .ino,
+            after.ino
+        );
+    });
+}
+
+#[test]
+fn unlink_after_deferred_chmod_does_not_degrade_mount() {
+    assert_unlink_after_deferred_setattr_keeps_mount_writable(
+        "unlink-after-deferred-chmod",
+        SetattrArgs {
+            mode: Some(0o600),
+            ..SetattrArgs::default()
+        },
+    );
+}
+
+#[test]
+fn unlink_after_deferred_utimens_does_not_degrade_mount() {
+    assert_unlink_after_deferred_setattr_keeps_mount_writable(
+        "unlink-after-deferred-utimens",
+        SetattrArgs {
+            atime: TimeSpec::Set(1_000_000_000),
+            mtime: TimeSpec::Set(2_000_000_000),
+            ..SetattrArgs::default()
+        },
+    );
+}
+
 #[test]
 fn deferred_attr_only_commit_does_not_revert_written_size() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");

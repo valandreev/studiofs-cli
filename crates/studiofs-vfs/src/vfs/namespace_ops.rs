@@ -1055,6 +1055,20 @@ impl StudioVfs {
                             }
                             continue;
                         }
+                        if let Some(stale_index) = Self::deleted_inode_setattr_index(&error, &batch)
+                        {
+                            let stale_operation = batch.remove(stale_index);
+                            self.drop_deleted_inode_deferred_setattr(&stale_operation);
+                            debug!(
+                                ino = stale_operation.ino(),
+                                remaining_operations = batch.len(),
+                                "dropped deferred setattr for an inode deleted before commit"
+                            );
+                            if batch.is_empty() {
+                                break;
+                            }
+                            continue;
+                        }
                         attempts += 1;
                         if attempts >= DEFERRED_NAMESPACE_MAX_RETRIES {
                             self.state
@@ -1098,6 +1112,43 @@ impl StudioVfs {
             }
             _ => None,
         }
+    }
+
+    /// Return the batch index of a `SetAttr` whose own inode no longer exists.
+    ///
+    /// Attr-only setattr is admitted against an inode that exists locally, and a
+    /// deferred create always precedes its dependent setattr in queue order. A
+    /// missing target therefore means the inode was deleted (for example by
+    /// unlink, rmdir, rename replacement, or a peer) after admission, so the
+    /// update has nothing left to apply.
+    fn deleted_inode_setattr_index(
+        error: &VfsError,
+        batch: &[DeferredNamespaceOp],
+    ) -> Option<usize> {
+        let VfsError::Meta(MetaError::NamespaceBatchOperation { index, source }) = error else {
+            return None;
+        };
+        let MetaError::InodeNotFound(missing) = source.as_ref() else {
+            return None;
+        };
+        match batch.get(*index) {
+            Some(DeferredNamespaceOp::SetAttr { attr, .. }) if attr.ino == *missing => Some(*index),
+            _ => None,
+        }
+    }
+
+    fn drop_deleted_inode_deferred_setattr(&self, op: &DeferredNamespaceOp) {
+        let ino = op.ino();
+        let op_bytes = Self::deferred_namespace_op_estimated_bytes(op);
+        {
+            let mut inner = self.state.namespace.deferred.inner.lock();
+            inner.settle_pending_inode(ino);
+            inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
+            inner.backlog_bytes = inner.backlog_bytes.saturating_sub(op_bytes);
+        }
+        // Deleted-inode cleanup owns the remaining runtime state for `ino`.
+        self.invalidate_attr_read_cache([ino]);
+        self.state.namespace.deferred.notify.notify_waiters();
     }
 
     fn deferred_namespace_mutation(op: &DeferredNamespaceOp) -> NamespaceMutation {
