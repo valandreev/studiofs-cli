@@ -190,7 +190,7 @@ unsafe extern "C" {
     #[cfg(test)]
     fn studiofs_linux_fuse_direct_io_mmap_strategy() -> c_int;
     #[cfg(test)]
-    fn studiofs_linux_fuse_init_wants_direct_io_allow_mmap() -> c_int;
+    fn studiofs_linux_fuse_init_wants_direct_io_allow_mmap(userdata: *mut c_void) -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_init_patch_reply_flags2_for_test(
         fd: c_int,
@@ -296,6 +296,7 @@ pub(crate) struct SessionState {
     connection_config: LinuxFuseConnectionConfig,
     cache_policy: LinuxFuseCachePolicy,
     async_direct_io: bool,
+    direct_io_mmap: bool,
     available_memory: Option<SystemMemorySampler>,
     read_buffers: SyncReadBufferPool,
     directory_buffers: DirectoryEntryBufferPool,
@@ -351,6 +352,11 @@ impl SessionState {
             connection_config,
             cache_policy,
             async_direct_io: linux_fuse_env_flag("STUDIOFS_FUSE_ASYNC_DIO"),
+            direct_io_mmap: direct_io_mmap_opt_in_from_env(
+                std::env::var("STUDIOFS_FUSE_DIRECT_IO_MMAP")
+                    .ok()
+                    .as_deref(),
+            ),
             available_memory: (cache_policy == LinuxFuseCachePolicy::Adaptive)
                 .then(SystemMemorySampler::system),
             read_buffers: SyncReadBufferPool::new(),
@@ -625,6 +631,13 @@ pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_writeback_cache(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn studiofs_linux_fuse_connection_wants_direct_io_mmap(
+    userdata: *mut c_void,
+) -> c_int {
+    fuse_flag(callback_state_from_userdata(userdata).is_some_and(|state| state.direct_io_mmap))
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn studiofs_linux_fuse_record_connection(
     userdata: *mut c_void,
     requested_max_read: u32,
@@ -726,6 +739,10 @@ fn linux_fuse_env_flag_value(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn direct_io_mmap_opt_in_from_env(value: Option<&str>) -> bool {
+    value.is_some_and(linux_fuse_env_flag_value)
 }
 
 fn linux_fuse_async_write_enabled() -> bool {
@@ -917,7 +934,9 @@ impl Session {
         // NUL-terminated path for this call.
         let mount_result = unsafe { raw::fuse_session_mount(raw.as_ptr(), mount_point.as_ptr()) };
         if mount_result == 0 {
-            enable_direct_io_mmap(raw);
+            if state.direct_io_mmap {
+                enable_direct_io_mmap(raw);
+            }
             let invalidation_state = Arc::new(SessionInvalidationState::new());
             let invalidation_queue = state.invalidation_queue.clone();
             let notify_target = SessionInvalidationTarget {
@@ -5172,10 +5191,49 @@ mod tests {
         assert_eq!(direct_io_mmap_strategy(), expected);
         // SAFETY: the C shim initializes and inspects a stack-local
         // fuse_conn_info with null userdata, which init supports.
-        let native_request =
-            unsafe { super::studiofs_linux_fuse_init_wants_direct_io_allow_mmap() };
-        assert_eq!(native_request == 1, expected == DIRECT_IO_MMAP_NATIVE);
-        assert_eq!(native_request == -1, expected != DIRECT_IO_MMAP_NATIVE);
+        let native_request = unsafe {
+            super::studiofs_linux_fuse_init_wants_direct_io_allow_mmap(std::ptr::null_mut())
+        };
+        assert_eq!(
+            native_request,
+            if expected == DIRECT_IO_MMAP_NATIVE {
+                0
+            } else {
+                -1
+            }
+        );
+        if expected == DIRECT_IO_MMAP_NATIVE {
+            let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
+                "linux-fuse-mmap-capability",
+            )
+            .expect("create VFS fixture");
+            let mut state = super::SessionState::new(
+                fixture.vfs(),
+                fixture.runtime().handle().clone(),
+                false,
+                default_connection_config(),
+            );
+            let default_request = unsafe {
+                super::studiofs_linux_fuse_init_wants_direct_io_allow_mmap(
+                    (&mut state as *mut super::SessionState).cast(),
+                )
+            };
+            assert_eq!(default_request, 0);
+            state.direct_io_mmap = true;
+            let native_request = unsafe {
+                super::studiofs_linux_fuse_init_wants_direct_io_allow_mmap(
+                    (&mut state as *mut super::SessionState).cast(),
+                )
+            };
+            assert_eq!(native_request, 1);
+        }
+    }
+
+    #[test]
+    fn direct_io_mmap_opt_in_is_off_by_default() {
+        assert!(!super::direct_io_mmap_opt_in_from_env(None));
+        assert!(!super::direct_io_mmap_opt_in_from_env(Some("0")));
+        assert!(super::direct_io_mmap_opt_in_from_env(Some("1")));
     }
 
     fn system_libfuse_version() -> (u32, u32) {
@@ -8518,6 +8576,7 @@ mod tests {
             default_connection_config(),
         );
         state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+        state.direct_io_mmap = true;
         let mut session =
             super::Session::mount(state, &mount_point, "studiofs-mmap").expect("mount");
         let mount_point_for_worker = mount_point.clone();

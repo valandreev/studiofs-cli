@@ -40,6 +40,7 @@ extern uint32_t studiofs_linux_fuse_connection_max_background(void *userdata);
 extern uint32_t studiofs_linux_fuse_connection_congestion_threshold(void *userdata);
 extern int studiofs_linux_fuse_connection_wants_async_dio(void *userdata);
 extern int studiofs_linux_fuse_connection_wants_writeback_cache(void *userdata);
+extern int studiofs_linux_fuse_connection_wants_direct_io_mmap(void *userdata);
 extern void studiofs_linux_fuse_record_connection(void *userdata,
                                                   uint32_t requested_max_read,
                                                   uint32_t requested_max_readahead,
@@ -182,8 +183,9 @@ static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn
         (void)studiofs_linux_fuse_set_feature_flag_compat(conn, FUSE_CAP_WRITEBACK_CACHE);
     }
 #if defined(STUDIOFS_DIRECT_IO_MMAP_NATIVE)
-    /* Without it the kernel refuses shared mmap of direct_io handles (ENODEV). */
-    (void)studiofs_linux_fuse_set_feature_flag_compat(conn, FUSE_CAP_DIRECT_IO_ALLOW_MMAP);
+    if (studiofs_linux_fuse_connection_wants_direct_io_mmap(userdata)) {
+        (void)studiofs_linux_fuse_set_feature_flag_compat(conn, FUSE_CAP_DIRECT_IO_ALLOW_MMAP);
+    }
 #endif
     if (userdata != NULL) {
         studiofs_linux_fuse_record_connection(userdata,
@@ -687,13 +689,14 @@ int studiofs_linux_fuse_conn_wants_async_dio_after_set(uint64_t capable_ext) {
 }
 
 /* 1 when init requests ALLOW_MMAP natively; -1 when this libfuse has no cap. */
-int studiofs_linux_fuse_init_wants_direct_io_allow_mmap(void) {
+int studiofs_linux_fuse_init_wants_direct_io_allow_mmap(void *userdata) {
 #if defined(STUDIOFS_DIRECT_IO_MMAP_NATIVE)
     struct fuse_conn_info conn = {0};
     studiofs_linux_fuse_set_capable_features(&conn, FUSE_CAP_DIRECT_IO_ALLOW_MMAP);
-    studiofs_linux_fuse_init(NULL, &conn);
+    studiofs_linux_fuse_init(userdata, &conn);
     return studiofs_linux_fuse_get_feature_flag_compat(&conn, FUSE_CAP_DIRECT_IO_ALLOW_MMAP);
 #else
+    (void)userdata;
     return -1;
 #endif
 }

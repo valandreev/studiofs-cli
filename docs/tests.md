@@ -477,25 +477,28 @@ dirty or newly changed files are unchanged by this work; SFS-901 covers them.
 
 ### SFS-916 Shared Writable mmap Under the Adaptive Policy
 
-Adaptive and `direct` open write-capable handles with `direct_io`, and the
-kernel refused `mmap(MAP_SHARED)` on them with `ENODEV` because the session
-never negotiated `FUSE_DIRECT_IO_ALLOW_MMAP`. The unit tests pin the libfuse
-3.13-3.16 INIT reply patch: the flag is added only to a successful INIT reply
-whose request offered it. The mounted test maps a file shared-writable under
-`adaptive`, then checks the bytes after `msync` and reopen, and after a write
-through a mapping that outlived `close()`:
+Adaptive and `direct` open write-capable handles with `direct_io`. By default,
+shared `mmap(MAP_SHARED)` on these handles is refused with `ENODEV`. Set
+`STUDIOFS_FUSE_DIRECT_IO_MMAP=1` to opt in to negotiating
+`FUSE_DIRECT_IO_ALLOW_MMAP` (native with libfuse 3.17+, via an INIT reply patch
+with libfuse 3.13-3.16). This opt-in has a known durable-size-loss failure under
+the adaptive policy; see SFS-921 below. The unit tests pin that the 3.13-3.16
+INIT reply patch only modifies a successful reply whose request offered the
+flag. The mounted test maps a file shared-writable under `adaptive`, then
+checks the bytes after `msync` and reopen, and after a write through a mapping
+that outlived `close()`:
 
 ```sh
 cargo test -p studiofs-linux-fuse --lib init_reply_patch -- --nocapture
-cargo test -p studiofs-linux-fuse --lib mounted_shared_writable_mmap_round_trips_under_adaptive_policy -- --ignored --nocapture
+STUDIOFS_FUSE_DIRECT_IO_MMAP=1 cargo test -p studiofs-linux-fuse --lib mounted_shared_writable_mmap_round_trips_under_adaptive_policy -- --ignored --nocapture
 ```
 
 The mounted test uses the VFS contract fixture and needs `/dev/fuse` and
-`fusermount3`. On a PostgreSQL/S3 mount with the default policy (WSL2 6.6,
-libfuse 3.14.0, release build), the mmap profiles that failed with `ENODEV`
-now run: `default` passed 2 of 2 runs, and `large`, `nommap`, and
-`large-nommap` passed. `small` is not a passing gate yet. It failed 1 of 2
-full runs and 1 of 5 replays with a durable size error after a `MAPWRITE`.
+`fusermount3`. The mmap behavior is opt-in because on a PostgreSQL/S3 mount
+with the adaptive policy (WSL2 6.6, libfuse 3.14.0, release build), `default`
+passed 2 of 2 runs, and `large`, `nommap`, and `large-nommap` passed, but
+`small` failed 1 of 2 full runs and 1 of 5 replays with a durable size error
+after a `MAPWRITE`.
 Its `-R` variant failed 1 of 2 runs; `-W` and `-R -W` passed 2 of 2 each.
 The `kernel` policy passed `small` 2 of 2. That size loss is tracked in
 [SFS-921](https://linear.app/valandreev/issue/SFS-921).
