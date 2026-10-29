@@ -3253,6 +3253,7 @@ impl StudioVfs {
     async fn unlink_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<Option<InodeAttr>> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
+        super::validate_name_len(name)?;
         self.reject_runtime_stats_entry_mutation(parent, name)?;
         if self.unlink_ignored_entry(parent, name) || self.ignored_dir_attr(parent).is_some() {
             namespace_mutations.record_removal(parent, name, std::iter::empty());
@@ -3351,6 +3352,7 @@ impl StudioVfs {
     async fn rmdir_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
+        super::validate_name_len(name)?;
         self.reject_runtime_stats_entry_mutation(parent, name)?;
         if self.unlink_ignored_subtree(parent, name) || self.ignored_dir_attr(parent).is_some() {
             namespace_mutations.record_removal(parent, name, std::iter::empty());
@@ -3574,6 +3576,7 @@ impl StudioVfs {
         let meta = self.sync_meta();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
+        super::validate_name_len(name)?;
         if parent == new_parent && name == new_name {
             debug!(
                 parent,

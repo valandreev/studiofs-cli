@@ -21459,6 +21459,10 @@ fn test_validate_name_too_long() {
         validate_name(&long),
         Err(VfsError::NameTooLong(256))
     ));
+    assert_eq!(
+        VfsError::NameTooLong(256).to_string(),
+        "filename too long (256 bytes, max 255)"
+    );
 }
 
 #[test]
@@ -21503,9 +21507,25 @@ fn namespace_operations_reject_over_long_components_as_name_too_long() {
         Err(VfsError::NameTooLong(256))
     ));
     assert!(matches!(
+        vfs.rename(ROOT_INO, &long, ROOT_INO, b"target", true),
+        Err(VfsError::NameTooLong(256))
+    ));
+    assert!(matches!(
+        vfs.unlink(ROOT_INO, &long),
+        Err(VfsError::NameTooLong(256))
+    ));
+    assert!(matches!(
+        vfs.rmdir(ROOT_INO, &long),
+        Err(VfsError::NameTooLong(256))
+    ));
+    assert!(matches!(
         vfs.lookup(ROOT_INO, &long),
         Err(VfsError::NameTooLong(256))
     ));
+    assert_eq!(
+        vfs.statfs().expect("statfs").namelen,
+        u32::try_from(MAX_NAME_BYTES).expect("name limit fits u32")
+    );
 }
 
 #[test]

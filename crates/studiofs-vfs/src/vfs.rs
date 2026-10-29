@@ -570,7 +570,7 @@ pub enum VfsError {
     InvalidName(String),
 
     /// Rejecting a path component longer than 255 bytes (`NAME_MAX`).
-    #[error("filename too long ({0} bytes, max 255)")]
+    #[error("filename too long ({0} bytes, max {MAX_NAME_BYTES})")]
     NameTooLong(usize),
 
     /// QoS-related rejection while reserving capacity for object work.

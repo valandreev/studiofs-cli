@@ -65,8 +65,8 @@ and Windows peers share the same volume namespace:
 - A component longer than 255 bytes (`NAME_MAX`, the `statfs` `namelen`) returns
   `VfsError::NameTooLong`. POSIX bridges report `ENAMETOOLONG` and WinFSP
   reports `STATUS_OBJECT_NAME_INVALID`. This applies to create, mkdir, symlink,
-  link, and rename targets, and to lookup, so lookup-based calls such as `stat`
-  or `chmod` do not report a missing entry.
+  link, rename (source and target), unlink, rmdir, and lookup, so lookup-based
+  calls such as `stat` or `chmod` do not report a missing entry.
 - Empty names, `.`, `..`, `/`, and the Windows-reserved characters
   `< > : " | \ ? *` return `VfsError::InvalidName` (`EINVAL` on POSIX,
   `STATUS_INVALID_PARAMETER` on WinFSP).

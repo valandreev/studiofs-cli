@@ -9665,7 +9665,10 @@ async fn test_validate_name_create_rejects_invalid() {
 
     // Too long (256 bytes)
     let long = vec![b'x'; 256];
-    assert!(vfs.create(1, &long, 0, 0, 0o644).is_err());
+    assert!(matches!(
+        vfs.create(1, &long, 0, 0, 0o644),
+        Err(VfsError::NameTooLong(256))
+    ));
 
     // Valid name should work
     assert!(vfs.create(1, b"valid.txt", 0, 0, 0o644).is_ok());
