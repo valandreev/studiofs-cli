@@ -249,6 +249,22 @@ impl StudioVfs {
             .map(|attr| dirty_attr.unwrap_or(attr))
     }
 
+    /// Overlay the parent updates of pending deferred creates on a directory attribute.
+    ///
+    /// Same-mount reads see an accepted create's parent `nlink`, `mtime`, and
+    /// `ctime` before the deferred batch commits them.
+    pub(super) fn with_deferred_parent_updates(&self, mut attr: InodeAttr) -> InodeAttr {
+        if attr.kind == FileType::Directory {
+            self.state
+                .namespace
+                .deferred
+                .inner
+                .lock()
+                .apply_parent_update(&mut attr);
+        }
+        attr
+    }
+
     fn deferred_namespace_op_estimated_bytes(op: &DeferredNamespaceOp) -> usize {
         std::mem::size_of::<DeferredNamespaceOp>()
             + match op {
@@ -342,6 +358,9 @@ impl StudioVfs {
             inner.attrs.insert(attr.ino, attr.clone());
             inner.errors.remove(&attr.ino);
             inner.admit_pending_inode(attr.ino);
+            if let Some(parent) = op.created_parent() {
+                inner.record_parent_update(parent, &attr);
+            }
             inner.queue.push_back(op);
             inner.admitted_operations += 1;
             inner.backlog_operations += 1;
@@ -389,7 +408,8 @@ impl StudioVfs {
             Self::settle_deferred_namespace_op_backlog(&mut inner, op);
         }
         self.clear_matching_dirty_attr_if_committed(ino, committed_attr);
-        self.invalidate_attr_read_cache([ino]);
+        // A committed create changed the parent attributes behind its cached copy.
+        self.invalidate_attr_read_cache(std::iter::once(ino).chain(op.created_parent()));
         self.refresh_inode_incarnation_state_from_attr(ino, committed_attr);
         self.state.namespace.deferred.notify.notify_waiters();
     }
@@ -422,6 +442,9 @@ impl StudioVfs {
         // Every operation for an abandoned inode is abandoned together, so drop its
         // deferred attr now rather than when the backlog settles after the batch.
         inner.attrs.remove(&ino);
+        if let Some(parent) = op.created_parent() {
+            inner.release_parent_update(parent, ino);
+        }
         match op {
             DeferredNamespaceOp::CreateFile { parent, name, .. } => {
                 inner
@@ -449,6 +472,9 @@ impl StudioVfs {
         op: &DeferredNamespaceOp,
     ) {
         inner.settle_pending_inode(op.ino());
+        if let Some(parent) = op.created_parent() {
+            inner.release_parent_update(parent, op.ino());
+        }
         inner.backlog_operations = inner.backlog_operations.saturating_sub(1);
         inner.backlog_bytes = inner
             .backlog_bytes
@@ -1400,7 +1426,9 @@ impl StudioVfs {
         if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
             return Ok(attr);
         }
-        self.getattr(ino)
+        let attr = self.getattr_base_unchecked(ino)?;
+        self.enforce_access(ino, AccessLevel::ReadOnly)?;
+        Ok(attr)
     }
 
     /// Apply attr-only metadata updates locally and commit them from the deferred metadata worker.
@@ -1436,7 +1464,7 @@ impl StudioVfs {
         )?;
         self.invalidate_attr_read_cache([ino]);
         self.schedule_deferred_namespace_metadata_drain(runtime);
-        Ok(self.peek_dirty_attr(ino).unwrap_or(attr))
+        Ok(self.with_deferred_parent_updates(self.peek_dirty_attr(ino).unwrap_or(attr)))
     }
 
     /// Update inode attributes, optionally while holding an open handle.
@@ -1563,7 +1591,7 @@ impl StudioVfs {
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
 
-        Ok(attr)
+        Ok(self.with_deferred_parent_updates(attr))
     }
 
     async fn setattr_with_size_change(

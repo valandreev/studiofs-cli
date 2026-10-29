@@ -19957,6 +19957,202 @@ fn symlink_over_pending_deferred_entry_reports_entry_exists() {
     });
 }
 
+/// Creates a committed directory whose mtime predates every later namespace op.
+fn committed_dir_with_aged_mtime(vfs: &StudioVfs, name: &[u8]) -> InodeAttr {
+    let dir = vfs
+        .mkdir(ROOT_INO, name, 0, 0, 0o755)
+        .expect("mkdir parent");
+    vfs.setattr_with_handle(
+        None,
+        dir.ino,
+        SetattrArgs {
+            mtime: TimeSpec::Set(1),
+            ..SetattrArgs::default()
+        },
+    )
+    .expect("age parent mtime")
+}
+
+fn assert_parent_times_updated(before: &InodeAttr, after: &InodeAttr, op: &str) {
+    assert!(
+        after.mtime > before.mtime,
+        "{op} must update the parent mtime: before={} after={}",
+        before.mtime,
+        after.mtime
+    );
+    assert!(
+        after.ctime > before.ctime,
+        "{op} must update the parent ctime: before={} after={}",
+        before.ctime,
+        after.ctime
+    );
+}
+
+#[test]
+fn create_and_symlink_update_parent_times() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_test_vfs(&tmp, "create-symlink-parent-times");
+    let parent = committed_dir_with_aged_mtime(&vfs, b"parent");
+
+    vfs.create(parent.ino, b"file", 0, 0, 0o644)
+        .expect("create file");
+    let after_create = vfs.getattr(parent.ino).expect("parent attr after create");
+    assert_parent_times_updated(&parent, &after_create, "create");
+    assert_eq!(
+        after_create.nlink, parent.nlink,
+        "create must not link the parent"
+    );
+
+    vfs.symlink(parent.ino, b"link", b"file", 0, 0)
+        .expect("create symlink");
+    let after_symlink = vfs.getattr(parent.ino).expect("parent attr after symlink");
+    assert_parent_times_updated(&after_create, &after_symlink, "symlink");
+    assert_eq!(
+        after_symlink.nlink, parent.nlink,
+        "symlink must not link the parent"
+    );
+    assert_eq!(
+        meta.get_attr(parent.ino).expect("committed parent").mtime,
+        after_symlink.mtime
+    );
+}
+
+/// An accepted deferred create is visible in the parent's attributes before
+/// its batch commits, and the committed parent is not counted twice after it.
+#[test]
+fn deferred_creates_update_parent_attr_before_commit() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-create-parent-attr");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let parent = committed_dir_with_aged_mtime(&vfs, b"parent");
+        hold_deferred_namespace_drain(&vfs, true);
+
+        let sub = vfs
+            .mkdir_with_deferred_metadata_admission(parent.ino, b"sub", 0, 0, 0o755, rt.handle())
+            .expect("admit deferred mkdir");
+        let after_mkdir = vfs.getattr(parent.ino).expect("parent attr after mkdir");
+        assert_eq!(
+            after_mkdir.nlink,
+            parent.nlink + 1,
+            "mkdir links the parent"
+        );
+        assert_parent_times_updated(&parent, &after_mkdir, "deferred mkdir");
+
+        vfs.create_with_deferred_metadata_admission(parent.ino, b"file", 0, 0, 0o644, rt.handle())
+            .expect("admit deferred create");
+        let after_create = vfs.getattr(parent.ino).expect("parent attr after create");
+        assert_eq!(after_create.nlink, after_mkdir.nlink);
+        assert_parent_times_updated(&after_mkdir, &after_create, "deferred create");
+
+        // A pending directory gains a link from its own pending subdirectory.
+        vfs.mkdir_with_deferred_metadata_admission(sub.ino, b"nested", 0, 0, 0o755, rt.handle())
+            .expect("admit nested deferred mkdir");
+        assert_eq!(
+            vfs.getattr(sub.ino).expect("pending sub attr").nlink,
+            sub.nlink + 1
+        );
+        assert_eq!(
+            meta.get_attr(parent.ino).expect("uncommitted parent").nlink,
+            parent.nlink,
+            "the deferred batch must still be pending"
+        );
+
+        hold_deferred_namespace_drain(&vfs, false);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.drain_deferred_namespace_metadata_for_barrier(),
+        )
+        .await
+        .expect("bounded deferred drain")
+        .expect("deferred drain");
+
+        let committed = meta.get_attr(parent.ino).expect("committed parent");
+        assert_eq!(committed.nlink, parent.nlink + 1);
+        let visible = vfs.getattr(parent.ino).expect("parent attr after commit");
+        assert_eq!(
+            visible.nlink, committed.nlink,
+            "the commit must not double-count"
+        );
+        assert_eq!(visible.mtime, committed.mtime);
+        assert!(visible.mtime >= after_create.mtime);
+        assert_eq!(
+            vfs.getattr(sub.ino).expect("committed sub attr").nlink,
+            sub.nlink + 1
+        );
+    });
+}
+
+/// A parent setattr stores its attributes without the pending creates' link.
+#[test]
+fn parent_setattr_during_deferred_mkdir_counts_the_link_once() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "parent-setattr-deferred-mkdir");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let deferred_parent = vfs.mkdir(ROOT_INO, b"deferred", 0, 0, 0o755).unwrap();
+        let sync_parent = vfs.mkdir(ROOT_INO, b"sync", 0, 0, 0o755).unwrap();
+        hold_deferred_namespace_drain(&vfs, true);
+        for parent in [&deferred_parent, &sync_parent] {
+            vfs.mkdir_with_deferred_metadata_admission(
+                parent.ino,
+                b"sub",
+                0,
+                0,
+                0o755,
+                rt.handle(),
+            )
+            .expect("admit deferred mkdir");
+        }
+        let chmod = SetattrArgs {
+            mode: Some(0o700),
+            ..SetattrArgs::default()
+        };
+        let deferred_reply = vfs
+            .setattr_attr_only_deferred_metadata(deferred_parent.ino, chmod.clone(), rt.handle())
+            .expect("deferred chmod");
+        let sync_reply = vfs
+            .setattr_with_handle(None, sync_parent.ino, chmod)
+            .expect("sync chmod");
+
+        for (parent, reply) in [
+            (&deferred_parent, deferred_reply),
+            (&sync_parent, sync_reply),
+        ] {
+            assert_eq!(
+                reply.nlink,
+                parent.nlink + 1,
+                "setattr reply sees the pending link"
+            );
+            assert_eq!(
+                vfs.getattr(parent.ino).expect("pending parent attr").nlink,
+                parent.nlink + 1,
+                "the pending link must be counted once"
+            );
+        }
+
+        hold_deferred_namespace_drain(&vfs, false);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            vfs.drain_deferred_namespace_metadata_for_barrier(),
+        )
+        .await
+        .expect("bounded deferred drain")
+        .expect("deferred drain");
+        for parent in [&deferred_parent, &sync_parent] {
+            let committed = meta.get_attr(parent.ino).expect("committed parent");
+            assert_eq!(committed.nlink, parent.nlink + 1);
+            assert_eq!(committed.mode, 0o700);
+            assert_eq!(
+                vfs.getattr(parent.ino)
+                    .expect("committed parent attr")
+                    .nlink,
+                committed.nlink
+            );
+        }
+    });
+}
+
 #[test]
 fn link_of_pending_deferred_file_into_pending_dir_waits_for_commit() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");

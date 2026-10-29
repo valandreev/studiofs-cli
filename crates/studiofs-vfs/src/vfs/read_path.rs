@@ -2087,6 +2087,13 @@ impl StudioVfs {
     }
 
     pub(super) fn getattr_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
+        self.getattr_base_unchecked(ino)
+            .map(|attr| self.with_deferred_parent_updates(attr))
+    }
+
+    /// Like [`Self::getattr_unchecked`], without parent updates of pending
+    /// deferred creates; a base for attributes that the VFS stores.
+    pub(super) fn getattr_base_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
         trace!(
             target: "studiofs_vfs::metadata_baseline::metadata_getattr",
             "VFS metadata getattr"
@@ -2193,6 +2200,13 @@ impl StudioVfs {
     }
 
     pub(super) async fn getattr_async_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
+        self.getattr_async_base_unchecked(ino)
+            .await
+            .map(|attr| self.with_deferred_parent_updates(attr))
+    }
+
+    /// Async form of [`Self::getattr_base_unchecked`].
+    pub(super) async fn getattr_async_base_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
         trace!(
             target: "studiofs_vfs::metadata_baseline::metadata_getattr",
             "VFS metadata getattr"

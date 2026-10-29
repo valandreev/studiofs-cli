@@ -375,6 +375,15 @@ impl PgMetaEngine {
                 {
                     stale_inodes.insert(attr.ino);
                 }
+                // The same create's parent mtime/ctime update directly follows its setup.
+                MetaEvent::SetAttr { attr }
+                    if attr.kind == FileType::Directory
+                        && Self::follows_stale_setup_under(
+                            events,
+                            index,
+                            attr.ino,
+                            &stale_inodes,
+                        ) => {}
                 MetaEvent::AddEntry { entry, .. }
                     if entry.kind == FileType::RegularFile && stale_inodes.contains(&entry.ino) => {
                 }
@@ -382,6 +391,20 @@ impl PgMetaEngine {
             }
         }
         Ok(events.len())
+    }
+
+    /// Whether `events[index]` directly follows a stale file setup under `parent`.
+    fn follows_stale_setup_under(
+        events: &[MetaEvent],
+        index: usize,
+        parent: Ino,
+        stale_inodes: &HashSet<Ino>,
+    ) -> bool {
+        matches!(
+            index.checked_sub(1).and_then(|previous| events.get(previous)),
+            Some(MetaEvent::SetAttr { attr })
+                if attr.parent == parent && stale_inodes.contains(&attr.ino)
+        )
     }
 
     fn initial_root_snapshot_prefix_len(event_start: u64, events: &[MetaEvent]) -> usize {
