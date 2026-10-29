@@ -197,6 +197,19 @@ impl StudioVfs {
     }
 
     #[cfg(test)]
+    pub(super) fn arm_supersede_window_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.supersede_window_hook.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_supersede_window_hook_for_test(&self) {
+        let hook = self.supersede_window_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn arm_fail_landing_zone_replay_after_for_test(&self, replayed_segments: usize) {
         self.fail_landing_zone_replay_after
             .store(replayed_segments, std::sync::atomic::Ordering::Relaxed);
@@ -2078,156 +2091,182 @@ impl StudioVfs {
         offset: u64,
         data: VfsWritePayload<'_>,
     ) -> VfsResult<u32> {
-        let dirty_attr = self.state.namespace.dirty_attrs.lock().get(&ino).cloned();
-        let open_attr = self
-            .handle_table
-            .get(fh)
-            .filter(|open_file| open_file.ino == ino)
-            .and_then(|open_file| open_file.open_attr());
-        let mut base_attr = match (dirty_attr, open_attr) {
-            (Some(dirty), Some(open)) if open.content_epoch > dirty.content_epoch => {
-                self.note_vfs_write_open_attr_hit();
-                open
-            }
-            (Some(dirty), _) => {
-                self.note_vfs_write_dirty_attr_hit();
-                dirty
-            }
-            (None, Some(open)) => {
-                self.note_vfs_write_open_attr_hit();
-                open
-            }
-            (None, None) => {
-                let getattr_started = Instant::now();
-                let getattr_result = self.getattr_async(ino).await;
-                self.record_vfs_write_getattr_async(getattr_started.elapsed());
-                let mut attr = match getattr_result {
-                    Ok(attr) => attr,
-                    Err(error)
-                        if Self::is_inode_not_found_error(&error, ino)
-                            && self
+        loop {
+            let dirty_attr = self.state.namespace.dirty_attrs.lock().get(&ino).cloned();
+            let open_attr = self
+                .handle_table
+                .get(fh)
+                .filter(|open_file| open_file.ino == ino)
+                .and_then(|open_file| open_file.open_attr());
+            let mut base_is_dirty_attr = false;
+            let mut base_attr = match (dirty_attr, open_attr) {
+                (Some(dirty), Some(open)) if open.content_epoch > dirty.content_epoch => {
+                    self.note_vfs_write_open_attr_hit();
+                    open
+                }
+                (Some(dirty), _) => {
+                    self.note_vfs_write_dirty_attr_hit();
+                    base_is_dirty_attr = true;
+                    dirty
+                }
+                (None, Some(open)) => {
+                    self.note_vfs_write_open_attr_hit();
+                    open
+                }
+                (None, None) => {
+                    let getattr_started = Instant::now();
+                    let getattr_result = self.getattr_async(ino).await;
+                    self.record_vfs_write_getattr_async(getattr_started.elapsed());
+                    let mut attr = match getattr_result {
+                        Ok(attr) => attr,
+                        Err(error)
+                            if Self::is_inode_not_found_error(&error, ino)
+                                && self
+                                    .handle_table
+                                    .get(fh)
+                                    .is_some_and(|open_file| open_file.active_open_overlay) =>
+                        {
+                            self.note_vfs_write_active_open_overlay_fallback();
+                            let open_file = self
                                 .handle_table
                                 .get(fh)
-                                .is_some_and(|open_file| open_file.active_open_overlay) =>
-                    {
-                        self.note_vfs_write_active_open_overlay_fallback();
-                        let open_file = self
-                            .handle_table
-                            .get(fh)
-                            .ok_or_else(|| VfsError::Meta(MetaError::InodeNotFound(ino)))?;
-                        self.handle_table.mark_orphan(ino);
-                        open_file
-                            .open_attr()
-                            .ok_or_else(|| VfsError::Meta(MetaError::InodeNotFound(ino)))?
-                    }
-                    Err(error) => return Err(error),
-                };
-                self.refresh_inode_incarnation_state_from_attr(ino, &attr);
-                self.begin_pending_incarnation(ino, &mut attr);
-                attr.upload_state = if attr.committed_size > 0 || attr.committed_content_epoch > 0 {
-                    MetaUploadState::Updating
-                } else {
-                    MetaUploadState::Uploading
-                };
-                attr
-            }
-        };
-        let starts_writer_only_empty_draft =
-            base_attr.is_unpublished_empty_draft() && !data.is_empty();
-        let writer_only_restore_attr = starts_writer_only_empty_draft.then(|| base_attr.clone());
-        let starts_payload_after_empty_local_incarnation = base_attr.is_unpublished_empty_draft()
-            || (base_attr.size == 0
-                && base_attr.committed_size == 0
-                && base_attr.content_epoch > base_attr.committed_content_epoch
-                && base_attr.upload_state != MetaUploadState::Ready);
-        if starts_payload_after_empty_local_incarnation && !data.is_empty() {
-            self.begin_size_change_incarnation(ino, &mut base_attr);
-            base_attr.upload_state = MetaUploadState::Uploading;
-        } else if base_attr.upload_state == MetaUploadState::Ready && !data.is_empty() {
-            self.begin_pending_incarnation(ino, &mut base_attr);
-            base_attr.upload_state =
-                if base_attr.committed_size > 0 || base_attr.committed_content_epoch > 0 {
-                    MetaUploadState::Updating
-                } else {
-                    MetaUploadState::Uploading
-                };
-        }
-
-        if starts_writer_only_empty_draft {
-            self.sync_meta().set_attr(&base_attr)?;
-            let meta = self.meta.clone();
-            run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                engine.sync_local_metadata()
-            })
-            .await?;
-        }
-
-        let spec = super::writer_stack::WriterWriteSpec {
-            fh,
-            ino,
-            current_size: base_attr.size,
-            content_epoch: base_attr.content_epoch,
-            first_object_id: 0,
-            offset,
-        };
-        let accepted = match data {
-            VfsWritePayload::Borrowed(data) => self.state.writer_stack.write_bytes(spec, data),
-            VfsWritePayload::Owned(data) => self.state.writer_stack.write_owned_bytes(spec, data),
-        };
-        let accepted = match accepted {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                if let Some(restore_attr) = writer_only_restore_attr {
-                    match self.sync_meta().set_attr(&restore_attr) {
-                        Err(restore_error) => warn!(
-                            ino,
-                            error = %restore_error,
-                            "failed to restore empty inode after writer stack rejection"
-                        ),
-                        Ok(()) => {
-                            let meta = self.meta.clone();
-                            if let Err(restore_error) =
-                                run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                                    engine.sync_local_metadata()
-                                })
-                                .await
-                            {
-                                warn!(
-                                    ino,
-                                    error = %restore_error,
-                                    "failed to persist restored empty inode after writer stack rejection"
-                                );
-                            }
+                                .ok_or_else(|| VfsError::Meta(MetaError::InodeNotFound(ino)))?;
+                            self.handle_table.mark_orphan(ino);
+                            open_file
+                                .open_attr()
+                                .ok_or_else(|| VfsError::Meta(MetaError::InodeNotFound(ino)))?
                         }
-                    }
-                }
-                return Err(error.into_vfs_error("writer stack write failed"));
-            }
-        };
-        {
-            let mut dirty = self.state.namespace.dirty_attrs.lock();
-            let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
-            merge_write_dirty_attr(attr, &base_attr);
-            attr.kind = FileType::RegularFile;
-            if accepted.visible_len > attr.size {
-                if attr.upload_state == MetaUploadState::Ready || attr.size < attr.committed_size {
-                    self.begin_size_change_incarnation(ino, attr);
+                        Err(error) => return Err(error),
+                    };
+                    self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+                    self.begin_pending_incarnation(ino, &mut attr);
                     attr.upload_state =
                         if attr.committed_size > 0 || attr.committed_content_epoch > 0 {
                             MetaUploadState::Updating
                         } else {
                             MetaUploadState::Uploading
                         };
+                    attr
                 }
-                attr.size = accepted.visible_len;
+            };
+            let starts_writer_only_empty_draft =
+                base_attr.is_unpublished_empty_draft() && !data.is_empty();
+            let writer_only_restore_attr =
+                starts_writer_only_empty_draft.then(|| base_attr.clone());
+            let starts_payload_after_empty_local_incarnation = base_attr
+                .is_unpublished_empty_draft()
+                || (base_attr.size == 0
+                    && base_attr.committed_size == 0
+                    && base_attr.content_epoch > base_attr.committed_content_epoch
+                    && base_attr.upload_state != MetaUploadState::Ready);
+            if starts_payload_after_empty_local_incarnation && !data.is_empty() {
+                self.begin_size_change_incarnation(ino, &mut base_attr);
+                base_attr.upload_state = MetaUploadState::Uploading;
+            } else if base_attr.upload_state == MetaUploadState::Ready && !data.is_empty() {
+                self.begin_pending_incarnation(ino, &mut base_attr);
+                base_attr.upload_state =
+                    if base_attr.committed_size > 0 || base_attr.committed_content_epoch > 0 {
+                        MetaUploadState::Updating
+                    } else {
+                        MetaUploadState::Uploading
+                    };
             }
-            attr.touch_mtime();
-            self.update_pending_incarnation_size(ino, attr.size);
+
+            if starts_writer_only_empty_draft {
+                self.sync_meta().set_attr(&base_attr)?;
+                let meta = self.meta.clone();
+                run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                    engine.sync_local_metadata()
+                })
+                .await?;
+            }
+
+            let spec = super::writer_stack::WriterWriteSpec {
+                fh,
+                ino,
+                current_size: base_attr.size,
+                content_epoch: base_attr.content_epoch,
+                first_object_id: 0,
+                offset,
+            };
+            // Buffer the bytes and publish their dirty attr as one step for
+            // supersede: a Ready attr must not retire an accepted write between them.
+            let accepted = {
+                let _supersede_admission = self.state.writer_stack.supersede_admission(ino);
+                // A supersede that retired the base dirty attr after it was read
+                // leaves this write on an already published epoch; resolve again.
+                if base_is_dirty_attr && !self.state.namespace.dirty_attrs.lock().contains_key(&ino)
+                {
+                    continue;
+                }
+                let accepted = match data {
+                    VfsWritePayload::Borrowed(data) => {
+                        self.state.writer_stack.write_bytes(spec, data)
+                    }
+                    VfsWritePayload::Owned(data) => {
+                        self.state.writer_stack.write_owned_bytes(spec, data)
+                    }
+                };
+                if let Ok(accepted) = &accepted {
+                    self.record_accepted_write_dirty_attr(ino, &base_attr, accepted.visible_len);
+                }
+                accepted
+            };
+            let accepted = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    if let Some(restore_attr) = writer_only_restore_attr {
+                        match self.sync_meta().set_attr(&restore_attr) {
+                            Err(restore_error) => warn!(
+                                ino,
+                                error = %restore_error,
+                                "failed to restore empty inode after writer stack rejection"
+                            ),
+                            Ok(()) => {
+                                let meta = self.meta.clone();
+                                if let Err(restore_error) =
+                                    run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                                        engine.sync_local_metadata()
+                                    })
+                                    .await
+                                {
+                                    warn!(
+                                        ino,
+                                        error = %restore_error,
+                                        "failed to persist restored empty inode after writer stack rejection"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return Err(error.into_vfs_error("writer stack write failed"));
+                }
+            };
+            self.invalidate_attr_read_cache([ino]);
+            // Keep the refresh pending even if materialization drains all dirty state before close.
+            self.retain_kernel_inode_attr_refresh(ino);
+            return Ok(accepted.accepted_bytes);
         }
-        self.invalidate_attr_read_cache([ino]);
-        // Keep the refresh pending even if materialization drains all dirty state before close.
-        self.retain_kernel_inode_attr_refresh(ino);
-        Ok(accepted.accepted_bytes)
+    }
+
+    fn record_accepted_write_dirty_attr(&self, ino: Ino, base_attr: &InodeAttr, visible_len: u64) {
+        let mut dirty = self.state.namespace.dirty_attrs.lock();
+        let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
+        merge_write_dirty_attr(attr, base_attr);
+        attr.kind = FileType::RegularFile;
+        if visible_len > attr.size {
+            if attr.upload_state == MetaUploadState::Ready || attr.size < attr.committed_size {
+                self.begin_size_change_incarnation(ino, attr);
+                attr.upload_state = if attr.committed_size > 0 || attr.committed_content_epoch > 0 {
+                    MetaUploadState::Updating
+                } else {
+                    MetaUploadState::Uploading
+                };
+            }
+            attr.size = visible_len;
+        }
+        attr.touch_mtime();
+        self.update_pending_incarnation_size(ino, attr.size);
     }
 
     async fn reserve_writer_stack_object_ids_by_count(

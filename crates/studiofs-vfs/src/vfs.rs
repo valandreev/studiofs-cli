@@ -1428,6 +1428,24 @@ impl AttrReadCacheMetrics {
     }
 }
 
+/// Condition re-checked under the supersede gate before local state is cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupersedeCheck {
+    /// The Ready attr must supersede existing local state.
+    ReadyAttrSupersedes,
+    /// No local state may be newer than the Ready attr.
+    NoNewerLocalState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupersedeOutcome {
+    /// Local state was cleared. Carries the refreshed observation when one was
+    /// supplied and no invalidation crossed it.
+    Cleared(Option<AttrReadObservation>),
+    /// A write was in flight or local state was newer; nothing was cleared.
+    Skipped,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct AttrReadObservation {
     global_generation: u64,
@@ -4199,6 +4217,9 @@ pub struct StudioVfs {
     fail_next_deferred_materialization_prefetch: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_landing_zone_replay_after: std::sync::atomic::AtomicUsize,
+    /// Runs once between the supersede decision and the clear it authorizes.
+    #[cfg(test)]
+    supersede_window_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) -> VfsError {
@@ -5969,14 +5990,13 @@ impl StudioVfs {
         attr: &InodeAttr,
         invalidate_kernel_on_supersede: bool,
     ) -> InodeIncarnationState {
-        if self.ready_attr_supersedes_local_regular_file_state(ino, attr) {
-            let _ = self.clear_superseded_local_regular_file_state(
-                ino,
-                attr.committed_content_epoch,
-                invalidate_kernel_on_supersede,
-                None,
-            );
-        }
+        let _ = self.try_supersede_local_regular_file_state(
+            ino,
+            attr,
+            SupersedeCheck::ReadyAttrSupersedes,
+            invalidate_kernel_on_supersede,
+            None,
+        );
 
         let has_pending_uploads = self.inode_has_pending_uploads(ino);
         let has_local_overlay = self.inode_has_local_overlay(ino);
@@ -6168,8 +6188,9 @@ impl StudioVfs {
             return false;
         }
         let has_pending_local_payloads = self.has_pending_local_dirty_payloads_for_inode(ino);
-        let has_dirty_writers = self.state.writer_stack.has_dirty_writers(ino);
-        if has_dirty_writers {
+        // Materializing slices have no dirty bytes, but the writer still holds
+        // the only copy until their payloads are installed.
+        if self.state.writer_stack.has_unsettled_writers(ino) {
             return false;
         }
         if !dirty_attr_present && !has_pending_local_payloads && has_same_epoch_pending_upload {
@@ -6196,7 +6217,6 @@ impl StudioVfs {
         }
         has_pending_local_payloads
             || dirty_attr_present
-            || has_dirty_writers
             || has_pending_uploads
             || has_live_extents
             || has_pending_epoch_finalization
@@ -6216,7 +6236,77 @@ impl StudioVfs {
             .is_some_and(|pending| pending.content_epoch > committed_epoch)
     }
 
+    /// Clears local regular-file state that the fully published `attr` covers,
+    /// deciding and clearing while foreground writes to `ino` are held off.
+    ///
+    /// Skips instead of waiting when a write holds supersede admission, when
+    /// `check` finds newer local state, or when writer bytes are still
+    /// unsettled; a later refresh retries.
+    fn try_supersede_local_regular_file_state(
+        &self,
+        ino: Ino,
+        attr: &InodeAttr,
+        check: SupersedeCheck,
+        invalidate_kernel: bool,
+        expected_observation: Option<AttrReadObservation>,
+    ) -> SupersedeOutcome {
+        let Some(writes_held_off) = self.state.writer_stack.try_supersede_exclusive(ino) else {
+            return SupersedeOutcome::Skipped;
+        };
+        let supersedes = match check {
+            SupersedeCheck::ReadyAttrSupersedes => {
+                self.ready_attr_supersedes_local_regular_file_state(ino, attr)
+            }
+            SupersedeCheck::NoNewerLocalState => {
+                Self::is_fully_published_regular_file(attr)
+                    && !self.has_local_pending_regular_file_state(ino, attr.committed_content_epoch)
+            }
+        };
+        if !supersedes {
+            return SupersedeOutcome::Skipped;
+        }
+        #[cfg(test)]
+        self.run_supersede_window_hook_for_test();
+        // Retire the writer first so unsettled bytes abort before any other
+        // local state is dropped.
+        if !self.state.writer_stack.clear_inode_if_settled(ino) {
+            return SupersedeOutcome::Skipped;
+        }
+        let observation = self.clear_superseded_local_state_without_writer(
+            ino,
+            attr.committed_content_epoch,
+            false,
+            expected_observation,
+        );
+        // A platform notifier may block on kernel page locks that a write
+        // waiting for admission holds, so notify only after releasing writes.
+        drop(writes_held_off);
+        if invalidate_kernel {
+            self.invalidate_kernel_inodes([ino]);
+        }
+        SupersedeOutcome::Cleared(observation)
+    }
+
+    /// Unconditionally clears superseded local state, including dirty writer
+    /// bytes; production paths use `try_supersede_local_regular_file_state`.
+    #[cfg(test)]
     fn clear_superseded_local_regular_file_state(
+        &self,
+        ino: Ino,
+        committed_epoch: u64,
+        invalidate_kernel: bool,
+        expected_observation: Option<AttrReadObservation>,
+    ) -> Option<AttrReadObservation> {
+        self.state.writer_stack.clear_inode(ino);
+        self.clear_superseded_local_state_without_writer(
+            ino,
+            committed_epoch,
+            invalidate_kernel,
+            expected_observation,
+        )
+    }
+
+    fn clear_superseded_local_state_without_writer(
         &self,
         ino: Ino,
         committed_epoch: u64,
@@ -6229,7 +6319,6 @@ impl StudioVfs {
         );
         self.cancel_pending_uploads_for_inode(ino);
         self.clear_pending_payloads_for_inode(ino);
-        self.state.writer_stack.clear_inode(ino);
         self.state.namespace.dirty_attrs.lock().remove(&ino);
         self.remove_live_extents_for_inode(ino);
         self.remove_pending_epoch_finalizations_for_inode(ino);

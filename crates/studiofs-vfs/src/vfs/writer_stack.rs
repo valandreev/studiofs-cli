@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+use parking_lot::{Condvar, Mutex};
 use studiofs_cache::{
     CachedStore, CachedStoreWriterConfig, CachedStoreWriterError, CachedStoreWriterSlice,
     DetachedStagedSlice, StagedSlice,
@@ -270,6 +272,60 @@ pub(super) struct MountedWriterStack {
     dirty_bytes: AtomicUsize,
     /// Wakes hard write-admission waiters whenever buffered dirty bytes drop.
     dirty_drained: tokio::sync::Notify,
+    /// Per-inode gates that keep an authoritative supersede decision and its
+    /// clear atomic with respect to foreground writes, sharded by inode.
+    supersede_gates: Box<[SupersedeGateShard]>,
+    /// Notified when a write waits for an in-progress supersede.
+    #[cfg(test)]
+    supersede_admission_contended: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+/// Supersede gate state for the inodes of one shard.
+///
+/// The mutex is held only to update this bookkeeping and is never nested with
+/// another lock; writers wait on the condvar only while their own inode is
+/// being superseded.
+#[derive(Default)]
+struct SupersedeGateShard {
+    state: Mutex<SupersedeGateState>,
+    superseded: Condvar,
+}
+
+#[derive(Default)]
+struct SupersedeGateState {
+    admitted_writes: HashMap<Ino, usize>,
+    superseding: HashSet<Ino>,
+}
+
+/// Holds off supersede of one inode while a write is admitted.
+pub(super) struct SupersedeAdmission<'a> {
+    shard: &'a SupersedeGateShard,
+    ino: Ino,
+}
+
+impl Drop for SupersedeAdmission<'_> {
+    fn drop(&mut self) {
+        let mut state = self.shard.state.lock();
+        if let Some(count) = state.admitted_writes.get_mut(&self.ino) {
+            *count -= 1;
+            if *count == 0 {
+                state.admitted_writes.remove(&self.ino);
+            }
+        }
+    }
+}
+
+/// Excludes writes to one inode for a supersede decision and clear.
+pub(super) struct SupersedeExclusive<'a> {
+    shard: &'a SupersedeGateShard,
+    ino: Ino,
+}
+
+impl Drop for SupersedeExclusive<'_> {
+    fn drop(&mut self) {
+        self.shard.state.lock().superseding.remove(&self.ino);
+        self.shard.superseded.notify_all();
+    }
 }
 
 impl MountedWriterStack {
@@ -300,7 +356,20 @@ impl MountedWriterStack {
             next_seq: AtomicU64::new(1),
             dirty_bytes: AtomicUsize::new(0),
             dirty_drained: tokio::sync::Notify::new(),
+            supersede_gates: (0..Self::SHARDS)
+                .map(|_| SupersedeGateShard::default())
+                .collect(),
+            #[cfg(test)]
+            supersede_admission_contended: Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_supersede_admission_contended_for_test(
+        &self,
+        notify: std::sync::mpsc::Sender<()>,
+    ) {
+        *self.supersede_admission_contended.lock() = Some(notify);
     }
 
     #[cfg(test)]
@@ -1062,6 +1131,70 @@ impl MountedWriterStack {
         }
     }
 
+    /// Holds off authoritative supersede of `ino` while a write installs its
+    /// bytes and dirty attr. Writers share admission, so they do not serialize;
+    /// a write waits only while `ino` itself is being superseded.
+    ///
+    /// Acquire it before any tier-2 writer or namespace lock and release it
+    /// before awaiting.
+    pub(super) fn supersede_admission(&self, ino: Ino) -> SupersedeAdmission<'_> {
+        let shard = &self.supersede_gates[Self::inode_shard_index(ino)];
+        let mut state = shard.state.lock();
+        #[cfg(test)]
+        if state.superseding.contains(&ino)
+            && let Some(notify) = self.supersede_admission_contended.lock().as_ref()
+        {
+            let _ = notify.send(());
+        }
+        while state.superseding.contains(&ino) {
+            shard.superseded.wait(&mut state);
+        }
+        *state.admitted_writes.entry(ino).or_default() += 1;
+        SupersedeAdmission { shard, ino }
+    }
+
+    /// Excludes writes to `ino` for one supersede decision and clear.
+    ///
+    /// Returns `None` while a write holds admission; supersede then skips and a
+    /// later refresh retries. It never waits, so a caller that already holds
+    /// admission or a file session cannot deadlock here.
+    pub(super) fn try_supersede_exclusive(&self, ino: Ino) -> Option<SupersedeExclusive<'_>> {
+        let shard = &self.supersede_gates[Self::inode_shard_index(ino)];
+        let mut state = shard.state.lock();
+        if state.admitted_writes.contains_key(&ino) || !state.superseding.insert(ino) {
+            return None;
+        }
+        Some(SupersedeExclusive { shard, ino })
+    }
+
+    /// Reports writer state that holds bytes not yet installed as local
+    /// payloads: dirty buffers, or slices that are still materializing.
+    pub(super) fn has_unsettled_writers(&self, ino: Ino) -> bool {
+        let file = {
+            let shard = self.shards[Self::inode_shard_index(ino)].lock();
+            shard.files.get(&ino).cloned()
+        };
+        file.is_some_and(|file| !file_is_settled(&file.lock()))
+    }
+
+    /// Retires the inode's writer state only when no bytes are unsettled.
+    ///
+    /// Returns `false`, leaving the writer in place, when it is dirty or still
+    /// materializing.
+    pub(super) fn clear_inode_if_settled(&self, ino: Ino) -> bool {
+        let mut shard = self.shards[Self::inode_shard_index(ino)].lock();
+        if shard
+            .files
+            .get(&ino)
+            .is_some_and(|file| !file_is_settled(&file.lock()))
+        {
+            return false;
+        }
+        shard.dirty_inodes.remove(&ino);
+        shard.files.remove(&ino);
+        true
+    }
+
     pub(super) fn has_dirty_writers(&self, ino: Ino) -> bool {
         self.dirty_bytes_for_inode(ino) > 0
     }
@@ -1360,6 +1493,15 @@ fn file_is_clean_and_materialized(file: &FileWriter) -> bool {
                 .slices
                 .iter()
                 .all(|slice| slice.materializing.is_empty())
+        })
+}
+
+fn file_is_settled(file: &FileWriter) -> bool {
+    file.dirty_bytes == 0
+        && file.chunks.values().all(|chunk| {
+            chunk.slices.iter().all(|slice| {
+                slice.materializing.is_empty() && slice.pending_materialization.is_empty()
+            })
         })
 }
 

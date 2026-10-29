@@ -461,6 +461,9 @@ impl StudioVfs {
             self.refresh_inode_incarnation_state_from_attr(ino, &base_attr);
             self.begin_pending_incarnation(ino, &mut base_attr);
             {
+                // The newer-epoch dirty attr is what keeps a later Ready attr
+                // from superseding these bytes before they are materialized.
+                let _supersede_admission = self.state.writer_stack.supersede_admission(ino);
                 let mut dirty = self.state.namespace.dirty_attrs.lock();
                 let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
                 attr.content_epoch = base_attr.content_epoch;

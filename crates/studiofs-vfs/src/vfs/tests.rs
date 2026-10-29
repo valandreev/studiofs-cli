@@ -7680,6 +7680,214 @@ fn remote_ready_attr_superseding_local_dirty_state_invalidates_kernel_inode() {
     });
 }
 
+/// Publishes `payload` as the Ready content of a new file, leaves a same-epoch
+/// stale dirty attr for supersede to clear, and opens a writer handle.
+async fn ready_file_with_stale_dirty_attr_and_writer(
+    vfs: &Arc<StudioVfs>,
+    meta: &Arc<RedbMetaEngine>,
+    name: &[u8],
+    payload: &[u8],
+) -> (InodeAttr, u64) {
+    let attr = vfs
+        .create(ROOT_INO, name, 0, 0, 0o644)
+        .expect("create file");
+    vfs.write(attr.ino, 0, payload)
+        .await
+        .expect("write payload");
+    vfs.flush(attr.ino).await.expect("flush payload");
+    let (published_epoch, published_blocks) =
+        mark_all_overlay_objects_uploaded(vfs, meta, attr.ino);
+    publish_current_file_graph(meta, attr.ino, published_epoch, &published_blocks);
+    vfs.cancel_pending_uploads_for_inode(attr.ino);
+    vfs.clear_pending_payloads_for_inode(attr.ino);
+    vfs.state.writer_stack.clear_inode(attr.ino);
+    vfs.remove_live_extents_for_inode(attr.ino);
+    vfs.remove_pending_epoch_finalizations_for_inode(attr.ino);
+    let published_attr = meta.get_attr(attr.ino).expect("load published attr");
+    assert_eq!(published_attr.upload_state, MetaUploadState::Ready);
+
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open writer");
+    let mut stale_dirty_attr = published_attr.clone();
+    stale_dirty_attr.upload_state = MetaUploadState::Updating;
+    vfs.state
+        .namespace
+        .dirty_attrs
+        .lock()
+        .insert(attr.ino, stale_dirty_attr);
+    (published_attr, fh)
+}
+
+#[test]
+fn ready_attr_supersede_keeps_write_accepted_inside_decision_window() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "supersede-window-write");
+    let _guard = rt.enter();
+    let payload = b"published payload";
+    let (published_attr, fh) = rt.block_on(ready_file_with_stale_dirty_attr_and_writer(
+        &vfs,
+        &meta,
+        b"supersede-window-write.bin",
+        payload,
+    ));
+    let ino = published_attr.ino;
+
+    // The writer reports either completion or that it is held off by supersede.
+    let (writer_event_tx, writer_event_rx) = std::sync::mpsc::channel::<()>();
+    vfs.state
+        .writer_stack
+        .set_supersede_admission_contended_for_test(writer_event_tx.clone());
+    let writer_vfs = Arc::clone(&vfs);
+    let writer_rt = Arc::clone(&rt);
+    let writer = Arc::new(Mutex::new(None::<thread::JoinHandle<u32>>));
+    let writer_slot = Arc::clone(&writer);
+    vfs.arm_supersede_window_hook_for_test(move || {
+        let handle = thread::spawn(move || {
+            let accepted = writer_rt
+                .block_on(writer_vfs.record_writer_stack_state_bytes(fh, ino, 0, b"RACE"))
+                .expect("write inside supersede window");
+            let _ = writer_event_tx.send(());
+            accepted
+        });
+        *writer_slot.lock() = Some(handle);
+        writer_event_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("writer completes or waits for supersede");
+    });
+
+    vfs.refresh_inode_incarnation_state_from_attr(ino, &published_attr);
+
+    let handle = writer.lock().take().expect("supersede window hook ran");
+    assert_eq!(handle.join().expect("writer thread"), 4);
+    let write_epoch = vfs
+        .state
+        .namespace
+        .dirty_attrs
+        .lock()
+        .get(&ino)
+        .map(|attr| attr.content_epoch)
+        .expect("write keeps a dirty attr");
+    assert!(
+        write_epoch > published_attr.committed_content_epoch,
+        "a write whose base dirty attr was superseded must start a newer epoch"
+    );
+    rt.block_on(async {
+        let read = vfs
+            .read(ino, 0, payload.len() as u32)
+            .await
+            .expect("read after supersede");
+        assert_eq!(
+            read.as_ref(),
+            b"RACEished payload",
+            "a write accepted while supersede decided must stay readable"
+        );
+        assert_eq!(
+            vfs.getattr(ino).expect("getattr").size,
+            payload.len() as u64
+        );
+        vfs.release_fh(fh).await.expect("release writer");
+    });
+}
+
+#[test]
+fn read_path_supersede_skips_while_a_write_is_admitted() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "supersede-read-path-admission");
+    let _guard = rt.enter();
+    let (published_attr, fh) = rt.block_on(ready_file_with_stale_dirty_attr_and_writer(
+        &vfs,
+        &meta,
+        b"supersede-read-path-admission.bin",
+        b"published payload",
+    ));
+    let ino = published_attr.ino;
+    // A write to another inode must not hold off this inode's supersede.
+    let other = vfs
+        .create(ROOT_INO, b"supersede-read-path-other.bin", 0, 0, 0o644)
+        .expect("create other file");
+    let other_admission = vfs.state.writer_stack.supersede_admission(other.ino);
+
+    let admission = vfs.state.writer_stack.supersede_admission(ino);
+    vfs.getattr(ino).expect("getattr while a write is admitted");
+    assert!(
+        vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+        "the read path must not clear local state while a write is admitted"
+    );
+    drop(admission);
+
+    vfs.getattr(ino).expect("getattr after the write");
+    assert!(
+        !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+        "the read path supersedes once no write to this inode is admitted"
+    );
+    drop(other_admission);
+    rt.block_on(vfs.release_fh(fh)).expect("release writer");
+}
+
+#[test]
+fn ready_attr_supersede_keeps_materializing_writer_slices() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "supersede-materializing-write");
+    let _guard = rt.enter();
+    let payload = b"published payload";
+    rt.block_on(async {
+        let (published_attr, fh) = ready_file_with_stale_dirty_attr_and_writer(
+            &vfs,
+            &meta,
+            b"supersede-materializing-write.bin",
+            payload,
+        )
+        .await;
+        let ino = published_attr.ino;
+        vfs.record_writer_stack_state_bytes(fh, ino, 0, b"SLOW")
+            .await
+            .expect("buffer write");
+        let object_count = vfs
+            .state
+            .writer_stack
+            .prepare_finish_inode(ino)
+            .expect("prepare materialization");
+        let first_object_id = meta
+            .next_object_ids(object_count)
+            .expect("reserve object ids")[0];
+        vfs.state
+            .writer_stack
+            .finish_prepared_inode(ino, first_object_id)
+            .expect("detach slices into materialization");
+        assert!(
+            !vfs.state.writer_stack.has_dirty_writers(ino),
+            "the bytes are materializing, not dirty"
+        );
+        // Authoritative metadata has caught up with the local attr, so only the
+        // materializing writer slice still holds the written bytes.
+        let mut caught_up_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("write keeps a dirty attr");
+        caught_up_attr.upload_state = MetaUploadState::Ready;
+        caught_up_attr.committed_content_epoch = caught_up_attr.content_epoch;
+        caught_up_attr.committed_size = caught_up_attr.size;
+
+        vfs.refresh_inode_incarnation_state_from_attr(ino, &caught_up_attr);
+
+        let read = vfs
+            .read(ino, 0, payload.len() as u32)
+            .await
+            .expect("read after supersede");
+        assert_eq!(
+            read.as_ref(),
+            b"SLOWished payload",
+            "supersede must not drop writer slices that are still materializing"
+        );
+        vfs.release_fh(fh).await.expect("release writer");
+    });
+}
+
 #[test]
 fn authoritative_ready_metadata_does_not_clear_newer_local_dirty_attr() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
