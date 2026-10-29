@@ -753,21 +753,28 @@ impl StudioVfs {
     /// Returns once committed metadata knows the inode, even while later
     /// queued operations for it (such as attribute updates) remain pending.
     async fn wait_for_deferred_namespace_create(&self, ino: Ino) -> VfsResult<()> {
+        // Re-read committed metadata only after this inode's progress moved,
+        // not on every settle of an unrelated inode.
+        let mut checked = None;
         loop {
             let notified = self.state.namespace.deferred.notify.notified();
-            {
+            let progress = {
                 let inner = self.state.namespace.deferred.inner.lock();
                 if let Some(error) = inner.errors.get(&ino) {
                     return Err(VfsError::Other(format!(
                         "deferred namespace metadata commit failed for inode {ino}: {error}"
                     )));
                 }
-                if !inner.pending_inodes.contains_key(&ino) {
+                let Some(progress) = inner.pending_inode_progress(ino) else {
+                    return Ok(());
+                };
+                progress
+            };
+            if checked != Some(progress) {
+                if self.sync_meta().get_attr(ino).is_ok() {
                     return Ok(());
                 }
-            }
-            if self.sync_meta().get_attr(ino).is_ok() {
-                return Ok(());
+                checked = Some(progress);
             }
             notified.await;
         }
@@ -3186,6 +3193,10 @@ impl StudioVfs {
         uid: u32,
         gid: u32,
     ) -> VfsResult<InodeAttr> {
+        // Fail fast on caller errors instead of waiting for the parent first.
+        self.enforce_access(parent, AccessLevel::ReadWrite)?;
+        validate_name(name)?;
+        self.reject_runtime_stats_entry_creation(parent, name)?;
         self.wait_for_deferred_namespace_create(parent).await?;
         self.symlink_committed(parent, name, target, uid, gid)
     }
