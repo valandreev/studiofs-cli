@@ -475,6 +475,25 @@ and single-job fio `psync` 4 KiB sequential writes rose from 12-15k to
 19-21k IOPS (four jobs: 11k to 22-24k). Kernel page-cache reads of locally
 dirty or newly changed files are unchanged by this work; SFS-901 covers them.
 
+### SFS-921 Writes After a Strict Flush Use the Current Epoch
+
+After a strict flush clears the dirty attr, a pending-slice commit can rebase
+local metadata to a newer epoch without refreshing the handle snapshot or the
+pending incarnation. A deferred write that took its base from either one
+landed on the older epoch, and the next commit clipped it to the metadata EOF,
+so the size change was lost. The test sets up that state and checks the size
+and bytes after `fsync`:
+
+```sh
+cargo test -p studiofs-vfs --lib deferred_write_after_epoch_rebase_ignores_stale_handle_attr -- --nocapture
+```
+
+On a PostgreSQL/S3 mount with `STUDIOFS_FUSE_DIRECT_IO_MMAP=1` (WSL2 6.6,
+libfuse 3.14.0), fsx `small -R` passed 3 of 3 runs after this change, against
+2 to 3 failures in 4 runs before it. fsx `small` with mmap still failed 2 of 10
+runs: an upload reattach of a stale-epoch object advances the epoch behind
+foreground state ([SFS-922](https://linear.app/valandreev/issue/SFS-922)).
+
 ### SFS-916 Shared Writable mmap Under the Adaptive Policy
 
 Adaptive and `direct` open write-capable handles with `direct_io`. By default,

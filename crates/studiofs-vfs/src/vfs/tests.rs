@@ -26300,6 +26300,72 @@ fn fsx_copy_then_shrink_and_sparse_growth_zeroes_old_destination() {
     }
 }
 
+/// SFS-921: once a strict flush clears the dirty attr, local metadata can move
+/// to a newer epoch than the handle's snapshot; the pending-slice commit
+/// rebases epochs without refreshing open handles. A write based on that stale
+/// snapshot looked older than metadata, so the next commit clipped it to the
+/// metadata EOF and the extension was lost.
+#[test]
+fn deferred_write_after_epoch_rebase_ignores_stale_handle_attr() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "write-after-epoch-rebase");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let ino = vfs.create(1, b"file", 0, 0, 0o644).unwrap().ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &vec![1; 32_391],
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        // Growth refreshes the handle snapshot to an unpublished epoch.
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(41_590))
+            .unwrap();
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            36_864,
+            &vec![3; 4_096],
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        vfs.fsync_fh(fh).await.unwrap();
+        assert!(!vfs.state.namespace.dirty_attrs.lock().contains_key(&ino));
+        let mut persisted = vfs.sync_meta().get_attr(ino).unwrap();
+        let open = vfs.handle_table.get(fh).unwrap().open_attr().unwrap();
+        assert_eq!(persisted.upload_state, MetaUploadState::Uploading);
+        assert_eq!(open.content_epoch, persisted.content_epoch);
+        // Mirror the commit rebase: metadata moves one epoch past the handle.
+        persisted.content_epoch += 1;
+        vfs.sync_meta().set_attr(&persisted).unwrap();
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            42_925,
+            &vec![2; 1_154],
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        vfs.fsync_fh(fh).await.unwrap();
+
+        assert_eq!(vfs.getattr(ino).unwrap().size, 44_079);
+        let mut tail = vec![0; 1_154];
+        assert_eq!(
+            vfs.read_into_fh(fh, ino, 42_925, &mut tail).await.unwrap(),
+            1_154
+        );
+        assert_eq!(tail, vec![2; 1_154]);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
 /// fsx-shaped random writes, truncates, and reads against a reference buffer
 /// while the real upload worker runs. Timing-dependent, so it stays opt-in.
 #[test]

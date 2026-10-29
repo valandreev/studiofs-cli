@@ -2093,11 +2093,24 @@ impl StudioVfs {
     ) -> VfsResult<u32> {
         loop {
             let dirty_attr = self.state.namespace.dirty_attrs.lock().get(&ino).cloned();
-            let open_attr = self
+            let mut open_attr = self
                 .handle_table
                 .get(fh)
                 .filter(|open_file| open_file.ino == ino)
                 .and_then(|open_file| open_file.open_attr());
+            // Without a dirty attr the handle snapshot is only a fallback: a
+            // pending-slice commit can rebase local metadata to a newer epoch
+            // without refreshing handles, and a write on the older epoch is
+            // then clipped to the metadata EOF (SFS-921).
+            if dirty_attr.is_none()
+                && open_attr.as_ref().is_some_and(|open| {
+                    self.sync_meta()
+                        .get_attr(ino)
+                        .is_ok_and(|current| current.content_epoch > open.content_epoch)
+                })
+            {
+                open_attr = None;
+            }
             let mut base_is_dirty_attr = false;
             let mut base_attr = match (dirty_attr, open_attr) {
                 (Some(dirty), Some(open)) if open.content_epoch > dirty.content_epoch => {
