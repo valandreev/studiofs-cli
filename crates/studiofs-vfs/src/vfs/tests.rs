@@ -21457,7 +21457,54 @@ fn test_validate_name_too_long() {
     let long = vec![b'a'; 256];
     assert!(matches!(
         validate_name(&long),
-        Err(VfsError::InvalidName(_))
+        Err(VfsError::NameTooLong(256))
+    ));
+}
+
+#[test]
+fn namespace_operations_reject_over_long_components_as_name_too_long() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "name-too-long");
+    let max = vec![b'm'; 255];
+    let long = vec![b'l'; 256];
+
+    assert!(matches!(
+        vfs.lookup(ROOT_INO, &max),
+        Err(VfsError::Meta(MetaError::EntryNotFound { .. }))
+    ));
+    assert!(matches!(
+        vfs.lookup(ROOT_INO, &long),
+        Err(VfsError::NameTooLong(256))
+    ));
+
+    let file = vfs
+        .create(ROOT_INO, &max, 0, 0, 0o644)
+        .expect("255-byte name is accepted");
+    assert_eq!(vfs.lookup(ROOT_INO, &max).expect("lookup").ino, file.ino);
+
+    assert!(matches!(
+        vfs.create(ROOT_INO, &long, 0, 0, 0o644),
+        Err(VfsError::NameTooLong(256))
+    ));
+    assert!(matches!(
+        vfs.mkdir(ROOT_INO, &long, 0, 0, 0o755),
+        Err(VfsError::NameTooLong(256))
+    ));
+    assert!(matches!(
+        vfs.symlink(ROOT_INO, &long, b"target", 0, 0),
+        Err(VfsError::NameTooLong(256))
+    ));
+    assert!(matches!(
+        vfs.link(file.ino, ROOT_INO, &long),
+        Err(VfsError::NameTooLong(256))
+    ));
+    assert!(matches!(
+        vfs.rename(ROOT_INO, &max, ROOT_INO, &long, true),
+        Err(VfsError::NameTooLong(256))
+    ));
+    assert!(matches!(
+        vfs.lookup(ROOT_INO, &long),
+        Err(VfsError::NameTooLong(256))
     ));
 }
 

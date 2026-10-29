@@ -89,6 +89,7 @@ pub fn vfs_err_to_errno(error: &VfsError) -> i32 {
         BridgeVfsErrorKind::UnrecognizedVolume => libc::ENODEV,
         BridgeVfsErrorKind::XattrValueTooLarge => libc::E2BIG,
         BridgeVfsErrorKind::InvalidInput => libc::EINVAL,
+        BridgeVfsErrorKind::NameTooLong => libc::ENAMETOOLONG,
         BridgeVfsErrorKind::OperationNotSupported => libc::EOPNOTSUPP,
         BridgeVfsErrorKind::PermissionDenied => libc::EACCES,
         BridgeVfsErrorKind::MetadataPersistenceDegraded => libc::EIO,
@@ -152,6 +153,9 @@ mod tests {
     fn vfs_error_maps_to_expected_errno_codes() {
         let invalid = VfsError::InvalidName("bad".into());
         assert_eq!(vfs_err_to_errno(&invalid), libc::EINVAL);
+
+        let too_long = VfsError::NameTooLong(256);
+        assert_eq!(vfs_err_to_errno(&too_long), libc::ENAMETOOLONG);
 
         let exists = VfsError::Meta(MetaError::EntryExists {
             parent: studiofs_meta::ROOT_INO,

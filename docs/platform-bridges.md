@@ -57,6 +57,25 @@ Path walks are centralized in VFS `NamespaceResolver`:
 - macFUSE uses VFS component lookup (`lookup`) which is routed through the same resolver logic.
 - Bridge-local namespace traversal should not bypass VFS runtime filtering.
 
+## Entry name rules
+
+The VFS applies one namespace rule set on every platform, because Linux, macOS,
+and Windows peers share the same volume namespace:
+
+- A component longer than 255 bytes (`NAME_MAX`, the `statfs` `namelen`) returns
+  `VfsError::NameTooLong`. POSIX bridges report `ENAMETOOLONG` and WinFSP
+  reports `STATUS_OBJECT_NAME_INVALID`. This applies to create, mkdir, symlink,
+  link, and rename targets, and to lookup, so lookup-based calls such as `stat`
+  or `chmod` do not report a missing entry.
+- Empty names, `.`, `..`, `/`, and the Windows-reserved characters
+  `< > : " | \ ? *` return `VfsError::InvalidName` (`EINVAL` on POSIX,
+  `STATUS_INVALID_PARAMETER` on WinFSP).
+
+Rejecting the Windows-reserved characters on Linux and macOS is unsupported by
+design: a WinFSP peer could not represent such a name. Linux trees that contain
+them, for example `12:00.log`, cannot be copied onto a StudioFS mount until the
+WinFSP view gains an escaping scheme.
+
 WinFSP rename forwards `ReplaceIfExists` to the local metadata write
 transaction. With replacement disabled, an existing file or directory returns
 `STATUS_OBJECT_NAME_COLLISION` before either entry changes, including when the
@@ -338,6 +357,7 @@ WinFSP callback barrier semantics:
 - `InodeNotFound` → `STATUS_OBJECT_NAME_NOT_FOUND`
 - `EntryNotFound` → `STATUS_OBJECT_NAME_NOT_FOUND`
 - `EntryExists` → `STATUS_OBJECT_NAME_COLLISION`
+- `NameTooLong` → `STATUS_OBJECT_NAME_INVALID`
 - `DirNotEmpty` → `STATUS_DIRECTORY_NOT_EMPTY`
 - `IsADirectory` → `STATUS_FILE_IS_A_DIRECTORY`
 - `RepairRequired` → `STATUS_DISK_CORRUPT_ERROR`

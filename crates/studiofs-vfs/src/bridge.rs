@@ -26,6 +26,8 @@ pub enum BridgeVfsErrorKind {
     XattrValueTooLarge,
     /// Input arguments or values were malformed or invalid.
     InvalidInput,
+    /// A path component exceeds the maximum name length.
+    NameTooLong,
     /// The requested filesystem operation is not supported.
     OperationNotSupported,
     /// Access was denied for the requested operation.
@@ -82,6 +84,7 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
         VfsError::WouldBlock | VfsError::RemoteContentPending => BridgeVfsErrorKind::Retryable,
         VfsError::OperationNotSupported => BridgeVfsErrorKind::OperationNotSupported,
         VfsError::InvalidName(_) => BridgeVfsErrorKind::InvalidInput,
+        VfsError::NameTooLong(_) => BridgeVfsErrorKind::NameTooLong,
         VfsError::Fetch(fetch_error) => classify_fetch_error(fetch_error),
         _ => BridgeVfsErrorKind::GenericFailure,
     }

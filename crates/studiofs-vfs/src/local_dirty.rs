@@ -711,6 +711,7 @@ fn clone_overlay_batch_error(error: &VfsError) -> VfsError {
         VfsError::WouldBlock => VfsError::WouldBlock,
         VfsError::RemoteContentPending => VfsError::RemoteContentPending,
         VfsError::InvalidName(name) => VfsError::InvalidName(name.clone()),
+        VfsError::NameTooLong(len) => VfsError::NameTooLong(*len),
         VfsError::Other(message) => VfsError::Other(message.clone()),
         _ => VfsError::Other(error.to_string()),
     }

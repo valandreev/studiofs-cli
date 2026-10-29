@@ -2331,6 +2331,7 @@ impl StudioVfs {
 
     pub(super) fn lookup_component_impl(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
         self.enforce_access(parent, AccessLevel::ReadOnly)?;
+        super::validate_name_len(name)?;
         if parent == super::ROOT_INO && super::is_probable_trash_component(name) {
             self.heal_dangling_entry_if_inode_missing(parent, name)?;
             self.dentry_cache_insert_negative(parent, name);
