@@ -3680,6 +3680,16 @@ fn hidden_flush_tail_is_republished_in_next_batch_and_acknowledged_after_remount
         pg.publish_regular_file_overlay_to_base_if_matches(published.ino, published.content_epoch)
             .unwrap()
     );
+    let base_inodes = redb::TableDefinition::<u64, &[u8]>::new("base_inodes");
+    let root_base_before_create = pg
+        .local
+        .begin_read_txn()
+        .unwrap()
+        .open_table(base_inodes)
+        .unwrap()
+        .get(ROOT_INO)
+        .unwrap()
+        .map(|row| row.value().to_vec());
     // The still-uploading create is the hidden tail of the first flush.
     let tail = pg
         .create_file(ROOT_INO, b"hidden-tail.bin", 0, 0, 0o644)
@@ -3732,8 +3742,21 @@ fn hidden_flush_tail_is_republished_in_next_batch_and_acknowledged_after_remount
 
     // A crash before the second self-ack leaves only the first batch's
     // cursor durable, and redb repair replays the remote tail from zero.
+    // Such a crash also leaves local overlay authority over the remote base,
+    // which makes the reopen preserve the journal. Self-acks already promoted
+    // the tail create's parent update, so restore the root base from before it.
     {
         let local = RedbMetaEngine::open(&path).unwrap();
+        let txn = local.begin_write_txn().unwrap();
+        {
+            let mut table = txn.open_table(base_inodes).unwrap();
+            match &root_base_before_create {
+                Some(row) => table.insert(ROOT_INO, row.as_slice()).map(drop),
+                None => table.remove(ROOT_INO).map(drop),
+            }
+            .unwrap();
+        }
+        txn.commit().unwrap();
         local
             .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, cursor_after_first_batch)
             .unwrap();
