@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::client::{ClientLifecycleState, ClientSpec, S3Config, client_spec_for};
@@ -389,6 +389,8 @@ struct RecordingRustfsOutageDriver {
     clients: Vec<ClientSpec>,
     actions: RefCell<Vec<&'static str>>,
     peer_probe_delay: Duration,
+    started: Instant,
+    first_peer_probe_elapsed: Option<Duration>,
 }
 
 impl RecordingRustfsOutageDriver {
@@ -397,6 +399,8 @@ impl RecordingRustfsOutageDriver {
             clients,
             actions: RefCell::new(Vec::new()),
             peer_probe_delay: Duration::from_millis(0),
+            started: Instant::now(),
+            first_peer_probe_elapsed: None,
         }
     }
 
@@ -473,6 +477,8 @@ impl RustfsOutageDriver for RecordingRustfsOutageDriver {
         forbidden_checksum: &str,
     ) -> Result<Option<String>, ScenarioError> {
         self.actions.borrow_mut().push("assert_peer_not_visible");
+        let elapsed = self.started.elapsed();
+        self.first_peer_probe_elapsed.get_or_insert(elapsed);
         if !self.peer_probe_delay.is_zero() {
             thread::sleep(self.peer_probe_delay);
         }
