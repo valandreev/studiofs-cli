@@ -186,6 +186,19 @@ unsafe extern "C" {
         ops_size: libc::size_t,
         userdata: *mut c_void,
     ) -> *mut raw::FuseSession;
+    fn studiofs_linux_fuse_session_enable_direct_io_mmap(session: *mut raw::FuseSession) -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_init_patch_reply_flags2_for_test(
+        fd: c_int,
+        kernel_flags: u32,
+        kernel_flags2: u32,
+        request_unique: u64,
+        request_opcode: u32,
+        reply_unique: u64,
+        reply_error: i32,
+        reply_flags: u32,
+        reply_flags2: u32,
+    ) -> i64;
     fn studiofs_linux_fuse_wrap_exit_signal(sig: c_int) -> c_int;
     fn studiofs_linux_fuse_unwrap_exit_signal(sig: c_int);
     #[cfg(test)]
@@ -778,6 +791,29 @@ fn path_to_cstring(path: &std::path::Path) -> io::Result<CString> {
     })
 }
 
+/// Ask the kernel to allow shared mmap of `direct_io` handles (SFS-916).
+///
+/// A failure only leaves shared writable mappings of `direct_io` handles
+/// refused with ENODEV, so it is logged rather than failing the mount.
+fn enable_direct_io_mmap(session: NonNull<raw::FuseSession>) {
+    // SAFETY: `session` is a live, mounted libfuse session whose loop has not
+    // started, so no worker reads or replies through its IO yet.
+    let result = unsafe { studiofs_linux_fuse_session_enable_direct_io_mmap(session.as_ptr()) };
+    match result {
+        2 => tracing::debug!("libfuse3 requests FUSE_DIRECT_IO_ALLOW_MMAP natively"),
+        1 => tracing::debug!("FUSE_DIRECT_IO_ALLOW_MMAP is added to the INIT reply by the shim"),
+        0 => tracing::warn!(
+            "libfuse3 < 3.13 cannot request FUSE_DIRECT_IO_ALLOW_MMAP; shared writable mmap \
+             of direct_io handles fails with ENODEV"
+        ),
+        errno => tracing::warn!(
+            error = %io::Error::from_raw_os_error(-errno),
+            "failed to arrange FUSE_DIRECT_IO_ALLOW_MMAP; shared writable mmap of direct_io \
+             handles fails with ENODEV"
+        ),
+    }
+}
+
 struct OwnedFuseArgs {
     _strings: Vec<CString>,
     _argv: Vec<*mut c_char>,
@@ -873,6 +909,7 @@ impl Session {
         // NUL-terminated path for this call.
         let mount_result = unsafe { raw::fuse_session_mount(raw.as_ptr(), mount_point.as_ptr()) };
         if mount_result == 0 {
+            enable_direct_io_mmap(raw);
             let invalidation_state = Arc::new(SessionInvalidationState::new());
             let invalidation_queue = state.invalidation_queue.clone();
             let notify_target = SessionInvalidationTarget {
@@ -5045,6 +5082,115 @@ mod tests {
         assert_eq!(enabled, 1);
     }
 
+    const FUSE_OPCODE_INIT: u32 = 26;
+    const FUSE_OPCODE_LOOKUP: u32 = 1;
+    const FUSE_INIT_EXT: u32 = 1 << 30;
+    const DIRECT_IO_ALLOW_MMAP_FLAGS2: u32 = 1 << (36 - 32);
+
+    struct InitPatchCase {
+        fd: libc::c_int,
+        kernel_flags2: u32,
+        request_opcode: u32,
+        reply_unique: u64,
+        reply_error: i32,
+        reply_flags: u32,
+    }
+
+    impl InitPatchCase {
+        /// A kernel 6.6 INIT that offers ALLOW_MMAP and a successful reply.
+        /// Each case uses its own fake fd, so parallel tests never share a slot.
+        fn offered(fd: libc::c_int) -> Self {
+            Self {
+                fd,
+                kernel_flags2: DIRECT_IO_ALLOW_MMAP_FLAGS2,
+                request_opcode: FUSE_OPCODE_INIT,
+                reply_unique: 2,
+                reply_error: 0,
+                reply_flags: FUSE_INIT_EXT,
+            }
+        }
+
+        fn reply_flags2(&self) -> Option<u32> {
+            const REPLY_FLAGS2: u32 = 1 << 1;
+            // SAFETY: the C hook only touches stack-local wire buffers and
+            // the slot for this case's fake fd.
+            let flags2 = unsafe {
+                super::studiofs_linux_fuse_init_patch_reply_flags2_for_test(
+                    self.fd,
+                    FUSE_INIT_EXT,
+                    self.kernel_flags2,
+                    2,
+                    self.request_opcode,
+                    self.reply_unique,
+                    self.reply_error,
+                    self.reply_flags,
+                    REPLY_FLAGS2,
+                )
+            };
+            let flags2 = u32::try_from(flags2).ok()?;
+            assert_ne!(
+                flags2 & REPLY_FLAGS2,
+                0,
+                "libfuse's own flags2 bits survive"
+            );
+            Some(flags2)
+        }
+    }
+
+    fn init_patch_is_compiled() -> bool {
+        InitPatchCase::offered(10_000).reply_flags2().is_some()
+    }
+
+    #[test]
+    fn init_reply_patch_adds_direct_io_allow_mmap_when_kernel_offers_it() {
+        if !init_patch_is_compiled() {
+            return;
+        }
+        let flags2 = InitPatchCase::offered(10_001)
+            .reply_flags2()
+            .expect("patch path");
+
+        assert_ne!(flags2 & DIRECT_IO_ALLOW_MMAP_FLAGS2, 0);
+    }
+
+    #[test]
+    fn init_reply_patch_leaves_replies_without_offer_or_match_unchanged() {
+        if !init_patch_is_compiled() {
+            return;
+        }
+        let cases = [
+            InitPatchCase {
+                kernel_flags2: 0,
+                ..InitPatchCase::offered(10_002)
+            },
+            InitPatchCase {
+                request_opcode: FUSE_OPCODE_LOOKUP,
+                ..InitPatchCase::offered(10_003)
+            },
+            InitPatchCase {
+                reply_unique: 3,
+                ..InitPatchCase::offered(10_004)
+            },
+            InitPatchCase {
+                reply_error: -libc::EPROTO,
+                ..InitPatchCase::offered(10_005)
+            },
+            InitPatchCase {
+                reply_flags: 0,
+                ..InitPatchCase::offered(10_006)
+            },
+        ];
+        for case in cases {
+            let flags2 = case.reply_flags2().expect("patch path");
+            assert_eq!(
+                flags2 & DIRECT_IO_ALLOW_MMAP_FLAGS2,
+                0,
+                "fd {} must not gain ALLOW_MMAP",
+                case.fd
+            );
+        }
+    }
+
     #[test]
     fn conn_feature_helper_requests_async_dio_when_supported() {
         let async_dio_cap = 1_u64 << 15;
@@ -8278,6 +8424,137 @@ mod tests {
             .expect("repeated mounted VFS shutdown should succeed");
         drop(fixture);
         std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
+    }
+
+    /// SFS-916: adaptive opens writable handles with `direct_io`; the kernel
+    /// refuses a shared writable mapping of such a file with ENODEV unless the
+    /// connection negotiated `FUSE_DIRECT_IO_ALLOW_MMAP`.
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_shared_writable_mmap_round_trips_under_adaptive_policy() {
+        use std::os::fd::AsRawFd;
+
+        const FILE_LEN: usize = 3 * 4096 + 123;
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-mmap")
+            .expect("create VFS fixture");
+        fixture.start().expect("start VFS fixture");
+        let mount_point =
+            std::env::temp_dir().join(format!("studiofs-linux-fuse-mmap-{}", std::process::id()));
+        std::fs::create_dir_all(&mount_point).expect("create mount point");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = crate::cache_policy::LinuxFuseCachePolicy::Adaptive;
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-mmap").expect("mount");
+        let mount_point_for_worker = mount_point.clone();
+        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
+            let guard = UnmountGuard::new(mount_point_for_worker.clone());
+            let path = mount_point_for_worker.join("mapped.bin");
+            let expected: Vec<u8> = (0..FILE_LEN).map(|index| (index % 251) as u8).collect();
+            let file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            file.set_len(FILE_LEN as u64)?;
+            // SAFETY: the fd is open read-write and the file is FILE_LEN bytes.
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    FILE_LEN,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if mapping == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: the mapping is FILE_LEN writable bytes and does not
+            // overlap `expected`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(expected.as_ptr(), mapping.cast::<u8>(), FILE_LEN);
+            }
+            // SAFETY: `mapping` is the live mapping created above.
+            let synced = unsafe { libc::msync(mapping, FILE_LEN, libc::MS_SYNC) };
+            let msync_error = std::io::Error::last_os_error();
+            // SAFETY: unmapping the live mapping created above exactly once.
+            let unmapped = unsafe { libc::munmap(mapping, FILE_LEN) };
+            let munmap_error = std::io::Error::last_os_error();
+            if synced != 0 {
+                return Err(msync_error);
+            }
+            if unmapped != 0 {
+                return Err(munmap_error);
+            }
+            drop(file);
+
+            assert_eq!(std::fs::read(&path)?, expected);
+
+            // A mapping outlives close(): its dirty pages reach the handle
+            // after FLUSH, via the writeback that munmap starts, before RELEASE.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            // SAFETY: the fd is open read-write and the file is FILE_LEN bytes.
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    FILE_LEN,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if mapping == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error());
+            }
+            drop(file);
+            let mut expected = expected;
+            expected[4096..4096 + 7].copy_from_slice(b"rewrite");
+            // SAFETY: the mapping stays valid after close and covers this range.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    b"rewrite".as_ptr(),
+                    mapping.cast::<u8>().add(4096),
+                    7,
+                );
+            }
+            // SAFETY: unmapping the live mapping created above exactly once.
+            if unsafe { libc::munmap(mapping, FILE_LEN) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            assert_eq!(std::fs::read(&path)?, expected);
+
+            let status = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&mount_point_for_worker)
+                .status();
+            guard.disarm();
+            status
+        });
+
+        session.run().expect("run libfuse3 session");
+        let unmount_status = worker
+            .join()
+            .expect("mounted mmap worker should not panic")
+            .expect("shared writable mmap should round-trip under adaptive");
+        assert!(unmount_status.success());
+        drop(session);
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(Duration::ZERO))
+            .expect("mounted VFS shutdown should succeed");
+        drop(fixture);
+        std::fs::remove_dir_all(&mount_point).expect("remove mount point");
     }
 
     #[test]

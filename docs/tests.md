@@ -475,6 +475,27 @@ and single-job fio `psync` 4 KiB sequential writes rose from 12-15k to
 19-21k IOPS (four jobs: 11k to 22-24k). Kernel page-cache reads of locally
 dirty or newly changed files are unchanged by this work; SFS-901 covers them.
 
+### SFS-916 Shared Writable mmap Under the Adaptive Policy
+
+Adaptive and `direct` open write-capable handles with `direct_io`, and the
+kernel refused `mmap(MAP_SHARED)` on them with `ENODEV` because the session
+never negotiated `FUSE_DIRECT_IO_ALLOW_MMAP`. The unit tests pin the libfuse
+3.13-3.16 INIT reply patch: the flag is added only to a successful INIT reply
+whose request offered it. The mounted test maps a file shared-writable under
+`adaptive`, then checks the bytes after `msync` and reopen, and after a write
+through a mapping that outlived `close()`:
+
+```sh
+cargo test -p studiofs-linux-fuse --lib init_reply_patch -- --nocapture
+cargo test -p studiofs-linux-fuse --lib mounted_shared_writable_mmap_round_trips_under_adaptive_policy -- --ignored --nocapture
+```
+
+The mounted test uses the VFS contract fixture and needs `/dev/fuse` and
+`fusermount3`. On a PostgreSQL/S3 mount with the default policy (WSL2 6.6,
+libfuse 3.14.0, release build), all five `tools/posix-conformance/run-fsx.sh`
+profiles passed, including the mmap profiles `default`, `small`, and `large`
+that failed with `ENODEV` before. The mount log had no payload warnings.
+
 ### SFS-901 Linux Page-Cache Reads After Local Writes
 
 Read-only opens of locally dirty files used direct I/O, so every 4 KiB

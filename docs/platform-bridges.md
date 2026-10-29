@@ -510,6 +510,23 @@ cached file size yet (ADR 0011, SFS-901 amendment). Set
 `STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct` and remount for the operational
 rollback.
 
+Shared mappings of `direct_io` handles need `FUSE_DIRECT_IO_ALLOW_MMAP`
+(kernel 6.6+); without it `mmap(MAP_SHARED)` fails with `ENODEV` (SFS-916).
+Each session requests the flag whenever the kernel offers it. libfuse 3.17+
+negotiates it as `FUSE_CAP_DIRECT_IO_ALLOW_MMAP` from `init`. Older libfuse
+drops capability bits it does not know, so on libfuse 3.13-3.16 the C shim
+installs a pass-through `fuse_session_custom_io` on the mounted `/dev/fuse` fd
+before the loop starts. It adds the flag to the INIT reply only when the kernel
+offered it, and forwards every other request and reply unchanged, splice
+included. libfuse older than 3.13 has no custom IO hook; the mount logs a
+warning and shared writable mappings of `direct_io` handles keep failing with
+`ENODEV`. Mapped pages go through the kernel page cache and reach StudioFS as
+ordinary `write` callbacks on the mapping's handle, so they follow the `write`
+local durability contract. `msync`, `fsync`, and `flush` write dirty pages back
+before their own barrier, and `munmap` writes them back before the last
+`release`. Writeback can therefore arrive after `flush` on a closed but still
+mapped handle.
+
 Adaptive sessions sample available memory in an owned background thread. Open
 callbacks read an atomic snapshot; samples expire two seconds after measurement
 starts, with a one-second sampling interval. Missing, failed, or expired samples
