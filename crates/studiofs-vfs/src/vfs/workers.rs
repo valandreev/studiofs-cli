@@ -1671,9 +1671,11 @@ impl StudioVfs {
     /// attributes together with content. A true result requires the bridge to defer
     /// delivery and leaves the ordinary handle-release retry armed.
     ///
-    /// Pending uploads and unflushed VFS state are deliberately not a reason: the
-    /// VFS owns that data, the kernel holds none of it for a write-capable handle,
-    /// and a purge only makes the kernel ask the VFS again.
+    /// The open handle is the reason, not the VFS state behind it: under a
+    /// writeback page cache the kernel owns the writer's dirty pages, and a purge
+    /// launders them through synchronous writes before re-reading from the VFS.
+    /// Pending uploads and unflushed VFS state are deliberately not a reason once
+    /// no write-capable handle remains, because no kernel writer holds pages for them.
     pub fn defer_kernel_invalidation_for_active_writer(&self, ino: Ino) -> bool {
         self.should_skip_kernel_invalidation_for_active_open(ino, true)
     }

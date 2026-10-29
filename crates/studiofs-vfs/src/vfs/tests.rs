@@ -2700,6 +2700,97 @@ fn local_namespace_change_reconciles_by_scope_without_walking_the_volume() {
 }
 
 #[test]
+fn own_writes_reconcile_without_kernel_inode_invalidation_while_peer_changes_still_invalidate() {
+    use super::workers::{
+        MetadataInvalidationWakeReason, MetadataReconcileOutcome, MetadataReconcileState,
+    };
+    use studiofs_meta::MetaEvent;
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "semantic-own-writes");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let own = vfs
+            .create(ROOT_INO, b"own-writes", 0, 0, 0o644)
+            .expect("create own");
+        let peer = vfs
+            .create(ROOT_INO, b"peer-changed", 0, 0, 0o644)
+            .expect("create peer");
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+        let counters = &vfs.metadata_reconcile_counters;
+        let mut state = MetadataReconcileState::default();
+        let pass = MetadataInvalidationWakeReason::BackendNotify;
+        vfs.drain_semantic_invalidations_into(&mut state.scope);
+        let outcome = vfs
+            .reconcile_metadata_pass(&mut state, pass, true, true)
+            .await;
+        assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
+        assert_eq!(
+            counters.full_walks(),
+            1,
+            "the first pass establishes the baseline"
+        );
+        invalidator.data_seen.lock().clear();
+        invalidator.attr_seen.lock().clear();
+
+        // A writer commits its own payload repeatedly, as fsx does.
+        let fh = vfs
+            .open_file(own.ino, OpenFlags::RDWR, false)
+            .expect("open writer");
+        for round in 0..8u64 {
+            let data = vec![round as u8 + 1; 4096];
+            vfs.write_fh(fh, own.ino, round * 4096, &data)
+                .await
+                .expect("write");
+            vfs.fsync_fh(fh).await.expect("fsync");
+            vfs.drain_semantic_invalidations_into(&mut state.scope);
+            let outcome = vfs
+                .reconcile_metadata_pass(&mut state, pass, false, true)
+                .await;
+            assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
+        }
+        assert_eq!(
+            counters.full_walks(),
+            1,
+            "own payload commits must reconcile by scope, not by a volume walk"
+        );
+        assert!(
+            !invalidator.snapshot().contains(&own.ino),
+            "own commits must not purge the writer's kernel page cache: {:?}",
+            invalidator.snapshot()
+        );
+
+        // A replicated content change still purges the kernel page cache.
+        let mut changed = meta.get_attr(peer.ino).expect("peer attr");
+        changed.content_epoch += 1;
+        meta.apply_replica_serving_state(&[MetaEvent::SetAttr { attr: changed }])
+            .expect("commit replicated change");
+        vfs.drain_semantic_invalidations_into(&mut state.scope);
+        let outcome = vfs
+            .reconcile_metadata_pass(&mut state, pass, false, true)
+            .await;
+        assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
+        assert!(
+            invalidator.snapshot().contains(&peer.ino),
+            "a peer content change must invalidate the kernel inode: {:?}",
+            invalidator.snapshot()
+        );
+        assert!(!invalidator.snapshot().contains(&own.ino));
+
+        // The deferral postpones, not drops: release delivers it.
+        invalidator.data_seen.lock().clear();
+        invalidator.attr_seen.lock().clear();
+        vfs.release_fh(fh).await.expect("release writer");
+        assert!(
+            invalidator.snapshot().contains(&own.ino)
+                || invalidator.attr_snapshot().contains(&own.ino),
+            "release must deliver the invalidation deferred for the writer"
+        );
+    });
+}
+
+#[test]
 fn upload_dirty_state_without_an_open_writer_does_not_defer_invalidation() {
     use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
 
