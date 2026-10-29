@@ -3976,19 +3976,20 @@ mod tests {
                 .expect("first growth");
             vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(16_384))
                 .expect("second growth");
-            let before = meta.get_attr(ino).expect("load grown attr");
-            assert!(before.content_epoch > stale.content_epoch);
+            let grown = meta.get_attr(ino).expect("load grown attr");
+            assert!(grown.content_epoch > stale.content_epoch);
             assert!(
                 meta.has_regular_file_overlay_object_if_matches(
                     ino,
-                    before.content_epoch,
+                    grown.content_epoch,
                     stale.object_id
                 )
                 .expect("scan overlay"),
                 "the stale upload's object must still back the current overlay"
             );
 
-            // An accepted extension stays in the dirty attr until the next fsync.
+            // An accepted extension normally stays in the dirty attr until the
+            // next fsync; a background drain may already have committed it.
             vfs.write_fh_with_deferred_materialize(
                 fh,
                 ino,
@@ -4010,17 +4011,20 @@ mod tests {
                 )
                 .await
                 .expect("reconcile stale upload");
-            assert_eq!(finalized, Some(before.content_epoch));
-            let after = meta.get_attr(ino).expect("load reconciled attr");
+            assert_eq!(finalized, Some(grown.content_epoch));
+            // The extension may commit concurrently at the same epoch, so only
+            // the epoch is stable here; size and bytes are checked after fsync.
             assert_eq!(
-                (after.size, after.content_epoch),
-                (before.size, before.content_epoch),
+                meta.get_attr(ino)
+                    .expect("load reconciled attr")
+                    .content_epoch,
+                grown.content_epoch,
                 "an already-visible object must not advance the epoch behind foreground state"
             );
             assert!(
                 meta.has_regular_file_overlay_object_if_matches(
                     ino,
-                    before.content_epoch,
+                    grown.content_epoch,
                     stale.object_id
                 )
                 .expect("scan current overlay"),
