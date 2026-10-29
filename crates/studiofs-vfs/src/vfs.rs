@@ -2043,6 +2043,8 @@ struct ReadState {
     foreground_local_payload_read_bytes: AtomicU64,
     foreground_local_payload_read_io_ns: AtomicU64,
     foreground_local_payload_read_io_max_ns: AtomicU64,
+    #[cfg(test)]
+    before_published_read_plan_cache_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl ReadState {
@@ -2070,6 +2072,17 @@ impl ReadState {
             foreground_local_payload_read_bytes: AtomicU64::new(0),
             foreground_local_payload_read_io_ns: AtomicU64::new(0),
             foreground_local_payload_read_io_max_ns: AtomicU64::new(0),
+            #[cfg(test)]
+            before_published_read_plan_cache_put: Mutex::new(None),
+        }
+    }
+
+    /// Runs a test hook after a published read-plan lookup and before its cache admission.
+    #[cfg(test)]
+    fn run_before_published_read_plan_cache_put_for_test(&self) {
+        let hook = self.before_published_read_plan_cache_put.lock().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 

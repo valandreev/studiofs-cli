@@ -924,6 +924,47 @@ mod tests {
     }
 
     #[test]
+    fn metadata_commit_without_attr_change_evicts_published_read_plan() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "commit-observer-read-plan");
+        let ino = 78;
+        let key = super::super::PublishedReadPlanCacheKey {
+            size: 4096,
+            committed_size: 4096,
+            content_epoch: 3,
+            committed_content_epoch: 3,
+            upload_state: MetaUploadState::Ready,
+        };
+        vfs.state.read.published_read_plan_cache_put(
+            ino,
+            key,
+            0,
+            4096,
+            Arc::from(Vec::<studiofs_meta::schema::ResolvedSliceSpan>::new()),
+        );
+        let observation_before = vfs.attr_read_observation(ino);
+
+        // A pending-slice overlay commit can change the graph while leaving
+        // the inode attrs, and therefore the plan cache key, untouched.
+        super::super::adapters::VfsDrainCommitObserver { vfs: &vfs }
+            .on_metadata_committed(ino, None);
+
+        assert!(
+            !vfs.state
+                .read
+                .published_read_plan_cache
+                .lock()
+                .contains(&ino),
+            "a graph commit must evict read plans resolved before it"
+        );
+        assert_ne!(
+            vfs.attr_read_observation(ino),
+            observation_before,
+            "an in-flight lookup from before the commit must not be re-admitted"
+        );
+    }
+
+    #[test]
     fn commit_pending_local_dirty_slices_trims_committed_prefix() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-prefix");

@@ -1763,6 +1763,30 @@ impl StudioVfs {
         removed
     }
 
+    /// Admits a resolved read plan only while the inode observation is unchanged.
+    ///
+    /// The graph lookup runs without holding the attr cache, so an overlay
+    /// commit can change the graph and invalidate in between. Holding the attr
+    /// cache lock across the check and the put orders this admission against
+    /// [`Self::invalidate_attr_read_cache`], which takes the same locks.
+    pub(super) fn put_published_read_plan_if_observed(
+        &self,
+        ino: Ino,
+        key: super::PublishedReadPlanCacheKey,
+        start: u64,
+        end: u64,
+        resolved_slices: Arc<[studiofs_meta::schema::ResolvedSliceSpan]>,
+        expected: super::AttrReadObservation,
+    ) {
+        let cache = self.state.namespace.attr_read_cache.lock();
+        if expected.global_generation == u64::MAX || cache.observation(ino) != expected {
+            return;
+        }
+        self.state
+            .read
+            .published_read_plan_cache_put(ino, key, start, end, resolved_slices);
+    }
+
     pub(super) fn invalidate_attr_read_cache_if_observed(
         &self,
         ino: Ino,
