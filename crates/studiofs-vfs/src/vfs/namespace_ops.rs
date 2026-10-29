@@ -748,6 +748,49 @@ impl StudioVfs {
         }
     }
 
+    /// Wait until a pending deferred create of `ino` is committed.
+    ///
+    /// Returns once committed metadata knows the inode, even while later
+    /// queued operations for it (such as attribute updates) remain pending.
+    async fn wait_for_deferred_namespace_create(&self, ino: Ino) -> VfsResult<()> {
+        // Re-read committed metadata only after this inode's progress moved,
+        // not on every settle of an unrelated inode.
+        let mut checked = None;
+        loop {
+            let notified = self.state.namespace.deferred.notify.notified();
+            let progress = {
+                let inner = self.state.namespace.deferred.inner.lock();
+                if let Some(error) = inner.errors.get(&ino) {
+                    return Err(VfsError::Other(format!(
+                        "deferred namespace metadata commit failed for inode {ino}: {error}"
+                    )));
+                }
+                let Some(progress) = inner.pending_inode_progress(ino) else {
+                    return Ok(());
+                };
+                progress
+            };
+            if checked != Some(progress) {
+                if self.sync_meta().get_attr(ino).is_ok() {
+                    return Ok(());
+                }
+                checked = Some(progress);
+            }
+            notified.await;
+        }
+    }
+
+    /// Reject `name` when a deferred create for it is still pending.
+    fn reject_pending_deferred_entry(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        if self.deferred_namespace_lookup(parent, name).is_some() {
+            return Err(VfsError::Meta(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).into_owned(),
+            }));
+        }
+        Ok(())
+    }
+
     async fn wait_for_deferred_namespace_entry(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         if let Some(attr) = self.deferred_namespace_lookup(parent, name) {
             self.wait_for_deferred_namespace_metadata(attr.ino).await?;
@@ -2764,7 +2807,12 @@ impl StudioVfs {
         self.run_sync_future(self.link_inner(ino, new_parent, new_name))
     }
 
-    async fn link_inner(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
+    pub(super) async fn link_inner(
+        &self,
+        ino: Ino,
+        new_parent: Ino,
+        new_name: &[u8],
+    ) -> VfsResult<InodeAttr> {
         let namespace_mutations = self.namespace_mutations();
         if self.is_runtime_stats_file_ino(ino) {
             return Err(Self::runtime_stats_access_denied_error());
@@ -2796,6 +2844,11 @@ impl StudioVfs {
             namespace_mutations.record_ignored_insertion(new_parent, std::iter::empty());
             return Ok(ignored);
         }
+        // `sync_meta().link` only knows committed inodes and dentries: settle
+        // pending creates of the source and the target parent first.
+        self.wait_for_deferred_namespace_create(ino).await?;
+        self.wait_for_deferred_namespace_create(new_parent).await?;
+        self.reject_pending_deferred_entry(new_parent, new_name)?;
         let session = self
             .state
             .file_session
@@ -2911,12 +2964,7 @@ impl StudioVfs {
         parent: Ino,
         name: &[u8],
     ) -> VfsResult<()> {
-        if self.deferred_namespace_lookup(parent, name).is_some() {
-            return Err(VfsError::Meta(MetaError::EntryExists {
-                parent,
-                name: String::from_utf8_lossy(name).into_owned(),
-            }));
-        }
+        self.reject_pending_deferred_entry(parent, name)?;
         if let Some(cached) = self.dentry_cache_lookup(parent, name) {
             return match cached {
                 DentryCacheValue::Negative => Ok(()),
@@ -3100,6 +3148,12 @@ impl StudioVfs {
     }
 
     /// Create a symlink entry under `parent` named `name` pointing to `target`.
+    ///
+    /// This does not wait for deferred namespace metadata: a parent whose
+    /// deferred create is still pending is not known to committed metadata and
+    /// yields `EntryNotFound`. Callers that own a bounded, cancellable wait
+    /// retry on top of this; others use
+    /// [`Self::symlink_after_deferred_parent`].
     pub fn symlink(
         &self,
         parent: Ino,
@@ -3109,6 +3163,52 @@ impl StudioVfs {
         gid: u32,
     ) -> VfsResult<InodeAttr> {
         let _operation = self.try_mutating_operation_admission()?;
+        self.symlink_committed(parent, name, target, uid, gid)
+    }
+
+    /// Create a symlink after a pending deferred create of `parent` commits.
+    ///
+    /// Same-mount callers observe an accepted `mkdir` immediately, so a
+    /// symlink under a directory whose create is still queued waits for that
+    /// create instead of failing with `ENOENT`. Later queued attribute updates
+    /// of the parent do not delay the symlink.
+    pub fn symlink_after_deferred_parent(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> VfsResult<InodeAttr> {
+        self.run_sync_future(
+            self.symlink_after_deferred_parent_inner(parent, name, target, uid, gid),
+        )
+    }
+
+    pub(super) async fn symlink_after_deferred_parent_inner(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> VfsResult<InodeAttr> {
+        // Fail fast on caller errors instead of waiting for the parent first.
+        self.enforce_access(parent, AccessLevel::ReadWrite)?;
+        validate_name(name)?;
+        self.reject_runtime_stats_entry_creation(parent, name)?;
+        self.wait_for_deferred_namespace_create(parent).await?;
+        self.symlink_committed(parent, name, target, uid, gid)
+    }
+
+    fn symlink_committed(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> VfsResult<InodeAttr> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
@@ -3118,6 +3218,8 @@ impl StudioVfs {
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
         }
+        // `create_symlink` only checks committed dentries.
+        self.reject_pending_deferred_entry(parent, name)?;
         let attr = self
             .sync_meta()
             .create_symlink(parent, name, target, uid, gid)?;

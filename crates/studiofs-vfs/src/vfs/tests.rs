@@ -19708,6 +19708,198 @@ fn deferred_namespace_create_under_deferred_dir_is_visible() {
     });
 }
 
+fn hold_deferred_namespace_drain(vfs: &StudioVfs, held: bool) {
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(held, AtomicOrdering::Release);
+}
+
+#[test]
+fn symlink_under_pending_deferred_dir_waits_for_parent_commit() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "symlink-under-pending-dir");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        hold_deferred_namespace_drain(&vfs, true);
+        let dir = vfs
+            .mkdir_with_deferred_metadata_admission(ROOT_INO, b"fresh", 0, 0, 0o755, rt.handle())
+            .expect("admit deferred dir");
+        assert!(matches!(
+            meta.get_attr(dir.ino),
+            Err(MetaError::InodeNotFound(_))
+        ));
+
+        let mut symlink =
+            std::pin::pin!(vfs.symlink_after_deferred_parent_inner(dir.ino, b"y", b"x", 0, 0));
+        assert!(
+            futures::poll!(symlink.as_mut()).is_pending(),
+            "symlink must wait for the pending parent instead of failing with ENOENT"
+        );
+
+        hold_deferred_namespace_drain(&vfs, false);
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+        let attr = tokio::time::timeout(Duration::from_secs(3), symlink)
+            .await
+            .expect("bounded symlink after parent commit")
+            .expect("symlink under committed parent");
+
+        assert_eq!(attr.kind, FileType::Symlink);
+        assert_eq!(
+            vfs.lookup(dir.ino, b"y").expect("lookup symlink").ino,
+            attr.ino
+        );
+        assert_eq!(vfs.readlink(attr.ino).expect("readlink"), b"x");
+    });
+}
+
+#[test]
+fn symlink_proceeds_once_pending_parent_create_is_committed() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "symlink-committed-pending-parent");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        hold_deferred_namespace_drain(&vfs, true);
+        let dir = vfs
+            .mkdir_with_deferred_metadata_admission(ROOT_INO, b"chmoded", 0, 0, 0o755, rt.handle())
+            .expect("admit deferred dir");
+        // Stand in for a committed create whose later queued attribute update
+        // keeps the parent inode pending.
+        meta.create_dir_with_ino(dir.ino, ROOT_INO, b"chmoded", 0, 0, 0o755)
+            .expect("commit parent create");
+        assert!(vfs.has_deferred_namespace_metadata(dir.ino));
+
+        let attr = tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.symlink_after_deferred_parent_inner(dir.ino, b"y", b"x", 0, 0),
+        )
+        .await
+        .expect("symlink must not wait for later parent operations")
+        .expect("symlink under committed parent");
+        assert_eq!(vfs.readlink(attr.ino).expect("readlink"), b"x");
+    });
+}
+
+#[test]
+fn symlink_after_deferred_parent_rejects_invalid_name_without_waiting() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "symlink-invalid-name-pending-parent");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        hold_deferred_namespace_drain(&vfs, true);
+        let dir = vfs
+            .mkdir_with_deferred_metadata_admission(ROOT_INO, b"fresh", 0, 0, 0o755, rt.handle())
+            .expect("admit deferred dir");
+
+        let mut symlink =
+            std::pin::pin!(vfs.symlink_after_deferred_parent_inner(dir.ino, b"a/b", b"x", 0, 0));
+        assert!(
+            matches!(
+                futures::poll!(symlink.as_mut()),
+                std::task::Poll::Ready(Err(_))
+            ),
+            "an invalid name must fail before waiting for the parent"
+        );
+    });
+}
+
+#[test]
+fn link_over_pending_deferred_entry_reports_entry_exists() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "link-over-pending-entry");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let source = vfs
+            .create(ROOT_INO, b"source", 0, 0, 0o644)
+            .expect("create source");
+        hold_deferred_namespace_drain(&vfs, true);
+        vfs.create_with_deferred_metadata_admission(ROOT_INO, b"taken", 0, 0, 0o644, rt.handle())
+            .expect("admit deferred file");
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.link_inner(source.ino, ROOT_INO, b"taken"),
+        )
+        .await
+        .expect("link over a pending entry must not wait")
+        .expect_err("link over an existing entry");
+        assert!(matches!(
+            error,
+            VfsError::Meta(MetaError::EntryExists { .. })
+        ));
+    });
+}
+
+#[test]
+fn symlink_over_pending_deferred_entry_reports_entry_exists() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "symlink-over-pending-entry");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        hold_deferred_namespace_drain(&vfs, true);
+        let file = vfs
+            .create_with_deferred_metadata_admission(ROOT_INO, b"taken", 0, 0, 0o644, rt.handle())
+            .expect("admit deferred file");
+
+        let error = vfs
+            .symlink(ROOT_INO, b"taken", b"x", 0, 0)
+            .expect_err("symlink must not bypass a pending entry with the same name");
+        assert!(matches!(
+            error,
+            VfsError::Meta(MetaError::EntryExists { .. })
+        ));
+
+        hold_deferred_namespace_drain(&vfs, false);
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            vfs.wait_for_deferred_namespace_metadata(file.ino),
+        )
+        .await
+        .expect("bounded create commit")
+        .expect("create commit");
+        assert_eq!(
+            meta.lookup(ROOT_INO, b"taken").expect("original entry").ino,
+            file.ino
+        );
+    });
+}
+
+#[test]
+fn link_of_pending_deferred_file_into_pending_dir_waits_for_commit() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "link-pending-source-and-parent");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        hold_deferred_namespace_drain(&vfs, true);
+        let dir = vfs
+            .mkdir_with_deferred_metadata_admission(ROOT_INO, b"L", 0, 0, 0o755, rt.handle())
+            .expect("admit deferred dir");
+        let file = vfs
+            .create_with_deferred_metadata_admission(dir.ino, b"f", 0, 0, 0o644, rt.handle())
+            .expect("admit deferred file");
+
+        let mut link = std::pin::pin!(vfs.link_inner(file.ino, dir.ino, b"g"));
+        assert!(
+            futures::poll!(link.as_mut()).is_pending(),
+            "link must wait for the pending source and parent instead of failing with ENOENT"
+        );
+
+        hold_deferred_namespace_drain(&vfs, false);
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+        let attr = tokio::time::timeout(Duration::from_secs(3), link)
+            .await
+            .expect("bounded link after commit")
+            .expect("link after commit");
+
+        assert_eq!(attr.ino, file.ino);
+        assert_eq!(attr.nlink, 2);
+        assert_eq!(meta.lookup(dir.ino, b"g").expect("new link").ino, file.ino);
+        assert_eq!(vfs.getattr(file.ino).expect("getattr").nlink, 2);
+    });
+}
+
 #[test]
 fn deferred_namespace_drain_commits_queued_operations_in_one_batch() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");

@@ -2195,7 +2195,7 @@ impl SessionState {
         }
         self.observe_attr(|| {
             self.vfs
-                .symlink(parent, name, target, caller.uid, caller.gid)
+                .symlink_after_deferred_parent(parent, name, target, caller.uid, caller.gid)
                 .map_err(|error| vfs_err_to_errno(&error))
         })
     }
