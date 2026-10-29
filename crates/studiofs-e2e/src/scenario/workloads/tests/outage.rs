@@ -475,10 +475,14 @@ fn rustfs_outage_duration_excludes_peer_visibility_probe_latency() {
     )
     .unwrap();
 
+    let first_peer_probe_elapsed_ms = driver
+        .first_peer_probe_elapsed
+        .expect("peer visibility probe should run");
     assert!(
-        summary.outage_duration_ms < 100,
-        "outage duration should exclude the peer visibility probe latency, got {}ms",
-        summary.outage_duration_ms
+        summary.outage_duration_ms <= first_peer_probe_elapsed_ms.as_millis(),
+        "outage duration should end before the first peer visibility probe, got {}ms before probe at {}ms",
+        summary.outage_duration_ms,
+        first_peer_probe_elapsed_ms.as_millis(),
     );
 }
 
