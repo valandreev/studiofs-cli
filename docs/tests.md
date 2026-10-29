@@ -491,8 +491,28 @@ cargo test -p studiofs-vfs --lib deferred_write_after_epoch_rebase_ignores_stale
 On a PostgreSQL/S3 mount with `STUDIOFS_FUSE_DIRECT_IO_MMAP=1` (WSL2 6.6,
 libfuse 3.14.0), fsx `small -R` passed 3 of 3 runs after this change, against
 2 to 3 failures in 4 runs before it. fsx `small` with mmap still failed 2 of 10
-runs: an upload reattach of a stale-epoch object advances the epoch behind
-foreground state ([SFS-922](https://linear.app/valandreev/issue/SFS-922)).
+runs until SFS-922 below.
+
+### SFS-922 Stale Uploads Already in the Current Overlay Keep the Epoch
+
+An upload that completes after later size changes still names its older
+content epoch. When its object already backed the current overlay, the upload
+reattach rewrote the same slices at the next epoch, ahead of the dirty attr,
+the pending incarnation, and the open handles. The next commit then clipped an
+accepted extension to the old EOF, which fsx reported as a size error or as
+zeros after a later truncate-up. The reattach now records such an upload at the
+current epoch without rewriting it. The test drives the reattach port between
+two size changes and a pending extension, then checks the epoch, size, and
+bytes after `fsync`:
+
+```sh
+cargo test -p studiofs-vfs --lib stale_upload_already_in_current_overlay_keeps_epoch_and_pending_extension -- --nocapture
+```
+
+On a PostgreSQL/S3 mount with the adaptive policy and
+`STUDIOFS_FUSE_DIRECT_IO_MMAP=1` (WSL2 6.6, libfuse 3.14.0, release build),
+fsx `small` (`-l 65536 -o 4096 -N 100000 -S 906003`) with mmap passed 10 of 10
+runs and its `-R` variant 3 of 3, with no payload warnings in the mount log.
 
 ### SFS-916 Shared Writable mmap Under the Adaptive Policy
 
@@ -500,8 +520,8 @@ Adaptive and `direct` open write-capable handles with `direct_io`. By default,
 shared `mmap(MAP_SHARED)` on these handles is refused with `ENODEV`. Set
 `STUDIOFS_FUSE_DIRECT_IO_MMAP=1` to opt in to negotiating
 `FUSE_DIRECT_IO_ALLOW_MMAP` (native with libfuse 3.17+, via an INIT reply patch
-with libfuse 3.13-3.16). This opt-in has a known durable-size-loss failure under
-the adaptive policy; see SFS-921 below. The unit tests pin that the 3.13-3.16
+with libfuse 3.13-3.16). The size-loss failures this opt-in exposed under the
+adaptive policy are fixed by SFS-921 and SFS-922 above. The unit tests pin that the 3.13-3.16
 INIT reply patch only modifies a successful reply whose request offered the
 flag. The mounted test maps a file shared-writable under `adaptive`, then
 checks the bytes after `msync` and reopen, and after a write through a mapping
@@ -513,14 +533,16 @@ STUDIOFS_FUSE_DIRECT_IO_MMAP=1 cargo test -p studiofs-linux-fuse --lib mounted_s
 ```
 
 The mounted test uses the VFS contract fixture and needs `/dev/fuse` and
-`fusermount3`. The mmap behavior is opt-in because on a PostgreSQL/S3 mount
+`fusermount3`. The mmap behavior became opt-in because on a PostgreSQL/S3 mount
 with the adaptive policy (WSL2 6.6, libfuse 3.14.0, release build), `default`
 passed 2 of 2 runs, and `large`, `nommap`, and `large-nommap` passed, but
 `small` failed 1 of 2 full runs and 1 of 5 replays with a durable size error
 after a `MAPWRITE`.
 Its `-R` variant failed 1 of 2 runs; `-W` and `-R -W` passed 2 of 2 each.
-The `kernel` policy passed `small` 2 of 2. That size loss is tracked in
-[SFS-921](https://linear.app/valandreev/issue/SFS-921).
+The `kernel` policy passed `small` 2 of 2. That size loss was fixed by
+[SFS-921](https://linear.app/valandreev/issue/SFS-921) and
+[SFS-922](https://linear.app/valandreev/issue/SFS-922); the flag stays opt-in
+until broader mounted validation.
 
 ### SFS-901 Linux Page-Cache Reads After Local Writes
 
