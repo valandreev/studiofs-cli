@@ -197,6 +197,19 @@ impl StudioVfs {
     }
 
     #[cfg(test)]
+    pub(super) fn arm_supersede_window_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.supersede_window_hook.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_supersede_window_hook_for_test(&self) {
+        let hook = self.supersede_window_hook.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn arm_fail_landing_zone_replay_after_for_test(&self, replayed_segments: usize) {
         self.fail_landing_zone_replay_after
             .store(replayed_segments, std::sync::atomic::Ordering::Relaxed);
@@ -2170,9 +2183,20 @@ impl StudioVfs {
             first_object_id: 0,
             offset,
         };
-        let accepted = match data {
-            VfsWritePayload::Borrowed(data) => self.state.writer_stack.write_bytes(spec, data),
-            VfsWritePayload::Owned(data) => self.state.writer_stack.write_owned_bytes(spec, data),
+        // Buffer the bytes and publish their dirty attr as one step for
+        // supersede: a Ready attr must not retire an accepted write between them.
+        let accepted = {
+            let _supersede_admission = self.state.writer_stack.supersede_admission(ino);
+            let accepted = match data {
+                VfsWritePayload::Borrowed(data) => self.state.writer_stack.write_bytes(spec, data),
+                VfsWritePayload::Owned(data) => {
+                    self.state.writer_stack.write_owned_bytes(spec, data)
+                }
+            };
+            if let Ok(accepted) = &accepted {
+                self.record_accepted_write_dirty_attr(ino, &base_attr, accepted.visible_len);
+            }
+            accepted
         };
         let accepted = match accepted {
             Ok(accepted) => accepted,
@@ -2204,30 +2228,30 @@ impl StudioVfs {
                 return Err(error.into_vfs_error("writer stack write failed"));
             }
         };
-        {
-            let mut dirty = self.state.namespace.dirty_attrs.lock();
-            let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
-            merge_write_dirty_attr(attr, &base_attr);
-            attr.kind = FileType::RegularFile;
-            if accepted.visible_len > attr.size {
-                if attr.upload_state == MetaUploadState::Ready || attr.size < attr.committed_size {
-                    self.begin_size_change_incarnation(ino, attr);
-                    attr.upload_state =
-                        if attr.committed_size > 0 || attr.committed_content_epoch > 0 {
-                            MetaUploadState::Updating
-                        } else {
-                            MetaUploadState::Uploading
-                        };
-                }
-                attr.size = accepted.visible_len;
-            }
-            attr.touch_mtime();
-            self.update_pending_incarnation_size(ino, attr.size);
-        }
         self.invalidate_attr_read_cache([ino]);
         // Keep the refresh pending even if materialization drains all dirty state before close.
         self.retain_kernel_inode_attr_refresh(ino);
         Ok(accepted.accepted_bytes)
+    }
+
+    fn record_accepted_write_dirty_attr(&self, ino: Ino, base_attr: &InodeAttr, visible_len: u64) {
+        let mut dirty = self.state.namespace.dirty_attrs.lock();
+        let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
+        merge_write_dirty_attr(attr, base_attr);
+        attr.kind = FileType::RegularFile;
+        if visible_len > attr.size {
+            if attr.upload_state == MetaUploadState::Ready || attr.size < attr.committed_size {
+                self.begin_size_change_incarnation(ino, attr);
+                attr.upload_state = if attr.committed_size > 0 || attr.committed_content_epoch > 0 {
+                    MetaUploadState::Updating
+                } else {
+                    MetaUploadState::Uploading
+                };
+            }
+            attr.size = visible_len;
+        }
+        attr.touch_mtime();
+        self.update_pending_incarnation_size(ino, attr.size);
     }
 
     async fn reserve_writer_stack_object_ids_by_count(

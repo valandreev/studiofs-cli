@@ -4,7 +4,7 @@ use super::writer_stack::WriterStackReadClaim;
 use super::{
     ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS,
     PrefetchBatch, PrefetchReadContext, PublishedReadPlanCacheKey, ReadRequestContext, StudioVfs,
-    VfsError, VfsResult,
+    SupersedeCheck, SupersedeOutcome, VfsError, VfsResult,
 };
 use crate::VfsMeta;
 use crate::access::AccessClass;
@@ -1543,16 +1543,16 @@ impl<'a> ReadMetadataResolver<'a> {
                 return Some(dirty_attr);
             }
         };
-        if self
-            .vfs
-            .ready_attr_supersedes_local_regular_file_state(self.ino, &remote_attr)
-        {
-            let _ = self.vfs.clear_superseded_local_regular_file_state(
+        if matches!(
+            self.vfs.try_supersede_local_regular_file_state(
                 self.ino,
-                remote_attr.committed_content_epoch,
+                &remote_attr,
+                SupersedeCheck::ReadyAttrSupersedes,
                 false,
                 None,
-            );
+            ),
+            SupersedeOutcome::Cleared(_)
+        ) {
             return Some(remote_attr);
         }
 
@@ -1594,16 +1594,16 @@ impl<'a> ReadMetadataResolver<'a> {
                     return Ok(Some(dirty_attr));
                 }
             };
-        if self
-            .vfs
-            .ready_attr_supersedes_local_regular_file_state(self.ino, &remote_attr)
-        {
-            let _ = self.vfs.clear_superseded_local_regular_file_state(
+        if matches!(
+            self.vfs.try_supersede_local_regular_file_state(
                 self.ino,
-                remote_attr.committed_content_epoch,
+                &remote_attr,
+                SupersedeCheck::ReadyAttrSupersedes,
                 false,
                 None,
-            );
+            ),
+            SupersedeOutcome::Cleared(_)
+        ) {
             return Ok(Some(remote_attr));
         }
 
@@ -1641,12 +1641,17 @@ impl<'a> ReadMetadataResolver<'a> {
             }
         };
         if StudioVfs::is_fully_published_regular_file(&remote_attr) {
-            let Some(observation) = self.vfs.clear_superseded_local_regular_file_state(
-                self.ino,
-                remote_attr.committed_content_epoch,
-                false,
-                Some(self.attr_observation),
-            ) else {
+            // A write that raced the local-state check skips the clear; the
+            // uncached remote attr is then only this call's answer.
+            let SupersedeOutcome::Cleared(Some(observation)) =
+                self.vfs.try_supersede_local_regular_file_state(
+                    self.ino,
+                    &remote_attr,
+                    SupersedeCheck::NoNewerLocalState,
+                    false,
+                    Some(self.attr_observation),
+                )
+            else {
                 return Ok(Some(remote_attr));
             };
             self.attr_observation = observation;
@@ -1691,12 +1696,17 @@ impl<'a> ReadMetadataResolver<'a> {
                 }
             };
         if StudioVfs::is_fully_published_regular_file(&remote_attr) {
-            let Some(observation) = self.vfs.clear_superseded_local_regular_file_state(
-                self.ino,
-                remote_attr.committed_content_epoch,
-                false,
-                Some(self.attr_observation),
-            ) else {
+            // A write that raced the local-state check skips the clear; the
+            // uncached remote attr is then only this call's answer.
+            let SupersedeOutcome::Cleared(Some(observation)) =
+                self.vfs.try_supersede_local_regular_file_state(
+                    self.ino,
+                    &remote_attr,
+                    SupersedeCheck::NoNewerLocalState,
+                    false,
+                    Some(self.attr_observation),
+                )
+            else {
                 return Ok(Some(remote_attr));
             };
             self.attr_observation = observation;
@@ -2064,8 +2074,12 @@ impl StudioVfs {
     /// chain stops at the first pending family it observes. The sharded
     /// writer-stack probe runs before the store-wide local-dirty maps so
     /// actively written inodes do not contend on those global locks.
-    fn has_local_pending_regular_file_state(&self, ino: Ino, committed_epoch: u64) -> bool {
-        self.inode_has_dirty_writer_stack(ino)
+    pub(super) fn has_local_pending_regular_file_state(
+        &self,
+        ino: Ino,
+        committed_epoch: u64,
+    ) -> bool {
+        self.state.writer_stack.has_unsettled_writers(ino)
             || self.has_pending_local_dirty_payloads_for_inode(ino)
             || self.inode_has_pending_uploads(ino)
             || self.has_pending_incarnation_newer_than(ino, committed_epoch)

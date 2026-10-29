@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use studiofs_cache::{
     CachedStore, CachedStoreWriterConfig, CachedStoreWriterError, CachedStoreWriterSlice,
     DetachedStagedSlice, StagedSlice,
@@ -270,10 +272,19 @@ pub(super) struct MountedWriterStack {
     dirty_bytes: AtomicUsize,
     /// Wakes hard write-admission waiters whenever buffered dirty bytes drop.
     dirty_drained: tokio::sync::Notify,
+    /// Per-inode-stripe gates that keep an authoritative supersede decision and
+    /// its clear atomic with respect to foreground writes.
+    supersede_gates: Box<[RwLock<()>]>,
+    /// Notified when a write waits for an in-progress supersede.
+    #[cfg(test)]
+    supersede_admission_contended: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl MountedWriterStack {
     const SHARDS: usize = 64;
+    /// Wider than `SHARDS` so a write to one inode rarely defers another
+    /// inode's supersede.
+    const SUPERSEDE_GATES: usize = 1024;
 
     pub(super) fn new(cached_store: Arc<CachedStore>, config: WriterStackConfig) -> Self {
         Self {
@@ -300,7 +311,20 @@ impl MountedWriterStack {
             next_seq: AtomicU64::new(1),
             dirty_bytes: AtomicUsize::new(0),
             dirty_drained: tokio::sync::Notify::new(),
+            supersede_gates: (0..Self::SUPERSEDE_GATES)
+                .map(|_| RwLock::new(()))
+                .collect(),
+            #[cfg(test)]
+            supersede_admission_contended: parking_lot::Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_supersede_admission_contended_for_test(
+        &self,
+        notify: std::sync::mpsc::Sender<()>,
+    ) {
+        *self.supersede_admission_contended.lock() = Some(notify);
     }
 
     #[cfg(test)]
@@ -1062,6 +1086,62 @@ impl MountedWriterStack {
         }
     }
 
+    /// Holds off authoritative supersede of `ino` while a write installs its
+    /// bytes and dirty attr. Writers share the gate, so they do not serialize.
+    ///
+    /// Acquire it before any tier-2 writer or namespace lock and release it
+    /// before awaiting.
+    pub(super) fn supersede_admission(&self, ino: Ino) -> RwLockReadGuard<'_, ()> {
+        let gate = &self.supersede_gates[Self::supersede_gate_index(ino)];
+        #[cfg(test)]
+        {
+            if let Some(guard) = gate.try_read() {
+                return guard;
+            }
+            if let Some(notify) = self.supersede_admission_contended.lock().as_ref() {
+                let _ = notify.send(());
+            }
+        }
+        gate.read()
+    }
+
+    /// Excludes writes to `ino` for one supersede decision and clear.
+    ///
+    /// Returns `None` while a write holds admission; supersede then skips and a
+    /// later refresh retries. It never waits, so a caller that already holds
+    /// admission or a file session cannot deadlock here.
+    pub(super) fn try_supersede_exclusive(&self, ino: Ino) -> Option<RwLockWriteGuard<'_, ()>> {
+        self.supersede_gates[Self::supersede_gate_index(ino)].try_write()
+    }
+
+    /// Reports writer state that holds bytes not yet installed as local
+    /// payloads: dirty buffers, or slices that are still materializing.
+    pub(super) fn has_unsettled_writers(&self, ino: Ino) -> bool {
+        let file = {
+            let shard = self.shards[Self::inode_shard_index(ino)].lock();
+            shard.files.get(&ino).cloned()
+        };
+        file.is_some_and(|file| !file_is_settled(&file.lock()))
+    }
+
+    /// Retires the inode's writer state only when no bytes are unsettled.
+    ///
+    /// Returns `false`, leaving the writer in place, when it is dirty or still
+    /// materializing.
+    pub(super) fn clear_inode_if_settled(&self, ino: Ino) -> bool {
+        let mut shard = self.shards[Self::inode_shard_index(ino)].lock();
+        if shard
+            .files
+            .get(&ino)
+            .is_some_and(|file| !file_is_settled(&file.lock()))
+        {
+            return false;
+        }
+        shard.dirty_inodes.remove(&ino);
+        shard.files.remove(&ino);
+        true
+    }
+
     pub(super) fn has_dirty_writers(&self, ino: Ino) -> bool {
         self.dirty_bytes_for_inode(ino) > 0
     }
@@ -1277,6 +1357,10 @@ impl MountedWriterStack {
         (ino % Self::SHARDS as u64) as usize
     }
 
+    fn supersede_gate_index(ino: Ino) -> usize {
+        (ino % Self::SUPERSEDE_GATES as u64) as usize
+    }
+
     fn handle_shard_index(fh: u64) -> usize {
         (fh % Self::SHARDS as u64) as usize
     }
@@ -1360,6 +1444,15 @@ fn file_is_clean_and_materialized(file: &FileWriter) -> bool {
                 .slices
                 .iter()
                 .all(|slice| slice.materializing.is_empty())
+        })
+}
+
+fn file_is_settled(file: &FileWriter) -> bool {
+    file.dirty_bytes == 0
+        && file.chunks.values().all(|chunk| {
+            chunk.slices.iter().all(|slice| {
+                slice.materializing.is_empty() && slice.pending_materialization.is_empty()
+            })
         })
 }
 
