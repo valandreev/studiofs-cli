@@ -2370,7 +2370,7 @@ impl StudioVfs {
         }
         if let Some(attr) = self.deferred_namespace_lookup(parent, name) {
             self.enforce_access(attr.ino, AccessLevel::ReadOnly)?;
-            return Ok(attr);
+            return Ok(self.with_deferred_parent_updates(attr));
         }
         if self.is_blocked_root_metadata_path(parent, name) {
             return Err(Self::ignored_entry_not_found(parent, name));
@@ -2547,7 +2547,8 @@ impl StudioVfs {
                 if !local_attr_inos.contains(&entry.ino) {
                     continue;
                 }
-                match self.getattr_unchecked(entry.ino) {
+                // `readdir_with_attrs` overlays pending parent updates on every source once.
+                match self.getattr_base_unchecked(entry.ino) {
                     Ok(attr) => {
                         attrs_by_ino.insert(entry.ino, attr);
                         confirmed_entry_inos.insert(entry.ino);
@@ -2690,10 +2691,17 @@ impl StudioVfs {
     /// Read directory entries and child attributes from the same metadata batch.
     pub fn readdir_with_attrs(&self, ino: Ino) -> VfsResult<Vec<super::DirEntryWithAttr>> {
         let (entries, mut attrs_by_ino) = self.readdir_entries_and_attrs(ino)?;
+        let deferred = self.state.namespace.deferred.inner.lock();
         Ok(entries
             .into_iter()
             .map(|entry| {
-                let attr = attrs_by_ino.remove(&entry.ino);
+                let mut attr = attrs_by_ino.remove(&entry.ino);
+                if let Some(attr) = attr
+                    .as_mut()
+                    .filter(|attr| attr.kind == FileType::Directory)
+                {
+                    deferred.apply_parent_update(attr);
+                }
                 super::DirEntryWithAttr { entry, attr }
             })
             .collect())

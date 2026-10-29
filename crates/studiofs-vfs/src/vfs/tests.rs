@@ -20083,6 +20083,47 @@ fn deferred_creates_update_parent_attr_before_commit() {
     });
 }
 
+/// Lookup and listing replies carry a directory's pending child creates.
+#[test]
+fn lookup_and_listing_see_deferred_parent_updates() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "lookup-listing-parent-updates");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let committed = vfs.mkdir(ROOT_INO, b"committed", 0, 0, 0o755).unwrap();
+        hold_deferred_namespace_drain(&vfs, true);
+        let pending = vfs
+            .mkdir_with_deferred_metadata_admission(ROOT_INO, b"pending", 0, 0, 0o755, rt.handle())
+            .expect("admit pending dir");
+        for dir in [&committed, &pending] {
+            vfs.mkdir_with_deferred_metadata_admission(dir.ino, b"sub", 0, 0, 0o755, rt.handle())
+                .expect("admit deferred subdir");
+        }
+
+        for (name, dir) in [(&b"committed"[..], &committed), (&b"pending"[..], &pending)] {
+            assert_eq!(
+                vfs.lookup(ROOT_INO, name).expect("lookup dir").nlink,
+                dir.nlink + 1,
+                "lookup of {} must see the pending subdirectory link",
+                String::from_utf8_lossy(name)
+            );
+        }
+        let listing = vfs.readdir_with_attrs(ROOT_INO).expect("list root");
+        for dir in [&committed, &pending] {
+            let attr = listing
+                .iter()
+                .find(|entry| entry.entry.ino == dir.ino)
+                .and_then(|entry| entry.attr.clone())
+                .expect("listed dir attr");
+            assert_eq!(
+                attr.nlink,
+                dir.nlink + 1,
+                "listing must see the pending link"
+            );
+        }
+    });
+}
+
 /// A parent setattr stores its attributes without the pending creates' link.
 #[test]
 fn parent_setattr_during_deferred_mkdir_counts_the_link_once() {

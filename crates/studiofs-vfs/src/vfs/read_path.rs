@@ -2200,13 +2200,6 @@ impl StudioVfs {
     }
 
     pub(super) async fn getattr_async_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
-        self.getattr_async_base_unchecked(ino)
-            .await
-            .map(|attr| self.with_deferred_parent_updates(attr))
-    }
-
-    /// Async form of [`Self::getattr_base_unchecked`].
-    pub(super) async fn getattr_async_base_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
         trace!(
             target: "studiofs_vfs::metadata_baseline::metadata_getattr",
             "VFS metadata getattr"
@@ -2214,10 +2207,11 @@ impl StudioVfs {
         if self.is_runtime_stats_file_ino(ino) {
             return Ok(self.runtime_stats_file_attr());
         }
-        if let Some(attr) = self.deferred_namespace_attr(ino) {
-            return Ok(attr);
-        }
-        ReadMetadataResolver::new(self, ino).resolve_attr().await
+        let attr = match self.deferred_namespace_attr(ino) {
+            Some(attr) => attr,
+            None => ReadMetadataResolver::new(self, ino).resolve_attr().await?,
+        };
+        Ok(self.with_deferred_parent_updates(attr))
     }
 
     pub(super) async fn resolve_read_metadata_async(
