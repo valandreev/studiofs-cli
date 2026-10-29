@@ -124,7 +124,14 @@ pub(super) struct DeferredNamespaceInner {
 pub(super) struct DeferredParentUpdate {
     /// Pending child inodes, each mapped to whether it adds a link to the parent.
     children: HashMap<Ino, bool>,
+    /// Pending children that add a link, kept in step with `children`.
+    links: u32,
     /// Latest admission time, which the parent's mtime and ctime reach.
+    ///
+    /// It never moves back while children remain: a committed child's commit
+    /// already stamped the parent at least this late, and an abandoned
+    /// child's update was visible, so lowering it would rewind the parent
+    /// times that readers observed.
     touched_at: i64,
 }
 
@@ -132,16 +139,18 @@ impl DeferredNamespaceInner {
     /// Record that admitting `child` under `parent` updates the parent's attributes.
     pub(super) fn record_parent_update(&mut self, parent: Ino, child: &InodeAttr) {
         let update = self.parent_updates.entry(parent).or_default();
-        update
-            .children
-            .insert(child.ino, child.kind == FileType::Directory);
+        let links_parent = child.kind == FileType::Directory;
+        let previous = update.children.insert(child.ino, links_parent);
+        update.links = update.links - u32::from(previous == Some(true)) + u32::from(links_parent);
         update.touched_at = update.touched_at.max(child.ctime);
     }
 
     /// Drop the parent update of `child`; repeated calls for one child are no-ops.
     pub(super) fn release_parent_update(&mut self, parent: Ino, child: Ino) {
         if let Some(update) = self.parent_updates.get_mut(&parent) {
-            update.children.remove(&child);
+            if update.children.remove(&child) == Some(true) {
+                update.links -= 1;
+            }
             if update.children.is_empty() {
                 self.parent_updates.remove(&parent);
             }
@@ -153,10 +162,7 @@ impl DeferredNamespaceInner {
         let Some(update) = self.parent_updates.get(&attr.ino) else {
             return;
         };
-        let links = update.children.values().filter(|links| **links).count();
-        attr.nlink = attr
-            .nlink
-            .saturating_add(u32::try_from(links).unwrap_or(u32::MAX));
+        attr.nlink = attr.nlink.saturating_add(update.links);
         attr.mtime = attr.mtime.max(update.touched_at);
         attr.ctime = attr.ctime.max(update.touched_at);
     }
