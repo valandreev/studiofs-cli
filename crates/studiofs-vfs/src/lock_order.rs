@@ -43,13 +43,15 @@
 //! with `LockTier` or validated by `LockOrderGuard`; their ordering is enforced
 //! by the call structure above.
 //!
-//! The writer stack's supersede gates order foreground writes against an
-//! authoritative Ready-attr supersede of local regular-file state. A write takes
-//! its inode stripe's gate shared before the writer shard and dirty-attr locks
-//! and releases it before awaiting. Supersede takes it with `try_write` before
-//! its re-check and clear, and skips when a write holds it, so it never waits
-//! and cannot deadlock against a caller already inside a write or file session.
-//! These gates are outside `LockTier` and `LockOrderGuard`.
+//! The writer stack's per-inode supersede gates order foreground writes against
+//! an authoritative Ready-attr supersede of local regular-file state. A write
+//! takes admission for its inode before the writer shard and dirty-attr locks,
+//! waiting only while that inode is being superseded, and releases it before
+//! awaiting. Supersede claims the inode without waiting before its re-check and
+//! clear, and skips while a write is admitted, so it cannot deadlock against a
+//! caller already inside a write or file session. The gate shard mutex is held
+//! only for its own bookkeeping. These gates are outside `LockTier` and
+//! `LockOrderGuard`.
 //!
 //! With `LocalPayloadBackendRuntime`, cached-store first/final pin transitions
 //! acquire locks in this order:

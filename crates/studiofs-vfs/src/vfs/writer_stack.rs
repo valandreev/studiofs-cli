@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Condvar, Mutex};
 use studiofs_cache::{
     CachedStore, CachedStoreWriterConfig, CachedStoreWriterError, CachedStoreWriterSlice,
     DetachedStagedSlice, StagedSlice,
@@ -272,19 +272,64 @@ pub(super) struct MountedWriterStack {
     dirty_bytes: AtomicUsize,
     /// Wakes hard write-admission waiters whenever buffered dirty bytes drop.
     dirty_drained: tokio::sync::Notify,
-    /// Per-inode-stripe gates that keep an authoritative supersede decision and
-    /// its clear atomic with respect to foreground writes.
-    supersede_gates: Box<[RwLock<()>]>,
+    /// Per-inode gates that keep an authoritative supersede decision and its
+    /// clear atomic with respect to foreground writes, sharded by inode.
+    supersede_gates: Box<[SupersedeGateShard]>,
     /// Notified when a write waits for an in-progress supersede.
     #[cfg(test)]
-    supersede_admission_contended: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    supersede_admission_contended: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+/// Supersede gate state for the inodes of one shard.
+///
+/// The mutex is held only to update this bookkeeping and is never nested with
+/// another lock; writers wait on the condvar only while their own inode is
+/// being superseded.
+#[derive(Default)]
+struct SupersedeGateShard {
+    state: Mutex<SupersedeGateState>,
+    superseded: Condvar,
+}
+
+#[derive(Default)]
+struct SupersedeGateState {
+    admitted_writes: HashMap<Ino, usize>,
+    superseding: HashSet<Ino>,
+}
+
+/// Holds off supersede of one inode while a write is admitted.
+pub(super) struct SupersedeAdmission<'a> {
+    shard: &'a SupersedeGateShard,
+    ino: Ino,
+}
+
+impl Drop for SupersedeAdmission<'_> {
+    fn drop(&mut self) {
+        let mut state = self.shard.state.lock();
+        if let Some(count) = state.admitted_writes.get_mut(&self.ino) {
+            *count -= 1;
+            if *count == 0 {
+                state.admitted_writes.remove(&self.ino);
+            }
+        }
+    }
+}
+
+/// Excludes writes to one inode for a supersede decision and clear.
+pub(super) struct SupersedeExclusive<'a> {
+    shard: &'a SupersedeGateShard,
+    ino: Ino,
+}
+
+impl Drop for SupersedeExclusive<'_> {
+    fn drop(&mut self) {
+        self.shard.state.lock().superseding.remove(&self.ino);
+        self.shard.superseded.notify_all();
+    }
 }
 
 impl MountedWriterStack {
     const SHARDS: usize = 64;
-    /// Wider than `SHARDS` so a write to one inode rarely defers another
-    /// inode's supersede.
-    const SUPERSEDE_GATES: usize = 1024;
 
     pub(super) fn new(cached_store: Arc<CachedStore>, config: WriterStackConfig) -> Self {
         Self {
@@ -311,11 +356,11 @@ impl MountedWriterStack {
             next_seq: AtomicU64::new(1),
             dirty_bytes: AtomicUsize::new(0),
             dirty_drained: tokio::sync::Notify::new(),
-            supersede_gates: (0..Self::SUPERSEDE_GATES)
-                .map(|_| RwLock::new(()))
+            supersede_gates: (0..Self::SHARDS)
+                .map(|_| SupersedeGateShard::default())
                 .collect(),
             #[cfg(test)]
-            supersede_admission_contended: parking_lot::Mutex::new(None),
+            supersede_admission_contended: Mutex::new(None),
         }
     }
 
@@ -1087,22 +1132,25 @@ impl MountedWriterStack {
     }
 
     /// Holds off authoritative supersede of `ino` while a write installs its
-    /// bytes and dirty attr. Writers share the gate, so they do not serialize.
+    /// bytes and dirty attr. Writers share admission, so they do not serialize;
+    /// a write waits only while `ino` itself is being superseded.
     ///
     /// Acquire it before any tier-2 writer or namespace lock and release it
     /// before awaiting.
-    pub(super) fn supersede_admission(&self, ino: Ino) -> RwLockReadGuard<'_, ()> {
-        let gate = &self.supersede_gates[Self::supersede_gate_index(ino)];
+    pub(super) fn supersede_admission(&self, ino: Ino) -> SupersedeAdmission<'_> {
+        let shard = &self.supersede_gates[Self::inode_shard_index(ino)];
+        let mut state = shard.state.lock();
         #[cfg(test)]
+        if state.superseding.contains(&ino)
+            && let Some(notify) = self.supersede_admission_contended.lock().as_ref()
         {
-            if let Some(guard) = gate.try_read() {
-                return guard;
-            }
-            if let Some(notify) = self.supersede_admission_contended.lock().as_ref() {
-                let _ = notify.send(());
-            }
+            let _ = notify.send(());
         }
-        gate.read()
+        while state.superseding.contains(&ino) {
+            shard.superseded.wait(&mut state);
+        }
+        *state.admitted_writes.entry(ino).or_default() += 1;
+        SupersedeAdmission { shard, ino }
     }
 
     /// Excludes writes to `ino` for one supersede decision and clear.
@@ -1110,8 +1158,13 @@ impl MountedWriterStack {
     /// Returns `None` while a write holds admission; supersede then skips and a
     /// later refresh retries. It never waits, so a caller that already holds
     /// admission or a file session cannot deadlock here.
-    pub(super) fn try_supersede_exclusive(&self, ino: Ino) -> Option<RwLockWriteGuard<'_, ()>> {
-        self.supersede_gates[Self::supersede_gate_index(ino)].try_write()
+    pub(super) fn try_supersede_exclusive(&self, ino: Ino) -> Option<SupersedeExclusive<'_>> {
+        let shard = &self.supersede_gates[Self::inode_shard_index(ino)];
+        let mut state = shard.state.lock();
+        if state.admitted_writes.contains_key(&ino) || !state.superseding.insert(ino) {
+            return None;
+        }
+        Some(SupersedeExclusive { shard, ino })
     }
 
     /// Reports writer state that holds bytes not yet installed as local
@@ -1355,10 +1408,6 @@ impl MountedWriterStack {
 
     fn inode_shard_index(ino: Ino) -> usize {
         (ino % Self::SHARDS as u64) as usize
-    }
-
-    fn supersede_gate_index(ino: Ino) -> usize {
-        (ino % Self::SUPERSEDE_GATES as u64) as usize
     }
 
     fn handle_shard_index(fh: u64) -> usize {

@@ -7760,6 +7760,18 @@ fn ready_attr_supersede_keeps_write_accepted_inside_decision_window() {
 
     let handle = writer.lock().take().expect("supersede window hook ran");
     assert_eq!(handle.join().expect("writer thread"), 4);
+    let write_epoch = vfs
+        .state
+        .namespace
+        .dirty_attrs
+        .lock()
+        .get(&ino)
+        .map(|attr| attr.content_epoch)
+        .expect("write keeps a dirty attr");
+    assert!(
+        write_epoch > published_attr.committed_content_epoch,
+        "a write whose base dirty attr was superseded must start a newer epoch"
+    );
     rt.block_on(async {
         let read = vfs
             .read(ino, 0, payload.len() as u32)
@@ -7776,6 +7788,41 @@ fn ready_attr_supersede_keeps_write_accepted_inside_decision_window() {
         );
         vfs.release_fh(fh).await.expect("release writer");
     });
+}
+
+#[test]
+fn read_path_supersede_skips_while_a_write_is_admitted() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "supersede-read-path-admission");
+    let _guard = rt.enter();
+    let (published_attr, fh) = rt.block_on(ready_file_with_stale_dirty_attr_and_writer(
+        &vfs,
+        &meta,
+        b"supersede-read-path-admission.bin",
+        b"published payload",
+    ));
+    let ino = published_attr.ino;
+    // A write to another inode must not hold off this inode's supersede.
+    let other = vfs
+        .create(ROOT_INO, b"supersede-read-path-other.bin", 0, 0, 0o644)
+        .expect("create other file");
+    let other_admission = vfs.state.writer_stack.supersede_admission(other.ino);
+
+    let admission = vfs.state.writer_stack.supersede_admission(ino);
+    vfs.getattr(ino).expect("getattr while a write is admitted");
+    assert!(
+        vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+        "the read path must not clear local state while a write is admitted"
+    );
+    drop(admission);
+
+    vfs.getattr(ino).expect("getattr after the write");
+    assert!(
+        !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+        "the read path supersedes once no write to this inode is admitted"
+    );
+    drop(other_admission);
+    rt.block_on(vfs.release_fh(fh)).expect("release writer");
 }
 
 #[test]
