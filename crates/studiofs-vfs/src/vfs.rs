@@ -5904,12 +5904,12 @@ impl StudioVfs {
                 VfsUploadState::Uploading
             };
             attr.content_epoch = next_epoch;
-        } else {
-            attr.content_epoch = state
-                .pending_incarnation
-                .as_ref()
-                .map(|pending| pending.content_epoch)
-                .unwrap_or(attr.content_epoch);
+        } else if let Some(pending) = state.pending_incarnation.as_mut() {
+            // A pending-slice commit can rebase metadata past the recorded
+            // pending epoch; adopting the older epoch would make the write look
+            // stale and get clipped to the metadata EOF (SFS-921).
+            pending.content_epoch = pending.content_epoch.max(attr.content_epoch);
+            attr.content_epoch = pending.content_epoch;
         }
 
         let base_size = state
