@@ -239,6 +239,26 @@ fn uploaded_object_reattach_slices(
     Some(chunk_slices.into_iter().collect())
 }
 
+/// Reports whether `object_id` already backs the latest graph for every span
+/// a reattach could fill, leaving no hole or tombstone in the uploaded range.
+fn uploaded_object_is_current(spans: &[ResolvedSliceSpan], object_id: u64) -> bool {
+    let mut referenced = false;
+    for span in spans {
+        match span.source {
+            ResolvedSliceSource::Hole
+            | ResolvedSliceSource::OverlayTombstone
+            | ResolvedSliceSource::BaseTombstone => return false,
+            ResolvedSliceSource::Overlay | ResolvedSliceSource::Base => {
+                referenced |= span
+                    .payload
+                    .as_ref()
+                    .is_some_and(|payload| payload.object_id == object_id);
+            }
+        }
+    }
+    referenced
+}
+
 fn append_uploaded_object_reattach_slices(
     chunk_slices: &mut BTreeMap<ChunkId, Vec<SliceRecord>>,
     object_id: u64,
@@ -1655,6 +1675,20 @@ impl UploadMetaPort for VfsUploadMetaPort {
             }
 
             let spans = engine.lookup_regular_file_slices(ino, offset, payload_len)?;
+            if content_epoch <= latest_attr.content_epoch
+                && uploaded_object_is_current(&spans, object_id)
+            {
+                // A later epoch already carries this object, so the upload
+                // only has to be recorded there. Rewriting it would advance
+                // redb past the dirty attr, pending incarnation and open
+                // handles, and a later commit would clip their accepted EOF.
+                engine.mark_regular_file_overlay_object_uploaded_if_matches(
+                    ino,
+                    latest_attr.content_epoch,
+                    object_id,
+                )?;
+                return Ok(Some(latest_attr.content_epoch));
+            }
             let chunk_slices =
                 match uploaded_object_reattach_slices(&spans, object_id, mapping, block_size) {
                     Some(chunk_slices) => chunk_slices,
@@ -3899,6 +3933,132 @@ mod tests {
                 .expect("rebased overlay object present"),
             "retained stale upload must become Uploaded in the current overlay epoch"
         );
+    }
+
+    /// SFS-922: an upload completing after two size changes still names an
+    /// older epoch while its object already backs the current overlay. A
+    /// rewrite advanced redb one epoch past the dirty attr of a pending
+    /// extension, so the next commit clipped the accepted write to the old EOF.
+    #[test]
+    fn stale_upload_already_in_current_overlay_keeps_epoch_and_pending_extension() {
+        use crate::{LocalSyncPolicy, OpenFlags, SetattrArgs};
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "stale-upload-current-overlay");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let ino = vfs
+                .create(1, b"stale-upload-current-overlay.bin", 0, 0, 0o644)
+                .expect("create file")
+                .ino;
+            let fh = vfs
+                .open_file(ino, OpenFlags::RDWR, false)
+                .expect("open handle");
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                0,
+                &[1; 8_192],
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .expect("write first payload");
+            vfs.fsync_fh(fh).await.expect("commit first payload");
+            let stale = vfs
+                .pending_uploads_snapshot_for_inode(ino)
+                .into_iter()
+                .next()
+                .expect("first payload queued for upload");
+            let mapping = stale.file_mapping.expect("contiguous upload mapping");
+
+            // Growth with queued publish work opens a new epoch each time.
+            vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(12_288))
+                .expect("first growth");
+            vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(16_384))
+                .expect("second growth");
+            let grown = meta.get_attr(ino).expect("load grown attr");
+            assert!(grown.content_epoch > stale.content_epoch);
+            assert!(
+                meta.has_regular_file_overlay_object_if_matches(
+                    ino,
+                    grown.content_epoch,
+                    stale.object_id
+                )
+                .expect("scan overlay"),
+                "the stale upload's object must still back the current overlay"
+            );
+
+            // An accepted extension normally stays in the dirty attr until the
+            // next fsync; a background drain may already have committed it.
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                20_000,
+                &[2; 1_000],
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .expect("extend past metadata EOF");
+
+            let port = VfsUploadMetaPort { vfs: vfs.clone() };
+            let finalized = port
+                .reattach_uploaded_object_if_uncovered(
+                    ino,
+                    stale.content_epoch,
+                    stale.object_id,
+                    mapping,
+                    vfs.block_size,
+                )
+                .await
+                .expect("reconcile stale upload");
+            assert_eq!(finalized, Some(grown.content_epoch));
+            // The extension may commit concurrently at the same epoch, so only
+            // the epoch is stable here; size and bytes are checked after fsync.
+            assert_eq!(
+                meta.get_attr(ino)
+                    .expect("load reconciled attr")
+                    .content_epoch,
+                grown.content_epoch,
+                "an already-visible object must not advance the epoch behind foreground state"
+            );
+            assert!(
+                meta.has_regular_file_overlay_object_if_matches(
+                    ino,
+                    grown.content_epoch,
+                    stale.object_id
+                )
+                .expect("scan current overlay"),
+                "the uploaded object must stay in the current overlay"
+            );
+
+            vfs.fsync_fh(fh).await.expect("commit extension");
+            assert_eq!(vfs.getattr(ino).expect("getattr").size, 21_000);
+            let mut head = vec![0; 8_192];
+            assert_eq!(
+                vfs.read_into_fh(fh, ino, 0, &mut head)
+                    .await
+                    .expect("read head"),
+                8_192
+            );
+            assert_eq!(head, vec![1; 8_192]);
+            let mut gap = vec![9; 11_808];
+            assert_eq!(
+                vfs.read_into_fh(fh, ino, 8_192, &mut gap)
+                    .await
+                    .expect("read gap"),
+                11_808
+            );
+            assert_eq!(gap, vec![0; 11_808]);
+            let mut tail = vec![0; 1_000];
+            assert_eq!(
+                vfs.read_into_fh(fh, ino, 20_000, &mut tail)
+                    .await
+                    .expect("read extension"),
+                1_000
+            );
+            assert_eq!(tail, vec![2; 1_000]);
+            vfs.release_fh(fh).await.expect("release handle");
+        });
     }
 
     #[test]

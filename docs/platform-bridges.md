@@ -521,16 +521,16 @@ loop starts. It adds the flag to the INIT reply only when the kernel offered
 it, and forwards every other request and reply unchanged, splice included.
 libfuse older than 3.13 has no custom IO hook; with opt-in, the mount logs a
 warning and shared writable mappings of `direct_io` handles keep failing with
-`ENODEV`. The opt-in is risky under the adaptive policy: a mounted workload
-reproduced durable size loss after a mapped write (SFS-921). Mapped pages go
+`ENODEV`. The opt-in first reproduced durable size loss after a mapped write
+under the adaptive policy; SFS-921 and SFS-922 fixed the two causes, and the
+flag stays opt-in until broader mounted validation. Mapped pages go
 through the kernel page cache and reach StudioFS as
 ordinary `write` callbacks on the mapping's handle, so they follow the `write`
 local durability contract. `msync`, `fsync`, and `flush` write dirty pages back
 before their own barrier, and `munmap` writes them back before the last
 `release`. Writeback can therefore arrive after `flush` on a closed but still
-mapped handle. Known issue: under `adaptive`, mixing mapping writeback with
-`direct_io` size changes can lose a size change (SFS-921). Until that is
-fixed, mmap-heavy workloads should use `STUDIOFS_LINUX_FUSE_CACHE_POLICY=kernel`.
+mapped handle. Without the opt-in, mmap-heavy workloads can use
+`STUDIOFS_LINUX_FUSE_CACHE_POLICY=kernel`.
 
 Adaptive sessions sample available memory in an owned background thread. Open
 callbacks read an atomic snapshot; samples expire two seconds after measurement
