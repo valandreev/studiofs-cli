@@ -2761,9 +2761,9 @@ fn own_writes_reconcile_without_kernel_inode_invalidation_while_peer_changes_sti
             invalidator.snapshot()
         );
 
-        // A replicated change still reaches the kernel.
+        // A replicated content change still purges the kernel page cache.
         let mut changed = meta.get_attr(peer.ino).expect("peer attr");
-        changed.mtime += 1;
+        changed.content_epoch += 1;
         meta.apply_replica_serving_state(&[MetaEvent::SetAttr { attr: changed }])
             .expect("commit replicated change");
         vfs.drain_semantic_invalidations_into(&mut state.scope);
@@ -2772,13 +2772,21 @@ fn own_writes_reconcile_without_kernel_inode_invalidation_while_peer_changes_sti
             .await;
         assert_eq!(outcome, MetadataReconcileOutcome::Reconciled);
         assert!(
-            invalidator.snapshot().contains(&peer.ino)
-                || invalidator.attr_snapshot().contains(&peer.ino),
-            "a peer change must invalidate the kernel inode"
+            invalidator.snapshot().contains(&peer.ino),
+            "a peer content change must invalidate the kernel inode: {:?}",
+            invalidator.snapshot()
         );
         assert!(!invalidator.snapshot().contains(&own.ino));
 
+        // The deferral postpones, not drops: release delivers it.
+        invalidator.data_seen.lock().clear();
+        invalidator.attr_seen.lock().clear();
         vfs.release_fh(fh).await.expect("release writer");
+        assert!(
+            invalidator.snapshot().contains(&own.ino)
+                || invalidator.attr_snapshot().contains(&own.ino),
+            "release must deliver the invalidation deferred for the writer"
+        );
     });
 }
 
