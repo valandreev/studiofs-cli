@@ -525,7 +525,9 @@ ordinary `write` callbacks on the mapping's handle, so they follow the `write`
 local durability contract. `msync`, `fsync`, and `flush` write dirty pages back
 before their own barrier, and `munmap` writes them back before the last
 `release`. Writeback can therefore arrive after `flush` on a closed but still
-mapped handle.
+mapped handle. Known issue: under `adaptive`, mixing mapping writeback with
+`direct_io` size changes can lose a size change (SFS-921). Until that is
+fixed, mmap-heavy workloads should use `STUDIOFS_LINUX_FUSE_CACHE_POLICY=kernel`.
 
 Adaptive sessions sample available memory in an owned background thread. Open
 callbacks read an atomic snapshot; samples expire two seconds after measurement

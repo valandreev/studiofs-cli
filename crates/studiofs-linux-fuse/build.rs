@@ -31,6 +31,10 @@ fn main() {
         );
     }
     let fuse_api_version = if fuse_version >= (3, 12) { "312" } else { "32" };
+    println!(
+        "cargo:rustc-env=STUDIOFS_LIBFUSE3_VERSION={}.{}",
+        fuse_version.0, fuse_version.1
+    );
 
     let mut build = cc::Build::new();
     build.file("csrc/low_level_ops.c");

@@ -492,9 +492,13 @@ cargo test -p studiofs-linux-fuse --lib mounted_shared_writable_mmap_round_trips
 
 The mounted test uses the VFS contract fixture and needs `/dev/fuse` and
 `fusermount3`. On a PostgreSQL/S3 mount with the default policy (WSL2 6.6,
-libfuse 3.14.0, release build), all five `tools/posix-conformance/run-fsx.sh`
-profiles passed, including the mmap profiles `default`, `small`, and `large`
-that failed with `ENODEV` before. The mount log had no payload warnings.
+libfuse 3.14.0, release build), the mmap profiles that failed with `ENODEV`
+now run: `default` passed 2 of 2 runs, and `large`, `nommap`, and
+`large-nommap` passed. `small` is not a passing gate yet. It failed 1 of 2
+full runs and 1 of 5 replays with a durable size error after a `MAPWRITE`.
+Its `-R` variant failed 1 of 2 runs; `-W` and `-R -W` passed 2 of 2 each.
+The `kernel` policy passed `small` 2 of 2. That size loss is tracked in
+[SFS-921](https://linear.app/valandreev/issue/SFS-921).
 
 ### SFS-901 Linux Page-Cache Reads After Local Writes
 

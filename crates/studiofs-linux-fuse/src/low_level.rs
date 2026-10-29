@@ -188,6 +188,10 @@ unsafe extern "C" {
     ) -> *mut raw::FuseSession;
     fn studiofs_linux_fuse_session_enable_direct_io_mmap(session: *mut raw::FuseSession) -> c_int;
     #[cfg(test)]
+    fn studiofs_linux_fuse_direct_io_mmap_strategy() -> c_int;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_init_wants_direct_io_allow_mmap() -> c_int;
+    #[cfg(test)]
     fn studiofs_linux_fuse_init_patch_reply_flags2_for_test(
         fd: c_int,
         kernel_flags: u32,
@@ -806,10 +810,14 @@ fn enable_direct_io_mmap(session: NonNull<raw::FuseSession>) {
             "libfuse3 < 3.13 cannot request FUSE_DIRECT_IO_ALLOW_MMAP; shared writable mmap \
              of direct_io handles fails with ENODEV"
         ),
-        errno => tracing::warn!(
+        errno if errno < 0 => tracing::warn!(
             error = %io::Error::from_raw_os_error(-errno),
             "failed to arrange FUSE_DIRECT_IO_ALLOW_MMAP; shared writable mmap of direct_io \
              handles fails with ENODEV"
+        ),
+        other => tracing::warn!(
+            result = other,
+            "unexpected FUSE_DIRECT_IO_ALLOW_MMAP shim result"
         ),
     }
 }
@@ -5137,8 +5145,48 @@ mod tests {
         }
     }
 
+    const DIRECT_IO_MMAP_NATIVE: libc::c_int = 2;
+    const DIRECT_IO_MMAP_INIT_PATCH: libc::c_int = 1;
+
+    fn direct_io_mmap_strategy() -> libc::c_int {
+        // SAFETY: the C shim returns a compile-time constant.
+        unsafe { super::studiofs_linux_fuse_direct_io_mmap_strategy() }
+    }
+
     fn init_patch_is_compiled() -> bool {
-        InitPatchCase::offered(10_000).reply_flags2().is_some()
+        direct_io_mmap_strategy() == DIRECT_IO_MMAP_INIT_PATCH
+    }
+
+    #[test]
+    fn supported_libfuse_builds_compile_a_direct_io_mmap_path() {
+        // build.rs requires libfuse >= 3.2, but the hooks need 3.13 or 3.17.
+        let (major, minor) = system_libfuse_version();
+        let expected = if (major, minor) >= (3, 17) {
+            DIRECT_IO_MMAP_NATIVE
+        } else if (major, minor) >= (3, 13) {
+            DIRECT_IO_MMAP_INIT_PATCH
+        } else {
+            0
+        };
+
+        assert_eq!(direct_io_mmap_strategy(), expected);
+        // SAFETY: the C shim initializes and inspects a stack-local
+        // fuse_conn_info with null userdata, which init supports.
+        let native_request =
+            unsafe { super::studiofs_linux_fuse_init_wants_direct_io_allow_mmap() };
+        assert_eq!(native_request == 1, expected == DIRECT_IO_MMAP_NATIVE);
+        assert_eq!(native_request == -1, expected != DIRECT_IO_MMAP_NATIVE);
+    }
+
+    fn system_libfuse_version() -> (u32, u32) {
+        // build.rs exports the libfuse3 version that the shim was compiled against.
+        let (major, minor) = env!("STUDIOFS_LIBFUSE3_VERSION")
+            .split_once('.')
+            .expect("major.minor libfuse3 version");
+        (
+            major.parse().expect("numeric libfuse3 major version"),
+            minor.parse().expect("numeric libfuse3 minor version"),
+        )
     }
 
     #[test]
@@ -5189,6 +5237,28 @@ mod tests {
                 case.fd
             );
         }
+    }
+
+    #[test]
+    fn init_reply_patch_settles_unmatched_inits_without_exhausting_slots() {
+        if !init_patch_is_compiled() {
+            return;
+        }
+        // More unanswered-by-match INITs than the shim has slots.
+        for fd in 10_100..10_116 {
+            let flags2 = InitPatchCase {
+                reply_unique: 3,
+                ..InitPatchCase::offered(fd)
+            }
+            .reply_flags2()
+            .expect("patch path");
+            assert_eq!(flags2 & DIRECT_IO_ALLOW_MMAP_FLAGS2, 0);
+        }
+        let flags2 = InitPatchCase::offered(10_116)
+            .reply_flags2()
+            .expect("patch path");
+
+        assert_ne!(flags2 & DIRECT_IO_ALLOW_MMAP_FLAGS2, 0);
     }
 
     #[test]

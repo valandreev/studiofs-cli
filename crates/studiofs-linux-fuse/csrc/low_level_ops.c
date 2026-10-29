@@ -1,4 +1,6 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <errno.h> /* IWYU pragma: keep */
 #include <fcntl.h>
 #include <pthread.h>
@@ -328,16 +330,24 @@ static void studiofs_init_patch_reply(int fd, struct iovec *iov, int count) {
         return;
     }
     const struct studiofs_fuse_out_header *out = iov[0].iov_base;
+    if (out->unique == 0) {
+        /* Kernel notifications carry no request and never answer INIT. */
+        return;
+    }
     pthread_mutex_lock(&studiofs_init_patch_lock);
     for (int i = 0; i < STUDIOFS_INIT_PATCH_SLOTS; i++) {
-        if (studiofs_init_patch_slots[i].fd != fd + 1 ||
-            studiofs_init_patch_slots[i].unique != out->unique) {
+        if (studiofs_init_patch_slots[i].fd != fd + 1) {
             continue;
         }
+        /*
+         * The kernel dispatches nothing else until INIT is answered, so the
+         * first reply on this fd settles the slot even when it does not match.
+         */
         studiofs_init_patch_slots[i].fd = 0;
         __atomic_sub_fetch(&studiofs_init_patch_pending, 1, __ATOMIC_RELEASE);
         /* libfuse sends the INIT reply as header + fuse_init_out. */
-        if (out->error == 0 && count >= 2 &&
+        if (studiofs_init_patch_slots[i].unique == out->unique && out->error == 0 &&
+            count >= 2 &&
             iov[1].iov_len >= sizeof(struct studiofs_fuse_init_out_prefix)) {
             struct studiofs_fuse_init_out_prefix *init = iov[1].iov_base;
             if ((init->flags & STUDIOFS_FUSE_INIT_EXT) != 0) {
@@ -381,17 +391,24 @@ static const struct fuse_custom_io STUDIOFS_INIT_PATCH_IO = {
 };
 #endif
 
-/*
- * Arrange for FUSE_DIRECT_IO_ALLOW_MMAP on a mounted session before its loop
- * runs. Returns 2 when libfuse requests it natively in init, 1 when the INIT
- * reply patch was installed, 0 when this libfuse cannot request it, and a
- * negative errno when installing the patch failed.
- */
-int studiofs_linux_fuse_session_enable_direct_io_mmap(struct fuse_session *session) {
+/* How this build requests FUSE_DIRECT_IO_ALLOW_MMAP: 2 native, 1 patch, 0 none. */
+int studiofs_linux_fuse_direct_io_mmap_strategy(void) {
 #if defined(STUDIOFS_DIRECT_IO_MMAP_NATIVE)
-    (void)session;
     return 2;
 #elif defined(STUDIOFS_DIRECT_IO_MMAP_INIT_PATCH)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/*
+ * Arrange for FUSE_DIRECT_IO_ALLOW_MMAP on a mounted session before its loop
+ * runs. Returns studiofs_linux_fuse_direct_io_mmap_strategy() on success and a
+ * negative errno when installing the INIT reply patch failed.
+ */
+int studiofs_linux_fuse_session_enable_direct_io_mmap(struct fuse_session *session) {
+#if defined(STUDIOFS_DIRECT_IO_MMAP_INIT_PATCH)
     int fd = fuse_session_fd(session);
     if (fd < 0) {
         return -EBADF;
@@ -400,7 +417,7 @@ int studiofs_linux_fuse_session_enable_direct_io_mmap(struct fuse_session *sessi
     return result == 0 ? 1 : (result < 0 ? result : -EIO);
 #else
     (void)session;
-    return 0;
+    return studiofs_linux_fuse_direct_io_mmap_strategy();
 #endif
 }
 
@@ -667,6 +684,18 @@ int studiofs_linux_fuse_conn_wants_async_dio_after_set(uint64_t capable_ext) {
     studiofs_linux_fuse_set_capable_features(&conn, capable_ext);
     return studiofs_linux_fuse_set_feature_flag_compat(&conn, FUSE_CAP_ASYNC_DIO) &&
            studiofs_linux_fuse_get_feature_flag_compat(&conn, FUSE_CAP_ASYNC_DIO);
+}
+
+/* 1 when init requests ALLOW_MMAP natively; -1 when this libfuse has no cap. */
+int studiofs_linux_fuse_init_wants_direct_io_allow_mmap(void) {
+#if defined(STUDIOFS_DIRECT_IO_MMAP_NATIVE)
+    struct fuse_conn_info conn = {0};
+    studiofs_linux_fuse_set_capable_features(&conn, FUSE_CAP_DIRECT_IO_ALLOW_MMAP);
+    studiofs_linux_fuse_init(NULL, &conn);
+    return studiofs_linux_fuse_get_feature_flag_compat(&conn, FUSE_CAP_DIRECT_IO_ALLOW_MMAP);
+#else
+    return -1;
+#endif
 }
 
 int studiofs_linux_fuse_low_level_ops_has_regular_file_callbacks(const struct fuse_lowlevel_ops *ops) {
