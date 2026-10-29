@@ -97,7 +97,8 @@ impl<'a> NamespaceCreateSpec<'a> {
         }
     }
 
-    pub(super) fn updates_parent_attr(&self) -> bool {
+    /// Only a subdirectory's `..` entry adds a link to the parent.
+    pub(super) fn links_parent(&self) -> bool {
         matches!(self.kind, NamespaceCreateKind::Directory { .. })
     }
 
@@ -179,17 +180,15 @@ impl<'a> NamespaceCreateTxn<'a> {
             RedbMetaEngine::set_symlink_in_txn(self.txn, spec.ino, target)?;
         }
 
-        let parent_attr_event = if spec.updates_parent_attr() {
+        // POSIX marks the parent's mtime and ctime for every new entry.
+        if spec.links_parent() {
             parent_attr.nlink += 1;
-            parent_attr.touch_mtime();
-            self.insert_attr(&parent_attr)?;
-            self.clear_inode_tombstone(spec.parent)?;
-            Some(parent_attr.clone())
-        } else {
-            None
-        };
+        }
+        parent_attr.touch_mtime();
+        self.insert_attr(&parent_attr)?;
+        self.clear_inode_tombstone(spec.parent)?;
 
-        self.append_create_events(spec, &attr, parent_attr_event)?;
+        self.append_create_events(spec, &attr, parent_attr)?;
         Ok(attr)
     }
 
@@ -333,7 +332,7 @@ impl<'a> NamespaceCreateTxn<'a> {
         &self,
         spec: &NamespaceCreateSpec<'_>,
         attr: &InodeAttr,
-        parent_attr_event: Option<InodeAttr>,
+        parent_attr: InodeAttr,
     ) -> MetaResult<()> {
         RedbMetaEngine::append_event_in_txn(
             self.txn,
@@ -342,12 +341,10 @@ impl<'a> NamespaceCreateTxn<'a> {
         if let Some(extra_event) = spec.extra_event() {
             RedbMetaEngine::append_event_in_txn(self.txn, &extra_event)?;
         }
-        if let Some(parent_attr) = parent_attr_event {
-            RedbMetaEngine::append_event_in_txn(
-                self.txn,
-                &crate::events::MetaEvent::SetAttr { attr: parent_attr },
-            )?;
-        }
+        RedbMetaEngine::append_event_in_txn(
+            self.txn,
+            &crate::events::MetaEvent::SetAttr { attr: parent_attr },
+        )?;
         RedbMetaEngine::append_event_in_txn(
             self.txn,
             &crate::events::MetaEvent::AddEntry {

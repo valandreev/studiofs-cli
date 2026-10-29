@@ -86,6 +86,14 @@ impl DeferredNamespaceOp {
             | Self::SetAttr { attr, .. } => attr.ino,
         }
     }
+
+    /// Parent directory whose attributes this operation updates.
+    pub(super) fn created_parent(&self) -> Option<Ino> {
+        match self {
+            Self::CreateFile { parent, .. } | Self::CreateDir { parent, .. } => Some(*parent),
+            Self::SetAttr { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -107,9 +115,58 @@ pub(super) struct DeferredNamespaceInner {
     pub(super) locally_created_dirs: HashSet<Ino>,
     /// `settled_operations` value at the latest admission or settle for each pending inode.
     pub(super) inode_progress: HashMap<Ino, u64>,
+    /// Parent attribute changes of admitted creates that have not settled, by parent.
+    pub(super) parent_updates: HashMap<Ino, DeferredParentUpdate>,
+}
+
+/// Parent attribute changes that pending deferred creates have not committed yet.
+#[derive(Debug, Default)]
+pub(super) struct DeferredParentUpdate {
+    /// Pending child inodes, each mapped to whether it adds a link to the parent.
+    children: HashMap<Ino, bool>,
+    /// Pending children that add a link, kept in step with `children`.
+    links: u32,
+    /// Latest admission time, which the parent's mtime and ctime reach.
+    ///
+    /// It never moves back while children remain: a committed child's commit
+    /// already stamped the parent at least this late, and an abandoned
+    /// child's update was visible, so lowering it would rewind the parent
+    /// times that readers observed.
+    touched_at: i64,
 }
 
 impl DeferredNamespaceInner {
+    /// Record that admitting `child` under `parent` updates the parent's attributes.
+    pub(super) fn record_parent_update(&mut self, parent: Ino, child: &InodeAttr) {
+        let update = self.parent_updates.entry(parent).or_default();
+        let links_parent = child.kind == FileType::Directory;
+        let previous = update.children.insert(child.ino, links_parent);
+        update.links = update.links - u32::from(previous == Some(true)) + u32::from(links_parent);
+        update.touched_at = update.touched_at.max(child.ctime);
+    }
+
+    /// Drop the parent update of `child`; repeated calls for one child are no-ops.
+    pub(super) fn release_parent_update(&mut self, parent: Ino, child: Ino) {
+        if let Some(update) = self.parent_updates.get_mut(&parent) {
+            if update.children.remove(&child) == Some(true) {
+                update.links -= 1;
+            }
+            if update.children.is_empty() {
+                self.parent_updates.remove(&parent);
+            }
+        }
+    }
+
+    /// Overlay pending child creates on a directory attribute read from another source.
+    pub(super) fn apply_parent_update(&self, attr: &mut InodeAttr) {
+        let Some(update) = self.parent_updates.get(&attr.ino) else {
+            return;
+        };
+        attr.nlink = attr.nlink.saturating_add(update.links);
+        attr.mtime = attr.mtime.max(update.touched_at);
+        attr.ctime = attr.ctime.max(update.touched_at);
+    }
+
     /// Count one more admitted deferred operation for `ino`.
     pub(super) fn admit_pending_inode(&mut self, ino: Ino) {
         let pending_count = self.pending_inodes.entry(ino).or_default();

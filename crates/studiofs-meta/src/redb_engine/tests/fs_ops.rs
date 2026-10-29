@@ -304,11 +304,11 @@ fn namespace_mutation_batch_propagates_inode_decode_errors() {
 }
 
 #[test]
-fn namespace_create_spec_marks_directory_parent_update() {
+fn namespace_create_spec_marks_directory_parent_link() {
     let spec = NamespaceCreateSpec::new_dir(41, ROOT_INO, b"subdir", 1000, 1000, 0o755);
 
     assert_eq!(spec.kind(), FileType::Directory);
-    assert!(spec.updates_parent_attr());
+    assert!(spec.links_parent());
     assert_eq!(spec.dir_entry_value().kind, FileType::Directory);
 
     let attr = spec.initial_attr();
@@ -322,7 +322,7 @@ fn namespace_create_spec_builds_symlink_target_event() {
     let spec = NamespaceCreateSpec::new_symlink(52, ROOT_INO, b"link", b"/tmp/target", 7, 8);
 
     assert_eq!(spec.kind(), FileType::Symlink);
-    assert!(!spec.updates_parent_attr());
+    assert!(!spec.links_parent());
     assert_eq!(spec.symlink_target(), Some(&b"/tmp/target"[..]));
 
     let attr = spec.initial_attr();
