@@ -1830,12 +1830,18 @@ impl<'a> ReadMetadataResolver<'a> {
                 Err(err) => return Err(err),
             };
             let resolved = Arc::<[ResolvedSliceSpan]>::from(resolved);
-            self.vfs.state.read.published_read_plan_cache_put(
+            #[cfg(test)]
+            self.vfs
+                .state
+                .read
+                .run_before_published_read_plan_cache_put_for_test();
+            self.vfs.put_published_read_plan_if_observed(
                 self.ino,
                 key,
                 offset,
                 cache_end,
                 resolved.clone(),
+                self.attr_observation,
             );
             return Ok(resolved);
         }
@@ -3970,6 +3976,91 @@ mod tests {
                     .any(|span| span.payload.as_ref().map(|payload| payload.object_id)
                         == Some(tail_payload.object_id)),
                 "metadata invalidation should drop the stale published read-plan cache: {fresh_slices:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn published_read_plan_lookup_crossing_invalidation_is_not_cached() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "read-metadata-plan-cache-race");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, b"published-read-plan-cache-race.txt", 1000, 1000, 0o644)
+                .expect("create file");
+            let ino = created.ino;
+
+            vfs.write(ino, 0, b"prefix payload")
+                .await
+                .expect("write payload");
+            vfs.flush(ino).await.expect("flush durable local payload");
+            let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+
+            let tail_start = 3_145_900_u64;
+            let tail_len = 26_u32;
+            let mut attr = meta.get_attr(ino).expect("load published attr");
+            attr.size = tail_start + u64::from(tail_len);
+            attr.committed_size = attr.size;
+            attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&attr).expect("extend logical EOF");
+            vfs.state.namespace.dirty_attrs.lock().remove(&ino);
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            // Publish the tail and invalidate between this read's graph lookup
+            // and its cache admission, as a concurrent overlay commit can.
+            let tail_payload = PayloadRef::new_partial(93_302, tail_len);
+            let hook_meta = Arc::clone(&meta);
+            let hook_vfs = Arc::downgrade(&vfs);
+            *vfs.state.read.before_published_read_plan_cache_put.lock() =
+                Some(Box::new(move || {
+                    hook_meta
+                        .apply_replica_aux_state(&[
+                            studiofs_meta::events::MetaEvent::PublishRegularFileBaseSlices {
+                                ino,
+                                chunk_slices: vec![(
+                                    ChunkId(0),
+                                    vec![SliceRecord {
+                                        slice_id: SliceId(0),
+                                        order: SliceOrder(0),
+                                        range: SliceRange::new(
+                                            tail_start as u32,
+                                            tail_start as u32 + tail_len,
+                                        )
+                                        .expect("tail range fits in chunk"),
+                                        payload: Some(tail_payload),
+                                        payload_state: PayloadRefState::Published,
+                                    }],
+                                )],
+                            },
+                        ])
+                        .expect("publish tail graph update");
+                    hook_vfs
+                        .upgrade()
+                        .expect("vfs alive during hook")
+                        .invalidate_attr_read_cache([ino]);
+                }));
+
+            let (_, raced_slices) = vfs
+                .resolve_read_metadata_async(ino, tail_start, u64::from(tail_len))
+                .await
+                .expect("resolve racing tail read");
+            assert!(
+                raced_slices.iter().all(|span| span.payload.is_none()),
+                "setup should resolve the graph before the concurrent publication: {raced_slices:?}"
+            );
+
+            let (_, fresh_slices) = vfs
+                .resolve_read_metadata_async(ino, tail_start, u64::from(tail_len))
+                .await
+                .expect("resolve tail after invalidation");
+            assert!(
+                fresh_slices
+                    .iter()
+                    .any(|span| span.payload.as_ref().map(|payload| payload.object_id)
+                        == Some(tail_payload.object_id)),
+                "a plan resolved before a concurrent invalidation must not be cached: {fresh_slices:?}"
             );
         });
     }

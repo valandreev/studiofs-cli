@@ -248,10 +248,6 @@ impl OpenFile {
         self.open_attr.read().as_deref().cloned()
     }
 
-    pub(super) fn set_open_attr(&self, attr: InodeAttr) {
-        self.set_shared_open_attr(Arc::new(attr));
-    }
-
     pub(super) fn set_shared_open_attr(&self, attr: Arc<InodeAttr>) {
         *self.open_attr.write() = Some(attr);
     }

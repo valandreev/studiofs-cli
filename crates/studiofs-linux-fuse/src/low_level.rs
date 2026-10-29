@@ -629,6 +629,9 @@ pub unsafe extern "C" fn studiofs_linux_fuse_record_connection(
         LinuxFuseCachePolicy::Kernel => "kernel",
     };
     tracing::info!(
+        cache_policy,
+        capable_features,
+        enabled_features,
         requested_max_background = state.connection_config.max_background,
         effective_max_background,
         effective_congestion_threshold,

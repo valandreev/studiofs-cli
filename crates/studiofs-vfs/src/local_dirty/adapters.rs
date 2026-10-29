@@ -217,8 +217,10 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
 
 impl DrainCommitObserverPort for VfsDrainCommitObserver<'_> {
     fn on_metadata_committed(&self, ino: Ino, committed_attr: Option<&InodeAttr>) {
+        // An overlay commit can change the graph without changing attrs, so a
+        // read plan cached under the unchanged attr key must be evicted too.
+        self.vfs.invalidate_attr_read_cache([ino]);
         if let Some(attr) = committed_attr {
-            self.vfs.invalidate_attr_read_cache([ino]);
             self.vfs
                 .refresh_inode_incarnation_state_from_attr(ino, attr);
         }

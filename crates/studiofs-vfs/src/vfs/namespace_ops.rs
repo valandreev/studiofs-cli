@@ -1484,9 +1484,6 @@ impl StudioVfs {
                 &operation,
                 self.setattr_with_size_change(ino, args, defer_handle_growth_flush),
             )?;
-            if let Some(handle) = fh {
-                self.handle_table.update_open_attr(handle, updated.clone());
-            }
             return Ok(updated);
         }
 
@@ -1696,6 +1693,13 @@ impl StudioVfs {
             Ok(attr)
         }
         .await;
+        if let Ok(attr) = &result {
+            // Size changes advance the inode incarnation. Keep every open
+            // handle's fallback snapshot in step before releasing the Flush
+            // session, so a later writeback through a sibling handle cannot
+            // reintroduce its pre-truncate EOF or content epoch.
+            self.handle_table.update_open_attrs_for_inode(ino, attr);
+        }
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result

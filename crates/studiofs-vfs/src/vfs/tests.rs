@@ -9240,6 +9240,123 @@ fn pending_sparse_slice_commit_rebases_when_size_growth_overtakes_flush() {
 }
 
 #[test]
+fn pending_slice_commit_preserves_prefix_when_uploading_eof_overtakes_flush() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "uploading-eof-cuts-pending-slice");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let ino = vfs
+            .create(1, b"uploading-eof-cuts-pending-slice.bin", 0, 0, 0o644)
+            .expect("create file")
+            .ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open file writer");
+        let payload = vec![0x5a; 8192];
+        let new_eof = 4096u64;
+        let (materializer, _materializer_guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(ino)
+            .expect("hold deferred materialization until the accepted bytes are checked");
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("accept write crossing the later EOF");
+        let mut accepted = vec![0; payload.len()];
+        assert_eq!(
+            vfs.read_into_fh(fh, ino, 0, &mut accepted)
+                .await
+                .expect("read accepted bytes before the competing EOF update"),
+            payload.len() as u32
+        );
+        assert_eq!(
+            accepted, payload,
+            "accepted bytes should be visible before EOF changes"
+        );
+        vfs.materialize_writer_stack_for_inode(ino)
+            .await
+            .expect("materialize mixed prefix and suffix slice");
+        vfs.finish_deferred_materialization_task(materializer, false);
+
+        let pre_shrink_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("accepted write should leave a dirty attr");
+        let mut truncated_attr = pre_shrink_attr;
+        truncated_attr.size = new_eof;
+        truncated_attr.content_epoch = truncated_attr.content_epoch.saturating_add(1);
+        truncated_attr.upload_state = MetaUploadState::Uploading;
+        truncated_attr.committed_size = 0;
+        truncated_attr.committed_content_epoch = 0;
+        meta.set_attr(&truncated_attr)
+            .expect("simulate a newer uploading EOF before pending-slice commit");
+
+        vfs.flush_fh(fh)
+            .await
+            .expect("flush should retain the in-EOF part of the accepted slice");
+
+        assert_eq!(
+            meta.get_attr(ino).expect("load current attr").size,
+            new_eof,
+            "rebasing a clipped slice must not restore its pre-truncate EOF"
+        );
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .expect("load overlay through the old EOF");
+        assert_eq!(
+            spans
+                .iter()
+                .filter_map(|span| span.payload.as_ref())
+                .count(),
+            1,
+            "the accepted prefix should remain in the local graph"
+        );
+        assert!(
+            spans
+                .iter()
+                .filter(|span| span.payload.is_some())
+                .all(|span| u64::from(span.range.end) <= new_eof),
+            "the clipped suffix must not remain hidden beyond EOF"
+        );
+        let payload_slices = meta
+            .lookup_payload_slices(ino)
+            .expect("load retained prefix payload object");
+        assert_eq!(payload_slices.len(), 1);
+        assert!(
+            vfs.local_payload_backend()
+                .contains(payload_slices[0].1.object_id),
+            "the packed object shared by retained prefix and discarded tail must remain available"
+        );
+        assert_eq!(
+            vfs.total_pending_persisted_local_dirty_slice_bytes(),
+            0,
+            "the original pending snapshot, including the clipped tail, must be retired"
+        );
+
+        let mut observed = vec![0; new_eof as usize];
+        assert_eq!(
+            vfs.read_into_fh(fh, ino, 0, &mut observed)
+                .await
+                .expect("read preserved prefix"),
+            new_eof as u32
+        );
+        assert_eq!(observed, payload[..new_eof as usize]);
+        vfs.release_fh(fh).await.expect("release writer");
+    });
+}
+
+#[test]
 fn pending_sparse_slice_commit_preserves_tail_during_newer_inflight_metadata() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sparse-tail-preserves-inflight-metadata");
@@ -23114,6 +23231,96 @@ fn first_write_after_truncate_ignores_stale_pretruncate_dirty_attr() {
             "the truncate handle generation must win over a late pre-truncate dirty attr"
         );
         vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn below_eof_writeback_on_sibling_handle_does_not_restore_pretruncate_size() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sibling-writeback-after-truncate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let ino = vfs
+            .create(1, b"sibling-writeback-after-truncate.bin", 0, 0, 0o644)
+            .expect("create file")
+            .ino;
+        let old_size = 0xf836usize;
+        let initial = vec![0x5a; old_size];
+        vfs.write(ino, 0, &initial)
+            .await
+            .expect("write initial payload");
+        vfs.flush(ino).await.expect("flush initial payload");
+
+        let stale_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open sibling writeback handle before truncate");
+        let truncate_fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open truncate handle");
+        let stale_attr = vfs
+            .get_open_file(stale_fh)
+            .and_then(|open_file| open_file.open_attr())
+            .expect("sibling should retain its pre-truncate open attr");
+        let new_size = 0xd46f;
+
+        let truncated = vfs
+            .setattr_with_handle(Some(truncate_fh), ino, SetattrArgs::size_only(new_size))
+            .expect("truncate through second handle");
+        assert_eq!(truncated.size, new_size);
+        assert_eq!(
+            meta.get_attr(ino).expect("load truncated attr").size,
+            new_size
+        );
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "strict truncate should leave no dirty attr to mask a stale sibling snapshot"
+        );
+        assert_eq!(stale_attr.size, old_size as u64);
+        assert!(stale_attr.content_epoch < truncated.content_epoch);
+
+        let mut expected = initial[..new_size as usize].to_vec();
+        for (offset, byte) in [(0x1000, 0x11), (0x5000, 0x22), (0x6000, 0x33)] {
+            let data = vec![byte; 4096];
+            expected[offset as usize..offset as usize + data.len()].copy_from_slice(&data);
+            vfs.write_fh_with_deferred_materialize(
+                stale_fh,
+                ino,
+                offset,
+                &data,
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .expect("write below-EOF page through stale sibling handle");
+        }
+
+        assert_eq!(
+            vfs.getattr(ino).expect("load attr after writeback").size,
+            new_size,
+            "below-EOF writeback must not restore the sibling handle's old EOF"
+        );
+        vfs.flush_fh(stale_fh)
+            .await
+            .expect("persist writeback through sibling handle");
+        assert_eq!(
+            meta.get_attr(ino).expect("load persisted attr").size,
+            new_size,
+            "persisted EOF must remain the truncate result"
+        );
+        let mut observed = vec![0; expected.len()];
+        assert_eq!(
+            vfs.read_into_fh(truncate_fh, ino, 0, &mut observed)
+                .await
+                .expect("read persisted post-truncate contents"),
+            expected.len() as u32
+        );
+        assert_eq!(observed, expected, "post-truncate writeback bytes");
+
+        vfs.release_fh(stale_fh)
+            .await
+            .expect("release stale handle");
+        vfs.release_fh(truncate_fh)
+            .await
+            .expect("release truncate handle");
     });
 }
 
