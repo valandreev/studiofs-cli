@@ -27,7 +27,7 @@ impl StudioVfs {
             files: used_inodes,
             ffree: u64::MAX.saturating_sub(used_inodes),
             bsize: frsize,
-            namelen: 255,
+            namelen: super::MAX_NAME_BYTES as u32,
             frsize,
         })
     }

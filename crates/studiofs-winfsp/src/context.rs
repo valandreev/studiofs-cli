@@ -100,6 +100,7 @@ fn load_volume_label(vfs: &StudioVfs) -> String {
 
 const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = NTSTATUS(0xC000_0034_u32 as i32);
 const STATUS_OBJECT_NAME_COLLISION: NTSTATUS = NTSTATUS(0xC000_0035_u32 as i32);
+const STATUS_OBJECT_NAME_INVALID: NTSTATUS = NTSTATUS(0xC000_0033_u32 as i32);
 const STATUS_DIRECTORY_NOT_EMPTY: NTSTATUS = NTSTATUS(0xC000_0101_u32 as i32);
 const STATUS_NOT_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_0103_u32 as i32);
 const STATUS_FILE_IS_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_00BA_u32 as i32);
@@ -1033,6 +1034,7 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
         }
         BridgeVfsErrorKind::XattrValueTooLarge => winfsp::FspError::from(STATUS_EA_TOO_LARGE),
         BridgeVfsErrorKind::InvalidInput => winfsp::FspError::from(STATUS_INVALID_PARAMETER),
+        BridgeVfsErrorKind::NameTooLong => winfsp::FspError::from(STATUS_OBJECT_NAME_INVALID),
         BridgeVfsErrorKind::OperationNotSupported => winfsp::FspError::from(STATUS_NOT_SUPPORTED),
         BridgeVfsErrorKind::PermissionDenied => winfsp::FspError::from(STATUS_ACCESS_DENIED),
         BridgeVfsErrorKind::MetadataPersistenceDegraded => {
@@ -2707,13 +2709,14 @@ mod tests {
         STATUS_BAD_NETWORK_PATH, STATUS_BUFFER_TOO_SMALL, STATUS_DATA_ERROR,
         STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_CORRUPT_ERROR, STATUS_DISK_FULL,
         STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT,
-        STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS,
-        StudioFileHandle, StudioFsContext, WinfspAsyncCallbackTracker, WinfspInvalidationQueue,
-        WinfspKernelInvalidator, WinfspMetadataCachePolicy, attr_to_file_info,
-        build_basic_info_setattr_args, build_notify_info, encode_symlink_reparse,
-        hidden_platform_root_path_component, ino_to_windows_path, is_runtime_stats_windows_path,
-        maybe_hide_platform_root_entry, maybe_hide_platform_root_path, notify_filter_for_kind,
-        open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
+        STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_NAME_NOT_FOUND,
+        SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspAsyncCallbackTracker,
+        WinfspInvalidationQueue, WinfspKernelInvalidator, WinfspMetadataCachePolicy,
+        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
+        encode_symlink_reparse, hidden_platform_root_path_component, ino_to_windows_path,
+        is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
+        maybe_hide_platform_root_path, notify_filter_for_kind, open_flags_from_access,
+        resolve_create_callback_kind, resolve_file_size_callback_action,
         should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
         unix_nanos_to_filetime, vfs_to_winfsp_err, winfsp_regular_file_allocation_size,
         with_lossy_utf16_path, write_local_sync_policy_from_create_options,
@@ -4806,6 +4809,10 @@ mod tests {
         let invalid = VfsError::InvalidName("bad".into());
         let status = vfs_to_winfsp_err(invalid).to_ntstatus();
         assert_eq!(status, STATUS_INVALID_PARAMETER.0);
+
+        let too_long = VfsError::NameTooLong(256);
+        let status = vfs_to_winfsp_err(too_long).to_ntstatus();
+        assert_eq!(status, STATUS_OBJECT_NAME_INVALID.0);
 
         let xattr_too_big = VfsError::Meta(MetaError::XattrValueTooLarge {
             actual: 17,

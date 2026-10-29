@@ -569,6 +569,10 @@ pub enum VfsError {
     #[error("invalid filename: {0}")]
     InvalidName(String),
 
+    /// Rejecting a path component longer than 255 bytes (`NAME_MAX`).
+    #[error("filename too long ({0} bytes, max {MAX_NAME_BYTES})")]
+    NameTooLong(usize),
+
     /// QoS-related rejection while reserving capacity for object work.
     #[error("qos permit failure at {stage} for object {object_id} (0x{object_id:016x}): {message}")]
     QosFailure {
@@ -690,24 +694,36 @@ enum WinfspBarrierType {
 // Filename Validation
 // =============================================================================
 
+/// Maximum length of one directory entry name in bytes (`NAME_MAX`).
+pub(crate) const MAX_NAME_BYTES: usize = 255;
+
+/// Reject a path component longer than [`MAX_NAME_BYTES`].
+///
+/// Lookup-based operations use this alone so an over-long name reports
+/// `ENAMETOOLONG` instead of a cacheable miss.
+fn validate_name_len(name: &[u8]) -> VfsResult<()> {
+    if name.len() > MAX_NAME_BYTES {
+        return Err(VfsError::NameTooLong(name.len()));
+    }
+    Ok(())
+}
+
 /// Validate a filename (directory entry name).
 ///
 /// Rejects:
 /// - Empty names
-/// - Names longer than 255 bytes
+/// - Names longer than [`MAX_NAME_BYTES`] (as [`VfsError::NameTooLong`])
 /// - Names containing '/' (path separator)
 /// - Dots-only names (`.`, `..`)
 /// - Names containing Windows-invalid characters: < > : " \ | ? *
+///
+/// The Windows-invalid characters are rejected on every platform: the
+/// namespace is shared with WinFSP peers, which cannot represent them.
 fn validate_name(name: &[u8]) -> VfsResult<()> {
     if name.is_empty() {
         return Err(VfsError::InvalidName("name is empty".into()));
     }
-    if name.len() > 255 {
-        return Err(VfsError::InvalidName(format!(
-            "name too long ({} bytes, max 255)",
-            name.len()
-        )));
-    }
+    validate_name_len(name)?;
 
     // Check for Unix path separator and Windows-invalid characters
     let invalid_chars = b"/<>:\"|\\?*";
@@ -2470,6 +2486,7 @@ pub(crate) enum ShutdownError {
     WouldBlock,
     RemoteContentPending,
     InvalidName(String),
+    NameTooLong(usize),
     QosFailure {
         stage: String,
         object_id: u64,
@@ -2524,6 +2541,7 @@ impl ShutdownError {
             VfsError::WouldBlock => Self::WouldBlock,
             VfsError::RemoteContentPending => Self::RemoteContentPending,
             VfsError::InvalidName(name) => Self::InvalidName(name.clone()),
+            VfsError::NameTooLong(len) => Self::NameTooLong(*len),
             VfsError::QosFailure {
                 stage,
                 object_id,
@@ -2576,6 +2594,7 @@ impl ShutdownError {
             Self::WouldBlock => VfsError::WouldBlock,
             Self::RemoteContentPending => VfsError::RemoteContentPending,
             Self::InvalidName(name) => VfsError::InvalidName(name),
+            Self::NameTooLong(len) => VfsError::NameTooLong(len),
             Self::QosFailure {
                 stage,
                 object_id,
