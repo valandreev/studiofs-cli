@@ -927,6 +927,15 @@ caller with at least one supplementary group:
 Run each command on its native platform with the FUSE driver available.
 An ignored or zero-test result does not prove the permission contract.
 
+The mounted macFUSE foreign-create check additionally needs a non-root mounter,
+a different non-root local account selected with `STUDIOFS_MACFUSE_PROBE_USER`,
+passwordless `sudo -n` to that account, and searchable mount-point ancestors:
+
+    cargo test -p studiofs-macfuse --test posix_access mounted_foreign_create_records_requesting_caller_as_owner -- --ignored --nocapture --test-threads=1
+
+It verifies the caller owns and can read a `0600` file created through the
+mounted legacy macFUSE path, while the mounter cannot read it.
+
 Without `allow_other`, the Linux kernel rejects every caller whose uid/gid
 differs from the mounting user, including root, before StudioFS sees the
 request. `--allow-other` adds the libfuse `allow_other` option and keeps

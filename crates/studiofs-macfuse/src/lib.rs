@@ -670,6 +670,7 @@ mod tests {
         );
         assert!(mount_args.iter().any(|arg| arg == "-onovncache"));
         assert!(mount_args.iter().any(|arg| arg == "-odefault_permissions"));
+        assert!(mount_args.iter().any(|arg| arg == "-oallow_other"));
         assert!(mount_args.iter().any(|arg| arg == "-ordonly"));
         assert!(
             !super::low_level::SessionConfig::new("/Volumes/Test", "Test")

@@ -293,6 +293,78 @@ fn run_access_checks(read_only: bool, mfmount: bool) {
     finish_access_test(result, mount_result, unmount_result.and(directory_result));
 }
 
+/// macFUSE always allows other local users to reach the mount, so creation
+/// must preserve the uid/gid from the native request context.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires macFUSE, a second local account, passwordless sudo to that account, and searchable mount-point ancestors"]
+fn mounted_foreign_create_records_requesting_caller_as_owner() {
+    use std::os::unix::fs::MetadataExt;
+
+    const PROBE_USER_ENV: &str = "STUDIOFS_MACFUSE_PROBE_USER";
+    let probe_user = std::env::var(PROBE_USER_ENV).expect("set STUDIOFS_MACFUSE_PROBE_USER");
+    // SAFETY: These credential queries have no pointer arguments.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    assert_ne!(uid, 0, "run the test as a non-root mounter");
+    let fixture = ContractVfsFixture::new("native-macfuse-foreign-create").expect("create fixture");
+    fixture
+        .vfs()
+        .mkdir(CONTRACT_ROOT_INO, b"shared", uid, gid, 0o777)
+        .expect("create shared directory");
+
+    let mount_point = native_mount_point();
+    std::fs::create_dir_all(&mount_point).expect("create mount point");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let signal = studiofs_macfuse::MacFuseUnmountSignal::new();
+    let request = studiofs_macfuse::MacFuseMountRequest::new(
+        fixture.vfs(),
+        fixture.runtime().handle().clone(),
+        &mount_point,
+        "macFUSE foreign create",
+    )
+    .with_signal_handling(studiofs_macfuse::SignalHandling::Disabled)
+    .with_unmount_signal(signal.clone())
+    .with_mount_ready_callback(move || ready_tx.send(()).expect("report ready mount"));
+    let worker = std::thread::spawn(move || studiofs_macfuse::mount_with_request(request));
+    let private = mount_point.join("shared").join("probe-private");
+    let result = std::panic::catch_unwind(|| {
+        wait_for_mounted_entry(&ready_rx, &mount_point.join("shared"));
+        let traversal = run_as_probe_user(&probe_user, &["ls", "-ld"], &mount_point.join("shared"));
+        assert!(traversal.status.success(), "foreign lookup failed: {}", String::from_utf8_lossy(&traversal.stderr));
+        let created = run_as_probe_user(
+            &probe_user,
+            &["sh", "-c", "umask 077 && printf secret > \"$1\"", "sh"],
+            &private,
+        );
+        assert!(
+            created.status.success(),
+            "foreign create must succeed; stderr: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let (probe_uid, probe_gid) = probe_user_ids(&probe_user);
+        assert_ne!(probe_uid, uid, "probe account must differ from the mounter");
+        assert_ne!(probe_uid, 0, "probe account must be non-root");
+        let metadata = std::fs::metadata(&private).expect("stat foreign-created file");
+        assert_eq!(
+            (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777),
+            (probe_uid, probe_gid, 0o600),
+            "foreign create must record the caller's uid/gid"
+        );
+        let own_read = run_as_probe_user(&probe_user, &["cat"], &private);
+        assert_eq!(own_read.stdout, b"secret", "creator must read its 0600 file");
+        assert_eq!(
+            std::fs::read(&private)
+                .expect_err("mounter must not read the foreign-created file")
+                .raw_os_error(),
+            Some(libc::EACCES)
+        );
+    });
+    signal.request_unmount();
+    let mount_result = worker.join();
+    let directory_result = remove_mount_point(&mount_point);
+    finish_access_test(result, mount_result, directory_result);
+}
+
 /// Waits for the ready callback and a successful lookup through the mount.
 fn wait_for_mounted_entry(ready_rx: &std::sync::mpsc::Receiver<()>, entry: &std::path::Path) {
     ready_rx
@@ -447,7 +519,6 @@ fn mounted_allow_other_applies_mode_bits_to_foreign_users() {
     finish_access_test(result, mount_result, unmount_result.and(directory_result));
 }
 
-#[cfg(target_os = "linux")]
 fn probe_user_ids(user: &str) -> (u32, u32) {
     let name = CString::new(user).expect("probe user name");
     // SAFETY: `name` is NUL-terminated; the returned record is read before any
@@ -458,7 +529,6 @@ fn probe_user_ids(user: &str) -> (u32, u32) {
     unsafe { ((*entry).pw_uid, (*entry).pw_gid) }
 }
 
-#[cfg(target_os = "linux")]
 fn run_as_probe_user(
     user: &str,
     command: &[&str],

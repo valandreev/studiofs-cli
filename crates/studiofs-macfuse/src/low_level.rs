@@ -610,6 +610,7 @@ impl SessionConfig {
             format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"),
             format!("-omax_read={MACOS_FUSE_IOSIZE_BYTES}"),
             "-odefault_permissions".to_owned(),
+            "-oallow_other".to_owned(),
             "-osparse".to_owned(),
         ];
         if self.read_only {
