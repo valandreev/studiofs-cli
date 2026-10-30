@@ -1094,6 +1094,48 @@ fn rename_directory_updates_inode_ctime_without_changing_mtime() {
 }
 
 #[test]
+fn rename_dirty_regular_file_preserves_upload_state_and_size() {
+    let engine = temp_engine();
+    let file = engine.create_file(ROOT_INO, b"ctime-dirty", 1000, 1000, 0o644).unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 3;
+    engine.set_attr(&attr).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(402, 4096))
+        .unwrap();
+    let before = engine.get_attr(file.ino).unwrap();
+    assert_eq!(before.upload_state, UploadState::Uploading);
+    let event_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    engine.rename_atomic(ROOT_INO, b"ctime-dirty", ROOT_INO, b"ctime-dirty-renamed", true, false).unwrap();
+
+    let after = engine.get_attr(file.ino).unwrap();
+    assert_eq!(after.upload_state, UploadState::Uploading);
+    assert_eq!(after.size, 4096);
+    assert_eq!(after.committed_size, before.committed_size);
+    assert_eq!(after.content_epoch, 3);
+    assert_eq!(after.committed_content_epoch, before.committed_content_epoch);
+    assert!(after.ctime >= before.ctime);
+    // The staged body must stay pending; publication only follows the upload.
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 3, 402)
+            .unwrap()
+    );
+    let event_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events = engine.read_events_range(event_start, event_end).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::events::MetaEvent::SetAttr { attr }
+            if attr.ino == file.ino
+                && attr.upload_state == UploadState::Uploading
+                && attr.size == 4096
+                && attr.content_epoch == 3
+    )));
+}
+
+#[test]
 fn test_link_basic() {
     let engine = temp_engine();
 
