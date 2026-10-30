@@ -989,6 +989,153 @@ fn redb_rename_keeps_same_inode_and_incarnation_ids() {
 }
 
 #[test]
+fn rename_symlink_updates_inode_ctime() {
+    let engine = temp_engine();
+    let symlink = engine.create_symlink(ROOT_INO, b"ctime-link", b"target", 1000, 1000).unwrap();
+    let mut old = engine.get_attr(symlink.ino).unwrap();
+    old.ctime -= 1_000_000_000;
+    engine.set_attr(&old).unwrap();
+    let before = engine.get_attr(symlink.ino).unwrap();
+    let event_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    engine.rename_atomic(ROOT_INO, b"ctime-link", ROOT_INO, b"ctime-link-renamed", true, false).unwrap();
+
+    let after = engine.get_attr(symlink.ino).unwrap();
+    assert!(after.ctime > before.ctime);
+    assert_eq!(after.mtime, before.mtime);
+    let event_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events = engine.read_events_range(event_start, event_end).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::events::MetaEvent::SetAttr { attr }
+            if attr.ino == symlink.ino && attr.ctime == after.ctime
+    )));
+}
+
+#[test]
+fn rename_over_hardlink_updates_displaced_inode_ctime() {
+    let engine = temp_engine();
+    engine.create_file(ROOT_INO, b"ctime-source", 1000, 1000, 0o644).unwrap();
+    let target = engine.create_file(ROOT_INO, b"ctime-target", 1000, 1000, 0o644).unwrap();
+    engine.link(target.ino, ROOT_INO, b"ctime-target-alias").unwrap();
+    let mut old = engine.get_attr(target.ino).unwrap();
+    old.ctime -= 1_000_000_000;
+    engine.set_attr(&old).unwrap();
+    let before = engine.get_attr(target.ino).unwrap();
+    let event_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    engine.rename_atomic(ROOT_INO, b"ctime-source", ROOT_INO, b"ctime-target", true, false).unwrap();
+
+    let after = engine.get_attr(target.ino).unwrap();
+    assert_eq!(after.nlink, 1);
+    assert!(after.ctime > before.ctime);
+    assert_eq!(after.mtime, before.mtime);
+    let event_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events = engine.read_events_range(event_start, event_end).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::events::MetaEvent::RenameEntry { displaced_set_attr, .. }
+            if displaced_set_attr.as_ref().as_ref().is_some_and(|attr| attr.ino == target.ino && attr.ctime == after.ctime)
+    )));
+}
+
+#[test]
+fn unlink_hardlink_updates_inode_ctime() {
+    let engine = temp_engine();
+    let file = engine.create_file(ROOT_INO, b"ctime-unlink", 1000, 1000, 0o644).unwrap();
+    let mut published = engine.get_attr(file.ino).unwrap();
+    published.content_epoch = 1;
+    published.committed_content_epoch = 1;
+    engine.set_attr(&published).unwrap();
+    engine.link(file.ino, ROOT_INO, b"ctime-unlink-alias").unwrap();
+    let mut old = engine.get_attr(file.ino).unwrap();
+    old.ctime -= 1_000_000_000;
+    engine.set_attr(&old).unwrap();
+    let before = engine.get_attr(file.ino).unwrap();
+    let event_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    let unlinked = engine.unlink(ROOT_INO, b"ctime-unlink").unwrap();
+
+    let after = engine.get_attr(file.ino).unwrap();
+    assert_eq!(unlinked.nlink, 1);
+    assert!(after.ctime > before.ctime);
+    assert_eq!(after.mtime, before.mtime);
+    let event_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events = engine.read_events_range(event_start, event_end).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::events::MetaEvent::SetAttr { attr }
+            if attr.ino == file.ino && attr.ctime == after.ctime
+    )));
+}
+
+#[test]
+fn rename_directory_updates_inode_ctime_without_changing_mtime() {
+    let engine = temp_engine();
+    let dir = engine.create_dir(ROOT_INO, b"ctime-dir", 1000, 1000, 0o755).unwrap();
+    let mut old = engine.get_attr(dir.ino).unwrap();
+    old.ctime -= 1_000_000_000;
+    engine.set_attr(&old).unwrap();
+    let before = engine.get_attr(dir.ino).unwrap();
+    let event_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    engine.rename_atomic(ROOT_INO, b"ctime-dir", ROOT_INO, b"ctime-dir-renamed", true, false).unwrap();
+
+    let after = engine.get_attr(dir.ino).unwrap();
+    assert!(after.ctime > before.ctime);
+    assert_eq!(after.mtime, before.mtime);
+    let event_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events = engine.read_events_range(event_start, event_end).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::events::MetaEvent::RenameEntry { moved_dir_attr, .. }
+            if moved_dir_attr.as_ref().as_ref().is_some_and(|attr| attr.ino == dir.ino && attr.ctime == after.ctime)
+    )));
+}
+
+#[test]
+fn rename_dirty_regular_file_preserves_upload_state_and_size() {
+    let engine = temp_engine();
+    let file = engine.create_file(ROOT_INO, b"ctime-dirty", 1000, 1000, 0o644).unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 3;
+    engine.set_attr(&attr).unwrap();
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(402, 4096))
+        .unwrap();
+    let before = engine.get_attr(file.ino).unwrap();
+    assert_eq!(before.upload_state, UploadState::Uploading);
+    let event_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    engine.rename_atomic(ROOT_INO, b"ctime-dirty", ROOT_INO, b"ctime-dirty-renamed", true, false).unwrap();
+
+    let after = engine.get_attr(file.ino).unwrap();
+    assert_eq!(after.upload_state, UploadState::Uploading);
+    assert_eq!(after.size, 4096);
+    assert_eq!(after.committed_size, before.committed_size);
+    assert_eq!(after.content_epoch, 3);
+    assert_eq!(after.committed_content_epoch, before.committed_content_epoch);
+    assert!(after.ctime >= before.ctime);
+    // The staged body must stay pending; publication only follows the upload.
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 3, 402)
+            .unwrap()
+    );
+    let event_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events = engine.read_events_range(event_start, event_end).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::events::MetaEvent::SetAttr { attr }
+            if attr.ino == file.ino
+                && attr.upload_state == UploadState::Uploading
+                && attr.size == 4096
+                && attr.content_epoch == 3
+    )));
+}
+
+#[test]
 fn test_link_basic() {
     let engine = temp_engine();
 

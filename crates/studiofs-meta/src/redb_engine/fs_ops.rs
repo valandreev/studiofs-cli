@@ -472,6 +472,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         RedbMetaEngine::remove_dentry_overlay_in_txn(self.txn, spec.parent, spec.name)?;
 
         attr.nlink = attr.nlink.saturating_sub(1);
+        attr.touch_ctime();
         let deleted_before_publish = if attr.nlink == 0
             && attr.kind == FileType::RegularFile
             && (attr.content_epoch != attr.committed_content_epoch
@@ -979,6 +980,7 @@ impl MetaFsOps for RedbMetaEngine {
                     displaced_remove_attr_ino = Some(dst_entry.ino);
                 } else {
                     attr.nlink = attr.nlink.saturating_sub(1);
+                    attr.touch_ctime();
                     if attr.nlink == 0 && !retain_displaced_inode {
                         Self::remove_inode_overlay_in_txn(&txn, dst_entry.ino)?;
                         Self::clear_inode_overlay_aux_in_txn_with_options(
@@ -1009,12 +1011,17 @@ impl MetaFsOps for RedbMetaEngine {
 
             Self::set_dentry_in_txn(&txn, new_parent, new_name, &src_entry)?;
 
-            if src_entry.kind == FileType::Directory && parent != new_parent {
-                if let Some(mut attr) = moved_dir_attr.take() {
+            if src_entry.kind == FileType::Directory
+                && let Some(mut attr) = moved_dir_attr.take()
+            {
+                if parent != new_parent {
                     attr.parent = new_parent;
-                    Self::set_inode_in_txn(&txn, &attr)?;
-                    moved_dir_attr = Some(attr);
                 }
+                attr.touch_ctime();
+                Self::set_inode_in_txn(&txn, &attr)?;
+                moved_dir_attr = Some(attr);
+            }
+            if src_entry.kind == FileType::Directory && parent != new_parent {
                 if let Some(mut attr) = old_parent_attr.take() {
                     attr.nlink = attr.nlink.saturating_sub(1);
                     attr.touch_mtime();
@@ -1044,6 +1051,12 @@ impl MetaFsOps for RedbMetaEngine {
                     new_parent_attr: Box::new(new_parent_attr),
                 },
             )?;
+            if src_entry.kind != FileType::Directory {
+                let mut attr = Self::get_attr_merged_in_write_txn(&txn, src_entry.ino)?;
+                attr.touch_ctime();
+                Self::set_inode_in_txn(&txn, &attr)?;
+                Self::append_event_in_txn(&txn, &crate::events::MetaEvent::SetAttr { attr })?;
+            }
         }
         if src_entry.kind == FileType::RegularFile {
             Self::refresh_pending_regular_file_recovery_metadata_in_txn(&txn, src_entry.ino)?;
