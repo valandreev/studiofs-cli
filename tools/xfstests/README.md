@@ -182,6 +182,9 @@ implicit full run. For a bounded run, pass explicit IDs such as
 hash; retain the source SHA recorded at build time when the checkout changes
 without rebuilding the product.
 
+Do not edit `run.sh` while it is active; drain or stop it before changing the
+script so Bash cannot read a changed tail after its current loop finishes.
+
 The upstream FUSE `_scratch_mkfs` path does not format a volume. It mounts the
 scratch volume, removes its files, and unmounts it. Tests that require actual
 reformatting, block-device geometry, or unsupported mount options must remain
