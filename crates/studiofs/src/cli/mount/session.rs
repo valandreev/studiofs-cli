@@ -42,7 +42,7 @@ use tokio::runtime::Runtime;
 use tracing::{debug, info, warn};
 
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
-const DAEMON_RECORD_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
+const DAEMON_RECORD_PUBLISH_TIMEOUT: Duration = Duration::from_secs(60);
 const DAEMON_RECORD_PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// After the daemon attaches, wait this long for startup sync to grant write
 /// authority (`live`) or settle as `degraded` before `--detach` returns.
