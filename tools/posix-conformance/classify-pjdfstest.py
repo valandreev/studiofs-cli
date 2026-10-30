@@ -8,6 +8,11 @@ import re
 import sys
 
 SPECIAL = re.compile(r"::(socket|char|block|fifo)$")
+INODE_CTIME_FAILURES = {
+    "rename::to_multiply_linked::regular",
+    "rename::changed_ctime_success::symlink",
+    "unlink::update_ctime_success::regular",
+}
 
 
 def bucket(name, verdict, detail):
@@ -20,6 +25,8 @@ def bucket(name, verdict, detail):
         return "B2 special files"
     if "uid_gid_eq_euid_egid" in name:
         return "B2 root owner"
+    if name in INODE_CTIME_FAILURES:
+        return "B1 SFS-923 inode ctime"
     if "ENAMETOOLONG" in detail:
         return "B1 SFS-912"
     if name in ("mkdir::changed_time_fields_success", "rename::updates_link_parent"):
@@ -48,7 +55,8 @@ def main(path):
                 unclassified.append((name, detail))
         if deg == "degraded=1":
             degraded.append(name)
-    cols = ["B1 SFS-911", "B1 SFS-912", "B1 SFS-913", "B2 special files", "B2 root owner"]
+    cols = ["B1 SFS-911", "B1 SFS-912", "B1 SFS-913", "B1 SFS-923 inode ctime",
+            "B2 special files", "B2 root owner"]
     print("| group | total | ok | skipped | failed | " + " | ".join(cols) + " |")
     print("|---|---:|---:|---:|---:|" + "---:|" * len(cols))
     tot = collections.Counter()
