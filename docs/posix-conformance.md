@@ -42,7 +42,8 @@ full per-case run:
 - `rename::changed_ctime_success::symlink`
 - `unlink::update_ctime_success::regular`
 
-fsx was not rerun. Non-WSL Linux validation was not performed.
+fsx was not rerun; no fsx result is claimed for this product revision.
+Non-WSL Linux validation was not performed.
 
 ## Environment and run configuration
 
