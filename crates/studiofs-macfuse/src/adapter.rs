@@ -79,8 +79,9 @@ pub(crate) struct MacFuseOpenCachePolicy {
 
 /// Credentials of the process that issued a namespace-creation request.
 ///
-/// macOS mounts always use `allow_other`, so callers other than the mounting
-/// user reach create paths and new inodes must record the caller.
+/// Legacy macFUSE mounts request `allow_other` when the kext permits it, so
+/// callers other than the mounting user reach create paths and new inodes must
+/// record the caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct MacFuseCaller {
     pub(crate) uid: u32,

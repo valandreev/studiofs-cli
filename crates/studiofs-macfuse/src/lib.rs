@@ -498,9 +498,17 @@ pub fn mount_with_request(request: MacFuseMountRequest) -> io::Result<()> {
         mount_ready_callback,
     } = request;
     reset_process_shutdown_state()?;
+    let allow_other = low_level::allow_other_permitted();
+    if !allow_other {
+        tracing::warn!(
+            "macFUSE admits allow_other only for root, admin-group members, or with \
+             vfs.generic.macfuse.tunables.allow_other=1; other local users cannot reach this mount"
+        );
+    }
     let config = low_level::SessionConfig::new(mount_point, volume_name)
         .with_read_only(read_only)
-        .with_run_in_foreground(run_in_foreground);
+        .with_run_in_foreground(run_in_foreground)
+        .with_allow_other(allow_other);
     let mut callback_state = Box::new(adapter::CallbackState::new(
         Arc::clone(&vfs),
         runtime_handle,
@@ -634,7 +642,8 @@ mod tests {
     fn session_config_uses_buffered_data_cache_with_uncached_names() {
         let config = super::low_level::SessionConfig::new("/Volumes/Studio FS", "StudioFS Native")
             .with_read_only(true)
-            .with_run_in_foreground(true);
+            .with_run_in_foreground(true)
+            .with_allow_other(true);
 
         let args = config.argv_strings();
         let mount_args = config.mount_argv_strings();
@@ -670,6 +679,7 @@ mod tests {
         );
         assert!(mount_args.iter().any(|arg| arg == "-onovncache"));
         assert!(mount_args.iter().any(|arg| arg == "-odefault_permissions"));
+        assert!(mount_args.iter().any(|arg| arg == "-oallow_other"));
         assert!(mount_args.iter().any(|arg| arg == "-ordonly"));
         assert!(
             !super::low_level::SessionConfig::new("/Volumes/Test", "Test")
