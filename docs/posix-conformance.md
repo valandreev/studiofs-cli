@@ -404,3 +404,144 @@ not committed:
 * `fsx-replay/`
 * `fsx-durability/`
 * `diag/`: strace of `chmod::eloop_final_comp` and mount logs around the degrade and fsx phases
+
+## SFS-925 full pjdfstest rerun after SFS-923 (2026-10-30)
+
+Run `20261030T184900Z-fec5f2b79`, product commit
+`fec5f2b79d416cf354f133280cc62958ada93fff`. It includes PR #902 (SFS-923).
+The behavior change is from `7b3e5e23`, with dirty-upload regression test
+`160bc982`. Commit `23cf07a5` has the same ctime-fix subject but only
+script-mode changes; `59d04d51` restores those executable modes. The release binary was rebuilt from this commit before
+testing. pjdfstest was pinned at
+`ce3ca5c10d1d29f25b2881c85c62be2c74c27bf8`; fsx is pinned at
+`22348afe338c0f6d540c0d7ef0db749eaa51b218`.
+
+The ext4 per-group control passed 385 cases, skipped the same 13 EROFS cases,
+and had no failures. StudioFS completed all 15 per-group runs with 207 pass,
+14 skip, and 177 fail. Per-group deltas from the immediately preceding run:
+
+| Group | Previous StudioFS | Current per-group | Delta (pass / fail) |
+|---|---:|---:|---:|
+| `chmod` | 16 / 1 / 16 | 16 / 1 / 16 | 0 / 0 |
+| `chown` | 16 / 2 / 8 | 16 / 2 / 8 | 0 / 0 |
+| `ftruncate` | 6 / 0 / 0 | 6 / 0 / 0 | 0 / 0 |
+| `link` | 15 / 2 / 24 | 15 / 2 / 24 | 0 / 0 |
+| `mkdir` | 11 / 1 / 9 | 11 / 1 / 9 | 0 / 0 |
+| `mkfifo` | 9 / 1 / 11 | 9 / 1 / 11 | 0 / 0 |
+| `mknod` | 15 / 0 / 23 | 15 / 0 / 23 | 0 / 0 |
+| `open` | 18 / 2 / 7 | 18 / 2 / 7 | 0 / 0 |
+| `posix_fallocate` | 5 / 0 / 0 | 5 / 0 / 0 | 0 / 0 |
+| `rename` | 25 / 1 / 34 | 27 / 1 / 32 | +2 / -2 |
+| `rmdir` | 14 / 1 / 8 | 14 / 1 / 8 | 0 / 0 |
+| `symlink` | 12 / 1 / 11 | 12 / 1 / 11 | 0 / 0 |
+| `truncate` | 14 / 1 / 4 | 14 / 1 / 4 | 0 / 0 |
+| `unlink` | 12 / 1 / 21 | 13 / 1 / 20 | +1 / -1 |
+| `utimensat` | 16 / 0 / 4 | 16 / 0 / 4 | 0 / 0 |
+| **All** | **204 / 14 / 180** | **207 / 14 / 177** | **+3 / -3** |
+
+The isolated StudioFS cases and ext4 controls all passed:
+
+| pjdfstest case | ext4 | StudioFS |
+|---|---|---|
+| `rename::to_multiply_linked::regular` | pass | pass |
+| `rename::changed_ctime_success::symlink` | pass | pass |
+| `unlink::update_ctime_success::regular` | pass | pass |
+
+The canonical per-case list has 398 unique names. Ext4, StudioFS per-group,
+and StudioFS per-case each covered those same 398 names. The per-group and
+per-case StudioFS verdicts match exactly: 207 pass, 14 skip, and 177 fail.
+Compared with the previous per-case run, all three SFS-923 ctime failures now
+pass; 177 failures remain and no previously passing case became a failure.
+All three focused cases passed in both the individual controls and the full
+per-case run.
+
+The remaining 177 failures classify as 175 unsupported special-file cases
+and two root-owner translations. There are no SFS-911, SFS-912, SFS-913, or
+SFS-923 failures, no unclassified failures, and no degraded cases. Every
+per-case row has `degraded=0`; the retained daemon log has zero
+`abandoning batch`, payload-relink failure, or `degraded=1` markers.
+The test-created mount was cleanly unmounted after the completed run.
+This is WSL2 evidence only; stable non-WSL Linux VM validation remains
+tracked separately in [SFS-924](https://linear.app/valandreev/issue/SFS-924).
+
+The fsx suite was not rerun. The SFS-923 implementation advances inode ctime
+and emits the corresponding metadata `SetAttr` event; it does not change the
+payload, size, write, upload-state, or local cache paths. The adjacent
+`160bc982` regression test asserts that rename preserves `Uploading` state,
+size, content epochs, and pending publication. The five-profile and remount
+fsx evidence from run `20261030T151455Z-76a9fc059` is carried forward only for
+those unchanged data paths; it is not a new-commit fsx result.
+
+To reproduce, rebuild first. Start the mount as the regular `valen` user in one
+WSL Bash terminal, then run the suites from another. Load the ignored `.env`
+only in shells that start the mount or per-case remount runner; never print its
+values.
+
+```bash
+# Terminal 1, as valen:
+cargo build -p studiofs --release
+set -a; source .env; set +a
+target/release/studiofs mount test /srv/sfs906/mnt/test -d --allow-other
+
+# Terminal 2, as valen:
+RUN=target/posix-conformance/20261030T184900Z-fec5f2b79
+sudo tools/posix-conformance/run-pjdfstest.sh ext4 /srv/sfs906/ext4 "$PWD/$RUN"
+sudo tools/posix-conformance/run-pjdfstest.sh studiofs /srv/sfs906/mnt/test "$PWD/$RUN"
+grep -h -oE '^[a-z_]+::[A-Za-z0-9_:]+' "$RUN"/pjdfstest-ext4/*.log | sort -u > "$RUN/cases.txt"
+
+PJD=target/posix-conformance/tools/pjdfstest-rs/rust/target/release/pjdfstest
+sudo "$PJD" -e -c tools/posix-conformance/pjdfstest-linux.toml -p /srv/sfs906/ext4/sfs925-case1 -s /dev/shm/sfs925-secondary-ext4 pjdfstest::tests::rename::to_multiply_linked::regular > "$RUN/focused-ext4/rename-to-multiply-linked-regular.log" 2>&1
+sudo "$PJD" -e -c tools/posix-conformance/pjdfstest-linux.toml -p /srv/sfs906/ext4/sfs925-case2 -s /dev/shm/sfs925-secondary-ext4 pjdfstest::tests::rename::changed_ctime_success::symlink > "$RUN/focused-ext4/rename-changed-ctime-symlink.log" 2>&1
+sudo "$PJD" -e -c tools/posix-conformance/pjdfstest-linux.toml -p /srv/sfs906/ext4/sfs925-case3 -s /dev/shm/sfs925-secondary-ext4 pjdfstest::tests::unlink::update_ctime_success::regular > "$RUN/focused-ext4/unlink-update-ctime-regular.log" 2>&1
+
+# Enter a root shell for the per-case runner and its remounts:
+sudo -s
+cd /home/valen/dev/studiofs
+set -a; source .env; set +a
+RUN=target/posix-conformance/20261030T184900Z-fec5f2b79
+MOUNT_LOG=$(ls -1t /home/valen/.studiofs/logs/test-*.log.* | head -1)
+mkdir -p "$RUN/runner-bin"
+cat > "$RUN/runner-bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-u" && "${3:-}" == "--preserve-env=STUDIOFS_LINUX_FUSE_CACHE_POLICY" ]]; then
+  user="$2"
+  shift 3
+  exec /usr/bin/sudo -u "$user" --preserve-env=STUDIOFS_LINUX_FUSE_CACHE_POLICY,STUDIOFS_S3_ENDPOINT,STUDIOFS_S3_ACCESS_KEY,STUDIOFS_S3_SECRET_KEY,STUDIOFS_S3_BUCKET "$@"
+fi
+exec /usr/bin/sudo "$@"
+EOF
+chmod 0755 "$RUN/runner-bin/sudo"
+PATH="$PWD/$RUN/runner-bin:$PATH" SFS_MOUNT=/srv/sfs906/mnt/test \
+  SFS_MOUNT_USER=valen SFS_VOLUME=test \
+  tools/posix-conformance/run-pjdfstest-per-case.sh \
+  "$PWD/$RUN" "$PWD/$RUN/cases.txt" "$MOUNT_LOG"
+
+python3 "$RUN/normalize-group-results.py"
+python3 tools/posix-conformance/classify-pjdfstest.py \
+  "$RUN/pjdfstest-studiofs-per-group/results.txt" > "$RUN/classification-per-group.md"
+python3 tools/posix-conformance/classify-pjdfstest.py \
+  "$RUN/pjdfstest-studiofs-per-case/results.txt" > "$RUN/classification-per-case.md"
+python3 "$RUN/compare-results.py" > "$RUN/comparison-summary.txt"
+
+# After the run, as valen:
+target/release/studiofs umount /srv/sfs906/mnt/test
+```
+
+An initial per-case attempt was stopped after six entries when filename prefixes
+were found in its input list. The list was regenerated without prefixes,
+verified to contain 398 unique cases, and the complete run above was counted;
+the stopped attempt is excluded.
+
+Raw and normalized evidence is retained under
+`target/posix-conformance/20261030T184900Z-fec5f2b79/`: `environment.txt`,
+`product-build.log`, `command-manifest.txt`, `cases.txt`,
+`focused-ext4/*.log`, `pjdfstest-ext4/*.log`,
+`pjdfstest-studiofs/*.log`,
+`pjdfstest-studiofs-per-group/results.txt`,
+`pjdfstest-studiofs-per-case/results.txt`,
+`classification-per-group.md`, `classification-per-case.md`,
+`pjdfstest-mode-comparison.json`, `per-group-delta.json`,
+`baseline-case-comparison.json`, `sfs923-focused-verdicts.json`,
+`normalize-group-results.py`, `compare-results.py`, and
+`diag/mount-daemon.log`. The daemon log was checked against locally loaded
+credential values before it was copied.
