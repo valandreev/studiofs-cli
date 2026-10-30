@@ -1,0 +1,16 @@
+# Source this before run.sh; replace paths/names with fresh dedicated volumes.
+# Keep checkout, client, artifacts and mountpoints on Linux ext4, never /mnt/c.
+export FSTYP=fuse
+export FUSE_SUBTYP=.studiofs
+export TEST_DEV=sfs907-unique-test
+export SCRATCH_DEV=sfs907-unique-scratch
+export TEST_DIR=/srv/sfs907/RUN/mnt/$TEST_DEV
+export SCRATCH_MNT=/srv/sfs907/RUN/mnt/$SCRATCH_DEV
+export STUDIOFS_BINARY=/home/YOU/studiofs-cli/target/release/studiofs
+export STUDIOFS_CLIENT_ROOT=/home/YOU/studiofs-cli/target/xfstests/RUN/client
+export XFSTESTS_RUN=/home/YOU/studiofs-cli/target/xfstests/RUN
+export FUSE_MOUNT_OPTIONS='-o rw,allow_other,default_permissions'
+# Adaptive default deliberately leaves writable mmap opt-in off, as in SFS-906.
+export STUDIOFS_LINUX_FUSE_CACHE_POLICY=adaptive
+export STUDIOFS_FUSE_DIRECT_IO_MMAP=0
+export TEST_TIMEOUT=300
