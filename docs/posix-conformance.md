@@ -38,6 +38,131 @@ SFS-908 added `--allow-other`, which this baseline needs; see
 [mount configuration](#mount-configuration). The SFS-910 fix (PR #888) merged
 after the baseline commit and is not reflected in these numbers.
 
+## 2026-10-30 Follow-up Run
+
+Run `20261030T151455Z-76a9fc059`, product commit
+`76a9fc05923673b86c7d049119345abed58d821f` (also `origin/main`). The
+release binary was rebuilt from this commit before measurements. It includes
+the fixes merged as PRs #888 (SFS-910), #897 (SFS-911), #899 (SFS-912),
+#900 (SFS-913), #891 (SFS-915), #894 (SFS-916), #895 (SFS-921), and
+#896 (SFS-922). The pinned pjdfstest and fsx revisions are unchanged from the
+previous run.
+
+### pjdfstest
+
+The ext4 control and StudioFS per-group run exercised all 15 groups; StudioFS
+per-case mode exercised all 398 cases. Counts below are pass / skip / fail.
+The per-case run is the source for failure classification.
+
+| Group | Previous StudioFS | Current per-group | Delta (pass / fail) |
+|---|---:|---:|---:|
+| `chmod` | 11 / 1 / 21 | 16 / 1 / 16 | +5 / -5 |
+| `chown` | 10 / 2 / 14 | 16 / 2 / 8 | +6 / -6 |
+| `ftruncate` | 6 / 0 / 0 | 6 / 0 / 0 | 0 / 0 |
+| `link` | 9 / 2 / 30 | 15 / 2 / 24 | +6 / -6 |
+| `mkdir` | 7 / 1 / 13 | 11 / 1 / 9 | +4 / -4 |
+| `mkfifo` | 6 / 1 / 14 | 9 / 1 / 11 | +3 / -3 |
+| `mknod` | 10 / 0 / 28 | 15 / 0 / 23 | +5 / -5 |
+| `open` | 14 / 2 / 11 | 18 / 2 / 7 | +4 / -4 |
+| `posix_fallocate` | 5 / 0 / 0 | 5 / 0 / 0 | 0 / 0 |
+| `rename` | 18 / 1 / 41 | 25 / 1 / 34 | +7 / -7 |
+| `rmdir` | 11 / 1 / 11 | 14 / 1 / 8 | +3 / -3 |
+| `symlink` | 7 / 1 / 16 | 12 / 1 / 11 | +5 / -5 |
+| `truncate` | 12 / 1 / 6 | 14 / 1 / 4 | +2 / -2 |
+| `unlink` | 7 / 1 / 26 | 12 / 1 / 21 | +5 / -5 |
+| `utimensat` | 15 / 0 / 5 | 16 / 0 / 4 | +1 / -1 |
+| **All** | **148 / 14 / 236** | **204 / 14 / 180** | **+56 / -56** |
+
+The ext4 per-group control passed 385, skipped the same 13 EROFS cases, and
+had no failures. StudioFS per-group and per-case verdicts match case by
+case: all 398 case names have the same verdict in both modes. The per-case
+classifier assigns every
+failure exactly once: 175 unsupported special-file cases, two legacy
+root-owner translations, and three inode-ctime failures (SFS-923). There
+were no SFS-911, SFS-912, or SFS-913 failures and no unclassified failures. The two root-owner
+cases match the documented uid/gid-zero-to-mount-user translation.
+
+The per-case comparison against the retained previous-run results shows 40
+original SFS-911 ENOENT/link failures now pass, all 11 original SFS-912
+failures pass, and both SFS-913 cases pass. The previous rendered summary labeled 43 cases
+as SFS-911; the raw per-case artifacts split that count into
+40 ENOENT/link failures and the three ctime failures now tracked as SFS-923.
+Those same three ctime cases failed in both runs, so they are reclassified
+baseline failures, not newly introduced failures. Across all 398 cases, 56
+previous failures now pass, 180 remain failed, and no previously passing case
+became a failure. All 14 `enametoolong_component` cases pass; three of those
+had previously been classified with unsupported special-file errors.
+
+All three SFS-923 ctime cases failed in both the per-group and per-case modes
+and reproduced when run alone. The tests require ctime to advance when a
+rename changes an inode's link count, when a symlink is renamed, and when
+unlink decrements a hard-linked inode's link count. The ext4 control passed
+them. Logs, normalized results, classifier reports, the baseline-to-current
+case comparison, and the exact verdict comparison are retained under
+`target/posix-conformance/20261030T151455Z-76a9fc059/`.
+
+SFS-910 is confirmed fixed for this run: all groups completed, no case was
+marked degraded, and the mount log contains no `abandoning batch` warning.
+The three reclassified ctime failures are tracked as
+SFS-923.
+
+### fsx
+
+The ext4 control passed all five profiles. The StudioFS adaptive results below
+show why the shared-mmap opt-in is kept distinct from the default policy.
+
+| Profile | Arguments | Previous adaptive | ext4 | Current adaptive (default) | Current adaptive with mmap opt-in | Current kernel policy |
+|---|---|---|---|---|---|---|
+| default | `-N 100000 -S 906001` | `ENODEV` | pass (18 s) | `ENODEV` at MAPWRITE (expected with opt-in off) | pass (105 s) | pass (186 s) |
+| nommap | `-R -W -N 100000 -S 906002` | pass | pass (6 s) | pass (50 s) | pass (65 s) | not run |
+| small | `-l 65536 -o 4096 -N 100000 -S 906003` | `ENODEV` | pass (9 s) | `ENODEV` at MAPWRITE (expected with opt-in off) | pass (159 s) | ten consecutive runs passed |
+| large | `-l 67108864 -o 1048576 -N 20000 -S 906004` | `ENODEV` | pass (22 s) | `ENODEV` at MAPWRITE (expected with opt-in off) | pass (39 s) | pass (58 s) |
+| large-nommap | `-R -W -l 67108864 -o 1048576 -N 20000 -S 906005` | pass | pass (15 s) | pass (18 s) | pass (21 s) | not run |
+
+The adaptive default-policy mmap failures retain the documented SFS-916 choice:
+shared writable mmap stays opt-in. With
+`STUDIOFS_FUSE_DIRECT_IO_MMAP=1`, all five profiles passed once. The required
+ten consecutive adaptive `small` runs also passed (100,000 operations each,
+seed 906003), confirming SFS-921/922 for this WSL2 run. Their timings were
+124, 158, 150, 143, 135, 131, 156, 124, 151, and 133 seconds. There were no
+`READ BAD DATA` results or `failed to relink retained overlay payloads`
+warnings.
+
+The kernel-policy default profile passed 100,000 operations with seed 906001
+(186 s). Its `small` profile passed 100,000 operations with seed 906003 and
+was followed immediately by nine more identical runs; all ten passed. The
+first run raw output is in `fsx-studiofs-kernel/small.log`; the consolidated
+summary is `fsx-studiofs-kernel-small-10/summary.txt`. The kernel `large`
+profile also passed 20,000 operations with seed 906004 (58 s). SFS-915 is
+confirmed fixed for these WSL2 profiles. SFS-916 remains a documented
+default-policy decision: mmap returns `ENODEV` when the opt-in is off, while
+all mmap profiles passed with it on.
+
+The adaptive remount durability check passed two nontrivial profiles:
+`-R -W -N 50000 -S 906010` (241,791-byte output) and
+`-R -W -l 67108864 -o 1048576 -N 10000 -S 906011` (67,108,864-byte output).
+After a clean unmount and fresh mount, both files matched their pre-unmount
+SHA-256 hashes. Before/after hashes and sizes are retained under
+`fsx-durability/`.
+
+The retained daemon log was scanned across the run, including remount
+intervals. Counts were zero for retained-overlay relink failures, missing
+payload reports, sticky async upload reports, payload link/submit reports,
+abandoned batches, and `degraded=1`. The counts are recorded in
+`warning-counts.json`.
+
+The Linux-VM rerun was not performed: the available VM repeatedly stopped and
+did not provide a stable test window. Track that validation in
+SFS-924; no VM result is claimed.
+Run logs, summaries, commands, and environment evidence are under
+`target/posix-conformance/20261030T151455Z-76a9fc059/`, including
+`command-manifest.txt`, `product-build.log`, `warning-counts.json`,
+`classification-per-group.md`, `classification-per-case.md`,
+`pjdfstest-mode-comparison.json`, `blocker-case-comparison.json`,
+`classification-old-baseline.md`, fsx profile logs, both ten-run summaries,
+and `fsx-durability/sha256-{before,after,after-check}.txt` plus
+`fsx-durability/stat-{before,after}.txt`.
+
 ## Environment
 
 | Item | Value |
