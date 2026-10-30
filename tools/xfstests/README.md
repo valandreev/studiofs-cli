@@ -155,14 +155,16 @@ sudo bash -c '
 The xfstests runner must run as root. Source the config in that root shell so
 the needed environment reaches the runner without relying on `sudo` to retain
 the caller's environment. The service credentials are no longer needed for
-the test cases. `tools/xfstests/exclude` is currently empty because
-the pinned upstream FUSE probes self-skip unsupported features. Run the full
+the test cases. `tools/xfstests/exclude` contains no manual test IDs: this
+baseline keeps every case selected, with native feature probes supplying most
+notrun results. Disabled-mmap and unavailable mount-option failures are retained
+and classified as profile/harness limits in the report. Run the full
 generic suite or named cases with the repository runner:
 
 ```bash
 sudo bash -c 'source "$1"; exec tools/xfstests/run.sh "$2" "$XFSTESTS_RUN/smoke" generic/001 generic/002 generic/005' \
   _ "$CONFIG" "$PWD/target/xfstests/tools/xfstests"
-sudo bash -c 'source "$1"; exec tools/xfstests/run.sh "$2" "$XFSTESTS_RUN/generic"' \
+sudo bash -c 'source "$1"; exec tools/xfstests/run.sh "$2" "$XFSTESTS_RUN/generic" "generic/*"' \
   _ "$CONFIG" "$PWD/target/xfstests/tools/xfstests"
 ```
 
@@ -173,6 +175,12 @@ each invocation. A timeout, missing report, or
 interrupted case is not a pass. Inspect the retained case records and logs
 before summarizing results. Do not run xfstests' whole-suite command directly:
 it bypasses the harness's per-test timeout and evidence layout.
+
+The selector is mandatory: an empty generated list is an error, never an
+implicit full run. For a bounded run, pass explicit IDs such as
+`generic/{001..403}` from Bash. Metadata records the checkout SHA and binary
+hash; retain the source SHA recorded at build time when the checkout changes
+without rebuilding the product.
 
 The upstream FUSE `_scratch_mkfs` path does not format a volume. It mounts the
 scratch volume, removes its files, and unmounts it. Tests that require actual

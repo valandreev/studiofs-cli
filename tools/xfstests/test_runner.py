@@ -11,7 +11,7 @@ RUNNER = ROOT / "run.sh"
 
 
 class RunnerTests(unittest.TestCase):
-    def run_case(self, mode, excluded=False, two_cases=False):
+    def run_case(self, mode, excluded=False, two_cases=False, selector="generic/001"):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             checkout = root / "xfstests"
@@ -56,7 +56,7 @@ esac
                 runner = copied
             else:
                 runner = RUNNER
-            selectors = ["generic/001", "generic/002"] if two_cases else ["generic/001"]
+            selectors = ["generic/001", "generic/002"] if two_cases else ([selector] if selector else [])
             result = subprocess.run([runner, checkout, run, *selectors], env=env,
                                     text=True, capture_output=True)
             manifest = (run / "manifest.tsv").read_text() if (run / "manifest.tsv").exists() else ""
@@ -83,6 +83,17 @@ esac
         result, manifest, _ = self.run_case("timeout")
         self.assertEqual(result.returncode, 1)
         self.assertIn("\ttimeout\n", manifest)
+
+    def test_empty_selection_does_not_expand_to_entire_group(self):
+        result, manifest, log_exists = self.run_case("pass", selector="")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(manifest, "")
+        self.assertFalse(log_exists)
+
+    def test_entire_group_requires_explicit_selector(self):
+        result, manifest, _ = self.run_case("pass", selector="generic/*")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("generic/001\t", manifest)
 
     def test_setup_failure_stops_before_next_case(self):
         result, manifest, _ = self.run_case("missing", two_cases=True)

@@ -1,3 +1,4 @@
-# No manual exclusions for FUSE. Upstream feature and scratch-device probes
-# self-skip unsupported generic tests; _scratch_mkfs for FUSE only cleans the
-# mounted scratch directory, while _scratch_mkfs_sized reports unsupported.
+# This baseline attempts every generic ID; there are no manual exclusions.
+# Native FUSE feature/geometry probes supply most notrun results. Disabled-mmap
+# and unavailable mount-option failures remain selected and are classified in
+# docs/posix-conformance.md, rather than counted as product bugs.

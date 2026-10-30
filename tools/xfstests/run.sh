@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -u
 
-usage() { echo "usage: $0 <xfstests-dir> <new-run-dir> [generic/NNN...]" >&2; exit 2; }
-[[ $# -ge 2 ]] || usage
+usage() { echo "usage: $0 <xfstests-dir> <new-run-dir> <generic/NNN... | 'generic/*'>" >&2; exit 2; }
+[[ $# -ge 3 ]] || usage
 xfstests=$(realpath "$1") || exit 2
 run=$(realpath -m "$2") || exit 2
 here=$(cd "$(dirname "$0")" && pwd) || exit 2
@@ -22,7 +22,7 @@ printf 'test\texit_status\twall_seconds\tverdict\n' >&3
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 {
-    printf 'product_sha\t%s\n' "$(git -C "$(dirname "$STUDIOFS_BINARY")" rev-parse HEAD 2>/dev/null || git rev-parse HEAD)"
+    printf 'checkout_sha\t%s\n' "$(git -C "$(dirname "$STUDIOFS_BINARY")" rev-parse HEAD 2>/dev/null || git rev-parse HEAD)"
     printf 'binary_sha256\t%s\n' "$(sha "$STUDIOFS_BINARY")"
     printf 'xfstests_sha\t%s\n' "$(git -C "$xfstests" rev-parse HEAD 2>/dev/null || echo unknown)"
     for name in FSTYP FUSE_SUBTYP TEST_DEV TEST_DIR SCRATCH_DEV SCRATCH_MNT FUSE_MOUNT_OPTIONS STUDIOFS_LINUX_FUSE_CACHE_POLICY STUDIOFS_FUSE_DIRECT_IO_MMAP TEST_TIMEOUT; do
@@ -30,10 +30,10 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
     done
 } >"$run/metadata.tsv"
 
-if (($#)); then
-    tests=("$@")
-else
+if [[ $# -eq 1 && $1 == 'generic/*' ]]; then
     mapfile -t tests < <(awk '!/^#/ && NF {print "generic/" $1}' "$xfstests/tests/generic/group.list")
+else
+    tests=("$@")
 fi
 [[ ${#tests[@]} -gt 0 ]] || { echo "no selected tests" >&2; exit 2; }
 for test_id in "${tests[@]}"; do
