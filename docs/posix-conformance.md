@@ -106,6 +106,20 @@ marked degraded, and the mount log contains no `abandoning batch` warning.
 The three reclassified ctime failures are tracked as
 SFS-923.
 
+#### SFS-923 focused follow-up (2026-10-30)
+
+The local metadata transaction advances ctime when rename changes the moved inode, when rename replacement decrements the displaced inode link count, and when unlink decrements a surviving inode link count. Moved symlink and regular-file attrs use the existing `SetAttr` event; directory attrs remain in `RenameEntry`. Existing VFS handling invalidates moved and displaced inode attr caches.
+
+After rebuilding `target/release/studiofs`, the three affected cases passed on the live WSL2 FUSE mount:
+
+| pjdfstest case | Result |
+|---|---|
+| `rename::changed_ctime_success::symlink` | pass |
+| `rename::to_multiply_linked::regular` | pass |
+| `unlink::update_ctime_success::regular` | pass |
+
+The run covered these three cases; the full 398-case baseline was not rerun. Results are retained in `target/sfs923/live/pjdfstest-studiofs-per-case/results.txt`; build and focused Rust validation logs are under `target/sfs923/`.
+
 ### fsx
 
 The ext4 control passed all five profiles. The StudioFS adaptive results below
