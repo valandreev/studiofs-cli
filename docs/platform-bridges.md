@@ -642,7 +642,7 @@ fallback). Rocky Linux 8.6+ remains best-effort.
 | Linux requested `max_read` / `max_readahead` | up to 4 MiB; negotiated values are recorded |
 | macOS `fsname` | `"studiofs"` |
 | macOS `auto_unmount` | Yes |
-| `allow_other` | macOS: yes; Linux: opt-in via `studiofs mount --allow-other` or `studiofs settings --allow-other` (off by default) |
+| `allow_other` | Legacy macFUSE: yes when the kext permits the mounter (root, `admin_group` member, or `tunables.allow_other=1`); macOS FSKit: not requested; Linux: opt-in via `studiofs mount --allow-other` or `studiofs settings --allow-other` (off by default) |
 | Linux `default_permissions` | Yes, also with `allow_other` |
 | Kernel `max_write` | macOS: `131072` bytes by default |
 | Kernel `max_read` | macOS mount option: `4194304` bytes |
@@ -912,8 +912,15 @@ the attributes returned by StudioFS. Directory search requires execute
 permission; owner/group checks do not fall through to a more permissive
 class. Root and capability behavior follow the native platform. Existing
 legacy uid/gid zero translation to the mount user remains in effect.
-Because macOS mounts always use `allow_other`, legacy macFUSE `create`,
-`mkdir`, `mknod` and `symlink` record the requesting caller's uid/gid from
+Legacy macFUSE mounts, including read-only snapshot `smount` sessions,
+request `allow_other` when the macFUSE kext accepts it from the mounter: root,
+a member of `vfs.generic.macfuse.tunables.admin_group` (default `80`, the
+`admin` group), or any user when `vfs.generic.macfuse.tunables.allow_other` is
+`1`. Otherwise the kext would fail the whole mount with `EPERM`, so the bridge
+omits the option, logs a warning, and only the mounter can reach the mount.
+Group membership comes from the process `getgroups` list. The FSKit/MFMount
+path does not request `allow_other`. Legacy macFUSE `create`, `mkdir`,
+`mknod` and `symlink` record the requesting caller's uid/gid from
 `fuse_req_ctx`, and FSKit records the uid/gid from the request header, so a
 foreign caller owns what it creates.
 FSKit rejects unexpected userspace access requests with `EACCES`.
@@ -927,9 +934,11 @@ caller with at least one supplementary group:
 Run each command on its native platform with the FUSE driver available.
 An ignored or zero-test result does not prove the permission contract.
 
-The mounted macFUSE foreign-create check additionally needs a non-root mounter,
-a different non-root local account selected with `STUDIOFS_MACFUSE_PROBE_USER`,
-passwordless `sudo -n` to that account, and searchable mount-point ancestors:
+The mounted legacy macFUSE foreign-create check additionally needs a non-root
+mounter that the kext admits for `allow_other`, a different non-root local
+account selected with `STUDIOFS_MACFUSE_PROBE_USER`, passwordless `sudo -n` to
+that account, and mount-point ancestors searchable by it. The test checks these
+before mounting:
 
     cargo test -p studiofs-macfuse --test posix_access mounted_foreign_create_records_requesting_caller_as_owner -- --ignored --nocapture --test-threads=1
 

@@ -293,19 +293,26 @@ fn run_access_checks(read_only: bool, mfmount: bool) {
     finish_access_test(result, mount_result, unmount_result.and(directory_result));
 }
 
-/// macFUSE always allows other local users to reach the mount, so creation
+/// Legacy macFUSE requests `allow_other` when the kext permits it, so creation
 /// must preserve the uid/gid from the native request context.
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "requires macFUSE, a second local account, passwordless sudo to that account, and searchable mount-point ancestors"]
+#[ignore = "requires macFUSE with allow_other permitted (root, admin group, or tunable), \
+            a second non-root account in $STUDIOFS_MACFUSE_PROBE_USER reachable through \
+            passwordless `sudo -n`, and mount-point ancestors searchable by that account"]
 fn mounted_foreign_create_records_requesting_caller_as_owner() {
-    use std::os::unix::fs::MetadataExt;
-
-    const PROBE_USER_ENV: &str = "STUDIOFS_MACFUSE_PROBE_USER";
-    let probe_user = std::env::var(PROBE_USER_ENV).expect("set STUDIOFS_MACFUSE_PROBE_USER");
+    let probe_user = std::env::var(MACFUSE_PROBE_USER_ENV)
+        .unwrap_or_else(|_| panic!("set {MACFUSE_PROBE_USER_ENV} to a second local account"));
+    assert!(
+        studiofs_macfuse::low_level::allow_other_permitted(),
+        "the macFUSE kext would reject allow_other for this mounter"
+    );
     // SAFETY: These credential queries have no pointer arguments.
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
     assert_ne!(uid, 0, "run the test as a non-root mounter");
+    let (probe_uid, _) = probe_user_ids(&probe_user);
+    assert_ne!(probe_uid, uid, "probe account must differ from the mounter");
+    assert_ne!(probe_uid, 0, "probe account must be non-root");
     let fixture = ContractVfsFixture::new("native-macfuse-foreign-create").expect("create fixture");
     fixture
         .vfs()
@@ -314,6 +321,7 @@ fn mounted_foreign_create_records_requesting_caller_as_owner() {
 
     let mount_point = native_mount_point();
     std::fs::create_dir_all(&mount_point).expect("create mount point");
+    assert_probe_user_can_search_parent(&probe_user, &mount_point);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let signal = studiofs_macfuse::MacFuseUnmountSignal::new();
     let request = studiofs_macfuse::MacFuseMountRequest::new(
@@ -326,44 +334,27 @@ fn mounted_foreign_create_records_requesting_caller_as_owner() {
     .with_unmount_signal(signal.clone())
     .with_mount_ready_callback(move || ready_tx.send(()).expect("report ready mount"));
     let worker = std::thread::spawn(move || studiofs_macfuse::mount_with_request(request));
-    let private = mount_point.join("shared").join("probe-private");
     let result = std::panic::catch_unwind(|| {
-        wait_for_mounted_entry(&ready_rx, &mount_point.join("shared"));
-        let traversal = run_as_probe_user(&probe_user, &["ls", "-ld"], &mount_point.join("shared"));
-        assert!(traversal.status.success(), "foreign lookup failed: {}", String::from_utf8_lossy(&traversal.stderr));
-        let created = run_as_probe_user(
-            &probe_user,
-            &["sh", "-c", "umask 077 && printf secret > \"$1\"", "sh"],
-            &private,
-        );
+        let shared = mount_point.join("shared");
+        wait_for_mounted_entry(&ready_rx, &shared);
+        // Without allow_other macFUSE denies every foreign lookup.
+        let lookup = run_as_probe_user(&probe_user, &["ls", "-ld", "--"], &shared);
         assert!(
-            created.status.success(),
-            "foreign create must succeed; stderr: {}",
-            String::from_utf8_lossy(&created.stderr)
+            lookup.status.success(),
+            "foreign lookup must reach StudioFS; stderr: {}",
+            String::from_utf8_lossy(&lookup.stderr)
         );
-        let (probe_uid, probe_gid) = probe_user_ids(&probe_user);
-        assert_ne!(probe_uid, uid, "probe account must differ from the mounter");
-        assert_ne!(probe_uid, 0, "probe account must be non-root");
-        let metadata = std::fs::metadata(&private).expect("stat foreign-created file");
-        assert_eq!(
-            (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777),
-            (probe_uid, probe_gid, 0o600),
-            "foreign create must record the caller's uid/gid"
-        );
-        let own_read = run_as_probe_user(&probe_user, &["cat"], &private);
-        assert_eq!(own_read.stdout, b"secret", "creator must read its 0600 file");
-        assert_eq!(
-            std::fs::read(&private)
-                .expect_err("mounter must not read the foreign-created file")
-                .raw_os_error(),
-            Some(libc::EACCES)
-        );
+        assert_foreign_create_owned_by_caller(&probe_user, &shared.join("probe-private"), uid);
     });
     signal.request_unmount();
     let mount_result = worker.join();
     let directory_result = remove_mount_point(&mount_point);
     finish_access_test(result, mount_result, directory_result);
 }
+
+/// Second local account used to probe the macFUSE `allow_other` mount.
+#[cfg(target_os = "macos")]
+const MACFUSE_PROBE_USER_ENV: &str = "STUDIOFS_MACFUSE_PROBE_USER";
 
 /// Waits for the ready callback and a successful lookup through the mount.
 fn wait_for_mounted_entry(ready_rx: &std::sync::mpsc::Receiver<()>, entry: &std::path::Path) {
@@ -420,8 +411,6 @@ const ALLOW_OTHER_PROBE_USER_ENV: &str = "STUDIOFS_ALLOW_OTHER_PROBE_USER";
             passwordless `sudo -u $STUDIOFS_ALLOW_OTHER_PROBE_USER` (default nobody), \
             and mount-point ancestors searchable by that user"]
 fn mounted_allow_other_applies_mode_bits_to_foreign_users() {
-    use std::os::unix::fs::MetadataExt;
-
     let probe_user =
         std::env::var(ALLOW_OTHER_PROBE_USER_ENV).unwrap_or_else(|_| "nobody".to_owned());
     studiofs_linux_fuse::check_allow_other_permitted().expect("allow_other preflight");
@@ -440,14 +429,7 @@ fn mounted_allow_other_applies_mode_bits_to_foreign_users() {
         .expect("create shared directory");
     let mount_point = native_mount_point();
     std::fs::create_dir_all(&mount_point).expect("create mount point");
-    let parent = mount_point.parent().expect("mount point parent");
-    let traversal = run_as_probe_user(&probe_user, &["test", "-x"], parent);
-    assert!(
-        traversal.status.success(),
-        "{probe_user} must be able to search {} (sudo -n and directory modes); stderr: {}",
-        parent.display(),
-        String::from_utf8_lossy(&traversal.stderr)
-    );
+    assert_probe_user_can_search_parent(&probe_user, &mount_point);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let request = studiofs_linux_fuse::LinuxFuseMountRequest::new(
         fixture.vfs(),
@@ -465,20 +447,28 @@ fn mounted_allow_other_applies_mode_bits_to_foreign_users() {
         wait_for_mounted_entry(&ready_rx, &mount_point.join("owner-only"));
         // Without allow_other the kernel denies every foreign lookup, so a
         // successful stat of the 0600 file proves the mount admits the caller.
-        let stat = run_as_probe_user(&probe_user, &["stat", "--"], &mount_point.join("owner-only"));
+        let stat = run_as_probe_user(
+            &probe_user,
+            &["stat", "--"],
+            &mount_point.join("owner-only"),
+        );
         assert!(
             stat.status.success(),
             "foreign stat must reach StudioFS; stderr: {}",
             String::from_utf8_lossy(&stat.stderr)
         );
-        let readable =
-            run_as_probe_user(&probe_user, &["cat", "--"], &mount_point.join("world-readable"));
+        let readable = run_as_probe_user(
+            &probe_user,
+            &["cat", "--"],
+            &mount_point.join("world-readable"),
+        );
         assert!(
             readable.status.success(),
             "0644 must be readable by other users; stderr: {}",
             String::from_utf8_lossy(&readable.stderr)
         );
-        let denied = run_as_probe_user(&probe_user, &["cat", "--"], &mount_point.join("owner-only"));
+        let denied =
+            run_as_probe_user(&probe_user, &["cat", "--"], &mount_point.join("owner-only"));
         let stderr = String::from_utf8_lossy(&denied.stderr);
         assert!(!denied.status.success(), "0600 must deny other users");
         assert!(
@@ -487,36 +477,67 @@ fn mounted_allow_other_applies_mode_bits_to_foreign_users() {
         );
 
         // Files created by a foreign caller belong to that caller, not the mounter.
-        let private = mount_point.join("shared").join("probe-private");
-        let created = run_as_probe_user(
+        assert_foreign_create_owned_by_caller(
             &probe_user,
-            &["sh", "-c", "umask 077 && printf secret > \"$1\"", "sh"],
-            &private,
+            &mount_point.join("shared").join("probe-private"),
+            uid,
         );
-        assert!(
-            created.status.success(),
-            "foreign create in a 0777 directory must succeed; stderr: {}",
-            String::from_utf8_lossy(&created.stderr)
-        );
-        let (probe_uid, probe_gid) = probe_user_ids(&probe_user);
-        let metadata = std::fs::metadata(&private).expect("stat foreign-created file");
-        assert_eq!(
-            (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777),
-            (probe_uid, probe_gid, 0o600),
-            "foreign create must record the caller's uid/gid"
-        );
-        let own_read = run_as_probe_user(&probe_user, &["cat", "--"], &private);
-        assert_eq!(own_read.stdout, b"secret", "creator must read its 0600 file");
-        if uid != 0 {
-            let mounter_read = std::fs::read(&private).expect_err("mounter must not read");
-            assert_eq!(mounter_read.raw_os_error(), Some(libc::EACCES));
-        }
     });
     let unmount_result = fusermount3_unmount(&mount_point);
     // Always join before interpreting unmount errors, including failed startup.
     let mount_result = worker.join();
     let directory_result = remove_mount_point(&mount_point);
     finish_access_test(result, mount_result, unmount_result.and(directory_result));
+}
+
+/// Fails fast when `sudo -n` or directory modes keep the probe account from
+/// reaching the mount point, instead of reporting it as a mount failure.
+fn assert_probe_user_can_search_parent(probe_user: &str, mount_point: &std::path::Path) {
+    let parent = mount_point.parent().expect("mount point parent");
+    let traversal = run_as_probe_user(probe_user, &["test", "-x"], parent);
+    assert!(
+        traversal.status.success(),
+        "{probe_user} must be able to search {} (sudo -n and directory modes); stderr: {}",
+        parent.display(),
+        String::from_utf8_lossy(&traversal.stderr)
+    );
+}
+
+/// Creates a `0600` file as `probe_user` and checks that the caller, not the
+/// mounter, owns it and can read it.
+fn assert_foreign_create_owned_by_caller(
+    probe_user: &str,
+    private: &std::path::Path,
+    mounter_uid: u32,
+) {
+    use std::os::unix::fs::MetadataExt;
+
+    let created = run_as_probe_user(
+        probe_user,
+        &["sh", "-c", "umask 077 && printf secret > \"$1\"", "sh"],
+        private,
+    );
+    assert!(
+        created.status.success(),
+        "foreign create in a 0777 directory must succeed; stderr: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let (probe_uid, probe_gid) = probe_user_ids(probe_user);
+    let metadata = std::fs::metadata(private).expect("stat foreign-created file");
+    assert_eq!(
+        (metadata.uid(), metadata.gid(), metadata.mode() & 0o7777),
+        (probe_uid, probe_gid, 0o600),
+        "foreign create must record the caller's uid/gid"
+    );
+    let own_read = run_as_probe_user(probe_user, &["cat", "--"], private);
+    assert_eq!(
+        own_read.stdout, b"secret",
+        "creator must read its 0600 file"
+    );
+    if mounter_uid != 0 {
+        let mounter_read = std::fs::read(private).expect_err("mounter must not read");
+        assert_eq!(mounter_read.raw_os_error(), Some(libc::EACCES));
+    }
 }
 
 fn probe_user_ids(user: &str) -> (u32, u32) {
@@ -529,11 +550,7 @@ fn probe_user_ids(user: &str) -> (u32, u32) {
     unsafe { ((*entry).pw_uid, (*entry).pw_gid) }
 }
 
-fn run_as_probe_user(
-    user: &str,
-    command: &[&str],
-    path: &std::path::Path,
-) -> std::process::Output {
+fn run_as_probe_user(user: &str, command: &[&str], path: &std::path::Path) -> std::process::Output {
     std::process::Command::new("sudo")
         .args(["-n", "-u", user, "--"])
         .args(command)

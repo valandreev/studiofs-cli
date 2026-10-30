@@ -550,6 +550,7 @@ pub struct SessionConfig {
     volume_name: String,
     read_only: bool,
     run_in_foreground: bool,
+    allow_other: bool,
 }
 
 impl SessionConfig {
@@ -560,12 +561,21 @@ impl SessionConfig {
             volume_name: volume_name.into(),
             read_only: false,
             run_in_foreground: false,
+            allow_other: false,
         }
     }
 
     /// Set whether the filesystem is mounted read-only.
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    /// Requests `allow_other`; `default_permissions` still applies mode bits
+    /// to foreign callers. Check [`allow_other_permitted`] first, because the
+    /// macFUSE kext fails the whole mount when it rejects the option.
+    pub fn with_allow_other(mut self, allow_other: bool) -> Self {
+        self.allow_other = allow_other;
         self
     }
 
@@ -610,9 +620,11 @@ impl SessionConfig {
             format!("-oiosize={MACOS_FUSE_IOSIZE_BYTES}"),
             format!("-omax_read={MACOS_FUSE_IOSIZE_BYTES}"),
             "-odefault_permissions".to_owned(),
-            "-oallow_other".to_owned(),
             "-osparse".to_owned(),
         ];
+        if self.allow_other {
+            args.push("-oallow_other".to_owned());
+        }
         if self.read_only {
             args.push("-ordonly".to_owned());
         }
@@ -627,6 +639,89 @@ impl SessionConfig {
             )
         })
     }
+}
+
+/// Whether the macFUSE kext accepts `allow_other` from this process.
+///
+/// The kext rejects the option with `EPERM`, failing the whole mount, unless
+/// the mounter is root, belongs to the `admin_group` tunable, or the
+/// `allow_other` tunable is set. Supplementary groups come from `getgroups`,
+/// so a membership the kernel resolves only through Open Directory reads as
+/// absent and the mount stays private to the mounter.
+pub fn allow_other_permitted() -> bool {
+    // SAFETY: `geteuid` takes no pointers and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    AllowOtherTunables::read().permits(euid, &effective_groups())
+}
+
+/// macFUSE kext tunables that decide who may mount with `allow_other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AllowOtherTunables {
+    /// `vfs.generic.macfuse.tunables.allow_other`: every user may request it.
+    allow_other: bool,
+    /// `vfs.generic.macfuse.tunables.admin_group`: members may request it.
+    admin_group: libc::gid_t,
+}
+
+impl AllowOtherTunables {
+    /// Kext defaults, used before the kext is loaded by the first mount.
+    const DEFAULT: Self = Self {
+        allow_other: false,
+        admin_group: 80,
+    };
+
+    fn read() -> Self {
+        let allow_other = sysctl_int(c"vfs.generic.macfuse.tunables.allow_other");
+        let admin_group = sysctl_int(c"vfs.generic.macfuse.tunables.admin_group")
+            .and_then(|group| libc::gid_t::try_from(group).ok());
+        match (allow_other, admin_group) {
+            (Some(allow_other), Some(admin_group)) => Self {
+                allow_other: allow_other != 0,
+                admin_group,
+            },
+            _ => Self::DEFAULT,
+        }
+    }
+
+    /// Mirrors the kext mount check for `allow_other`.
+    fn permits(self, euid: libc::uid_t, groups: &[libc::gid_t]) -> bool {
+        euid == 0 || self.allow_other || groups.contains(&self.admin_group)
+    }
+}
+
+fn sysctl_int(name: &std::ffi::CStr) -> Option<c_int> {
+    let mut value: c_int = 0;
+    let mut len = mem::size_of::<c_int>();
+    // SAFETY: `name` is NUL-terminated, `value`/`len` describe a writable
+    // `c_int` buffer, and a null new-value pointer only reads the sysctl.
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0 && len == mem::size_of::<c_int>()).then_some(value)
+}
+
+/// Effective gid followed by the process supplementary groups.
+fn effective_groups() -> Vec<libc::gid_t> {
+    // SAFETY: `getegid` takes no pointers and cannot fail.
+    let mut groups = vec![unsafe { libc::getegid() }];
+    // SAFETY: A zero length only queries the supplementary group count.
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if let Ok(len) = usize::try_from(count)
+        && len > 0
+    {
+        let mut supplementary = vec![0; len];
+        // SAFETY: `supplementary` has room for `count` gid entries.
+        let read = unsafe { libc::getgroups(count, supplementary.as_mut_ptr()) };
+        supplementary.truncate(usize::try_from(read).unwrap_or(0));
+        groups.extend(supplementary);
+    }
+    groups
 }
 
 struct OwnedFuseArgs {
@@ -2117,6 +2212,47 @@ mod tests {
         assert!(result.is_ok(), "consumed request must not panic");
         assert_eq!(result.unwrap(), Err(DirectoryEntryError::AlreadyReplied));
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn allow_other_tunables_mirror_the_kext_mount_check() {
+        let defaults = AllowOtherTunables::DEFAULT;
+        assert!(defaults.permits(0, &[20]), "root may always request it");
+        assert!(defaults.permits(501, &[20, 80]), "admin group member");
+        assert!(!defaults.permits(501, &[20, 12]), "standard user");
+        assert!(!defaults.permits(501, &[]), "no groups");
+        let opened = AllowOtherTunables {
+            allow_other: true,
+            ..defaults
+        };
+        assert!(opened.permits(501, &[20]), "tunable admits every user");
+        let custom = AllowOtherTunables {
+            allow_other: false,
+            admin_group: 4242,
+        };
+        assert!(custom.permits(501, &[4242]));
+        assert!(!custom.permits(501, &[80]));
+    }
+
+    #[test]
+    fn effective_groups_start_with_the_effective_gid() {
+        // SAFETY: `getegid` takes no pointers and cannot fail.
+        let egid = unsafe { libc::getegid() };
+        assert_eq!(effective_groups().first(), Some(&egid));
+    }
+
+    #[test]
+    fn allow_other_is_requested_only_when_configured() {
+        let has_allow_other = |config: &SessionConfig| {
+            config
+                .mount_argv_strings()
+                .iter()
+                .any(|arg| arg == "-oallow_other")
+        };
+        let config = SessionConfig::new("target/macfuse-allow-other", "policy");
+        assert!(!has_allow_other(&config));
+        assert!(has_allow_other(&config.clone().with_allow_other(true)));
+        assert!(!has_allow_other(&config.with_allow_other(false)));
     }
 
     #[test]
