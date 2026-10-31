@@ -17067,6 +17067,39 @@ fn rename_over_existing_target_invalidates_displaced_inode_attr_cache() {
 }
 
 #[test]
+fn rmdir_invalidates_removed_directory_attr_cache() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "rmdir-removed-cache-invalidation");
+    let _guard = rt.enter();
+    let removed = vfs.mkdir(1, b"removed-dir", 0, 0, 0o755).unwrap();
+    // Populate the resolver attribute cache the way a FUSE getattr does.
+    let cached = vfs.getattr(removed.ino).expect("getattr before rmdir");
+    assert_eq!(cached.kind, FileType::Directory);
+    assert!(
+        vfs.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .contains(removed.ino),
+        "setup must prime removed directory attr cache"
+    );
+
+    vfs.rmdir(1, b"removed-dir").unwrap();
+
+    assert!(
+        matches!(meta.get_attr(removed.ino), Err(MetaError::InodeNotFound(_))),
+        "rmdir must delete the directory inode from local metadata"
+    );
+    assert!(
+        matches!(
+            vfs.getattr(removed.ino),
+            Err(VfsError::Meta(MetaError::InodeNotFound(ino))) if ino == removed.ino
+        ),
+        "rmdir must not serve the removed directory from a stale attr cache"
+    );
+}
+
+#[test]
 fn deleted_inode_cleanup_batches_pending_deletions_for_multiple_objects() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deleted-inode-batch-cleanup");
@@ -18239,6 +18272,73 @@ fn sfs930_rename_over_directory_with_deferred_setattr_reports_zero_links() {
         let displaced = vfs.getattr(target.ino).expect("queued attr still answers");
         assert_eq!(displaced.nlink, 0, "a displaced directory has no links");
         assert_eq!(displaced.mode & 0o777, 0o700);
+    });
+}
+
+#[test]
+fn rmdir_with_deferred_setattr_reports_zero_links() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-deferred-dir-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-deferred-dir");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let removed = vfs
+            .mkdir(ROOT_INO, b"removed", 0, 0, 0o755)
+            .expect("mkdir removed");
+        // Keep the chmod queued so the rmdir overtakes it.
+        vfs.state
+            .namespace
+            .deferred
+            .batch_linger_override_ms
+            .store(3_600_000, AtomicOrdering::Release);
+        vfs.setattr_attr_only_deferred_metadata(
+            removed.ino,
+            SetattrArgs {
+                mode: Some(0o700),
+                ..SetattrArgs::default()
+            },
+            rt.handle(),
+        )
+        .expect("defer chmod");
+        assert!(vfs.has_deferred_namespace_metadata(removed.ino));
+
+        vfs.rmdir(ROOT_INO, b"removed").expect("rmdir");
+
+        let attr = vfs.getattr(removed.ino).expect("queued attr still answers");
+        assert_eq!(attr.nlink, 0, "a removed directory has no links");
+        assert_eq!(attr.mode & 0o777, 0o700);
+    });
+}
+
+#[test]
+fn unlink_with_deferred_setattr_reports_zero_links() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("unlink-deferred-file-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "unlink-deferred-file");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let created = vfs
+            .create(ROOT_INO, b"unlinked", 0, 0, 0o644)
+            .expect("create file");
+        vfs.state
+            .namespace
+            .deferred
+            .batch_linger_override_ms
+            .store(3_600_000, AtomicOrdering::Release);
+        vfs.setattr_attr_only_deferred_metadata(
+            created.ino,
+            SetattrArgs {
+                mode: Some(0o600),
+                ..SetattrArgs::default()
+            },
+            rt.handle(),
+        )
+        .expect("defer chmod");
+        assert!(vfs.has_deferred_namespace_metadata(created.ino));
+
+        vfs.unlink(ROOT_INO, b"unlinked").expect("unlink");
+
+        let attr = vfs.getattr(created.ino).expect("queued attr still answers");
+        assert_eq!(attr.nlink, 0, "an unlinked file has no links");
+        assert_eq!(attr.mode & 0o777, 0o600);
     });
 }
 

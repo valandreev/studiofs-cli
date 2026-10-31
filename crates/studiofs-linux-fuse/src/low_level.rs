@@ -4563,13 +4563,15 @@ mod tests {
         let target = vfs.mkdir(1, b"dir2", 0, 0, 0o755).unwrap();
         vfs.mkdir(1, b"dir3", 0, 0, 0o755).unwrap();
         let unopened_target = vfs.mkdir(1, b"dir4", 0, 0, 0o755).unwrap();
-        let open = || {
-            let attr = state.getattr_attr(target.ino).unwrap();
+        let removed = vfs.mkdir(1, b"dir5", 0, 0, 0o755).unwrap();
+        let open = |ino| {
+            let attr = state.getattr_attr(ino).unwrap();
             state.open_dir(&attr).unwrap()
         };
-        let first = open();
+        let first = open(target.ino);
         // A second handle keeps the snapshot alive after the first release.
-        let second = open();
+        let second = open(target.ino);
+        let removed_handle = open(removed.ino);
         // fchmod on the handle: the setattr reply must refresh the snapshot.
         state
             .setattr(
@@ -4584,6 +4586,18 @@ mod tests {
 
         state.rename(1, b"dir1", 1, b"dir2").unwrap();
         state.rename(1, b"dir3", 1, b"dir4").unwrap();
+        state.rmdir(1, b"dir5").unwrap();
+
+        // rmdir must not leave a stale cached attr that bypasses the snapshot.
+        let rmdired = state
+            .getattr(removed.ino)
+            .expect("rmdir'd open directory stays observable");
+        assert_eq!(rmdired.st_ino, removed.ino);
+        assert_eq!(rmdired.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(rmdired.st_nlink, 0);
+        // SAFETY: this test exclusively owns the handles returned by open_dir.
+        drop(unsafe { Box::from_raw(removed_handle.as_ptr()) });
+        assert_eq!(state.getattr(removed.ino).err(), Some(libc::ENOENT));
 
         let displaced = state
             .getattr(target.ino)
