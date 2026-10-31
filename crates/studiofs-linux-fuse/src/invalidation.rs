@@ -120,12 +120,15 @@ impl FuseInodeLiveness {
         }
     }
 
-    /// Whether the kernel holds a committed lookup reference to `ino`.
-    pub(crate) fn has_lookup_ref(&self, ino: u64) -> bool {
-        lock_poison_tolerant(self.inner.state(ino))
-            .lookup_refs
-            .get(&ino)
-            .is_some_and(|refs| *refs != 0)
+    /// Whether the kernel holds, or may be receiving, a lookup reference to
+    /// `ino`: a committed reference or an entry reply still in flight.
+    pub(crate) fn may_hold_lookup_ref(&self, ino: u64) -> bool {
+        let state = lock_poison_tolerant(self.inner.state(ino));
+        state.lookup_refs.get(&ino).is_some_and(|refs| *refs != 0)
+            || state
+                .reservations
+                .iter()
+                .any(|reservation| reservation.ino == ino)
     }
 
     #[cfg(test)]
