@@ -3605,6 +3605,7 @@ impl StudioVfs {
 
     async fn delete_source_tree_and_invalidate_trash_target(
         &self,
+        namespace_mutations: &super::namespace::NamespaceMutationOps<'_>,
         parent: Ino,
         name: &[u8],
         new_parent: Ino,
@@ -3645,9 +3646,7 @@ impl StudioVfs {
                 stack.push((current_ino, entry.name, entry.ino, entry.kind, false));
             }
         }
-        self.invalidate_attr_read_cache([new_parent]);
-        self.bump_namespace_for_parents([new_parent]);
-        self.dentry_cache_insert_negative(new_parent, new_name);
+        namespace_mutations.record_absent_target(new_parent, new_name);
         info!(
             parent,
             name = %String::from_utf8_lossy(name),
@@ -3733,10 +3732,13 @@ impl StudioVfs {
             }
             self.unlink_ignored_subtree(parent, name);
             self.bump_acl_namespace_epoch();
-            namespace_mutations.record_ignored_rename(parent, name, new_parent, std::iter::empty());
-            if target_is_ignored_trash {
-                self.dentry_cache_insert_negative(new_parent, new_name);
-            }
+            namespace_mutations.record_ignored_rename(
+                parent,
+                name,
+                new_parent,
+                target_is_ignored_trash.then_some(new_name),
+                std::iter::empty(),
+            );
             debug!(
                 parent,
                 name = %name_display,
@@ -3763,6 +3765,7 @@ impl StudioVfs {
             if target_is_ignored_trash {
                 return self
                     .delete_source_tree_and_invalidate_trash_target(
+                        &namespace_mutations,
                         parent,
                         name,
                         new_parent,
@@ -3837,6 +3840,7 @@ impl StudioVfs {
             );
             return self
                 .delete_source_tree_and_invalidate_trash_target(
+                    &namespace_mutations,
                     parent,
                     name,
                     new_parent,

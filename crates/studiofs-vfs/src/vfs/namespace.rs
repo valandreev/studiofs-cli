@@ -1327,11 +1327,13 @@ impl<'a> NamespaceMutationOps<'a> {
     }
 
     /// Records a rename that is rejected for destination update but should invalidate source state.
+    /// `absent_target` also caches `new_name` under `new_parent` as missing.
     pub(super) fn record_ignored_rename(
         &self,
         parent: Ino,
         name: &[u8],
         new_parent: Ino,
+        absent_target: Option<&[u8]>,
         attr_invalidations: impl IntoIterator<Item = Ino>,
     ) {
         let mut invalidated = vec![parent];
@@ -1340,9 +1342,20 @@ impl<'a> NamespaceMutationOps<'a> {
         }
         invalidated.extend(attr_invalidations);
         self.vfs.invalidate_attr_read_cache(invalidated);
+        let mut entries = vec![(parent, name, DentryCacheValue::Negative)];
+        if let Some(new_name) = absent_target {
+            entries.push((new_parent, new_name, DentryCacheValue::Negative));
+        }
+        self.vfs
+            .record_dentry_changes(self.started_epoch, &[parent, new_parent], &entries);
+    }
+
+    /// Records that `name` is absent under `parent` after a destructive move.
+    pub(super) fn record_absent_target(&self, parent: Ino, name: &[u8]) {
+        self.vfs.invalidate_attr_read_cache([parent]);
         self.vfs.record_dentry_changes(
             self.started_epoch,
-            &[parent, new_parent],
+            &[parent],
             &[(parent, name, DentryCacheValue::Negative)],
         );
     }
@@ -1532,17 +1545,24 @@ impl StudioVfs {
     pub(super) fn bump_namespace_for_parents(&self, parents: impl IntoIterator<Item = Ino>) {
         self.bump_namespace_epoch();
         let mut generations = self.state.namespace.directory_generations.lock();
+        Self::bump_parent_generations(&mut generations, parents);
+    }
+
+    /// Increments each distinct parent's generation once.
+    fn bump_parent_generations(
+        generations: &mut std::collections::HashMap<Ino, u64>,
+        parents: impl IntoIterator<Item = Ino>,
+    ) {
         let mut seen = HashSet::new();
         for parent in parents {
             if !seen.insert(parent) {
                 continue;
             }
             let current = generations.get(&parent).copied().unwrap_or(0);
-            let next = current.saturating_add(1);
             if current == u64::MAX {
                 warn!(parent, "directory generation saturated at u64::MAX");
             }
-            generations.insert(parent, next);
+            generations.insert(parent, current.saturating_add(1));
         }
     }
 
@@ -1574,17 +1594,7 @@ impl StudioVfs {
         if !admitted {
             self.bump_namespace_epoch();
         }
-        let mut seen = HashSet::new();
-        for &parent in parents {
-            if !seen.insert(parent) {
-                continue;
-            }
-            let current = generations.get(&parent).copied().unwrap_or(0);
-            if current == u64::MAX {
-                warn!(parent, "directory generation saturated at u64::MAX");
-            }
-            generations.insert(parent, current.saturating_add(1));
-        }
+        Self::bump_parent_generations(&mut generations, parents.iter().copied());
         if !admitted {
             return;
         }
