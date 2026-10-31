@@ -495,18 +495,21 @@ impl PgMetaEngine {
                 serving_reconciled: false,
             });
         }
-        let local_event_ack_barrier = self
-            .local_event_progress
-            .lock()
-            .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?
-            .rejected
-            .first()
-            .map(|range| range.start);
+        let (local_event_ack_barrier, published_prefixes) = {
+            let progress = self.local_event_progress.lock().map_err(|_| {
+                MetaError::Storage("pg local event progress lock poisoned".to_string())
+            })?;
+            (
+                progress.rejected.first().map(|range| range.start),
+                progress.published_prefixes.clone(),
+            )
+        };
         let local_event_overlay_exclusions = self.local_event_overlay_exclusions()?;
         let txn = self.local.begin_write_txn()?;
         let result = RemoteApplyCoordinator::new(&self.local)
             .with_local_event_ack_barrier(local_event_ack_barrier)
             .with_local_event_overlay_exclusions(local_event_overlay_exclusions)
+            .with_published_prefixes(published_prefixes)
             .apply_decoded_batches_in_txn(&txn, batches, recent_flush, context, execution);
         let mut outcome = match result {
             Ok(outcome) => outcome,

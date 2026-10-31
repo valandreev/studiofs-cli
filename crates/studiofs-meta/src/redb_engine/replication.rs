@@ -1,5 +1,10 @@
 use super::*;
 
+pub(crate) struct PendingLocalNamespaceState {
+    pub(crate) bindings: HashMap<Vec<u8>, Option<DirEntryValue>>,
+    pub(crate) removed_inodes: HashSet<Ino>,
+}
+
 #[cfg(test)]
 thread_local! {
     static REPLICA_INVALIDATION_DERIVATIONS: std::cell::Cell<usize> =
@@ -2626,6 +2631,132 @@ impl RedbMetaEngine {
             descendant_scope.discard();
         }
         Ok(true)
+    }
+
+    /// Reduces pending namespace events to their final binding per dentry.
+    /// Inode removal events clear every indexed alias, including base names
+    /// whose original AddEntry is no longer inside the pending event range.
+    pub(crate) fn pending_local_namespace_bindings_in_txn(
+        txn: &redb::WriteTransaction,
+        events: &[crate::events::MetaEvent],
+    ) -> MetaResult<PendingLocalNamespaceState> {
+        use crate::events::MetaEvent;
+
+        let mut bindings = HashMap::new();
+        let mut removed_inodes = HashSet::new();
+        for event in events {
+            match event {
+                MetaEvent::SetAttr { attr } => {
+                    removed_inodes.remove(&attr.ino);
+                }
+                MetaEvent::AddEntry {
+                    parent,
+                    name,
+                    entry,
+                } => {
+                    bindings.insert(encode_dentry_key(*parent, name), Some(entry.clone()));
+                }
+                MetaEvent::RemoveEntry { parent, name } => {
+                    bindings.insert(encode_dentry_key(*parent, name), None);
+                }
+                MetaEvent::RenameEntry {
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    entry,
+                    displaced_remove_attr_ino,
+                    ..
+                } => {
+                    if let Some(ino) = displaced_remove_attr_ino {
+                        Self::remove_pending_bindings_for_inode_in_txn(txn, *ino, &mut bindings)?;
+                        removed_inodes.insert(*ino);
+                    }
+                    bindings.insert(encode_dentry_key(*parent, name), None);
+                    bindings.insert(
+                        encode_dentry_key(*new_parent, new_name),
+                        Some(entry.clone()),
+                    );
+                }
+                MetaEvent::RemoveAttr { ino } => {
+                    Self::remove_pending_bindings_for_inode_in_txn(txn, *ino, &mut bindings)?;
+                    removed_inodes.insert(*ino);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(PendingLocalNamespaceState {
+            bindings,
+            removed_inodes,
+        })
+    }
+
+    fn remove_pending_bindings_for_inode_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        bindings: &mut HashMap<Vec<u8>, Option<DirEntryValue>>,
+    ) -> MetaResult<()> {
+        for binding in bindings.values_mut() {
+            if binding.as_ref().is_some_and(|entry| entry.ino == ino) {
+                *binding = None;
+            }
+        }
+        let mut keys =
+            Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, ino)?;
+        keys.extend(Self::dentry_keys_for_inode_in_write_index(
+            txn,
+            BASE_DENTRIES_BY_INODE_TABLE,
+            ino,
+        )?);
+        for key in keys {
+            if bindings.contains_key(&key) {
+                continue;
+            }
+            // A base index row can be stale after a published rename displaced
+            // this inode; only clear names that still resolve to it.
+            let (parent, name) = decode_dentry_key(&key)?;
+            if Self::lookup_merged_exact_in_write_txn(txn, parent, name)?
+                .is_some_and(|entry| entry.ino == ino)
+            {
+                bindings.insert(key, None);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reapplies the final namespace bindings from the still-pending local
+    /// suffix after an earlier self prefix is mirrored into the base view.
+    /// Rows that already match are skipped; returns whether anything changed.
+    pub(crate) fn rebase_pending_local_namespace_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        state: &PendingLocalNamespaceState,
+    ) -> MetaResult<bool> {
+        let mut changed = false;
+        for (key, entry) in &state.bindings {
+            let (parent, name) = decode_dentry_key(key)?;
+            if Self::lookup_merged_exact_in_write_txn(txn, parent, name)?.as_ref() == entry.as_ref()
+            {
+                continue;
+            }
+            if let Some(entry) = entry {
+                Self::set_dentry_in_txn(txn, parent, name, entry)?;
+            } else {
+                Self::remove_dentry_overlay_in_txn(txn, parent, name)?;
+            }
+            changed = true;
+        }
+        for &ino in &state.removed_inodes {
+            match Self::get_attr_merged_in_write_txn(txn, ino) {
+                Ok(_) => {
+                    Self::remove_inode_overlay_in_txn(txn, ino)?;
+                    changed = true;
+                }
+                Err(MetaError::InodeNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(changed)
     }
 
     /// Journals, after the write, the name and inode intents
