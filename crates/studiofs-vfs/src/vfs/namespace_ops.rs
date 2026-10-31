@@ -226,8 +226,21 @@ impl StudioVfs {
     /// Apply a committed link count to local attributes that answer getattr
     /// before metadata: dirty writer state and a lingering attr-only setattr.
     fn record_committed_nlink(&self, ino: Ino, nlink: u32) {
+        self.update_local_getattr_sources(ino, |attr| attr.nlink = nlink);
+    }
+
+    /// Apply a committed hard link's count and ctime to the same local
+    /// attributes as [`Self::record_committed_nlink`].
+    fn record_committed_link(&self, ino: Ino, committed: &InodeAttr) {
+        self.update_local_getattr_sources(ino, |attr| {
+            attr.nlink = committed.nlink;
+            attr.ctime = committed.ctime;
+        });
+    }
+
+    fn update_local_getattr_sources(&self, ino: Ino, update: impl Fn(&mut InodeAttr)) {
         if let Some(dirty_attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
-            dirty_attr.nlink = nlink;
+            update(dirty_attr);
         }
         if let Some(deferred_attr) = self
             .state
@@ -238,7 +251,7 @@ impl StudioVfs {
             .attrs
             .get_mut(&ino)
         {
-            deferred_attr.nlink = nlink;
+            update(deferred_attr);
         }
     }
 
@@ -2920,10 +2933,7 @@ impl StudioVfs {
             self.bump_acl_namespace_epoch();
             visible_attr.nlink = attr.nlink;
             visible_attr.ctime = attr.ctime;
-            if let Some(dirty_attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
-                dirty_attr.nlink = attr.nlink;
-                dirty_attr.ctime = attr.ctime;
-            }
+            self.record_committed_link(ino, &attr);
             self.invalidate_attr_read_cache([ino]);
             self.state.namespace.attr_read_cache.lock().put(
                 ino,
