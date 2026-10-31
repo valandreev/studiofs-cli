@@ -8494,6 +8494,412 @@ fn unit_remote_projection_converges_nested_rename_overwrite_to_source_inode() {
     );
 }
 
+#[test]
+fn self_ack_of_local_create_keeps_later_unlink_visible_as_absent() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let file = pg
+        .create_file(ROOT_INO, b"copy-chain.0", 0, 0, 0o644)
+        .expect("create local copy");
+    let mut attr = pg.get_attr(file.ino).expect("load local copy attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make local copy publishable");
+    let create_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("create end");
+    let create_events = pg
+        .local
+        .read_events_range(start, create_end)
+        .expect("read local create events");
+    let self_create = RemoteApplyCoordinator::project_local_batch(&create_events).events;
+    assert!(!self_create.is_empty(), "create prefix must be publishable");
+
+    pg.unlink(ROOT_INO, b"copy-chain.0")
+        .expect("unlink local copy");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("unlink end");
+    assert!(pg.local.lookup(ROOT_INO, b"copy-chain.0").is_err());
+    let overlay = pg.local_overlay_conflicts().expect("local suffix overlay");
+    assert!(
+        overlay
+            .dentry_keys
+            .contains(&encode_dentry_key(ROOT_INO, b"copy-chain.0"))
+    );
+
+    apply_self_replay(&pg, self_create, start, end, overlay);
+
+    pg.persist_flushed_event_seq(end)
+        .expect("ack the later local unlink after base replay");
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"copy-chain.0"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "acknowledging the earlier create and later unlink must leave the name absent"
+    );
+}
+
+#[test]
+fn self_apply_with_mismatched_local_prefix_keeps_later_unlink_absent() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let file = pg
+        .create_file(ROOT_INO, b"copy-chain.mismatch", 0, 0, 0o644)
+        .expect("create local copy");
+    let mut attr = pg.get_attr(file.ino).expect("load local copy attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make local copy publishable");
+    let create_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("create end");
+    let create_events = pg
+        .local
+        .read_events_range(start, create_end)
+        .expect("read local create events");
+    let mut self_create = RemoteApplyCoordinator::project_local_batch(&create_events).events;
+    assert!(!self_create.is_empty(), "create prefix must be publishable");
+    let replayed_attr = self_create
+        .iter_mut()
+        .find_map(|event| match event {
+            MetaEvent::SetAttr { attr } if attr.ino == file.ino => Some(attr),
+            _ => None,
+        })
+        .expect("self batch has a file attribute");
+    replayed_attr.mtime = replayed_attr.mtime.saturating_add(1);
+
+    pg.unlink(ROOT_INO, b"copy-chain.mismatch")
+        .expect("unlink local copy");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("unlink end");
+    assert_eq!(
+        RemoteApplyCoordinator::new(&pg.local)
+            .acknowledge_local_prefix_from_self_batch(&self_create, start, end)
+            .expect("check mismatched self prefix"),
+        None,
+        "different projected attrs must not advance the local event cursor"
+    );
+
+    RemoteApplyCoordinator::new(&pg.local)
+        .apply_decoded_batches(
+            vec![DecodedReplayBatch {
+                batch_version: 1,
+                events: self_create,
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq: start,
+                next_event_seq: end,
+                initial_overlay: pg.local_overlay_conflicts().expect("pending overlay"),
+            },
+        )
+        .expect("apply mismatched self batch");
+
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"copy-chain.mismatch"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "the unacknowledged local journal must mask the self-applied base dentry"
+    );
+}
+
+#[test]
+fn self_ack_of_local_create_preserves_later_rename_source_and_destination() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let file = pg
+        .create_file(ROOT_INO, b"copy-chain.from", 0, 0, 0o644)
+        .expect("create local copy");
+    let mut attr = pg.get_attr(file.ino).expect("load local copy attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make local copy publishable");
+    let create_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("create end");
+    let create_events = pg
+        .local
+        .read_events_range(start, create_end)
+        .expect("read local create events");
+    let self_create = RemoteApplyCoordinator::project_local_batch(&create_events).events;
+    assert!(!self_create.is_empty(), "create prefix must be publishable");
+
+    pg.rename_atomic(
+        ROOT_INO,
+        b"copy-chain.from",
+        ROOT_INO,
+        b"copy-chain.last",
+        true,
+        false,
+    )
+    .expect("rename local copy");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("rename end");
+    assert!(pg.local.lookup(ROOT_INO, b"copy-chain.from").is_err());
+    assert!(pg.local.lookup(ROOT_INO, b"copy-chain.last").is_ok());
+    let overlay = pg.local_overlay_conflicts().expect("local suffix overlay");
+
+    apply_self_replay(&pg, self_create, start, end, overlay);
+
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"copy-chain.from"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "acknowledging the earlier create must not restore the later rename source"
+    );
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, b"copy-chain.last")
+            .expect("renamed destination remains visible")
+            .ino,
+        file.ino
+    );
+}
+
+#[test]
+fn self_replay_uses_local_namespace_events_committed_after_context_capture() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let file = pg
+        .create_file(ROOT_INO, b"copy-chain.context", 0, 0, 0o644)
+        .expect("create local copy");
+    let mut attr = pg.get_attr(file.ino).expect("load local copy attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make local copy publishable");
+    let captured_next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).expect("create end");
+    let create_events = pg
+        .local
+        .read_events_range(start, captured_next_event_seq)
+        .expect("read local create events");
+    let self_create = RemoteApplyCoordinator::project_local_batch(&create_events).events;
+    assert!(!self_create.is_empty(), "create prefix must be publishable");
+    let captured_overlay = pg.local_overlay_conflicts().expect("capture overlay");
+
+    pg.rename_atomic(
+        ROOT_INO,
+        b"copy-chain.context",
+        ROOT_INO,
+        b"copy-chain.renamed",
+        true,
+        false,
+    )
+    .expect("rename after replay context capture");
+    assert!(
+        pg.local.get_counter(NEXT_EVENT_SEQ).expect("rename end") > captured_next_event_seq,
+        "rename must be outside the captured event range"
+    );
+
+    apply_self_replay(
+        &pg,
+        self_create,
+        start,
+        captured_next_event_seq,
+        captured_overlay,
+    );
+
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"copy-chain.context"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "replay must not restore the pre-rename source from a stale context"
+    );
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, b"copy-chain.renamed")
+            .expect("renamed destination remains visible")
+            .ino,
+        file.ino
+    );
+}
+
+#[test]
+fn local_completion_does_not_advance_past_unapplied_published_prefix() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+    for name in [
+        b"completed-prefix-a".as_slice(),
+        b"completed-prefix-b".as_slice(),
+        b"completed-prefix-c".as_slice(),
+    ] {
+        pg.create_dir(ROOT_INO, name, 0, 0, 0o755)
+            .expect("create directory event range");
+    }
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+    let completed_range = LocalEventRange { start, end };
+    let published_range = LocalEventRange {
+        start: start + 2,
+        end: end - 2,
+    };
+    pg.mark_local_event_ranges_published_with_prefix(
+        &[published_range],
+        Some((1, vec![published_range])),
+    )
+    .expect("record published but unapplied prefix");
+    // Completion spans local-only events around a published interior range.
+    pg.complete_local_event_ranges(&[completed_range])
+        .expect("complete local-only work");
+
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        published_range.start,
+        "cursor may advance through the local-only prefix, then must stop at the publication"
+    );
+    assert_eq!(
+        pg.flushed_event_seq_after_completed_ranges_locked(
+            pg.flushed_event_seq.load(Ordering::SeqCst),
+            0,
+        )
+        .expect("cursor before published batch applies"),
+        published_range.start,
+        "the unapplied published interval must remain a barrier"
+    );
+    assert_eq!(
+        pg.flushed_event_seq_after_completed_ranges_locked(
+            pg.flushed_event_seq.load(Ordering::SeqCst),
+            1,
+        )
+        .expect("cursor after published batch applies"),
+        end,
+        "the interior interval may advance once its PG version applies"
+    );
+}
+
+#[test]
+fn local_only_unlink_does_not_ack_unapplied_published_prefix() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+    let file = pg
+        .create_file(ROOT_INO, b"published-then-canceled", 0, 0, 0o644)
+        .expect("create local file");
+    let mut attr = pg.get_attr(file.ino).expect("load file attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make file publishable");
+    let published_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("published end");
+    let published_range = LocalEventRange {
+        start,
+        end: published_end,
+    };
+    pg.mark_local_event_ranges_published_with_prefix(
+        &[published_range],
+        Some((1, vec![published_range])),
+    )
+    .expect("record published but unapplied prefix");
+
+    // This models a canceled pending window after publication, before its self page applies.
+    {
+        let mut state = pg.pending_state.lock().expect("pending state");
+        state.ops = 0;
+        state.event_start = Some(start);
+        state.event_end = published_end;
+    }
+    attr.size = 0;
+    attr.committed_size = 0;
+    attr.content_epoch = 0;
+    attr.committed_content_epoch = 0;
+    attr.upload_state = UploadState::Ready;
+    pg.local
+        .set_attr(&attr)
+        .expect("stage empty draft before local-only unlink");
+    pg.unlink(ROOT_INO, b"published-then-canceled")
+        .expect("unlink unpublished empty draft");
+
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        start,
+        "local-only unlink must not ack an earlier published prefix before self replay"
+    );
+}
+
+#[test]
+fn self_ack_of_local_create_preserves_later_recreated_name() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let original = pg
+        .create_file(ROOT_INO, b"copy-chain.recreated", 0, 0, 0o644)
+        .expect("create original local copy");
+    let mut original_attr = pg.get_attr(original.ino).expect("load original attrs");
+    original_attr.size = 1;
+    original_attr.committed_size = 1;
+    original_attr.content_epoch = 1;
+    original_attr.committed_content_epoch = 1;
+    original_attr.upload_state = UploadState::Ready;
+    pg.set_attr(&original_attr)
+        .expect("make original publishable");
+    let create_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("create end");
+    let create_events = pg
+        .local
+        .read_events_range(start, create_end)
+        .expect("read original create events");
+    let self_create = RemoteApplyCoordinator::project_local_batch(&create_events).events;
+    assert!(!self_create.is_empty(), "create prefix must be publishable");
+
+    pg.unlink(ROOT_INO, b"copy-chain.recreated")
+        .expect("unlink original local copy");
+    let replacement = pg
+        .create_file(ROOT_INO, b"copy-chain.recreated", 0, 0, 0o644)
+        .expect("recreate local copy");
+    let mut replacement_attr = pg
+        .get_attr(replacement.ino)
+        .expect("load replacement attrs");
+    replacement_attr.size = 1;
+    replacement_attr.committed_size = 1;
+    replacement_attr.content_epoch = 1;
+    replacement_attr.committed_content_epoch = 1;
+    replacement_attr.upload_state = UploadState::Ready;
+    pg.set_attr(&replacement_attr)
+        .expect("make replacement publishable");
+    let end = pg
+        .local
+        .get_counter(NEXT_EVENT_SEQ)
+        .expect("replacement end");
+    let overlay = pg.local_overlay_conflicts().expect("local suffix overlay");
+
+    apply_self_replay(&pg, self_create, start, end, overlay);
+
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, b"copy-chain.recreated")
+            .expect("recreated name remains visible")
+            .ino,
+        replacement.ino,
+        "the suffix's final create must win over the acknowledged earlier create"
+    );
+}
+
 fn apply_self_replay(
     pg: &PgMetaEngine,
     events: Vec<MetaEvent>,

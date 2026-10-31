@@ -35,6 +35,71 @@ fn trim_local_event_ranges_before(ranges: &mut Vec<LocalEventRange>, cursor: u64
     }
 }
 
+/// Remove applied intervals from a sorted range set.
+fn subtract_local_event_ranges(
+    ranges: &[LocalEventRange],
+    applied: &[LocalEventRange],
+) -> Vec<LocalEventRange> {
+    let mut remaining = Vec::new();
+    for range in ranges {
+        let mut cursor = range.start;
+        for applied_range in applied {
+            if applied_range.end <= cursor {
+                continue;
+            }
+            if applied_range.start >= range.end {
+                break;
+            }
+            if applied_range.start > cursor {
+                remaining.push(LocalEventRange {
+                    start: cursor,
+                    end: applied_range.start.min(range.end),
+                });
+            }
+            cursor = cursor.max(applied_range.end);
+            if cursor >= range.end {
+                break;
+            }
+        }
+        if cursor < range.end {
+            remaining.push(LocalEventRange {
+                start: cursor,
+                end: range.end,
+            });
+        }
+    }
+    remaining
+}
+
+fn flushed_event_seq_for_progress(
+    cursor: u64,
+    applied_version: i64,
+    progress: &super::LocalEventProgress,
+) -> u64 {
+    let mut completed = progress.completed.clone();
+    let mut applied_published = Vec::new();
+    for (version, ranges) in &progress.published_prefixes {
+        if *version <= applied_version {
+            completed.extend_from_slice(ranges);
+            applied_published.extend_from_slice(ranges);
+        }
+    }
+    merge_local_event_ranges(&mut completed);
+    merge_local_event_ranges(&mut applied_published);
+
+    // A completed range cannot jump over a publication that has not yet been
+    // replayed locally. Prefixes whose PG version is applied are no longer a
+    // barrier; publications without a mapped prefix remain protected until an
+    // exact self-batch acknowledgement advances the cursor.
+    let mut barriers = progress.rejected.clone();
+    barriers.extend(subtract_local_event_ranges(
+        &progress.published,
+        &applied_published,
+    ));
+    merge_local_event_ranges(&mut barriers);
+    flushed_event_seq_after_completed_ranges(cursor, &completed, &barriers)
+}
+
 impl PgMetaEngine {
     /// Acquire the local replay position and pending mutation state together.
     ///
@@ -284,8 +349,13 @@ impl PgMetaEngine {
         }
         merge_local_event_ranges(&mut completed_ranges);
 
-        let next =
-            flushed_event_seq_after_completed_ranges(cursor, &completed_ranges, &progress.rejected);
+        let mut next_progress = progress.clone();
+        next_progress.completed = completed_ranges.clone();
+        let next = flushed_event_seq_for_progress(
+            cursor,
+            self.local_version.load(Ordering::SeqCst),
+            &next_progress,
+        );
         if next > cursor {
             self.persist_flushed_event_seq_locked(next)?;
             trim_local_event_ranges_before(&mut completed_ranges, next);
@@ -308,17 +378,10 @@ impl PgMetaEngine {
             .local_event_progress
             .lock()
             .map_err(|_| MetaError::Storage("pg local event progress lock poisoned".to_string()))?;
-        let mut completed = progress.completed.clone();
-        for (version, ranges) in &progress.published_prefixes {
-            if *version <= applied_version {
-                completed.extend_from_slice(ranges);
-            }
-        }
-        merge_local_event_ranges(&mut completed);
-        Ok(flushed_event_seq_after_completed_ranges(
+        Ok(flushed_event_seq_for_progress(
             cursor,
-            &completed,
-            &progress.rejected,
+            applied_version,
+            &progress,
         ))
     }
 

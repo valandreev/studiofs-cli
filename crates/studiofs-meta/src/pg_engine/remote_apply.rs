@@ -2394,8 +2394,24 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 serving_reconciled: false,
             });
         }
-
-        let mut overlay = std::mem::take(&mut context.initial_overlay);
+        // The caller sampled these bounds before acquiring this write transaction.
+        // A foreground namespace write can commit in between, so extend replay
+        // protection from that captured boundary using this transaction's view.
+        context.flushed_event_seq = context
+            .flushed_event_seq
+            .max(txn.get_counter(crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ)?);
+        let replay_next_event_seq = context
+            .next_event_seq
+            .max(txn.get_counter(crate::schema::counters::NEXT_EVENT_SEQ)?);
+        let appended_overlay = Self::overlay_conflicts_for_local_range_in_txn(
+            txn,
+            context.next_event_seq,
+            replay_next_event_seq,
+            &self.local_event_overlay_exclusions,
+            execution,
+        )?;
+        let mut overlay =
+            Self::merge_overlay_conflicts(&context.initial_overlay, &appended_overlay);
         let mut applied_any = false;
         let mut max_version = context.last_seq;
         let mut max_namespace_version = context.current_namespace_version;
@@ -2403,6 +2419,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let mut reconcile_dentry_keys = HashSet::new();
         let mut replay_protected_overlay = OverlayConflictSets::default();
         let mut acknowledged_flushed_event_seq = None;
+        let mut applied_self_batch = false;
         let mut overlay_is_dirty = false;
         let empty_protected_base_inodes = HashSet::new();
         // Inodes this client's own batches removed. Serving cleanup of their
@@ -2436,6 +2453,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             }
             if batch.is_self_batch {
                 applied_any |= self.apply_visible_self_batch_in_txn(txn, &events)?;
+                applied_self_batch = true;
                 let acknowledged_seq = self.acknowledge_local_prefix_from_self_batch_in_txn(
                     txn,
                     &batch.events,
@@ -2480,7 +2498,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 overlay = Self::overlay_conflicts_for_local_range_in_txn(
                     txn,
                     context.flushed_event_seq,
-                    context.next_event_seq,
+                    replay_next_event_seq,
                     &self.local_event_overlay_exclusions,
                     execution,
                 )?;
@@ -2508,6 +2526,21 @@ impl<'a> RemoteApplyCoordinator<'a> {
             &reconcile_dentry_keys,
             &final_overlay,
         )?;
+        if applied_self_batch {
+            let pending_namespace_events =
+                RedbMetaEngine::read_events_range_in_write_txn_with_check(
+                    txn,
+                    context.flushed_event_seq,
+                    replay_next_event_seq,
+                    || execution.map_or(Ok(()), RemoteReplayExecution::check),
+                )?;
+            // A self batch reaches base before its local prefix is necessarily
+            // acknowledged, so restore the journal's final namespace state.
+            applied_any |= RedbMetaEngine::rebase_pending_local_namespace_in_txn(
+                txn,
+                &pending_namespace_events,
+            )?;
+        }
         if let Some(execution) = execution {
             execution.check()?;
         }

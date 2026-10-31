@@ -745,6 +745,18 @@ impl Drop for InvalidationScope<'_, '_> {
 }
 
 impl RedbWriteTransaction<'_> {
+    /// Read a metadata counter from the write transaction's consistent view.
+    pub(crate) fn get_counter(&self, name: &str) -> MetaResult<u64> {
+        let counters = self
+            .txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok(counters
+            .get(name)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map_or(0, |value| value.value()))
+    }
+
     pub(crate) fn invalidate(&self, intent: InvalidationIntent) {
         if self.invalidations_suppressed.get() {
             return;
