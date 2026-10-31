@@ -945,11 +945,10 @@ impl PgMetaEngine {
             if target_reached {
                 self.local.reconcile_pending_regular_file_recoveries()?;
             }
+            // Startup judged the rows against a checkpoint that can predate their
+            // published parents; re-judge them against the caught-up head.
             if target_reached
-                && self
-                    .local
-                    .pending_uploaded_regular_file_recoveries()?
-                    .is_empty()
+                && self.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()?
             {
                 // Replay can retire the rows that made startup repair read-only.
                 self.local

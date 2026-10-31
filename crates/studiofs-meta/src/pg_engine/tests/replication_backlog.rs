@@ -4116,3 +4116,94 @@ fn poisoned_hidden_window_cache_falls_back_without_failing_the_mutation() {
         "the fallback must clear the poison"
     );
 }
+
+/// SFS-929: startup repair judges recovery rows against a bootstrap checkpoint
+/// that can predate the published parent directory. Catch-up must re-judge the
+/// row at head instead of leaving the volume degraded on every remount.
+#[test]
+fn redb_repair_restores_unpublished_uploaded_file_after_catchup_publishes_parent() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let parent = pg
+        .create_dir(ROOT_INO, b"published-parent", 0, 0, 0o755)
+        .expect("create parent");
+    let name = b"unpublished-child.bin";
+    let file = pg
+        .create_file(parent.ino, name, 0, 0, 0o644)
+        .expect("create pending child");
+    let payload = PayloadRef::new_partial(77_929, 152);
+    pg.stage_payload_slice(file.ino, 0, &payload)
+        .expect("stage pending payload");
+    set_file_state(&pg, file.ino, 152, 1);
+    let accepted = pg.get_attr(file.ino).expect("pending attr");
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(
+            file.ino,
+            accepted.content_epoch,
+            payload.object_id,
+        )
+        .expect("mark payload uploaded")
+    );
+
+    let mut checkpoint = pg.local.export_snapshot().expect("export checkpoint");
+    checkpoint.event_log.clear();
+    checkpoint
+        .inodes
+        .retain(|(ino, _)| *ino != file.ino && *ino != parent.ino);
+    checkpoint.dentries.retain(|(key, _)| {
+        key != &encode_dentry_key(ROOT_INO, b"published-parent")
+            && key != &encode_dentry_key(parent.ino, name)
+    });
+    checkpoint
+        .regular_file_overlay
+        .retain(|(ino, _)| *ino != file.ino);
+    pg.local
+        .import_remote_snapshot(&checkpoint)
+        .expect("import checkpoint that predates the parent");
+    assert!(
+        !pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("startup repair against stale checkpoint"),
+        "the parent is not visible yet, so startup cannot restore the child"
+    );
+    pg.local
+        .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)
+        .expect("keep repair marker");
+    pg.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
+
+    pg.local
+        .apply_replica_serving_state(&[
+            MetaEvent::SetAttr {
+                attr: parent.clone(),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"published-parent".to_vec(),
+                entry: crate::types::DirEntryValue {
+                    ino: parent.ino,
+                    kind: parent.kind,
+                },
+            },
+        ])
+        .expect("catch-up applies the published parent");
+    pg.metadata_startup_target_version
+        .store(0, Ordering::Release);
+    pg.try_complete_catchup_sync().expect("complete catch-up");
+
+    assert_eq!(
+        pg.local
+            .lookup(parent.ino, name)
+            .expect("child restored under caught-up parent")
+            .ino,
+        file.ino
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, accepted.size).expect("restored payload"),
+        vec![payload.object_id]
+    );
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+            .expect("repair marker"),
+        0
+    );
+    assert_ne!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+}
