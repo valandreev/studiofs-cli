@@ -18,6 +18,7 @@ mod cache_policy;
 mod directory_cache;
 mod invalidation;
 mod low_level;
+mod open_directories;
 
 /// Linux libfuse3 queue bounds and callback worker policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
