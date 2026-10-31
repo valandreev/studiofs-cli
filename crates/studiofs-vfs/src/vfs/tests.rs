@@ -18383,6 +18383,46 @@ fn link_with_deferred_setattr_reports_committed_links() {
     });
 }
 
+#[test]
+fn unlink_one_of_two_links_with_deferred_setattr_reports_committed_ctime() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("unlink-deferred-link-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "unlink-deferred-link");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let created = meta
+            .create_file(ROOT_INO, b"first", 0, 0, 0o644)
+            .expect("create clean inode");
+        meta.link(created.ino, ROOT_INO, b"second")
+            .expect("link second name");
+        vfs.state
+            .namespace
+            .deferred
+            .batch_linger_override_ms
+            .store(3_600_000, AtomicOrdering::Release);
+        vfs.setattr_attr_only_deferred_metadata(
+            created.ino,
+            SetattrArgs {
+                mode: Some(0o600),
+                ..SetattrArgs::default()
+            },
+            rt.handle(),
+        )
+        .expect("defer chmod");
+        assert!(vfs.has_deferred_namespace_metadata(created.ino));
+
+        vfs.unlink(ROOT_INO, b"first").expect("unlink first name");
+
+        let committed = meta.get_attr(created.ino).expect("committed attr");
+        let attr = vfs.getattr(created.ino).expect("queued attr still answers");
+        assert_eq!(attr.nlink, 1);
+        assert_eq!(
+            attr.ctime, committed.ctime,
+            "unlink changes the inode ctime"
+        );
+        assert_eq!(attr.mode & 0o777, 0o600);
+    });
+}
+
 /// Create a file, commit its deferred create, queue an attr-only setattr, and
 /// unlink the file before the setattr batch commits (SFS-910).
 fn assert_unlink_after_deferred_setattr_keeps_mount_writable(

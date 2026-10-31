@@ -223,24 +223,18 @@ impl StudioVfs {
         self.deferred_namespace_attr(ino)
     }
 
-    /// Apply a committed link count to local attributes that answer getattr
-    /// before metadata: dirty writer state and a lingering attr-only setattr.
-    fn record_committed_nlink(&self, ino: Ino, nlink: u32) {
-        self.update_local_getattr_sources(ino, |attr| attr.nlink = nlink);
-    }
-
-    /// Apply a committed hard link's count and ctime to the same local
-    /// attributes as [`Self::record_committed_nlink`].
-    fn record_committed_link(&self, ino: Ino, committed: &InodeAttr) {
-        self.update_local_getattr_sources(ino, |attr| {
-            attr.nlink = committed.nlink;
-            attr.ctime = committed.ctime;
-        });
-    }
-
-    fn update_local_getattr_sources(&self, ino: Ino, update: impl Fn(&mut InodeAttr)) {
+    /// Apply a committed link count change to local attributes that answer
+    /// getattr before metadata: dirty writer state and a lingering attr-only
+    /// setattr. `ctime` is the committed inode ctime when the inode survives.
+    fn record_committed_link_change(&self, ino: Ino, nlink: u32, ctime: Option<i64>) {
+        let apply = |attr: &mut InodeAttr| {
+            attr.nlink = nlink;
+            if let Some(ctime) = ctime {
+                attr.ctime = ctime;
+            }
+        };
         if let Some(dirty_attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
-            update(dirty_attr);
+            apply(dirty_attr);
         }
         if let Some(deferred_attr) = self
             .state
@@ -251,7 +245,7 @@ impl StudioVfs {
             .attrs
             .get_mut(&ino)
         {
-            update(deferred_attr);
+            apply(deferred_attr);
         }
     }
 
@@ -2933,7 +2927,7 @@ impl StudioVfs {
             self.bump_acl_namespace_epoch();
             visible_attr.nlink = attr.nlink;
             visible_attr.ctime = attr.ctime;
-            self.record_committed_link(ino, &attr);
+            self.record_committed_link_change(ino, attr.nlink, Some(attr.ctime));
             self.invalidate_attr_read_cache([ino]);
             self.state.namespace.attr_read_cache.lock().put(
                 ino,
@@ -3356,7 +3350,11 @@ impl StudioVfs {
             };
 
             namespace_mutations.record_removal(parent, name, [unlinked_attr.ino]);
-            self.record_committed_nlink(unlinked_attr.ino, unlinked_attr.nlink);
+            self.record_committed_link_change(
+                unlinked_attr.ino,
+                unlinked_attr.nlink,
+                Some(unlinked_attr.ctime),
+            );
             self.invalidate_attr_read_cache([unlinked_attr.ino]);
             if unlinked_attr.nlink > 0 {
                 self.state.namespace.attr_read_cache.lock().put(
@@ -3504,7 +3502,7 @@ impl StudioVfs {
         // as rename does for a displaced inode; the metadata inode is gone.
         namespace_mutations.record_removal(parent, name, removed);
         if let Some(removed_ino) = removed {
-            self.record_committed_nlink(removed_ino, 0);
+            self.record_committed_link_change(removed_ino, 0, None);
             self.bump_directory_generation(removed_ino);
         }
         // Directory removals follow the same local-first group-commit path as
@@ -3852,7 +3850,7 @@ impl StudioVfs {
 
         if let Some(attr) = &rename_result.displaced {
             let ino = attr.ino;
-            self.record_committed_nlink(ino, attr.nlink);
+            self.record_committed_link_change(ino, attr.nlink, Some(attr.ctime));
             self.invalidate_attr_read_cache([ino]);
             if attr.nlink == 0 {
                 self.retire_os_cache_inode(ino);
