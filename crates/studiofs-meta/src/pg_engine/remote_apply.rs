@@ -83,7 +83,7 @@ impl HiddenWindowProjection {
                 .or_else(|| self.states.get(ino))
                 .is_some_and(RegularFileProjectionState::hidden)
         };
-        let suffix_hidden = suffix.iter().all(|event| {
+        let suffix_hidden = suffix.iter().enumerate().all(|(index, event)| {
             !RemoteApplyCoordinator::remote_event_is_projectable(event)
                 || match event {
                     MetaEvent::SetAttr { attr } => {
@@ -91,6 +91,10 @@ impl HiddenWindowProjection {
                     }
                     MetaEvent::AddEntry { entry, .. } => {
                         entry.kind == FileType::RegularFile && hidden_after(&entry.ino)
+                    }
+                    MetaEvent::RenameEntry { .. } => {
+                        RemoteApplyCoordinator::hidden_draft_rename_ino(suffix, index)
+                            .is_some_and(|ino| hidden_after(&ino))
                     }
                     // A deletion can leave nothing to replay, so the window
                     // may be acknowledged; only a full projection decides that.
@@ -180,8 +184,12 @@ impl VisibleWindowProjection {
         };
         let hidden: HashSet<Ino> = suffix
             .iter()
-            .filter_map(|event| match event {
+            .enumerate()
+            .filter_map(|(index, event)| match event {
                 MetaEvent::AddEntry { entry, .. } => Some(entry.ino),
+                MetaEvent::RenameEntry { .. } => {
+                    RemoteApplyCoordinator::hidden_draft_rename_ino(suffix, index)
+                }
                 MetaEvent::RemoveAttr { ino } => Some(*ino),
                 MetaEvent::SetAttr { attr } => Some(attr.ino),
                 _ => None,
@@ -429,6 +437,32 @@ impl<'a> RemoteApplyCoordinator<'a> {
         changed.then_some(ino)
     }
 
+    /// Empty draft renamed by `events[index]` without displacing another inode.
+    ///
+    /// `rename_atomic` follows a regular file's `RenameEntry` with its
+    /// `SetAttr`; a draft's names stay hidden with it, like its `AddEntry`.
+    fn hidden_draft_rename_ino(events: &[MetaEvent], index: usize) -> Option<Ino> {
+        match (events.get(index), events.get(index + 1)) {
+            (
+                Some(MetaEvent::RenameEntry {
+                    entry,
+                    displaced_set_attr,
+                    displaced_remove_attr_ino,
+                    ..
+                }),
+                Some(MetaEvent::SetAttr { attr }),
+            ) if entry.kind == FileType::RegularFile
+                && displaced_set_attr.is_none()
+                && displaced_remove_attr_ino.is_none()
+                && attr.ino == entry.ino
+                && attr.is_unpublished_empty_draft() =>
+            {
+                Some(entry.ino)
+            }
+            _ => None,
+        }
+    }
+
     /// Inode whose regular-file projection state `event` updates, if any.
     fn projection_event_inode(event: &MetaEvent) -> Option<Ino> {
         match event {
@@ -492,12 +526,17 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 _ => None,
             })
             .collect::<HashSet<_>>();
-        events.iter().any(|event| match event {
+        events.iter().enumerate().any(|(index, event)| match event {
             MetaEvent::AddEntry { entry, .. } => {
                 entry.kind == FileType::RegularFile
                     && hidden_regular_inodes.contains(&entry.ino)
                     && !deleted_hidden_regular_inodes.contains(&entry.ino)
             }
+            MetaEvent::RenameEntry { .. } => Self::hidden_draft_rename_ino(events, index)
+                .is_some_and(|ino| {
+                    hidden_regular_inodes.contains(&ino)
+                        && !deleted_hidden_regular_inodes.contains(&ino)
+                }),
             MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
                 !deleted_hidden_regular_inodes.contains(ino)
                     && chunk_slices.iter().any(|(_, slices)| {
@@ -542,6 +581,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
             MetaEvent::AddEntry { entry, .. } if entry.kind == FileType::RegularFile => {
                 !hidden.contains(&entry.ino)
             }
+            MetaEvent::RenameEntry { .. } => Self::hidden_draft_rename_ino(events, index)
+                .is_none_or(|ino| !hidden.contains(&ino)),
             MetaEvent::RemoveAttr { ino } => !hidden.contains(ino),
             MetaEvent::SetAttr { attr } => {
                 !hidden.contains(&attr.ino)
@@ -2150,6 +2191,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 MetaEvent::AddEntry { entry, .. } if entry.kind == FileType::RegularFile => {
                     Some(entry.ino)
                 }
+                MetaEvent::RenameEntry { entry, .. } if entry.kind == FileType::RegularFile => {
+                    Some(entry.ino)
+                }
                 _ => None,
             };
             if let Some(ino) = dependent_ino {
@@ -2169,6 +2213,15 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     } else {
                         None
                     }
+                }
+                // A rename's draft status comes from the SetAttr that follows it.
+                (Some(previous), MetaEvent::SetAttr { attr })
+                    if matches!(
+                        &local_events[previous],
+                        MetaEvent::RenameEntry { entry, .. } if entry.ino == attr.ino
+                    ) =>
+                {
+                    Some(previous)
                 }
                 _ => None,
             };

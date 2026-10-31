@@ -1285,6 +1285,9 @@ fn forget_request_with(
 ) {
     if let Some(state) = state {
         state.inode_liveness.forget(ino, nlookup);
+        if !state.inode_liveness.may_hold_lookup_ref(ino) {
+            state.open_directories.release_removed(ino);
+        }
     }
     reply_none();
 }
@@ -2225,9 +2228,51 @@ impl SessionState {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        self.vfs
-            .rmdir(parent, name)
-            .map_err(|error| vfs_err_to_errno(&error))
+        // Another process may still use the directory as its working
+        // directory. Install the snapshot before removal so a concurrent
+        // GETATTR never sees neither the inode nor the snapshot.
+        let expected = self
+            .vfs
+            .lookup(parent, name)
+            .ok()
+            .filter(|attr| attr.kind == FileType::Directory);
+        if let Some(attr) = &expected {
+            self.open_directories.retain_removed(attr);
+        }
+        let removed = match self.vfs.rmdir_returning_removed(parent, name) {
+            Ok(removed) => removed,
+            Err(error) => {
+                // Keep it only if a concurrent removal took the directory.
+                if let Some(attr) = &expected
+                    && self.vfs.getattr(attr.ino).is_ok()
+                {
+                    self.open_directories.release_removed(attr.ino);
+                }
+                return Err(vfs_err_to_errno(&error));
+            }
+        };
+        // A concurrent rename may have rebound the name before the removal.
+        if let Some(attr) = &expected
+            && removed
+                .as_ref()
+                .is_none_or(|removed| removed.ino != attr.ino)
+        {
+            self.open_directories.release_removed(attr.ino);
+        }
+        if let Some(attr) = removed {
+            if expected
+                .as_ref()
+                .is_none_or(|expected| expected.ino != attr.ino)
+            {
+                self.open_directories.retain_removed(&attr);
+            }
+            // shortcut: an in-flight reply that later rolls back leaves this
+            // small snapshot until unmount; release it from rollback if that matters.
+            if !self.inode_liveness.may_hold_lookup_ref(attr.ino) {
+                self.open_directories.release_removed(attr.ino);
+            }
+        }
+        Ok(())
     }
 
     fn rename(&self, parent: u64, name: &[u8], newparent: u64, newname: &[u8]) -> Result<(), i32> {
@@ -7453,6 +7498,67 @@ mod tests {
 
         assert_eq!(replies.load(Ordering::Relaxed), 1);
         assert!(!state.inode_liveness.is_live(42));
+    }
+
+    #[test]
+    fn removed_working_directory_getattr_survives_until_forget() {
+        // xfstests generic/011: dirstress chdir("..") from a stressdir that a
+        // sibling process removed; the kernel first revalidates the cwd inode.
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-removed-cwd")
+            .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let cwd = fixture.vfs().mkdir(1, b"stressdir", 0, 0, 0o755).unwrap();
+        let unreferenced = fixture.vfs().mkdir(1, b"other", 0, 0, 0o755).unwrap();
+        let lookup = state.inode_liveness.reserve_lookup(cwd.ino);
+        assert!(lookup.begin_reply());
+        assert!(lookup.commit().is_some());
+        assert!(state.inode_liveness.may_hold_lookup_ref(cwd.ino));
+
+        state.rmdir(1, b"stressdir").unwrap();
+        state.rmdir(1, b"other").unwrap();
+
+        let removed = state
+            .getattr(cwd.ino)
+            .expect("a removed directory the kernel still references stays observable");
+        assert_eq!(removed.st_ino, cwd.ino);
+        assert_eq!(removed.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(removed.st_nlink, 0);
+        assert_eq!(state.getattr(unreferenced.ino).err(), Some(libc::ENOENT));
+
+        super::forget_request_with(Some(&state), cwd.ino, 1, || {});
+        assert_eq!(state.getattr(cwd.ino).err(), Some(libc::ENOENT));
+    }
+
+    #[test]
+    fn removed_directory_snapshot_covers_an_entry_reply_in_flight() {
+        // The kernel may already hold the reply while its reservation is provisional.
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-removed-inflight")
+                .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let dir = fixture.vfs().mkdir(1, b"stressdir", 0, 0, 0o755).unwrap();
+        let lookup = state.inode_liveness.reserve_lookup(dir.ino);
+        assert!(lookup.begin_reply());
+
+        state.rmdir(1, b"stressdir").unwrap();
+        assert!(lookup.commit().is_some());
+
+        assert_eq!(
+            state.getattr(dir.ino).expect("snapshot retained").st_nlink,
+            0
+        );
+        super::forget_request_with(Some(&state), dir.ino, 1, || {});
+        assert_eq!(state.getattr(dir.ino).err(), Some(libc::ENOENT));
     }
 
     #[test]

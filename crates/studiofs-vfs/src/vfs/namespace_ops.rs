@@ -3428,6 +3428,16 @@ impl StudioVfs {
     /// Remove an empty directory `name` from directory `parent`.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         self.run_sync_future(self.rmdir_inner(parent, name))
+            .map(|_| ())
+    }
+
+    /// Remove a directory and return the attributes of the inode actually removed.
+    pub fn rmdir_returning_removed(
+        &self,
+        parent: Ino,
+        name: &[u8],
+    ) -> VfsResult<Option<InodeAttr>> {
+        self.run_sync_future(self.rmdir_inner(parent, name))
     }
 
     /// Retry a cleanup-triggered directory removal while child callbacks catch up.
@@ -3443,7 +3453,7 @@ impl StudioVfs {
                 {
                     tokio::time::sleep(RMDIR_INFLIGHT_RETRY_DELAY).await;
                 }
-                result => return result,
+                result => return result.map(|_| ()),
             }
         }
         Err(VfsError::Other(
@@ -3451,14 +3461,14 @@ impl StudioVfs {
         ))
     }
 
-    async fn rmdir_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+    async fn rmdir_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<Option<InodeAttr>> {
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         super::validate_name_len(name)?;
         self.reject_runtime_stats_entry_mutation(parent, name)?;
         if self.unlink_ignored_subtree(parent, name) || self.ignored_dir_attr(parent).is_some() {
             namespace_mutations.record_removal(parent, name, std::iter::empty());
-            return Ok(());
+            return Ok(None);
         }
         // Serialize directory removal with child namespace mutations. A
         // nested rmdir holds this parent gate while it waits for its own
@@ -3471,6 +3481,8 @@ impl StudioVfs {
         self.wait_for_deferred_namespace_entry(parent, name).await?;
         let meta = self.sync_meta();
         let removed = meta.lookup(parent, name).ok().map(|entry| entry.ino);
+        // Taken under the parent Delete gate, so it names the inode removed below.
+        let removed_attr = removed.and_then(|ino| meta.get_attr(ino).ok());
         let mut retry_attempts: u16 = 0;
         let mut settle_attempts: u16 = 0;
         let mut rechecked_after_skipped_heal = false;
@@ -3554,7 +3566,7 @@ impl StudioVfs {
         }
         // Directory removals follow the same local-first group-commit path as
         // child unlinks instead of waking PostgreSQL once per entry.
-        Ok(())
+        Ok(removed_attr)
     }
 
     /// Atomically rename an entry, optionally replacing an existing destination.

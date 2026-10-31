@@ -3472,4 +3472,24 @@ mod tests {
         );
         assert!(meta.lookup(ROOT_INO, b".Trashes").is_err());
     }
+
+    #[test]
+    fn rmdir_returning_removed_reports_the_removed_directory() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-returning-removed");
+        let first = vfs.mkdir(ROOT_INO, b"a", 0, 0, 0o750).expect("mkdir a");
+        let second = vfs.mkdir(ROOT_INO, b"b", 0, 0, 0o700).expect("mkdir b");
+        // The name now binds the second directory, as after a concurrent rename.
+        vfs.rename(ROOT_INO, b"b", ROOT_INO, b"a", true)
+            .expect("replace a");
+
+        let removed = vfs
+            .rmdir_returning_removed(ROOT_INO, b"a")
+            .expect("rmdir")
+            .expect("removed attr");
+        assert_eq!(removed.ino, second.ino);
+        assert_ne!(removed.ino, first.ino);
+        assert_eq!(removed.kind, FileType::Directory);
+        assert_eq!(removed.mode & 0o777, 0o700);
+    }
 }
