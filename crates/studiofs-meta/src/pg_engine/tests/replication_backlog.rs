@@ -4123,6 +4123,17 @@ fn poisoned_hidden_window_cache_falls_back_without_failing_the_mutation() {
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn pg_redb_repair_restores_unpublished_child_of_dir_published_after_checkpoint() {
+    redb_repair_restores_unpublished_child(0);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_redb_repair_catches_up_more_than_one_session() {
+    let _page_limit = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1");
+    redb_repair_restores_unpublished_child(20);
+}
+
+fn redb_repair_restores_unpublished_child(tail_batches: usize) {
     let dsn = pg_dsn().expect("PostgreSQL regression requires STUDIOFS_TEST_PG_DSN");
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
@@ -4139,6 +4150,17 @@ fn pg_redb_repair_restores_unpublished_child_of_dir_published_after_checkpoint()
     pg.flush_due_pending().expect("publish seed entry");
     pg.write_checkpoint_with_lease()
         .expect("publish checkpoint before parent");
+    let checkpoint_head = pg.remote_metadata_head_version().expect("checkpoint head");
+    for index in 0..tail_batches {
+        pg.create_dir(ROOT_INO, format!("tail-{index}").as_bytes(), 0, 0, 0o755)
+            .expect("create tail entry");
+        pg.pending_state.lock().unwrap().force_flush = true;
+        pg.flush_due_pending().expect("publish tail batch");
+    }
+    assert!(
+        pg.remote_metadata_head_version().expect("tail head") - checkpoint_head
+            >= tail_batches as i64
+    );
     let parent = pg
         .create_dir(ROOT_INO, b"after-checkpoint", 0, 0, 0o755)
         .expect("create parent");
@@ -4194,6 +4216,7 @@ fn pg_redb_repair_restores_unpublished_child_of_dir_published_after_checkpoint()
             .expect("repair marker"),
         0
     );
-    assert_ne!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    assert_eq!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(pg.pg_sync_status().allows_new_mutations());
     pg.prepare_for_close().expect("close repaired writer");
 }

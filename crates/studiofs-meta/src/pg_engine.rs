@@ -1686,32 +1686,43 @@ impl PgMetaEngine {
             engine.restore_pending_state_from_local_log()?;
             // The checkpoint can predate published parents of recovery rows; judge
             // the rows at head, before workers or the VFS startup scan can run.
-            if let Err(error) = engine
-                .run_startup_catch_up_session(MetadataSyncSource::Manual, &AtomicBool::new(false))
-            {
-                warn!(
-                    error = %error,
-                    "redb repair could not reach the remote head before graph recovery"
-                );
-            }
+            let catch_up_succeeded = loop {
+                let previous_version = engine.local_version.load(Ordering::Acquire);
+                match engine.run_startup_catch_up_session(
+                    MetadataSyncSource::Manual,
+                    &AtomicBool::new(false),
+                ) {
+                    Ok(_) => break true,
+                    Err(MetaError::CatchUpBudgetExceeded { local_version, .. })
+                        if local_version > previous_version => {}
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "redb repair could not reach the remote head before graph recovery"
+                        );
+                        break false;
+                    }
+                }
+            };
             let recovery_resolved =
                 engine.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()?;
             if recovery_resolved {
                 engine
                     .local
                     .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
-                // The catch-up session saw the marker before restore resolved it;
-                // only that check degraded, so let the background poll finish.
-                engine.update_pg_sync_lifecycle(|current| match current {
-                    PgSyncLifecycle::Degraded => PgSyncLifecycle::CatchingUp,
-                    current => current,
-                });
+                if catch_up_succeeded {
+                    engine.metadata_startup_target_version.store(
+                        engine.local_version.load(Ordering::Acquire),
+                        Ordering::Release,
+                    );
+                    engine.try_complete_catchup_sync()?;
+                }
             } else {
                 warn!(
                     "redb graph recovery remains pending because an uploaded recovery row could not be safely restored or retired"
                 );
             }
-            recovery_resolved
+            recovery_resolved && catch_up_succeeded
         } else {
             // Preserve unflushed local overlays while optionally importing a
             // bounded startup checkpoint. Do not replay the remote event tail
