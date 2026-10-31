@@ -538,7 +538,8 @@ impl<'a> NamespaceDeleteTxn<'a> {
         parent_attr.touch_mtime();
         RedbMetaEngine::set_inode_in_txn(self.txn, &parent_attr)?;
 
-        if spec.records_deferred_delete() {
+        // Only the last name hands the open inode to deferred deletion.
+        if spec.records_deferred_delete() && attr.nlink == 0 {
             self.record_deferred_delete(spec, entry.ino)?;
         }
 
@@ -704,7 +705,10 @@ impl<'a> NamespaceDeleteTxn<'a> {
             return Ok(());
         }
 
-        if deleted_before_publish.is_some() || attr.is_unpublished_empty_draft() {
+        // A remaining hard link keeps the inode; drop only this name.
+        if deleted_before_publish.is_some()
+            || (attr.nlink == 0 && attr.is_unpublished_empty_draft())
+        {
             RedbMetaEngine::append_event_in_txn(
                 self.txn,
                 &crate::events::MetaEvent::RemoveRegularFileGraph { ino: attr.ino },
@@ -1079,19 +1083,21 @@ impl MetaFsOps for RedbMetaEngine {
     // --- Hardlinks -------------------------------------------------------
 
     fn link_atomic(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> MetaResult<InodeAttr> {
-        let mut attr = self.get_attr(ino)?;
-        let mut parent_attr = self.get_attr(new_parent)?;
+        // Validate inside the write transaction: a concurrent link to the
+        // same name must observe the winner's dentry and fail with EEXIST.
+        let txn = self.begin_write_txn()?;
+        let mut attr = Self::get_attr_merged_in_write_txn(&txn, ino)?;
+        let mut parent_attr = Self::get_attr_merged_in_write_txn(&txn, new_parent)?;
         if parent_attr.kind != FileType::Directory {
             return Err(MetaError::NotADirectory(new_parent));
         }
-        if self.lookup(new_parent, new_name).is_ok() {
+        if Self::lookup_merged_in_write_txn(&txn, new_parent, new_name)?.is_some() {
             return Err(MetaError::EntryExists {
                 parent: new_parent,
                 name: String::from_utf8_lossy(new_name).to_string(),
             });
         }
 
-        let txn = self.begin_write_txn()?;
         let result;
         let parent_attr_event: Option<InodeAttr>;
         {

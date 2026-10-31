@@ -9151,6 +9151,52 @@ fn self_ack_of_local_create_preserves_later_recreated_name() {
     );
 }
 
+#[test]
+fn self_replay_of_unlinked_empty_draft_keeps_remaining_hardlink() {
+    // xfstests generic/089 lock dance: create an empty file, hard-link the
+    // lock name to it, then unlink the original name (SFS-932).
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let draft = pg
+        .create_file(ROOT_INO, b"t_mtab~1234", 0, 0, 0o600)
+        .expect("create empty draft");
+    pg.link(draft.ino, ROOT_INO, b"t_mtab~")
+        .expect("link lock name");
+    let unlinked = pg
+        .unlink(ROOT_INO, b"t_mtab~1234")
+        .expect("unlink original name");
+    assert_eq!(
+        unlinked.nlink, 1,
+        "the lock name still references the inode"
+    );
+
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+    let events = pg.local.read_events_range(start, end).expect("read events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    assert!(
+        !projected.events.iter().any(|event| matches!(
+            event,
+            MetaEvent::RemoveAttr { ino } | MetaEvent::RemoveRegularFileGraph { ino }
+                if *ino == draft.ino
+        )),
+        "unlinking one of two names must not publish inode removal: {:?}",
+        projected.events
+    );
+    let overlay = pg.local_overlay_conflicts().expect("local suffix overlay");
+
+    apply_self_replay(&pg, projected.events, start, end, overlay);
+
+    let lock = pg
+        .local
+        .lookup(ROOT_INO, b"t_mtab~")
+        .expect("lock name survives self replay");
+    assert_eq!(lock.ino, draft.ino);
+    assert_eq!(pg.get_attr(draft.ino).expect("inode survives").nlink, 1);
+}
+
 fn apply_self_replay(
     pg: &PgMetaEngine,
     events: Vec<MetaEvent>,

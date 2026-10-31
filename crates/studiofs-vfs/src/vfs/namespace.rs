@@ -1267,12 +1267,16 @@ fn name_to_string(name: Vec<u8>) -> String {
 /// Coordinates cache/epoch side effects for namespace mutating operations.
 pub(super) struct NamespaceMutationOps<'a> {
     vfs: &'a StudioVfs,
+    /// Namespace epoch observed before the mutation commits; recorded dentry
+    /// values are admitted only if no other change was recorded since.
+    started_epoch: u64,
 }
 
 impl<'a> NamespaceMutationOps<'a> {
     /// Creates a mutation coordinator tied to the current VFS.
     pub(super) fn new(vfs: &'a StudioVfs) -> Self {
-        Self { vfs }
+        let started_epoch = vfs.state.namespace.namespace_epoch.load(Ordering::Acquire);
+        Self { vfs, started_epoch }
     }
 
     /// Records insertion: invalidates affected attr caches and stores positive dentry cache.
@@ -1286,8 +1290,11 @@ impl<'a> NamespaceMutationOps<'a> {
         let mut invalidated = vec![parent];
         invalidated.extend(attr_invalidations);
         self.vfs.invalidate_attr_read_cache(invalidated);
-        self.vfs.bump_namespace_for_parents([parent]);
-        self.vfs.dentry_cache_insert_positive(parent, name, child);
+        self.vfs.record_dentry_changes(
+            self.started_epoch,
+            &[parent],
+            &[(parent, name, DentryCacheValue::Positive(child))],
+        );
     }
 
     /// Records ignored insertions where filesystem state is already visible elsewhere.
@@ -1312,8 +1319,11 @@ impl<'a> NamespaceMutationOps<'a> {
         let mut invalidated = vec![parent];
         invalidated.extend(attr_invalidations);
         self.vfs.invalidate_attr_read_cache(invalidated);
-        self.vfs.bump_namespace_for_parents([parent]);
-        self.vfs.dentry_cache_insert_negative(parent, name);
+        self.vfs.record_dentry_changes(
+            self.started_epoch,
+            &[parent],
+            &[(parent, name, DentryCacheValue::Negative)],
+        );
     }
 
     /// Records a rename that is rejected for destination update but should invalidate source state.
@@ -1330,8 +1340,11 @@ impl<'a> NamespaceMutationOps<'a> {
         }
         invalidated.extend(attr_invalidations);
         self.vfs.invalidate_attr_read_cache(invalidated);
-        self.vfs.bump_namespace_for_parents([parent, new_parent]);
-        self.vfs.dentry_cache_insert_negative(parent, name);
+        self.vfs.record_dentry_changes(
+            self.started_epoch,
+            &[parent, new_parent],
+            &[(parent, name, DentryCacheValue::Negative)],
+        );
     }
 
     /// Records successful rename/move and updates both old and new parent cache states.
@@ -1350,10 +1363,14 @@ impl<'a> NamespaceMutationOps<'a> {
         };
         invalidated.push(moved_ino);
         self.vfs.invalidate_attr_read_cache(invalidated);
-        self.vfs.bump_namespace_for_parents([parent, new_parent]);
-        self.vfs.dentry_cache_insert_negative(parent, name);
-        self.vfs
-            .dentry_cache_insert_positive(new_parent, new_name, moved_ino);
+        self.vfs.record_dentry_changes(
+            self.started_epoch,
+            &[parent, new_parent],
+            &[
+                (parent, name, DentryCacheValue::Negative),
+                (new_parent, new_name, DentryCacheValue::Positive(moved_ino)),
+            ],
+        );
     }
 }
 
@@ -1529,6 +1546,55 @@ impl StudioVfs {
         }
     }
 
+    /// Bumps namespace tokens for `parents` after a committed mutation and
+    /// caches `entries` only when no other change was recorded since
+    /// `started_epoch`. A mutation that committed earlier but records later
+    /// bumps the tokens again, so an admitted entry cannot outlive it.
+    pub(super) fn record_dentry_changes(
+        &self,
+        started_epoch: u64,
+        parents: &[Ino],
+        entries: &[(Ino, &[u8], DentryCacheValue)],
+    ) {
+        // Hold the generations lock across the epoch step and the inserts so
+        // the admitted token is exactly the one this record produced.
+        let mut generations = self.state.namespace.directory_generations.lock();
+        let admitted = started_epoch < u64::MAX
+            && self
+                .state
+                .namespace
+                .namespace_epoch
+                .compare_exchange(
+                    started_epoch,
+                    started_epoch + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+        if !admitted {
+            self.bump_namespace_epoch();
+        }
+        let mut seen = HashSet::new();
+        for &parent in parents {
+            if !seen.insert(parent) {
+                continue;
+            }
+            let current = generations.get(&parent).copied().unwrap_or(0);
+            if current == u64::MAX {
+                warn!(parent, "directory generation saturated at u64::MAX");
+            }
+            generations.insert(parent, current.saturating_add(1));
+        }
+        if !admitted {
+            return;
+        }
+        let mut cache = self.state.namespace.dentry_cache.lock();
+        for &(parent, name, value) in entries {
+            let generation = generations.get(&parent).copied().unwrap_or(0);
+            cache.put(parent, name, value, started_epoch + 1, generation);
+        }
+    }
+
     /// Looks up `(parent,name)` in dentry cache using current namespace tokens.
     pub(super) fn dentry_cache_lookup(&self, parent: Ino, name: &[u8]) -> Option<DentryCacheValue> {
         let token = self.namespace_cache_token_for_parent(parent);
@@ -1540,7 +1606,9 @@ impl StudioVfs {
         )
     }
 
-    /// Caches a successful child lookup for `(parent,name)`.
+    /// Seeds a positive entry under the current tokens; production inserts go
+    /// through observed tokens or [`Self::record_dentry_changes`].
+    #[cfg(test)]
     pub(super) fn dentry_cache_insert_positive(&self, parent: Ino, name: &[u8], child: Ino) {
         let token = self.namespace_cache_token_for_parent(parent);
         self.state.namespace.dentry_cache.lock().put(
@@ -2961,6 +3029,59 @@ mod tests {
             let cache = vfs.state.namespace.dentry_cache.lock();
             assert_eq!(cache.entry_value(&key), Some(DentryCacheValue::Negative));
         }
+    }
+
+    #[test]
+    fn late_removal_record_does_not_hide_a_newer_link() {
+        // generic/089 lock handoff (SFS-932): the releasing unlink commits,
+        // the next holder links the name and records it, and only then the
+        // releasing unlink records its removal.
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "late-removal-record");
+        let first = vfs
+            .create(ROOT_INO, b"t_mtab~1", 0, 0, 0o600)
+            .expect("create first lock");
+        vfs.link(first.ino, ROOT_INO, b"t_mtab~")
+            .expect("take first lock");
+        let second = vfs
+            .create(ROOT_INO, b"t_mtab~2", 0, 0, 0o600)
+            .expect("create second lock");
+
+        let release = vfs.namespace_mutations();
+        vfs.sync_meta()
+            .unlink(ROOT_INO, b"t_mtab~")
+            .expect("commit lock release");
+        vfs.link(second.ino, ROOT_INO, b"t_mtab~")
+            .expect("take second lock");
+        release.record_removal(ROOT_INO, b"t_mtab~", [first.ino]);
+
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"t_mtab~")
+                .expect("the newer lock stays visible")
+                .ino,
+            second.ino
+        );
+    }
+
+    #[test]
+    fn late_insertion_record_does_not_resurrect_a_removed_name() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "late-insertion-record");
+        let lock = vfs
+            .create(ROOT_INO, b"t_mtab~1", 0, 0, 0o600)
+            .expect("create lock");
+
+        let take = vfs.namespace_mutations();
+        vfs.sync_meta()
+            .link(lock.ino, ROOT_INO, b"t_mtab~")
+            .expect("commit lock link");
+        vfs.unlink(ROOT_INO, b"t_mtab~").expect("release lock");
+        take.record_insertion(ROOT_INO, b"t_mtab~", lock.ino, [lock.ino]);
+
+        assert!(
+            vfs.lookup(ROOT_INO, b"t_mtab~").is_err(),
+            "a released name must not be served from a late insertion record"
+        );
     }
 
     #[test]

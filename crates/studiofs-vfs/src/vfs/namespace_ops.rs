@@ -2853,10 +2853,13 @@ impl StudioVfs {
             }
             Err(err) => return Err(VfsError::Meta(err)),
         };
-        if attr.nlink == 0 {
-            self.retire_os_cache_inode(attr.ino);
-            self.mark_inode_deleted_for_uploads(attr.ino);
+        if attr.nlink > 0 {
+            // Another name still references the inode: the last close must
+            // not run deleted-inode cleanup.
+            return Ok(Some(attr));
         }
+        self.retire_os_cache_inode(attr.ino);
+        self.mark_inode_deleted_for_uploads(attr.ino);
 
         self.handle_table.mark_orphan(target.ino);
         debug!(
