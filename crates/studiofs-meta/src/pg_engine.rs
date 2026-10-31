@@ -1715,7 +1715,14 @@ impl PgMetaEngine {
                         engine.local_version.load(Ordering::Acquire),
                         Ordering::Release,
                     );
-                    engine.try_complete_catchup_sync()?;
+                    // Like a failed background completion: degrade, don't fail open.
+                    if let Err(error) = engine.try_complete_catchup_sync() {
+                        engine.record_pg_sync_failure(&error);
+                        warn!(
+                            error = %error,
+                            "redb repair could not complete startup catch-up"
+                        );
+                    }
                 }
             } else {
                 warn!(
