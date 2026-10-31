@@ -2410,6 +2410,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             &self.local_event_overlay_exclusions,
             execution,
         )?;
+        context.next_event_seq = replay_next_event_seq;
         let mut overlay =
             Self::merge_overlay_conflicts(&context.initial_overlay, &appended_overlay);
         let mut applied_any = false;
@@ -2515,7 +2516,42 @@ impl<'a> RemoteApplyCoordinator<'a> {
         if let Some(execution) = execution {
             execution.check()?;
         }
-        let final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
+        let mut final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
+        let pending_namespace_events = if applied_self_batch {
+            let events = RedbMetaEngine::read_events_range_in_write_txn_with_check(
+                txn,
+                context.flushed_event_seq,
+                replay_next_event_seq,
+                || execution.map_or(Ok(()), RemoteReplayExecution::check),
+            )?;
+            events
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, event)| {
+                    // Event seqs start at 1; match overlay_conflicts_for_local_events.
+                    let seq = context
+                        .flushed_event_seq
+                        .max(1)
+                        .saturating_add(index as u64);
+                    (!self
+                        .local_event_overlay_exclusions
+                        .iter()
+                        .any(|range| range.start <= seq && seq < range.end))
+                    .then_some(event)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let pending_namespace_bindings = if applied_self_batch {
+            RedbMetaEngine::pending_local_namespace_bindings_in_txn(txn, &pending_namespace_events)?
+                .bindings
+        } else {
+            HashMap::new()
+        };
+        final_overlay
+            .dentry_keys
+            .extend(pending_namespace_bindings.keys().cloned());
         applied_any |= self.reconcile_regular_file_serving_from_base_with_overlay_in_txn(
             txn,
             &reconcile_inodes,
@@ -2527,19 +2563,14 @@ impl<'a> RemoteApplyCoordinator<'a> {
             &final_overlay,
         )?;
         if applied_self_batch {
-            let pending_namespace_events =
-                RedbMetaEngine::read_events_range_in_write_txn_with_check(
-                    txn,
-                    context.flushed_event_seq,
-                    replay_next_event_seq,
-                    || execution.map_or(Ok(()), RemoteReplayExecution::check),
-                )?;
             // A self batch reaches base before its local prefix is necessarily
             // acknowledged, so restore the journal's final namespace state.
-            applied_any |= RedbMetaEngine::rebase_pending_local_namespace_in_txn(
-                txn,
-                &pending_namespace_events,
-            )?;
+            applied_any |= txn.without_invalidations(|| {
+                RedbMetaEngine::rebase_pending_local_namespace_in_txn(
+                    txn,
+                    &pending_namespace_events,
+                )
+            })?;
         }
         if let Some(execution) = execution {
             execution.check()?;

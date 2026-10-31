@@ -8532,6 +8532,10 @@ fn self_ack_of_local_create_keeps_later_unlink_visible_as_absent() {
 
     apply_self_replay(&pg, self_create, start, end, overlay);
 
+    assert!(
+        matches!(pg.get_attr(file.ino), Err(MetaError::InodeNotFound(_))),
+        "self-acknowledging the create must not restore the later unlinked inode"
+    );
     pg.persist_flushed_event_seq(end)
         .expect("ack the later local unlink after base replay");
     assert!(
@@ -8540,6 +8544,104 @@ fn self_ack_of_local_create_keeps_later_unlink_visible_as_absent() {
             Err(MetaError::EntryNotFound { .. })
         ),
         "acknowledging the earlier create and later unlink must leave the name absent"
+    );
+}
+
+#[test]
+fn self_ack_uses_event_bound_refreshed_in_replay_transaction() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let captured_next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).expect("captured end");
+    let file = pg
+        .create_file(ROOT_INO, b"self-ack-refreshed-bound", 0, 0, 0o644)
+        .expect("create local file after replay context capture");
+    let mut attr = pg.get_attr(file.ino).expect("load local file attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make local file publishable");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+    let local_events = pg
+        .local
+        .read_events_range(start, end)
+        .expect("read local events");
+    let self_create = RemoteApplyCoordinator::project_local_batch(&local_events).events;
+
+    let outcome = RemoteApplyCoordinator::new(&pg.local)
+        .apply_decoded_batches(
+            vec![DecodedReplayBatch {
+                batch_version: 1,
+                events: self_create,
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq: start,
+                next_event_seq: captured_next_event_seq,
+                initial_overlay: OverlayConflictSets::default(),
+            },
+        )
+        .expect("apply self replay with stale captured bound");
+
+    assert_eq!(
+        outcome.flushed_event_seq,
+        Some(end),
+        "self replay must acknowledge the prefix visible in its write transaction"
+    );
+}
+
+#[test]
+fn self_replay_of_draft_unlink_does_not_emit_entry_invalidation() {
+    use crate::coherence::InvalidationIntent;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+    let file = pg
+        .create_file(ROOT_INO, b"draft-unlink-no-invalidation", 0, 0, 0o644)
+        .expect("create local draft");
+    let mut attr = pg.get_attr(file.ino).expect("load draft attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make draft publishable");
+    let create_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("create end");
+    let local_events = pg
+        .local
+        .read_events_range(start, create_end)
+        .expect("read create events");
+    let self_create = RemoteApplyCoordinator::project_local_batch(&local_events).events;
+
+    pg.unlink(ROOT_INO, b"draft-unlink-no-invalidation")
+        .expect("unlink draft before self replay");
+    journaled_invalidation_intents(&pg);
+    apply_self_replay(
+        &pg,
+        self_create,
+        start,
+        pg.local.get_counter(NEXT_EVENT_SEQ).expect("unlink end"),
+        pg.local_overlay_conflicts().expect("pending overlay"),
+    );
+
+    assert!(
+        journaled_invalidation_intents(&pg)
+            .iter()
+            .all(|intent| !matches!(
+                intent,
+                InvalidationIntent::Entry { name, .. }
+                    if name.as_slice() == b"draft-unlink-no-invalidation"
+            )),
+        "rebasing a locally deleted draft must not publish a transient entry invalidation"
     );
 }
 

@@ -1,5 +1,10 @@
 use super::*;
 
+pub(crate) struct PendingLocalNamespaceState {
+    pub(crate) bindings: HashMap<Vec<u8>, Option<DirEntryValue>>,
+    pub(crate) removed_inodes: HashSet<Ino>,
+}
+
 #[cfg(test)]
 thread_local! {
     static REPLICA_INVALIDATION_DERIVATIONS: std::cell::Cell<usize> =
@@ -2634,12 +2639,16 @@ impl RedbMetaEngine {
     pub(crate) fn pending_local_namespace_bindings_in_txn(
         txn: &redb::WriteTransaction,
         events: &[crate::events::MetaEvent],
-    ) -> MetaResult<HashMap<Vec<u8>, Option<DirEntryValue>>> {
+    ) -> MetaResult<PendingLocalNamespaceState> {
         use crate::events::MetaEvent;
 
         let mut bindings = HashMap::new();
+        let mut removed_inodes = HashSet::new();
         for event in events {
             match event {
+                MetaEvent::SetAttr { attr } => {
+                    removed_inodes.remove(&attr.ino);
+                }
                 MetaEvent::AddEntry {
                     parent,
                     name,
@@ -2661,6 +2670,7 @@ impl RedbMetaEngine {
                 } => {
                     if let Some(ino) = displaced_remove_attr_ino {
                         Self::remove_pending_bindings_for_inode_in_txn(txn, *ino, &mut bindings)?;
+                        removed_inodes.insert(*ino);
                     }
                     bindings.insert(encode_dentry_key(*parent, name), None);
                     bindings.insert(
@@ -2670,12 +2680,16 @@ impl RedbMetaEngine {
                 }
                 MetaEvent::RemoveAttr { ino } => {
                     Self::remove_pending_bindings_for_inode_in_txn(txn, *ino, &mut bindings)?;
+                    removed_inodes.insert(*ino);
                 }
                 _ => {}
             }
         }
 
-        Ok(bindings)
+        Ok(PendingLocalNamespaceState {
+            bindings,
+            removed_inodes,
+        })
     }
 
     fn remove_pending_bindings_for_inode_in_txn(
@@ -2683,6 +2697,11 @@ impl RedbMetaEngine {
         ino: Ino,
         bindings: &mut HashMap<Vec<u8>, Option<DirEntryValue>>,
     ) -> MetaResult<()> {
+        for binding in bindings.values_mut() {
+            if binding.as_ref().is_some_and(|entry| entry.ino == ino) {
+                *binding = None;
+            }
+        }
         let mut keys =
             Self::dentry_keys_for_inode_in_write_index(txn, DENTRIES_BY_INODE_TABLE, ino)?;
         keys.extend(Self::dentry_keys_for_inode_in_write_index(
@@ -2690,17 +2709,8 @@ impl RedbMetaEngine {
             BASE_DENTRIES_BY_INODE_TABLE,
             ino,
         )?);
-        keys.sort_unstable();
-        keys.dedup();
         for key in keys {
-            if !matches!(bindings.get(&key), Some(Some(entry)) if entry.ino != ino) {
-                bindings.insert(key, None);
-            }
-        }
-        for binding in bindings.values_mut() {
-            if binding.as_ref().is_some_and(|entry| entry.ino == ino) {
-                *binding = None;
-            }
+            bindings.entry(key).or_insert(None);
         }
         Ok(())
     }
@@ -2711,8 +2721,8 @@ impl RedbMetaEngine {
         txn: &RedbWriteTransaction<'_>,
         events: &[crate::events::MetaEvent],
     ) -> MetaResult<bool> {
-        let bindings = Self::pending_local_namespace_bindings_in_txn(txn, events)?;
-        for (key, entry) in &bindings {
+        let state = Self::pending_local_namespace_bindings_in_txn(txn, events)?;
+        for (key, entry) in &state.bindings {
             let (parent, name) = decode_dentry_key(key)?;
             if let Some(entry) = entry {
                 Self::set_dentry_in_txn(txn, parent, name, entry)?;
@@ -2720,7 +2730,10 @@ impl RedbMetaEngine {
                 Self::remove_dentry_overlay_in_txn(txn, parent, name)?;
             }
         }
-        Ok(!bindings.is_empty())
+        for ino in state.removed_inodes {
+            Self::remove_inode_overlay_in_txn(txn, ino)?;
+        }
+        Ok(!state.bindings.is_empty())
     }
 
     /// Journals, after the write, the name and inode intents

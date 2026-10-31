@@ -75,16 +75,14 @@ fn flushed_event_seq_for_progress(
     cursor: u64,
     applied_version: i64,
     progress: &super::LocalEventProgress,
+    completed: &[LocalEventRange],
 ) -> u64 {
-    let mut completed = progress.completed.clone();
     let mut applied_published = Vec::new();
     for (version, ranges) in &progress.published_prefixes {
         if *version <= applied_version {
-            completed.extend_from_slice(ranges);
             applied_published.extend_from_slice(ranges);
         }
     }
-    merge_local_event_ranges(&mut completed);
     merge_local_event_ranges(&mut applied_published);
 
     // A completed range cannot jump over a publication that has not yet been
@@ -97,6 +95,13 @@ fn flushed_event_seq_for_progress(
         &applied_published,
     ));
     merge_local_event_ranges(&mut barriers);
+    let mut completed = completed.to_vec();
+    for (version, ranges) in &progress.published_prefixes {
+        if *version <= applied_version {
+            completed.extend_from_slice(ranges);
+        }
+    }
+    merge_local_event_ranges(&mut completed);
     flushed_event_seq_after_completed_ranges(cursor, &completed, &barriers)
 }
 
@@ -349,12 +354,11 @@ impl PgMetaEngine {
         }
         merge_local_event_ranges(&mut completed_ranges);
 
-        let mut next_progress = progress.clone();
-        next_progress.completed = completed_ranges.clone();
         let next = flushed_event_seq_for_progress(
             cursor,
             self.local_version.load(Ordering::SeqCst),
-            &next_progress,
+            &progress,
+            &completed_ranges,
         );
         if next > cursor {
             self.persist_flushed_event_seq_locked(next)?;
@@ -382,6 +386,7 @@ impl PgMetaEngine {
             cursor,
             applied_version,
             &progress,
+            &progress.completed,
         ))
     }
 
