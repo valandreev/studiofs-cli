@@ -22,6 +22,7 @@ use crate::invalidation::{
     FuseInvalidationShutdownOutcome, FuseInvalidationWorker, FuseLookupReservation,
     FuseOpenHandleGuard, LIVENESS_SHARDS,
 };
+use crate::open_directories::{OpenDirectoryAttrGuard, OpenDirectoryAttrs};
 use bytes::Bytes;
 use libc::{mode_t, off_t, size_t, stat, statvfs};
 use studiofs_bridge::fuse_open_reply::FuseOpenReplySerializer;
@@ -303,6 +304,7 @@ pub(crate) struct SessionState {
     directory_snapshots: DirectorySnapshotCache,
     open_reply_serializer: FuseOpenReplySerializer,
     inode_liveness: FuseInodeLiveness,
+    open_directories: OpenDirectoryAttrs,
     open_liveness: [Mutex<HashMap<u64, FuseOpenHandleGuard>>; LIVENESS_SHARDS],
     invalidation_queue: FuseInvalidationQueue,
     /// Runtime stats text captured at open, keyed by VFS file handle.
@@ -364,6 +366,7 @@ impl SessionState {
             directory_snapshots: DirectorySnapshotCache::default(),
             open_reply_serializer: FuseOpenReplySerializer::new(),
             inode_liveness: FuseInodeLiveness::default(),
+            open_directories: OpenDirectoryAttrs::default(),
             open_liveness: std::array::from_fn(|_| Mutex::new(HashMap::new())),
             invalidation_queue: FuseInvalidationQueue::default(),
             runtime_stats_snapshots: Mutex::new(HashMap::new()),
@@ -1716,7 +1719,7 @@ pub extern "C" fn studiofs_linux_fuse_opendir(
         return;
     };
     match state.getattr_attr(ino) {
-        Ok(attr) if attr.kind == FileType::Directory => match state.open_dir(ino, attr.parent) {
+        Ok(attr) if attr.kind == FileType::Directory => match state.open_dir(&attr) {
             Ok(handle) => {
                 reply_dir_open(req, fi, handle);
             }
@@ -2045,7 +2048,16 @@ impl SessionState {
     }
 
     fn getattr(&self, ino: u64) -> Result<stat, i32> {
-        self.getattr_attr(ino).map(|attr| self.attr_to_stat(&attr))
+        let attr = match self.getattr_attr(ino) {
+            Ok(attr) => {
+                self.open_directories.observe(&attr);
+                attr
+            }
+            // Directory fstat carries no file handle; keep a displaced open directory observable.
+            Err(libc::ENOENT) => self.open_directories.displaced(ino).ok_or(libc::ENOENT)?,
+            Err(errno) => return Err(errno),
+        };
+        Ok(self.attr_to_stat(&attr))
     }
 
     fn setattr(
@@ -2779,11 +2791,13 @@ impl SessionState {
     }
 
     /// `parent_ino` is captured at open, matching macFUSE; the root reports itself.
-    fn open_dir(&self, ino: u64, parent_ino: u64) -> Result<NonNull<DirectoryHandle>, i32> {
+    fn open_dir(&self, attr: &InodeAttr) -> Result<NonNull<DirectoryHandle>, i32> {
+        let ino = attr.ino;
         let liveness = self.inode_liveness.open_handle(ino);
         let raw = Box::into_raw(Box::new(DirectoryHandle {
-            parent_ino: if parent_ino == 0 { ino } else { parent_ino },
+            parent_ino: if attr.parent == 0 { ino } else { attr.parent },
             entries: Mutex::new(None),
+            _attrs: self.open_directories.open(attr),
             _liveness: liveness,
         }));
         NonNull::new(raw).ok_or(libc::ENOMEM)
@@ -3011,6 +3025,7 @@ impl SessionState {
 struct DirectoryHandle {
     parent_ino: u64,
     entries: Mutex<Option<CapturedDirectory>>,
+    _attrs: OpenDirectoryAttrGuard,
     _liveness: FuseOpenHandleGuard,
 }
 
@@ -4106,7 +4121,9 @@ mod tests {
         for name in [b"a", b"b", b"c", b"d"] {
             fixture.vfs().create(dir.ino, name, 0, 0, 0o644).unwrap();
         }
-        let raw_handle = state.open_dir(dir.ino, 1).unwrap();
+        let raw_handle = state
+            .open_dir(&state.getattr_attr(dir.ino).unwrap())
+            .unwrap();
         // SAFETY: this test owns the handle and keeps the box alive through every read.
         let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
         fixture.vfs().mkdir(dir.ino, b"e", 0, 0, 0o755).unwrap();
@@ -4174,7 +4191,9 @@ mod tests {
             "rewinding to offset 0 must start a fresh enumeration, as on WinFSP"
         );
 
-        let fresh = state.open_dir(dir.ino, 1).unwrap();
+        let fresh = state
+            .open_dir(&state.getattr_attr(dir.ino).unwrap())
+            .unwrap();
         let mut buffer = state.directory_buffers.take(4096);
         state
             .readdir(std::ptr::null_mut(), dir.ino, fresh, 2, &mut buffer)
@@ -4210,7 +4229,9 @@ mod tests {
         let dir = fixture.vfs().mkdir(1, b"dir", 0, 0, 0o755).unwrap();
         fixture.vfs().create(dir.ino, b"a", 0, 0, 0o644).unwrap();
         let capture = || {
-            let raw = state.open_dir(dir.ino, 1).unwrap();
+            let raw = state
+                .open_dir(&state.getattr_attr(dir.ino).unwrap())
+                .unwrap();
             let mut buffer = state.directory_buffers.take(4096);
             state
                 .readdir(std::ptr::null_mut(), dir.ino, raw, 2, &mut buffer)
@@ -4272,7 +4293,7 @@ mod tests {
             default_connection_config(),
         );
         fixture.vfs().create(1, b"child", 0, 0, 0o644).unwrap();
-        let raw_handle = state.open_dir(1, 1).unwrap();
+        let raw_handle = state.open_dir(&state.getattr_attr(1).unwrap()).unwrap();
         // SAFETY: this test keeps its handle alive until all reads complete.
         let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
         for (offset, size, expected) in [
@@ -4350,7 +4371,9 @@ mod tests {
         let dir = fixture.vfs().mkdir(1, b"dir", 0, 0, 0o755).unwrap();
         let a = fixture.vfs().create(dir.ino, b"a", 0, 0, 0o644).unwrap();
         let b = fixture.vfs().mkdir(dir.ino, b"b", 0, 0, 0o755).unwrap();
-        let raw_handle = state.open_dir(dir.ino, 1).unwrap();
+        let raw_handle = state
+            .open_dir(&state.getattr_attr(dir.ino).unwrap())
+            .unwrap();
         // SAFETY: this test owns the handle and keeps the box alive through every read.
         let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
         let mut buffer = state.directory_buffers.take(4096);
@@ -4393,7 +4416,7 @@ mod tests {
             default_connection_config(),
         );
         let a = fixture.vfs().create(1, b"a", 0, 0, 0o644).unwrap();
-        let raw_handle = state.open_dir(1, 1).unwrap();
+        let raw_handle = state.open_dir(&state.getattr_attr(1).unwrap()).unwrap();
         // SAFETY: this test owns the handle and keeps the box alive through the read.
         let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
         let mut buffer = state.directory_buffers.take(4096);
@@ -4426,7 +4449,9 @@ mod tests {
         let dir = fixture.vfs().mkdir(1, b"dir", 0, 0, 0o755).unwrap();
         let a = fixture.vfs().create(dir.ino, b"a", 0, 0, 0o644).unwrap();
         let b = fixture.vfs().create(dir.ino, b"b", 0, 0, 0o644).unwrap();
-        let raw_handle = state.open_dir(dir.ino, 1).unwrap();
+        let raw_handle = state
+            .open_dir(&state.getattr_attr(dir.ino).unwrap())
+            .unwrap();
         // SAFETY: this test owns the handle and keeps the box alive through every read.
         let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
         let read = |offset| {
@@ -4489,7 +4514,7 @@ mod tests {
         for (ino, expected_parent) in [(child.ino, parent.ino), (1, 1)] {
             // Same attr source as the opendir callback.
             let attr = state.getattr_attr(ino).unwrap();
-            let raw_handle = state.open_dir(ino, attr.parent).unwrap();
+            let raw_handle = state.open_dir(&attr).unwrap();
             let dot_inodes = |offset| {
                 let mut buffer = state.directory_buffers.take(4096);
                 state
@@ -4519,6 +4544,50 @@ mod tests {
             // SAFETY: this test exclusively owns the handle returned by open_dir.
             drop(unsafe { Box::from_raw(raw_handle.as_ptr()) });
         }
+    }
+
+    #[test]
+    fn open_directory_getattr_survives_displacement_until_release() {
+        // xfstests generic/035: fstat on an open directory replaced by rename.
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-open-dir-displaced")
+                .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let vfs = fixture.vfs();
+        vfs.mkdir(1, b"dir1", 0, 0, 0o755).unwrap();
+        let target = vfs.mkdir(1, b"dir2", 0, 0, 0o755).unwrap();
+        vfs.mkdir(1, b"dir3", 0, 0, 0o755).unwrap();
+        let unopened_target = vfs.mkdir(1, b"dir4", 0, 0, 0o755).unwrap();
+        let open = || {
+            let attr = state.getattr_attr(target.ino).unwrap();
+            state.open_dir(&attr).unwrap()
+        };
+        let first = open();
+        // A second handle keeps the snapshot alive after the first release.
+        let second = open();
+
+        state.rename(1, b"dir1", 1, b"dir2").unwrap();
+        state.rename(1, b"dir3", 1, b"dir4").unwrap();
+
+        let displaced = state
+            .getattr(target.ino)
+            .expect("open directory stays observable");
+        assert_eq!(displaced.st_ino, target.ino);
+        assert_eq!(displaced.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(displaced.st_nlink, 0);
+        assert_eq!(state.getattr(unopened_target.ino).err(), Some(libc::ENOENT));
+
+        // SAFETY: this test exclusively owns the handles returned by open_dir.
+        drop(unsafe { Box::from_raw(first.as_ptr()) });
+        assert_eq!(state.getattr(target.ino).unwrap().st_nlink, 0);
+        // SAFETY: as above.
+        drop(unsafe { Box::from_raw(second.as_ptr()) });
+        assert_eq!(state.getattr(target.ino).err(), Some(libc::ENOENT));
     }
 
     #[test]
@@ -4673,7 +4742,7 @@ mod tests {
             default_connection_config(),
         );
         fixture.vfs().create(1, b"child", 0, 0, 0o644).unwrap();
-        let handle = state.open_dir(1, 1).unwrap();
+        let handle = state.open_dir(&state.getattr_attr(1).unwrap()).unwrap();
         // SAFETY: this test exclusively owns the handle returned by open_dir.
         let handle = unsafe { Box::from_raw(handle.as_ptr()) };
         assert!(
@@ -4699,7 +4768,9 @@ mod tests {
                 .create(dir.ino, format!("file-{index:04}").as_bytes(), 0, 0, 0o644)
                 .unwrap();
         }
-        let handle = state.open_dir(dir.ino, 1).unwrap();
+        let handle = state
+            .open_dir(&state.getattr_attr(dir.ino).unwrap())
+            .unwrap();
         let mut reply = state.directory_buffers.take(4096);
         state
             .readdir(std::ptr::null_mut(), dir.ino, handle, 2, &mut reply)
@@ -8039,9 +8110,7 @@ mod tests {
             .vfs()
             .mkdir(1, b"dir", 0, 0, 0o755)
             .expect("create directory");
-        let handle = state
-            .open_dir(attr.ino, attr.parent)
-            .expect("open directory");
+        let handle = state.open_dir(&attr).expect("open directory");
         assert!(state.inode_liveness.is_live(attr.ino));
 
         assert_eq!(
@@ -8118,9 +8187,7 @@ mod tests {
             .vfs()
             .mkdir(1, b"dir", 0, 0, 0o755)
             .expect("create directory");
-        let handle = state
-            .open_dir(attr.ino, attr.parent)
-            .expect("open directory");
+        let handle = state.open_dir(&attr).expect("open directory");
         // SAFETY: this test owns the pointer returned by `open_dir`.
         let handle = unsafe { Box::from_raw(handle.as_ptr()) };
 
