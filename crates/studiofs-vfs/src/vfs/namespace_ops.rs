@@ -223,6 +223,25 @@ impl StudioVfs {
         self.deferred_namespace_attr(ino)
     }
 
+    /// Apply a committed link count to local attributes that answer getattr
+    /// before metadata: dirty writer state and a lingering attr-only setattr.
+    fn record_committed_nlink(&self, ino: Ino, nlink: u32) {
+        if let Some(dirty_attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
+            dirty_attr.nlink = nlink;
+        }
+        if let Some(deferred_attr) = self
+            .state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .attrs
+            .get_mut(&ino)
+        {
+            deferred_attr.nlink = nlink;
+        }
+    }
+
     pub(super) fn deferred_namespace_attr(&self, ino: Ino) -> Option<InodeAttr> {
         if !self
             .state
@@ -3327,15 +3346,7 @@ impl StudioVfs {
             };
 
             namespace_mutations.record_removal(parent, name, [unlinked_attr.ino]);
-            if let Some(dirty_attr) = self
-                .state
-                .namespace
-                .dirty_attrs
-                .lock()
-                .get_mut(&unlinked_attr.ino)
-            {
-                dirty_attr.nlink = unlinked_attr.nlink;
-            }
+            self.record_committed_nlink(unlinked_attr.ino, unlinked_attr.nlink);
             self.invalidate_attr_read_cache([unlinked_attr.ino]);
             if unlinked_attr.nlink > 0 {
                 self.state.namespace.attr_read_cache.lock().put(
@@ -3483,6 +3494,7 @@ impl StudioVfs {
         // as rename does for a displaced inode; the metadata inode is gone.
         namespace_mutations.record_removal(parent, name, removed);
         if let Some(removed_ino) = removed {
+            self.record_committed_nlink(removed_ino, 0);
             self.bump_directory_generation(removed_ino);
         }
         // Directory removals follow the same local-first group-commit path as
@@ -3830,21 +3842,7 @@ impl StudioVfs {
 
         if let Some(attr) = &rename_result.displaced {
             let ino = attr.ino;
-            if let Some(dirty_attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
-                dirty_attr.nlink = attr.nlink;
-            }
-            // A lingering attr-only setattr still answers getattr for the displaced inode.
-            if let Some(deferred_attr) = self
-                .state
-                .namespace
-                .deferred
-                .inner
-                .lock()
-                .attrs
-                .get_mut(&ino)
-            {
-                deferred_attr.nlink = attr.nlink;
-            }
+            self.record_committed_nlink(ino, attr.nlink);
             self.invalidate_attr_read_cache([ino]);
             if attr.nlink == 0 {
                 self.retire_os_cache_inode(ino);

@@ -18275,6 +18275,73 @@ fn sfs930_rename_over_directory_with_deferred_setattr_reports_zero_links() {
     });
 }
 
+#[test]
+fn rmdir_with_deferred_setattr_reports_zero_links() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-deferred-dir-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "rmdir-deferred-dir");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let removed = vfs
+            .mkdir(ROOT_INO, b"removed", 0, 0, 0o755)
+            .expect("mkdir removed");
+        // Keep the chmod queued so the rmdir overtakes it.
+        vfs.state
+            .namespace
+            .deferred
+            .batch_linger_override_ms
+            .store(3_600_000, AtomicOrdering::Release);
+        vfs.setattr_attr_only_deferred_metadata(
+            removed.ino,
+            SetattrArgs {
+                mode: Some(0o700),
+                ..SetattrArgs::default()
+            },
+            rt.handle(),
+        )
+        .expect("defer chmod");
+        assert!(vfs.has_deferred_namespace_metadata(removed.ino));
+
+        vfs.rmdir(ROOT_INO, b"removed").expect("rmdir");
+
+        let attr = vfs.getattr(removed.ino).expect("queued attr still answers");
+        assert_eq!(attr.nlink, 0, "a removed directory has no links");
+        assert_eq!(attr.mode & 0o777, 0o700);
+    });
+}
+
+#[test]
+fn unlink_with_deferred_setattr_reports_zero_links() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("unlink-deferred-file-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "unlink-deferred-file");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let created = vfs
+            .create(ROOT_INO, b"unlinked", 0, 0, 0o644)
+            .expect("create file");
+        vfs.state
+            .namespace
+            .deferred
+            .batch_linger_override_ms
+            .store(3_600_000, AtomicOrdering::Release);
+        vfs.setattr_attr_only_deferred_metadata(
+            created.ino,
+            SetattrArgs {
+                mode: Some(0o600),
+                ..SetattrArgs::default()
+            },
+            rt.handle(),
+        )
+        .expect("defer chmod");
+        assert!(vfs.has_deferred_namespace_metadata(created.ino));
+
+        vfs.unlink(ROOT_INO, b"unlinked").expect("unlink");
+
+        let attr = vfs.getattr(created.ino).expect("queued attr still answers");
+        assert_eq!(attr.nlink, 0, "an unlinked file has no links");
+        assert_eq!(attr.mode & 0o777, 0o600);
+    });
+}
+
 /// Create a file, commit its deferred create, queue an attr-only setattr, and
 /// unlink the file before the setattr batch commits (SFS-910).
 fn assert_unlink_after_deferred_setattr_keeps_mount_writable(
