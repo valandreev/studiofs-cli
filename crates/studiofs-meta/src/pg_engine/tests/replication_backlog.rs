@@ -4133,7 +4133,19 @@ fn pg_redb_repair_catches_up_more_than_one_session() {
     redb_repair_restores_unpublished_child(20);
 }
 
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_redb_repair_catch_up_stops_at_deadline_and_stays_degraded() {
+    let _page_limit = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1");
+    let _deadline = set_test_env("STUDIOFS_PG_REPAIR_CATCH_UP_TIMEOUT_MS", "1");
+    redb_repair_unpublished_child_scenario(20, false);
+}
+
 fn redb_repair_restores_unpublished_child(tail_batches: usize) {
+    redb_repair_unpublished_child_scenario(tail_batches, true);
+}
+
+fn redb_repair_unpublished_child_scenario(tail_batches: usize, expect_restored: bool) {
     let dsn = pg_dsn().expect("PostgreSQL regression requires STUDIOFS_TEST_PG_DSN");
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let path = dir.path().join("meta.redb");
@@ -4202,6 +4214,21 @@ fn redb_repair_restores_unpublished_child(tail_batches: usize) {
     }
     let pg = PgMetaEngine::open_with_options(&path, options).expect("repair reopen");
 
+    if !expect_restored {
+        assert!(
+            pg.lookup(parent.ino, name).is_err(),
+            "an expired catch-up must not judge rows mid-tail"
+        );
+        assert_eq!(
+            pg.local
+                .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+                .expect("repair marker"),
+            1
+        );
+        assert_eq!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+        pg.prepare_for_close().expect("close degraded writer");
+        return;
+    }
     assert_eq!(
         pg.lookup(parent.ino, name).expect("child restored").ino,
         file.ino

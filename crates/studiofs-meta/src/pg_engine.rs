@@ -1686,15 +1686,24 @@ impl PgMetaEngine {
             engine.restore_pending_state_from_local_log()?;
             // The checkpoint can predate published parents of recovery rows; judge
             // the rows at head, before workers or the VFS startup scan can run.
+            // Bounded below the CLI's 60s mount-record wait; on expiry the rows
+            // stay pending and startup keeps the existing degraded refusal.
+            let catch_up_deadline = Instant::now()
+                + Self::env_duration_ms("STUDIOFS_PG_REPAIR_CATCH_UP_TIMEOUT_MS", 30_000);
             let catch_up_succeeded = loop {
                 let previous_version = engine.local_version.load(Ordering::Acquire);
                 match engine.run_startup_catch_up_session(
                     MetadataSyncSource::Manual,
                     &AtomicBool::new(false),
                 ) {
-                    Ok(_) => break true,
+                    // `Ok(false)` also means "already at head", so check the cursor.
+                    Ok(_) => {
+                        let head = engine.metadata_remote_head_version.load(Ordering::Acquire);
+                        break head >= 0 && engine.local_version.load(Ordering::Acquire) >= head;
+                    }
                     Err(MetaError::CatchUpBudgetExceeded { local_version, .. })
-                        if local_version > previous_version => {}
+                        if local_version > previous_version
+                            && Instant::now() < catch_up_deadline => {}
                     Err(error) => {
                         warn!(
                             error = %error,
