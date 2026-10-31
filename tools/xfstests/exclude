@@ -1,0 +1,4 @@
+# This baseline attempts every generic ID; there are no manual exclusions.
+# Native FUSE feature/geometry probes supply most notrun results. Disabled-mmap
+# and unavailable mount-option failures remain selected and are classified in
+# docs/posix-conformance.md, rather than counted as product bugs.
