@@ -487,25 +487,24 @@ impl CommitCoordinator {
         // older finalizer cannot restore a dirty_attr after a newer finalizer has
         // already published and removed it.
         //
-        // A lingering attr-only setattr takes over the retired dirty attr and
-        // then the published upload state, so getattr neither reverts to its
-        // enqueue-time snapshot nor reports the published epoch as uploading.
-        let (was_dirty_visible, removed_matching_dirty_attr, newer_dirty_attr) =
-            vfs.retire_published_dirty_attr(ino, content_epoch);
-
-        let published_attr = if let Ok(attr) =
+        // A lingering attr-only setattr takes over the retired dirty attr with
+        // the published upload state in the same step, so getattr neither
+        // reverts to its enqueue-time snapshot nor reports the published epoch
+        // as uploading. Read the published attr first: the handoff must not be
+        // split by an await.
+        let published_attr =
             run_meta_maintenance(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 engine.get_attr(ino)
             })
             .await
-        {
-            vfs.refresh_inode_incarnation_state_from_attr_inner(ino, &attr, false);
-            vfs.record_published_attr(&attr);
-            Some(attr)
+            .ok();
+        let (was_dirty_visible, removed_matching_dirty_attr, newer_dirty_attr) =
+            vfs.retire_published_dirty_attr(ino, content_epoch, published_attr.as_ref());
+        if let Some(attr) = published_attr.as_ref() {
+            vfs.refresh_inode_incarnation_state_from_attr_inner(ino, attr, false);
         } else {
             vfs.clear_inode_incarnation(ino);
-            None
-        };
+        }
         let restored_newer_dirty_attr = newer_dirty_attr.is_some();
         if let Some(newer_dirty_attr) = newer_dirty_attr {
             Self::restore_newer_dirty_attr_and_refresh_open_handles(vfs, ino, newer_dirty_attr);
