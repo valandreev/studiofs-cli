@@ -3479,7 +3479,9 @@ impl StudioVfs {
                 Err(err) => return Err(VfsError::Meta(err)),
             }
         }
-        namespace_mutations.record_removal(parent, name, std::iter::empty());
+        // Retire the removed directory's cached attributes with the parent's,
+        // as rename does for a displaced inode; the metadata inode is gone.
+        namespace_mutations.record_removal(parent, name, removed);
         if let Some(removed_ino) = removed {
             self.bump_directory_generation(removed_ino);
         }

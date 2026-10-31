@@ -17067,6 +17067,39 @@ fn rename_over_existing_target_invalidates_displaced_inode_attr_cache() {
 }
 
 #[test]
+fn rmdir_invalidates_removed_directory_attr_cache() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "rmdir-removed-cache-invalidation");
+    let _guard = rt.enter();
+    let removed = vfs.mkdir(1, b"removed-dir", 0, 0, 0o755).unwrap();
+    // Populate the resolver attribute cache the way a FUSE getattr does.
+    let cached = vfs.getattr(removed.ino).expect("getattr before rmdir");
+    assert_eq!(cached.kind, FileType::Directory);
+    assert!(
+        vfs.state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .contains(removed.ino),
+        "setup must prime removed directory attr cache"
+    );
+
+    vfs.rmdir(1, b"removed-dir").unwrap();
+
+    assert!(
+        matches!(meta.get_attr(removed.ino), Err(MetaError::InodeNotFound(_))),
+        "rmdir must delete the directory inode from local metadata"
+    );
+    assert!(
+        matches!(
+            vfs.getattr(removed.ino),
+            Err(VfsError::Meta(MetaError::InodeNotFound(ino))) if ino == removed.ino
+        ),
+        "rmdir must not serve the removed directory from a stale attr cache"
+    );
+}
+
+#[test]
 fn deleted_inode_cleanup_batches_pending_deletions_for_multiple_objects() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deleted-inode-batch-cleanup");
