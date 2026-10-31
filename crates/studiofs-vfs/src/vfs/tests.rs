@@ -18239,6 +18239,89 @@ fn attr_only_setattr_size_uses_regular_non_deferred_path() {
 }
 
 #[test]
+fn epoch_publication_with_deferred_setattr_reports_published_attr() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("deferred-setattr-publish-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-setattr-publish");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let step = Duration::from_secs(30);
+        let ino = vfs
+            .create(ROOT_INO, b"deferred-setattr-publish.bin", 0, 0, 0o644)
+            .expect("create file")
+            .ino;
+        vfs.write(ino, 0, b"published base payload")
+            .await
+            .expect("write base payload");
+        vfs.flush(ino).await.expect("flush base payload");
+        let (base_epoch, base_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, base_epoch, &base_blocks);
+
+        // Persist a metadata-only grow epoch that the finalizer can publish.
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        let grown_size = 8192u64;
+        vfs.setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(grown_size))
+            .expect("extend through handle");
+        tokio::time::timeout(step, vfs.fsync_with_outcome(ino, false))
+            .await
+            .expect("fsync in time")
+            .expect("fsync extended size");
+        let content_epoch = meta.get_attr(ino).expect("load grown attr").content_epoch;
+
+        // Keep the chmod queued across publication.
+        vfs.state
+            .namespace
+            .deferred
+            .batch_linger_override_ms
+            .store(3_600_000, AtomicOrdering::Release);
+        vfs.setattr_attr_only_deferred_metadata(
+            ino,
+            SetattrArgs {
+                mode: Some(0o600),
+                ..SetattrArgs::default()
+            },
+            rt.handle(),
+        )
+        .expect("defer chmod");
+        let local = vfs.getattr(ino).expect("getattr before publication");
+        assert_eq!(local.size, grown_size);
+        assert_ne!(local.upload_state, MetaUploadState::Ready);
+
+        let status = tokio::time::timeout(
+            step,
+            super::commit::CommitCoordinator::finalize_inode_epoch(&vfs, ino, content_epoch),
+        )
+        .await
+        .expect("finalize in time")
+        .expect("finalize grown epoch");
+        assert!(matches!(
+            status,
+            super::commit::EpochFinalizeStatus::Published
+        ));
+        assert!(
+            vfs.has_deferred_namespace_metadata(ino),
+            "the chmod must still be queued after publication"
+        );
+
+        let published = vfs.getattr(ino).expect("getattr after publication");
+        assert_eq!(published.mode & 0o777, 0o600);
+        assert_eq!(published.size, grown_size);
+        assert_eq!(published.mtime, local.mtime);
+        assert_eq!(published.ctime, local.ctime);
+        assert_eq!(
+            published.upload_state,
+            MetaUploadState::Ready,
+            "getattr must not report the published epoch as still uploading"
+        );
+        assert_eq!(published.committed_size, grown_size);
+        assert_eq!(published.committed_content_epoch, content_epoch);
+
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
 fn sfs930_rename_over_directory_with_deferred_setattr_reports_zero_links() {
     let tmp = studiofs_test_support::workspace_target_tempdir("sfs930-deferred-dir-");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs930-deferred-dir");
