@@ -253,6 +253,16 @@ impl MetaRecovery for RedbMetaEngine {
                 let Some(deferred) = deferred_by_ino.get(&record.ino) else {
                     continue;
                 };
+                // Earlier builds recorded a deferred delete when one name of a
+                // hard-linked file was unlinked while open; that inode is live.
+                match self.get_attr(record.ino) {
+                    Ok(attr) if attr.nlink > 0 => {
+                        self.remove_deferred_delete(record.ino)?;
+                        continue;
+                    }
+                    Ok(_) | Err(MetaError::InodeNotFound(_)) => {}
+                    Err(err) => return Err(err),
+                }
                 self.set_undo_log_phase_for(
                     record.kind.clone(),
                     record.ino,

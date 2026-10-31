@@ -16489,6 +16489,41 @@ fn test_open_unlink_handle_accepts_followup_write_until_release() {
 }
 
 #[test]
+fn unlink_of_open_hardlink_keeps_inode_for_remaining_name() {
+    // generic/089 (SFS-932): FUSE delivers RELEASE after close(), so the
+    // t_mtab pid name can be unlinked while its create handle is still open.
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "open-hardlink-unlink");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(ROOT_INO, b"t_mtab~1", 0, 0, 0o600).unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh_with_deferred_materialize(fh, ino, 0, b"lock", LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.link(ino, ROOT_INO, b"t_mtab~").expect("link lock name");
+
+        vfs.unlink(ROOT_INO, b"t_mtab~1")
+            .expect("unlink pid name while open");
+        vfs.release_fh(fh).await.expect("release create handle");
+
+        let remaining = vfs
+            .lookup(ROOT_INO, b"t_mtab~")
+            .expect("the remaining name still resolves");
+        assert_eq!(remaining.ino, ino);
+        assert_eq!(remaining.nlink, 1);
+        assert_eq!(
+            vfs.read(ino, 0, 16)
+                .await
+                .expect("read through remaining name"),
+            Bytes::from_static(b"lock")
+        );
+    });
+}
+
+#[test]
 fn kernel_invalidation_skips_unresolved_active_open_overlay() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "active-open-unlinked-kernel-inval");

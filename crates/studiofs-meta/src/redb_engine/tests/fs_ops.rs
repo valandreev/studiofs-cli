@@ -410,6 +410,30 @@ fn test_unlink_open_handle_keeps_inode_and_decrements_nlink() {
 }
 
 #[test]
+fn unlink_open_handle_of_hardlink_does_not_record_deferred_delete() {
+    let engine = temp_engine();
+    let attr = engine
+        .create_file(ROOT_INO, b"open-link.txt", 1000, 1000, 0o644)
+        .unwrap();
+    engine.link(attr.ino, ROOT_INO, b"open-link-alias").unwrap();
+
+    let result = engine
+        .unlink_open_handle(ROOT_INO, b"open-link.txt")
+        .unwrap();
+
+    assert_eq!(result.nlink, 1);
+    assert_eq!(engine.lookup(ROOT_INO, b"open-link-alias").unwrap().ino, attr.ino);
+    assert!(
+        !engine
+            .list_deferred_deletes()
+            .unwrap()
+            .iter()
+            .any(|record| record.ino == attr.ino),
+        "recovery must not delete an inode that keeps another name"
+    );
+}
+
+#[test]
 fn zeroio_delete_before_publish_persists_tombstone_lifecycle() {
     let engine = temp_engine();
     let file = engine
@@ -753,6 +777,48 @@ fn test_rename_no_replace_does_not_overwrite_concurrently_created_destination() 
             assert_eq!(engine.lookup(ROOT_INO, b"dst.txt").unwrap().ino, created.ino);
         }
         outcome => panic!("unexpected competing create/rename result: {outcome:?}"),
+    }
+}
+
+#[test]
+fn concurrent_links_to_one_name_admit_exactly_one() {
+    // generic/089's t_mtab lock relies on link() returning EEXIST (SFS-932).
+    let engine = Arc::new(temp_engine());
+    for round in 0..32 {
+        let lock = format!("lock-{round}").into_bytes();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let linkers: Vec<_> = (0..2)
+            .map(|linker| {
+                let source = engine
+                    .create_file(ROOT_INO, format!("src-{round}-{linker}").as_bytes(), 0, 0, 0o600)
+                    .unwrap();
+                let engine = Arc::clone(&engine);
+                let barrier = Arc::clone(&barrier);
+                let lock = lock.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (source.ino, engine.link(source.ino, ROOT_INO, &lock))
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = linkers.into_iter().map(|l| l.join().unwrap()).collect();
+
+        let winners: Vec<_> = outcomes
+            .iter()
+            .filter_map(|(ino, result)| result.as_ref().ok().map(|attr| (*ino, attr.nlink)))
+            .collect();
+        assert_eq!(winners.len(), 1, "round {round}: {outcomes:?}");
+        assert!(outcomes.iter().any(|(_, result)| matches!(
+            result,
+            Err(MetaError::EntryExists { .. })
+        )));
+        let (winner, nlink) = winners[0];
+        assert_eq!(nlink, 2);
+        assert_eq!(engine.lookup(ROOT_INO, &lock).unwrap().ino, winner);
+        for (ino, result) in &outcomes {
+            let expected = if result.is_ok() { 2 } else { 1 };
+            assert_eq!(engine.get_attr(*ino).unwrap().nlink, expected);
+        }
     }
 }
 

@@ -4089,11 +4089,15 @@ mod tests {
             )
             .expect("seed upload payload");
 
-            let session_guard = vfs
-                .state
-                .file_session
-                .enter_op(ino, FileSessionOperation::Flush)
-                .await;
+            // Like production holders, retire the session on exit: the permit
+            // releases its gate before its own bookkeeping, so the reattach
+            // may finish while this holder still pins the session entry.
+            let session_guard = vfs.file_session_cleanup(ino).with_permit(
+                vfs.state
+                    .file_session
+                    .enter_op(ino, FileSessionOperation::Flush)
+                    .await,
+            );
             let upload_vfs = vfs.clone();
             let block_size = vfs.block_size;
             let reattach = tokio::spawn(async move {

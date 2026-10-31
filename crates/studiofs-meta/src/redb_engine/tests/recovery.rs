@@ -31,6 +31,59 @@ fn test_recover_pending_create_intent_removes_dangling_dentry() {
 }
 
 #[test]
+fn recover_undo_logs_keeps_linked_inode_with_legacy_deferred_delete() {
+    // Earlier builds recorded a deferred delete when one name of a hard-linked
+    // file was unlinked while open (SFS-932).
+    let engine = temp_engine();
+    let attr = engine
+        .create_file(ROOT_INO, b"legacy-open-link.txt", 1000, 1000, 0o644)
+        .unwrap();
+    engine
+        .link(attr.ino, ROOT_INO, b"legacy-open-link-alias")
+        .unwrap();
+    engine
+        .unlink_open_handle(ROOT_INO, b"legacy-open-link.txt")
+        .unwrap();
+    engine
+        .add_deferred_delete(&DeferredDeleteRecord {
+            ino: attr.ino,
+            parent: ROOT_INO,
+            name: b"legacy-open-link.txt".to_vec(),
+            created_at: 0,
+        })
+        .unwrap();
+    engine
+        .append_undo_log(&UndoLogRecord {
+            op_id: u64::MAX,
+            kind: UndoLogKind::DeferredDelete,
+            phase: UndoLogPhase::Started,
+            ino: attr.ino,
+            parent: ROOT_INO,
+            name: b"legacy-open-link.txt".to_vec(),
+            created_at: 0,
+        })
+        .unwrap();
+
+    engine.recover_undo_logs().unwrap();
+
+    assert_eq!(engine.get_attr(attr.ino).unwrap().nlink, 1);
+    assert_eq!(
+        engine
+            .lookup(ROOT_INO, b"legacy-open-link-alias")
+            .unwrap()
+            .ino,
+        attr.ino
+    );
+    assert!(
+        !engine
+            .list_deferred_deletes()
+            .unwrap()
+            .iter()
+            .any(|record| record.ino == attr.ino)
+    );
+}
+
+#[test]
 fn test_recover_undo_logs_replays_deferred_delete() {
     let engine = temp_engine();
     let parent = ROOT_INO;
