@@ -945,10 +945,11 @@ impl PgMetaEngine {
             if target_reached {
                 self.local.reconcile_pending_regular_file_recoveries()?;
             }
-            // Startup judged the rows against a checkpoint that can predate their
-            // published parents; re-judge them against the caught-up head.
             if target_reached
-                && self.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()?
+                && self
+                    .local
+                    .pending_uploaded_regular_file_recoveries()?
+                    .is_empty()
             {
                 // Replay can retire the rows that made startup repair read-only.
                 self.local
@@ -1683,12 +1684,28 @@ impl PgMetaEngine {
                 StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog,
             )?;
             engine.restore_pending_state_from_local_log()?;
+            // The checkpoint can predate published parents of recovery rows; judge
+            // the rows at head, before workers or the VFS startup scan can run.
+            if let Err(error) = engine
+                .run_startup_catch_up_session(MetadataSyncSource::Manual, &AtomicBool::new(false))
+            {
+                warn!(
+                    error = %error,
+                    "redb repair could not reach the remote head before graph recovery"
+                );
+            }
             let recovery_resolved =
                 engine.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()?;
             if recovery_resolved {
                 engine
                     .local
                     .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
+                // The catch-up session saw the marker before restore resolved it;
+                // only that check degraded, so let the background poll finish.
+                engine.update_pg_sync_lifecycle(|current| match current {
+                    PgSyncLifecycle::Degraded => PgSyncLifecycle::CatchingUp,
+                    current => current,
+                });
             } else {
                 warn!(
                     "redb graph recovery remains pending because an uploaded recovery row could not be safely restored or retired"

@@ -4117,82 +4117,71 @@ fn poisoned_hidden_window_cache_falls_back_without_failing_the_mutation() {
     );
 }
 
-/// SFS-929: startup repair judges recovery rows against a bootstrap checkpoint
-/// that can predate the published parent directory. Catch-up must re-judge the
-/// row at head instead of leaving the volume degraded on every remount.
+/// SFS-929 with real PostgreSQL: the bootstrap checkpoint predates a
+/// published parent directory, and an uploaded child is unpublished at the
+/// crash. Repair startup must judge the child against head, not the checkpoint.
 #[test]
-fn redb_repair_restores_unpublished_uploaded_file_after_catchup_publishes_parent() {
-    let (_dir, pg) = temp_pg_engine_for_unit();
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_redb_repair_restores_unpublished_child_of_dir_published_after_checkpoint() {
+    let dsn = pg_dsn().expect("PostgreSQL regression requires STUDIOFS_TEST_PG_DSN");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-sfs929-repair-child-after-checkpoint");
+    seed_local(&path, &volume.format_info());
+    let options = PgOpenOptions {
+        background_poll: false,
+        ..Default::default()
+    };
+    let pg = PgMetaEngine::open_with_options(&path, options).expect("open writer");
+    pg.create_file(ROOT_INO, b"before-checkpoint", 0, 0, 0o644)
+        .expect("seed entry");
+    pg.pending_state.lock().unwrap().force_flush = true;
+    pg.flush_due_pending().expect("publish seed entry");
+    pg.write_checkpoint_with_lease()
+        .expect("publish checkpoint before parent");
     let parent = pg
-        .create_dir(ROOT_INO, b"published-parent", 0, 0, 0o755)
+        .create_dir(ROOT_INO, b"after-checkpoint", 0, 0, 0o755)
         .expect("create parent");
+    pg.pending_state.lock().unwrap().force_flush = true;
+    pg.flush_due_pending()
+        .expect("publish parent after checkpoint");
+    assert_eq!(pg.replication_backlog().total_ops(), 0, "parent published");
+
     let name = b"unpublished-child.bin";
     let file = pg
         .create_file(parent.ino, name, 0, 0, 0o644)
-        .expect("create pending child");
-    let payload = PayloadRef::new_partial(77_929, 152);
+        .expect("create child");
+    let payload = PayloadRef::new_partial(92_929, 152);
     pg.stage_payload_slice(file.ino, 0, &payload)
-        .expect("stage pending payload");
+        .expect("stage child payload");
     set_file_state(&pg, file.ino, 152, 1);
-    let accepted = pg.get_attr(file.ino).expect("pending attr");
+    let accepted = pg.get_attr(file.ino).expect("child attr");
     assert!(
         pg.mark_regular_file_overlay_object_uploaded_if_matches(
             file.ino,
             accepted.content_epoch,
             payload.object_id,
         )
-        .expect("mark payload uploaded")
+        .expect("mark child uploaded")
     );
+    // The crash happens before the child create reaches PostgreSQL; model the
+    // lost local journal tail the SFS-929 evidence showed.
+    let next = pg.local.get_counter(NEXT_EVENT_SEQ).expect("next event");
+    pg.persist_flushed_event_seq(next)
+        .expect("acknowledge local tail");
+    pg.prune_local_event_log_once().expect("prune local tail");
+    drop(pg);
 
-    let mut checkpoint = pg.local.export_snapshot().expect("export checkpoint");
-    checkpoint.event_log.clear();
-    checkpoint
-        .inodes
-        .retain(|(ino, _)| *ino != file.ino && *ino != parent.ino);
-    checkpoint.dentries.retain(|(key, _)| {
-        key != &encode_dentry_key(ROOT_INO, b"published-parent")
-            && key != &encode_dentry_key(parent.ino, name)
-    });
-    checkpoint
-        .regular_file_overlay
-        .retain(|(ino, _)| *ino != file.ino);
-    pg.local
-        .import_remote_snapshot(&checkpoint)
-        .expect("import checkpoint that predates the parent");
-    assert!(
-        !pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
-            .expect("startup repair against stale checkpoint"),
-        "the parent is not visible yet, so startup cannot restore the child"
-    );
-    pg.local
-        .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)
-        .expect("keep repair marker");
-    pg.transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
-
-    pg.local
-        .apply_replica_serving_state(&[
-            MetaEvent::SetAttr {
-                attr: parent.clone(),
-            },
-            MetaEvent::AddEntry {
-                parent: ROOT_INO,
-                name: b"published-parent".to_vec(),
-                entry: crate::types::DirEntryValue {
-                    ino: parent.ino,
-                    kind: parent.kind,
-                },
-            },
-        ])
-        .expect("catch-up applies the published parent");
-    pg.metadata_startup_target_version
-        .store(0, Ordering::Release);
-    pg.try_complete_catchup_sync().expect("complete catch-up");
+    studiofs_test_support::mark_redb_repair_required(&path).expect("mark repair");
+    {
+        let redb = RedbMetaEngine::open(&path).expect("redb auto-repair");
+        redb.set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)
+            .expect("set repair marker");
+    }
+    let pg = PgMetaEngine::open_with_options(&path, options).expect("repair reopen");
 
     assert_eq!(
-        pg.local
-            .lookup(parent.ino, name)
-            .expect("child restored under caught-up parent")
-            .ino,
+        pg.lookup(parent.ino, name).expect("child restored").ino,
         file.ino
     );
     assert_eq!(
@@ -4206,4 +4195,5 @@ fn redb_repair_restores_unpublished_uploaded_file_after_catchup_publishes_parent
         0
     );
     assert_ne!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+    pg.prepare_for_close().expect("close repaired writer");
 }
