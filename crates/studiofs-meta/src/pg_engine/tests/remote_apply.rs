@@ -8838,6 +8838,155 @@ fn self_replay_uses_local_namespace_events_committed_after_context_capture() {
 }
 
 #[test]
+fn self_replay_rebases_later_published_rename_not_yet_replayed() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let file = pg
+        .create_file(ROOT_INO, b"copy-chain.published", 0, 0, 0o644)
+        .expect("create local copy");
+    let mut attr = pg.get_attr(file.ino).expect("load local copy attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make local copy publishable");
+    let create_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("create end");
+    let create_events = pg
+        .local
+        .read_events_range(start, create_end)
+        .expect("read local create events");
+    let self_create = RemoteApplyCoordinator::project_local_batch(&create_events).events;
+
+    pg.rename_atomic(
+        ROOT_INO,
+        b"copy-chain.published",
+        ROOT_INO,
+        b"copy-chain.next",
+        true,
+        false,
+    )
+    .expect("rename local copy");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("rename end");
+    // The rename is published at a later PG version whose self batch has not replayed.
+    let rename_range = LocalEventRange {
+        start: create_end,
+        end,
+    };
+    pg.mark_local_event_ranges_published_with_prefix(
+        &[rename_range],
+        Some((2, vec![rename_range])),
+    )
+    .expect("record published rename");
+    let overlay = pg.local_overlay_conflicts().expect("local suffix overlay");
+
+    let progress = pg.unprocessed_local_event_progress().expect("progress");
+    RemoteApplyCoordinator::new(&pg.local)
+        .with_local_event_overlay_exclusions(
+            pg.local_event_overlay_exclusions().expect("exclusions"),
+        )
+        .with_published_prefixes(progress.published_prefixes)
+        .apply_decoded_batches(
+            vec![DecodedReplayBatch {
+                batch_version: 1,
+                events: self_create,
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: 0,
+                current_namespace_version: 0,
+                flushed_event_seq: start,
+                next_event_seq: end,
+                initial_overlay: overlay,
+            },
+        )
+        .expect("apply self create");
+
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"copy-chain.published"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "an unreplayed published rename must keep its source absent"
+    );
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, b"copy-chain.next")
+            .expect("published rename destination remains visible")
+            .ino,
+        file.ino
+    );
+}
+
+#[test]
+fn pending_inode_removal_keeps_name_rebound_by_excluded_rename() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let old = create_published_small_file(&pg, ROOT_INO, b"linked.k", 77_301);
+    pg.link(old.ino, ROOT_INO, b"linked.k2")
+        .expect("add second link");
+    let link_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("link end");
+    let link_events = pg
+        .local
+        .read_events_range(start, link_end)
+        .expect("read link events");
+    let self_links = RemoteApplyCoordinator::project_local_batch(&link_events).events;
+    apply_self_replay(
+        &pg,
+        self_links,
+        start,
+        link_end,
+        OverlayConflictSets::default(),
+    );
+
+    // Replace one link; this range is treated as already published and replayed.
+    let replacement = create_published_small_file(&pg, ROOT_INO, b"linked.tmp", 77_302);
+    pg.rename_atomic(ROOT_INO, b"linked.tmp", ROOT_INO, b"linked.k", true, false)
+        .expect("rename replacement over first link");
+    let unlink_start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("unlink start");
+    pg.unlink(ROOT_INO, b"linked.k2")
+        .expect("unlink last old link");
+    let unlink_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("unlink end");
+    let pending = pg
+        .local
+        .read_events_range(unlink_start, unlink_end)
+        .expect("read pending unlink");
+    assert!(
+        pending
+            .iter()
+            .any(|event| matches!(event, MetaEvent::RemoveAttr { ino } if *ino == old.ino)),
+        "unlinking the last link must remove the old inode"
+    );
+
+    let txn = pg.local.begin_write_txn().expect("begin txn");
+    let state = RedbMetaEngine::pending_local_namespace_bindings_in_txn(&txn, &pending)
+        .expect("reduce pending namespace");
+    let _ = txn.abort();
+
+    assert_eq!(
+        state
+            .bindings
+            .get(&encode_dentry_key(ROOT_INO, b"linked.k")),
+        None,
+        "a stale base alias must not clear the live replacement"
+    );
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, b"linked.k")
+            .expect("replacement")
+            .ino,
+        replacement.ino
+    );
+}
+
+#[test]
 fn local_completion_does_not_advance_past_unapplied_published_prefix() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");

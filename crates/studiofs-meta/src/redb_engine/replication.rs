@@ -2710,30 +2710,53 @@ impl RedbMetaEngine {
             ino,
         )?);
         for key in keys {
-            bindings.entry(key).or_insert(None);
+            if bindings.contains_key(&key) {
+                continue;
+            }
+            // A base index row can be stale after a published rename displaced
+            // this inode; only clear names that still resolve to it.
+            let (parent, name) = decode_dentry_key(&key)?;
+            if Self::lookup_merged_exact_in_write_txn(txn, parent, name)?
+                .is_some_and(|entry| entry.ino == ino)
+            {
+                bindings.insert(key, None);
+            }
         }
         Ok(())
     }
 
     /// Reapplies the final namespace bindings from the still-pending local
     /// suffix after an earlier self prefix is mirrored into the base view.
+    /// Rows that already match are skipped; returns whether anything changed.
     pub(crate) fn rebase_pending_local_namespace_in_txn(
         txn: &RedbWriteTransaction<'_>,
-        events: &[crate::events::MetaEvent],
+        state: &PendingLocalNamespaceState,
     ) -> MetaResult<bool> {
-        let state = Self::pending_local_namespace_bindings_in_txn(txn, events)?;
+        let mut changed = false;
         for (key, entry) in &state.bindings {
             let (parent, name) = decode_dentry_key(key)?;
+            if Self::lookup_merged_exact_in_write_txn(txn, parent, name)?.as_ref() == entry.as_ref()
+            {
+                continue;
+            }
             if let Some(entry) = entry {
                 Self::set_dentry_in_txn(txn, parent, name, entry)?;
             } else {
                 Self::remove_dentry_overlay_in_txn(txn, parent, name)?;
             }
+            changed = true;
         }
-        for ino in state.removed_inodes {
-            Self::remove_inode_overlay_in_txn(txn, ino)?;
+        for &ino in &state.removed_inodes {
+            match Self::get_attr_merged_in_write_txn(txn, ino) {
+                Ok(_) => {
+                    Self::remove_inode_overlay_in_txn(txn, ino)?;
+                    changed = true;
+                }
+                Err(MetaError::InodeNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
-        Ok(!state.bindings.is_empty())
+        Ok(changed)
     }
 
     /// Journals, after the write, the name and inode intents

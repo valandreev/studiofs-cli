@@ -9,7 +9,7 @@ use crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Sort ranges and merge overlaps or adjacency without replacing the vector.
-fn merge_local_event_ranges(ranges: &mut Vec<LocalEventRange>) {
+pub(super) fn merge_local_event_ranges(ranges: &mut Vec<LocalEventRange>) {
     if ranges.len() < 2 {
         return;
     }
@@ -36,7 +36,7 @@ fn trim_local_event_ranges_before(ranges: &mut Vec<LocalEventRange>, cursor: u64
 }
 
 /// Remove applied intervals from a sorted range set.
-fn subtract_local_event_ranges(
+pub(super) fn subtract_local_event_ranges(
     ranges: &[LocalEventRange],
     applied: &[LocalEventRange],
 ) -> Vec<LocalEventRange> {
@@ -77,30 +77,19 @@ fn flushed_event_seq_for_progress(
     progress: &super::LocalEventProgress,
     completed: &[LocalEventRange],
 ) -> u64 {
-    let mut applied_published = Vec::new();
-    for (version, ranges) in &progress.published_prefixes {
-        if *version <= applied_version {
-            applied_published.extend_from_slice(ranges);
-        }
-    }
-    merge_local_event_ranges(&mut applied_published);
-
-    // A completed range cannot jump over a publication that has not yet been
-    // replayed locally. Prefixes whose PG version is applied are no longer a
-    // barrier; publications without a mapped prefix remain protected until an
-    // exact self-batch acknowledgement advances the cursor.
+    // A completed range cannot jump over a mapped publication whose PG version
+    // has not replayed locally; once applied, that prefix counts as completed.
+    // Unmapped publications are not barriers, so they cannot pin the cursor.
     let mut barriers = progress.rejected.clone();
-    barriers.extend(subtract_local_event_ranges(
-        &progress.published,
-        &applied_published,
-    ));
-    merge_local_event_ranges(&mut barriers);
     let mut completed = completed.to_vec();
     for (version, ranges) in &progress.published_prefixes {
         if *version <= applied_version {
             completed.extend_from_slice(ranges);
+        } else {
+            barriers.extend_from_slice(ranges);
         }
     }
+    merge_local_event_ranges(&mut barriers);
     merge_local_event_ranges(&mut completed);
     flushed_event_seq_after_completed_ranges(cursor, &completed, &barriers)
 }

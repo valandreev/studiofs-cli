@@ -1,4 +1,5 @@
 use super::LocalEventRange;
+use super::local_state::{merge_local_event_ranges, subtract_local_event_ranges};
 use crate::engine::{MetaError, MetaResult};
 use crate::events::{MetaEvent, decode_event_with_type};
 use crate::redb_engine::layout::{
@@ -298,6 +299,7 @@ pub(super) struct RemoteApplyCoordinator<'a> {
     pub(super) local: &'a RedbMetaEngine,
     local_event_ack_barrier: Option<u64>,
     local_event_overlay_exclusions: Vec<LocalEventRange>,
+    published_prefixes: Vec<(i64, Vec<LocalEventRange>)>,
 }
 
 impl<'a> RemoteApplyCoordinator<'a> {
@@ -306,6 +308,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             local,
             local_event_ack_barrier: None,
             local_event_overlay_exclusions: Vec::new(),
+            published_prefixes: Vec::new(),
         }
     }
 
@@ -319,6 +322,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
         ranges: Vec<LocalEventRange>,
     ) -> Self {
         self.local_event_overlay_exclusions = ranges;
+        self
+    }
+
+    /// Published local prefixes keyed by PG batch version. Prefixes above the
+    /// replayed version still represent local state the base view lacks.
+    pub(super) fn with_published_prefixes(
+        mut self,
+        prefixes: Vec<(i64, Vec<LocalEventRange>)>,
+    ) -> Self {
+        self.published_prefixes = prefixes;
         self
     }
 
@@ -587,13 +600,28 @@ impl<'a> RemoteApplyCoordinator<'a> {
         if excluded_ranges.is_empty() && execution.is_none() {
             return Ok(Self::overlay_conflicts_for_events(events));
         }
-        let first_seq = event_start.max(1);
-        let mut excluded_index = excluded_ranges.partition_point(|range| range.end <= first_seq);
+        let mut included = Self::local_event_inclusion(event_start, excluded_ranges);
         let mut overlay = OverlayConflictSets::default();
         for (index, event) in events.iter().enumerate() {
             if let Some(execution) = execution {
                 execution.check()?;
             }
+            if included(index) {
+                Self::add_event_overlay_conflicts(&mut overlay, event);
+            }
+        }
+        Ok(overlay)
+    }
+
+    /// Returns a predicate for ascending event indexes from `event_start`
+    /// (event seqs start at 1) that is true outside sorted `excluded_ranges`.
+    fn local_event_inclusion(
+        event_start: u64,
+        excluded_ranges: &[LocalEventRange],
+    ) -> impl FnMut(usize) -> bool + '_ {
+        let first_seq = event_start.max(1);
+        let mut excluded_index = excluded_ranges.partition_point(|range| range.end <= first_seq);
+        move |index| {
             let seq = first_seq.saturating_add(index as u64);
             while excluded_ranges
                 .get(excluded_index)
@@ -601,14 +629,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
             {
                 excluded_index += 1;
             }
-            if excluded_ranges
+            excluded_ranges
                 .get(excluded_index)
                 .is_none_or(|range| range.start > seq)
-            {
-                Self::add_event_overlay_conflicts(&mut overlay, event);
-            }
         }
-        Ok(overlay)
     }
 
     pub(super) fn add_event_overlay_conflicts(
@@ -2411,8 +2435,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
             execution,
         )?;
         context.next_event_seq = replay_next_event_seq;
-        let mut overlay =
-            Self::merge_overlay_conflicts(&context.initial_overlay, &appended_overlay);
+        let mut overlay = std::mem::take(&mut context.initial_overlay);
+        Self::extend_overlay_conflicts(&mut overlay, &appended_overlay);
         let mut applied_any = false;
         let mut max_version = context.last_seq;
         let mut max_namespace_version = context.current_namespace_version;
@@ -2517,41 +2541,37 @@ impl<'a> RemoteApplyCoordinator<'a> {
             execution.check()?;
         }
         let mut final_overlay = Self::merge_overlay_conflicts(&overlay, &replay_protected_overlay);
-        let pending_namespace_events = if applied_self_batch {
+        let pending_namespace = if applied_self_batch {
+            // Published prefixes whose PG version has not replayed yet are
+            // still local-only state for the base view, so rebase them too.
+            let mut unreplayed = self
+                .published_prefixes
+                .iter()
+                .filter(|(version, _)| *version > max_version)
+                .flat_map(|(_, ranges)| ranges.iter().copied())
+                .collect::<Vec<_>>();
+            merge_local_event_ranges(&mut unreplayed);
+            let exclusions =
+                subtract_local_event_ranges(&self.local_event_overlay_exclusions, &unreplayed);
+            let mut included = Self::local_event_inclusion(context.flushed_event_seq, &exclusions);
             let events = RedbMetaEngine::read_events_range_in_write_txn_with_check(
                 txn,
                 context.flushed_event_seq,
                 replay_next_event_seq,
                 || execution.map_or(Ok(()), RemoteReplayExecution::check),
-            )?;
-            events
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, event)| {
-                    // Event seqs start at 1; match overlay_conflicts_for_local_events.
-                    let seq = context
-                        .flushed_event_seq
-                        .max(1)
-                        .saturating_add(index as u64);
-                    (!self
-                        .local_event_overlay_exclusions
-                        .iter()
-                        .any(|range| range.start <= seq && seq < range.end))
-                    .then_some(event)
-                })
-                .collect::<Vec<_>>()
+            )?
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, event)| included(index).then_some(event))
+            .collect::<Vec<_>>();
+            let state = RedbMetaEngine::pending_local_namespace_bindings_in_txn(txn, &events)?;
+            final_overlay
+                .dentry_keys
+                .extend(state.bindings.keys().cloned());
+            Some(state)
         } else {
-            Vec::new()
+            None
         };
-        let pending_namespace_bindings = if applied_self_batch {
-            RedbMetaEngine::pending_local_namespace_bindings_in_txn(txn, &pending_namespace_events)?
-                .bindings
-        } else {
-            HashMap::new()
-        };
-        final_overlay
-            .dentry_keys
-            .extend(pending_namespace_bindings.keys().cloned());
         applied_any |= self.reconcile_regular_file_serving_from_base_with_overlay_in_txn(
             txn,
             &reconcile_inodes,
@@ -2562,14 +2582,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
             &reconcile_dentry_keys,
             &final_overlay,
         )?;
-        if applied_self_batch {
+        if let Some(pending_namespace) = &pending_namespace {
             // A self batch reaches base before its local prefix is necessarily
-            // acknowledged, so restore the journal's final namespace state.
+            // acknowledged, so restore the journal's final namespace state. The
+            // foreground writes that produced it already announced it to the
+            // kernel; the reducer only clears names still bound to removed inodes.
             applied_any |= txn.without_invalidations(|| {
-                RedbMetaEngine::rebase_pending_local_namespace_in_txn(
-                    txn,
-                    &pending_namespace_events,
-                )
+                RedbMetaEngine::rebase_pending_local_namespace_in_txn(txn, pending_namespace)
             })?;
         }
         if let Some(execution) = execution {
