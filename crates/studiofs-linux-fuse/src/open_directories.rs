@@ -3,7 +3,9 @@
 //! A replacement rename or `rmdir` removes the directory inode from metadata
 //! while an `opendir` handle may still reference it. Linux sends `fstat` on that
 //! handle as an inode-only FUSE_GETATTR, so the adapter answers from the last
-//! attributes it observed with `nlink = 0`, matching local filesystems.
+//! attributes it observed with `nlink = 0`, matching local filesystems. A
+//! removed directory the kernel still references by lookup (for example a
+//! process's working directory) stays observable the same way until FORGET.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,6 +16,7 @@ use crate::invalidation::{LIVENESS_SHARDS, liveness_shard, lock_poison_tolerant}
 
 struct OpenDirectory {
     handles: u64,
+    removed: bool,
     attr: InodeAttr,
 }
 
@@ -43,6 +46,7 @@ impl OpenDirectoryAttrs {
             })
             .or_insert_with(|| OpenDirectory {
                 handles: 1,
+                removed: false,
                 attr: attr.clone(),
             });
         OpenDirectoryAttrGuard {
@@ -58,6 +62,28 @@ impl OpenDirectoryAttrs {
         }
         if let Some(open) = lock_poison_tolerant(shard(&self.shards, attr.ino)).get_mut(&attr.ino) {
             open.attr = attr.clone();
+        }
+    }
+
+    /// Keep a removed directory observable while the kernel still looks it up.
+    pub(crate) fn retain_removed(&self, attr: &InodeAttr) {
+        let mut shard = lock_poison_tolerant(shard(&self.shards, attr.ino));
+        let entry = shard.entry(attr.ino).or_insert_with(|| OpenDirectory {
+            handles: 0,
+            removed: true,
+            attr: attr.clone(),
+        });
+        entry.removed = true;
+    }
+
+    /// Drop a removed directory's snapshot once the kernel forgot it.
+    pub(crate) fn release_removed(&self, ino: u64) {
+        let mut shard = lock_poison_tolerant(shard(&self.shards, ino));
+        if let Some(entry) = shard.get_mut(&ino) {
+            entry.removed = false;
+            if entry.handles == 0 {
+                shard.remove(&ino);
+            }
         }
     }
 
@@ -83,7 +109,7 @@ impl Drop for OpenDirectoryAttrGuard {
         let mut shard = lock_poison_tolerant(shard(&self.shards, self.ino));
         if let Some(open) = shard.get_mut(&self.ino) {
             open.handles -= 1;
-            if open.handles == 0 {
+            if open.handles == 0 && !open.removed {
                 shard.remove(&self.ino);
             }
         }

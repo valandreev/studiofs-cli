@@ -1285,6 +1285,9 @@ fn forget_request_with(
 ) {
     if let Some(state) = state {
         state.inode_liveness.forget(ino, nlookup);
+        if !state.inode_liveness.has_lookup_ref(ino) {
+            state.open_directories.release_removed(ino);
+        }
     }
     reply_none();
 }
@@ -2225,9 +2228,21 @@ impl SessionState {
         if self.read_only {
             return Err(libc::EROFS);
         }
+        // Another process may still use the directory as its working directory.
+        let removed = self.vfs.lookup(parent, name).ok();
         self.vfs
             .rmdir(parent, name)
-            .map_err(|error| vfs_err_to_errno(&error))
+            .map_err(|error| vfs_err_to_errno(&error))?;
+        if let Some(attr) = removed
+            && self.inode_liveness.has_lookup_ref(attr.ino)
+        {
+            self.open_directories.retain_removed(&attr);
+            // FORGET may have run before the snapshot was stored.
+            if !self.inode_liveness.has_lookup_ref(attr.ino) {
+                self.open_directories.release_removed(attr.ino);
+            }
+        }
+        Ok(())
     }
 
     fn rename(&self, parent: u64, name: &[u8], newparent: u64, newname: &[u8]) -> Result<(), i32> {
@@ -7453,6 +7468,40 @@ mod tests {
 
         assert_eq!(replies.load(Ordering::Relaxed), 1);
         assert!(!state.inode_liveness.is_live(42));
+    }
+
+    #[test]
+    fn removed_working_directory_getattr_survives_until_forget() {
+        // xfstests generic/011: dirstress chdir("..") from a stressdir that a
+        // sibling process removed; the kernel first revalidates the cwd inode.
+        let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-removed-cwd")
+            .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let cwd = fixture.vfs().mkdir(1, b"stressdir", 0, 0, 0o755).unwrap();
+        let unreferenced = fixture.vfs().mkdir(1, b"other", 0, 0, 0o755).unwrap();
+        let lookup = state.inode_liveness.reserve_lookup(cwd.ino);
+        assert!(lookup.begin_reply());
+        assert!(lookup.commit().is_some());
+        assert!(state.inode_liveness.has_lookup_ref(cwd.ino));
+
+        state.rmdir(1, b"stressdir").unwrap();
+        state.rmdir(1, b"other").unwrap();
+
+        let removed = state
+            .getattr(cwd.ino)
+            .expect("a removed directory the kernel still references stays observable");
+        assert_eq!(removed.st_ino, cwd.ino);
+        assert_eq!(removed.st_mode & libc::S_IFMT, libc::S_IFDIR);
+        assert_eq!(removed.st_nlink, 0);
+        assert_eq!(state.getattr(unreferenced.ino).err(), Some(libc::ENOENT));
+
+        super::forget_request_with(Some(&state), cwd.ino, 1, || {});
+        assert_eq!(state.getattr(cwd.ino).err(), Some(libc::ENOENT));
     }
 
     #[test]

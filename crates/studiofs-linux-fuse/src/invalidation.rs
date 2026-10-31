@@ -120,6 +120,14 @@ impl FuseInodeLiveness {
         }
     }
 
+    /// Whether the kernel holds a committed lookup reference to `ino`.
+    pub(crate) fn has_lookup_ref(&self, ino: u64) -> bool {
+        lock_poison_tolerant(self.inner.state(ino))
+            .lookup_refs
+            .get(&ino)
+            .is_some_and(|refs| *refs != 0)
+    }
+
     #[cfg(test)]
     pub(crate) fn is_live(&self, ino: u64) -> bool {
         if ino == ROOT_INODE {
