@@ -962,11 +962,15 @@ impl MetaFsOps for RedbMetaEngine {
         } else {
             None
         };
-        let new_parent_seed = if src_entry.kind == FileType::Directory && parent != new_parent {
-            Some(Self::get_attr_merged_in_write_txn(&txn, new_parent)?)
-        } else {
-            None
-        };
+        let displaces_dir = dst_entry_opt
+            .as_ref()
+            .is_some_and(|dst| dst.kind == FileType::Directory);
+        let new_parent_seed =
+            if (src_entry.kind == FileType::Directory && parent != new_parent) || displaces_dir {
+                Some(Self::get_attr_merged_in_write_txn(&txn, new_parent)?)
+            } else {
+                None
+            };
         let mut displaced = None;
         let mut displaced_set_attr = None;
         let mut displaced_remove_attr_ino = None;
@@ -1025,18 +1029,46 @@ impl MetaFsOps for RedbMetaEngine {
                 Self::set_inode_in_txn(&txn, &attr)?;
                 moved_dir_attr = Some(attr);
             }
-            if src_entry.kind == FileType::Directory && parent != new_parent {
-                if let Some(mut attr) = old_parent_attr.take() {
-                    attr.nlink = attr.nlink.saturating_sub(1);
-                    attr.touch_mtime();
-                    Self::set_inode_in_txn(&txn, &attr)?;
-                    old_parent_attr = Some(attr);
-                }
-                if let Some(mut attr) = new_parent_attr.take() {
+            if let Some(mut attr) = old_parent_attr.take() {
+                attr.nlink = attr.nlink.saturating_sub(1);
+                attr.touch_mtime();
+                Self::set_inode_in_txn(&txn, &attr)?;
+                old_parent_attr = Some(attr);
+            }
+            if let Some(mut attr) = new_parent_attr.take() {
+                if src_entry.kind == FileType::Directory && parent != new_parent {
                     attr.nlink += 1;
-                    attr.touch_mtime();
-                    Self::set_inode_in_txn(&txn, &attr)?;
-                    new_parent_attr = Some(attr);
+                }
+                // The displaced directory's ".." link to new_parent goes with it.
+                if displaces_dir {
+                    attr.nlink = attr.nlink.saturating_sub(1);
+                }
+                attr.touch_mtime();
+                Self::set_inode_in_txn(&txn, &attr)?;
+                new_parent_attr = Some(attr);
+            }
+
+            // An empty draft's own names stay out of PG, so its RenameEntry is
+            // projected away; journal a replaced file's removal on its own.
+            if src_entry.kind == FileType::RegularFile
+                && dst_entry_opt
+                    .as_ref()
+                    .is_some_and(|dst| dst.kind != FileType::Directory)
+                && Self::get_attr_merged_in_write_txn(&txn, src_entry.ino)?
+                    .is_unpublished_empty_draft()
+            {
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::RemoveEntry {
+                        parent: new_parent,
+                        name: new_name.to_vec(),
+                    },
+                )?;
+                if let Some(attr) = displaced_set_attr.take() {
+                    Self::append_event_in_txn(&txn, &crate::events::MetaEvent::SetAttr { attr })?;
+                }
+                if let Some(ino) = displaced_remove_attr_ino.take() {
+                    Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveAttr { ino })?;
                 }
             }
 

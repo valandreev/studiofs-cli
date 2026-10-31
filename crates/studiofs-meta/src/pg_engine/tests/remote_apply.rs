@@ -10039,3 +10039,126 @@ fn later_complete_foreign_publish_does_not_leave_protected_intermediate_attr() {
         vec![77_105, 77_106]
     );
 }
+
+#[test]
+fn renamed_empty_draft_stays_out_of_pg_after_local_unlink() {
+    // generic/011: an empty file renamed and then unlinked must not leave a
+    // hidden name that keeps its directory from being removed.
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let dir = pg
+        .create_dir(ROOT_INO, b"stress.0", 0, 0, 0o755)
+        .expect("mkdir stress dir");
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start).expect("ack setup");
+
+    pg.create_file(dir.ino, b"entry.1", 0, 0, 0o644)
+        .expect("create empty draft");
+    pg.rename_atomic(dir.ino, b"entry.1", dir.ino, b"entry.2", true, false)
+        .expect("rename empty draft");
+    let rename_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("rename end");
+    let events = pg
+        .local
+        .read_events_range(start, rename_end)
+        .expect("read draft events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    assert_eq!(
+        projected.visible_ops, 0,
+        "an empty draft's rename must stay out of PG like its create: {:?}",
+        projected.events
+    );
+
+    pg.unlink(dir.ino, b"entry.2")
+        .expect("unlink renamed draft");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("unlink end");
+    // The flusher retires the draft-only unlink window without publishing it.
+    pg.complete_local_event_ranges(&[LocalEventRange {
+        start: rename_end,
+        end,
+    }])
+    .expect("retire local-only unlink");
+    let overlay = pg.local_overlay_conflicts().expect("overlay");
+    apply_self_replay(&pg, projected.events, start, end, overlay);
+
+    pg.rmdir(ROOT_INO, b"stress.0")
+        .expect("the stress directory must be empty after replay");
+}
+
+#[test]
+fn empty_draft_renamed_over_published_file_publishes_only_the_removal() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let dir = pg
+        .create_dir(ROOT_INO, b"stress.1", 0, 0, 0o755)
+        .expect("mkdir stress dir");
+    let published = create_published_small_file(&pg, dir.ino, b"entry.2", 77_301);
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start).expect("ack setup");
+
+    pg.create_file(dir.ino, b"entry.1", 0, 0, 0o644)
+        .expect("create empty draft");
+    pg.rename_atomic(dir.ino, b"entry.1", dir.ino, b"entry.2", true, false)
+        .expect("rename draft over published file");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("rename end");
+    let events = pg.local.read_events_range(start, end).expect("read events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+
+    assert!(
+        projected.events.iter().any(|event| matches!(
+            event,
+            MetaEvent::RemoveEntry { parent, name } if *parent == dir.ino && name == b"entry.2"
+        )),
+        "peers must drop the replaced name: {:?}",
+        projected.events
+    );
+    assert!(
+        projected.events.iter().any(|event| matches!(
+            event,
+            MetaEvent::RemoveAttr { ino } if *ino == published.ino
+        )),
+        "peers must retire the replaced inode: {:?}",
+        projected.events
+    );
+    assert!(
+        !projected.events.iter().any(|event| matches!(
+            event,
+            MetaEvent::RenameEntry { .. } | MetaEvent::AddEntry { .. }
+        )),
+        "the draft's own binding must stay local: {:?}",
+        projected.events
+    );
+    assert!(
+        RemoteApplyCoordinator::matching_local_prefix(&events, &projected.events, None)
+            .expect("match projected prefix")
+            .is_some(),
+        "the self batch must still acknowledge its local prefix"
+    );
+}
+
+#[test]
+fn self_batch_after_hidden_draft_rename_matches_its_local_prefix() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.create_file(ROOT_INO, b"draft.a", 0, 0, 0o644)
+        .expect("create empty draft");
+    pg.rename_atomic(ROOT_INO, b"draft.a", ROOT_INO, b"draft.b", true, false)
+        .expect("rename empty draft");
+    pg.create_dir(ROOT_INO, b"visible", 0, 0, 0o755)
+        .expect("mkdir after the hidden rename");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+    let events = pg.local.read_events_range(start, end).expect("read events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+
+    assert!(
+        !projected
+            .events
+            .iter()
+            .any(|event| matches!(event, MetaEvent::RenameEntry { .. })),
+        "the draft rename must stay local: {:?}",
+        projected.events
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&events, &projected.events, None)
+            .expect("match projected prefix"),
+        Some(events.len()),
+        "the self batch must acknowledge the whole window"
+    );
+}

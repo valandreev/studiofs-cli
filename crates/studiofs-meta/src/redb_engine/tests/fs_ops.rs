@@ -1098,11 +1098,17 @@ fn rename_over_hardlink_updates_displaced_inode_ctime() {
     assert_eq!(after.mtime, before.mtime);
     let event_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
     let events = engine.read_events_range(event_start, event_end).unwrap();
-    assert!(events.iter().any(|event| matches!(
-        event,
-        crate::events::MetaEvent::RenameEntry { displaced_set_attr, .. }
-            if displaced_set_attr.as_ref().as_ref().is_some_and(|attr| attr.ino == target.ino && attr.ctime == after.ctime)
-    )));
+    // An empty-draft source journals the displacement beside its RenameEntry.
+    assert!(events.iter().any(|event| match event {
+        crate::events::MetaEvent::RenameEntry { displaced_set_attr, .. } => displaced_set_attr
+            .as_ref()
+            .as_ref()
+            .is_some_and(|attr| attr.ino == target.ino && attr.ctime == after.ctime),
+        crate::events::MetaEvent::SetAttr { attr } => {
+            attr.ino == target.ino && attr.ctime == after.ctime
+        }
+        _ => false,
+    }));
 }
 
 #[test]
@@ -1366,20 +1372,33 @@ fn rename_retained_displaced_inode_replicates_removal_only_when_never_published(
 
         let end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
         let events = engine.read_events_range(start, end).unwrap();
-        let (set_attr, remove_ino) = events
-            .iter()
-            .find_map(|event| match event {
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, crate::events::MetaEvent::RenameEntry { .. })),
+            "rename should append RenameEntry"
+        );
+        // An empty-draft source journals the displacement beside its RenameEntry.
+        let (mut set_attr, mut remove_ino) = (None, None);
+        for event in &events {
+            match event {
                 crate::events::MetaEvent::RenameEntry {
                     displaced_set_attr,
                     displaced_remove_attr_ino,
                     ..
-                } => Some((
-                    displaced_set_attr.as_ref().as_ref().map(|attr| attr.ino),
-                    *displaced_remove_attr_ino,
-                )),
-                _ => None,
-            })
-            .expect("rename should append RenameEntry");
+                } => {
+                    set_attr = set_attr.or(displaced_set_attr.as_ref().as_ref().map(|attr| attr.ino));
+                    remove_ino = remove_ino.or(*displaced_remove_attr_ino);
+                }
+                crate::events::MetaEvent::SetAttr { attr } if attr.ino == target.ino => {
+                    set_attr = Some(attr.ino);
+                }
+                crate::events::MetaEvent::RemoveAttr { ino } if *ino == target.ino => {
+                    remove_ino = Some(*ino);
+                }
+                _ => {}
+            }
+        }
         if published {
             assert_eq!((set_attr, remove_ino), (Some(target.ino), None));
         } else {
@@ -1425,3 +1444,31 @@ fn rename_onto_own_hardlink_preserves_both_names_and_link_count() {
 }
 
 // === xattr Tests ===
+
+#[test]
+fn rename_directory_over_empty_directory_drops_replaced_parent_link() {
+    let engine = temp_engine();
+    let same = engine.create_dir(ROOT_INO, b"same", 0, 0, 0o755).unwrap();
+    engine.create_dir(same.ino, b"src", 0, 0, 0o755).unwrap();
+    engine.create_dir(same.ino, b"dst", 0, 0, 0o755).unwrap();
+    let other = engine.create_dir(ROOT_INO, b"other", 0, 0, 0o755).unwrap();
+    engine.create_dir(other.ino, b"dst", 0, 0, 0o755).unwrap();
+    assert_eq!(engine.get_attr(same.ino).unwrap().nlink, 4);
+    let event_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    engine.rename_atomic(same.ino, b"src", same.ino, b"dst", true, false).unwrap();
+    assert_eq!(engine.get_attr(same.ino).unwrap().nlink, 3, "same parent");
+    // Peers apply the parent nlink carried by the event.
+    let events = engine
+        .read_events_range(event_start, engine.get_counter(NEXT_EVENT_SEQ).unwrap())
+        .unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::events::MetaEvent::RenameEntry { new_parent_attr, .. }
+            if new_parent_attr.as_ref().as_ref().is_some_and(|attr| attr.ino == same.ino && attr.nlink == 3)
+    )));
+
+    engine.rename_atomic(same.ino, b"dst", other.ino, b"dst", true, false).unwrap();
+    assert_eq!(engine.get_attr(same.ino).unwrap().nlink, 2, "old parent");
+    assert_eq!(engine.get_attr(other.ino).unwrap().nlink, 3, "new parent");
+}
