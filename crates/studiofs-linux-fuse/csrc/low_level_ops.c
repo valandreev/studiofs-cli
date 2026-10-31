@@ -129,11 +129,7 @@ static int studiofs_linux_fuse_set_feature_flag_compat(struct fuse_conn_info *co
 
 static int studiofs_linux_fuse_get_feature_flag_compat(struct fuse_conn_info *conn,
                                                        uint64_t flag) {
-#if FUSE_VERSION >= FUSE_MAKE_VERSION(3, 17)
-    return fuse_get_feature_flag(conn, flag);
-#else
-    return flag <= UINT32_MAX && (conn->want & (uint32_t)flag) != 0;
-#endif
+    return (studiofs_linux_fuse_enabled_features(conn) & flag) != 0;
 }
 
 static uint64_t studiofs_linux_fuse_capable_features(const struct fuse_conn_info *conn) {

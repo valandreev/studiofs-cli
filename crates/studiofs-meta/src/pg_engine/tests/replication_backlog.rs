@@ -4116,3 +4116,134 @@ fn poisoned_hidden_window_cache_falls_back_without_failing_the_mutation() {
         "the fallback must clear the poison"
     );
 }
+
+/// SFS-929 with real PostgreSQL: the bootstrap checkpoint predates a
+/// published parent directory, and an uploaded child is unpublished at the
+/// crash. Repair startup must judge the child against head, not the checkpoint.
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_redb_repair_restores_unpublished_child_of_dir_published_after_checkpoint() {
+    redb_repair_restores_unpublished_child(0);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_redb_repair_catches_up_more_than_one_session() {
+    let _page_limit = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1");
+    redb_repair_restores_unpublished_child(20);
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_redb_repair_catch_up_stops_at_deadline_and_stays_degraded() {
+    let _page_limit = set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1");
+    let _deadline = set_test_env("STUDIOFS_PG_REPAIR_CATCH_UP_TIMEOUT_MS", "1");
+    redb_repair_unpublished_child_scenario(20, false);
+}
+
+fn redb_repair_restores_unpublished_child(tail_batches: usize) {
+    redb_repair_unpublished_child_scenario(tail_batches, true);
+}
+
+fn redb_repair_unpublished_child_scenario(tail_batches: usize, expect_restored: bool) {
+    let dsn = pg_dsn().expect("PostgreSQL regression requires STUDIOFS_TEST_PG_DSN");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-sfs929-repair-child-after-checkpoint");
+    seed_local(&path, &volume.format_info());
+    let options = PgOpenOptions {
+        background_poll: false,
+        ..Default::default()
+    };
+    let pg = PgMetaEngine::open_with_options(&path, options).expect("open writer");
+    pg.create_file(ROOT_INO, b"before-checkpoint", 0, 0, 0o644)
+        .expect("seed entry");
+    pg.pending_state.lock().unwrap().force_flush = true;
+    pg.flush_due_pending().expect("publish seed entry");
+    pg.write_checkpoint_with_lease()
+        .expect("publish checkpoint before parent");
+    let checkpoint_head = pg.remote_metadata_head_version().expect("checkpoint head");
+    for index in 0..tail_batches {
+        pg.create_dir(ROOT_INO, format!("tail-{index}").as_bytes(), 0, 0, 0o755)
+            .expect("create tail entry");
+        pg.pending_state.lock().unwrap().force_flush = true;
+        pg.flush_due_pending().expect("publish tail batch");
+    }
+    assert!(
+        pg.remote_metadata_head_version().expect("tail head") - checkpoint_head
+            >= tail_batches as i64
+    );
+    let parent = pg
+        .create_dir(ROOT_INO, b"after-checkpoint", 0, 0, 0o755)
+        .expect("create parent");
+    pg.pending_state.lock().unwrap().force_flush = true;
+    pg.flush_due_pending()
+        .expect("publish parent after checkpoint");
+    assert_eq!(pg.replication_backlog().total_ops(), 0, "parent published");
+
+    let name = b"unpublished-child.bin";
+    let file = pg
+        .create_file(parent.ino, name, 0, 0, 0o644)
+        .expect("create child");
+    let payload = PayloadRef::new_partial(92_929, 152);
+    pg.stage_payload_slice(file.ino, 0, &payload)
+        .expect("stage child payload");
+    set_file_state(&pg, file.ino, 152, 1);
+    let accepted = pg.get_attr(file.ino).expect("child attr");
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(
+            file.ino,
+            accepted.content_epoch,
+            payload.object_id,
+        )
+        .expect("mark child uploaded")
+    );
+    // The crash happens before the child create reaches PostgreSQL; model the
+    // lost local journal tail the SFS-929 evidence showed.
+    let next = pg.local.get_counter(NEXT_EVENT_SEQ).expect("next event");
+    pg.persist_flushed_event_seq(next)
+        .expect("acknowledge local tail");
+    pg.prune_local_event_log_once().expect("prune local tail");
+    drop(pg);
+
+    studiofs_test_support::mark_redb_repair_required(&path).expect("mark repair");
+    {
+        let redb = RedbMetaEngine::open(&path).expect("redb auto-repair");
+        redb.set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)
+            .expect("set repair marker");
+    }
+    let pg = PgMetaEngine::open_with_options(&path, options).expect("repair reopen");
+
+    if !expect_restored {
+        assert!(
+            pg.lookup(parent.ino, name).is_err(),
+            "an expired catch-up must not judge rows mid-tail"
+        );
+        assert_eq!(
+            pg.local
+                .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+                .expect("repair marker"),
+            1
+        );
+        assert_eq!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Degraded);
+        pg.prepare_for_close().expect("close degraded writer");
+        return;
+    }
+    assert_eq!(
+        pg.lookup(parent.ino, name).expect("child restored").ino,
+        file.ino
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, accepted.size).expect("restored payload"),
+        vec![payload.object_id]
+    );
+    assert_eq!(
+        pg.local
+            .get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+            .expect("repair marker"),
+        0
+    );
+    assert_eq!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert!(pg.pg_sync_status().allows_new_mutations());
+    pg.prepare_for_close().expect("close repaired writer");
+}
