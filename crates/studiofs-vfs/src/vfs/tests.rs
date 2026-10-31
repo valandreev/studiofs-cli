@@ -18205,6 +18205,43 @@ fn attr_only_setattr_size_uses_regular_non_deferred_path() {
     });
 }
 
+#[test]
+fn sfs930_rename_over_directory_with_deferred_setattr_reports_zero_links() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("sfs930-deferred-dir-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs930-deferred-dir");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        vfs.mkdir(ROOT_INO, b"dir1", 0, 0, 0o755)
+            .expect("mkdir dir1");
+        let target = vfs
+            .mkdir(ROOT_INO, b"dir2", 0, 0, 0o755)
+            .expect("mkdir dir2");
+        // Keep the chmod queued so the rename overtakes it.
+        vfs.state
+            .namespace
+            .deferred
+            .batch_linger_override_ms
+            .store(3_600_000, AtomicOrdering::Release);
+        vfs.setattr_attr_only_deferred_metadata(
+            target.ino,
+            SetattrArgs {
+                mode: Some(0o700),
+                ..SetattrArgs::default()
+            },
+            rt.handle(),
+        )
+        .expect("defer chmod");
+        assert!(vfs.has_deferred_namespace_metadata(target.ino));
+
+        vfs.rename(ROOT_INO, b"dir1", ROOT_INO, b"dir2", true)
+            .expect("rename over directory");
+
+        let displaced = vfs.getattr(target.ino).expect("queued attr still answers");
+        assert_eq!(displaced.nlink, 0, "a displaced directory has no links");
+        assert_eq!(displaced.mode & 0o777, 0o700);
+    });
+}
+
 /// Create a file, commit its deferred create, queue an attr-only setattr, and
 /// unlink the file before the setattr batch commits (SFS-910).
 fn assert_unlink_after_deferred_setattr_keeps_mount_writable(

@@ -2066,15 +2066,15 @@ impl SessionState {
         ino: u64,
         args: SetattrArgs,
     ) -> Result<InodeAttr, i32> {
-        if linux_fuse_setattr_args_are_attr_only(&args) {
-            return self
-                .vfs
+        let result = if linux_fuse_setattr_args_are_attr_only(&args) {
+            self.vfs
                 .setattr_attr_only_deferred_metadata(ino, args, &self.runtime_handle)
-                .map_err(|error| vfs_err_to_errno(&error));
-        }
-        self.vfs
-            .setattr_with_handle(file_handle, ino, args)
-            .map_err(|error| vfs_err_to_errno(&error))
+        } else {
+            self.vfs.setattr_with_handle(file_handle, ino, args)
+        };
+        let attr = result.map_err(|error| vfs_err_to_errno(&error))?;
+        self.open_directories.observe(&attr);
+        Ok(attr)
     }
 
     fn create(
@@ -2790,7 +2790,7 @@ impl SessionState {
         file_handle(fi).filter(|fh| self.vfs.get_open_file(*fh).is_some())
     }
 
-    /// `parent_ino` is captured at open, matching macFUSE; the root reports itself.
+    /// The handle's `..` parent is captured at open, matching macFUSE; the root reports itself.
     fn open_dir(&self, attr: &InodeAttr) -> Result<NonNull<DirectoryHandle>, i32> {
         let ino = attr.ino;
         let liveness = self.inode_liveness.open_handle(ino);
@@ -4570,6 +4570,17 @@ mod tests {
         let first = open();
         // A second handle keeps the snapshot alive after the first release.
         let second = open();
+        // fchmod on the handle: the setattr reply must refresh the snapshot.
+        state
+            .setattr(
+                None,
+                target.ino,
+                super::SetattrArgs {
+                    mode: Some(0o700),
+                    ..super::SetattrArgs::default()
+                },
+            )
+            .unwrap();
 
         state.rename(1, b"dir1", 1, b"dir2").unwrap();
         state.rename(1, b"dir3", 1, b"dir4").unwrap();
@@ -4580,6 +4591,7 @@ mod tests {
         assert_eq!(displaced.st_ino, target.ino);
         assert_eq!(displaced.st_mode & libc::S_IFMT, libc::S_IFDIR);
         assert_eq!(displaced.st_nlink, 0);
+        assert_eq!(displaced.st_mode & 0o777, 0o700);
         assert_eq!(state.getattr(unopened_target.ino).err(), Some(libc::ENOENT));
 
         // SAFETY: this test exclusively owns the handles returned by open_dir.
@@ -4587,6 +4599,18 @@ mod tests {
         assert_eq!(state.getattr(target.ino).unwrap().st_nlink, 0);
         // SAFETY: as above.
         drop(unsafe { Box::from_raw(second.as_ptr()) });
+        // The deferred chmod batch still answers until it settles against the removed inode.
+        fixture
+            .runtime()
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    vfs.wait_for_deferred_namespace_metadata_or_shutdown(target.ino),
+                )
+                .await
+            })
+            .expect("deferred chmod settles")
+            .expect("deferred chmod drops without error");
         assert_eq!(state.getattr(target.ino).err(), Some(libc::ENOENT));
     }
 

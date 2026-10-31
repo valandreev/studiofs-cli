@@ -3831,6 +3831,18 @@ impl StudioVfs {
             if let Some(dirty_attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
                 dirty_attr.nlink = attr.nlink;
             }
+            // A lingering attr-only setattr still answers getattr for the displaced inode.
+            if let Some(deferred_attr) = self
+                .state
+                .namespace
+                .deferred
+                .inner
+                .lock()
+                .attrs
+                .get_mut(&ino)
+            {
+                deferred_attr.nlink = attr.nlink;
+            }
             self.invalidate_attr_read_cache([ino]);
             if attr.nlink == 0 {
                 self.retire_os_cache_inode(ino);

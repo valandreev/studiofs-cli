@@ -6,11 +6,11 @@
 //! attributes it observed with `nlink = 0`, matching local filesystems.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use studiofs_meta::{FileType, InodeAttr};
 
-use crate::invalidation::LIVENESS_SHARDS;
+use crate::invalidation::{LIVENESS_SHARDS, liveness_shard, lock_poison_tolerant};
 
 struct OpenDirectory {
     handles: u64,
@@ -19,7 +19,6 @@ struct OpenDirectory {
 
 type Shard = Mutex<HashMap<u64, OpenDirectory>>;
 
-#[derive(Clone)]
 pub(crate) struct OpenDirectoryAttrs {
     shards: Arc<[Shard; LIVENESS_SHARDS]>,
 }
@@ -36,7 +35,7 @@ impl OpenDirectoryAttrs {
     /// Track one directory handle; the snapshot lives until every guard drops.
     pub(crate) fn open(&self, attr: &InodeAttr) -> OpenDirectoryAttrGuard {
         let ino = attr.ino;
-        lock(shard(&self.shards, ino))
+        lock_poison_tolerant(shard(&self.shards, ino))
             .entry(ino)
             .and_modify(|open| {
                 open.handles += 1;
@@ -52,23 +51,25 @@ impl OpenDirectoryAttrs {
         }
     }
 
-    /// Refresh the snapshot of an open directory from a successful getattr.
+    /// Refresh the snapshot of an open directory from attributes replied to the kernel.
     pub(crate) fn observe(&self, attr: &InodeAttr) {
         if attr.kind != FileType::Directory {
             return;
         }
-        if let Some(open) = lock(shard(&self.shards, attr.ino)).get_mut(&attr.ino) {
+        if let Some(open) = lock_poison_tolerant(shard(&self.shards, attr.ino)).get_mut(&attr.ino) {
             open.attr = attr.clone();
         }
     }
 
     /// Attributes of an open directory whose inode left the namespace.
     pub(crate) fn displaced(&self, ino: u64) -> Option<InodeAttr> {
-        lock(shard(&self.shards, ino)).get(&ino).map(|open| {
-            let mut attr = open.attr.clone();
-            attr.nlink = 0;
-            attr
-        })
+        lock_poison_tolerant(shard(&self.shards, ino))
+            .get(&ino)
+            .map(|open| {
+                let mut attr = open.attr.clone();
+                attr.nlink = 0;
+                attr
+            })
     }
 }
 
@@ -79,7 +80,7 @@ pub(crate) struct OpenDirectoryAttrGuard {
 
 impl Drop for OpenDirectoryAttrGuard {
     fn drop(&mut self) {
-        let mut shard = lock(shard(&self.shards, self.ino));
+        let mut shard = lock_poison_tolerant(shard(&self.shards, self.ino));
         if let Some(open) = shard.get_mut(&self.ino) {
             open.handles -= 1;
             if open.handles == 0 {
@@ -90,9 +91,5 @@ impl Drop for OpenDirectoryAttrGuard {
 }
 
 fn shard(shards: &[Shard; LIVENESS_SHARDS], ino: u64) -> &Shard {
-    &shards[usize::from(ino.to_le_bytes()[0]) % LIVENESS_SHARDS]
-}
-
-fn lock(shard: &Shard) -> MutexGuard<'_, HashMap<u64, OpenDirectory>> {
-    shard.lock().unwrap_or_else(PoisonError::into_inner)
+    &shards[liveness_shard(ino)]
 }

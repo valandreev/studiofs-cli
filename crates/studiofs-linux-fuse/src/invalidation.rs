@@ -37,8 +37,13 @@ struct FuseInodeLivenessInner {
 
 impl FuseInodeLivenessInner {
     fn state(&self, ino: u64) -> &Mutex<FuseInodeLivenessState> {
-        &self.states[usize::from(ino.to_le_bytes()[0]) % LIVENESS_SHARDS]
+        &self.states[liveness_shard(ino)]
     }
+}
+
+/// Shard index shared by the per-inode tables of this adapter.
+pub(crate) fn liveness_shard(ino: u64) -> usize {
+    usize::from(ino.to_le_bytes()[0]) % LIVENESS_SHARDS
 }
 
 #[derive(Clone, Default)]
@@ -838,7 +843,7 @@ impl FuseInvalidationWorker {
     }
 }
 
-fn lock_poison_tolerant<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock_poison_tolerant<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
