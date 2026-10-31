@@ -242,6 +242,55 @@ impl StudioVfs {
         }
     }
 
+    /// Remove the dirty attr that captured the just-published `content_epoch`.
+    ///
+    /// A lingering attr-only setattr answers getattr from its enqueue-time
+    /// snapshot once no dirty attr shadows it, so the retired dirty attr becomes
+    /// that snapshot. Returns whether a dirty attr was present, whether the
+    /// matching one was retired, and a newer dirty attr to keep.
+    pub(super) fn retire_published_dirty_attr(
+        &self,
+        ino: Ino,
+        content_epoch: u64,
+    ) -> (bool, bool, Option<InodeAttr>) {
+        // Same order as `enqueue_deferred_namespace_op`: deferred, then dirty attrs.
+        let mut deferred = self.state.namespace.deferred.inner.lock();
+        let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
+        let Some(current) = dirty_attrs.get(&ino) else {
+            return (false, false, None);
+        };
+        if current.content_epoch > content_epoch {
+            return (true, false, Some(current.clone()));
+        }
+        if current.content_epoch < content_epoch {
+            return (true, false, None);
+        }
+        let retired = dirty_attrs.remove(&ino);
+        if let (Some(deferred_attr), Some(retired)) = (deferred.attrs.get_mut(&ino), retired) {
+            *deferred_attr = retired;
+        }
+        (true, true, None)
+    }
+
+    /// Apply the publication state of `published` to a lingering attr-only
+    /// setattr snapshot of the same content epoch.
+    pub(super) fn record_published_attr(&self, published: &InodeAttr) {
+        if let Some(deferred_attr) = self
+            .state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .attrs
+            .get_mut(&published.ino)
+            .filter(|attr| attr.content_epoch == published.content_epoch)
+        {
+            deferred_attr.committed_size = published.committed_size;
+            deferred_attr.committed_content_epoch = published.committed_content_epoch;
+            deferred_attr.upload_state = published.upload_state;
+        }
+    }
+
     pub(super) fn deferred_namespace_attr(&self, ino: Ino) -> Option<InodeAttr> {
         if !self
             .state
