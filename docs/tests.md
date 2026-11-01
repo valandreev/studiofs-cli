@@ -544,6 +544,19 @@ The `kernel` policy passed `small` 2 of 2. That size loss was fixed by
 [SFS-922](https://linear.app/valandreev/issue/SFS-922); the flag stays opt-in
 until broader mounted validation.
 
+### SFS-934 POSIX ACL Xattrs Rejected on Linux FUSE
+
+POSIX ACLs are not offered, so the Linux bridge returns `EOPNOTSUPP` for
+`system.posix_acl_access` and `system.posix_acl_default` on get, size and set,
+and filters them from `listxattr` (including values stored before the boundary
+existed). Remove deletes such a stored value so it can be cleaned up and returns
+`EOPNOTSUPP` when none exists; read-only sessions return `EROFS` first. The unit test drives `SessionState` directly; it does not
+prove the kernel forwards ACL xattrs to the server on every kernel version:
+
+```sh
+cargo test -p studiofs-linux-fuse --lib posix_acl_xattrs_are_rejected_not_silently_stored
+```
+
 ### SFS-933 File Capabilities Cleared on Data Writes
 
 The kernel runs `file_remove_privs` only for writes on handles it opened

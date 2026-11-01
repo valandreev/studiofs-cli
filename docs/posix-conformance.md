@@ -112,8 +112,10 @@ disabled by the selected profile, consistent with the
 Unavailable helper options are rejected, not silently discarded.
 
 Every fail and timeout has one of the four classification buckets below.
-ACL conformance remains unsupported; SFS-934 separately tracks successful
-acceptance/advertising of an unsupported ACL policy. In /193, host uutils 0.10.0
+ACL conformance remains unsupported. In the recorded run ACL xattrs were
+accepted but not applied; since SFS-934 the Linux bridge rejects
+`system.posix_acl_access`/`system.posix_acl_default` with `EOPNOTSUPP` and hides
+them from `listxattr`, as on a filesystem mounted without ACL support. In /193, host uutils 0.10.0
 also changes EPERM wording, reproduced on ext4; the privilege-bit mismatch was
 separately confirmed and is the product finding. Exact operation controls for
 /001, /011, /035, /089, /093, /192, /193, /309, /313 and /355 are retained; body
