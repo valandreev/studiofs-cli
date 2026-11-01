@@ -183,6 +183,40 @@ The user explicitly deferred /404–805 and WSL2 is owned by SFS-935. No CI,
 registered mounted E2E gate, workspace Rust suite or other platform was run.
 
 
+## SFS-938 focused replacement-rename rerun
+
+On 2026-11-01, `generic/309` passed on `devbench` with kernel
+`7.0.0-42-generic`, using product commit
+`5deb586d220019262d1f8670d45d5ad33c9addac`. The release binary was rebuilt with
+`cargo build -p studiofs --release -j 2`; its SHA-256 was
+`dfd7d46ecdcec9dc4363e2dd73d23c24d25f86edd66a046ffbc37f7bcffe290c`.
+The pinned xfstests revision and repository FUSE subtype patch were unchanged.
+The installed mount helper was updated to the repository version before this
+run; its previous copy is retained with the artifacts.
+
+The repository `tools/xfstests/run.sh` runner selected only `generic/309`, with
+fresh dedicated test/scratch volumes, adaptive caching, writable mmap disabled,
+and `rw,allow_other,default_permissions`. The manifest records **1 pass, 0
+failures, 0 skips**, with a 13-second wrapper duration; the xunit testcase took
+2 seconds. This confirms that cross-parent replacement advances the destination
+directory's mtime and ctime through the live Linux FUSE path.
+
+The registered `mounted-symlink-attribute-convergence` scenario also passed
+using the same product binary, `--infra env --platform linux-fuse`, and services
+from `.env` (38 seconds, cleanup passed). All six PostgreSQL-backed rename tests
+passed with `cargo test -p studiofs-meta --lib rename -- --ignored --test-threads=1`.
+Device access and PostgreSQL connectivity required execution outside the agent
+sandbox; their absence inside that sandbox was not a host limitation.
+
+Artifacts remain under ignored
+`target/xfstests/sfs938-5deb586d/` (manifest, xunit, build/binary/patch identity,
+mount logs, configuration and `cleanup.json`) and
+`target/e2e-runs/sfs938-5deb586d-attrs/` (scenario report and validation).
+Both xfstests mounts were detached and their recorded daemons exited; E2E
+cleanup passed. Test volumes and diagnostics are retained. This focused rerun
+does not change the historical 403-case baseline totals or establish the full
+SFS-940 suite gate.
+
 ## Latest pjdfstest run
 
 Run `20261030T184900Z-fec5f2b79` used product revision
