@@ -1620,10 +1620,15 @@ impl RedbMetaEngine {
             let tombstones = txn
                 .open_table(INODE_TOMBSTONES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
+            // Replay never writes base, so this view is stable for the whole window.
+            let base_dentries = txn
+                .open_table(BASE_DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut live_events = Vec::with_capacity(events.len());
             for event in events {
                 Self::push_pending_replay_events_for_tombstones(
                     &tombstones,
+                    &base_dentries,
                     event,
                     &mut live_events,
                 )?;
@@ -1637,11 +1642,16 @@ impl RedbMetaEngine {
     }
 
     /// Appends the replay form of `event` to `out`; a superseded event appends nothing.
-    fn push_pending_replay_events_for_tombstones<'event, T: ReadableTable<u64, u8>>(
+    fn push_pending_replay_events_for_tombstones<'event, T, B>(
         tombstones: &T,
+        base_dentries: &B,
         event: &'event crate::events::MetaEvent,
         out: &mut Vec<Cow<'event, crate::events::MetaEvent>>,
-    ) -> MetaResult<()> {
+    ) -> MetaResult<()>
+    where
+        T: ReadableTable<u64, u8>,
+        B: ReadableTable<&'static [u8], &'static [u8]>,
+    {
         use crate::events::MetaEvent;
         let tombstoned = |ino: Ino| -> MetaResult<bool> { Ok(tombstones.get(ino)?.is_some()) };
         let single = |ino: Ino| -> MetaResult<Option<Cow<'event, MetaEvent>>> {
@@ -1703,7 +1713,7 @@ impl RedbMetaEngine {
                     || drop_new_parent)
                 {
                     out.push(Cow::Borrowed(event));
-                    Self::push_destination_entry_replay(event, out);
+                    Self::push_rename_namespace_replay(base_dentries, event, out)?;
                     return Ok(());
                 }
                 let mut sanitized = event.clone();
@@ -1733,7 +1743,7 @@ impl RedbMetaEngine {
                     }
                 }
                 out.push(Cow::Owned(sanitized));
-                Self::push_destination_entry_replay(event, out);
+                Self::push_rename_namespace_replay(base_dentries, event, out)?;
                 return Ok(());
             }
             _ => Some(Cow::Borrowed(event)),
@@ -1742,25 +1752,39 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    /// A replayed live rename also sets its destination name to the moved entry, as the
-    /// local rename did. The serving rename arm only sets it when the base tables agree.
-    fn push_destination_entry_replay<'event>(
+    /// Restore both sides of the local rename. The serving rename arm restores the source
+    /// only while base still binds it to the moved entry, so only that binding is removed;
+    /// a foreign entry that reused the source name stays visible.
+    fn push_rename_namespace_replay<'event, B: ReadableTable<&'static [u8], &'static [u8]>>(
+        base_dentries: &B,
         event: &'event crate::events::MetaEvent,
         out: &mut Vec<Cow<'event, crate::events::MetaEvent>>,
-    ) {
+    ) -> MetaResult<()> {
         if let crate::events::MetaEvent::RenameEntry {
+            parent,
+            name,
             new_parent,
             new_name,
             entry,
             ..
         } = event
         {
+            let source_in_base =
+                Self::lookup_exact_in_opened_dentry_table(base_dentries, *parent, name)?
+                    .is_some_and(|base| base.ino == entry.ino && base.kind == entry.kind);
+            if source_in_base {
+                out.push(Cow::Owned(crate::events::MetaEvent::RemoveEntry {
+                    parent: *parent,
+                    name: name.clone(),
+                }));
+            }
             out.push(Cow::Owned(crate::events::MetaEvent::AddEntry {
                 parent: *new_parent,
                 name: new_name.clone(),
                 entry: entry.clone(),
             }));
         }
+        Ok(())
     }
 
     fn apply_replica_serving_state_inner(

@@ -2826,3 +2826,71 @@ fn pending_serving_replay_rename_over_local_entry_resolves_to_moved_winner() {
         .is_err());
     assert!(engine.get_attr(displaced.ino).is_err());
 }
+
+#[test]
+fn pending_rename_replay_does_not_restore_the_published_source() {
+    let engine = temp_engine();
+    let file = engine.create_file(ROOT_INO, b"copy.0", 0, 0, 0o644).unwrap();
+    publish_base_row_for_test(&engine, file.ino);
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"copy.0".to_vec(),
+            entry: DirEntryValue {
+                ino: file.ino,
+                kind: FileType::RegularFile,
+            },
+        }])
+        .unwrap();
+    let start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    engine
+        .rename(ROOT_INO, b"copy.0", ROOT_INO, b"copy.last")
+        .unwrap();
+    let events = local_window_events(&engine, start);
+    assert!(engine.lookup(ROOT_INO, b"copy.0").is_err());
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+    assert!(
+        matches!(
+            engine.lookup(ROOT_INO, b"copy.0"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "pending replay must keep the renamed source absent while base still holds it"
+    );
+    assert_eq!(engine.lookup(ROOT_INO, b"copy.last").unwrap().ino, file.ino);
+}
+
+#[test]
+fn pending_rename_replay_keeps_a_foreign_entry_that_reused_the_source_name() {
+    let engine = temp_engine();
+    let file = engine.create_file(ROOT_INO, b"copy.0", 0, 0, 0o644).unwrap();
+    let peer = engine.create_file(ROOT_INO, b"peer.tmp", 0, 0, 0o644).unwrap();
+    publish_base_row_for_test(&engine, file.ino);
+    publish_base_row_for_test(&engine, peer.ino);
+    let start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    engine
+        .rename(ROOT_INO, b"copy.0", ROOT_INO, b"copy.last")
+        .unwrap();
+    let events = local_window_events(&engine, start);
+    let foreign = [MetaEvent::AddEntry {
+        parent: ROOT_INO,
+        name: b"copy.0".to_vec(),
+        entry: DirEntryValue {
+            ino: peer.ino,
+            kind: FileType::RegularFile,
+        },
+    }];
+    engine.apply_replica_events_to_base(&foreign).unwrap();
+    engine.apply_replica_serving_state(&foreign).unwrap();
+    assert_eq!(engine.lookup(ROOT_INO, b"copy.0").unwrap().ino, peer.ino);
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"copy.0").unwrap().ino,
+        peer.ino,
+        "pending replay must only remove the source binding it moved"
+    );
+    assert_eq!(engine.lookup(ROOT_INO, b"copy.last").unwrap().ino, file.ino);
+}
