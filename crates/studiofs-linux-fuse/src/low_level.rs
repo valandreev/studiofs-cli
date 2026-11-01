@@ -279,6 +279,8 @@ unsafe extern "C" {
     #[cfg(test)]
     fn studiofs_linux_fuse_file_info_set_writepage_for_test(info: *mut raw::FuseFileInfo);
     #[cfg(test)]
+    fn studiofs_linux_fuse_file_info_set_flags_for_test(info: *mut raw::FuseFileInfo, flags: c_int);
+    #[cfg(test)]
     fn studiofs_linux_fuse_file_info_flags_after_init(
         direct_io: c_int,
         keep_cache: c_int,
@@ -448,6 +450,7 @@ struct FuseWriteCallbackMetrics {
 struct FuseWriteCallbackContext<R> {
     reply: R,
     started: Instant,
+    caller: FuseCaller,
 }
 
 impl<R: FuseWriteReply> FuseWriteTaskGuard<R> {
@@ -777,6 +780,16 @@ fn linux_fuse_async_write_enabled_from_env(
         return false;
     }
     async_write.is_none_or(linux_fuse_env_flag_value)
+}
+
+fn killed_privilege_mode(mode: u16) -> u16 {
+    const SGID_EXEC: u16 = (libc::S_ISGID | libc::S_IXGRP) as u16;
+    let mode = mode & !(libc::S_ISUID as u16);
+    if mode & SGID_EXEC == SGID_EXEC {
+        mode & !(libc::S_ISGID as u16)
+    } else {
+        mode
+    }
 }
 
 fn linux_fuse_setattr_args_are_attr_only(args: &SetattrArgs) -> bool {
@@ -1559,7 +1572,7 @@ pub extern "C" fn studiofs_linux_fuse_open(
     }
     match state.run_open_reply_transaction(
         ino,
-        || state.open(ino, fi),
+        || state.open(state.request_caller(req), ino, fi),
         |prepared| reply_file_open(req, fi, prepared),
     ) {
         Ok(_) => {}
@@ -1631,10 +1644,12 @@ pub extern "C" fn studiofs_linux_fuse_write(
         return;
     };
     let started = Instant::now();
+    let caller = state.request_caller(req);
     match state.queue_async_write(
         FuseWriteCallbackContext {
             reply: FuseReqPtr(req),
             started,
+            caller,
         },
         ino,
         buf,
@@ -1652,7 +1667,7 @@ pub extern "C" fn studiofs_linux_fuse_write(
             return;
         }
     }
-    match state.write(ino, buf, size, off, fi) {
+    match state.write(caller, ino, buf, size, off, fi) {
         Ok(written) => {
             state
                 .vfs
@@ -2339,8 +2354,23 @@ impl SessionState {
         Ok((attr, cache_safe))
     }
 
-    fn open(&self, ino: u64, fi: *const raw::FuseFileInfo) -> Result<LinuxFuseAllocatedOpen, i32> {
-        self.open_with_flags(ino, file_info_flags(fi))
+    fn open(
+        &self,
+        caller: FuseCaller,
+        ino: u64,
+        fi: *const raw::FuseFileInfo,
+    ) -> Result<LinuxFuseAllocatedOpen, i32> {
+        let flags = file_info_flags(fi);
+        let allocated = self.open_with_flags(ino, flags)?;
+        // Atomic O_TRUNC makes the kernel skip its setattr privilege kill;
+        // apply it only once the truncating open has succeeded.
+        if flags & libc::O_TRUNC != 0
+            && let Err(errno) = self.kill_suid_sgid(caller, ino, Some(allocated.fh))
+        {
+            self.reject_prepared_open(ino, allocated.fh);
+            return Err(errno);
+        }
+        Ok(allocated)
     }
 
     fn open_with_flags(&self, ino: u64, flags: c_int) -> Result<LinuxFuseAllocatedOpen, i32> {
@@ -2643,6 +2673,7 @@ impl SessionState {
 
     fn write(
         &self,
+        caller: FuseCaller,
         ino: u64,
         buf: *const c_char,
         size: usize,
@@ -2650,7 +2681,7 @@ impl SessionState {
         fi: *const raw::FuseFileInfo,
     ) -> Result<u32, i32> {
         let request = self.prepare_write_metadata(buf, size, offset, fi)?;
-        self.clear_write_capability(ino, request.fh, size, fi)?;
+        self.clear_write_privileges(caller, ino, request.fh, size, fi)?;
         with_write_data_slice(buf, size, |data| {
             self.runtime_handle
                 .block_on(self.vfs.write_fh_with_deferred_materialize(
@@ -2690,7 +2721,7 @@ impl SessionState {
         if let Err(errno) = ticket
             .reserve_capacity(size)
             .map_err(|error| error.errno())
-            .and_then(|()| self.clear_write_capability(ino, request.fh, size, fi))
+            .and_then(|()| self.clear_write_privileges(callback.caller, ino, request.fh, size, fi))
         {
             ticket.complete(Err(errno));
             return Err(errno);
@@ -2804,8 +2835,9 @@ impl SessionState {
         })
     }
 
-    fn clear_write_capability(
+    fn clear_write_privileges(
         &self,
+        caller: FuseCaller,
         ino: u64,
         fh: u64,
         size: usize,
@@ -2814,25 +2846,54 @@ impl SessionState {
         // SAFETY: prepare_write_metadata validated fi before either caller gets here.
         let writeback = unsafe { studiofs_linux_fuse_file_info_writepage(fi) } != 0;
         // Direct IO bypasses kernel privilege removal; delayed writeback must not
-        // remove capabilities installed after the original buffered write.
-        if size > 0
-            && !writeback
-            && !self.is_kernel_buffered(fh)
-            && self
+        // remove privileges installed after the original buffered write.
+        if size == 0
+            || writeback
+            || self.is_kernel_buffered(fh)
+            || !self
                 .vfs
                 .get_open_file(fh)
                 .is_some_and(|open| open.ino == ino && open.flags.allows_write())
-            && self
-                .vfs
-                .get_xattr_size(ino, b"security.capability")
-                .map_err(|error| vfs_err_to_errno(&error))?
-                .is_some()
+        {
+            return Ok(());
+        }
+        if self
+            .vfs
+            .get_xattr_size(ino, b"security.capability")
+            .map_err(|error| vfs_err_to_errno(&error))?
+            .is_some()
         {
             match self.vfs.remove_xattr(ino, b"security.capability") {
                 Ok(()) => {}
                 Err(error) if xattr_mutation_err_to_errno(&error) == libc::ENODATA => {}
                 Err(error) => return Err(vfs_err_to_errno(&error)),
             }
+        }
+        self.kill_suid_sgid(caller, ino, Some(fh))
+    }
+
+    /// Clears setuid, and setgid with group execute, as Linux does when a
+    /// caller without `CAP_FSETID` writes or truncates a file.
+    fn kill_suid_sgid(&self, caller: FuseCaller, ino: u64, fh: Option<u64>) -> Result<(), i32> {
+        // shortcut: uid 0 stands in for CAP_FSETID; read the caller's capability set if non-root FSETID holders matter.
+        if caller.uid == 0 {
+            return Ok(());
+        }
+        let mode = self
+            .vfs
+            .getattr(ino)
+            .map_err(|error| vfs_err_to_errno(&error))?
+            .mode;
+        let killed = killed_privilege_mode(mode);
+        if killed != mode {
+            self.setattr(
+                fh,
+                ino,
+                SetattrArgs {
+                    mode: Some(killed),
+                    ..SetattrArgs::default()
+                },
+            )?;
         }
         Ok(())
     }
@@ -6466,6 +6527,7 @@ mod tests {
                         replies: Arc::clone(&replies),
                     },
                     started: Instant::now(),
+                    caller: state.mount_caller(),
                 },
                 attr.ino,
                 data.as_ptr().cast(),
@@ -6536,6 +6598,7 @@ mod tests {
                         replies: Arc::clone(&replies),
                     },
                     started: Instant::now(),
+                    caller: state.mount_caller(),
                 },
                 attr.ino,
                 small.as_ptr().cast(),
@@ -8528,6 +8591,91 @@ mod tests {
     }
 
     #[test]
+    fn killed_privilege_mode_matches_linux_setgid_rule() {
+        for (before, after) in [
+            (0o6644, 0o2644),
+            (0o6744, 0o2744),
+            (0o6654, 0o0654),
+            (0o6754, 0o0754),
+            (0o6770, 0o0770),
+            (0o2644, 0o2644),
+            (0o0755, 0o0755),
+        ] {
+            assert_eq!(super::killed_privilege_mode(before), after, "{before:o}");
+        }
+    }
+
+    #[test]
+    fn direct_write_and_o_trunc_open_kill_privileges_except_for_root() {
+        let (fixture, state) = reply_fixture("linux-killpriv");
+        fixture.start().expect("start fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs.create(1, b"file", 0, 0, 0o6754).expect("create");
+        let mode = || vfs.getattr(attr.ino).unwrap().mode;
+        let user = super::FuseCaller {
+            uid: 1000,
+            gid: 1000,
+        };
+        let root = super::FuseCaller { uid: 0, gid: 0 };
+        let open = state
+            .open_with_flags(attr.ino, libc::O_WRONLY)
+            .expect("open write handle");
+        // SAFETY: the C shim allocates file info with the handle, freed below.
+        let fi = unsafe { super::studiofs_linux_fuse_file_info_new_for_test(open.fh) };
+        let data = b"data";
+        assert_eq!(
+            state.write(root, attr.ino, data.as_ptr().cast(), 4, 0, fi),
+            Ok(4)
+        );
+        assert_eq!(mode(), 0o6754, "CAP_FSETID callers keep the bits");
+        assert_eq!(
+            state.write(user, attr.ino, std::ptr::null(), 0, 0, fi),
+            Ok(0)
+        );
+        assert_eq!(mode(), 0o6754, "empty writes keep the bits");
+        assert_eq!(
+            state.write(user, attr.ino, data.as_ptr().cast(), 4, 0, fi),
+            Ok(4)
+        );
+        assert_eq!(mode(), 0o0754);
+        // SAFETY: this test owns the allocation returned by the C shim.
+        unsafe { libc::free(fi.cast()) };
+        state.release(open.fh).expect("release");
+
+        vfs.setattr(
+            attr.ino,
+            super::SetattrArgs {
+                mode: Some(0o6754),
+                ..super::SetattrArgs::default()
+            },
+        )
+        .expect("restore mode");
+        // SAFETY: the C shim allocates zeroed file info freed below.
+        let fi = unsafe { super::studiofs_linux_fuse_file_info_new_for_test(0) };
+        // SAFETY: `fi` is the live allocation above.
+        unsafe {
+            super::studiofs_linux_fuse_file_info_set_flags_for_test(
+                fi,
+                libc::O_WRONLY | libc::O_TRUNC,
+            );
+        };
+        let opened = state.open(user, attr.ino, fi).expect("O_TRUNC open");
+        assert_eq!(mode(), 0o0754);
+        assert_eq!(vfs.getattr(attr.ino).unwrap().size, 0);
+        state.release(opened.fh).expect("release");
+
+        let dir = vfs.mkdir(1, b"dir", 0, 0, 0o2775).expect("mkdir");
+        assert_eq!(state.open(user, dir.ino, fi).err(), Some(libc::EISDIR));
+        assert_eq!(
+            vfs.getattr(dir.ino).unwrap().mode,
+            0o2775,
+            "a failed O_TRUNC open must not change the mode"
+        );
+        // SAFETY: this test owns the allocation returned by the C shim.
+        unsafe { libc::free(fi.cast()) };
+    }
+
+    #[test]
     fn append_clears_capability_and_preserves_other_xattrs() {
         let (fixture, state) = reply_fixture("linux-append-capability");
         fixture.start().expect("start fixture");
@@ -8540,7 +8688,14 @@ mod tests {
         let fi = unsafe { super::studiofs_linux_fuse_file_info_new_for_test(open.fh) };
         let seed = b"seed";
         assert_eq!(
-            state.write(attr.ino, seed.as_ptr().cast(), seed.len(), 0, fi),
+            state.write(
+                state.mount_caller(),
+                attr.ino,
+                seed.as_ptr().cast(),
+                seed.len(),
+                0,
+                fi
+            ),
             Ok(4)
         );
         for name in [
@@ -8551,7 +8706,10 @@ mod tests {
             vfs.set_xattr(attr.ino, name, b"keep", 0)
                 .expect("set xattr");
         }
-        assert_eq!(state.write(attr.ino, std::ptr::null(), 0, 0, fi), Ok(0));
+        assert_eq!(
+            state.write(state.mount_caller(), attr.ino, std::ptr::null(), 0, 0, fi),
+            Ok(0)
+        );
         assert_eq!(
             vfs.get_xattr(attr.ino, b"security.capability").unwrap(),
             Some(b"keep".to_vec()),
@@ -8563,7 +8721,14 @@ mod tests {
         let read_fi = unsafe { super::studiofs_linux_fuse_file_info_new_for_test(read_only.fh) };
         assert!(
             state
-                .write(attr.ino, data.as_ptr().cast(), data.len(), 4, read_fi)
+                .write(
+                    state.mount_caller(),
+                    attr.ino,
+                    data.as_ptr().cast(),
+                    data.len(),
+                    4,
+                    read_fi
+                )
                 .is_err()
         );
         // SAFETY: the read-only file info is owned by this test and no longer used.
@@ -8572,7 +8737,14 @@ mod tests {
             .release(read_only.fh)
             .expect("release read-only handle");
         assert_eq!(
-            state.write(attr.ino, data.as_ptr().cast(), data.len(), -1, fi),
+            state.write(
+                state.mount_caller(),
+                attr.ino,
+                data.as_ptr().cast(),
+                data.len(),
+                -1,
+                fi
+            ),
             Err(libc::EINVAL)
         );
         assert_eq!(
@@ -8581,7 +8753,14 @@ mod tests {
             "invalid offsets must not mutate xattrs"
         );
         assert_eq!(
-            state.write(attr.ino, data.as_ptr().cast(), data.len(), 4, fi),
+            state.write(
+                state.mount_caller(),
+                attr.ino,
+                data.as_ptr().cast(),
+                data.len(),
+                4,
+                fi
+            ),
             Ok(6)
         );
         assert_eq!(
@@ -8595,7 +8774,14 @@ mod tests {
             );
         }
         assert_eq!(
-            state.write(attr.ino, data.as_ptr().cast(), data.len(), 10, fi),
+            state.write(
+                state.mount_caller(),
+                attr.ino,
+                data.as_ptr().cast(),
+                data.len(),
+                10,
+                fi
+            ),
             Ok(6),
             "an absent capability must not fail subsequent writes"
         );
@@ -8604,7 +8790,14 @@ mod tests {
         // SAFETY: this test owns a valid file info allocated by the C shim.
         unsafe { super::studiofs_linux_fuse_file_info_set_writepage_for_test(fi) };
         assert_eq!(
-            state.write(attr.ino, data.as_ptr().cast(), data.len(), 12, fi),
+            state.write(
+                state.mount_caller(),
+                attr.ino,
+                data.as_ptr().cast(),
+                data.len(),
+                12,
+                fi
+            ),
             Ok(6)
         );
         assert_eq!(
@@ -8618,7 +8811,14 @@ mod tests {
         // SAFETY: the C shim allocates file info for the still-open handle.
         let fi = unsafe { super::studiofs_linux_fuse_file_info_new_for_test(open.fh) };
         assert_eq!(
-            state.write(attr.ino, data.as_ptr().cast(), data.len(), 18, fi),
+            state.write(
+                state.mount_caller(),
+                attr.ino,
+                data.as_ptr().cast(),
+                data.len(),
+                18,
+                fi
+            ),
             Ok(6)
         );
         assert_eq!(
@@ -8636,7 +8836,14 @@ mod tests {
         vfs.set_xattr(attr.ino, b"security.capability", b"buf", 0)
             .unwrap();
         assert_eq!(
-            state.write(attr.ino, data.as_ptr().cast(), data.len(), 24, fi),
+            state.write(
+                state.mount_caller(),
+                attr.ino,
+                data.as_ptr().cast(),
+                data.len(),
+                24,
+                fi
+            ),
             Ok(6)
         );
         assert_eq!(
@@ -8691,7 +8898,14 @@ mod tests {
         );
 
         assert_eq!(
-            state.write(1, std::ptr::null(), 0, 0, std::ptr::null()),
+            state.write(
+                state.mount_caller(),
+                1,
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null()
+            ),
             Err(libc::EROFS)
         );
     }
@@ -9119,6 +9333,144 @@ mod tests {
             .expect("repeated mounted VFS shutdown should succeed");
         drop(fixture);
         std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
+    }
+
+    /// SFS-936: an unprivileged owner's truncate and successful write must
+    /// clear setuid, and setgid only with group execute, like ext4.
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_owner_truncate_and_write_clear_privilege_bits() {
+        mounted_privilege_bit_clearing(crate::cache_policy::LinuxFuseCachePolicy::Adaptive);
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_owner_truncate_and_write_clear_privilege_bits_with_kernel_cache() {
+        mounted_privilege_bit_clearing(crate::cache_policy::LinuxFuseCachePolicy::Kernel);
+    }
+
+    fn mounted_privilege_bit_clearing(policy: crate::cache_policy::LinuxFuseCachePolicy) {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+
+        // SAFETY: geteuid has no preconditions.
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "run as an unprivileged owner; root keeps the bits via CAP_FSETID"
+        );
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-killpriv")
+                .expect("create VFS fixture");
+        fixture.start().expect("start VFS fixture");
+        let mount_point = std::env::temp_dir().join(format!(
+            "studiofs-linux-fuse-killpriv-{policy:?}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&mount_point).expect("create mount point");
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = policy;
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-killpriv").expect("mount");
+        let mount_point_for_worker = mount_point.clone();
+        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
+            let guard = UnmountGuard::new(mount_point_for_worker.clone());
+            let path = mount_point_for_worker.join("privileged.bin");
+            std::fs::write(&path, vec![7_u8; 8192])?;
+            let mode = || -> std::io::Result<u32> {
+                Ok(std::fs::metadata(&path)?.permissions().mode() & 0o7777)
+            };
+            let set_mode =
+                |mode: u32| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+
+            type Truncate = fn(&std::path::Path) -> std::io::Result<()>;
+            let truncations: [(&str, Truncate); 3] = [
+                ("truncate", |path| {
+                    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                        .expect("mount path has no NUL");
+                    // SAFETY: c_path is NUL-terminated.
+                    if unsafe { libc::truncate(c_path.as_ptr(), 4096) } == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                }),
+                ("ftruncate", |path| {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(path)?
+                        .set_len(2048)
+                }),
+                ("open O_TRUNC", |path| {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .truncate(true)
+                        .open(path)
+                        .map(drop)
+                }),
+            ];
+            for (name, truncate) in truncations {
+                set_mode(0o6770)?;
+                assert_eq!(mode()?, 0o6770);
+                truncate(&path)?;
+                assert_eq!(mode()?, 0o770, "{name} must clear setuid and setgid");
+            }
+
+            // 4 KiB O_DIRECT pwrite as in generic/355.
+            let layout = std::alloc::Layout::from_size_align(4096, 4096).expect("layout");
+            // SAFETY: the layout has a nonzero size.
+            let block = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!block.is_null());
+            // SAFETY: `block` is a live, initialized 4096-byte allocation.
+            let data = unsafe { std::slice::from_raw_parts(block, 4096) };
+            let mut result = Ok(());
+            for (before, after) in [
+                (0o6644, 0o2644),
+                (0o6744, 0o2744),
+                (0o6654, 0o0654),
+                (0o6754, 0o0754),
+            ] {
+                set_mode(before)?;
+                let written = std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(&path)
+                    .and_then(|file| file.write_at(data, 0));
+                if let Err(error) = written {
+                    result = Err(error);
+                    break;
+                }
+                assert_eq!(mode()?, after, "direct write on {before:o}");
+            }
+            // SAFETY: `block` was allocated above with `layout`.
+            unsafe { std::alloc::dealloc(block, layout) };
+            result?;
+
+            let status = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&mount_point_for_worker)
+                .status();
+            guard.disarm();
+            status
+        });
+
+        session.run().expect("run libfuse3 session");
+        let unmount_status = worker
+            .join()
+            .expect("mounted privilege worker should not panic")
+            .expect("mounted privilege worker should complete");
+        assert!(unmount_status.success());
+        drop(session);
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(Duration::ZERO))
+            .expect("mounted VFS shutdown should succeed");
+        drop(fixture);
+        std::fs::remove_dir_all(&mount_point).expect("remove mount point");
     }
 
     /// SFS-916: adaptive opens writable handles with `direct_io`; the kernel

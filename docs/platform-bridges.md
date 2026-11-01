@@ -537,8 +537,12 @@ lookup: the kernel already ran `file_remove_privs`. Empty writes and kernel
 writeback callbacks retain it; delayed
 writeback must not strip a capability installed after the original write.
 Other xattrs are preserved. Removal errors fail the write before data acceptance.
-This does not negotiate `HANDLE_KILLPRIV` or implement setuid/setgid removal
-(SFS-936).
+
+The same direct-I/O write path, and `open(O_TRUNC)` (atomic O_TRUNC makes the
+kernel skip its setattr privilege kill), clear setuid, and clear setgid only
+when group execute is set, matching ext4 (SFS-936). `HANDLE_KILLPRIV` is not
+negotiated, so `truncate`/`ftruncate` and kernel-buffered writes keep relying
+on the kernel. Callers with uid 0 stand in for `CAP_FSETID` and keep the bits.
 
 Shared mappings of `direct_io` handles require `FUSE_DIRECT_IO_ALLOW_MMAP`
 (kernel 6.6+); without it `mmap(MAP_SHARED)` fails with `ENODEV` (SFS-916).

@@ -637,6 +637,10 @@ void studiofs_linux_fuse_file_info_set_writepage_for_test(struct fuse_file_info 
     info->writepage = 1;
 }
 
+void studiofs_linux_fuse_file_info_set_flags_for_test(struct fuse_file_info *info, int flags) {
+    info->flags = flags;
+}
+
 int studiofs_linux_fuse_file_info_flags(const struct fuse_file_info *info) {
     return info->flags;
 }
