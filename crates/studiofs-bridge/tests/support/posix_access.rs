@@ -296,6 +296,7 @@ fn run_access_checks(read_only: bool, mfmount: bool) {
 /// Legacy macFUSE requests `allow_other` when the kext permits it, so creation
 /// must preserve the uid/gid from the native request context.
 #[cfg(target_os = "macos")]
+#[cfg(feature = "foreign-user-mount-sanity")]
 #[test]
 #[ignore = "requires macFUSE with allow_other permitted (root, admin group, or tunable), \
             a second non-root account in $STUDIOFS_MACFUSE_PROBE_USER reachable through \
@@ -354,6 +355,7 @@ fn mounted_foreign_create_records_requesting_caller_as_owner() {
 
 /// Second local account used to probe the macFUSE `allow_other` mount.
 #[cfg(target_os = "macos")]
+#[cfg(feature = "foreign-user-mount-sanity")]
 const MACFUSE_PROBE_USER_ENV: &str = "STUDIOFS_MACFUSE_PROBE_USER";
 
 /// Waits for the ready callback and a successful lookup through the mount.
@@ -492,6 +494,7 @@ fn mounted_allow_other_applies_mode_bits_to_foreign_users() {
 
 /// Fails fast when `sudo -n` or directory modes keep the probe account from
 /// reaching the mount point, instead of reporting it as a mount failure.
+#[cfg_attr(target_os = "macos", cfg(feature = "foreign-user-mount-sanity"))]
 fn assert_probe_user_can_search_parent(probe_user: &str, mount_point: &std::path::Path) {
     let parent = mount_point.parent().expect("mount point parent");
     let traversal = run_as_probe_user(probe_user, &["test", "-x"], parent);
@@ -505,6 +508,7 @@ fn assert_probe_user_can_search_parent(probe_user: &str, mount_point: &std::path
 
 /// Creates a `0600` file as `probe_user` and checks that the caller, not the
 /// mounter, owns it and can read it.
+#[cfg_attr(target_os = "macos", cfg(feature = "foreign-user-mount-sanity"))]
 fn assert_foreign_create_owned_by_caller(
     probe_user: &str,
     private: &std::path::Path,
@@ -540,6 +544,7 @@ fn assert_foreign_create_owned_by_caller(
     }
 }
 
+#[cfg_attr(target_os = "macos", cfg(feature = "foreign-user-mount-sanity"))]
 fn probe_user_ids(user: &str) -> (u32, u32) {
     let name = CString::new(user).expect("probe user name");
     // SAFETY: `name` is NUL-terminated; the returned record is read before any
@@ -550,6 +555,7 @@ fn probe_user_ids(user: &str) -> (u32, u32) {
     unsafe { ((*entry).pw_uid, (*entry).pw_gid) }
 }
 
+#[cfg_attr(target_os = "macos", cfg(feature = "foreign-user-mount-sanity"))]
 fn run_as_probe_user(user: &str, command: &[&str], path: &std::path::Path) -> std::process::Output {
     std::process::Command::new("sudo")
         .args(["-n", "-u", user, "--"])

@@ -8,6 +8,7 @@ build = "build.rs"
 
 [features]
 fskit-mount-sanity = []
+foreign-user-mount-sanity = []
 
 [lints]
 workspace = true

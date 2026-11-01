@@ -974,13 +974,15 @@ caller with at least one supplementary group:
 Run each command on its native platform with the FUSE driver available.
 An ignored or zero-test result does not prove the permission contract.
 
-The mounted legacy macFUSE foreign-create check additionally needs a non-root
+The mounted legacy macFUSE foreign-create check is separately enabled with
+`foreign-user-mount-sanity`, so the ordinary `posix_access -- --ignored` run
+does not require a second account. It additionally needs a non-root
 mounter that the kext admits for `allow_other`, a different non-root local
 account selected with `STUDIOFS_MACFUSE_PROBE_USER`, passwordless `sudo -n` to
 that account, and mount-point ancestors searchable by it. The test checks these
 before mounting:
 
-    cargo test -p studiofs-macfuse --test posix_access mounted_foreign_create_records_requesting_caller_as_owner -- --ignored --nocapture --test-threads=1
+    cargo test -p studiofs-macfuse --features foreign-user-mount-sanity --test posix_access mounted_foreign_create_records_requesting_caller_as_owner -- --ignored --nocapture --test-threads=1
 
 It verifies the caller owns and can read a `0600` file created through the
 mounted legacy macFUSE path, while the mounter cannot read it.
