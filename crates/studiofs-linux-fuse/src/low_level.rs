@@ -7371,7 +7371,7 @@ mod tests {
     }
 
     #[test]
-    fn session_read_preserves_atime_and_reuses_buffer_for_holes_short_reads_and_eof() {
+    fn session_read_reuses_buffer_for_holes_short_reads_and_eof() {
         struct FileInfo(*mut super::raw::FuseFileInfo);
         impl Drop for FileInfo {
             fn drop(&mut self) {
@@ -7404,18 +7404,6 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let explicit_atime = 1_000_000_000;
-        state
-            .setattr(
-                Some(open.fh),
-                attr.ino,
-                studiofs_meta::SetattrArgs {
-                    atime: studiofs_meta::TimeSpec::Set(explicit_atime),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(state.getattr_attr(attr.ino).unwrap().atime, explicit_atime);
         // SAFETY: the helper allocates and initializes the native header's layout.
         let fi = FileInfo(unsafe { super::studiofs_linux_fuse_file_info_new_for_test(open.fh) });
         assert!(!fi.0.is_null(), "allocate native file info");
@@ -7443,10 +7431,90 @@ mod tests {
             });
         }
         state.release(open.fh).unwrap();
+    }
+
+    #[test]
+    fn session_reads_and_readdir_preserve_explicit_atime() {
+        struct FileInfo(*mut super::raw::FuseFileInfo);
+        impl Drop for FileInfo {
+            fn drop(&mut self) {
+                // SAFETY: the C test helper allocated this pointer with calloc.
+                unsafe { libc::free(self.0.cast()) };
+            }
+        }
+
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-atime-contract")
+                .expect("create VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let explicit_atime = 1_000_000_000;
+        let set_atime = |ino| {
+            state
+                .setattr(
+                    None,
+                    ino,
+                    studiofs_meta::SetattrArgs {
+                        atime: studiofs_meta::TimeSpec::Set(explicit_atime),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(state.getattr_attr(ino).unwrap().atime, explicit_atime);
+        };
+
+        let dir = state.vfs.mkdir(1, b"dir", 0, 0, 0o755).unwrap();
+        let file = state.vfs.create(dir.ino, b"file", 0, 0, 0o644).unwrap();
+        let writer = state.open_with_flags(file.ino, libc::O_RDWR).unwrap();
+        fixture.runtime().block_on(async {
+            state
+                .vfs
+                .write_fh(writer.fh, file.ino, 0, b"abcdefgh")
+                .await
+                .unwrap();
+        });
+        state.release(writer.fh).unwrap();
+        set_atime(file.ino);
+        set_atime(dir.ino);
+
+        // Plain read-only reads (generic/192) and reads through a writable handle.
+        for flags in [libc::O_RDONLY, libc::O_RDWR] {
+            let open = state.open_with_flags(file.ino, flags).unwrap();
+            // SAFETY: the helper allocates and initializes the native header's layout.
+            let fi =
+                FileInfo(unsafe { super::studiofs_linux_fuse_file_info_new_for_test(open.fh) });
+            assert!(!fi.0.is_null(), "allocate native file info");
+            for offset in [0, 8] {
+                let buffer = state.read(file.ino, 8, offset, fi.0).unwrap();
+                state.reply_with_pooled_read_buffer(buffer, |_| 0);
+            }
+            state.release(open.fh).unwrap();
+            assert_eq!(
+                state.getattr_attr(file.ino).unwrap().atime,
+                explicit_atime,
+                "data and EOF reads and release preserve atime (flags {flags:#o})"
+            );
+        }
+
+        let raw_handle = state
+            .open_dir(&state.getattr_attr(dir.ino).unwrap())
+            .unwrap();
+        // SAFETY: this test owns the handle and keeps the box alive through every read.
+        let handle = unsafe { Box::from_raw(raw_handle.as_ptr()) };
+        let mut buffer = state.directory_buffers.take(4096);
+        state
+            .readdir(std::ptr::null_mut(), dir.ino, raw_handle, 0, &mut buffer)
+            .unwrap();
+        state.directory_buffers.put(buffer);
+        drop(handle);
         assert_eq!(
-            state.getattr_attr(attr.ino).unwrap().atime,
+            state.getattr_attr(dir.ino).unwrap().atime,
             explicit_atime,
-            "data, hole and EOF reads and release preserve explicitly set atime"
+            "readdir preserves directory atime"
         );
     }
 

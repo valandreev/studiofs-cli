@@ -33,12 +33,18 @@ class MountCommandTests(unittest.TestCase):
             self.assertIn("--read-only", command)
             self.assertIn("--allow-other=true", command)
 
+    def test_accepts_noatime_as_no_op(self):
+        command = helper.mount_command("xfstest-test", "/test/xfstest-test", "rw,noatime", self.env)
+        self.assertNotIn("--read-only", command)
+        self.assertFalse(any("atime" in arg for arg in command))
+
     def test_rejects_unknown_source_target_and_options(self):
         for source, target, options in [
             ("test", "/test/xfstest-test", "rw"),
             ("xfstest-test", "/test/xfstest-scratch", "rw"),
             ("xfstest-test", "/test/xfstest-test", "remount,ro"),
-            ("xfstest-test", "/test/xfstest-test", "noatime"),
+            ("xfstest-test", "/test/xfstest-test", "relatime"),
+            ("xfstest-test", "/test/xfstest-test", "strictatime"),
         ]:
             with self.subTest(source=source, target=target, options=options):
                 with self.assertRaises(ValueError):

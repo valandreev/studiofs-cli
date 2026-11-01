@@ -22,8 +22,9 @@ def mount_command(source, target, options, env):
     if Path(target).name != source:
         raise ValueError("StudioFS mountpoint basename must equal its volume name")
     opts = set(filter(None, options.split(",")))
-    if opts - {"rw", "ro", "defaults", "relatime", "allow_other", "default_permissions"}:
+    if opts - {"rw", "ro", "defaults", "noatime", "allow_other", "default_permissions"}:
         raise ValueError("unsupported mount options; see harness README")
+    # noatime is accepted as a no-op: StudioFS never updates atime on reads (SFS-937).
     command = [env["STUDIOFS_BINARY"], "mount", source, target, "--foreground",
                "--allow-other=true"]
     if "ro" in opts:

@@ -30,11 +30,12 @@ remote replay, and read/write authority have separate contracts.
 
 ## Linux access-time contract
 
-Linux FUSE file reads do not automatically update persisted access time
-(`atime`). StudioFS reports the stored inode timestamp and supports explicit
+Linux FUSE file reads and directory reads (`readdir`/`readdirplus`) do not
+automatically update persisted access time (`atime`). StudioFS reports the stored inode timestamp and supports explicit
 access-time changes through `setattr` (`utimensat`/`touch -a`). Automatic
 `relatime` and `strictatime` updates are unsupported; a kernel mount entry
-showing `relatime` does not enable them in StudioFS. Applications must not use
+showing `relatime` does not enable them in StudioFS, and `noatime` describes the
+existing behavior. Applications must not use
 access time to determine whether a file has been read.
 
 This defines the existing read behavior without introducing metadata writes on

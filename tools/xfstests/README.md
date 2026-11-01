@@ -190,9 +190,9 @@ scratch volume, removes its files, and unmounts it. Tests that require actual
 reformatting, block-device geometry, or unsupported mount options must remain
 excluded or will report not-run/failure; do not configure a fake mkfs command.
 
-The helper accepts `relatime` for the default Linux mount profile, but does not
-translate it into a StudioFS timestamp policy. StudioFS
+The helper accepts `noatime` as a no-op because StudioFS
 [does not automatically update file access time on reads](../../docs/platform-bridges.md#linux-access-time).
+It rejects `relatime` and `strictatime`, which StudioFS does not implement.
 Consequently `generic/192` is an expected unsupported result under the current
 contract (SFS-937), not evidence that a TTL change is needed. Keep the measured
 failure in retained results; this classification is not a passing rerun.

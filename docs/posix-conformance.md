@@ -126,7 +126,7 @@ TTL causes remain unassigned unless established by the specific evidence.
 | Test | Bucket | Observed limit / failure | Follow-up |
 |---|---|---|---|
 | generic/001 | bug | copy-chain source names remain visible after rename/unlink; ext4 replay passes | [SFS-927](https://linear.app/valandreev/issue/SFS-927) |
-| generic/003 | environment/harness | nodiratime/noatime/strictatime are unavailable through helper; a helper change alone would not pass, because SFS-937 defines [automatic strictatime/relatime updates as unsupported](platform-bridges.md#linux-access-time) | [SFS-937](https://linear.app/valandreev/issue/SFS-937) |
+| generic/003 | environment/harness | nodiratime/strictatime are unavailable through helper (`noatime` is accepted as a no-op since SFS-937; not rerun); a helper change alone would not pass, because SFS-937 defines [automatic strictatime/relatime updates as unsupported](platform-bridges.md#linux-access-time) | [SFS-937](https://linear.app/valandreev/issue/SFS-937) |
 | generic/011 | bug | final dirstress cleanup leaves nonempty directories; ext4 replay passes | [SFS-928](https://linear.app/valandreev/issue/SFS-928) |
 | generic/013 | environment/harness | fsstress exceeded initial 60-second budget; no deadlock inferred | — |
 | generic/020 | bug | xattrs remain listed after successful removals | [SFS-931](https://linear.app/valandreev/issue/SFS-931) |
@@ -141,7 +141,7 @@ TTL causes remain unassigned unless established by the specific evidence.
 | generic/093 | bug | security.capability remains after append; ext4 control clears it | [SFS-933](https://linear.app/valandreev/issue/SFS-933) |
 | generic/099 | unsupported by design | POSIX ACL policy is not offered; accepted ACL xattrs are not applied to permissions | [SFS-934](https://linear.app/valandreev/issue/SFS-934) |
 | generic/112 | unsupported by design | selected profile disables direct-I/O mmap; mmap returns ENODEV | — |
-| generic/120 | environment/harness | nodiratime/noatime/strictatime are unavailable through helper | — |
+| generic/120 | environment/harness | nodiratime/noatime/strictatime were unavailable through helper; `noatime` is now accepted as a no-op (SFS-937), not rerun | [SFS-937](https://linear.app/valandreev/issue/SFS-937) |
 | generic/127 | environment/harness | fsx workload exceeded 300-second limit; timeout-truncated output does not establish a product bug | — |
 | generic/128 | environment/harness | test adds -o nosuid, which helper rejects before scratch mount | — |
 | generic/141 | unsupported by design | selected profile disables direct-I/O mmap; mmap returns ENODEV | — |

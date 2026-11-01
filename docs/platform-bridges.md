@@ -61,8 +61,9 @@ Path walks are centralized in VFS `NamespaceResolver`:
 
 The [canonical access-time contract](juicefs-local-first-rust-contract.md#linux-access-time-contract)
 supports explicit `atime` changes, but file reads preserve stored `atime`,
-including reads of data, holes, and EOF. Handle release does not synthesize a
-read timestamp. This applies regardless of the Linux bridge cache policy;
+including reads of data, holes, and EOF through read-only and writable handles.
+Directory reads preserve the directory's stored `atime`. Handle release does not
+synthesize a read timestamp. This applies regardless of the Linux bridge cache policy;
 automatic `relatime`/`strictatime` maintenance is unsupported.
 
 The Linux bridge's `SessionState::read` calls `StudioVfs::read_into_fh` without
@@ -77,10 +78,10 @@ TTL therefore cannot supply the missing update.
 
 Run the adapter characterization check without a mount or remote services:
 
-    cargo test -p studiofs-linux-fuse --lib session_read_preserves_atime_and_reuses_buffer_for_holes_short_reads_and_eof
+    cargo test -p studiofs-linux-fuse --lib session_reads_and_readdir_preserve_explicit_atime
 
-It exercises explicit access-time assignment and subsequent adapter reads and
-release. It does not establish native kernel-cache or remount acceptance.
+It exercises explicit access-time assignment, then `O_RDONLY` and `O_RDWR`
+reads, release, and `readdir`. It does not establish native kernel-cache or remount acceptance.
 
 ## Entry name rules
 
