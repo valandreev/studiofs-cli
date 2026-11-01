@@ -9472,6 +9472,25 @@ mod tests {
                 );
             }
             drop(file);
+            // Atomic O_TRUNC truncates inside the open request, not via setattr.
+            let times = [libc::timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            }; 2];
+            // SAFETY: c_path and times are valid for the call.
+            assert_eq!(
+                unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
+                0
+            );
+            drop(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)?,
+            );
+            let attr = std::fs::metadata(&path)?;
+            assert_eq!(attr.len(), 0);
+            assert!(attr.mtime() > 1, "open O_TRUNC: mtime unchanged");
             let status = Command::new("fusermount3")
                 .arg("-u")
                 .arg(&worker_mount)

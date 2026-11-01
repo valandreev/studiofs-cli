@@ -10608,7 +10608,7 @@ impl StudioVfs {
             read_context = ReadRequestContext::from_attr(
                 self,
                 ino,
-                self.setattr(ino, SetattrArgs::size_only(0))?,
+                self.setattr_with_handle_posix(None, ino, SetattrArgs::size_only(0))?,
             );
         }
 
