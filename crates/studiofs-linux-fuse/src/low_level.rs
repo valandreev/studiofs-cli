@@ -2097,7 +2097,7 @@ impl SessionState {
             self.vfs
                 .setattr_attr_only_deferred_metadata(ino, args, &self.runtime_handle)
         } else {
-            self.vfs.setattr_with_handle(file_handle, ino, args)
+            self.vfs.setattr_with_handle_posix(file_handle, ino, args)
         };
         let attr = result.map_err(|error| vfs_err_to_errno(&error))?;
         self.open_directories.observe(&attr);
@@ -9418,6 +9418,94 @@ mod tests {
             .expect("repeated mounted VFS shutdown should succeed");
         drop(fixture);
         std::fs::remove_dir_all(&mount_point).expect("remove smoke mount point");
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_truncate_updates_mtime() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-truncate-mtime")
+                .expect("create fixture");
+        fixture.start().expect("start fixture");
+        let mount_dir = studiofs_test_support::workspace_target_tempdir("linux-truncate-mtime-");
+        let mount_point = mount_dir.path().to_owned();
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-truncate-mtime").unwrap();
+        let worker_mount = mount_point.clone();
+        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
+            let guard = UnmountGuard::new(worker_mount.clone());
+            let path = worker_mount.join("file");
+            std::fs::write(&path, [1_u8; 256])?;
+            let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+            let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            for (handle, size) in [(false, 0), (false, 123), (true, 0), (true, 123)] {
+                let times = [libc::timespec {
+                    tv_sec: 1,
+                    tv_nsec: 0,
+                }; 2];
+                // SAFETY: c_path and times are valid for the call.
+                assert_eq!(
+                    unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
+                    0
+                );
+                if handle {
+                    file.set_len(size)?;
+                } else {
+                    // SAFETY: c_path is NUL-terminated.
+                    assert_eq!(
+                        unsafe { libc::truncate(c_path.as_ptr(), size as libc::off_t) },
+                        0
+                    );
+                }
+                let attr = std::fs::metadata(&path)?;
+                assert_eq!(attr.len(), size);
+                assert!(
+                    attr.mtime() > 1,
+                    "handle={handle} size={size}: mtime unchanged"
+                );
+            }
+            drop(file);
+            // Atomic O_TRUNC truncates inside the open request, not via setattr.
+            let times = [libc::timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            }; 2];
+            // SAFETY: c_path and times are valid for the call.
+            assert_eq!(
+                unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) },
+                0
+            );
+            drop(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)?,
+            );
+            let attr = std::fs::metadata(&path)?;
+            assert_eq!(attr.len(), 0);
+            assert!(attr.mtime() > 1, "open O_TRUNC: mtime unchanged");
+            let status = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&worker_mount)
+                .status();
+            guard.disarm();
+            status
+        });
+        session.run().unwrap();
+        assert!(worker.join().unwrap().unwrap().success());
+        drop(session);
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(Duration::ZERO))
+            .unwrap();
+        drop(fixture);
     }
 
     /// SFS-936: an unprivileged owner's truncate and successful write must
