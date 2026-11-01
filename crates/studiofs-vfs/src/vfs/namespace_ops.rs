@@ -14,6 +14,7 @@ use super::{
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use studiofs_meta::TimeSpec;
 use studiofs_meta::engine::NamespaceMutation;
 use studiofs_meta::schema::PayloadRefState;
 use tracing::trace;
@@ -1548,6 +1549,26 @@ impl StudioVfs {
         ino: Ino,
         args: SetattrArgs,
     ) -> VfsResult<InodeAttr> {
+        self.setattr_with_handle_and_mtime(fh, ino, args, false)
+    }
+
+    /// Apply POSIX size-change modification timestamps while preserving explicit mtime.
+    pub fn setattr_with_handle_posix(
+        &self,
+        fh: Option<u64>,
+        ino: Ino,
+        args: SetattrArgs,
+    ) -> VfsResult<InodeAttr> {
+        self.setattr_with_handle_and_mtime(fh, ino, args, true)
+    }
+
+    fn setattr_with_handle_and_mtime(
+        &self,
+        fh: Option<u64>,
+        ino: Ino,
+        args: SetattrArgs,
+        update_mtime: bool,
+    ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Setattr);
         let operation = self.try_mutating_operation_admission()?;
         if self.is_runtime_stats_file_ino(ino) {
@@ -1556,6 +1577,9 @@ impl StudioVfs {
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if let Some(attr) = self.update_ignored_entry(ino, |attr| {
             if let Some(new_size) = args.size {
+                if update_mtime && new_size != attr.size && matches!(args.mtime, TimeSpec::Omit) {
+                    attr.touch_mtime();
+                }
                 attr.size = new_size;
                 attr.committed_size = new_size;
             }
@@ -1623,7 +1647,7 @@ impl StudioVfs {
                 handle_backed_growth_may_defer_strict_flush(fh, new_size, attr.size, &args);
             let updated = self.run_sync_future_with_admission(
                 &operation,
-                self.setattr_with_size_change(ino, args, defer_handle_growth_flush),
+                self.setattr_with_size_change(ino, args, defer_handle_growth_flush, update_mtime),
             )?;
             return Ok(updated);
         }
@@ -1669,6 +1693,7 @@ impl StudioVfs {
         ino: Ino,
         args: SetattrArgs,
         defer_handle_growth_flush: bool,
+        update_mtime: bool,
     ) -> VfsResult<InodeAttr> {
         // A lingering deferred materialization task holds the materialize gate.
         // Like flush and fsync, a strict size change interrupts and waits for
@@ -1735,6 +1760,9 @@ impl StudioVfs {
             if let Some(new_size) = args.size
                 && new_size != attr.size
             {
+                if update_mtime && matches!(args.mtime, TimeSpec::Omit) {
+                    attr.touch_mtime();
+                }
                 if new_size < attr.size {
                     self.state.writer_stack.clear_inode(ino);
                     self.begin_size_change_incarnation(ino, &mut attr);
@@ -3973,6 +4001,31 @@ mod tests {
     use bytes::BytesMut;
     use studiofs_meta::schema::ROOT_INO;
     use studiofs_meta::{MetaFsOps, MetaInodes, MetaNamespace};
+
+    #[test]
+    fn posix_size_change_preserves_explicit_mtime_and_same_size() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("posix-size-mtime-");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "posix-size-mtime");
+        let attr = vfs.create(ROOT_INO, b"file", 0, 0, 0o644).unwrap();
+        let explicit = SetattrArgs {
+            size: Some(123),
+            mtime: TimeSpec::Set(1_000_000_000),
+            ..Default::default()
+        };
+        let changed = vfs
+            .setattr_with_handle_posix(None, attr.ino, explicit)
+            .unwrap();
+        assert_eq!(changed.mtime, 1_000_000_000);
+        let same = vfs
+            .setattr_with_handle_posix(None, attr.ino, SetattrArgs::size_only(123))
+            .unwrap();
+        assert_eq!(same.mtime, changed.mtime);
+        let changed = vfs
+            .setattr_with_handle_posix(None, attr.ino, SetattrArgs::size_only(0))
+            .unwrap();
+        assert!(changed.mtime > same.mtime);
+        assert_eq!(vfs.getattr(attr.ino).unwrap().mtime, changed.mtime);
+    }
 
     #[test]
     fn same_size_setattr_rechecks_after_pending_write() {
