@@ -408,6 +408,49 @@ impl Drop for LocalPayloadBackendRuntime {
 }
 
 impl LocalPayloadBackendRuntime {
+    /// Runs only the cache-budget eviction pass of background pressure
+    /// maintenance. Unlike `run_pressure_maintenance`, this never samples
+    /// native filesystem space, so its outcome does not depend on host disk usage.
+    fn run_budget_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError> {
+        self.flush_access_touches(true, "run_pressure_maintenance");
+        let stats = self.index.stats()?;
+        if let Some(target_bytes) = self.budget_governor.background_target(stats.current_bytes) {
+            match self.try_evict_to_target_bytes(target_bytes, "run_pressure_maintenance")? {
+                Some(current_bytes) => {
+                    debug!(
+                        current_bytes,
+                        target_bytes,
+                        "local payload runtime background pressure maintenance eviction pass completed"
+                    );
+                }
+                None => {
+                    debug!(
+                        target_bytes,
+                        "local payload runtime background pressure maintenance skipped because another eviction pass is in progress"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Budget-only maintenance for tests whose assertions must not depend on
+    /// host free space; fails if the pass queries native filesystem space.
+    #[cfg(test)]
+    pub(crate) fn run_budget_pressure_maintenance_for_test(
+        &self,
+    ) -> Result<(), LocalPayloadBackendError> {
+        let queries = || platform::FILESYSTEM_SPACE_QUERIES.with(std::cell::Cell::get);
+        let before = queries();
+        let result = self.run_budget_pressure_maintenance();
+        assert_eq!(
+            queries(),
+            before,
+            "budget pressure maintenance must not sample native filesystem space"
+        );
+        result
+    }
+
     #[cfg(test)]
     fn fail_next_index_write_for_test(&self) {
         self.index.fail_next_write_for_test();
@@ -1434,25 +1477,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     }
 
     fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError> {
-        self.flush_access_touches(true, "run_pressure_maintenance");
-        let stats = self.index.stats()?;
-        if let Some(target_bytes) = self.budget_governor.background_target(stats.current_bytes) {
-            match self.try_evict_to_target_bytes(target_bytes, "run_pressure_maintenance")? {
-                Some(current_bytes) => {
-                    debug!(
-                        current_bytes,
-                        target_bytes,
-                        "local payload runtime background pressure maintenance eviction pass completed"
-                    );
-                }
-                None => {
-                    debug!(
-                        target_bytes,
-                        "local payload runtime background pressure maintenance skipped because another eviction pass is in progress"
-                    );
-                }
-            }
-        }
+        self.run_budget_pressure_maintenance()?;
         self.run_disk_pressure_maintenance(Instant::now(), platform::filesystem_space)
     }
 
@@ -3836,7 +3861,7 @@ mod tests {
         backend.put(23, &[0x04; 5], true).unwrap();
         assert_eq!(backend.index.stats().unwrap().current_bytes, 95);
 
-        backend.run_pressure_maintenance().unwrap();
+        backend.run_budget_pressure_maintenance_for_test().unwrap();
 
         let stats = backend.index.stats().unwrap();
         assert!(
@@ -3959,7 +3984,7 @@ mod tests {
         backend.put(31, &[0xBB; 32], true).unwrap();
         backend.put(32, &[0xCC; 32], true).unwrap();
 
-        backend.run_pressure_maintenance().unwrap();
+        backend.run_budget_pressure_maintenance_for_test().unwrap();
 
         assert!(
             backend.contains(30),

@@ -333,5 +333,10 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Cache tests that sample real free space behave differently above 90% disk usage.
+      - name: Report free disk space
+        run: |
+          mkdir -p target
+          df -h target
       - name: cargo test (workspace)
         run: cargo test --workspace --all-targets -- --nocapture
