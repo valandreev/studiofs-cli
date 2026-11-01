@@ -2498,8 +2498,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let mut overlay = std::mem::take(&mut context.initial_overlay);
         Self::extend_overlay_conflicts(&mut overlay, &appended_overlay);
         let mut completed_bindings = HashMap::new();
-        if batches.iter().any(|batch| batch.is_self_batch) && !self.local_only_completed.is_empty()
-        {
+        if !self.local_only_completed.is_empty() {
             let mut events = Vec::new();
             for range in &self.local_only_completed {
                 events.extend(RedbMetaEngine::read_events_range_in_write_txn_with_check(
@@ -2520,6 +2519,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 }
             }
         }
+        // Served local-only names are local authority in every page, not only self pages.
+        overlay
+            .dentry_keys
+            .extend(completed_bindings.keys().cloned());
         let mut applied_any = false;
         let mut max_version = context.last_seq;
         let mut max_namespace_version = context.current_namespace_version;
@@ -2610,6 +2613,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     &self.local_event_overlay_exclusions,
                     execution,
                 )?;
+                overlay
+                    .dentry_keys
+                    .extend(completed_bindings.keys().cloned());
                 if batch.is_self_batch {
                     Self::clear_resolved_self_regular_file_protection(
                         &mut replay_protected_overlay,
@@ -2648,9 +2654,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
             .filter_map(|(index, event)| included(index).then_some(event))
             .collect::<Vec<_>>();
             let mut state = RedbMetaEngine::pending_local_namespace_bindings_in_txn(txn, &events)?;
-            for (key, entry) in completed_bindings {
-                state.bindings.entry(key).or_insert(entry);
-            }
+            // A still-served completed binding is the journal's final state for its key,
+            // so it outranks older included events such as an unreplayed rename source.
+            state.bindings.extend(completed_bindings);
             final_overlay
                 .dentry_keys
                 .extend(state.bindings.keys().cloned());

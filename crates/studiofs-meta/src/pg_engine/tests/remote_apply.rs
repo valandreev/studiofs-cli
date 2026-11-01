@@ -2369,12 +2369,12 @@ fn foreign_unlink_reconciles_published_rename_alias_while_inode_is_open() {
             .expect("local rename");
         let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("rename end");
         let range = LocalEventRange { start, end };
+        // Production completes a visible range only after publishing it.
+        pg.mark_local_event_ranges_published(&[range])
+            .expect("publish rename");
         if completed {
             pg.complete_local_event_ranges(&[range])
                 .expect("complete rename");
-        } else {
-            pg.mark_local_event_ranges_published(&[range])
-                .expect("publish rename");
         }
         pg.link(file.ino, ROOT_INO, b"pending-link.txt")
             .expect("pending link");
@@ -2469,12 +2469,12 @@ fn foreign_rename_removes_published_local_loser_across_cursor_gap() {
             start: published_start,
             end: published_end,
         };
+        // Production completes a visible range only after publishing it.
+        pg.mark_local_event_ranges_published(&[range])
+            .expect("publish range");
         if completed {
             pg.complete_local_event_ranges(&[range])
                 .expect("complete range");
-        } else {
-            pg.mark_local_event_ranges_published(&[range])
-                .expect("publish range");
         }
         pg.link(file.ino, ROOT_INO, b"pending-link.txt")
             .expect("create pending local hardlink");
@@ -9018,6 +9018,188 @@ fn self_replay_of_published_directory_rename_preserves_local_only_replacement() 
             .is_empty(),
         "acknowledged local-only markers must be retired with the cursor"
     );
+}
+
+#[test]
+fn self_replay_keeps_local_only_replacement_over_later_unreplayed_rename() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let directory = pg
+        .local
+        .create_dir(ROOT_INO, b"X.457", 0, 0, 0o755)
+        .expect("create setup directory");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("acknowledge setup");
+
+    let first_start = setup_end;
+    pg.local
+        .create_dir(ROOT_INO, b"other", 0, 0, 0o755)
+        .expect("create first published directory");
+    let first_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("first end");
+    let first_range = LocalEventRange {
+        start: first_start,
+        end: first_end,
+    };
+    let first_events = pg
+        .local
+        .read_events_range(first_start, first_end)
+        .expect("read first prefix");
+    let first = RemoteApplyCoordinator::project_local_batch(&first_events).events;
+    pg.mark_local_event_ranges_published_with_prefix(&[first_range], Some((1, vec![first_range])))
+        .expect("record first published prefix");
+
+    let rename_start = first_end;
+    pg.local
+        .rename_atomic(ROOT_INO, b"X.457", ROOT_INO, b"X.315", false, false)
+        .expect("rename setup directory");
+    let rename_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("rename end");
+    let rename_range = LocalEventRange {
+        start: rename_start,
+        end: rename_end,
+    };
+    pg.mark_local_event_ranges_published_with_prefix(
+        &[rename_range],
+        Some((2, vec![rename_range])),
+    )
+    .expect("record later published rename prefix");
+
+    let draft_start = rename_end;
+    let draft = pg
+        .local
+        .create_file(ROOT_INO, b"X.457", 0, 0, 0o644)
+        .expect("create local-only replacement draft");
+    let draft_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("draft end");
+    pg.complete_local_event_ranges(&[LocalEventRange {
+        start: draft_start,
+        end: draft_end,
+    }])
+    .expect("complete local-only draft suffix");
+
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: first,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq: setup_end,
+            next_event_seq: draft_end,
+            initial_overlay: pg.local_overlay_conflicts().expect("local overlay"),
+        },
+    )
+    .expect("replay first published prefix");
+
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, b"X.457")
+            .expect("newer draft outranks the older unreplayed rename source")
+            .ino,
+        draft.ino
+    );
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, b"X.315")
+            .expect("renamed directory remains")
+            .ino,
+        directory.ino
+    );
+}
+
+/// A local-only draft name wins over a foreign create of the same name
+/// whether or not the foreign batch shares its replay page with a self batch.
+fn foreign_create_over_local_only_draft(with_self_batch: bool) -> (Ino, Ino) {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start).expect("ack setup");
+
+    pg.local
+        .create_dir(ROOT_INO, b"other", 0, 0, 0o755)
+        .expect("create published directory");
+    let published_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("published end");
+    let published_range = LocalEventRange {
+        start,
+        end: published_end,
+    };
+    let published_events = pg
+        .local
+        .read_events_range(start, published_end)
+        .expect("read published prefix");
+    let published = RemoteApplyCoordinator::project_local_batch(&published_events).events;
+    pg.mark_local_event_ranges_published_with_prefix(
+        &[published_range],
+        Some((2, vec![published_range])),
+    )
+    .expect("record published prefix that pins the cursor");
+
+    let draft = pg
+        .local
+        .create_file(ROOT_INO, b"draft", 0, 0, 0o644)
+        .expect("create local-only draft");
+    let draft_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("draft end");
+    pg.complete_local_event_ranges(&[LocalEventRange {
+        start: published_end,
+        end: draft_end,
+    }])
+    .expect("complete local-only draft");
+
+    let remote_ino = ROOT_INO + 9_101;
+    let mut batches = vec![DecodedReplayBatch {
+        batch_version: 1,
+        events: vec![
+            MetaEvent::SetAttr {
+                attr: InodeAttr::new_dir(remote_ino, ROOT_INO, 0, 0, 0o755),
+            },
+            MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: b"draft".to_vec(),
+                entry: DirEntryValue {
+                    ino: remote_ino,
+                    kind: FileType::Directory,
+                },
+            },
+        ],
+        is_self_batch: false,
+    }];
+    if with_self_batch {
+        batches.push(DecodedReplayBatch {
+            batch_version: 2,
+            events: published,
+            is_self_batch: true,
+        });
+    }
+    pg.apply_replay_page_atomically(
+        batches,
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq: start,
+            next_event_seq: draft_end,
+            initial_overlay: pg.local_overlay_conflicts().expect("local overlay"),
+        },
+    )
+    .expect("replay page");
+    let served = pg
+        .local
+        .lookup(ROOT_INO, b"draft")
+        .expect("draft name stays served")
+        .ino;
+    (served, draft.ino)
+}
+
+#[test]
+fn local_only_draft_wins_over_foreign_create_alone_in_page() {
+    let (served, draft) = foreign_create_over_local_only_draft(false);
+    assert_eq!(served, draft);
+}
+
+#[test]
+fn local_only_draft_wins_over_foreign_create_next_to_self_batch() {
+    let (served, draft) = foreign_create_over_local_only_draft(true);
+    assert_eq!(served, draft);
 }
 
 #[test]
