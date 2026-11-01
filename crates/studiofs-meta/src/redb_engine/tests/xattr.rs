@@ -1,4 +1,13 @@
 #[test]
+fn unlink_does_not_retain_overlay_only_xattr_tombstones() {
+    let engine = temp_engine();
+    let file = engine.create_file(ROOT_INO, b"xattr-unlink", 0, 0, 0o644).unwrap();
+    engine.set_xattr(file.ino, b"user.temporary", b"value", 0).unwrap();
+    engine.unlink(ROOT_INO, b"xattr-unlink").unwrap();
+    assert!(engine.local_overlay_xattr_keys().unwrap().is_empty());
+}
+
+#[test]
 fn test_detect_overlay_xattr_against_imported_base() {
     let source = temp_engine();
     let file = source

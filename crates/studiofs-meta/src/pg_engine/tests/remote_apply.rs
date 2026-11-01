@@ -1,7 +1,66 @@
 use super::*;
-use crate::engine::MetaEngine;
+use crate::engine::{MetaEngine, XATTR_CREATE_FLAG};
 use crate::events::encode_event;
 use crate::redb_engine::layout::encode_dentry_key;
+
+#[test]
+fn removed_xattr_stays_absent_when_earlier_self_set_replays() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.set_xattr(ROOT_INO, b"user.snrub", b"keep", 0).unwrap();
+    pg.set_xattr(ROOT_INO, b"user.attribute_0", b"old", 0)
+        .unwrap();
+    let set_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let sets = pg.local.read_events_range(start, set_end).unwrap();
+    pg.remove_xattr(ROOT_INO, b"user.attribute_0").unwrap();
+    assert_eq!(pg.get_xattr(ROOT_INO, b"user.attribute_0").unwrap(), None);
+
+    let replay = |version, events, flushed_event_seq| {
+        pg.apply_replay_page_atomically(
+            vec![DecodedReplayBatch {
+                batch_version: version,
+                events,
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: version - 1,
+                current_namespace_version: 0,
+                flushed_event_seq,
+                next_event_seq: pg.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+                initial_overlay: OverlayConflictSets::default(),
+            },
+        )
+        .unwrap();
+    };
+    replay(1, sets, start);
+    assert_eq!(
+        pg.list_xattrs(ROOT_INO).unwrap(),
+        vec![b"user.snrub".to_vec()]
+    );
+    assert_eq!(pg.get_xattr(ROOT_INO, b"user.attribute_0").unwrap(), None);
+    assert_eq!(
+        pg.get_xattr_size(ROOT_INO, b"user.attribute_0").unwrap(),
+        None
+    );
+
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    replay(
+        2,
+        pg.local.read_events_range(set_end, end).unwrap(),
+        set_end,
+    );
+    assert_eq!(
+        pg.list_xattrs(ROOT_INO).unwrap(),
+        vec![b"user.snrub".to_vec()]
+    );
+    pg.set_xattr(ROOT_INO, b"user.attribute_0", b"new", XATTR_CREATE_FLAG)
+        .unwrap();
+    assert_eq!(
+        pg.get_xattr(ROOT_INO, b"user.attribute_0").unwrap(),
+        Some(b"new".to_vec())
+    );
+}
 
 #[test]
 fn decoded_replay_batches_reject_an_intra_page_gap() {

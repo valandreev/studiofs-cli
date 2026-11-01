@@ -1587,20 +1587,11 @@ impl RedbMetaEngine {
         xattrs.remove(key.as_slice())?;
         drop(xattrs);
 
-        let has_base = txn
-            .open_table(BASE_XATTRS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .get(key.as_slice())?
-            .is_some();
-
         let mut tombstones = txn
             .open_table(XATTR_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        if has_base {
-            tombstones.insert(key.as_slice(), 1)?;
-        } else {
-            tombstones.remove(key.as_slice())?;
-        }
+        // An earlier local set may still reach base through delayed self replay.
+        tombstones.insert(key.as_slice(), 1)?;
         Ok(())
     }
 
@@ -1734,7 +1725,7 @@ impl RedbMetaEngine {
         };
         for key in current_keys {
             let name = xattr_name_from_key(&key).to_vec();
-            Self::remove_xattr_overlay_in_txn(txn, ino, &name)?;
+            Self::remove_xattr_mirror_in_txn(txn, ino, &name)?;
         }
 
         if clear_regular_file_graph {

@@ -776,7 +776,8 @@ Destination side:
 
 - validate existence against merged xattr visibility
 - remove the local `xattrs` entry for that key
-- if the key exists in `base_xattrs`, write a tombstone
+- always write a tombstone, even if `base_xattrs` does not contain the key yet:
+  delayed self replay of an earlier set can still populate the base
 
 Update behavior:
 - the PostgreSQL sync format/protocol change is breaking; migration
