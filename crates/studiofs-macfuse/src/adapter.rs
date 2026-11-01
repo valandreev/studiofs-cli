@@ -1565,19 +1565,19 @@ impl StudioVfsAdapter {
         if self.read_only {
             return Err(libc::EROFS);
         }
-        let existing = self.vfs.lookup(parent, name).ok();
         // Return ENOTEMPTY promptly when Finder has not issued child deletes
         // yet. Blocking this callback prevents Finder from enumerating and
         // deleting the directory contents. VFS rmdir waits for child deletes
         // that are already in flight before reporting the same error.
-        let result = self.vfs.rmdir(parent, name);
-        result
-            .inspect(|_| {
-                if let Some(attr) = &existing {
+        self.vfs
+            .rmdir_returning_removed(parent, name)
+            .inspect(|removed| {
+                if let Some(attr) = removed {
                     self.clear_file_flags(attr.ino);
                     self.shared.kernel_inode_liveness.close(attr.ino);
                 }
             })
+            .map(|_| ())
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
@@ -5212,6 +5212,30 @@ mod tests {
         adapter.remember_file_flags(attr.ino, MACOS_UF_HIDDEN);
 
         assert!(!adapter.file_flags_contains_for_test(attr.ino));
+    }
+
+    #[test]
+    fn rmdir_clears_file_flags_of_the_removed_directory_only() {
+        let fixture = ContractVfsFixture::new("macfuse-rmdir-flags").expect("fixture");
+        let vfs = fixture.vfs();
+        let survivor = vfs
+            .mkdir(ROOT_INO, b"target", 501, 20, 0o755)
+            .expect("mkdir target");
+        let replacement = vfs
+            .mkdir(ROOT_INO, b"replacement", 501, 20, 0o755)
+            .expect("mkdir replacement");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        adapter.remember_file_flags(survivor.ino, MACOS_UF_HIDDEN);
+        adapter.remember_file_flags(replacement.ino, MACOS_UF_HIDDEN);
+        vfs.rename(ROOT_INO, b"target", ROOT_INO, b"survivor", false)
+            .expect("rename target away");
+        vfs.rename(ROOT_INO, b"replacement", ROOT_INO, b"target", false)
+            .expect("rename replacement into target");
+
+        adapter.rmdir(ROOT_INO, b"target").expect("rmdir target");
+
+        assert!(!adapter.file_flags_contains_for_test(replacement.ino));
+        assert!(adapter.file_flags_contains_for_test(survivor.ino));
     }
 
     #[test]

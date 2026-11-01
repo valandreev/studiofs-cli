@@ -424,7 +424,9 @@ impl<M: ?Sized + MetaFsOps> MetaFsOps for RuntimeMetaHandle<M> {
     forward_method!(
         fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>
     );
-    forward_method!(fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>);
+    forward_method!(
+        fn rmdir_returning_removed(&self, parent: Ino, name: &[u8], expected_ino: Option<Ino>) -> MetaResult<Option<(Ino, Option<InodeAttr>)>>
+    );
     forward_method!(
         fn rename_atomic(
             &self,

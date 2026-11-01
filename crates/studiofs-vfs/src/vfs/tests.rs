@@ -19261,6 +19261,8 @@ fn direct_namespace_mutations_obey_shutdown_admission_gate() {
 
 #[test]
 fn shutdown_waits_for_deferred_create_admitted_before_cleanup_registration() {
+    const ADMISSION_WAIT_BOUND: Duration = Duration::from_secs(10);
+    const ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(1);
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "shutdown-deferred-create-admission");
     let _guard = rt.enter();
@@ -19297,18 +19299,23 @@ fn shutdown_waits_for_deferred_create_admitted_before_cleanup_registration() {
                 .create_with_deferred_metadata_admission(ROOT_INO, name, 0, 0, 0o644, &runtime)
         });
         started_rx.await.expect("create worker should start");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if vfs
-                    .state
-                    .shutdown
-                    .mutating_operation_gate
-                    .try_write()
-                    .is_err()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
+        // Shared CI runners can deschedule the worker for a long time. Poll the
+        // observable admission state with a pause so this loop does not compete
+        // with that worker for CPU. A worker that returned before blocking can
+        // never hold the gate, so fail at once and report its result.
+        tokio::time::timeout(ADMISSION_WAIT_BOUND, async {
+            while vfs
+                .state
+                .shutdown
+                .mutating_operation_gate
+                .try_write()
+                .is_ok()
+            {
+                assert!(
+                    !operation.is_finished(),
+                    "deferred create returned before blocking on its inode reservation"
+                );
+                tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
             }
         })
         .await
@@ -19316,9 +19323,9 @@ fn shutdown_waits_for_deferred_create_admitted_before_cleanup_registration() {
 
         let shutdown_vfs = Arc::clone(&vfs);
         let shutdown = tokio::spawn(async move { shutdown_vfs.shutdown(Duration::ZERO).await });
-        tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::time::timeout(ADMISSION_WAIT_BOUND, async {
             while !vfs.shutdown_requested() {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(ADMISSION_POLL_INTERVAL).await;
             }
         })
         .await
@@ -19329,7 +19336,7 @@ fn shutdown_waits_for_deferred_create_admitted_before_cleanup_registration() {
         );
 
         drop(held_reservations);
-        let created = tokio::time::timeout(Duration::from_secs(1), operation)
+        let created = tokio::time::timeout(ADMISSION_WAIT_BOUND, operation)
             .await
             .expect("admitted create should finish after releasing inode reservation")
             .expect("create worker should not panic")

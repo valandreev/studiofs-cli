@@ -211,8 +211,13 @@ impl MetaFsOps for PgMetaEngine {
         )
     }
 
-    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()> {
-        self.mutate(|local| local.rmdir(parent, name))
+    fn rmdir_returning_removed(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        expected_ino: Option<Ino>,
+    ) -> MetaResult<Option<(Ino, Option<InodeAttr>)>> {
+        self.mutate(|local| local.rmdir_returning_removed(parent, name, expected_ino))
     }
 
     fn rename_atomic(

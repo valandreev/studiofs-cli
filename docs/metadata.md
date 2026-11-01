@@ -42,6 +42,20 @@ appending an event. Ordinary skipped healing must invalidate cached dentry
 observations rather than cache the name as absent. Hidden platform-root entries
 remain deliberately negative-cached.
 
+Empty-directory removal returns the removed inode and its last attributes from
+the removal transaction through `rmdir_returning_removed`. Attributes are absent
+for a dangling directory entry. VFS uses that committed identity for cache,
+link-count and directory-generation updates, even if rename or foreign apply
+changed the name after an earlier lookup.
+When VFS supplies an expected inode, the same transaction checks the binding
+before deleting anything. A different inode returns no removal, so VFS retries
+with the new target's namespace barrier.
+VFS overlays the removed inode's last local deferred/dirty attributes on that
+transaction snapshot before returning it to a bridge, then retires its dirty
+attribute so later drains cannot keep serving the deleted inode. A retargeted
+rmdir waits for any admitted deferred replacement and starts fresh retry/healing
+state for each target inode.
+
 ## Contract/Core Test Harness
 
 `studiofs_meta::contract_harness` provides the fast local Contract/Core test
