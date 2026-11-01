@@ -13,13 +13,14 @@ changed. WSL2 coverage is separate in [SFS-935](https://linear.app/valandreev/is
 | `generic-capped-323-403-v2/`, 323–403 | 300 s | 11 | 8 | 62 | 0 | 81 |
 | **Total** | | **58** | **40** | **303** | **2** | **403** |
 
-Of the 40 fail verdicts, 11 are product-bug cases, 26 are unsupported feature
+Of the 40 fail verdicts, 10 are product-bug cases, 27 are unsupported feature
 or selected-profile cases, and 3 are harness mount-option limits. Both timeouts
 are classified as environment/harness budget limits. No case is assigned to
 the kernel-cache/TTL-only bucket without a controlled TTL comparison. A native
 notrun is a skipped feature/device/tool probe, not a successful data-path test.
 There are **zero manual test-ID exclusions**: expected limitations stayed
-selected and are classified below.
+selected and are classified below. These counts include the SFS-937 contract
+clarification for automatic access-time updates; the recorded verdicts are unchanged.
 
 The measured window was **22:20:31–23:42:40 UTC on 2026-10-30**, wall time
 **1 h 22 min 9 s**, including recovery, pauses and supplemental attempts. The
@@ -125,7 +126,7 @@ TTL causes remain unassigned unless established by the specific evidence.
 | Test | Bucket | Observed limit / failure | Follow-up |
 |---|---|---|---|
 | generic/001 | bug | copy-chain source names remain visible after rename/unlink; ext4 replay passes | [SFS-927](https://linear.app/valandreev/issue/SFS-927) |
-| generic/003 | environment/harness | nodiratime/noatime/strictatime are unavailable through helper | — |
+| generic/003 | environment/harness | nodiratime/strictatime are unavailable through helper (`noatime` is accepted as a no-op since SFS-937; not rerun); a helper change alone would not pass, because SFS-937 defines [automatic strictatime/relatime updates as unsupported](platform-bridges.md#linux-access-time) | [SFS-937](https://linear.app/valandreev/issue/SFS-937) |
 | generic/011 | bug | final dirstress cleanup leaves nonempty directories; ext4 replay passes | [SFS-928](https://linear.app/valandreev/issue/SFS-928) |
 | generic/013 | environment/harness | fsstress exceeded initial 60-second budget; no deadlock inferred | — |
 | generic/020 | bug | xattrs remain listed after successful removals | [SFS-931](https://linear.app/valandreev/issue/SFS-931) |
@@ -140,11 +141,11 @@ TTL causes remain unassigned unless established by the specific evidence.
 | generic/093 | bug | security.capability remains after append; ext4 control clears it | [SFS-933](https://linear.app/valandreev/issue/SFS-933) |
 | generic/099 | unsupported by design | POSIX ACL policy is not offered; accepted ACL xattrs are not applied to permissions | [SFS-934](https://linear.app/valandreev/issue/SFS-934) |
 | generic/112 | unsupported by design | selected profile disables direct-I/O mmap; mmap returns ENODEV | — |
-| generic/120 | environment/harness | nodiratime/noatime/strictatime are unavailable through helper | — |
+| generic/120 | environment/harness | nodiratime/noatime/strictatime were unavailable through helper; `noatime` is now accepted as a no-op (SFS-937), not rerun | [SFS-937](https://linear.app/valandreev/issue/SFS-937) |
 | generic/127 | environment/harness | fsx workload exceeded 300-second limit; timeout-truncated output does not establish a product bug | — |
 | generic/128 | environment/harness | test adds -o nosuid, which helper rejects before scratch mount | — |
 | generic/141 | unsupported by design | selected profile disables direct-I/O mmap; mmap returns ENODEV | — |
-| generic/192 | bug | atime unchanged after five-second delay and read under default relatime; ext4 control advances by five seconds; cause unassigned | [SFS-937](https://linear.app/valandreev/issue/SFS-937) |
+| generic/192 | unsupported by design | atime unchanged after five-second delay and read; ext4 control advances by five seconds; SFS-937 defines [automatic read-time atime updates as unsupported](platform-bridges.md#linux-access-time), without a mounted rerun | [SFS-937](https://linear.app/valandreev/issue/SFS-937) |
 | generic/193 | bug | generic/193 owner truncation leaves setuid/setgid bits set; ext4 control changes mode 06770 to 0770; uutils error wording also appears on ext4 | [SFS-936](https://linear.app/valandreev/issue/SFS-936) |
 | generic/198 | unsupported by design | selected profile disables direct-I/O mmap; mmap returns ENODEV | — |
 | generic/215 | unsupported by design | mapped write did not run because mmap returned ENODEV under selected profile | — |
