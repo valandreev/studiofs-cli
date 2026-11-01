@@ -3501,28 +3501,39 @@ impl StudioVfs {
         // Serialize directory removal with child namespace mutations. A
         // nested rmdir holds this parent gate while it waits for its own
         // children, so an outer rmdir can observe and wait for that work.
-        let _parent_delete_session = self
+        let parent_cleanup = self.file_session_cleanup(parent);
+        let parent_delete_session = self
             .state
             .file_session
             .enter_op(parent, FileSessionOperation::Delete)
             .await;
-        self.wait_for_deferred_namespace_entry(parent, name).await?;
+        let _parent_delete_session = parent_cleanup.with_permit(parent_delete_session);
         let meta = self.sync_meta();
         let mut retry_attempts: u16 = 0;
         let mut settle_attempts: u16 = 0;
         let mut rechecked_after_skipped_heal = false;
+        let mut last_target_ino = None;
         let (removed_ino, removed_attr) = loop {
+            self.wait_for_deferred_namespace_entry(parent, name).await?;
             let target_ino = meta.lookup(parent, name)?.ino;
+            if last_target_ino != Some(target_ino) {
+                retry_attempts = 0;
+                settle_attempts = 0;
+                rechecked_after_skipped_heal = false;
+                last_target_ino = Some(target_ino);
+            }
             let rmdir_result = {
                 // A child unlink/rmdir takes the target directory's Delete
                 // gate. Hold its fair Read barrier across the emptiness
                 // transaction so an already queued child mutation cannot
                 // slip between the in-flight check and meta.rmdir.
-                let _target_namespace_read = self
+                let target_cleanup = self.file_session_cleanup(target_ino);
+                let target_namespace_read = self
                     .state
                     .file_session
                     .enter_op(target_ino, FileSessionOperation::Read)
                     .await;
+                let _target_namespace_read = target_cleanup.with_permit(target_namespace_read);
                 // Check the binding in the transaction: rename and foreign apply
                 // do not take the parent Delete gate.
                 meta.rmdir_returning_removed(parent, name, Some(target_ino))
@@ -3530,6 +3541,11 @@ impl StudioVfs {
             match rmdir_result {
                 Ok(Some(removed)) => break removed,
                 Ok(None) => continue,
+                Err(MetaError::EntryNotFound { .. })
+                    if self.deferred_namespace_lookup(parent, name).is_some() =>
+                {
+                    continue;
+                }
                 Err(err @ MetaError::DirNotEmpty(removed_ino)) => {
                     let (healed, child_delete_inos, observed_missing_child) =
                         self.heal_dangling_directory_children(removed_ino)?;
@@ -3544,6 +3560,7 @@ impl StudioVfs {
                             .then_some(removed_ino)
                     }) {
                         retry_attempts = retry_attempts.saturating_add(1);
+                        let _delete_wait_cleanup = self.file_session_cleanup(delete_ino);
                         self.state
                             .file_session
                             .wait_for_delete_inflight(delete_ino)
@@ -3585,6 +3602,11 @@ impl StudioVfs {
         // as rename does for a displaced inode; the metadata inode is gone.
         namespace_mutations.record_removal(parent, name, [removed_ino]);
         self.record_committed_link_change(removed_ino, 0, None);
+        let removed_dirty_attr = self.state.namespace.dirty_attrs.lock().remove(&removed_ino);
+        let removed_attr = self
+            .deferred_namespace_attr(removed_ino)
+            .or(removed_dirty_attr)
+            .or(removed_attr);
         self.bump_directory_generation(removed_ino);
         // Directory removals follow the same local-first group-commit path as
         // child unlinks instead of waking PostgreSQL once per entry.
@@ -4557,6 +4579,13 @@ mod tests {
                     .unwrap();
 
                 assert_eq!(removed.ino, replacement.ino);
+                assert_eq!(removed.mode & 0o777, if deferred { 0o750 } else { 0o700 });
+                for ino in [ROOT_INO, old.ino, replacement.ino] {
+                    assert!(
+                        vfs.state.file_session.debug_snapshot(ino).is_none(),
+                        "rmdir must retire idle namespace sessions for inode {ino}"
+                    );
+                }
                 assert_eq!(meta.lookup(ROOT_INO, b"survivor").unwrap().ino, old.ino);
                 assert_eq!(vfs.getattr(old.ino).unwrap().nlink, 2);
                 if deferred {
@@ -4576,8 +4605,117 @@ mod tests {
                     meta.get_attr(replacement.ino),
                     Err(MetaError::InodeNotFound(_))
                 ));
+                vfs.drain_deferred_namespace_metadata_for_barrier()
+                    .await
+                    .unwrap();
+                vfs.shutdown(Duration::from_secs(2)).await.unwrap();
+                assert!(matches!(
+                    meta.get_attr(replacement.ino),
+                    Err(MetaError::InodeNotFound(_))
+                ));
+                assert!(vfs.peek_dirty_attr(replacement.ino).is_none());
+                assert!(matches!(vfs.getattr(replacement.ino),
+                    Err(VfsError::Meta(MetaError::InodeNotFound(ino))) if ino == replacement.ino));
             });
         }
+    }
+
+    #[test]
+    fn rmdir_waits_for_deferred_replacement_after_target_barrier() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-deferred-replacement-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-deferred-replacement");
+        rt.block_on(async {
+            let old = vfs.mkdir(ROOT_INO, b"target", 0, 0, 0o755).unwrap();
+            let old_gate = vfs
+                .state
+                .file_session
+                .enter_op(old.ino, FileSessionOperation::Delete)
+                .await;
+            let mut removal = std::pin::pin!(vfs.rmdir_inner(ROOT_INO, b"target"));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(removal.as_mut().poll(&mut cx), Poll::Pending));
+            vfs.rename_inner(ROOT_INO, b"target", ROOT_INO, b"survivor", false)
+                .await
+                .unwrap();
+            vfs.state
+                .namespace
+                .deferred
+                .batch_linger_override_ms
+                .store(3_600_000, Ordering::Release);
+            let replacement = vfs
+                .mkdir_with_deferred_metadata_admission(
+                    ROOT_INO,
+                    b"target",
+                    0,
+                    0,
+                    0o700,
+                    rt.handle(),
+                )
+                .unwrap();
+            assert_eq!(
+                vfs.lookup(ROOT_INO, b"target").unwrap().ino,
+                replacement.ino
+            );
+            assert!(meta.lookup(ROOT_INO, b"target").is_err());
+            drop(old_gate);
+            assert!(
+                matches!(removal.as_mut().poll(&mut cx), Poll::Pending),
+                "rmdir must wait for the admitted replacement's metadata"
+            );
+            vfs.drain_deferred_namespace_metadata_for_barrier()
+                .await
+                .unwrap();
+            let removed = tokio::time::timeout(Duration::from_secs(2), removal)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(removed.ino, replacement.ino);
+            assert_eq!(meta.lookup(ROOT_INO, b"survivor").unwrap().ino, old.ino);
+            assert!(meta.lookup(ROOT_INO, b"target").is_err());
+        });
+    }
+
+    #[test]
+    fn rmdir_resets_skipped_heal_state_when_target_changes() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-retarget-heal-");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-retarget-heal");
+        let old = meta.create_dir(ROOT_INO, b"target", 0, 0, 0o755).unwrap();
+        let replacement = meta
+            .create_dir(ROOT_INO, b"replacement", 0, 0, 0o700)
+            .unwrap();
+        let old_child = meta.create_file(old.ino, b"child", 0, 0, 0o644).unwrap();
+        let new_child = meta
+            .create_file(replacement.ino, b"child", 0, 0, 0o644)
+            .unwrap();
+        meta.remove_attr(old_child.ino).unwrap();
+        meta.remove_attr(new_child.ino).unwrap();
+        let hook_meta = meta.clone();
+        let _hook = DanglingSnapshotHookGuard::arm(Box::new(move || {
+            let mut changed = hook_meta.remove_entry(old.ino, b"child").unwrap();
+            changed.ino += 10_000;
+            hook_meta.add_entry(old.ino, b"child", &changed).unwrap();
+            hook_meta
+                .rename_atomic(ROOT_INO, b"target", ROOT_INO, b"survivor", false, false)
+                .unwrap();
+            hook_meta
+                .rename_atomic(ROOT_INO, b"replacement", ROOT_INO, b"target", false, false)
+                .unwrap();
+            RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    hook_meta.remove_entry(replacement.ino, b"child").unwrap();
+                }));
+            });
+        }));
+        let removed = rt
+            .block_on(vfs.rmdir_inner(ROOT_INO, b"target"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.ino, replacement.ino);
+        assert_eq!(meta.lookup(ROOT_INO, b"survivor").unwrap().ino, old.ino);
     }
 
     #[test]

@@ -50,6 +50,11 @@ changed the name after an earlier lookup.
 When VFS supplies an expected inode, the same transaction checks the binding
 before deleting anything. A different inode returns no removal, so VFS retries
 with the new target's namespace barrier.
+VFS overlays the removed inode's last local deferred/dirty attributes on that
+transaction snapshot before returning it to a bridge, then retires its dirty
+attribute so later drains cannot keep serving the deleted inode. A retargeted
+rmdir waits for any admitted deferred replacement and starts fresh retry/healing
+state for each target inode.
 
 ## Contract/Core Test Harness
 

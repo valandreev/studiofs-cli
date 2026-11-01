@@ -619,6 +619,7 @@ fn test_rmdir_changed_target_is_not_removed() {
     let replacement = engine.create_dir(ROOT_INO, b"target", 0, 0, 0o700).unwrap();
     let parent_before = engine.get_attr(ROOT_INO).unwrap();
     let next_event_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let commits_before = engine.metadata_write_observability().commit.calls;
 
     assert!(
         engine
@@ -634,6 +635,7 @@ fn test_rmdir_changed_target_is_not_removed() {
     assert_eq!(engine.get_attr(old.ino).unwrap().nlink, 2);
     assert_eq!(engine.get_attr(ROOT_INO).unwrap(), parent_before);
     assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), next_event_before);
+    assert_eq!(engine.metadata_write_observability().commit.calls, commits_before);
 
     let (ino, attr) = engine
         .rmdir_returning_removed(ROOT_INO, b"target", Some(replacement.ino))

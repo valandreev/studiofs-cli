@@ -908,8 +908,12 @@ impl RedbMetaEngine {
     ) -> MetaResult<NamespaceDeleteResult> {
         let txn = self.begin_write_txn()?;
         let result = NamespaceDeleteTxn::new(&txn).execute(&spec)?;
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if matches!(result, NamespaceDeleteResult::TargetChanged) {
+            txn.abort().map_err(|e| MetaError::Storage(e.to_string()))?;
+        } else {
+            txn.commit()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
         Ok(result)
     }
 }
