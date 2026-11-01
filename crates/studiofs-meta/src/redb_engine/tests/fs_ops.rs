@@ -731,6 +731,7 @@ fn rename_file_updates_parent_times_and_journals_them() {
                     _ => None,
                 })
                 .unwrap();
+            assert_eq!(old_parent_attr.is_some(), cross_parent);
             for (ino, nlink) in [
                 (ROOT_INO, 3),
                 (new_parent, if cross_parent { 2 } else { 3 }),
