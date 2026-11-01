@@ -249,7 +249,12 @@ where
         Err(read_only_error(parent))
     }
 
-    fn rmdir(&self, parent: Ino, _name: &[u8]) -> MetaResult<()> {
+    fn rmdir_returning_removed(
+        &self,
+        parent: Ino,
+        _name: &[u8],
+        _expected_ino: Option<Ino>,
+    ) -> MetaResult<Option<(Ino, Option<InodeAttr>)>> {
         Err(read_only_error(parent))
     }
 

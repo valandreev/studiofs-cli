@@ -561,10 +561,15 @@ fn zeroio_unlink_open_handle_marks_unpublished_epoch_deleted_before_publish() {
 #[test]
 fn test_rmdir() {
     let engine = temp_engine();
-    engine
+    let created = engine
         .create_dir(ROOT_INO, b"empty_dir", 1000, 1000, 0o755)
         .unwrap();
-    engine.rmdir(ROOT_INO, b"empty_dir").unwrap();
+    let (ino, attr) = engine
+        .rmdir_returning_removed(ROOT_INO, b"empty_dir", None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ino, created.ino);
+    assert_eq!(attr.unwrap(), created);
 
     assert!(engine.lookup(ROOT_INO, b"empty_dir").is_err());
     let root = engine.get_attr(ROOT_INO).unwrap();
@@ -583,6 +588,59 @@ fn test_rmdir_notempty() {
 
     let result = engine.rmdir(ROOT_INO, b"notempty");
     assert!(result.is_err());
+}
+
+#[test]
+fn test_rmdir_returns_identity_for_dangling_directory() {
+    let engine = temp_engine();
+    let dir = engine
+        .create_dir(ROOT_INO, b"dangling", 0, 0, 0o755)
+        .unwrap();
+    engine.remove_attr(dir.ino).unwrap();
+
+    let (ino, attr) = engine
+        .rmdir_returning_removed(ROOT_INO, b"dangling", None)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(ino, dir.ino);
+    assert!(attr.is_none());
+    assert!(engine.lookup(ROOT_INO, b"dangling").is_err());
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap().nlink, 2);
+}
+
+#[test]
+fn test_rmdir_changed_target_is_not_removed() {
+    let engine = temp_engine();
+    let old = engine.create_dir(ROOT_INO, b"target", 0, 0, 0o755).unwrap();
+    engine
+        .rename_atomic(ROOT_INO, b"target", ROOT_INO, b"survivor", false, false)
+        .unwrap();
+    let replacement = engine.create_dir(ROOT_INO, b"target", 0, 0, 0o700).unwrap();
+    let parent_before = engine.get_attr(ROOT_INO).unwrap();
+    let next_event_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    assert!(
+        engine
+            .rmdir_returning_removed(ROOT_INO, b"target", Some(old.ino))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"target").unwrap().ino,
+        replacement.ino
+    );
+    assert_eq!(engine.get_attr(replacement.ino).unwrap(), replacement);
+    assert_eq!(engine.get_attr(old.ino).unwrap().nlink, 2);
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap(), parent_before);
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), next_event_before);
+
+    let (ino, attr) = engine
+        .rmdir_returning_removed(ROOT_INO, b"target", Some(replacement.ino))
+        .unwrap()
+        .unwrap();
+    assert_eq!(ino, replacement.ino);
+    assert_eq!(attr.unwrap(), replacement);
 }
 
 #[test]

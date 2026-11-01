@@ -368,6 +368,7 @@ pub(super) struct NamespaceDeleteSpec<'a> {
     name: &'a [u8],
     kind: NamespaceDeleteKind,
     created_at: i64,
+    expected_ino: Option<Ino>,
 }
 
 impl<'a> NamespaceDeleteSpec<'a> {
@@ -376,6 +377,7 @@ impl<'a> NamespaceDeleteSpec<'a> {
             parent,
             name,
             kind: NamespaceDeleteKind::Unlink,
+            expected_ino: None,
             created_at: current_unix_seconds(),
         }
     }
@@ -385,6 +387,7 @@ impl<'a> NamespaceDeleteSpec<'a> {
             parent,
             name,
             kind: NamespaceDeleteKind::UnlinkOpenHandle,
+            expected_ino: None,
             created_at: current_unix_seconds(),
         }
     }
@@ -394,6 +397,7 @@ impl<'a> NamespaceDeleteSpec<'a> {
             parent,
             name,
             kind: NamespaceDeleteKind::RemoveDir,
+            expected_ino: None,
             created_at: current_unix_seconds(),
         }
     }
@@ -413,7 +417,8 @@ impl<'a> NamespaceDeleteSpec<'a> {
 
 pub(super) enum NamespaceDeleteResult {
     File(InodeAttr),
-    Directory,
+    Directory(Ino, Option<InodeAttr>),
+    TargetChanged,
 }
 
 pub(super) struct NamespaceDeleteTxn<'a> {
@@ -435,6 +440,12 @@ impl<'a> NamespaceDeleteTxn<'a> {
             name: String::from_utf8_lossy(spec.name).to_string(),
         })?;
 
+        if spec
+            .expected_ino
+            .is_some_and(|expected| expected != entry.ino)
+        {
+            return Ok(NamespaceDeleteResult::TargetChanged);
+        }
         if spec.allows_directory_target() {
             self.execute_rmdir(spec, entry)
         } else {
@@ -559,11 +570,12 @@ impl<'a> NamespaceDeleteTxn<'a> {
         spec: &NamespaceDeleteSpec<'_>,
         entry: DirEntryValue,
     ) -> MetaResult<NamespaceDeleteResult> {
-        let target_kind = match RedbMetaEngine::get_attr_merged_in_write_txn(self.txn, entry.ino) {
-            Ok(attr) => attr.kind,
-            Err(MetaError::InodeNotFound(_)) => entry.kind,
+        let removed_attr = match RedbMetaEngine::get_attr_merged_in_write_txn(self.txn, entry.ino) {
+            Ok(attr) => Some(attr),
+            Err(MetaError::InodeNotFound(_)) => None,
             Err(err) => return Err(err),
         };
+        let target_kind = removed_attr.as_ref().map_or(entry.kind, |attr| attr.kind);
         if target_kind != FileType::Directory {
             return Err(MetaError::NotADirectory(entry.ino));
         }
@@ -584,7 +596,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         RedbMetaEngine::set_inode_in_txn(self.txn, &parent_attr)?;
 
         self.append_rmdir_events(spec, entry.ino, &parent_attr)?;
-        Ok(NamespaceDeleteResult::Directory)
+        Ok(NamespaceDeleteResult::Directory(entry.ino, removed_attr))
     }
 
     pub(super) fn remove_regular_file_graph_for_inode(&self, ino: Ino) -> MetaResult<()> {
@@ -1257,7 +1269,9 @@ impl MetaFsOps for RedbMetaEngine {
     fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
         match self.execute_namespace_delete(NamespaceDeleteSpec::new_unlink(parent, name))? {
             NamespaceDeleteResult::File(attr) => Ok(attr),
-            NamespaceDeleteResult::Directory => unreachable!("unlink cannot remove directories"),
+            NamespaceDeleteResult::Directory(..) | NamespaceDeleteResult::TargetChanged => {
+                unreachable!("unlink cannot remove directories")
+            }
         }
     }
 
@@ -1266,15 +1280,23 @@ impl MetaFsOps for RedbMetaEngine {
             .execute_namespace_delete(NamespaceDeleteSpec::new_unlink_open_handle(parent, name))?
         {
             NamespaceDeleteResult::File(attr) => Ok(attr),
-            NamespaceDeleteResult::Directory => {
+            NamespaceDeleteResult::Directory(..) | NamespaceDeleteResult::TargetChanged => {
                 unreachable!("unlink_open_handle cannot remove directories")
             }
         }
     }
 
-    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()> {
-        match self.execute_namespace_delete(NamespaceDeleteSpec::new_rmdir(parent, name))? {
-            NamespaceDeleteResult::Directory => Ok(()),
+    fn rmdir_returning_removed(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        expected_ino: Option<Ino>,
+    ) -> MetaResult<Option<(Ino, Option<InodeAttr>)>> {
+        let mut spec = NamespaceDeleteSpec::new_rmdir(parent, name);
+        spec.expected_ino = expected_ino;
+        match self.execute_namespace_delete(spec)? {
+            NamespaceDeleteResult::Directory(ino, attr) => Ok(Some((ino, attr))),
+            NamespaceDeleteResult::TargetChanged => Ok(None),
             NamespaceDeleteResult::File(_) => unreachable!("rmdir must only remove directories"),
         }
     }

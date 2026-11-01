@@ -3508,14 +3508,12 @@ impl StudioVfs {
             .await;
         self.wait_for_deferred_namespace_entry(parent, name).await?;
         let meta = self.sync_meta();
-        let removed = meta.lookup(parent, name).ok().map(|entry| entry.ino);
-        // Taken under the parent Delete gate, so it names the inode removed below.
-        let removed_attr = removed.and_then(|ino| meta.get_attr(ino).ok());
         let mut retry_attempts: u16 = 0;
         let mut settle_attempts: u16 = 0;
         let mut rechecked_after_skipped_heal = false;
-        loop {
-            let rmdir_result = if let Some(removed_ino) = removed {
+        let (removed_ino, removed_attr) = loop {
+            let target_ino = meta.lookup(parent, name)?.ino;
+            let rmdir_result = {
                 // A child unlink/rmdir takes the target directory's Delete
                 // gate. Hold its fair Read barrier across the emptiness
                 // transaction so an already queued child mutation cannot
@@ -3523,18 +3521,16 @@ impl StudioVfs {
                 let _target_namespace_read = self
                     .state
                     .file_session
-                    .enter_op(removed_ino, FileSessionOperation::Read)
+                    .enter_op(target_ino, FileSessionOperation::Read)
                     .await;
-                meta.rmdir(parent, name)
-            } else {
-                meta.rmdir(parent, name)
+                // Check the binding in the transaction: rename and foreign apply
+                // do not take the parent Delete gate.
+                meta.rmdir_returning_removed(parent, name, Some(target_ino))
             };
             match rmdir_result {
-                Ok(()) => break,
-                Err(err @ MetaError::DirNotEmpty(_)) => {
-                    let Some(removed_ino) = removed else {
-                        return Err(VfsError::Meta(err));
-                    };
+                Ok(Some(removed)) => break removed,
+                Ok(None) => continue,
+                Err(err @ MetaError::DirNotEmpty(removed_ino)) => {
                     let (healed, child_delete_inos, observed_missing_child) =
                         self.heal_dangling_directory_children(removed_ino)?;
                     if healed > 0 {
@@ -3584,14 +3580,12 @@ impl StudioVfs {
                 }
                 Err(err) => return Err(VfsError::Meta(err)),
             }
-        }
+        };
         // Retire the removed directory's cached attributes with the parent's,
         // as rename does for a displaced inode; the metadata inode is gone.
-        namespace_mutations.record_removal(parent, name, removed);
-        if let Some(removed_ino) = removed {
-            self.record_committed_link_change(removed_ino, 0, None);
-            self.bump_directory_generation(removed_ino);
-        }
+        namespace_mutations.record_removal(parent, name, [removed_ino]);
+        self.record_committed_link_change(removed_ino, 0, None);
+        self.bump_directory_generation(removed_ino);
         // Directory removals follow the same local-first group-commit path as
         // child unlinks instead of waking PostgreSQL once per entry.
         Ok(removed_attr)
@@ -4489,6 +4483,101 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(RMDIR_AFTER_DANGLING_SNAPSHOT_HOOK.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn rmdir_retargets_after_rename_while_waiting_for_namespace_barrier() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        for deferred in [false, true] {
+            let tmp = studiofs_test_support::workspace_target_tempdir("rmdir-retarget-");
+            let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-retarget");
+            rt.block_on(async {
+                let old = vfs.mkdir(ROOT_INO, b"target", 0, 0, 0o755).unwrap();
+                let replacement = vfs.mkdir(ROOT_INO, b"replacement", 0, 0, 0o700).unwrap();
+                if deferred {
+                    // Keep both deferred attrs queued so a wrong nlink update stays observable.
+                    vfs.state
+                        .namespace
+                        .deferred
+                        .batch_linger_override_ms
+                        .store(3_600_000, std::sync::atomic::Ordering::Release);
+                    for ino in [old.ino, replacement.ino] {
+                        vfs.setattr_attr_only_deferred_metadata(
+                            ino,
+                            SetattrArgs {
+                                mode: Some(0o750),
+                                ..SetattrArgs::default()
+                            },
+                            rt.handle(),
+                        )
+                        .unwrap();
+                    }
+                } else {
+                    vfs.getattr(replacement.ino).unwrap();
+                    assert!(
+                        vfs.state
+                            .namespace
+                            .attr_read_cache
+                            .lock()
+                            .contains(replacement.ino)
+                    );
+                }
+                let old_gate = vfs
+                    .state
+                    .file_session
+                    .enter_op(old.ino, FileSessionOperation::Delete)
+                    .await;
+                let mut removal = std::pin::pin!(vfs.rmdir_inner(ROOT_INO, b"target"));
+                let mut cx = Context::from_waker(Waker::noop());
+                assert!(matches!(removal.as_mut().poll(&mut cx), Poll::Pending));
+
+                vfs.rename_inner(ROOT_INO, b"target", ROOT_INO, b"survivor", false)
+                    .await
+                    .unwrap();
+                vfs.rename_inner(ROOT_INO, b"replacement", ROOT_INO, b"target", false)
+                    .await
+                    .unwrap();
+                let replacement_gate = vfs
+                    .state
+                    .file_session
+                    .enter_op(replacement.ino, FileSessionOperation::Delete)
+                    .await;
+                drop(old_gate);
+                assert!(
+                    matches!(removal.as_mut().poll(&mut cx), Poll::Pending),
+                    "rmdir must wait on the replacement directory's barrier"
+                );
+                drop(replacement_gate);
+                let removed = tokio::time::timeout(Duration::from_secs(2), removal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+
+                assert_eq!(removed.ino, replacement.ino);
+                assert_eq!(meta.lookup(ROOT_INO, b"survivor").unwrap().ino, old.ino);
+                assert_eq!(vfs.getattr(old.ino).unwrap().nlink, 2);
+                if deferred {
+                    assert_eq!(vfs.getattr(replacement.ino).unwrap().nlink, 0);
+                } else {
+                    assert!(matches!(vfs.getattr(replacement.ino),
+                    Err(VfsError::Meta(MetaError::InodeNotFound(ino))) if ino == replacement.ino));
+                }
+                assert!(
+                    !vfs.state
+                        .namespace
+                        .attr_read_cache
+                        .lock()
+                        .contains(replacement.ino)
+                );
+                assert!(matches!(
+                    meta.get_attr(replacement.ino),
+                    Err(MetaError::InodeNotFound(_))
+                ));
+            });
+        }
     }
 
     #[test]

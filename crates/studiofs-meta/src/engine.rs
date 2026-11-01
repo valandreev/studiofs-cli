@@ -1541,7 +1541,20 @@ pub trait MetaFsOps: Send + Sync + MetaInodes {
     fn unlink_open_handle(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>;
 
     /// Remove an empty directory.
-    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()>;
+    fn rmdir(&self, parent: Ino, name: &[u8]) -> MetaResult<()> {
+        self.rmdir_returning_removed(parent, name, None).map(|_| ())
+    }
+
+    /// Remove an empty directory and return its identity from the removal transaction.
+    /// Attributes are absent when repairing a dangling directory entry.
+    /// With an expected inode, return `None` without mutation if the name points
+    /// to another inode. An absent name returns `MetaError::EntryNotFound`.
+    fn rmdir_returning_removed(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        expected_ino: Option<Ino>,
+    ) -> MetaResult<Option<(Ino, Option<InodeAttr>)>>;
 
     /// Atomic rename with optional replacement of an existing destination.
     ///
