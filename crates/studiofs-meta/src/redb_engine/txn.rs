@@ -1089,9 +1089,9 @@ impl RedbMetaEngine {
         Ok(keys)
     }
 
-    pub(super) fn keys_for_inode_in_write_table(
+    pub(super) fn keys_for_inode_in_write_table<V: redb::Value + 'static>(
         txn: &redb::WriteTransaction,
-        table_def: TableDefinition<&[u8], &[u8]>,
+        table_def: TableDefinition<&[u8], V>,
         ino: Ino,
     ) -> MetaResult<Vec<Vec<u8>>> {
         let prefix = xattr_prefix(ino);
@@ -1587,18 +1587,33 @@ impl RedbMetaEngine {
         xattrs.remove(key.as_slice())?;
         drop(xattrs);
 
-        let has_base = txn
-            .open_table(BASE_XATTRS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .get(key.as_slice())?
-            .is_some();
-
         let mut tombstones = txn
             .open_table(XATTR_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        if has_base {
-            tombstones.insert(key.as_slice(), 1)?;
-        } else {
+        // An earlier local set may still reach base through delayed self replay.
+        tombstones.insert(key.as_slice(), 1)?;
+        Ok(())
+    }
+
+    /// Drops xattr tombstones for `keys` and for every key of `inodes` once base already
+    /// reflects the acknowledged removal and no pending local event can repopulate them.
+    pub(crate) fn retire_xattr_tombstones_in_txn(
+        txn: &redb::WriteTransaction,
+        keys: &[Vec<u8>],
+        inodes: &[Ino],
+    ) -> MetaResult<()> {
+        let mut inode_keys = Vec::new();
+        for ino in inodes {
+            inode_keys.extend(Self::keys_for_inode_in_write_table(
+                txn,
+                XATTR_TOMBSTONES_TABLE,
+                *ino,
+            )?);
+        }
+        let mut tombstones = txn
+            .open_table(XATTR_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for key in keys.iter().chain(&inode_keys) {
             tombstones.remove(key.as_slice())?;
         }
         Ok(())
