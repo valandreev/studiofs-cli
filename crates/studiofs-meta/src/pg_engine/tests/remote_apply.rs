@@ -1,7 +1,7 @@
 use super::*;
 use crate::engine::{MetaEngine, XATTR_CREATE_FLAG};
 use crate::events::encode_event;
-use crate::redb_engine::layout::encode_dentry_key;
+use crate::redb_engine::layout::{encode_dentry_key, encode_xattr_key};
 
 #[test]
 fn removed_xattr_stays_absent_when_earlier_self_set_replays() {
@@ -54,12 +54,65 @@ fn removed_xattr_stays_absent_when_earlier_self_set_replays() {
         pg.list_xattrs(ROOT_INO).unwrap(),
         vec![b"user.snrub".to_vec()]
     );
+    // The acknowledged removal is in base, so its tombstone is no longer local state.
+    assert!(pg.local.local_overlay_xattr_keys().unwrap().is_empty());
     pg.set_xattr(ROOT_INO, b"user.attribute_0", b"new", XATTR_CREATE_FLAG)
         .unwrap();
     assert_eq!(
         pg.get_xattr(ROOT_INO, b"user.attribute_0").unwrap(),
         Some(b"new".to_vec())
     );
+}
+
+#[test]
+fn acknowledged_self_removals_retire_xattr_tombstones() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let replay = |version: i64, start, end| {
+        let outcome = pg
+            .apply_replay_page_atomically(
+                vec![DecodedReplayBatch {
+                    batch_version: version,
+                    events: pg.local.read_events_range(start, end).unwrap(),
+                    is_self_batch: true,
+                }],
+                None,
+                RemoteReplayApplyContext {
+                    last_seq: version - 1,
+                    current_namespace_version: 0,
+                    flushed_event_seq: start,
+                    next_event_seq: pg.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+                    initial_overlay: OverlayConflictSets::default(),
+                },
+            )
+            .unwrap();
+        assert_eq!(outcome.flushed_event_seq, Some(end));
+    };
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let dir = pg
+        .create_dir(ROOT_INO, b"xattr-tombstones", 0, 0, 0o755)
+        .unwrap();
+    let created = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    replay(1, start, created);
+
+    pg.set_xattr(dir.ino, b"user.temp", b"v", 0).unwrap();
+    pg.remove_xattr(dir.ino, b"user.temp").unwrap();
+    pg.set_xattr(dir.ino, b"user.kept", b"v", 0).unwrap();
+    pg.rmdir(ROOT_INO, b"xattr-tombstones").unwrap();
+    pg.set_xattr(ROOT_INO, b"user.later", b"v", 0).unwrap();
+    pg.remove_xattr(ROOT_INO, b"user.later").unwrap();
+    let removed = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    // A later unacknowledged set/remove keeps the tombstone needed against its replay.
+    pg.set_xattr(ROOT_INO, b"user.later", b"again", 0).unwrap();
+    pg.remove_xattr(ROOT_INO, b"user.later").unwrap();
+    assert!(!pg.local.local_overlay_xattr_keys().unwrap().is_empty());
+
+    replay(2, created, removed);
+
+    assert_eq!(
+        pg.local.local_overlay_xattr_keys().unwrap(),
+        HashSet::from([encode_xattr_key(ROOT_INO, b"user.later")])
+    );
+    assert_eq!(pg.get_xattr(ROOT_INO, b"user.later").unwrap(), None);
 }
 
 #[test]

@@ -2150,6 +2150,41 @@ impl<'a> RemoteApplyCoordinator<'a> {
         )
     }
 
+    /// After a self batch is acknowledged, base already reflects its xattr removals, so
+    /// their tombstones only matter while an unacknowledged local event (published or not)
+    /// could still repopulate the key.
+    fn retire_acknowledged_xattr_tombstones_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        batch_events: &[MetaEvent],
+        pending_start: u64,
+        pending_end: u64,
+        execution: Option<&RemoteReplayExecution<'_>>,
+    ) -> MetaResult<()> {
+        let mut keys = Vec::new();
+        let mut inodes = Vec::new();
+        for event in batch_events {
+            match event {
+                MetaEvent::RemoveXattr { ino, name } => keys.push(encode_xattr_key(*ino, name)),
+                MetaEvent::RemoveAttr { ino } => inodes.push(*ino),
+                _ => {}
+            }
+        }
+        if keys.is_empty() && inodes.is_empty() {
+            return Ok(());
+        }
+        // No exclusions: published-but-unreplayed events can still reach base.
+        let pending = Self::overlay_conflicts_for_local_range_in_txn(
+            txn,
+            pending_start,
+            pending_end,
+            &[],
+            execution,
+        )?;
+        keys.retain(|key| !pending.xattr_keys.contains(key));
+        inodes.retain(|ino| !pending.xattr_inodes.contains(ino));
+        RedbMetaEngine::retire_xattr_tombstones_in_txn(txn, &keys, &inodes)
+    }
+
     fn acknowledge_local_prefix_from_self_batch_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
@@ -2580,6 +2615,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     context.flushed_event_seq = next_flushed_event_seq;
                     acknowledged_flushed_event_seq = Some(next_flushed_event_seq);
                     overlay_is_dirty = true;
+                    Self::retire_acknowledged_xattr_tombstones_in_txn(
+                        txn,
+                        &batch.events,
+                        next_flushed_event_seq,
+                        replay_next_event_seq,
+                        execution,
+                    )?;
                 }
             } else {
                 let effective_overlay =

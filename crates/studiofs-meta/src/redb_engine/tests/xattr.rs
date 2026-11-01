@@ -1,10 +1,39 @@
 #[test]
-fn unlink_does_not_retain_overlay_only_xattr_tombstones() {
+fn unlink_keeps_hiding_xattr_that_delayed_self_set_replays() {
     let engine = temp_engine();
     let file = engine.create_file(ROOT_INO, b"xattr-unlink", 0, 0, 0o644).unwrap();
     engine.set_xattr(file.ino, b"user.temporary", b"value", 0).unwrap();
     engine.unlink(ROOT_INO, b"xattr-unlink").unwrap();
-    assert!(engine.local_overlay_xattr_keys().unwrap().is_empty());
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::SetXattr {
+            ino: file.ino,
+            name: b"user.temporary".to_vec(),
+            value: b"value".to_vec(),
+            flags: 0,
+        }])
+        .unwrap();
+    assert_eq!(engine.get_xattr(file.ino, b"user.temporary").unwrap(), None);
+}
+
+#[test]
+fn pending_replay_of_local_xattr_removal_hides_base_value() {
+    let engine = temp_engine();
+    engine.set_xattr(ROOT_INO, b"user.gone", b"v", 0).unwrap();
+    let set = MetaEvent::SetXattr {
+        ino: ROOT_INO,
+        name: b"user.gone".to_vec(),
+        value: b"v".to_vec(),
+        flags: 0,
+    };
+    engine.apply_replica_events_to_base(&[set]).unwrap();
+    engine.remove_xattr(ROOT_INO, b"user.gone").unwrap();
+    engine
+        .apply_replica_serving_state_for_pending_replay(&[MetaEvent::RemoveXattr {
+            ino: ROOT_INO,
+            name: b"user.gone".to_vec(),
+        }])
+        .unwrap();
+    assert_eq!(engine.get_xattr(ROOT_INO, b"user.gone").unwrap(), None);
 }
 
 #[test]

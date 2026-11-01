@@ -778,6 +778,13 @@ Destination side:
 - remove the local `xattrs` entry for that key
 - always write a tombstone, even if `base_xattrs` does not contain the key yet:
   delayed self replay of an earlier set can still populate the base
+- unlink/rmdir tombstones every local and base xattr key of the removed inode
+  for the same reason
+- pending local replay re-applies a removal with the same tombstone, never as a
+  mirror delete
+- a tombstone is retired when this client's self batch carrying the
+  `RemoveXattr` (or the inode's `RemoveAttr`) is acknowledged and no
+  unacknowledged local event, published or not, touches that key (or inode)
 
 Update behavior:
 - the PostgreSQL sync format/protocol change is breaking; migration

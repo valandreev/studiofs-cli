@@ -1089,9 +1089,9 @@ impl RedbMetaEngine {
         Ok(keys)
     }
 
-    pub(super) fn keys_for_inode_in_write_table(
+    pub(super) fn keys_for_inode_in_write_table<V: redb::Value + 'static>(
         txn: &redb::WriteTransaction,
-        table_def: TableDefinition<&[u8], &[u8]>,
+        table_def: TableDefinition<&[u8], V>,
         ino: Ino,
     ) -> MetaResult<Vec<Vec<u8>>> {
         let prefix = xattr_prefix(ino);
@@ -1595,6 +1595,30 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    /// Drops xattr tombstones for `keys` and for every key of `inodes` once base already
+    /// reflects the acknowledged removal and no pending local event can repopulate them.
+    pub(crate) fn retire_xattr_tombstones_in_txn(
+        txn: &redb::WriteTransaction,
+        keys: &[Vec<u8>],
+        inodes: &[Ino],
+    ) -> MetaResult<()> {
+        let mut inode_keys = Vec::new();
+        for ino in inodes {
+            inode_keys.extend(Self::keys_for_inode_in_write_table(
+                txn,
+                XATTR_TOMBSTONES_TABLE,
+                *ino,
+            )?);
+        }
+        let mut tombstones = txn
+            .open_table(XATTR_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for key in keys.iter().chain(&inode_keys) {
+            tombstones.remove(key.as_slice())?;
+        }
+        Ok(())
+    }
+
     pub(super) fn next_undo_op_id_in_txn(txn: &redb::WriteTransaction) -> MetaResult<u64> {
         let mut counters = txn
             .open_table(COUNTERS_TABLE)
@@ -1725,7 +1749,7 @@ impl RedbMetaEngine {
         };
         for key in current_keys {
             let name = xattr_name_from_key(&key).to_vec();
-            Self::remove_xattr_mirror_in_txn(txn, ino, &name)?;
+            Self::remove_xattr_overlay_in_txn(txn, ino, &name)?;
         }
 
         if clear_regular_file_graph {

@@ -2014,7 +2014,13 @@ impl RedbMetaEngine {
                     Self::set_xattr_in_txn(txn, *ino, name, value)?;
                 }
                 crate::events::MetaEvent::RemoveXattr { ino, name } => {
-                    Self::remove_xattr_mirror_in_txn(txn, *ino, name)?;
+                    // Only pending local replay sets this flag; its removal must keep
+                    // hiding a base row that an earlier self set may still populate.
+                    if reject_stale_ready_growth {
+                        Self::remove_xattr_overlay_in_txn(txn, *ino, name)?;
+                    } else {
+                        Self::remove_xattr_mirror_in_txn(txn, *ino, name)?;
+                    }
                 }
                 crate::events::MetaEvent::SetAclRule {
                     ino,
