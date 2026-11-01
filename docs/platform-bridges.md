@@ -530,6 +530,16 @@ cached file size yet (ADR 0011, SFS-901 amendment). Set
 `STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct` and remount for the operational
 rollback.
 
+Linux nonempty write callbacks on `direct_io` handles clear `security.capability`
+before accepting data, because the kernel skips buffered-write privilege removal
+for them (SFS-933). Handles the kernel accepted without `direct_io` skip the
+lookup: the kernel already ran `file_remove_privs`. Empty writes and kernel
+writeback callbacks retain it; delayed
+writeback must not strip a capability installed after the original write.
+Other xattrs are preserved. Removal errors fail the write before data acceptance.
+This does not negotiate `HANDLE_KILLPRIV` or implement setuid/setgid removal
+(SFS-936).
+
 Shared mappings of `direct_io` handles require `FUSE_DIRECT_IO_ALLOW_MMAP`
 (kernel 6.6+); without it `mmap(MAP_SHARED)` fails with `ENODEV` (SFS-916).
 Negotiation is disabled by default. Set `STUDIOFS_FUSE_DIRECT_IO_MMAP=1` to

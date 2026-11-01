@@ -629,6 +629,14 @@ uint64_t studiofs_linux_fuse_file_info_fh(const struct fuse_file_info *info) {
     return info->fh;
 }
 
+int studiofs_linux_fuse_file_info_writepage(const struct fuse_file_info *info) {
+    return info->writepage;
+}
+
+void studiofs_linux_fuse_file_info_set_writepage_for_test(struct fuse_file_info *info) {
+    info->writepage = 1;
+}
+
 int studiofs_linux_fuse_file_info_flags(const struct fuse_file_info *info) {
     return info->flags;
 }
