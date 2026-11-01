@@ -24168,7 +24168,8 @@ fn deferred_materialization_drains_idle_tail_before_close() {
 #[test]
 fn deferred_materialization_drains_tail_after_write_handle_closes_with_reader_open() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-idle-tail-reader-open");
+    // Keep queued uploads observable without an uploader consuming them.
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-301-idle-tail-reader-open");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -24204,6 +24205,14 @@ fn deferred_materialization_drains_tail_after_write_handle_closes_with_reader_op
         .await
         .expect("idle tail should drain after the writer closes with a reader open");
 
+        assert_eq!(
+            vfs.pending_uploads_snapshot_for_inode(ino)
+                .iter()
+                .map(|upload| upload.payload_len)
+                .sum::<u64>(),
+            payload.len() as u64,
+            "the entire tail must enter the upload queue while the reader remains open"
+        );
         vfs.release_fh(reader).await.unwrap();
     });
 }

@@ -533,7 +533,16 @@ STUDIOFS_FUSE_DIRECT_IO_MMAP=1 cargo test -p studiofs-linux-fuse --lib mounted_s
 ```
 
 The mounted test uses the VFS contract fixture and needs `/dev/fuse` and
-`fusermount3`. The mmap behavior became opt-in because on a PostgreSQL/S3 mount
+`fusermount3`. Its mmap client re-executes the test binary in a child process
+while the parent serves FUSE and retains the unmount guard. Separate address
+spaces avoid the in-process `mmap_lock` deadlock tracked in SFS-948. The same
+client and failure propagation can be checked on a local filesystem without FUSE:
+
+```sh
+cargo test -p studiofs-linux-fuse --lib shared_writable_mmap_client_runs_in_child_process
+```
+
+The mmap behavior became opt-in because on a PostgreSQL/S3 mount
 with the adaptive policy (WSL2 6.6, libfuse 3.14.0, release build), `default`
 passed 2 of 2 runs, and `large`, `nommap`, and `large-nommap` passed, but
 `small` failed 1 of 2 full runs and 1 of 5 replays with a durable size error

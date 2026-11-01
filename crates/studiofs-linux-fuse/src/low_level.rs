@@ -9646,20 +9646,139 @@ mod tests {
         std::fs::remove_dir_all(&mount_point).expect("remove mount point");
     }
 
+    /// Returns whether the child ran exactly one client test and it passed.
+    fn run_mmap_client(directory: &std::path::Path) -> std::io::Result<bool> {
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "low_level::tests::mounted_shared_writable_mmap_round_trips_under_adaptive_policy",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("STUDIOFS_TEST_MMAP_DIRECTORY", directory)
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let passed = output.status.success() && stdout.contains("test result: ok. 1 passed;");
+        if !passed {
+            eprintln!(
+                "mmap client {}: {stdout}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(passed)
+    }
+
+    #[test]
+    fn shared_writable_mmap_client_runs_in_child_process() {
+        let directory = studiofs_test_support::workspace_target_tempdir("mmap-client-");
+        assert!(run_mmap_client(directory.path()).expect("run mmap client"));
+        let bytes = std::fs::read(directory.path().join("mapped.bin")).expect("client wrote file");
+        assert_eq!(bytes.len(), 3 * 4096 + 123);
+        assert_eq!(&bytes[4096..4096 + 7], b"rewrite");
+        assert!(
+            !run_mmap_client(directory.path()).expect("run failing mmap client"),
+            "client errors must reach the parent",
+        );
+    }
+
+    fn shared_writable_mmap_client(directory: &std::path::Path) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        const FILE_LEN: usize = 3 * 4096 + 123;
+        let path = directory.join("mapped.bin");
+        let expected: Vec<u8> = (0..FILE_LEN).map(|index| (index % 251) as u8).collect();
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        file.set_len(FILE_LEN as u64)?;
+        // SAFETY: the fd is open read-write and the file is FILE_LEN bytes.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                FILE_LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the mapping is FILE_LEN writable bytes and does not
+        // overlap `expected`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), mapping.cast::<u8>(), FILE_LEN);
+        }
+        // SAFETY: `mapping` is the live mapping created above.
+        let synced = unsafe { libc::msync(mapping, FILE_LEN, libc::MS_SYNC) };
+        let msync_error = std::io::Error::last_os_error();
+        // SAFETY: unmapping the live mapping created above exactly once.
+        let unmapped = unsafe { libc::munmap(mapping, FILE_LEN) };
+        let munmap_error = std::io::Error::last_os_error();
+        if synced != 0 {
+            return Err(msync_error);
+        }
+        if unmapped != 0 {
+            return Err(munmap_error);
+        }
+        drop(file);
+
+        assert_eq!(std::fs::read(&path)?, expected);
+
+        // A mapping outlives close(): its dirty pages reach the handle
+        // after FLUSH, via the writeback that munmap starts, before RELEASE.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        // SAFETY: the fd is open read-write and the file is FILE_LEN bytes.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                FILE_LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        drop(file);
+        let mut expected = expected;
+        expected[4096..4096 + 7].copy_from_slice(b"rewrite");
+        // SAFETY: the mapping stays valid after close and covers this range.
+        unsafe {
+            std::ptr::copy_nonoverlapping(b"rewrite".as_ptr(), mapping.cast::<u8>().add(4096), 7);
+        }
+        // SAFETY: unmapping the live mapping created above exactly once.
+        if unsafe { libc::munmap(mapping, FILE_LEN) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        assert_eq!(std::fs::read(&path)?, expected);
+
+        Ok(())
+    }
+
     /// SFS-916: adaptive opens writable handles with `direct_io`; the kernel
     /// refuses a shared writable mapping of such a file with ENODEV unless the
     /// connection negotiated `FUSE_DIRECT_IO_ALLOW_MMAP`.
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
-    fn mounted_shared_writable_mmap_round_trips_under_adaptive_policy() {
-        use std::os::fd::AsRawFd;
-
-        const FILE_LEN: usize = 3 * 4096 + 123;
+    fn mounted_shared_writable_mmap_round_trips_under_adaptive_policy() -> std::io::Result<()> {
+        if let Some(directory) = std::env::var_os("STUDIOFS_TEST_MMAP_DIRECTORY") {
+            return shared_writable_mmap_client(std::path::Path::new(&directory));
+        }
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-mmap")
             .expect("create VFS fixture");
         fixture.start().expect("start VFS fixture");
-        let mount_point =
-            std::env::temp_dir().join(format!("studiofs-linux-fuse-mmap-{}", std::process::id()));
+        let mount_point = studiofs_test_support::workspace_target_temp_path("linux-fuse-mmap-");
         std::fs::create_dir_all(&mount_point).expect("create mount point");
         let mut state = super::SessionState::new(
             fixture.vfs(),
@@ -9674,92 +9793,19 @@ mod tests {
         let mount_point_for_worker = mount_point.clone();
         let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
             let guard = UnmountGuard::new(mount_point_for_worker.clone());
-            let path = mount_point_for_worker.join("mapped.bin");
-            let expected: Vec<u8> = (0..FILE_LEN).map(|index| (index % 251) as u8).collect();
-            let file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&path)?;
-            file.set_len(FILE_LEN as u64)?;
-            // SAFETY: the fd is open read-write and the file is FILE_LEN bytes.
-            let mapping = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    FILE_LEN,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    file.as_raw_fd(),
-                    0,
-                )
-            };
-            if mapping == libc::MAP_FAILED {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: the mapping is FILE_LEN writable bytes and does not
-            // overlap `expected`.
-            unsafe {
-                std::ptr::copy_nonoverlapping(expected.as_ptr(), mapping.cast::<u8>(), FILE_LEN);
-            }
-            // SAFETY: `mapping` is the live mapping created above.
-            let synced = unsafe { libc::msync(mapping, FILE_LEN, libc::MS_SYNC) };
-            let msync_error = std::io::Error::last_os_error();
-            // SAFETY: unmapping the live mapping created above exactly once.
-            let unmapped = unsafe { libc::munmap(mapping, FILE_LEN) };
-            let munmap_error = std::io::Error::last_os_error();
-            if synced != 0 {
-                return Err(msync_error);
-            }
-            if unmapped != 0 {
-                return Err(munmap_error);
-            }
-            drop(file);
-
-            assert_eq!(std::fs::read(&path)?, expected);
-
-            // A mapping outlives close(): its dirty pages reach the handle
-            // after FLUSH, via the writeback that munmap starts, before RELEASE.
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)?;
-            // SAFETY: the fd is open read-write and the file is FILE_LEN bytes.
-            let mapping = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    FILE_LEN,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    file.as_raw_fd(),
-                    0,
-                )
-            };
-            if mapping == libc::MAP_FAILED {
-                return Err(std::io::Error::last_os_error());
-            }
-            drop(file);
-            let mut expected = expected;
-            expected[4096..4096 + 7].copy_from_slice(b"rewrite");
-            // SAFETY: the mapping stays valid after close and covers this range.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    b"rewrite".as_ptr(),
-                    mapping.cast::<u8>().add(4096),
-                    7,
-                );
-            }
-            // SAFETY: unmapping the live mapping created above exactly once.
-            if unsafe { libc::munmap(mapping, FILE_LEN) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-
-            assert_eq!(std::fs::read(&path)?, expected);
-
+            // The client must have its own mm so page faults cannot hold the
+            // server's mmap_lock while FUSE workers allocate (SFS-948).
+            let client_status = run_mmap_client(&mount_point_for_worker);
             let status = Command::new("fusermount3")
                 .arg("-u")
                 .arg(&mount_point_for_worker)
                 .status();
-            guard.disarm();
+            if status.as_ref().is_ok_and(std::process::ExitStatus::success) {
+                guard.disarm();
+            }
+            if !client_status? {
+                return Err(std::io::Error::other("mmap client failed"));
+            }
             status
         });
 
@@ -9776,6 +9822,7 @@ mod tests {
             .expect("mounted VFS shutdown should succeed");
         drop(fixture);
         std::fs::remove_dir_all(&mount_point).expect("remove mount point");
+        Ok(())
     }
 
     #[test]
