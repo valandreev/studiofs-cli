@@ -1821,7 +1821,10 @@ fn round_up_to_page(len: usize, page_size: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{open_local_payload_backend, open_local_payload_backend_with_budget};
+    use crate::open_local_payload_backend;
+    use crate::runtime::{
+        LocalPayloadBackendConfig, LocalPayloadBackendRuntime, LocalPayloadLayout,
+    };
 
     fn temp_cached_store(dir: &tempfile::TempDir) -> (Arc<CachedStore>, mpsc::Receiver<()>) {
         let backend =
@@ -1834,15 +1837,27 @@ mod tests {
     fn temp_cached_store_with_budget(
         dir: &tempfile::TempDir,
         budget_bytes: u64,
-    ) -> (Arc<CachedStore>, mpsc::Receiver<()>) {
-        let backend = open_local_payload_backend_with_budget(
-            dir.path(),
-            "00000000-0000-0000-0000-000000000001",
-            budget_bytes,
-        )
-        .expect("open budgeted backend")
-        .backend;
-        CachedStore::open(CachedStoreConfig::new(dir.path()), backend).expect("open cached store")
+    ) -> (
+        Arc<CachedStore>,
+        mpsc::Receiver<()>,
+        Arc<LocalPayloadBackendRuntime>,
+    ) {
+        LocalPayloadLayout::from_cache_root(dir.path())
+            .provision()
+            .expect("provision local payload layout");
+        let backend = Arc::new(
+            LocalPayloadBackendRuntime::open_with_budget(
+                LocalPayloadBackendConfig {
+                    cache_root: dir.path().to_path_buf(),
+                    volume_uuid: [1; 16],
+                },
+                Some(budget_bytes),
+            )
+            .expect("open budgeted backend"),
+        );
+        let (store, rx) = CachedStore::open(CachedStoreConfig::new(dir.path()), backend.clone())
+            .expect("open cached store");
+        (store, rx, backend)
     }
 
     async fn recv_one(store: &CachedStore, rx: &mut mpsc::Receiver<()>) -> PendingUpload {
@@ -3599,7 +3614,7 @@ mod tests {
     #[test]
     fn pressure_maintenance_does_not_evict_pinned_uploaded_blocks() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
-        let (cached_store, _rx) = temp_cached_store_with_budget(&dir, 100);
+        let (cached_store, _rx, backend) = temp_cached_store_with_budget(&dir, 100);
 
         cached_store.put(20, &[0x01; 30], true).expect("put 20");
         cached_store.put(21, &[0x02; 30], true).expect("put 21");
@@ -3607,8 +3622,8 @@ mod tests {
         cached_store.put(23, &[0x04; 5], true).expect("put 23");
         cached_store.pin(20);
 
-        cached_store
-            .run_pressure_maintenance()
+        backend
+            .run_budget_pressure_maintenance_for_test()
             .expect("run pressure maintenance");
 
         assert!(
@@ -3620,7 +3635,7 @@ mod tests {
     #[test]
     fn double_pin_requires_double_unpin_before_eviction_can_resume() {
         let dir = studiofs_test_support::workspace_target_tempdir("test-");
-        let (cached_store, _rx) = temp_cached_store_with_budget(&dir, 100);
+        let (cached_store, _rx, backend) = temp_cached_store_with_budget(&dir, 100);
 
         cached_store.put(20, &[0x01; 30], true).expect("put 20");
         cached_store.put(21, &[0x02; 30], true).expect("put 21");
@@ -3631,8 +3646,8 @@ mod tests {
         cached_store.pin(20);
         cached_store.unpin(20);
 
-        cached_store
-            .run_pressure_maintenance()
+        backend
+            .run_budget_pressure_maintenance_for_test()
             .expect("run pressure maintenance");
 
         assert!(
@@ -3646,8 +3661,8 @@ mod tests {
             "object should become evictable again after the final unpin"
         );
         cached_store.put(24, &[0x05; 30], true).expect("put 24");
-        cached_store
-            .run_pressure_maintenance()
+        backend
+            .run_budget_pressure_maintenance_for_test()
             .expect("run pressure maintenance after final unpin");
 
         assert!(
