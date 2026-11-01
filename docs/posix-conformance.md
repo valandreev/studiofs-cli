@@ -126,7 +126,7 @@ TTL causes remain unassigned unless established by the specific evidence.
 | Test | Bucket | Observed limit / failure | Follow-up |
 |---|---|---|---|
 | generic/001 | bug | copy-chain source names remain visible after rename/unlink; ext4 replay passes | [SFS-927](https://linear.app/valandreev/issue/SFS-927) |
-| generic/003 | environment/harness | nodiratime/noatime/strictatime are unavailable through helper | — |
+| generic/003 | environment/harness | nodiratime/noatime/strictatime are unavailable through helper; a helper change alone would not pass, because SFS-937 defines [automatic strictatime/relatime updates as unsupported](platform-bridges.md#linux-access-time) | [SFS-937](https://linear.app/valandreev/issue/SFS-937) |
 | generic/011 | bug | final dirstress cleanup leaves nonempty directories; ext4 replay passes | [SFS-928](https://linear.app/valandreev/issue/SFS-928) |
 | generic/013 | environment/harness | fsstress exceeded initial 60-second budget; no deadlock inferred | — |
 | generic/020 | bug | xattrs remain listed after successful removals | [SFS-931](https://linear.app/valandreev/issue/SFS-931) |
