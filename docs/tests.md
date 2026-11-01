@@ -562,6 +562,19 @@ cargo build -p studiofs -p studiofs-e2e
 target/debug/studiofs-e2e run mounted-posix-acl-xattr-rejection --studiofs-bin target/debug/studiofs --run-id sfs934-acl --retain always --timeout 300s
 ```
 
+### SFS-936 Setuid/Setgid Cleared on Direct Writes and O_TRUNC
+
+The unit tests cover the conditional setgid rule, empty writes, a uid 0 caller,
+and `open(O_TRUNC)`. The mounted tests run `truncate`, `ftruncate`,
+`open(O_TRUNC)`, and the four generic/355 4 KiB `O_DIRECT` mode variants as an
+unprivileged owner under `adaptive` and `kernel`; run them as a non-root user:
+
+```sh
+cargo test -p studiofs-linux-fuse --lib killed_privilege_mode_matches_linux_setgid_rule
+cargo test -p studiofs-linux-fuse --lib direct_write_and_o_trunc_open_kill_privileges_except_for_root
+cargo test -p studiofs-linux-fuse --lib mounted_owner_truncate_and_write_clear_privilege_bits -- --ignored
+```
+
 ### SFS-933 File Capabilities Cleared on Data Writes
 
 The kernel runs `file_remove_privs` only for writes on handles it opened
