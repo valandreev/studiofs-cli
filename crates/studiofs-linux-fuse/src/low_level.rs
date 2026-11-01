@@ -232,6 +232,7 @@ unsafe extern "C" {
         parallel_direct_writes: c_int,
     );
     fn studiofs_linux_fuse_file_info_fh(info: *const raw::FuseFileInfo) -> u64;
+    fn studiofs_linux_fuse_file_info_writepage(info: *const raw::FuseFileInfo) -> c_int;
     fn studiofs_linux_fuse_file_info_flags(info: *const raw::FuseFileInfo) -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_low_level_ops_has_metadata_callbacks(
@@ -275,6 +276,8 @@ unsafe extern "C" {
     /// Returns null on allocation failure; free a nonnull result once with `libc::free`.
     #[cfg(test)]
     fn studiofs_linux_fuse_file_info_new_for_test(fh: u64) -> *mut raw::FuseFileInfo;
+    #[cfg(test)]
+    fn studiofs_linux_fuse_file_info_set_writepage_for_test(info: *mut raw::FuseFileInfo);
     #[cfg(test)]
     fn studiofs_linux_fuse_file_info_flags_after_init(
         direct_io: c_int,
@@ -2615,6 +2618,7 @@ impl SessionState {
         fi: *const raw::FuseFileInfo,
     ) -> Result<u32, i32> {
         let request = self.prepare_write_metadata(buf, size, offset, fi)?;
+        self.clear_write_capability(ino, request.fh, size, fi)?;
         with_write_data_slice(buf, size, |data| {
             self.runtime_handle
                 .block_on(self.vfs.write_fh_with_deferred_materialize(
@@ -2644,6 +2648,7 @@ impl SessionState {
         if !request.local_sync_policy.is_opportunistic() {
             return Ok(false);
         }
+        self.clear_write_capability(ino, request.fh, size, fi)?;
 
         // Register before capacity admission so a concurrently captured
         // inode/handle watermark cannot miss this callback.
@@ -2763,6 +2768,38 @@ impl SessionState {
             offset,
             local_sync_policy,
         })
+    }
+
+    fn clear_write_capability(
+        &self,
+        ino: u64,
+        fh: u64,
+        size: usize,
+        fi: *const raw::FuseFileInfo,
+    ) -> Result<(), i32> {
+        // SAFETY: prepare_write_metadata validated fi before either caller gets here.
+        let writeback = unsafe { studiofs_linux_fuse_file_info_writepage(fi) } != 0;
+        // Direct IO bypasses kernel privilege removal; delayed writeback must not
+        // remove capabilities installed after the original buffered write.
+        if size > 0
+            && !writeback
+            && self
+                .vfs
+                .get_open_file(fh)
+                .is_some_and(|open| open.ino == ino && open.flags.allows_write())
+            && self
+                .vfs
+                .get_xattr_size(ino, b"security.capability")
+                .map_err(|error| vfs_err_to_errno(&error))?
+                .is_some()
+        {
+            match self.vfs.remove_xattr(ino, b"security.capability") {
+                Ok(()) => {}
+                Err(error) if xattr_mutation_err_to_errno(&error) == libc::ENODATA => {}
+                Err(error) => return Err(vfs_err_to_errno(&error)),
+            }
+        }
+        Ok(())
     }
 
     fn local_sync_policy_for_handle(&self, fh: u64) -> LocalSyncPolicy {
@@ -6328,7 +6365,18 @@ mod tests {
             )
         };
         let small = vec![1_u8; super::INLINE_WRITE_MAX_BYTES];
+        fixture
+            .vfs()
+            .set_xattr(attr.ino, b"security.capability", b"cap", 0)
+            .unwrap();
         assert_eq!(write(&small, 0), Ok(true));
+        assert_eq!(
+            fixture
+                .vfs()
+                .get_xattr(attr.ino, b"security.capability")
+                .unwrap(),
+            None
+        );
         assert_eq!(
             *replies.lock().unwrap(),
             [(thread::current().id(), Ok(small.len() as u32))],
@@ -6337,10 +6385,21 @@ mod tests {
         assert_eq!(state.async_writes.metrics_snapshot().pending_writes, 0);
 
         let large = vec![2_u8; super::INLINE_WRITE_MAX_BYTES + 1];
+        fixture
+            .vfs()
+            .set_xattr(attr.ino, b"security.capability", b"cap", 0)
+            .unwrap();
         assert_eq!(write(&large, small.len() as libc::off_t), Ok(true));
         assert_eq!(
             state.async_writes.wait_all(Duration::from_secs(10)),
             crate::async_writes::BarrierOutcome::Complete(None)
+        );
+        assert_eq!(
+            fixture
+                .vfs()
+                .get_xattr(attr.ino, b"security.capability")
+                .unwrap(),
+            None
         );
         let replies = replies.lock().unwrap().clone();
         assert_eq!(replies.len(), 2);
@@ -8359,6 +8418,109 @@ mod tests {
     }
 
     #[test]
+    fn append_clears_capability_and_preserves_other_xattrs() {
+        let (fixture, state) = reply_fixture("linux-append-capability");
+        fixture.start().expect("start fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs.create(1, b"file", 0, 0, 0o644).expect("create");
+        let open = state
+            .open_with_flags(attr.ino, libc::O_WRONLY | libc::O_APPEND)
+            .expect("open append handle");
+        // SAFETY: the C shim allocates file info with the handle, freed below.
+        let fi = unsafe { super::studiofs_linux_fuse_file_info_new_for_test(open.fh) };
+        let seed = b"seed";
+        assert_eq!(
+            state.write(attr.ino, seed.as_ptr().cast(), seed.len(), 0, fi),
+            Ok(4)
+        );
+        for name in [
+            b"security.capability".as_slice(),
+            b"user.keep",
+            b"trusted.keep",
+        ] {
+            vfs.set_xattr(attr.ino, name, b"keep", 0)
+                .expect("set xattr");
+        }
+        assert_eq!(state.write(attr.ino, std::ptr::null(), 0, 0, fi), Ok(0));
+        assert_eq!(
+            vfs.get_xattr(attr.ino, b"security.capability").unwrap(),
+            Some(b"keep".to_vec()),
+            "empty writes must retain capabilities"
+        );
+        let data = b"data1\n";
+        let read_only = state.open_with_flags(attr.ino, libc::O_RDONLY).unwrap();
+        // SAFETY: the C shim allocates file info with the read-only handle.
+        let read_fi = unsafe { super::studiofs_linux_fuse_file_info_new_for_test(read_only.fh) };
+        assert!(
+            state
+                .write(attr.ino, data.as_ptr().cast(), data.len(), 4, read_fi)
+                .is_err()
+        );
+        // SAFETY: the read-only file info is owned by this test and no longer used.
+        unsafe { libc::free(read_fi.cast()) };
+        state
+            .release(read_only.fh)
+            .expect("release read-only handle");
+        assert_eq!(
+            state.write(attr.ino, data.as_ptr().cast(), data.len(), -1, fi),
+            Err(libc::EINVAL)
+        );
+        assert_eq!(
+            vfs.get_xattr(attr.ino, b"security.capability").unwrap(),
+            Some(b"keep".to_vec()),
+            "invalid offsets must not mutate xattrs"
+        );
+        assert_eq!(
+            state.write(attr.ino, data.as_ptr().cast(), data.len(), 4, fi),
+            Ok(6)
+        );
+        assert_eq!(
+            vfs.get_xattr(attr.ino, b"security.capability").unwrap(),
+            None
+        );
+        for name in [b"user.keep".as_slice(), b"trusted.keep"] {
+            assert_eq!(
+                vfs.get_xattr(attr.ino, name).unwrap(),
+                Some(b"keep".to_vec())
+            );
+        }
+        assert_eq!(
+            state.write(attr.ino, data.as_ptr().cast(), data.len(), 10, fi),
+            Ok(6),
+            "an absent capability must not fail subsequent writes"
+        );
+        vfs.set_xattr(attr.ino, b"security.capability", b"new", 0)
+            .unwrap();
+        // SAFETY: this test owns a valid file info allocated by the C shim.
+        unsafe { super::studiofs_linux_fuse_file_info_set_writepage_for_test(fi) };
+        assert_eq!(
+            state.write(attr.ino, data.as_ptr().cast(), data.len(), 12, fi),
+            Ok(6)
+        );
+        assert_eq!(
+            vfs.get_xattr(attr.ino, b"security.capability").unwrap(),
+            Some(b"new".to_vec()),
+            "delayed writeback must retain a capability installed after dirtying"
+        );
+        // SAFETY: this test owns the allocation returned by the C shim.
+        unsafe { libc::free(fi.cast()) };
+        vfs.unlink(1, b"file").expect("unlink open file");
+        // SAFETY: the C shim allocates file info for the still-open handle.
+        let fi = unsafe { super::studiofs_linux_fuse_file_info_new_for_test(open.fh) };
+        assert_eq!(
+            state.write(attr.ino, data.as_ptr().cast(), data.len(), 18, fi),
+            Ok(6)
+        );
+        assert_eq!(
+            vfs.get_xattr(attr.ino, b"security.capability").unwrap(),
+            None
+        );
+        // SAFETY: this test owns the file info and no longer uses it.
+        unsafe { libc::free(fi.cast()) };
+        state.release(open.fh).expect("release");
+    }
+
+    #[test]
     fn sync_open_handle_uses_write_through_policy() {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-sync-policy")
@@ -8714,6 +8876,7 @@ mod tests {
         let mut session =
             super::Session::mount(state, &mount_point, "studiofs-regular-io").expect("mount");
         let mount_point_for_worker = mount_point.clone();
+        let vfs = fixture.vfs();
         let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
             let guard = UnmountGuard::new(mount_point_for_worker.clone());
             let path = mount_point_for_worker.join("regular.txt");
@@ -8732,6 +8895,41 @@ mod tests {
             drop(file);
 
             assert_eq!(std::fs::read_to_string(&path)?, "hello local-first");
+            let attr = vfs.lookup(1, b"regular.txt").expect("lookup mounted file");
+            // Seed revision-2 cap_chown+ep without requiring CAP_SETFCAP in the test process.
+            let mut capability = [0_u8; 20];
+            capability[0] = 1;
+            capability[3] = 2;
+            capability[4] = 1;
+            for (name, value) in [
+                (b"security.capability".as_slice(), capability.as_slice()),
+                (b"user.keep", b"keep"),
+                (b"trusted.keep", b"keep"),
+            ] {
+                vfs.set_xattr(attr.ino, name, value, 0).expect("seed xattr");
+            }
+            let before = Command::new("getcap").arg(&path).output()?;
+            assert!(before.status.success());
+            assert!(
+                !before.stdout.is_empty(),
+                "mounted file must expose the capability"
+            );
+            let mut append = std::fs::OpenOptions::new().append(true).open(&path)?;
+            append.write_all(b"!")?;
+            drop(append);
+            let after = Command::new("getcap").arg(&path).output()?;
+            assert!(after.status.success());
+            assert!(
+                after.stdout.is_empty(),
+                "append must clear the mounted capability"
+            );
+            for name in [b"user.keep".as_slice(), b"trusted.keep"] {
+                assert_eq!(
+                    vfs.get_xattr(attr.ino, name).unwrap(),
+                    Some(b"keep".to_vec())
+                );
+            }
+            assert_eq!(std::fs::read_to_string(&path)?, "hello local-first!");
             let file = std::fs::OpenOptions::new().write(true).open(&path)?;
             file.set_len(5)?;
             file.sync_data()?;
