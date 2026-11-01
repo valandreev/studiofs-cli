@@ -24082,7 +24082,8 @@ fn deferred_materialization_coalesces_synchronous_small_callbacks() {
 #[test]
 fn deferred_materialization_drains_idle_tail_before_close() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-idle-tail-before-close");
+    // Keep queued uploads observable without an uploader consuming them.
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-301-idle-tail-before-close");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -24105,20 +24106,8 @@ fn deferred_materialization_drains_idle_tail_before_close() {
         .await
         .unwrap();
 
-        let idle_tail_timeout = Duration::from_millis(
-            DEFERRED_MATERIALIZATION_LINGER_WAIT_MS
-                * DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES as u64
-                * 3,
-        )
-        .max(Duration::from_secs(2));
-        tokio::time::timeout(idle_tail_timeout, async {
-            loop {
-                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
-                    && vfs.total_pending_persisted_local_dirty_slice_bytes() == 0
-                    && !vfs.pending_uploads_for_inode(ino).is_empty()
-                {
-                    break;
-                }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while vfs.state.deferred_materialize_inflight.contains(ino) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -24134,6 +24123,13 @@ fn deferred_materialization_drains_idle_tail_before_close() {
             vfs.state.writer_stack.dirty_bytes_for_inode(ino),
             0,
             "background materialization should not wait for last-handle release"
+        );
+        assert_eq!(vfs.total_pending_persisted_local_dirty_slice_bytes(), 0);
+        let uploads = vfs.pending_uploads_snapshot_for_inode(ino);
+        assert_eq!(
+            uploads.iter().map(|upload| upload.payload_len).sum::<u64>(),
+            payload.len() as u64,
+            "both the full block and idle tail must enter the upload queue before close"
         );
 
         vfs.release_fh(fh).await.unwrap();
