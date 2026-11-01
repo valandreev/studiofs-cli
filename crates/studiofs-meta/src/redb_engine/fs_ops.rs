@@ -957,7 +957,7 @@ impl MetaFsOps for RedbMetaEngine {
         } else {
             None
         };
-        let old_parent_seed = if src_entry.kind == FileType::Directory && parent != new_parent {
+        let old_parent_seed = if parent != new_parent {
             Some(Self::get_attr_merged_in_write_txn(&txn, parent)?)
         } else {
             None
@@ -965,12 +965,7 @@ impl MetaFsOps for RedbMetaEngine {
         let displaces_dir = dst_entry_opt
             .as_ref()
             .is_some_and(|dst| dst.kind == FileType::Directory);
-        let new_parent_seed =
-            if (src_entry.kind == FileType::Directory && parent != new_parent) || displaces_dir {
-                Some(Self::get_attr_merged_in_write_txn(&txn, new_parent)?)
-            } else {
-                None
-            };
+        let new_parent_seed = Some(Self::get_attr_merged_in_write_txn(&txn, new_parent)?);
         let mut displaced = None;
         let mut displaced_set_attr = None;
         let mut displaced_remove_attr_ino = None;
@@ -1030,7 +1025,9 @@ impl MetaFsOps for RedbMetaEngine {
                 moved_dir_attr = Some(attr);
             }
             if let Some(mut attr) = old_parent_attr.take() {
-                attr.nlink = attr.nlink.saturating_sub(1);
+                if src_entry.kind == FileType::Directory {
+                    attr.nlink = attr.nlink.saturating_sub(1);
+                }
                 attr.touch_mtime();
                 Self::set_inode_in_txn(&txn, &attr)?;
                 old_parent_attr = Some(attr);

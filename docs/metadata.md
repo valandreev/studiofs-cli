@@ -748,6 +748,9 @@ Destination side:
 
 - if destination exists in merged view, treat it as overwritten
 - write `Present(src_entry)` at destination name
+- update both parents' `mtime` and `ctime` in the same transaction and carry
+  their attributes in `RenameEntry`, including file replacement; a same-parent
+  rename updates that parent once, while a same-inode no-op changes neither
 - update moved inode attr in `inodes` when parent changes
 - update overwritten inode attr in `inodes` if `nlink` drops but inode
   survives locally
