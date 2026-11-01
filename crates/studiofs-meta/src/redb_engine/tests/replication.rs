@@ -2826,3 +2826,37 @@ fn pending_serving_replay_rename_over_local_entry_resolves_to_moved_winner() {
         .is_err());
     assert!(engine.get_attr(displaced.ino).is_err());
 }
+
+#[test]
+fn pending_rename_replay_does_not_restore_the_published_source() {
+    let engine = temp_engine();
+    let file = engine.create_file(ROOT_INO, b"copy.0", 0, 0, 0o644).unwrap();
+    publish_base_row_for_test(&engine, file.ino);
+    engine
+        .apply_replica_events_to_base(&[MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"copy.0".to_vec(),
+            entry: DirEntryValue {
+                ino: file.ino,
+                kind: FileType::RegularFile,
+            },
+        }])
+        .unwrap();
+    let start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    engine
+        .rename(ROOT_INO, b"copy.0", ROOT_INO, b"copy.last")
+        .unwrap();
+    let events = local_window_events(&engine, start);
+    assert!(engine.lookup(ROOT_INO, b"copy.0").is_err());
+    engine
+        .apply_replica_serving_state_for_pending_replay(&events)
+        .unwrap();
+    assert!(
+        matches!(
+            engine.lookup(ROOT_INO, b"copy.0"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "pending replay must keep the renamed source absent while base still holds it"
+    );
+    assert_eq!(engine.lookup(ROOT_INO, b"copy.last").unwrap().ino, file.ino);
+}

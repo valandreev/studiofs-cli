@@ -1703,7 +1703,7 @@ impl RedbMetaEngine {
                     || drop_new_parent)
                 {
                     out.push(Cow::Borrowed(event));
-                    Self::push_destination_entry_replay(event, out);
+                    Self::push_rename_namespace_replay(event, out);
                     return Ok(());
                 }
                 let mut sanitized = event.clone();
@@ -1733,7 +1733,7 @@ impl RedbMetaEngine {
                     }
                 }
                 out.push(Cow::Owned(sanitized));
-                Self::push_destination_entry_replay(event, out);
+                Self::push_rename_namespace_replay(event, out);
                 return Ok(());
             }
             _ => Some(Cow::Borrowed(event)),
@@ -1742,19 +1742,24 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    /// A replayed live rename also sets its destination name to the moved entry, as the
-    /// local rename did. The serving rename arm only sets it when the base tables agree.
-    fn push_destination_entry_replay<'event>(
+    /// Restore both sides of the local rename even while base still holds its source.
+    fn push_rename_namespace_replay<'event>(
         event: &'event crate::events::MetaEvent,
         out: &mut Vec<Cow<'event, crate::events::MetaEvent>>,
     ) {
         if let crate::events::MetaEvent::RenameEntry {
+            parent,
+            name,
             new_parent,
             new_name,
             entry,
             ..
         } = event
         {
+            out.push(Cow::Owned(crate::events::MetaEvent::RemoveEntry {
+                parent: *parent,
+                name: name.clone(),
+            }));
             out.push(Cow::Owned(crate::events::MetaEvent::AddEntry {
                 parent: *new_parent,
                 name: new_name.clone(),
