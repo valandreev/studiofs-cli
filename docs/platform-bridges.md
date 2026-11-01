@@ -530,9 +530,11 @@ cached file size yet (ADR 0011, SFS-901 amendment). Set
 `STUDIOFS_LINUX_FUSE_CACHE_POLICY=direct` and remount for the operational
 rollback.
 
-Linux nonempty write callbacks clear `security.capability` before accepting data,
-including direct I/O writes where the kernel skips buffered-write privilege
-removal (SFS-933). Empty writes and kernel writeback callbacks retain it; delayed
+Linux nonempty write callbacks on `direct_io` handles clear `security.capability`
+before accepting data, because the kernel skips buffered-write privilege removal
+for them (SFS-933). Handles the kernel accepted without `direct_io` skip the
+lookup: the kernel already ran `file_remove_privs`. Empty writes and kernel
+writeback callbacks retain it; delayed
 writeback must not strip a capability installed after the original write.
 Other xattrs are preserved. Removal errors fail the write before data acceptance.
 This does not negotiate `HANDLE_KILLPRIV` or implement setuid/setgid removal

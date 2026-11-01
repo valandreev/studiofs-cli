@@ -308,7 +308,7 @@ pub(crate) struct SessionState {
     open_reply_serializer: FuseOpenReplySerializer,
     inode_liveness: FuseInodeLiveness,
     open_directories: OpenDirectoryAttrs,
-    open_liveness: [Mutex<HashMap<u64, FuseOpenHandleGuard>>; LIVENESS_SHARDS],
+    open_liveness: [Mutex<HashMap<u64, FuseOpenHandle>>; LIVENESS_SHARDS],
     invalidation_queue: FuseInvalidationQueue,
     /// Runtime stats text captured at open, keyed by VFS file handle.
     runtime_stats_snapshots: Mutex<HashMap<u64, Arc<[u8]>>>,
@@ -559,6 +559,12 @@ impl Drop for ForgetClosedHandle<'_> {
             "closed handle barrier must consume all pending writes and errors"
         );
     }
+}
+
+struct FuseOpenHandle {
+    liveness: FuseOpenHandleGuard,
+    /// Set once the kernel accepted the open without `direct_io`.
+    kernel_buffered: bool,
 }
 
 struct LinuxFuseWriteRequest {
@@ -2493,6 +2499,15 @@ impl SessionState {
     }
 
     fn record_accepted_open_cache(&self, prepared: LinuxFusePreparedOpen) {
+        if !prepared.cache.direct_io
+            && let Some(handle) = self
+                .open_liveness_shard(prepared.fh)
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_mut(&prepared.fh)
+        {
+            handle.kernel_buffered = true;
+        }
         self.vfs.record_linux_fuse_open_cache_decision(
             prepared.cache.direct_io,
             prepared.disposition,
@@ -2517,11 +2532,17 @@ impl SessionState {
             .open_liveness_shard(fh)
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(fh, guard);
+            .insert(
+                fh,
+                FuseOpenHandle {
+                    liveness: guard,
+                    kernel_buffered: false,
+                },
+            );
         debug_assert!(replaced.is_none(), "VFS file handles must be unique");
     }
 
-    fn open_liveness_shard(&self, fh: u64) -> &Mutex<HashMap<u64, FuseOpenHandleGuard>> {
+    fn open_liveness_shard(&self, fh: u64) -> &Mutex<HashMap<u64, FuseOpenHandle>> {
         &self.open_liveness[usize::from(fh.to_le_bytes()[0]) % LIVENESS_SHARDS]
     }
 
@@ -2530,6 +2551,17 @@ impl SessionState {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&fh)
+            .map(|handle| handle.liveness)
+    }
+
+    /// The kernel runs `file_remove_privs` before buffered writes; only
+    /// `direct_io` handles (or ones never accepted by the kernel) need ours.
+    fn is_kernel_buffered(&self, fh: u64) -> bool {
+        self.open_liveness_shard(fh)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&fh)
+            .is_some_and(|handle| handle.kernel_buffered)
     }
 
     fn enqueue_follow_up_invalidation(&self, ino: u64) {
@@ -2648,7 +2680,6 @@ impl SessionState {
         if !request.local_sync_policy.is_opportunistic() {
             return Ok(false);
         }
-        self.clear_write_capability(ino, request.fh, size, fi)?;
 
         // Register before capacity admission so a concurrently captured
         // inode/handle watermark cannot miss this callback.
@@ -2656,8 +2687,11 @@ impl SessionState {
             .async_writes
             .start_request(ino, request.fh)
             .map_err(|error| error.errno())?;
-        if let Err(error) = ticket.reserve_capacity(size) {
-            let errno = error.errno();
+        if let Err(errno) = ticket
+            .reserve_capacity(size)
+            .map_err(|error| error.errno())
+            .and_then(|()| self.clear_write_capability(ino, request.fh, size, fi))
+        {
             ticket.complete(Err(errno));
             return Err(errno);
         }
@@ -2783,6 +2817,7 @@ impl SessionState {
         // remove capabilities installed after the original buffered write.
         if size > 0
             && !writeback
+            && !self.is_kernel_buffered(fh)
             && self
                 .vfs
                 .get_open_file(fh)
@@ -8515,6 +8550,25 @@ mod tests {
             vfs.get_xattr(attr.ino, b"security.capability").unwrap(),
             None
         );
+        // The kernel already ran file_remove_privs for buffered handles.
+        state
+            .open_liveness_shard(open.fh)
+            .lock()
+            .unwrap()
+            .get_mut(&open.fh)
+            .expect("open handle liveness")
+            .kernel_buffered = true;
+        vfs.set_xattr(attr.ino, b"security.capability", b"buf", 0)
+            .unwrap();
+        assert_eq!(
+            state.write(attr.ino, data.as_ptr().cast(), data.len(), 24, fi),
+            Ok(6)
+        );
+        assert_eq!(
+            vfs.get_xattr(attr.ino, b"security.capability").unwrap(),
+            Some(b"buf".to_vec()),
+            "kernel-buffered handles must not pay the capability lookup"
+        );
         // SAFETY: this test owns the file info and no longer uses it.
         unsafe { libc::free(fi.cast()) };
         state.release(open.fh).expect("release");
@@ -8857,22 +8911,36 @@ mod tests {
     #[test]
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_regular_file_io_is_visible_across_reopen() {
+        // Adaptive opens writers with `direct_io`, which bypasses the kernel's
+        // `file_remove_privs`; this proves the server-side clearing (SFS-933).
+        mounted_regular_file_io(crate::cache_policy::LinuxFuseCachePolicy::Adaptive);
+    }
+
+    /// Page-cache writers skip the server-side check and rely on the kernel.
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_regular_file_io_is_visible_across_reopen_with_kernel_cache() {
+        mounted_regular_file_io(crate::cache_policy::LinuxFuseCachePolicy::Kernel);
+    }
+
+    fn mounted_regular_file_io(policy: crate::cache_policy::LinuxFuseCachePolicy) {
         let fixture =
             studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-regular-io")
                 .expect("create VFS fixture");
         fixture.start().expect("start VFS fixture");
         let mount_point = std::env::temp_dir().join(format!(
-            "studiofs-linux-fuse-regular-io-{}",
+            "studiofs-linux-fuse-regular-io-{policy:?}-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&mount_point).expect("create smoke mount point");
 
-        let state = super::SessionState::new(
+        let mut state = super::SessionState::new(
             fixture.vfs(),
             fixture.runtime().handle().clone(),
             false,
             default_connection_config(),
         );
+        state.cache_policy = policy;
         let mut session =
             super::Session::mount(state, &mount_point, "studiofs-regular-io").expect("mount");
         let mount_point_for_worker = mount_point.clone();
@@ -8908,20 +8976,35 @@ mod tests {
             ] {
                 vfs.set_xattr(attr.ino, name, value, 0).expect("seed xattr");
             }
-            let before = Command::new("getcap").arg(&path).output()?;
-            assert!(before.status.success());
-            assert!(
-                !before.stdout.is_empty(),
+            let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                .expect("mount path has no NUL");
+            let capability_len = || {
+                // SAFETY: both strings are NUL-terminated; a null buffer only queries the size.
+                unsafe {
+                    libc::getxattr(
+                        c_path.as_ptr(),
+                        c"security.capability".as_ptr(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                }
+            };
+            assert_eq!(
+                capability_len(),
+                20,
                 "mounted file must expose the capability"
             );
             let mut append = std::fs::OpenOptions::new().append(true).open(&path)?;
             append.write_all(b"!")?;
             drop(append);
-            let after = Command::new("getcap").arg(&path).output()?;
-            assert!(after.status.success());
-            assert!(
-                after.stdout.is_empty(),
+            assert_eq!(
+                capability_len(),
+                -1,
                 "append must clear the mounted capability"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENODATA)
             );
             for name in [b"user.keep".as_slice(), b"trusted.keep"] {
                 assert_eq!(
