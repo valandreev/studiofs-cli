@@ -8923,6 +8923,104 @@ fn self_replay_rebases_later_published_rename_not_yet_replayed() {
 }
 
 #[test]
+fn self_replay_of_published_directory_rename_preserves_local_only_replacement() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let directory = pg
+        .local
+        .create_dir(ROOT_INO, b"X.457", 0, 0, 0o755)
+        .expect("create setup directory");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("acknowledge setup");
+
+    let rename_start = setup_end;
+    pg.local
+        .rename_atomic(ROOT_INO, b"X.457", ROOT_INO, b"X.315", false, false)
+        .expect("rename setup directory");
+    let rename_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("rename end");
+    let prefix_range = LocalEventRange {
+        start: rename_start,
+        end: rename_end,
+    };
+    let prefix_events = pg
+        .local
+        .read_events_range(rename_start, rename_end)
+        .expect("read rename prefix");
+    let prefix = RemoteApplyCoordinator::project_local_batch(&prefix_events).events;
+    pg.mark_local_event_ranges_published_with_prefix(
+        &[prefix_range],
+        Some((1, vec![prefix_range])),
+    )
+    .expect("record published rename prefix");
+
+    let draft_start = rename_end;
+    let draft = pg
+        .local
+        .create_file(ROOT_INO, b"X.457", 0, 0, 0o644)
+        .expect("create local-only replacement draft");
+    let draft_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("draft end");
+    let draft_events = pg
+        .local
+        .read_events_range(draft_start, draft_end)
+        .expect("read draft suffix");
+    assert!(
+        RemoteApplyCoordinator::project_local_batch(&draft_events)
+            .events
+            .is_empty(),
+        "the replacement has no PG batch to restore its name"
+    );
+    pg.complete_local_event_ranges(&[LocalEventRange {
+        start: draft_start,
+        end: draft_end,
+    }])
+    .expect("complete local-only draft suffix");
+    assert_eq!(
+        pg.flushed_event_seq.load(Ordering::SeqCst),
+        setup_end,
+        "the older unpublished-to-base prefix must pin the local cursor"
+    );
+
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: prefix,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq: setup_end,
+            next_event_seq: draft_end,
+            initial_overlay: pg.local_overlay_conflicts().expect("local overlay"),
+        },
+    )
+    .expect("replay published rename through production page wrapper");
+
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, b"X.457")
+            .expect("draft stays at original name")
+            .ino,
+        draft.ino
+    );
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, b"X.315")
+            .expect("renamed directory remains")
+            .ino,
+        directory.ino
+    );
+    assert!(
+        pg.unprocessed_local_event_progress()
+            .expect("completed replay progress")
+            .local_only_completed
+            .is_empty(),
+        "acknowledged local-only markers must be retired with the cursor"
+    );
+}
+
+#[test]
 fn pending_inode_removal_keeps_name_rebound_by_excluded_rename() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
@@ -9014,6 +9112,16 @@ fn local_completion_does_not_advance_past_unapplied_published_prefix() {
     // Completion spans local-only events around a published interior range.
     pg.complete_local_event_ranges(&[completed_range])
         .expect("complete local-only work");
+    assert_eq!(
+        pg.unprocessed_local_event_progress()
+            .expect("local-only completion progress")
+            .local_only_completed,
+        vec![LocalEventRange {
+            start: published_range.end,
+            end,
+        }],
+        "published intervals and the acknowledged local-only prefix are not retained"
+    );
 
     assert_eq!(
         pg.flushed_event_seq.load(Ordering::SeqCst),
