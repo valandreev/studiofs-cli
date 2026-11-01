@@ -2361,11 +2361,16 @@ impl SessionState {
         fi: *const raw::FuseFileInfo,
     ) -> Result<LinuxFuseAllocatedOpen, i32> {
         let flags = file_info_flags(fi);
-        // Atomic O_TRUNC makes the kernel skip its setattr privilege kill.
-        if flags & libc::O_TRUNC != 0 && !self.read_only {
-            self.kill_suid_sgid(caller, ino, None)?;
+        let allocated = self.open_with_flags(ino, flags)?;
+        // Atomic O_TRUNC makes the kernel skip its setattr privilege kill;
+        // apply it only once the truncating open has succeeded.
+        if flags & libc::O_TRUNC != 0
+            && let Err(errno) = self.kill_suid_sgid(caller, ino, Some(allocated.fh))
+        {
+            self.reject_prepared_open(ino, allocated.fh);
+            return Err(errno);
         }
-        self.open_with_flags(ino, flags)
+        Ok(allocated)
     }
 
     fn open_with_flags(&self, ino: u64, flags: c_int) -> Result<LinuxFuseAllocatedOpen, i32> {
@@ -8657,9 +8662,17 @@ mod tests {
         let opened = state.open(user, attr.ino, fi).expect("O_TRUNC open");
         assert_eq!(mode(), 0o0754);
         assert_eq!(vfs.getattr(attr.ino).unwrap().size, 0);
+        state.release(opened.fh).expect("release");
+
+        let dir = vfs.mkdir(1, b"dir", 0, 0, 0o2775).expect("mkdir");
+        assert_eq!(state.open(user, dir.ino, fi).err(), Some(libc::EISDIR));
+        assert_eq!(
+            vfs.getattr(dir.ino).unwrap().mode,
+            0o2775,
+            "a failed O_TRUNC open must not change the mode"
+        );
         // SAFETY: this test owns the allocation returned by the C shim.
         unsafe { libc::free(fi.cast()) };
-        state.release(opened.fh).expect("release");
     }
 
     #[test]
