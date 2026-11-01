@@ -402,6 +402,13 @@ impl<'a> NamespaceDeleteSpec<'a> {
         }
     }
 
+    /// Delete only while `name` still points to `expected_ino`; otherwise the
+    /// transaction reports `TargetChanged` without mutating anything.
+    pub(super) fn with_expected_ino(mut self, expected_ino: Option<Ino>) -> Self {
+        self.expected_ino = expected_ino;
+        self
+    }
+
     pub(super) fn records_deferred_delete(&self) -> bool {
         matches!(self.kind, NamespaceDeleteKind::UnlinkOpenHandle)
     }
@@ -1273,8 +1280,11 @@ impl MetaFsOps for RedbMetaEngine {
     fn unlink(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
         match self.execute_namespace_delete(NamespaceDeleteSpec::new_unlink(parent, name))? {
             NamespaceDeleteResult::File(attr) => Ok(attr),
-            NamespaceDeleteResult::Directory(..) | NamespaceDeleteResult::TargetChanged => {
+            NamespaceDeleteResult::Directory(..) => {
                 unreachable!("unlink cannot remove directories")
+            }
+            NamespaceDeleteResult::TargetChanged => {
+                unreachable!("unlink does not supply an expected inode")
             }
         }
     }
@@ -1284,8 +1294,11 @@ impl MetaFsOps for RedbMetaEngine {
             .execute_namespace_delete(NamespaceDeleteSpec::new_unlink_open_handle(parent, name))?
         {
             NamespaceDeleteResult::File(attr) => Ok(attr),
-            NamespaceDeleteResult::Directory(..) | NamespaceDeleteResult::TargetChanged => {
+            NamespaceDeleteResult::Directory(..) => {
                 unreachable!("unlink_open_handle cannot remove directories")
+            }
+            NamespaceDeleteResult::TargetChanged => {
+                unreachable!("unlink_open_handle does not supply an expected inode")
             }
         }
     }
@@ -1296,8 +1309,7 @@ impl MetaFsOps for RedbMetaEngine {
         name: &[u8],
         expected_ino: Option<Ino>,
     ) -> MetaResult<Option<(Ino, Option<InodeAttr>)>> {
-        let mut spec = NamespaceDeleteSpec::new_rmdir(parent, name);
-        spec.expected_ino = expected_ino;
+        let spec = NamespaceDeleteSpec::new_rmdir(parent, name).with_expected_ino(expected_ino);
         match self.execute_namespace_delete(spec)? {
             NamespaceDeleteResult::Directory(ino, attr) => Ok(Some((ino, attr))),
             NamespaceDeleteResult::TargetChanged => Ok(None),

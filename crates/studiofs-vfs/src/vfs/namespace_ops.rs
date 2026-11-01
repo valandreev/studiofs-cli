@@ -3546,18 +3546,18 @@ impl StudioVfs {
                 {
                     continue;
                 }
-                Err(err @ MetaError::DirNotEmpty(removed_ino)) => {
+                Err(err @ MetaError::DirNotEmpty(dir_ino)) => {
                     let (healed, child_delete_inos, observed_missing_child) =
-                        self.heal_dangling_directory_children(removed_ino)?;
+                        self.heal_dangling_directory_children(dir_ino)?;
                     if healed > 0 {
-                        debug!(ino = removed_ino, healed, "rmdir healed dangling children");
+                        debug!(ino = dir_ino, healed, "rmdir healed dangling children");
                         continue;
                     }
                     if let Some(delete_ino) = child_delete_inos.into_iter().next().or_else(|| {
                         self.state
                             .file_session
-                            .has_delete_inflight(removed_ino)
-                            .then_some(removed_ino)
+                            .has_delete_inflight(dir_ino)
+                            .then_some(dir_ino)
                     }) {
                         retry_attempts = retry_attempts.saturating_add(1);
                         let _delete_wait_cleanup = self.file_session_cleanup(delete_ino);
@@ -3588,7 +3588,7 @@ impl StudioVfs {
                         settle_attempts += 1;
                     }
                     debug!(
-                        ino = removed_ino,
+                        ino = dir_ino,
                         retry_attempt = retry_attempts,
                         settle_attempt = settle_attempts,
                         "rmdir waiting for in-flight child delete"

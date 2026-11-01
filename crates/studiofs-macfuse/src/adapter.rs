@@ -5215,6 +5215,30 @@ mod tests {
     }
 
     #[test]
+    fn rmdir_clears_file_flags_of_the_removed_directory_only() {
+        let fixture = ContractVfsFixture::new("macfuse-rmdir-flags").expect("fixture");
+        let vfs = fixture.vfs();
+        let survivor = vfs
+            .mkdir(ROOT_INO, b"target", 501, 20, 0o755)
+            .expect("mkdir target");
+        let replacement = vfs
+            .mkdir(ROOT_INO, b"replacement", 501, 20, 0o755)
+            .expect("mkdir replacement");
+        let adapter = StudioVfsAdapter::new(fixture.vfs(), fixture.runtime().handle().clone());
+        adapter.remember_file_flags(survivor.ino, MACOS_UF_HIDDEN);
+        adapter.remember_file_flags(replacement.ino, MACOS_UF_HIDDEN);
+        vfs.rename(ROOT_INO, b"target", ROOT_INO, b"survivor", false)
+            .expect("rename target away");
+        vfs.rename(ROOT_INO, b"replacement", ROOT_INO, b"target", false)
+            .expect("rename replacement into target");
+
+        adapter.rmdir(ROOT_INO, b"target").expect("rmdir target");
+
+        assert!(!adapter.file_flags_contains_for_test(replacement.ino));
+        assert!(adapter.file_flags_contains_for_test(survivor.ino));
+    }
+
+    #[test]
     fn file_flags_failed_vfs_setattr_preserves_overlay() {
         let (_fixture, adapter, attr) = file_flags_fixture_file("macfuse-flags-rejected");
         adapter.remember_file_flags(attr.ino, MACOS_UF_HIDDEN);
