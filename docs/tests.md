@@ -544,6 +544,24 @@ The `kernel` policy passed `small` 2 of 2. That size loss was fixed by
 [SFS-922](https://linear.app/valandreev/issue/SFS-922); the flag stays opt-in
 until broader mounted validation.
 
+### SFS-933 File Capabilities Cleared on Data Writes
+
+The kernel runs `file_remove_privs` only for writes on handles it opened
+without `direct_io`; StudioFS clears `security.capability` itself on
+`direct_io` handles. The unit test covers empty writes, invalid offsets,
+read-only handles, an absent capability, delayed writeback, kernel-buffered
+handles, and preservation of other xattrs. The mounted test runs under
+`adaptive` (writers use `direct_io`, so it proves the server-side clear) and
+under `kernel` (the kernel clears the capability itself):
+
+```sh
+cargo test -p studiofs-linux-fuse --lib append_clears_capability_and_preserves_other_xattrs -- --nocapture
+cargo test -p studiofs-linux-fuse --lib mounted_regular_file_io -- --ignored --nocapture
+```
+
+The mounted tests use the VFS contract fixture and need `/dev/fuse` and
+`fusermount3`.
+
 ### SFS-901 Linux Page-Cache Reads After Local Writes
 
 Read-only opens of locally dirty files used direct I/O, so every 4 KiB
