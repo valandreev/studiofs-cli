@@ -28,6 +28,19 @@ The PostgreSQL lifecycle contract is defined separately in
 catch-up is not a foreground data-plane prerequisite: local `redb` serving,
 remote replay, and read/write authority have separate contracts.
 
+## Linux access-time contract
+
+Linux FUSE file reads do not automatically update persisted access time
+(`atime`). StudioFS reports the stored inode timestamp and supports explicit
+access-time changes through `setattr` (`utimensat`/`touch -a`). Automatic
+`relatime` and `strictatime` updates are unsupported; a kernel mount entry
+showing `relatime` does not enable them in StudioFS. Applications must not use
+access time to determine whether a file has been read.
+
+This defines the existing read behavior without introducing metadata writes on
+reads. See [platform-bridges.md](platform-bridges.md#linux-access-time) for the
+kernel/userspace boundary and the focused check.
+
 ## 1. Core Vocabulary
 
 | Term | Meaning |

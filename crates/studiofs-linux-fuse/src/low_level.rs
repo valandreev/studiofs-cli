@@ -7371,7 +7371,7 @@ mod tests {
     }
 
     #[test]
-    fn session_read_reuses_dense_buffer_for_holes_short_reads_and_eof() {
+    fn session_read_preserves_atime_and_reuses_buffer_for_holes_short_reads_and_eof() {
         struct FileInfo(*mut super::raw::FuseFileInfo);
         impl Drop for FileInfo {
             fn drop(&mut self) {
@@ -7404,6 +7404,18 @@ mod tests {
                 .await
                 .unwrap();
         });
+        let explicit_atime = 1_000_000_000;
+        state
+            .setattr(
+                Some(open.fh),
+                attr.ino,
+                studiofs_meta::SetattrArgs {
+                    atime: studiofs_meta::TimeSpec::Set(explicit_atime),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(state.getattr_attr(attr.ino).unwrap().atime, explicit_atime);
         // SAFETY: the helper allocates and initializes the native header's layout.
         let fi = FileInfo(unsafe { super::studiofs_linux_fuse_file_info_new_for_test(open.fh) });
         assert!(!fi.0.is_null(), "allocate native file info");
@@ -7431,6 +7443,11 @@ mod tests {
             });
         }
         state.release(open.fh).unwrap();
+        assert_eq!(
+            state.getattr_attr(attr.ino).unwrap().atime,
+            explicit_atime,
+            "data, hole and EOF reads and release preserve explicitly set atime"
+        );
     }
 
     #[test]

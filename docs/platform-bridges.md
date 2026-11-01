@@ -57,6 +57,31 @@ Path walks are centralized in VFS `NamespaceResolver`:
 - macFUSE uses VFS component lookup (`lookup`) which is routed through the same resolver logic.
 - Bridge-local namespace traversal should not bypass VFS runtime filtering.
 
+## Linux access time
+
+The [canonical access-time contract](juicefs-local-first-rust-contract.md#linux-access-time-contract)
+supports explicit `atime` changes, but file reads preserve stored `atime`,
+including reads of data, holes, and EOF. Handle release does not synthesize a
+read timestamp. This applies regardless of the Linux bridge cache policy;
+automatic `relatime`/`strictatime` maintenance is unsupported.
+
+The Linux bridge's `SessionState::read` calls `StudioVfs::read_into_fh` without
+an inode timestamp mutation. Attribute replies return the stored timestamp.
+For reference, Linux v6.12 FUSE
+[direct and page reads](https://github.com/torvalds/linux/blob/v6.12/fs/fuse/file.c)
+call `fuse_invalidate_atime`; its
+[implementation](https://github.com/torvalds/linux/blob/v6.12/fs/fuse/dir.c)
+marks access-time attributes stale for a later userspace fetch. Invalidation
+does not itself persist a new timestamp in StudioFS. Shortening the attribute
+TTL therefore cannot supply the missing update.
+
+Run the adapter characterization check without a mount or remote services:
+
+    cargo test -p studiofs-linux-fuse --lib session_read_preserves_atime_and_reuses_buffer_for_holes_short_reads_and_eof
+
+It exercises explicit access-time assignment and subsequent adapter reads and
+release. It does not establish native kernel-cache or remount acceptance.
+
 ## Entry name rules
 
 The VFS applies one namespace rule set on every platform, because Linux, macOS,
