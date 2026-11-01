@@ -50,6 +50,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             // Keep this acceptance outside the long-standing numbered scenario range.
             MountedSyncSafetyTwoClient.definition(),
             RandomWritePacking.definition(),
+            PosixAclXattrRejection.definition(),
         ]
     })
 }
@@ -58,6 +59,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
 pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
     match name {
         "mounted-random-write-packing" => Some(Box::new(RandomWritePacking)),
+        "mounted-posix-acl-xattr-rejection" => Some(Box::new(PosixAclXattrRejection)),
         "mounted-worker-concurrency" => Some(Box::new(WorkerConcurrency)),
         "mounted-concurrent-mkdir-merge-convergence" | "concurrent-mkdir" => {
             Some(Box::new(ConcurrentMkdirMerge))
