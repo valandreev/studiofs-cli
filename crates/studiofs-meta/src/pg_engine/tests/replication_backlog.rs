@@ -3058,6 +3058,11 @@ fn completed_overlay_conflicts_are_removed_during_self_ack_replay() {
     pg.local
         .create_file(ROOT_INO, completed_name, 0, 0, 0o644)
         .expect("append local create to be completed");
+    pg.complete_local_event_ranges(&[LocalEventRange {
+        start: self_event_end,
+        end: pg.local.get_counter(NEXT_EVENT_SEQ).expect("create end"),
+    }])
+    .expect("complete the draft before it is canceled");
     pg.local
         .unlink(ROOT_INO, completed_name)
         .expect("append local delete to be completed");

@@ -342,6 +342,9 @@ impl PgMetaEngine {
             }
         }
         merge_local_event_ranges(&mut completed_ranges);
+        let mut local_only_completed = progress.local_only_completed.clone();
+        local_only_completed.extend(subtract_local_event_ranges(ranges, &progress.published));
+        merge_local_event_ranges(&mut local_only_completed);
 
         let next = flushed_event_seq_for_progress(
             cursor,
@@ -354,7 +357,9 @@ impl PgMetaEngine {
             trim_local_event_ranges_before(&mut completed_ranges, next);
             trim_local_event_ranges_before(&mut progress.published, next);
         }
+        trim_local_event_ranges_before(&mut local_only_completed, next);
         progress.completed = completed_ranges;
+        progress.local_only_completed = local_only_completed;
         Ok(())
     }
 
@@ -404,6 +409,7 @@ impl PgMetaEngine {
         merge_local_event_ranges(&mut progress.completed);
         trim_local_event_ranges_before(&mut progress.rejected, cursor);
         trim_local_event_ranges_before(&mut progress.completed, cursor);
+        trim_local_event_ranges_before(&mut progress.local_only_completed, cursor);
         trim_local_event_ranges_before(&mut progress.published, cursor);
         Ok(())
     }

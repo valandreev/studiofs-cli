@@ -458,6 +458,8 @@ struct LocalEventProgress {
     rejected: Vec<LocalEventRange>,
     /// Ranges fully retired locally, including applied publication prefixes.
     completed: Vec<LocalEventRange>,
+    /// Completed without publication; PG cannot restore their local namespace.
+    local_only_completed: Vec<LocalEventRange>,
     /// Ranges committed to PostgreSQL and awaiting local self-acknowledgment.
     published: Vec<LocalEventRange>,
     /// Complete projected prefixes, gated by the last batch of their publication.

@@ -239,6 +239,13 @@ catch-up retains the existing at-least-once recovery behavior.
 Journal-derived overlay conflicts include unprocessed and rejected local
 events; published and completed ranges no longer reserve their old keys.
 Rejected ranges remain local authority until replay can resume past the gap.
+Completed ranges that retain unpublished serving state remain local authority
+while they are at or above the journal cursor: every replay page treats their
+still-served names as overlay conflicts, and self-replay's local namespace
+rebase restores them, so the outcome does not depend on page boundaries. They must not be confused with applied publication prefixes: PostgreSQL has no batch that
+can restore a locally created hidden draft after an older rename replays.
+Fully canceled local windows remain excluded so they cannot erase a later
+foreign create at the same name.
 Replay of inode removal reconciles that inode's serving names against the base
 namespace, including names introduced by a published local rename. Retaining
 inode state for an open handle does not retain those names for new opens;

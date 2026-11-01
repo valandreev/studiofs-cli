@@ -308,6 +308,7 @@ pub(super) struct RemoteApplyCoordinator<'a> {
     local_event_ack_barrier: Option<u64>,
     local_event_overlay_exclusions: Vec<LocalEventRange>,
     published_prefixes: Vec<(i64, Vec<LocalEventRange>)>,
+    local_only_completed: Vec<LocalEventRange>,
 }
 
 impl<'a> RemoteApplyCoordinator<'a> {
@@ -317,11 +318,17 @@ impl<'a> RemoteApplyCoordinator<'a> {
             local_event_ack_barrier: None,
             local_event_overlay_exclusions: Vec::new(),
             published_prefixes: Vec::new(),
+            local_only_completed: Vec::new(),
         }
     }
 
     pub(super) fn with_local_event_ack_barrier(mut self, barrier: Option<u64>) -> Self {
         self.local_event_ack_barrier = barrier;
+        self
+    }
+
+    pub(super) fn with_local_only_completed(mut self, ranges: Vec<LocalEventRange>) -> Self {
+        self.local_only_completed = ranges;
         self
     }
 
@@ -2490,6 +2497,32 @@ impl<'a> RemoteApplyCoordinator<'a> {
         context.next_event_seq = replay_next_event_seq;
         let mut overlay = std::mem::take(&mut context.initial_overlay);
         Self::extend_overlay_conflicts(&mut overlay, &appended_overlay);
+        let mut completed_bindings = HashMap::new();
+        if !self.local_only_completed.is_empty() {
+            let mut events = Vec::new();
+            for range in &self.local_only_completed {
+                events.extend(RedbMetaEngine::read_events_range_in_write_txn_with_check(
+                    txn,
+                    range.start.max(context.flushed_event_seq),
+                    range.end.min(replay_next_event_seq),
+                    || execution.map_or(Ok(()), RemoteReplayExecution::check),
+                )?);
+            }
+            let state = RedbMetaEngine::pending_local_namespace_bindings_in_txn(txn, &events)?;
+            // Preserve only bindings still served locally, not canceled creates or old aliases.
+            for (key, entry) in state.bindings {
+                let (parent, name) = decode_dentry_key(&key)?;
+                if entry.is_some()
+                    && RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)? == entry
+                {
+                    completed_bindings.insert(key, entry);
+                }
+            }
+        }
+        // Served local-only names are local authority in every page, not only self pages.
+        overlay
+            .dentry_keys
+            .extend(completed_bindings.keys().cloned());
         let mut applied_any = false;
         let mut max_version = context.last_seq;
         let mut max_namespace_version = context.current_namespace_version;
@@ -2580,6 +2613,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     &self.local_event_overlay_exclusions,
                     execution,
                 )?;
+                overlay
+                    .dentry_keys
+                    .extend(completed_bindings.keys().cloned());
                 if batch.is_self_batch {
                     Self::clear_resolved_self_regular_file_protection(
                         &mut replay_protected_overlay,
@@ -2617,7 +2653,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
             .enumerate()
             .filter_map(|(index, event)| included(index).then_some(event))
             .collect::<Vec<_>>();
-            let state = RedbMetaEngine::pending_local_namespace_bindings_in_txn(txn, &events)?;
+            let mut state = RedbMetaEngine::pending_local_namespace_bindings_in_txn(txn, &events)?;
+            // A still-served completed binding is the journal's final state for its key,
+            // so it outranks older included events such as an unreplayed rename source.
+            state.bindings.extend(completed_bindings);
             final_overlay
                 .dentry_keys
                 .extend(state.bindings.keys().cloned());
