@@ -68,6 +68,7 @@ jobs:
               --scenario 1-28
               --scenario mounted-sync-safety-two-client-acceptance
               --scenario mounted-random-write-packing
+              --scenario mounted-posix-acl-xattr-rejection
             )
           fi
 
