@@ -9646,8 +9646,9 @@ mod tests {
         std::fs::remove_dir_all(&mount_point).expect("remove mount point");
     }
 
-    fn run_mmap_client(directory: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
-        Command::new(std::env::current_exe()?)
+    /// Returns whether the child ran exactly one client test and it passed.
+    fn run_mmap_client(directory: &std::path::Path) -> std::io::Result<bool> {
+        let output = Command::new(std::env::current_exe()?)
             .args([
                 "--exact",
                 "low_level::tests::mounted_shared_writable_mmap_round_trips_under_adaptive_policy",
@@ -9655,25 +9656,28 @@ mod tests {
                 "--nocapture",
             ])
             .env("STUDIOFS_TEST_MMAP_DIRECTORY", directory)
-            .env("STUDIOFS_TEST_MMAP_PARENT", std::process::id().to_string())
-            .status()
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let passed = output.status.success() && stdout.contains("test result: ok. 1 passed;");
+        if !passed {
+            eprintln!(
+                "mmap client {}: {stdout}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(passed)
     }
 
     #[test]
     fn shared_writable_mmap_client_runs_in_child_process() {
         let directory = studiofs_test_support::workspace_target_tempdir("mmap-client-");
-        assert!(
-            run_mmap_client(directory.path())
-                .expect("run mmap client")
-                .success()
-        );
+        assert!(run_mmap_client(directory.path()).expect("run mmap client"));
         let bytes = std::fs::read(directory.path().join("mapped.bin")).expect("client wrote file");
         assert_eq!(bytes.len(), 3 * 4096 + 123);
         assert_eq!(&bytes[4096..4096 + 7], b"rewrite");
         assert!(
-            !run_mmap_client(directory.path())
-                .expect("run failing mmap client")
-                .success(),
+            !run_mmap_client(directory.path()).expect("run failing mmap client"),
             "client errors must reach the parent",
         );
     }
@@ -9769,11 +9773,6 @@ mod tests {
     #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
     fn mounted_shared_writable_mmap_round_trips_under_adaptive_policy() -> std::io::Result<()> {
         if let Some(directory) = std::env::var_os("STUDIOFS_TEST_MMAP_DIRECTORY") {
-            assert_ne!(
-                std::env::var("STUDIOFS_TEST_MMAP_PARENT").expect("parent PID"),
-                std::process::id().to_string(),
-                "mmap client must not share the server's address space",
-            );
             return shared_writable_mmap_client(std::path::Path::new(&directory));
         }
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-mmap")
@@ -9804,7 +9803,9 @@ mod tests {
             if status.as_ref().is_ok_and(std::process::ExitStatus::success) {
                 guard.disarm();
             }
-            assert!(client_status?.success(), "mmap client failed");
+            if !client_status? {
+                return Err(std::io::Error::other("mmap client failed"));
+            }
             status
         });
 
