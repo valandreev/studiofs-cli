@@ -3103,18 +3103,21 @@ impl SessionState {
     }
 
     fn get_xattr(&self, ino: u64, name: &[u8]) -> Result<Option<Vec<u8>>, i32> {
+        reject_posix_acl_xattr(name)?;
         self.vfs
             .get_xattr(ino, name)
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
     fn get_xattr_size(&self, ino: u64, name: &[u8]) -> Result<Option<usize>, i32> {
+        reject_posix_acl_xattr(name)?;
         self.vfs
             .get_xattr_size(ino, name)
             .map_err(|error| vfs_err_to_errno(&error))
     }
 
     fn set_xattr(&self, ino: u64, name: &[u8], value: &[u8], flags: u32) -> Result<(), i32> {
+        reject_posix_acl_xattr(name)?;
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -3124,6 +3127,7 @@ impl SessionState {
     }
 
     fn remove_xattr(&self, ino: u64, name: &[u8]) -> Result<(), i32> {
+        reject_posix_acl_xattr(name)?;
         if self.read_only {
             return Err(libc::EROFS);
         }
@@ -3135,7 +3139,20 @@ impl SessionState {
     fn list_xattrs(&self, ino: u64) -> Result<Vec<Vec<u8>>, i32> {
         self.vfs
             .list_xattrs(ino)
+            .map(|mut names| {
+                names.retain(|name| reject_posix_acl_xattr(name).is_ok());
+                names
+            })
             .map_err(|error| vfs_err_to_errno(&error))
+    }
+}
+
+/// POSIX ACLs are not offered (SFS-906); acknowledging one would claim a policy
+/// that access checks never apply, so the ACL names fail like on a no-ACL fs.
+fn reject_posix_acl_xattr(name: &[u8]) -> Result<(), i32> {
+    match name {
+        b"system.posix_acl_access" | b"system.posix_acl_default" => Err(libc::EOPNOTSUPP),
+        _ => Ok(()),
     }
 }
 
@@ -6355,6 +6372,37 @@ mod tests {
         let third = super::InlineWriteSlot::acquire(&in_flight, 2).expect("released slot");
         drop((second, third));
         assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn posix_acl_xattrs_are_rejected_not_silently_stored() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-posix-acl")
+                .expect("create VFS fixture");
+        fixture.start().expect("start VFS fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let attr = fixture
+            .vfs()
+            .create(1, b"acl.bin", 1000, 1000, 0o644)
+            .expect("create file");
+        for name in [&b"system.posix_acl_access"[..], b"system.posix_acl_default"] {
+            assert_eq!(
+                state.set_xattr(attr.ino, name, b"acl", 0),
+                Err(libc::EOPNOTSUPP)
+            );
+            // A value stored before this boundary existed must not be advertised either.
+            fixture.vfs().set_xattr(attr.ino, name, b"acl", 0).unwrap();
+            assert_eq!(state.get_xattr(attr.ino, name), Err(libc::EOPNOTSUPP));
+            assert_eq!(state.get_xattr_size(attr.ino, name), Err(libc::EOPNOTSUPP));
+            assert_eq!(state.remove_xattr(attr.ino, name), Err(libc::EOPNOTSUPP));
+        }
+        assert_eq!(state.set_xattr(attr.ino, b"user.keep", b"v", 0), Ok(()));
+        assert_eq!(state.list_xattrs(attr.ino), Ok(vec![b"user.keep".to_vec()]));
     }
 
     #[test]
