@@ -957,7 +957,7 @@ impl MetaFsOps for RedbMetaEngine {
         } else {
             None
         };
-        let old_parent_seed = if src_entry.kind == FileType::Directory && parent != new_parent {
+        let old_parent_seed = if parent != new_parent {
             Some(Self::get_attr_merged_in_write_txn(&txn, parent)?)
         } else {
             None
@@ -965,18 +965,12 @@ impl MetaFsOps for RedbMetaEngine {
         let displaces_dir = dst_entry_opt
             .as_ref()
             .is_some_and(|dst| dst.kind == FileType::Directory);
-        let new_parent_seed =
-            if (src_entry.kind == FileType::Directory && parent != new_parent) || displaces_dir {
-                Some(Self::get_attr_merged_in_write_txn(&txn, new_parent)?)
-            } else {
-                None
-            };
+        let mut new_parent_attr = Self::get_attr_merged_in_write_txn(&txn, new_parent)?;
         let mut displaced = None;
         let mut displaced_set_attr = None;
         let mut displaced_remove_attr_ino = None;
         let mut moved_dir_attr = moved_dir_seed;
         let mut old_parent_attr = old_parent_seed;
-        let mut new_parent_attr = new_parent_seed;
         {
             Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
             if let Some(dst_entry) = &dst_entry_opt {
@@ -1030,23 +1024,22 @@ impl MetaFsOps for RedbMetaEngine {
                 moved_dir_attr = Some(attr);
             }
             if let Some(mut attr) = old_parent_attr.take() {
-                attr.nlink = attr.nlink.saturating_sub(1);
-                attr.touch_mtime();
-                Self::set_inode_in_txn(&txn, &attr)?;
-                old_parent_attr = Some(attr);
-            }
-            if let Some(mut attr) = new_parent_attr.take() {
-                if src_entry.kind == FileType::Directory && parent != new_parent {
-                    attr.nlink += 1;
-                }
-                // The displaced directory's ".." link to new_parent goes with it.
-                if displaces_dir {
+                if src_entry.kind == FileType::Directory {
                     attr.nlink = attr.nlink.saturating_sub(1);
                 }
                 attr.touch_mtime();
                 Self::set_inode_in_txn(&txn, &attr)?;
-                new_parent_attr = Some(attr);
+                old_parent_attr = Some(attr);
             }
+            if src_entry.kind == FileType::Directory && parent != new_parent {
+                new_parent_attr.nlink += 1;
+            }
+            // The displaced directory's ".." link to new_parent goes with it.
+            if displaces_dir {
+                new_parent_attr.nlink = new_parent_attr.nlink.saturating_sub(1);
+            }
+            new_parent_attr.touch_mtime();
+            Self::set_inode_in_txn(&txn, &new_parent_attr)?;
 
             // An empty draft's own names stay out of PG, so its RenameEntry is
             // projected away; journal a replaced file's removal on its own.
@@ -1070,6 +1063,13 @@ impl MetaFsOps for RedbMetaEngine {
                 if let Some(ino) = displaced_remove_attr_ino.take() {
                     Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveAttr { ino })?;
                 }
+                // The hidden RenameEntry cannot carry the parent's removal times.
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetAttr {
+                        attr: new_parent_attr.clone(),
+                    },
+                )?;
             }
 
             Self::append_event_in_txn(
@@ -1084,7 +1084,7 @@ impl MetaFsOps for RedbMetaEngine {
                     displaced_remove_attr_ino,
                     moved_dir_attr: Box::new(moved_dir_attr),
                     old_parent_attr: Box::new(old_parent_attr),
-                    new_parent_attr: Box::new(new_parent_attr),
+                    new_parent_attr: Box::new(Some(new_parent_attr)),
                 },
             )?;
             if src_entry.kind != FileType::Directory {

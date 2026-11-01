@@ -20325,6 +20325,35 @@ fn assert_parent_times_updated(before: &InodeAttr, after: &InodeAttr, op: &str) 
 }
 
 #[test]
+fn replacement_rename_updates_cached_destination_parent_times() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "replacement-rename-parent-times");
+    let _guard = rt.enter();
+    let dir = vfs.mkdir(ROOT_INO, b"d", 0, 0, 0o755).unwrap();
+    vfs.create(dir.ino, b"target", 0, 0, 0o644).unwrap();
+    let source = vfs.create(ROOT_INO, b"source", 0, 0, 0o644).unwrap();
+    let mut before = meta.get_attr(dir.ino).unwrap();
+    before.mtime = 1;
+    before.ctime = 1;
+    meta.set_attr(&before).unwrap();
+    vfs.state.namespace.attr_read_cache.lock().put(
+        dir.ino,
+        before.clone(),
+        ATTR_CACHE_TTL,
+        Instant::now(),
+    );
+
+    vfs.rename(ROOT_INO, b"source", dir.ino, b"target", true)
+        .unwrap();
+
+    let after = vfs.getattr(dir.ino).unwrap();
+    assert_parent_times_updated(&before, &after, "replacement rename");
+    assert_eq!(after.nlink, before.nlink);
+    assert_eq!(vfs.lookup(dir.ino, b"target").unwrap().ino, source.ino);
+    assert_eq!(after.mtime, meta.get_attr(dir.ino).unwrap().mtime);
+}
+
+#[test]
 fn create_and_symlink_update_parent_times() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "create-symlink-parent-times");

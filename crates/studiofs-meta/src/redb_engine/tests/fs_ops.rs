@@ -684,6 +684,84 @@ fn test_rename_overwrite_file() {
 }
 
 #[test]
+fn rename_file_updates_parent_times_and_journals_them() {
+    for cross_parent in [false, true] {
+        for replace in [false, true] {
+            let engine = temp_engine();
+            let dir = engine.create_dir(ROOT_INO, b"d", 0, 0, 0o755).unwrap();
+            let new_parent = if cross_parent { dir.ino } else { ROOT_INO };
+            let source = engine
+                .create_file(ROOT_INO, b"source", 0, 0, 0o644)
+                .unwrap();
+            if replace {
+                engine
+                    .create_file(new_parent, b"target", 0, 0, 0o644)
+                    .unwrap();
+            }
+            for ino in [ROOT_INO, dir.ino] {
+                let mut attr = engine.get_attr(ino).unwrap();
+                attr.mtime = 1;
+                attr.ctime = 1;
+                engine.set_attr(&attr).unwrap();
+            }
+            let event_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+            engine
+                .rename_atomic(ROOT_INO, b"source", new_parent, b"target", true, false)
+                .unwrap();
+
+            assert_eq!(
+                engine.lookup(new_parent, b"target").unwrap().ino,
+                source.ino
+            );
+            let events = engine
+                .read_events_range(event_start, engine.get_counter(NEXT_EVENT_SEQ).unwrap())
+                .unwrap();
+            let (old_parent_attr, new_parent_attr) = events
+                .iter()
+                .find_map(|event| match event {
+                    crate::events::MetaEvent::RenameEntry {
+                        old_parent_attr,
+                        new_parent_attr,
+                        ..
+                    } => Some((
+                        old_parent_attr.as_ref().as_ref(),
+                        new_parent_attr.as_ref().as_ref(),
+                    )),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(old_parent_attr.is_some(), cross_parent);
+            for (ino, nlink) in [
+                (ROOT_INO, 3),
+                (new_parent, if cross_parent { 2 } else { 3 }),
+            ] {
+                let after = engine.get_attr(ino).unwrap();
+                assert!(
+                    after.mtime > 1,
+                    "parent {ino}: cross={cross_parent}, replace={replace}"
+                );
+                assert!(
+                    after.ctime > 1,
+                    "parent {ino}: cross={cross_parent}, replace={replace}"
+                );
+                assert_eq!(after.nlink, nlink);
+                let journaled = if ino == new_parent {
+                    new_parent_attr
+                } else {
+                    old_parent_attr
+                };
+                assert_eq!(
+                    journaled,
+                    Some(&after),
+                    "peers must receive updated parent attributes"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn test_rename_no_replace_rejects_existing_file_without_changes() {
     let engine = temp_engine();
     let src = engine
@@ -694,6 +772,7 @@ fn test_rename_no_replace_rejects_existing_file_without_changes() {
         .unwrap();
     let src_attr_before = engine.get_attr(src.ino).unwrap();
     let dst_attr_before = engine.get_attr(dst.ino).unwrap();
+    let parent_before = engine.get_attr(ROOT_INO).unwrap();
     let next_event_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
 
     let result =
@@ -704,6 +783,7 @@ fn test_rename_no_replace_rejects_existing_file_without_changes() {
     assert_eq!(engine.lookup(ROOT_INO, b"dst.txt").unwrap().ino, dst.ino);
     assert_eq!(engine.get_attr(src.ino).unwrap(), src_attr_before);
     assert_eq!(engine.get_attr(dst.ino).unwrap(), dst_attr_before);
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap(), parent_before);
     assert_eq!(
         engine.get_counter(NEXT_EVENT_SEQ).unwrap(),
         next_event_before
@@ -1418,6 +1498,7 @@ fn rename_onto_own_hardlink_preserves_both_names_and_link_count() {
     engine
         .link(source.ino, ROOT_INO, b"same-inode-alias")
         .unwrap();
+    let parent_before = engine.get_attr(ROOT_INO).unwrap();
 
     let renamed = engine
         .rename_atomic(
@@ -1441,6 +1522,7 @@ fn rename_onto_own_hardlink_preserves_both_names_and_link_count() {
         source.ino
     );
     assert_eq!(engine.get_attr(source.ino).unwrap().nlink, 2);
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap(), parent_before);
 }
 
 // === xattr Tests ===

@@ -10519,6 +10519,15 @@ fn empty_draft_renamed_over_published_file_publishes_only_the_removal() {
         "peers must retire the replaced inode: {:?}",
         projected.events
     );
+    let dir_after = pg.local.get_attr(dir.ino).expect("dir attr");
+    assert!(
+        projected.events.iter().any(|event| matches!(
+            event,
+            MetaEvent::SetAttr { attr } if *attr == dir_after
+        )),
+        "peers must receive the parent's removal times: {:?}",
+        projected.events
+    );
     assert!(
         !projected.events.iter().any(|event| matches!(
             event,
