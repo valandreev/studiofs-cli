@@ -19,10 +19,11 @@ ext4 utilities:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y acl attr automake bc dbench dump e2fsprogs fio gawk \
-  gcc git indent libacl1-dev libaio-dev libcap-dev libgdbm-dev libtool \
-  libtool-bin liburing-dev libuuid1 lvm2 make psmisc python3 quota sed \
-  uuid-dev uuid-runtime xfsprogs sqlite3 libgdbm-compat-dev \
+sudo apt-get install -y acct acl attr automake bc dbench dump duperemove \
+  e2fsprogs fio fsverity gawk gcc git indent libacl1-dev libaio-dev \
+  libcap-dev libgdbm-dev libtool libtool-bin liburing-dev libuuid1 lvm2 \
+  make psmisc python3 quota sed uuid-dev uuid-runtime xfsprogs sqlite3 \
+  libgdbm-compat-dev \
   libfuse3-3 fuse3
 ```
 
@@ -66,7 +67,10 @@ this is a harness compatibility patch, not a product change. If the checkout
 already exists, verify `git -C target/xfstests/tools/xfstests rev-parse HEAD`
 is exactly `22348afe338c0f6d540c0d7ef0db749eaa51b218` and that the patch is
 applied before building or running tests. Do not use a moving branch as the
-baseline. Preserve the patch hash with run evidence because the upstream
+baseline. If `libgdbm-compat-dev` was installed after the first build, rerun
+`./configure --libexecdir=/usr/lib --exec_prefix=/var/lib` and `make` in the
+checkout; otherwise `src/dbtest` is not built and `generic/010` is skipped.
+Preserve the patch hash with run evidence because the upstream
 checkout has a local modification.
 
 Build StudioFS and use the resulting absolute binary path:
