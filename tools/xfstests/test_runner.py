@@ -178,6 +178,87 @@ exec /usr/bin/timeout "$@"
                     process.terminate()
                     process.wait(timeout=5)
 
+    def test_timeout_reaps_escaped_descendants_and_restores_cpus(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            checkout = root / "xfstests"
+            (checkout / "tests/generic").mkdir(parents=True)
+            (checkout / "tests/generic/group.list").write_text("650 auto\n")
+            (checkout / "tests/generic/650").touch()
+            # Like fsstress and the mount daemons, these children leave timeout's process group.
+            # The recorded TEST_DEV daemon and its watchdog child are mount recovery's to stop;
+            # a daemon whose argv does not match its pidfile is not trusted.
+            check = checkout / "check"
+            check.write_text("""#!/bin/bash
+cd "$MOCK_DIR"
+setsid sleep 60 > writer.out & echo $! > escaped.pid
+setsid bash -c 'exec -a "$STUDIOFS_BINARY" bash mount testvol "$TEST_DIR"' &
+setsid bash -c 'exec -a "$STUDIOFS_BINARY" bash mount scratchvol /elsewhere' &
+until [[ -s watchdog.testvol.pid && -s watchdog.scratchvol.pid ]]; do sleep 0.05; done
+echo 0 > "$XFSTESTS_CPU_SYSFS/cpu1/online"
+sleep 5
+""")
+            check.chmod(0o755)
+            (root / "mount").write_text("""echo $$ > "$XFSTESTS_RUN/mounts/$1.pid"
+echo $$ > "$MOCK_DIR/daemon.$1.pid"
+sleep 60 & echo $! > "$MOCK_DIR/watchdog.$1.pid"
+exec 9<> "$MOCK_DIR/fifo"; read -r -t 60 -u 9
+""")
+            os.mkfifo(root / "fifo")
+            (root / "evidence/mounts").mkdir(parents=True)
+            binary = root / "studiofs"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o755)
+            cpus = root / "cpu"
+            for cpu, state in (("cpu1", "1"), ("cpu2", "0")):
+                (cpus / cpu).mkdir(parents=True)
+                (cpus / cpu / "online").write_text(state + "\n")
+            run = root / "run"
+            env = os.environ | {
+                "MOCK_DIR": str(root), "XFSTESTS_CPU_SYSFS": str(cpus),
+                "TEST_DEV": "testvol", "TEST_DIR": str(root / "testmnt"),
+                "SCRATCH_DEV": "scratchvol", "SCRATCH_MNT": str(root / "scratchmnt"),
+                "STUDIOFS_BINARY": str(binary), "STUDIOFS_CLIENT_ROOT": str(root / "client"),
+                "XFSTESTS_RUN": str(root / "evidence"), "TEST_TIMEOUT": "1",
+                "FSTYP": "fuse", "FUSE_SUBTYP": ".studiofs",
+            }
+            env.pop("STUDIOFS_XFSTESTS_CASE", None)
+            pid_files = ["escaped.pid", "daemon.testvol.pid", "watchdog.testvol.pid",
+                         "daemon.scratchvol.pid", "watchdog.scratchvol.pid"]
+            try:
+                result = subprocess.run([RUNNER, checkout, run, "generic/650"], env=env,
+                                        text=True, capture_output=True, timeout=30)
+                escaped, daemon, watchdog, stray, stray_watchdog = (
+                    int((root / name).read_text()) for name in pid_files)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("generic/650\t124\t", (run / "manifest.tsv").read_text())
+                self.assertFalse(alive(escaped), "escaped testcase descendant survived")
+                rows = {line.split("\t")[0]: line.split("\t")
+                        for line in (run / "cases/650/reaped.tsv").read_text().splitlines()}
+                # Open files identify what an escaped writer was filling; no runner fd leaks in.
+                self.assertEqual(rows[str(escaped)][3].split(" "),
+                                 [str(run / "cases/650/check.log"), str(root / "writer.out")])
+                self.assertIn(str(stray), rows)
+                self.assertIn(str(stray_watchdog), rows)
+                self.assertNotIn(str(daemon), rows)
+                self.assertNotIn(str(watchdog), rows)
+                self.assertEqual((cpus / "cpu1/online").read_text().strip(), "1")
+                self.assertEqual((cpus / "cpu2/online").read_text().strip(), "0")
+                self.assertEqual((run / "cases/650/cpu-restored.txt").read_text(), "cpu1\n")
+            finally:
+                for name in pid_files:
+                    path = root / name
+                    if path.exists() and alive(pid := int(path.read_text())):
+                        os.kill(pid, 9)
+
+
+def alive(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:  # ENOENT once reaped, ESRCH while the task is being torn down
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
 
 if __name__ == "__main__":
     unittest.main()
