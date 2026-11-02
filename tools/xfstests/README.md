@@ -183,8 +183,11 @@ it bypasses the harness's per-test timeout and evidence layout.
 Each case runs with a unique `STUDIOFS_XFSTESTS_CASE` environment token. After
 `check` exits, the runner SIGKILLs every process that still carries that token,
 because test descendants can leave timeout's process group (for example
-fsstress). StudioFS mount daemons are excluded; mount recovery owns them. Killed
-processes are recorded in the case's `reaped.tsv`. A process that survives the
+fsstress). A StudioFS daemon whose pidfile and exact argv match the configured
+mount, and that daemon's direct children (the `fusermount3` auto-unmount
+watchdog), are excluded because mount recovery owns them. Killed processes are
+recorded in the case's `reaped.tsv` with PID, start ticks, argv, and open
+files. A process that survives the
 bounded wait, even after mount recovery, stops the run. CPUs that were online
 when the run started and are offline after a case (a killed generic/650 skips
 its cleanup) are re-onlined and listed in `cpu-restored.txt`. If one cannot be

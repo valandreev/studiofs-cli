@@ -87,7 +87,7 @@ recover_mount() {
 
 # Kill testcase descendants that escaped timeout's process group; evidence goes to reaped.tsv.
 reap_case() {
-    python3 "$here/reap_case.py" "$1" "$STUDIOFS_BINARY" "$2/reaped.tsv" 10
+    python3 "$here/reap_case.py" "$1" "$2/reaped.tsv" 10
 }
 
 # A killed test skips its cleanup trap (generic/650 leaves hotplugged CPUs offline).
@@ -118,7 +118,7 @@ for test_id in "${tests[@]}"; do
     start=$SECONDS
     set +e
     token=$(</proc/sys/kernel/random/uuid)
-    (cd "$xfstests" && STUDIOFS_XFSTESTS_CASE=$token RESULT_BASE="$dir/results" REPORT_DIR="$dir/results" timeout -k 10 "$timeout_s" ./check -R xunit -E "$here/exclude" "$test_id") >"$dir/check.log" 2>&1
+    (cd "$xfstests" && STUDIOFS_XFSTESTS_CASE=$token RESULT_BASE="$dir/results" REPORT_DIR="$dir/results" timeout -k 10 "$timeout_s" ./check -R xunit -E "$here/exclude" "$test_id") >"$dir/check.log" 2>&1 3>&-
     status=$?
     elapsed=$((SECONDS - start))
     reap_case "$token" "$dir"
