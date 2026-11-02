@@ -718,6 +718,13 @@ impl FileSessionState {
         self.sessions.lock().get(&ino).cloned()
     }
 
+    /// Returns whether an operation currently holds the inode's materialize gate.
+    #[cfg(test)]
+    pub(super) fn materialize_gate_is_held(&self, ino: Ino) -> bool {
+        self.live_session(ino)
+            .is_some_and(|session| session.materialize_gate.try_write().is_err())
+    }
+
     /// Returns whether a delete operation is queued or active for an inode.
     pub(super) fn has_delete_inflight(&self, ino: Ino) -> bool {
         self.live_session(ino).is_some_and(|session| {

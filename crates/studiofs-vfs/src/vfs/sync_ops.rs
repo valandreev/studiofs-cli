@@ -806,10 +806,10 @@ impl StudioVfs {
         debug!("orphan cleanup: ino={} (last fd closed)", ino);
 
         // A deferred materialization task may have snapped dirty state before
-        // unlink marked this inode deleted. Let it finish first so final orphan
-        // cleanup removes the complete graph and no late materialization can
-        // recreate payload refs after the last handle closes.
-        self.wait_for_deferred_materialization_inflight(ino).await;
+        // unlink marked this inode deleted. Callers join it before taking the
+        // Release session, whose materialize gate keeps any later task parked
+        // until this cleanup has removed the complete graph. Waiting for that
+        // parked task here would deadlock.
 
         let cleanup = self.collect_orphan_deleted_inode_cleanup(ino).await?;
         let removed_blocks = cleanup.removed_ids.len();
@@ -1158,18 +1158,11 @@ impl StudioVfs {
         sticky_error_policy: StickyErrorPolicy,
         dirty_attr_persist_policy: DirtyAttrPersistPolicy,
     ) -> VfsResult<LocalSyncBarrierOutcome> {
-        // Wait for any in-flight deferred materialization task to finish
-        // before we run our own strict materialization pass. A strict waiter
-        // interrupts only the task's coalescing sleep; the task still drains
-        // its accepted tail and normal local-dirty epilogue under the existing
-        // gate. Without this ordering the flush/close path and the background
-        // task would race on writer-stack snapshots, producing fragmented
-        // blocks.
-        //
-        // The parking_lot lock is scoped so the MutexGuard (which is !Send)
-        // is dropped before the .await point.  We then acquire the
-        // tokio::sync::Mutex which blocks until the background task releases it.
-        self.wait_for_deferred_materialization_inflight(ino).await;
+        // Callers join the deferred materializer and then hold a file-session
+        // permit that blocks materialization, so this pass cannot race a
+        // background task on writer-stack snapshots. A materializer registered
+        // after that join is parked on the session's materialize gate; waiting
+        // for it here would never return while the caller holds the gate.
 
         let mut materialized_writer_stack_bytes =
             self.materialize_writer_stack_for_inode(ino).await?;
@@ -1430,6 +1423,11 @@ impl StudioVfs {
             && !self.state.writer_stack.has_dirty_writers(open_file.ino)
         {
             if force_strict_metadata_sync {
+                let session = self
+                    .state
+                    .file_session
+                    .enter_op(open_file.ino, FileSessionOperation::Flush)
+                    .await;
                 let outcome = self
                     .local_sync_barrier_with_outcome(
                         open_file.ino,
@@ -1437,8 +1435,10 @@ impl StudioVfs {
                         StickyErrorPolicy::Ignore,
                         DirtyAttrPersistPolicy::Ignore,
                     )
-                    .await?;
+                    .await;
+                drop(session);
                 self.state.file_session.gc_if_idle(open_file.ino);
+                let outcome = outcome?;
                 return Ok(ExplicitFlushOutcome {
                     flushed_local_dirty_state: outcome.had_local_dirty_state,
                 });
