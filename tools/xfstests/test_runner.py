@@ -255,7 +255,7 @@ exec 9<> "$MOCK_DIR/fifo"; read -r -t 60 -u 9
 def alive(pid):
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except OSError:  # ENOENT once reaped, ESRCH while the task is being torn down
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 

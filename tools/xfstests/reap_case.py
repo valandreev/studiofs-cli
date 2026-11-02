@@ -42,12 +42,13 @@ def case_process(pid, marker, daemons):
         environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
         fields = stat_fields(pid)
-    except (OSError, IndexError):
+        ppid, ticks = int(fields[1]), fields[19]
+    except (OSError, IndexError, ValueError):
         return None
     if marker not in environ:
         return None
     # recover_mount owns verified daemons and their helpers (the fusermount3 auto_unmount watchdog).
-    if pid in daemons or int(fields[1]) in daemons:
+    if pid in daemons or ppid in daemons:
         return None
     files = []
     try:
@@ -57,7 +58,7 @@ def case_process(pid, marker, daemons):
                 files.append(target)
     except OSError:
         pass
-    return argv, fields[19], sorted(set(files))
+    return argv, ticks, sorted(set(files))
 
 
 def reap(token, record, timeout, env):
