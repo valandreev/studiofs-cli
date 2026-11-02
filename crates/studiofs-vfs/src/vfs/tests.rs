@@ -24731,6 +24731,79 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
 }
 
 #[test]
+fn deferred_release_does_not_deadlock_with_materializer_queued_behind_its_session() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-954-release-materializer");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-954-release-materializer.tmp", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        // Keep the write's own materializer from draining the payload so the
+        // last close still has writer-stack state to sync.
+        let (materialize_entry, materialize_guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(ino)
+            .expect("test should reserve the deferred materialization gate");
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            b"dbench word temp payload",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        drop(materialize_entry);
+        drop(materialize_guard);
+        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+
+        // A write on a reopened handle owns the session gate, so the deferred
+        // release takes the materialize gate and then parks behind the write.
+        let write_session = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Write)
+            .await;
+        let outcome = vfs.release_fh_with_deferred_last_handle_barrier(fh, rt.handle());
+        assert!(outcome.closed_last_handle);
+        assert!(
+            outcome.flushed_local_dirty_state,
+            "the release must take the deferred local-sync path"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !vfs.state.file_session.materialize_gate_is_held(ino) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("deferred release should take the materialize gate behind the write");
+
+        // That write then schedules the materializer, which registers its
+        // in-flight entry and queues behind the release's materialize gate.
+        vfs.spawn_deferred_materialization_if_needed(ino);
+        assert!(vfs.state.deferred_materialize_inflight.contains(ino));
+        drop(write_session);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            vfs.wait_for_deferred_release_inflight(ino),
+        )
+        .await
+        .expect("deferred release must not wait on a materializer parked behind its own session");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            vfs.wait_for_deferred_materialization_inflight(ino),
+        )
+        .await
+        .expect("queued materializer should run after the release drops its session");
+    });
+}
+
+#[test]
 fn deferred_release_drains_many_tiny_closed_files_promptly() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-release-many-tiny");
