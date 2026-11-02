@@ -1262,6 +1262,11 @@ impl StudioVfs {
             self.payload_store_sync_data_async().await?;
         }
 
+        if persist_dirty_attr_inline {
+            // The inline persist updates the inode row, which an unwritten
+            // queued create has not committed yet (SFS-950).
+            self.wait_for_deferred_namespace_metadata(ino).await?;
+        }
         let dirty_attr = match dirty_attr_persist_policy {
             DirtyAttrPersistPolicy::Ignore => None,
             DirtyAttrPersistPolicy::PersistIfPresent if !persist_dirty_attr_inline => None,

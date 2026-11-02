@@ -263,6 +263,14 @@ required; an unsupported interface may instead need explicit rejection. The
 /404–805 cases had no original measurements; neither these observations nor the
 retained-state cleanup establish a new regression in current main.
 
+SFS-950 traced the generic/431 failure to the `read`, not the open: `cmp`
+opened the empty `g` destination and its first `read` returned `ENOENT`.
+Opening an unwritten create treated its admitted attributes as published
+metadata and dropped the local attributes while the deferred create was still
+queued, so the read missed the inode until the batch committed. The fix and its
+unit and in-process mounted regressions do not replace a VM rerun of
+generic/431; the row above remains the SFS-940 measurement.
+
 ### Environment-prerequisite reruns (2026-11-02)
 
 Nineteen canonical notrun rows stopped on missing host prerequisites rather than
