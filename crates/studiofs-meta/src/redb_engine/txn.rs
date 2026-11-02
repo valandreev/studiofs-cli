@@ -902,10 +902,11 @@ impl RedbMetaEngine {
         Self::resolve_attr_from_opened_tables(&base, &current, &tombstones, ino, true)
     }
 
-    pub(super) fn readdir_merged_in_write_txn(
+    /// Unfiltered merged children of `parent` and its overlay dentry keys.
+    fn merged_children_in_write_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
-    ) -> MetaResult<Vec<DirEntry>> {
+    ) -> MetaResult<(Vec<DirEntry>, HashSet<Vec<u8>>)> {
         let current = txn
             .open_table(DENTRIES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -928,6 +929,15 @@ impl RedbMetaEngine {
             parent,
             &overlay_dentries,
         )?;
+        Ok((merged, overlay_dentries))
+    }
+
+    #[cfg(test)]
+    pub(super) fn readdir_merged_in_write_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+    ) -> MetaResult<Vec<DirEntry>> {
+        let (merged, overlay_dentries) = Self::merged_children_in_write_txn(txn, parent)?;
         if !Self::remote_namespace_visibility_filter_enabled_in_write_txn(txn)? {
             return Ok(merged);
         }
@@ -968,68 +978,69 @@ impl RedbMetaEngine {
         Ok(visible)
     }
 
-    /// Names of `parent`'s base regular-file dentries that the remote
-    /// visibility filter hides because their inode is gone from the merged
-    /// view. Lookup and readdir never expose these, so no foreground heal can
-    /// reach them, yet they still count toward directory emptiness.
-    pub(super) fn hidden_dangling_children_in_write_txn(
+    /// Fail with `DirNotEmpty` unless `dir` has no children that block its
+    /// removal or replacement.
+    ///
+    /// A base regular-file dentry whose inode is gone from the merged view is
+    /// hidden by the remote visibility filter, so neither lookup nor readdir
+    /// can reach it for a foreground heal. Such children are retired here, as
+    /// the VFS heal does for visible dangling entries (SFS-953). A hidden child
+    /// with a live inode (an unpublished draft) still blocks removal. Callers
+    /// must drop the transaction on error so a retirement is never committed
+    /// without the directory change.
+    pub(super) fn ensure_directory_empty_in_write_txn(
         txn: &redb::WriteTransaction,
-        parent: Ino,
-    ) -> MetaResult<Vec<Vec<u8>>> {
+        dir: Ino,
+    ) -> MetaResult<()> {
+        if !Self::has_entries_merged_in_write_txn(txn, dir)? {
+            return Ok(());
+        }
         if !Self::remote_namespace_visibility_filter_enabled_in_write_txn(txn)? {
-            return Ok(Vec::new());
+            return Err(MetaError::DirNotEmpty(dir));
         }
-        let current = txn
-            .open_table(DENTRIES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let base = txn
-            .open_table(BASE_DENTRIES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let tombstones = txn
-            .open_table(DENTRY_TOMBSTONES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries = Self::collect_parent_overlay_dentries_from_tables(
-            &current,
-            &base,
-            &tombstones,
-            parent,
-        )?;
-        let merged = Self::readdir_merged_from_opened_tables(
-            &base,
-            &current,
-            &tombstones,
-            parent,
-            &overlay_dentries,
-        )?;
-        let current_inodes = txn
-            .open_table(INODES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let base_inodes = txn
-            .open_table(BASE_INODES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let inode_tombstones = txn
-            .open_table(INODE_TOMBSTONES_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut dangling = Vec::new();
-        for entry in merged {
-            if entry.kind != FileType::RegularFile
-                || overlay_dentries.contains(&encode_dentry_key(parent, &entry.name))
-            {
-                continue;
+        let (merged, overlay_dentries) = Self::merged_children_in_write_txn(txn, dir)?;
+        let dangling = {
+            let current_inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let base_inodes = txn
+                .open_table(BASE_INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let inode_tombstones = txn
+                .open_table(INODE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut dangling = Vec::new();
+            for entry in merged {
+                if entry.kind != FileType::RegularFile
+                    || overlay_dentries.contains(&encode_dentry_key(dir, &entry.name))
+                {
+                    return Err(MetaError::DirNotEmpty(dir));
+                }
+                match Self::resolve_attr_from_opened_tables(
+                    &base_inodes,
+                    &current_inodes,
+                    &inode_tombstones,
+                    entry.ino,
+                    true,
+                ) {
+                    Ok(_) => return Err(MetaError::DirNotEmpty(dir)),
+                    Err(MetaError::InodeNotFound(_)) => dangling.push(entry.name),
+                    Err(err) => return Err(err),
+                }
             }
-            match Self::resolve_attr_from_opened_tables(
-                &base_inodes,
-                &current_inodes,
-                &inode_tombstones,
-                entry.ino,
-                true,
-            ) {
-                Ok(_) => {}
-                Err(MetaError::InodeNotFound(_)) => dangling.push(entry.name),
-                Err(err) => return Err(err),
-            }
+            dangling
+        };
+        for name in dangling {
+            Self::remove_dentry_overlay_in_txn(txn, dir, &name)?;
+            Self::append_event_in_txn(
+                txn,
+                &crate::events::MetaEvent::RemoveEntry { parent: dir, name },
+            )?;
         }
-        Ok(dangling)
+        if Self::has_entries_merged_in_write_txn(txn, dir)? {
+            return Err(MetaError::DirNotEmpty(dir));
+        }
+        Ok(())
     }
 
     pub(super) fn has_entries_merged_in_write_txn(

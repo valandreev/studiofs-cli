@@ -586,22 +586,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         if target_kind != FileType::Directory {
             return Err(MetaError::NotADirectory(entry.ino));
         }
-        // Retire filter-hidden dangling children with the directory, as the
-        // VFS heal does for visible ones; otherwise an apparently empty
-        // directory stays ENOTEMPTY forever (SFS-953).
-        for name in RedbMetaEngine::hidden_dangling_children_in_write_txn(self.txn, entry.ino)? {
-            RedbMetaEngine::remove_dentry_overlay_in_txn(self.txn, entry.ino, &name)?;
-            RedbMetaEngine::append_event_in_txn(
-                self.txn,
-                &crate::events::MetaEvent::RemoveEntry {
-                    parent: entry.ino,
-                    name,
-                },
-            )?;
-        }
-        if RedbMetaEngine::has_entries_merged_in_write_txn(self.txn, entry.ino)? {
-            return Err(MetaError::DirNotEmpty(entry.ino));
-        }
+        RedbMetaEngine::ensure_directory_empty_in_write_txn(self.txn, entry.ino)?;
 
         let mut parent_attr = RedbMetaEngine::get_attr_merged_in_write_txn(self.txn, spec.parent)?;
 
@@ -983,9 +968,8 @@ impl MetaFsOps for RedbMetaEngine {
         }
         if let Some(dst_entry) = &dst_entry_opt
             && dst_entry.kind == FileType::Directory
-            && !Self::readdir_merged_in_write_txn(&txn, dst_entry.ino)?.is_empty()
         {
-            return Err(MetaError::DirNotEmpty(dst_entry.ino));
+            Self::ensure_directory_empty_in_write_txn(&txn, dst_entry.ino)?;
         }
 
         let moved_dir_seed = if src_entry.kind == FileType::Directory {
