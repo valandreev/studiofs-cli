@@ -968,6 +968,70 @@ impl RedbMetaEngine {
         Ok(visible)
     }
 
+    /// Names of `parent`'s base regular-file dentries that the remote
+    /// visibility filter hides because their inode is gone from the merged
+    /// view. Lookup and readdir never expose these, so no foreground heal can
+    /// reach them, yet they still count toward directory emptiness.
+    pub(super) fn hidden_dangling_children_in_write_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+    ) -> MetaResult<Vec<Vec<u8>>> {
+        if !Self::remote_namespace_visibility_filter_enabled_in_write_txn(txn)? {
+            return Ok(Vec::new());
+        }
+        let current = txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_dentries = Self::collect_parent_overlay_dentries_from_tables(
+            &current,
+            &base,
+            &tombstones,
+            parent,
+        )?;
+        let merged = Self::readdir_merged_from_opened_tables(
+            &base,
+            &current,
+            &tombstones,
+            parent,
+            &overlay_dentries,
+        )?;
+        let current_inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_inodes = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let inode_tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut dangling = Vec::new();
+        for entry in merged {
+            if entry.kind != FileType::RegularFile
+                || overlay_dentries.contains(&encode_dentry_key(parent, &entry.name))
+            {
+                continue;
+            }
+            match Self::resolve_attr_from_opened_tables(
+                &base_inodes,
+                &current_inodes,
+                &inode_tombstones,
+                entry.ino,
+                true,
+            ) {
+                Ok(_) => {}
+                Err(MetaError::InodeNotFound(_)) => dangling.push(entry.name),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(dangling)
+    }
+
     pub(super) fn has_entries_merged_in_write_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
