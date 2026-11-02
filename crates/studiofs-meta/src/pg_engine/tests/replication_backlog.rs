@@ -307,15 +307,18 @@ fn reject_oversized_test_event(pg: &mut PgMetaEngine, name: &[u8]) -> u64 {
     pg.sync_max_response_bytes_per_page = 1;
     let cursor = pg.flushed_event_seq.load(Ordering::SeqCst);
     pg.set_xattr(ROOT_INO, b"user.sfs726.oversized", name, 0)
-        .expect("append one oversized event");
-    let rejected = pg
-        .claim_pending_batch(true)
-        .expect("oversized event should be claimable");
-    let error = match pg.flush_pending_claimed_batch_with_restore(rejected) {
-        Ok(_) => panic!("oversized event must be rejected"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, MetaError::EventTooLarge { .. }));
+        .expect("append oversized xattr and ctime events");
+    // Every event exceeds the 1-byte page, so each is rejected into one merged range.
+    while pg.replication_backlog().pending_ops > 0 {
+        let rejected = pg
+            .claim_pending_batch(true)
+            .expect("oversized event should be claimable");
+        let error = match pg.flush_pending_claimed_batch_with_restore(rejected) {
+            Ok(_) => panic!("oversized event must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, MetaError::EventTooLarge { .. }));
+    }
     assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), cursor);
     cursor
 }
@@ -2581,8 +2584,9 @@ fn permanent_event_size_error_does_not_restore_claimed_pending_batch() {
     pg.remote_format_validated.store(true, Ordering::Release);
     pg.sync_max_response_bytes_per_page = 1;
 
-    pg.set_xattr(ROOT_INO, b"user.sfs726.permanent-size", &[b'x'; 128], 0)
-        .expect("create oversized pending event");
+    // A single-event mutation; xattr writes also journal a ctime SetAttr.
+    let root = pg.get_attr(ROOT_INO).expect("root attr");
+    pg.set_attr(&root).expect("create oversized pending event");
     let claimed = pg
         .claim_pending_batch(true)
         .expect("oversized event should be claimable");
@@ -2698,11 +2702,7 @@ fn oversized_event_rejects_only_its_sequence_and_restores_independent_events() {
     let oversized_start = published_end;
     pg.local
         .set_xattr(ROOT_INO, b"user.sfs726.oversized", &[b'x'; 8 * 1024], 0)
-        .expect("append one oversized event");
-    let oversized_end = pg
-        .local
-        .get_counter(NEXT_EVENT_SEQ)
-        .expect("read oversized event end");
+        .expect("append one oversized event and its small ctime event");
     pg.local
         .set_xattr(ROOT_INO, b"user.small.after", b"ok", 0)
         .expect("append valid event after oversized event");
@@ -2718,7 +2718,7 @@ fn oversized_event_rejects_only_its_sequence_and_restores_independent_events() {
 
     {
         let mut state = pg.pending_state.lock().expect("pending state");
-        state.ops = 3;
+        state.ops = 6;
         state.force_flush = true;
         state.event_start = Some(event_start);
         state.event_end = event_end;
@@ -2739,7 +2739,7 @@ fn oversized_event_rejects_only_its_sequence_and_restores_independent_events() {
         progress.rejected,
         vec![LocalEventRange {
             start: oversized_start,
-            end: oversized_end,
+            end: oversized_start + 1,
         }],
         "only the oversized event should be rejected"
     );
@@ -2755,7 +2755,10 @@ fn oversized_event_rejects_only_its_sequence_and_restores_independent_events() {
         let pending = pg.pending_state.lock().expect("restored pending state");
         assert_eq!(pending.event_start, Some(event_start));
         assert_eq!(pending.event_end, event_end);
-        assert_eq!(pending.ops, 2, "both independent events should be restored");
+        assert_eq!(
+            pending.ops, 5,
+            "independent events, including the oversized write's ctime, should be restored"
+        );
         assert!(
             pending.force_flush,
             "restored independent work should be schedulable"
