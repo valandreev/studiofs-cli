@@ -24732,13 +24732,23 @@ fn explicit_winfsp_flush_waits_for_deferred_last_handle_release_barrier() {
 
 #[test]
 fn deferred_release_does_not_deadlock_with_materializer_queued_behind_its_session() {
+    assert_deferred_release_clears_with_materializer_queued_behind_its_session(false);
+}
+
+#[test]
+fn deferred_orphan_release_does_not_deadlock_with_materializer_queued_behind_its_session() {
+    assert_deferred_release_clears_with_materializer_queued_behind_its_session(true);
+}
+
+fn assert_deferred_release_clears_with_materializer_queued_behind_its_session(
+    unlink_before_close: bool,
+) {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-954-release-materializer");
     let _guard = rt.enter();
     rt.block_on(async {
-        let attr = vfs
-            .create(1, b"sfs-954-release-materializer.tmp", 0, 0, 0o644)
-            .unwrap();
+        let name = b"sfs-954-release-materializer.tmp";
+        let attr = vfs.create(1, name, 0, 0, 0o644).unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
         // Keep the write's own materializer from draining the payload so the
@@ -24760,6 +24770,9 @@ fn deferred_release_does_not_deadlock_with_materializer_queued_behind_its_sessio
         drop(materialize_entry);
         drop(materialize_guard);
         assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+        if unlink_before_close {
+            vfs.unlink(1, name).unwrap();
+        }
 
         // A write on a reopened handle owns the session gate, so the deferred
         // release takes the materialize gate and then parks behind the write.
@@ -24770,9 +24783,9 @@ fn deferred_release_does_not_deadlock_with_materializer_queued_behind_its_sessio
             .await;
         let outcome = vfs.release_fh_with_deferred_last_handle_barrier(fh, rt.handle());
         assert!(outcome.closed_last_handle);
-        assert!(
-            outcome.flushed_local_dirty_state,
-            "the release must take the deferred local-sync path"
+        assert_eq!(
+            outcome.flushed_local_dirty_state, !unlink_before_close,
+            "the release must take the deferred local-sync or orphan-cleanup path"
         );
         tokio::time::timeout(Duration::from_secs(5), async {
             while !vfs.state.file_session.materialize_gate_is_held(ino) {
@@ -24800,6 +24813,12 @@ fn deferred_release_does_not_deadlock_with_materializer_queued_behind_its_sessio
         )
         .await
         .expect("queued materializer should run after the release drops its session");
+        if unlink_before_close {
+            assert!(
+                !vfs.state.writer_stack.has_dirty_writers(ino),
+                "a materializer queued behind orphan cleanup must not revive writer state"
+            );
+        }
     });
 }
 

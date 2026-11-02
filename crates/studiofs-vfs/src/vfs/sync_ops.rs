@@ -1437,8 +1437,8 @@ impl StudioVfs {
                     )
                     .await;
                 drop(session);
-                let outcome = outcome?;
                 self.state.file_session.gc_if_idle(open_file.ino);
+                let outcome = outcome?;
                 return Ok(ExplicitFlushOutcome {
                     flushed_local_dirty_state: outcome.had_local_dirty_state,
                 });
