@@ -180,6 +180,16 @@ interrupted case is not a pass. Inspect the retained case records and logs
 before summarizing results. Do not run xfstests' whole-suite command directly:
 it bypasses the harness's per-test timeout and evidence layout.
 
+Each case runs with a unique `STUDIOFS_XFSTESTS_CASE` environment token. After
+`check` exits, the runner SIGKILLs every process that still carries that token,
+because test descendants can leave timeout's process group (for example
+fsstress). StudioFS mount daemons are excluded; mount recovery owns them. Killed
+processes are recorded in the case's `reaped.tsv`. A process that survives the
+bounded wait, even after mount recovery, stops the run. CPUs that were online
+when the run started and are offline after a case (a killed generic/650 skips
+its cleanup) are re-onlined and listed in `cpu-restored.txt`. If one cannot be
+re-onlined, the run stops.
+
 The selector is mandatory: an empty generated list is an error, never an
 implicit full run. For a bounded run, pass explicit IDs such as
 `generic/{001..403}` from Bash. Metadata records the checkout SHA and binary

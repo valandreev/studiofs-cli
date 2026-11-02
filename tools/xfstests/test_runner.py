@@ -178,6 +178,71 @@ exec /usr/bin/timeout "$@"
                     process.terminate()
                     process.wait(timeout=5)
 
+    def test_timeout_reaps_escaped_descendants_and_restores_cpus(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            checkout = root / "xfstests"
+            (checkout / "tests/generic").mkdir(parents=True)
+            (checkout / "tests/generic/group.list").write_text("650 auto\n")
+            (checkout / "tests/generic/650").touch()
+            # Like fsstress and the mount daemon, both children leave timeout's process group.
+            check = checkout / "check"
+            check.write_text("""#!/bin/bash
+cd "$MOCK_DIR"
+setsid sleep 60 & echo $! > escaped.pid
+setsid bash -c 'exec -a "$STUDIOFS_BINARY" bash mount' & echo $! > daemon.pid
+echo 0 > "$XFSTESTS_CPU_SYSFS/cpu1/online"
+sleep 5
+""")
+            check.chmod(0o755)
+            (root / "mount").write_text("exec 9<> fifo; read -r -t 60 -u 9\n")
+            os.mkfifo(root / "fifo")
+            binary = root / "studiofs"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o755)
+            cpus = root / "cpu"
+            for cpu, state in (("cpu1", "1"), ("cpu2", "0")):
+                (cpus / cpu).mkdir(parents=True)
+                (cpus / cpu / "online").write_text(state + "\n")
+            run = root / "run"
+            env = os.environ | {
+                "MOCK_DIR": str(root), "XFSTESTS_CPU_SYSFS": str(cpus),
+                "TEST_DEV": "testvol", "TEST_DIR": str(root / "testmnt"),
+                "SCRATCH_DEV": "scratchvol", "SCRATCH_MNT": str(root / "scratchmnt"),
+                "STUDIOFS_BINARY": str(binary), "STUDIOFS_CLIENT_ROOT": str(root / "client"),
+                "XFSTESTS_RUN": str(root / "evidence"), "TEST_TIMEOUT": "1",
+                "FSTYP": "fuse", "FUSE_SUBTYP": ".studiofs",
+            }
+            env.pop("STUDIOFS_XFSTESTS_CASE", None)
+            daemon = None
+            try:
+                result = subprocess.run([RUNNER, checkout, run, "generic/650"], env=env,
+                                        text=True, capture_output=True, timeout=30)
+                escaped = int((root / "escaped.pid").read_text())
+                daemon = int((root / "daemon.pid").read_text())
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("generic/650\t124\t", (run / "manifest.tsv").read_text())
+                self.assertFalse(alive(escaped), "escaped testcase descendant survived")
+                self.assertTrue(alive(daemon), "runner killed the StudioFS daemon")
+                reaped = [line.split("\t")[0]
+                          for line in (run / "cases/650/reaped.tsv").read_text().splitlines()]
+                self.assertIn(str(escaped), reaped)
+                self.assertNotIn(str(daemon), reaped)
+                self.assertEqual((cpus / "cpu1/online").read_text().strip(), "1")
+                self.assertEqual((cpus / "cpu2/online").read_text().strip(), "0")
+                self.assertEqual((run / "cases/650/cpu-restored.txt").read_text(), "cpu1\n")
+            finally:
+                if daemon is not None and alive(daemon):
+                    os.kill(daemon, 9)
+
+
+def alive(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -85,6 +85,28 @@ recover_mount() {
     fi
 }
 
+# Kill testcase descendants that escaped timeout's process group; evidence goes to reaped.tsv.
+reap_case() {
+    python3 "$here/reap_case.py" "$1" "$STUDIOFS_BINARY" "$2/reaped.tsv" 10
+}
+
+# A killed test skips its cleanup trap (generic/650 leaves hotplugged CPUs offline).
+cpu_dir=${XFSTESTS_CPU_SYSFS:-/sys/devices/system/cpu}
+online_cpus=()
+for cpu_online in "$cpu_dir"/cpu[0-9]*/online; do
+    [[ -r $cpu_online && $(<"$cpu_online") == 1 ]] && online_cpus+=("$cpu_online")
+done
+restore_cpus() {
+    local online cpu
+    for online in "${online_cpus[@]}"; do
+        [[ $(<"$online") == 1 ]] && continue
+        cpu=${online%/online}; cpu=${cpu##*/}
+        { echo 1 >"$online" && [[ $(<"$online") == 1 ]]; } 2>/dev/null ||
+            { echo "could not re-online $cpu" >&2; return 1; }
+        printf '%s\n' "$cpu" >>"$1/cpu-restored.txt"
+    done
+}
+
 failed=0
 for test_id in "${tests[@]}"; do
     dir="$run/cases/${test_id##*/}"
@@ -95,9 +117,12 @@ for test_id in "${tests[@]}"; do
     fi
     start=$SECONDS
     set +e
-    (cd "$xfstests" && RESULT_BASE="$dir/results" REPORT_DIR="$dir/results" timeout -k 10 "$timeout_s" ./check -R xunit -E "$here/exclude" "$test_id") >"$dir/check.log" 2>&1
+    token=$(</proc/sys/kernel/random/uuid)
+    (cd "$xfstests" && STUDIOFS_XFSTESTS_CASE=$token RESULT_BASE="$dir/results" REPORT_DIR="$dir/results" timeout -k 10 "$timeout_s" ./check -R xunit -E "$here/exclude" "$test_id") >"$dir/check.log" 2>&1
     status=$?
     elapsed=$((SECONDS - start))
+    reap_case "$token" "$dir"
+    reaped=$?
     if [[ $status -eq 124 || $status -eq 137 ]]; then
         verdict=timeout
     elif [[ -f $dir/results/result.xml ]]; then
@@ -126,12 +151,15 @@ PY
         verdict=harness
     fi
     printf '%s\t%s\t%s\t%s\n' "$test_id" "$status" "$elapsed" "$verdict" >&3
-    # A setup failure provides no testcase verdict; repair it before resuming.
-    [[ $verdict != harness ]] || exit 1
     if [[ $verdict == timeout ]]; then
         recover_mount "$TEST_DIR" "$TEST_DEV" || exit 1
         recover_mount "$SCRATCH_MNT" "$SCRATCH_DEV" || exit 1
     fi
+    # A descendant blocked on a wedged FUSE request can only exit after mount recovery.
+    if [[ $reaped -ne 0 ]]; then reap_case "$token" "$dir" || exit 1; fi
+    restore_cpus "$dir" || exit 1
+    # A setup failure provides no testcase verdict; repair it before resuming.
+    [[ $verdict != harness ]] || exit 1
     [[ $verdict == pass || $verdict == notrun ]] || failed=1
 done
 exit "$failed"
