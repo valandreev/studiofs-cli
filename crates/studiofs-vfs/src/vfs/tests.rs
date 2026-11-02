@@ -17650,6 +17650,68 @@ fn deferred_namespace_create_is_visible_before_background_commit() {
     });
 }
 
+/// SFS-950: opening an unwritten deferred create must not treat its admitted
+/// attributes as published metadata; reads stay local until the create commits.
+#[test]
+fn deferred_create_without_writes_reads_empty_before_commit() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-create-empty-read");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        // Hold the drainer so the create stays queued for every read below.
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(true, AtomicOrdering::Release);
+        let created = vfs
+            .create_with_deferred_metadata_admission(
+                ROOT_INO,
+                b"empty-copy-destination",
+                0,
+                0,
+                0o600,
+                rt.handle(),
+            )
+            .expect("admit deferred create");
+        let writer = vfs
+            .open_created_file_with_known_attr(&created, OpenFlags::RDWR, false)
+            .expect("open deferred create");
+        let reader = vfs
+            .open_file(created.ino, OpenFlags::RDONLY, false)
+            .expect("open queued create for reading");
+        assert!(
+            matches!(meta.get_attr(created.ino), Err(MetaError::InodeNotFound(_))),
+            "the reads must run before the create reaches metadata"
+        );
+
+        let mut buffer = [0_u8; 4096];
+        for fh in [writer, reader] {
+            let read = vfs
+                .read_into_fh(fh, created.ino, 0, &mut buffer)
+                .await
+                .expect("read queued empty create");
+            assert_eq!(read, 0);
+        }
+        assert_eq!(vfs.getattr(created.ino).expect("getattr").size, 0);
+
+        // Release persists the retained dirty attr only after the create commits.
+        vfs.state
+            .namespace
+            .deferred
+            .draining
+            .store(false, AtomicOrdering::Release);
+        vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+        for fh in [reader, writer] {
+            tokio::time::timeout(Duration::from_secs(10), vfs.release_fh(fh))
+                .await
+                .expect("release in time")
+                .expect("release queued create handle");
+        }
+        assert_eq!(meta.get_attr(created.ino).expect("committed").size, 0);
+    });
+}
+
 #[test]
 fn deferred_create_conflict_keeps_competing_entry_visible_through_vfs_lookup() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");

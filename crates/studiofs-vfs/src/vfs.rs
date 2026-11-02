@@ -6260,7 +6260,9 @@ impl StudioVfs {
     ///
     /// Skips instead of waiting when a write holds supersede admission, when
     /// `check` finds newer local state, or when writer bytes are still
-    /// unsettled; a later refresh retries.
+    /// unsettled; a later refresh retries. Queued deferred namespace metadata
+    /// is newer local state too: an unwritten create's admitted attributes look
+    /// published but have no metadata row until the batch commits (SFS-950).
     fn try_supersede_local_regular_file_state(
         &self,
         ino: Ino,
@@ -6269,6 +6271,9 @@ impl StudioVfs {
         invalidate_kernel: bool,
         expected_observation: Option<AttrReadObservation>,
     ) -> SupersedeOutcome {
+        if self.has_deferred_namespace_metadata(ino) {
+            return SupersedeOutcome::Skipped;
+        }
         let Some(writes_held_off) = self.state.writer_stack.try_supersede_exclusive(ino) else {
             return SupersedeOutcome::Skipped;
         };

@@ -9600,6 +9600,105 @@ mod tests {
         drop(fixture);
     }
 
+    /// SFS-950: a destination created by an EOF `copy_file_range` must read
+    /// as an empty file right after the creating handle closes, while its
+    /// deferred create may still be queued.
+    #[test]
+    #[ignore = "requires /dev/fuse and fusermount3 on a Linux host"]
+    fn mounted_eof_copy_range_destination_is_immediately_readable() {
+        for policy in [
+            crate::cache_policy::LinuxFuseCachePolicy::Adaptive,
+            crate::cache_policy::LinuxFuseCachePolicy::Kernel,
+        ] {
+            mounted_eof_copy_range_destination(policy);
+        }
+    }
+
+    fn mounted_eof_copy_range_destination(policy: crate::cache_policy::LinuxFuseCachePolicy) {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-eof-copy-range")
+                .expect("create fixture");
+        fixture.start().expect("start fixture");
+        let mount_dir = studiofs_test_support::workspace_target_tempdir("linux-eof-copy-range-");
+        let mount_point = mount_dir.path().to_owned();
+        let mut state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        state.cache_policy = policy;
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-eof-copy-range").unwrap();
+        let worker_mount = mount_point.clone();
+        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
+            let guard = UnmountGuard::new(worker_mount.clone());
+            let source = worker_mount.join("file");
+            std::fs::write(&source, b"abcde")?;
+            for round in 0..64 {
+                let destination = worker_mount.join(format!("copy-{round}"));
+                let output = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&destination)?;
+                let input = std::fs::File::open(&source)?;
+                let mut source_offset: libc::loff_t = 5;
+                // SAFETY: both descriptors are open; the offset outlives the call.
+                let copied = unsafe {
+                    libc::copy_file_range(
+                        input.as_raw_fd(),
+                        &mut source_offset,
+                        output.as_raw_fd(),
+                        std::ptr::null_mut(),
+                        1,
+                        0,
+                    )
+                };
+                assert_eq!(
+                    copied,
+                    0,
+                    "{policy:?} round {round}: EOF copy_file_range: {}",
+                    std::io::Error::last_os_error()
+                );
+                drop(input);
+                drop(output);
+                let mut contents = Vec::new();
+                std::fs::File::open(&destination)
+                    .and_then(|mut reopened| reopened.read_to_end(&mut contents))
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!("{policy:?} round {round}: immediate reopen and read: {error}"),
+                        )
+                    })?;
+                assert!(
+                    contents.is_empty(),
+                    "{policy:?} round {round}: {contents:?}"
+                );
+            }
+            let status = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&worker_mount)
+                .status();
+            guard.disarm();
+            status
+        });
+        session.run().unwrap();
+        let result = worker.join().unwrap();
+        drop(session);
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(Duration::ZERO))
+            .unwrap();
+        drop(fixture);
+        assert!(result.unwrap().success());
+    }
+
     /// SFS-936: an unprivileged owner's truncate and successful write must
     /// clear setuid, and setgid only with group execute, like ext4.
     #[test]
