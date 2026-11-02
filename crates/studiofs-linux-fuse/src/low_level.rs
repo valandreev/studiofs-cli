@@ -268,6 +268,8 @@ unsafe extern "C" {
     fn studiofs_linux_fuse_loop_config_uses_loop_config_api() -> c_int;
     fn studiofs_linux_fuse_loop_has_worker_limit() -> c_int;
     #[cfg(test)]
+    fn studiofs_linux_fuse_init_wants_export_support(capable_ext: u64) -> c_int;
+    #[cfg(test)]
     fn studiofs_linux_fuse_conn_wants_async_dio_after_set(capable_ext: u64) -> c_int;
     #[cfg(test)]
     fn studiofs_linux_fuse_conn_wants_writeback_cache_after_set(capable_ext: u64) -> c_int;
@@ -2059,11 +2061,40 @@ impl SessionState {
     fn lookup(&self, parent: u64, name: &[u8]) -> Result<ObservedInodeAttr, i32> {
         #[cfg(test)]
         self.lookup_calls.fetch_add(1, Ordering::Relaxed);
-        self.observe_attr(|| {
-            self.vfs
-                .lookup(parent, name)
-                .map_err(|error| vfs_err_to_errno(&error))
-        })
+        // Path walks resolve "." and ".." in the kernel; with export support the
+        // kernel sends them only to decode uncached file handles.
+        match name {
+            b"." => self.observe_attr(|| self.export_handle_attr(parent)),
+            b".." => self.observe_attr(|| self.export_handle_parent_attr(parent)),
+            _ => self.observe_attr(|| {
+                self.vfs
+                    .lookup(parent, name)
+                    .map_err(|error| vfs_err_to_errno(&error))
+            }),
+        }
+    }
+
+    /// Resolves an export handle's node id; an unlinked inode is stale.
+    fn export_handle_attr(&self, ino: u64) -> Result<InodeAttr, i32> {
+        let attr = self.getattr_attr(ino)?;
+        if attr.nlink == 0 {
+            return Err(libc::ENOENT);
+        }
+        Ok(attr)
+    }
+
+    /// Resolves a directory export handle's parent from its authoritative parent.
+    fn export_handle_parent_attr(&self, ino: u64) -> Result<InodeAttr, i32> {
+        let attr = self.export_handle_attr(ino)?;
+        if attr.kind != FileType::Directory {
+            return Err(libc::ENOTDIR);
+        }
+        let parent = if attr.ino == studiofs_meta::ROOT_INO || attr.parent == 0 {
+            studiofs_meta::ROOT_INO
+        } else {
+            attr.parent
+        };
+        self.export_handle_attr(parent)
     }
 
     fn getattr_attr(&self, ino: u64) -> Result<InodeAttr, i32> {
@@ -5410,6 +5441,62 @@ mod tests {
             // SAFETY: the non-null session is uniquely owned by this test.
             unsafe { super::raw::fuse_session_destroy(session) };
         }
+    }
+
+    #[test]
+    fn init_requests_export_support_only_when_kernel_offers_it() {
+        let export_support_cap = 1_u64 << 4;
+        // SAFETY: the C shim initializes and inspects a stack-local fuse_conn_info.
+        let (offered, withheld) = unsafe {
+            (
+                super::studiofs_linux_fuse_init_wants_export_support(export_support_cap),
+                super::studiofs_linux_fuse_init_wants_export_support(0),
+            )
+        };
+
+        assert_eq!(offered, 1);
+        assert_eq!(withheld, 0);
+    }
+
+    #[test]
+    fn export_handle_lookups_resolve_linked_inodes_and_reject_unlinked_ones() {
+        // xfstests generic/426, generic/467: open_by_handle after the kernel dropped the inode.
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-export-handles")
+                .expect("create fixture");
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let vfs = fixture.vfs();
+        let first = vfs.mkdir(1, b"first", 0, 0, 0o755).unwrap();
+        let second = vfs.mkdir(1, b"second", 0, 0, 0o755).unwrap();
+        let child = vfs.mkdir(first.ino, b"child", 0, 0, 0o755).unwrap();
+        let file = vfs.create(child.ino, b"file", 0, 0, 0o644).unwrap();
+        vfs.link(file.ino, second.ino, b"alias").unwrap();
+        let removed = vfs.create(child.ino, b"removed", 0, 0, 0o644).unwrap();
+        vfs.unlink(child.ino, b"removed").unwrap();
+
+        let resolve = |ino, name: &[u8]| state.lookup(ino, name).map(|observed| observed.attr.ino);
+        assert_eq!(resolve(file.ino, b"."), Ok(file.ino));
+        assert_eq!(resolve(child.ino, b"."), Ok(child.ino));
+        assert_eq!(resolve(child.ino, b".."), Ok(first.ino));
+        assert_eq!(resolve(first.ino, b".."), Ok(1));
+        assert_eq!(resolve(1, b".."), Ok(1));
+        assert_eq!(resolve(file.ino, b".."), Err(libc::ENOTDIR));
+        assert_eq!(resolve(removed.ino, b"."), Err(libc::ENOENT));
+
+        // Directory parents follow rename; the hard-linked file outlives one unlink.
+        state
+            .rename(first.ino, b"child", second.ino, b"moved")
+            .unwrap();
+        assert_eq!(resolve(child.ino, b".."), Ok(second.ino));
+        vfs.unlink(child.ino, b"file").unwrap();
+        assert_eq!(resolve(file.ino, b"."), Ok(file.ino));
+        vfs.unlink(second.ino, b"alias").unwrap();
+        assert_eq!(resolve(file.ino, b"."), Err(libc::ENOENT));
     }
 
     #[test]
