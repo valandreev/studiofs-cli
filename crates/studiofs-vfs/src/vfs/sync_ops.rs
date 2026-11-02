@@ -324,6 +324,11 @@ impl StudioVfs {
     /// materialize gate. Joining that materializer while holding the session
     /// gate never returns. The `Fsync` permit then keeps later materializers
     /// out of the strict pass, like the flush and fsync barriers.
+    ///
+    /// A materializer registered after the join, for example by the periodic
+    /// worker that sees the bytes this write just recorded, can still win the
+    /// materialize gate. Interrupt its linger so the strict write waits only
+    /// for its drain.
     async fn enter_write_path_durability_session(
         &self,
         ino: Ino,
@@ -331,12 +336,17 @@ impl StudioVfs {
     ) {
         drop(session.take());
         self.wait_for_deferred_materialization_inflight(ino).await;
+        let materialize_interrupt = self
+            .state
+            .deferred_materialize_inflight
+            .request_interrupt(ino);
         *session = Some(
             self.state
                 .file_session
                 .enter_op(ino, FileSessionOperation::Fsync)
                 .await,
         );
+        drop(materialize_interrupt);
     }
 
     pub(super) async fn wait_for_deferred_release_inflight(&self, ino: Ino) {

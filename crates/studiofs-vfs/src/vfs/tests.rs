@@ -24878,6 +24878,9 @@ fn assert_write_through_write_clears_queued_release_and_materializer(deferred_en
                 })
                 .await
                 .expect(what);
+                // Each step must add exactly one waiter so the queue order
+                // is the one this test sets up.
+                assert_eq!(queued_ops(&vfs), expected, "{what}");
             }
         };
 
@@ -24955,6 +24958,9 @@ fn assert_write_through_write_clears_queued_release_and_materializer(deferred_en
             !vfs.state.writer_stack.has_dirty_writers(ino),
             "write-through must leave no memory-only writer state"
         );
+        let mut readback = vec![0u8; b"write-through payload".len()];
+        let read = vfs.read_into_fh(fh2, ino, 0, &mut readback).await.unwrap();
+        assert_eq!(&readback[..read as usize], b"write-through payload");
         vfs.release_fh(fh2).await.unwrap();
     });
 }
