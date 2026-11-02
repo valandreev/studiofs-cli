@@ -1210,3 +1210,149 @@ fn unicode_query_lowercase_matches_ascii_stored_name() {
     );
     assert_eq!(FOLDED_DENTRY_INDEX_ROWS.get(), 1);
 }
+
+/// SFS-953: a replica whose base holds `dir/draft` from a peer that has not
+/// published the draft yet, so the visibility filter hides `draft`. The peer
+/// also creates an empty `src` directory for rename-over-directory cases.
+fn replica_with_hidden_base_child() -> (TestEngine, Ino, Ino) {
+    let writer = temp_engine();
+    let replica = temp_engine();
+    replica.set_remote_namespace_visibility_filter(true).unwrap();
+    let start = writer.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let dir = writer.create_dir(ROOT_INO, b"dir", 0, 0, 0o755).unwrap();
+    let draft = writer.create_file(dir.ino, b"draft", 0, 0, 0o644).unwrap();
+    writer.create_dir(ROOT_INO, b"src", 0, 0, 0o755).unwrap();
+    let end = writer.get_counter(NEXT_EVENT_SEQ).unwrap();
+    replica
+        .apply_replica_events_to_base(&writer.read_events_range(start, end).unwrap())
+        .unwrap();
+    assert!(replica.readdir(dir.ino).unwrap().is_empty());
+    assert!(matches!(
+        replica.lookup(dir.ino, b"draft"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    (replica, dir.ino, draft.ino)
+}
+
+fn remove_base_inode(engine: &TestEngine, ino: Ino) {
+    let txn = engine.begin_write_txn().unwrap();
+    txn.open_table(BASE_INODES_TABLE)
+        .unwrap()
+        .remove(ino)
+        .unwrap();
+    txn.commit().unwrap();
+}
+
+#[test]
+fn rmdir_retires_filter_hidden_dangling_child() {
+    let (replica, dir_ino, draft_ino) = replica_with_hidden_base_child();
+    remove_base_inode(&replica, draft_ino);
+    let start = replica.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    replica.rmdir(ROOT_INO, b"dir").unwrap();
+
+    assert!(matches!(
+        replica.lookup(ROOT_INO, b"dir"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    let end = replica.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events = replica.read_events_range(start, end).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        MetaEvent::RemoveEntry { parent, name } if *parent == dir_ino && name == b"draft"
+    )));
+    let txn = replica.begin_read_txn().unwrap();
+    let tombstones = txn.open_table(DENTRY_TOMBSTONES_TABLE).unwrap();
+    let key = encode_dentry_key(dir_ino, b"draft");
+    assert!(tombstones.get(key.as_slice()).unwrap().is_some());
+}
+
+#[test]
+fn rmdir_keeps_filter_hidden_live_draft_child() {
+    let (replica, dir_ino, draft_ino) = replica_with_hidden_base_child();
+    let start = replica.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    assert!(matches!(
+        replica.rmdir(ROOT_INO, b"dir"),
+        Err(MetaError::DirNotEmpty(ino)) if ino == dir_ino
+    ));
+
+    assert_eq!(replica.get_counter(NEXT_EVENT_SEQ).unwrap(), start);
+    assert_eq!(replica.lookup(ROOT_INO, b"dir").unwrap().ino, dir_ino);
+    let txn = replica.begin_read_txn().unwrap();
+    let dentries = txn.open_table(BASE_DENTRIES_TABLE).unwrap();
+    let key = encode_dentry_key(dir_ino, b"draft");
+    let entry = dentries.get(key.as_slice()).unwrap().unwrap();
+    assert_eq!(decode::<DirEntryValue>(entry.value()).unwrap().ino, draft_ino);
+    let tombstones = txn.open_table(DENTRY_TOMBSTONES_TABLE).unwrap();
+    assert!(tombstones.get(key.as_slice()).unwrap().is_none());
+}
+
+#[test]
+fn rmdir_with_live_draft_rolls_back_dangling_child_retirement() {
+    let writer = temp_engine();
+    let replica = temp_engine();
+    replica.set_remote_namespace_visibility_filter(true).unwrap();
+    let start = writer.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let dir = writer.create_dir(ROOT_INO, b"dir", 0, 0, 0o755).unwrap();
+    let dangling = writer.create_file(dir.ino, b"dangling", 0, 0, 0o644).unwrap();
+    writer.create_file(dir.ino, b"draft", 0, 0, 0o644).unwrap();
+    let end = writer.get_counter(NEXT_EVENT_SEQ).unwrap();
+    replica
+        .apply_replica_events_to_base(&writer.read_events_range(start, end).unwrap())
+        .unwrap();
+    remove_base_inode(&replica, dangling.ino);
+
+    assert!(matches!(
+        replica.rmdir(ROOT_INO, b"dir"),
+        Err(MetaError::DirNotEmpty(_))
+    ));
+
+    let txn = replica.begin_read_txn().unwrap();
+    let tombstones = txn.open_table(DENTRY_TOMBSTONES_TABLE).unwrap();
+    let key = encode_dentry_key(dir.ino, b"dangling");
+    assert!(tombstones.get(key.as_slice()).unwrap().is_none());
+}
+
+#[test]
+fn rename_over_directory_keeps_filter_hidden_live_draft_child() {
+    let (replica, dir_ino, _) = replica_with_hidden_base_child();
+
+    assert!(matches!(
+        replica.rename_atomic(ROOT_INO, b"src", ROOT_INO, b"dir", true, false),
+        Err(MetaError::DirNotEmpty(ino)) if ino == dir_ino
+    ));
+    assert_eq!(replica.lookup(ROOT_INO, b"dir").unwrap().ino, dir_ino);
+}
+
+#[test]
+fn rename_over_directory_retires_filter_hidden_dangling_child() {
+    let (replica, dir_ino, draft_ino) = replica_with_hidden_base_child();
+    remove_base_inode(&replica, draft_ino);
+    let src_ino = replica.lookup(ROOT_INO, b"src").unwrap().ino;
+
+    replica
+        .rename_atomic(ROOT_INO, b"src", ROOT_INO, b"dir", true, false)
+        .unwrap();
+
+    assert_eq!(replica.lookup(ROOT_INO, b"dir").unwrap().ino, src_ino);
+    let txn = replica.begin_read_txn().unwrap();
+    let tombstones = txn.open_table(DENTRY_TOMBSTONES_TABLE).unwrap();
+    let key = encode_dentry_key(dir_ino, b"draft");
+    assert!(tombstones.get(key.as_slice()).unwrap().is_some());
+}
+
+#[test]
+fn rmdir_without_visibility_filter_leaves_dangling_child_to_vfs_heal() {
+    let (replica, dir_ino, draft_ino) = replica_with_hidden_base_child();
+    remove_base_inode(&replica, draft_ino);
+    replica.set_remote_namespace_visibility_filter(false).unwrap();
+    assert_eq!(replica.readdir(dir_ino).unwrap().len(), 1);
+    let start = replica.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+    assert!(matches!(
+        replica.rmdir(ROOT_INO, b"dir"),
+        Err(MetaError::DirNotEmpty(ino)) if ino == dir_ino
+    ));
+    assert_eq!(replica.get_counter(NEXT_EVENT_SEQ).unwrap(), start);
+}
