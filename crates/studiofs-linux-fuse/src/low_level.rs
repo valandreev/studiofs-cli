@@ -2089,10 +2089,10 @@ impl SessionState {
         if attr.kind != FileType::Directory {
             return Err(libc::ENOTDIR);
         }
-        let parent = if attr.ino == studiofs_meta::ROOT_INO || attr.parent == 0 {
-            studiofs_meta::ROOT_INO
-        } else {
-            attr.parent
+        // The root records itself as its parent; 0 only appears in legacy records.
+        let parent = match attr.parent {
+            0 => studiofs_meta::ROOT_INO,
+            parent => parent,
         };
         self.export_handle_attr(parent)
     }
@@ -5487,6 +5487,11 @@ mod tests {
         assert_eq!(resolve(1, b".."), Ok(1));
         assert_eq!(resolve(file.ino, b".."), Err(libc::ENOTDIR));
         assert_eq!(resolve(removed.ino, b"."), Err(libc::ENOENT));
+        assert_eq!(resolve(1 << 40, b"."), Err(libc::ENOENT));
+        let removed_dir = vfs.mkdir(first.ino, b"removed-dir", 0, 0, 0o755).unwrap();
+        state.rmdir(first.ino, b"removed-dir").unwrap();
+        assert_eq!(resolve(removed_dir.ino, b"."), Err(libc::ENOENT));
+        assert_eq!(resolve(removed_dir.ino, b".."), Err(libc::ENOENT));
 
         // Directory parents follow rename; the hard-linked file outlives one unlink.
         state
