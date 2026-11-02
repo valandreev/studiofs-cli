@@ -439,6 +439,15 @@ matching WinFSP's marker-less `read_directory`. Because capture happens on first
 child read, `ENOENT` for a directory removed before then is returned by
 `readdir`, not `opendir`.
 
+The bridge requests `FUSE_CAP_EXPORT_SUPPORT` when the kernel offers it, so
+`open_by_handle_at` survives eviction from the kernel inode cache and remount.
+Path walks never send `.` or `..` to userspace; the kernel uses them only to
+decode a handle. `LOOKUP(ino, ".")` resolves the inode by number from the local
+view and returns `ENOENT` (the kernel reports `ESTALE`) once it has no links.
+`LOOKUP(dir, "..")` returns the directory's authoritative parent, which rename
+maintains; the root is its own parent. The entry generation is constant because
+inode numbers are not reused. This is local handle decoding, not NFS export.
+
 As on WinFSP, snapshots are shared through a session cache keyed by inode and
 validated by `StudioVfs::directory_enumeration_observation`. The cache keeps at
 most 64 snapshots and 4 MiB of entry/name bytes with LRU eviction, clears on a

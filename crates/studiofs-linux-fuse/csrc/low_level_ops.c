@@ -172,6 +172,8 @@ static void studiofs_linux_fuse_init(void *userdata, struct fuse_conn_info *conn
     }
     conn->max_background = studiofs_linux_fuse_connection_max_background(userdata);
     conn->congestion_threshold = studiofs_linux_fuse_connection_congestion_threshold(userdata);
+    /* LOOKUP "." and ".." resolve export handles whose inode left the kernel cache. */
+    (void)studiofs_linux_fuse_set_feature_flag_compat(conn, FUSE_CAP_EXPORT_SUPPORT);
     if (studiofs_linux_fuse_connection_wants_async_dio(userdata)) {
         (void)studiofs_linux_fuse_set_feature_flag_compat(conn, FUSE_CAP_ASYNC_DIO);
     }
@@ -687,6 +689,13 @@ int studiofs_linux_fuse_conn_wants_writeback_cache_after_set(uint64_t capable_ex
     studiofs_linux_fuse_set_capable_features(&conn, capable_ext);
     return studiofs_linux_fuse_set_feature_flag_compat(&conn, FUSE_CAP_WRITEBACK_CACHE) &&
            studiofs_linux_fuse_get_feature_flag_compat(&conn, FUSE_CAP_WRITEBACK_CACHE);
+}
+
+int studiofs_linux_fuse_init_wants_export_support(uint64_t capable_ext) {
+    struct fuse_conn_info conn = {0};
+    studiofs_linux_fuse_set_capable_features(&conn, capable_ext);
+    studiofs_linux_fuse_init(NULL, &conn);
+    return studiofs_linux_fuse_get_feature_flag_compat(&conn, FUSE_CAP_EXPORT_SUPPORT);
 }
 
 int studiofs_linux_fuse_conn_wants_async_dio_after_set(uint64_t capable_ext) {
