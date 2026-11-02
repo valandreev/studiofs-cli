@@ -1282,6 +1282,39 @@ fn unlink_hardlink_updates_inode_ctime() {
 }
 
 #[test]
+fn xattr_set_and_remove_update_inode_ctime() {
+    let engine = temp_engine();
+    let file = engine.create_file(ROOT_INO, b"ctime-xattr", 1000, 1000, 0o644).unwrap();
+    let age_ctime = |engine: &RedbMetaEngine| {
+        let mut old = engine.get_attr(file.ino).unwrap();
+        old.ctime -= 1_000_000_000;
+        engine.set_attr(&old).unwrap();
+        engine.get_attr(file.ino).unwrap()
+    };
+
+    for remove in [false, true] {
+        let before = age_ctime(&engine);
+        let event_start = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+        if remove {
+            engine.remove_xattr(file.ino, b"user.foobar").unwrap();
+        } else {
+            engine.set_xattr(file.ino, b"user.foobar", b"v", 0).unwrap();
+        }
+
+        let after = engine.get_attr(file.ino).unwrap();
+        assert!(after.ctime > before.ctime, "remove={remove}");
+        assert_eq!(after.mtime, before.mtime, "remove={remove}");
+        let event_end = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+        let events = engine.read_events_range(event_start, event_end).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::events::MetaEvent::SetAttr { attr }
+                if attr.ino == file.ino && attr.ctime == after.ctime
+        )), "remove={remove}");
+    }
+}
+
+#[test]
 fn rename_directory_updates_inode_ctime_without_changing_mtime() {
     let engine = temp_engine();
     let dir = engine.create_dir(ROOT_INO, b"ctime-dir", 1000, 1000, 0o755).unwrap();

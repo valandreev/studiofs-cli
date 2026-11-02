@@ -1,5 +1,15 @@
 use super::*;
 
+impl RedbMetaEngine {
+    /// POSIX advances ctime on every xattr mutation; journal it like other attr-only ctime touches.
+    fn touch_xattr_ctime_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+        let mut attr = Self::get_attr_merged_in_write_txn(txn, ino)?;
+        attr.touch_ctime();
+        Self::set_inode_in_txn(txn, &attr)?;
+        Self::append_event_in_txn(txn, &crate::events::MetaEvent::SetAttr { attr })
+    }
+}
+
 impl MetaXattr for RedbMetaEngine {
     fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
         let txn = self.begin_read_txn()?;
@@ -39,6 +49,7 @@ impl MetaXattr for RedbMetaEngine {
                     flags,
                 },
             )?;
+            Self::touch_xattr_ctime_in_txn(&txn, ino)?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -63,6 +74,7 @@ impl MetaXattr for RedbMetaEngine {
                     name: name.to_vec(),
                 },
             )?;
+            Self::touch_xattr_ctime_in_txn(&txn, ino)?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;

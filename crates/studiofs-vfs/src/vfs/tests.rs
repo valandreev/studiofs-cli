@@ -27727,3 +27727,44 @@ fn fsx_like_write_truncate_stress_keeps_overlay_payloads() {
         vfs.release_fh(fh).await.expect("release");
     });
 }
+
+#[test]
+fn xattr_mutations_invalidate_cached_attr_ctime() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("xattr-ctime-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "xattr-ctime");
+    let _guard = rt.enter();
+    let attr = vfs
+        .create(ROOT_INO, b"xattr-ctime.txt", 0, 0, 0o644)
+        .expect("create file");
+
+    for remove in [false, true] {
+        // Age ctime so the assertion does not depend on clock resolution.
+        let mut old = meta.get_attr(attr.ino).expect("committed attr");
+        old.ctime -= 1_000_000_000;
+        meta.set_attr(&old).expect("age ctime");
+        vfs.invalidate_attr_read_cache([attr.ino]);
+        let cached = vfs.getattr(attr.ino).expect("cache file attributes");
+        assert_eq!(cached.ctime, old.ctime);
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(attr.ino)
+        );
+        if remove {
+            vfs.remove_xattr(attr.ino, b"user.foobar")
+                .expect("remove xattr");
+        } else {
+            vfs.set_xattr(attr.ino, b"user.foobar", b"v", 0)
+                .expect("set xattr");
+        }
+        let committed = meta.get_attr(attr.ino).expect("committed attr");
+        assert!(committed.ctime > cached.ctime, "remove={remove}");
+        assert_eq!(
+            vfs.getattr(attr.ino).expect("fresh attr").ctime,
+            committed.ctime,
+            "remove={remove}"
+        );
+    }
+}

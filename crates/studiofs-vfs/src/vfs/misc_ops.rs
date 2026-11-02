@@ -46,6 +46,7 @@ impl StudioVfs {
             }));
         }
         self.sync_meta().set_xattr(ino, name, value, flags)?;
+        self.invalidate_attr_read_cache([ino]);
         Ok(())
     }
 
@@ -57,6 +58,7 @@ impl StudioVfs {
             return Ok(());
         }
         self.sync_meta().remove_xattr(ino, name)?;
+        self.invalidate_attr_read_cache([ino]);
         Ok(())
     }
 

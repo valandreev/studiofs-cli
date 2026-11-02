@@ -1710,7 +1710,8 @@ fn self_batch_prefix_matching_bounds_work_for_long_late_and_missing_matches() {
         pg.local
             .set_xattr(ROOT_INO, b"user.echo", b"match", 0)
             .unwrap();
-        let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+        // The echo carries only SetXattr; the trailing ctime SetAttr stays local.
+        let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap() - 1;
         let coordinator = RemoteApplyCoordinator::new(&pg.local);
         let txn = pg.local.begin_write_txn().unwrap();
         for (value, expected) in [(b"match".as_slice(), Some(end)), (b"absent", None)] {
@@ -7728,14 +7729,18 @@ fn test_pg_local_xattr_overlay_masks_foreign_update_until_flush() {
     let a = PgMetaEngine::open(&db_a).expect("open a");
     let b = PgMetaEngine::open(&db_b).expect("open b");
 
-    let file = create_published_small_file(&a, ROOT_INO, b"shared.txt", 50_313);
+    // A Ready regular file's xattr ctime SetAttr flushes eagerly (like chmod), so a
+    // directory keeps B's xattr local until its explicit flush.
+    let file = a
+        .create_dir(ROOT_INO, b"shared-dir", 0, 0, 0o755)
+        .expect("create shared dir on a");
     a.set_xattr(file.ino, b"user.color", b"red", 0)
         .expect("set red xattr on a");
     a.flush_metadata().expect("flush red on a");
     assert!(wait_visible(
         &b,
         ROOT_INO,
-        b"shared.txt",
+        b"shared-dir",
         Duration::from_secs(10)
     ));
     assert_eq!(
