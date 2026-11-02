@@ -24823,6 +24823,149 @@ fn assert_deferred_release_clears_with_materializer_queued_behind_its_session(
 }
 
 #[test]
+fn write_through_write_does_not_deadlock_with_queued_release_and_materializer() {
+    assert_write_through_write_clears_queued_release_and_materializer(false);
+}
+
+#[test]
+fn write_through_deferred_write_does_not_deadlock_with_queued_release_and_materializer() {
+    assert_write_through_write_clears_queued_release_and_materializer(true);
+}
+
+fn assert_write_through_write_clears_queued_release_and_materializer(deferred_entry: bool) {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "write-through-release-materializer");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"write-through-release-materializer.tmp", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        // Keep the write's own materializer from draining the payload so the
+        // last close still has writer-stack state to sync.
+        let (materialize_entry, materialize_guard) = vfs
+            .state
+            .deferred_materialize_inflight
+            .try_register(ino)
+            .expect("test should reserve the deferred materialization gate");
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            b"closed writer payload",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        drop(materialize_entry);
+        drop(materialize_guard);
+        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+
+        let queued_ops = |vfs: &StudioVfs| {
+            vfs.state
+                .file_session
+                .debug_snapshot(ino)
+                .map_or(0, |snapshot| snapshot.queued_ops)
+        };
+        let wait_for_queued_ops = |expected: u64, what: &'static str| {
+            let vfs = Arc::clone(&vfs);
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while queued_ops(&vfs) < expected {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect(what);
+                // Each step must add exactly one waiter so the queue order
+                // is the one this test sets up.
+                assert_eq!(queued_ops(&vfs), expected, "{what}");
+            }
+        };
+
+        // Hold both gates so the release, the materializer, and the write
+        // queue in a fixed order: release then materializer on the materialize
+        // gate, the write on the session gate.
+        let barrier_session = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Flush)
+            .await;
+        let outcome = vfs.release_fh_with_deferred_last_handle_barrier(fh, rt.handle());
+        assert!(outcome.closed_last_handle);
+        assert!(
+            outcome.flushed_local_dirty_state,
+            "the release must take the deferred local-sync path"
+        );
+        wait_for_queued_ops(1, "deferred release should queue on the materialize gate").await;
+
+        let fh2 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        vfs.spawn_deferred_materialization_if_needed(ino);
+        assert!(vfs.state.deferred_materialize_inflight.contains(ino));
+        wait_for_queued_ops(2, "materializer should queue behind the release").await;
+
+        let writer = Arc::clone(&vfs);
+        let write = tokio::spawn(async move {
+            let payload = b"write-through payload";
+            if deferred_entry {
+                writer
+                    .write_fh_with_deferred_materialize(
+                        fh2,
+                        ino,
+                        0,
+                        payload,
+                        LocalSyncPolicy::WriteThrough,
+                    )
+                    .await
+            } else {
+                writer
+                    .write_fh_with_local_sync_policy(
+                        fh2,
+                        ino,
+                        0,
+                        payload,
+                        LocalSyncPolicy::WriteThrough,
+                    )
+                    .await
+            }
+        });
+        wait_for_queued_ops(3, "write-through write should queue on the session gate").await;
+
+        // The write takes the session gate and the release takes the
+        // materialize gate, then parks behind the write. The write must not
+        // join the materializer that is parked behind the release.
+        drop(barrier_session);
+        let written = tokio::time::timeout(Duration::from_secs(5), write)
+            .await
+            .expect("write-through write must not wait on a materializer parked behind a release")
+            .expect("write task should not panic")
+            .expect("write-through write should succeed");
+        assert_eq!(written, b"write-through payload".len() as u32);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            vfs.wait_for_deferred_release_inflight(ino),
+        )
+        .await
+        .expect("deferred release barrier should clear");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            vfs.wait_for_deferred_materialization_inflight(ino),
+        )
+        .await
+        .expect("queued materializer should finish");
+        assert!(
+            !vfs.state.writer_stack.has_dirty_writers(ino),
+            "write-through must leave no memory-only writer state"
+        );
+        let mut readback = vec![0u8; b"write-through payload".len()];
+        let read = vfs.read_into_fh(fh2, ino, 0, &mut readback).await.unwrap();
+        assert_eq!(&readback[..read as usize], b"write-through payload");
+        vfs.release_fh(fh2).await.unwrap();
+    });
+}
+
+#[test]
 fn deferred_release_drains_many_tiny_closed_files_promptly() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-release-many-tiny");

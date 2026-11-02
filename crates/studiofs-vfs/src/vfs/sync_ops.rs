@@ -315,6 +315,40 @@ impl StudioVfs {
             .remove(&ino);
     }
 
+    /// Swaps a write's `Write` permit for an `Fsync` permit before the
+    /// write-path durability pass.
+    ///
+    /// The deferred materializer must be joined outside the write's session: a
+    /// release or flush can hold the materialize gate while it queues on the
+    /// session gate, and a materializer registered after it parks on that
+    /// materialize gate. Joining that materializer while holding the session
+    /// gate never returns. The `Fsync` permit then keeps later materializers
+    /// out of the strict pass, like the flush and fsync barriers.
+    ///
+    /// A materializer registered after the join, for example by the periodic
+    /// worker that sees the bytes this write just recorded, can still win the
+    /// materialize gate. Interrupt its linger so the strict write waits only
+    /// for its drain.
+    async fn enter_write_path_durability_session(
+        &self,
+        ino: Ino,
+        session: &mut Option<super::file_session::FileSessionPermit>,
+    ) {
+        drop(session.take());
+        self.wait_for_deferred_materialization_inflight(ino).await;
+        let materialize_interrupt = self
+            .state
+            .deferred_materialize_inflight
+            .request_interrupt(ino);
+        *session = Some(
+            self.state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Fsync)
+                .await,
+        );
+        drop(materialize_interrupt);
+    }
+
     pub(super) async fn wait_for_deferred_release_inflight(&self, ino: Ino) {
         self.state.deferred_release_inflight.wait(ino).await;
     }
@@ -1705,11 +1739,12 @@ impl StudioVfs {
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
         let _sync_safety_activity = self.state.sync_safety_activity.begin();
-        let session = self
-            .state
-            .file_session
-            .enter_op(ino, FileSessionOperation::Write)
-            .await;
+        let mut session = Some(
+            self.state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Write)
+                .await,
+        );
         let open_file = self.enforce_mutating_handle_access(fh, ino).ok();
         let _ = self.state.read.observe_write_access(
             open_file.as_ref(),
@@ -1745,7 +1780,8 @@ impl StudioVfs {
 
             if local_sync_policy.requires_write_path_durability() {
                 drain_after_write = true;
-                self.wait_for_deferred_materialization_inflight(ino).await;
+                self.enter_write_path_durability_session(ino, &mut session)
+                    .await;
                 let materialize_strict_started = Instant::now();
                 // This starts with the target inode, then only drains other dirty
                 // inodes when the global dirty budget still requires it. Using it
@@ -2011,7 +2047,8 @@ impl StudioVfs {
             }
             (Ok(_), policy) if policy.requires_write_path_durability() => {
                 // Durability-required: await writer-stack materialization inline.
-                self.wait_for_deferred_materialization_inflight(ino).await;
+                self.enter_write_path_durability_session(ino, &mut session)
+                    .await;
                 let materialize_strict_started = Instant::now();
                 let materialized_bytes = match self.materialize_writer_stack_for_limits(ino).await {
                     Ok(materialized_bytes) => materialized_bytes,
