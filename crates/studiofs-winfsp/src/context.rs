@@ -4575,7 +4575,11 @@ mod tests {
         );
         assert_ne!(security.attributes & super::FILE_ATTRIBUTE_REPARSE_POINT, 0);
         assert!(security.sz_security_descriptor > 0);
+    }
 
+    #[test]
+    fn get_security_by_name_returns_resolver_result_without_lookup() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("resolver-security-passthrough");
         let missing = U16CString::from_str("\\missing\\child").expect("u16 path");
         let security = <StudioFsContext as FileSystemContext>::get_security_by_name(
             &ctx,
@@ -4593,6 +4597,32 @@ mod tests {
         assert!(security.reparse);
         assert_eq!(security.attributes, 7);
         assert_eq!(security.sz_security_descriptor, 0);
+    }
+
+    #[test]
+    fn cleanup_delete_removes_dangling_symlink() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("dangling-symlink-delete");
+        let link = vfs
+            .symlink(ROOT_INO, b"dangling", b"missing", 0, 0)
+            .expect("create dangling symlink");
+        let handle = StudioFileHandle::new(link.ino, false, 0, OpenFlags::RDWR);
+        let file_name = U16CString::from_str(r"\dangling").expect("u16 path");
+
+        <StudioFsContext as FileSystemContext>::set_delete(
+            &ctx,
+            &handle,
+            file_name.as_ucstr(),
+            true,
+        )
+        .expect("delete precheck");
+        <StudioFsContext as FileSystemContext>::cleanup(
+            &ctx,
+            &handle,
+            Some(file_name.as_ucstr()),
+            0x01,
+        );
+
+        assert!(vfs.meta().lookup(ROOT_INO, b"dangling").is_err());
     }
 
     #[test]
