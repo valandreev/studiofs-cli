@@ -297,6 +297,7 @@ Serving rules are:
 Events that stay local-only are not published as remote-visible deltas:
 - local regular-file overlay graph staging (`StageRegularFileOverlaySlices` and upload-state marks)
 - pending deletion churn
+- `RemoveLocalEntry`, the exact local name removed when canceling an unpublished version; peers retain the previous published version. The local journal uses tag 18 (retired snapshot tags 16/17 remain reserved). Older binaries cannot read a journal containing tag 18, so use the updated binary when reopening that local state. This event never enters the PostgreSQL event stream.
 - local regular-file `size` ahead of `committed_size`
 
 Operational note:

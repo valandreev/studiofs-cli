@@ -13692,7 +13692,7 @@ fn test_offset_within_block() {
 #[test]
 fn test_sticky_upload_error_is_deterministic_across_sync_points() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-upload-error");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sticky-upload-error");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs.create(1, b"sticky.txt", 0, 0, 0o644).unwrap();
@@ -13731,7 +13731,7 @@ fn test_sticky_upload_error_is_deterministic_across_sync_points() {
 #[test]
 fn test_fsync_reports_sticky_error_after_persisting_current_changes() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-fsync-order");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sticky-fsync-order");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs.create(1, b"sticky-fsync.txt", 0, 0, 0o644).unwrap();
@@ -13767,7 +13767,8 @@ fn test_fsync_reports_sticky_error_after_persisting_current_changes() {
 #[test]
 fn test_release_fh_reports_sticky_error_after_persisting_current_changes() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sticky-release-order");
+    // Keep background persistence/recovery from clearing the state this close must drain.
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sticky-release-order");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs.create(1, b"sticky-release.txt", 0, 0, 0o644).unwrap();
@@ -13776,6 +13777,10 @@ fn test_release_fh_reports_sticky_error_after_persisting_current_changes() {
         let payload = b"persist-before-release-sticky-report";
 
         vfs.write(ino, 0, payload).await.unwrap();
+        assert!(
+            vfs.inode_has_local_dirty_state(ino),
+            "release must own the pending local-state drain"
+        );
         vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
 
         let release_err = vfs.release_fh(fh).await.unwrap_err();

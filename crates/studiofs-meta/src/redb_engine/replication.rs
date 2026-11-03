@@ -100,7 +100,9 @@ impl LocalDentryMutationReducer {
         use crate::events::MetaEvent;
 
         match event {
-            MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
+            MetaEvent::AddEntry { parent, name, .. }
+            | MetaEvent::RemoveEntry { parent, name }
+            | MetaEvent::RemoveLocalEntry { parent, name } => {
                 self.load_key_from_table(table, &encode_dentry_key(*parent, name))?;
             }
             MetaEvent::RenameEntry {
@@ -147,7 +149,8 @@ impl LocalDentryMutationReducer {
                 self.touched.insert(key.clone());
                 self.states.insert(key, LocalDentryMutation::Created);
             }
-            MetaEvent::RemoveEntry { parent, name } => {
+            MetaEvent::RemoveEntry { parent, name }
+            | MetaEvent::RemoveLocalEntry { parent, name } => {
                 let key = encode_dentry_key(*parent, name);
                 self.touched.insert(key.clone());
                 if self.states.remove(&key) != Some(LocalDentryMutation::Created) {
@@ -194,7 +197,8 @@ impl LocalDentryMutationReducer {
                 self.retained_created.insert(key.clone());
                 self.states.insert(key, LocalDentryMutation::Created);
             }
-            MetaEvent::RemoveEntry { parent, name } => {
+            MetaEvent::RemoveEntry { parent, name }
+            | MetaEvent::RemoveLocalEntry { parent, name } => {
                 let key = encode_dentry_key(*parent, name);
                 self.loaded.insert(key.clone());
                 if self.retained_created.remove(&key) {
@@ -317,7 +321,8 @@ impl PendingLocalAliases {
                 name,
                 entry,
             } => self.insert(Self::identity(entry), encode_dentry_key(*parent, name)),
-            MetaEvent::RemoveEntry { parent, name } => {
+            MetaEvent::RemoveEntry { parent, name }
+            | MetaEvent::RemoveLocalEntry { parent, name } => {
                 let key = encode_dentry_key(*parent, name);
                 for identity in self.entries_by_key.remove(&key).unwrap_or_default() {
                     if let Some(keys) = self.by_entry.get_mut(&identity) {
@@ -699,7 +704,8 @@ impl RedbMetaEngine {
                 Self::invalidate_replica_entry(txn, *parent, name, Some(entry.ino))?;
                 Self::invalidate_replica_inode(txn, entry.ino, false)?;
             }
-            MetaEvent::RemoveEntry { parent, name } => {
+            MetaEvent::RemoveEntry { parent, name }
+            | MetaEvent::RemoveLocalEntry { parent, name } => {
                 Self::invalidate_replica_entry(txn, *parent, name, None)?
             }
             MetaEvent::RenameEntry {
@@ -1245,7 +1251,8 @@ impl RedbMetaEngine {
                     Self::clear_regular_file_graph_in_txn(txn, *ino)?;
                 }
                 crate::events::MetaEvent::AddEntry { .. } => {}
-                crate::events::MetaEvent::RemoveEntry { .. } => {}
+                crate::events::MetaEvent::RemoveEntry { .. }
+                | crate::events::MetaEvent::RemoveLocalEntry { .. } => {}
                 crate::events::MetaEvent::RenameEntry { .. } => {}
                 crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
                     for (chunk_id, slices) in chunk_slices {
@@ -1442,6 +1449,7 @@ impl RedbMetaEngine {
                 } => {
                     Self::set_base_dentry_in_txn(txn, *parent, name, entry)?;
                 }
+                crate::events::MetaEvent::RemoveLocalEntry { .. } => {}
                 crate::events::MetaEvent::RemoveEntry { parent, name } => {
                     Self::remove_base_dentry_in_txn(txn, *parent, name)?;
                 }
@@ -1671,7 +1679,9 @@ impl RedbMetaEngine {
             MetaEvent::AddEntry { parent, entry, .. } => {
                 (!tombstoned(*parent)? && !tombstoned(entry.ino)?).then_some(Cow::Borrowed(event))
             }
-            MetaEvent::RemoveEntry { parent, .. } => single(*parent)?,
+            MetaEvent::RemoveEntry { parent, .. } | MetaEvent::RemoveLocalEntry { parent, .. } => {
+                single(*parent)?
+            }
             MetaEvent::RenameEntry {
                 parent,
                 new_parent,
@@ -1964,7 +1974,8 @@ impl RedbMetaEngine {
                 } => {
                     Self::set_dentry_in_txn(txn, *parent, name, entry)?;
                 }
-                crate::events::MetaEvent::RemoveEntry { parent, name } => {
+                crate::events::MetaEvent::RemoveEntry { parent, name }
+                | crate::events::MetaEvent::RemoveLocalEntry { parent, name } => {
                     Self::remove_dentry_overlay_in_txn(txn, *parent, name)?;
                 }
                 crate::events::MetaEvent::RenameEntry {
@@ -2243,7 +2254,8 @@ impl RedbMetaEngine {
                     scope.inodes.extend([*parent, entry.ino]);
                     scope.dentry_keys.insert(encode_dentry_key(*parent, name));
                 }
-                MetaEvent::RemoveEntry { parent, name } => {
+                MetaEvent::RemoveEntry { parent, name }
+                | MetaEvent::RemoveLocalEntry { parent, name } => {
                     scope.inodes.insert(*parent);
                     scope.dentry_keys.insert(encode_dentry_key(*parent, name));
                 }
@@ -2386,10 +2398,19 @@ impl RedbMetaEngine {
             let serving_entry =
                 Self::lookup_exact_in_write_table(txn, DENTRIES_TABLE, parent, name)?;
             let binding_before = Self::invalidation_binding(txn, key)?;
+            let locally_deleted = match &base_entry {
+                Some(entry) => {
+                    Self::get_inode_lifecycle_in_write_txn(txn, entry.ino)?.is_some_and(|record| {
+                        record.state == InodeLifecycleState::DeletedBeforePublish
+                    })
+                }
+                None => false,
+            };
             // Most keys already serve their base binding, so write first and
             // derive intents only for a binding that actually changed; they
             // match what journaling before the write would have recorded.
             txn.without_invalidations(|| match &base_entry {
+                Some(_) if locally_deleted => Self::remove_dentry_overlay_in_txn(txn, parent, name),
                 Some(entry) => Self::set_dentry_in_txn(txn, parent, name, entry),
                 None => Self::remove_dentry_mirror_in_txn(txn, parent, name),
             })?;
@@ -2686,7 +2707,8 @@ impl RedbMetaEngine {
                 } => {
                     bindings.insert(encode_dentry_key(*parent, name), Some(entry.clone()));
                 }
-                MetaEvent::RemoveEntry { parent, name } => {
+                MetaEvent::RemoveEntry { parent, name }
+                | MetaEvent::RemoveLocalEntry { parent, name } => {
                     bindings.insert(encode_dentry_key(*parent, name), None);
                 }
                 MetaEvent::RenameEntry {

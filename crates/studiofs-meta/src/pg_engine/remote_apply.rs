@@ -363,6 +363,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         !matches!(
             event,
             MetaEvent::SetRegularFileOverlaySlices { .. }
+                | MetaEvent::RemoveLocalEntry { .. }
                 | MetaEvent::RemoveRegularFileGraph { .. }
                 | MetaEvent::AddPendingDeletion { .. }
                 | MetaEvent::RemovePendingDeletion { .. }
@@ -621,6 +622,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::RemoveAttr { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RemoveLocalEntry { .. }
             | MetaEvent::RenameEntry { .. } => false,
             MetaEvent::PublishRegularFileBaseSlices { .. } => true,
             MetaEvent::SetSymlinkTarget { .. }
@@ -697,7 +699,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 overlay.symlink_inodes.insert(*ino);
                 overlay.xattr_inodes.insert(*ino);
             }
-            MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
+            MetaEvent::AddEntry { parent, name, .. }
+            | MetaEvent::RemoveEntry { parent, name }
+            | MetaEvent::RemoveLocalEntry { parent, name } => {
                 overlay.dentry_keys.insert(encode_dentry_key(*parent, name));
             }
             MetaEvent::RenameEntry {
@@ -865,6 +869,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RemoveLocalEntry { .. }
             | MetaEvent::RenameEntry { .. } => false,
         }
     }
@@ -920,6 +925,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             MetaEvent::SetAttr { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RemoveLocalEntry { .. }
             | MetaEvent::RenameEntry { .. }
             | MetaEvent::AddPendingDeletion { .. }
             | MetaEvent::RemovePendingDeletion { .. } => false,
@@ -950,11 +956,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     || overlay.symlink_inodes.contains(ino)
                     || overlay.xattr_inodes.contains(ino)
             }
-            MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
-                overlay
-                    .dentry_keys
-                    .contains(&encode_dentry_key(*parent, name))
-            }
+            MetaEvent::AddEntry { parent, name, .. }
+            | MetaEvent::RemoveEntry { parent, name }
+            | MetaEvent::RemoveLocalEntry { parent, name } => overlay
+                .dentry_keys
+                .contains(&encode_dentry_key(*parent, name)),
             MetaEvent::RenameEntry { .. } => false,
             MetaEvent::SetSymlinkTarget { ino, .. } => {
                 overlay.block_inodes.contains(ino)
@@ -1037,7 +1043,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let mut removed = HashSet::new();
         for event in batch_events {
             match event {
-                MetaEvent::RemoveEntry { parent, name } => {
+                MetaEvent::RemoveEntry { parent, name }
+                | MetaEvent::RemoveLocalEntry { parent, name } => {
                     if let Ok(Some(entry)) =
                         RedbMetaEngine::lookup_merged_in_write_txn(txn, *parent, name)
                     {
@@ -1068,12 +1075,24 @@ impl<'a> RemoteApplyCoordinator<'a> {
         txn: &RedbWriteTransaction<'_>,
         ino: Ino,
     ) -> MetaResult<bool> {
+        self.local_regular_file_state_protection_in_txn(txn, ino, true)
+    }
+
+    fn local_regular_file_state_protection_in_txn(
+        &self,
+        txn: &RedbWriteTransaction<'_>,
+        ino: Ino,
+        protect_local_deletion: bool,
+    ) -> MetaResult<bool> {
         if RedbMetaEngine::has_local_regular_file_overlay_in_write_txn(txn, ino)? {
             return Ok(true);
         }
         let Some(lifecycle) = RedbMetaEngine::get_inode_lifecycle_in_write_txn(txn, ino)? else {
             return Ok(false);
         };
+        if protect_local_deletion && lifecycle.state == InodeLifecycleState::DeletedBeforePublish {
+            return Ok(true);
+        }
         if lifecycle.state == InodeLifecycleState::Published {
             return Ok(false);
         }
@@ -1097,7 +1116,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
         txn: &RedbWriteTransaction<'_>,
         ino: Ino,
     ) -> MetaResult<bool> {
-        self.local_regular_file_state_needs_foreign_protection_in_txn(txn, ino)
+        // A peer removing the inode agrees with a local deletion; only live local state wins.
+        self.local_regular_file_state_protection_in_txn(txn, ino, false)
     }
 
     #[cfg(test)]
@@ -1137,7 +1157,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 }
                 MetaEvent::PublishRegularFileBaseSlices { ino, .. }
                 | MetaEvent::RemoveRegularFileGraph { ino } => *ino,
-                MetaEvent::RemoveEntry { parent, name } => {
+                MetaEvent::RemoveEntry { parent, name }
+                | MetaEvent::RemoveLocalEntry { parent, name } => {
                     let Ok(Some(entry)) =
                         RedbMetaEngine::lookup_merged_in_write_txn(txn, *parent, name)
                     else {
@@ -1210,6 +1231,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
             && attr.upload_state != UploadState::Ready
             && (attr.size <= attr.committed_size || attr.committed_size == 0)
             && RedbMetaEngine::has_local_regular_file_overlay_in_write_txn(txn, ino)?)
+    }
+
+    fn local_regular_file_namespace_is_unpublished_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        ino: Ino,
+    ) -> MetaResult<bool> {
+        Ok(
+            RedbMetaEngine::get_inode_lifecycle_in_write_txn(txn, ino)?.is_some_and(|lifecycle| {
+                !lifecycle.has_published_base
+                    && lifecycle.state != InodeLifecycleState::DeletedBeforePublish
+            }),
+        )
     }
 
     fn grandfather_removed_local_regular_file_attrs_in_txn(
@@ -2462,7 +2495,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 continue;
             };
             if entry.kind == FileType::RegularFile
-                && RedbMetaEngine::has_local_regular_file_overlay_in_write_txn(txn, entry.ino)?
+                && (RedbMetaEngine::has_local_regular_file_overlay_in_write_txn(txn, entry.ino)?
+                    || Self::local_regular_file_namespace_is_unpublished_in_txn(txn, entry.ino)?)
             {
                 protected_dentry_keys.insert(key.clone());
             }
@@ -2531,7 +2565,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         context.next_event_seq = replay_next_event_seq;
         let mut overlay = std::mem::take(&mut context.initial_overlay);
         Self::extend_overlay_conflicts(&mut overlay, &appended_overlay);
-        let mut completed_bindings = HashMap::new();
+        let mut protected_local_bindings = HashMap::new();
         if !self.local_only_completed.is_empty() {
             let mut events = Vec::new();
             for range in &self.local_only_completed {
@@ -2549,14 +2583,14 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 if entry.is_some()
                     && RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)? == entry
                 {
-                    completed_bindings.insert(key, entry);
+                    protected_local_bindings.insert(key, entry);
                 }
             }
         }
         // Served local-only names are local authority in every page, not only self pages.
         overlay
             .dentry_keys
-            .extend(completed_bindings.keys().cloned());
+            .extend(protected_local_bindings.keys().cloned());
         let mut applied_any = false;
         let mut max_version = context.last_seq;
         let mut max_namespace_version = context.current_namespace_version;
@@ -2592,10 +2626,28 @@ impl<'a> RemoteApplyCoordinator<'a> {
             // Raw events still match the local journal; appliers see the merged namespace.
             let events = RedbMetaEngine::canonicalize_replay_batch_in_txn(txn, &batch.events)?;
             let rewritten = matches!(events, Cow::Owned(_)).then_some(&events[..]);
+            let mut touched_keys = HashSet::new();
             for events in std::iter::once(&batch.events[..]).chain(rewritten) {
                 Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, events);
-                Self::collect_replay_reconcile_dentries(txn, &mut reconcile_dentry_keys, events)?;
+                Self::collect_replay_reconcile_dentries(txn, &mut touched_keys, events)?;
             }
+            // Hidden names outlive the journal cursor. Capture actual local
+            // ownership after alias resolution and before this batch can erase it.
+            for key in &touched_keys {
+                if let Some(execution) = execution {
+                    execution.check()?;
+                }
+                let (parent, name) = decode_dentry_key(key)?;
+                if let Some(entry) =
+                    RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)?
+                    && entry.kind == FileType::RegularFile
+                    && Self::local_regular_file_namespace_is_unpublished_in_txn(txn, entry.ino)?
+                {
+                    overlay.dentry_keys.insert(key.clone());
+                    protected_local_bindings.insert(key.clone(), Some(entry));
+                }
+            }
+            reconcile_dentry_keys.extend(touched_keys);
             if batch.is_self_batch {
                 applied_any |= self.apply_visible_self_batch_in_txn(txn, &events)?;
                 applied_self_batch = true;
@@ -2656,7 +2708,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 )?;
                 overlay
                     .dentry_keys
-                    .extend(completed_bindings.keys().cloned());
+                    .extend(protected_local_bindings.keys().cloned());
                 if batch.is_self_batch {
                     Self::clear_resolved_self_regular_file_protection(
                         &mut replay_protected_overlay,
@@ -2695,9 +2747,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
             .filter_map(|(index, event)| included(index).then_some(event))
             .collect::<Vec<_>>();
             let mut state = RedbMetaEngine::pending_local_namespace_bindings_in_txn(txn, &events)?;
-            // A still-served completed binding is the journal's final state for its key,
-            // so it outranks older included events such as an unreplayed rename source.
-            state.bindings.extend(completed_bindings);
+            // Captured local-only bindings outrank older included events such as
+            // an unreplayed rename source, even after their journal events are acked.
+            state.bindings.extend(protected_local_bindings);
             final_overlay
                 .dentry_keys
                 .extend(state.bindings.keys().cloned());
@@ -2802,14 +2854,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
         if local_version < recent_flush.batch_version {
             return Ok(false);
         }
-        let mut reconcile_inodes = recent_flush.overlay.attr_inodes.clone();
-        reconcile_inodes.extend(recent_flush.overlay.block_inodes.iter().copied());
-        let mut changed =
-            self.reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, overlay)?;
-        changed |= self.reconcile_serving_dentries_from_base_with_overlay(
+        // Replay reconciles inode state transactionally; rename conflict keys can
+        // also name a local inode whose attr was hidden from the published batch.
+        self.reconcile_serving_dentries_from_base_with_overlay(
             &recent_flush.overlay.dentry_keys,
             overlay,
-        )?;
-        Ok(changed)
+        )
     }
 }

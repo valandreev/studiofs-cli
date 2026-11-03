@@ -3026,9 +3026,8 @@ fn foreign_unlink_during_unpublished_local_uploading_preserves_writer_dentry() {
 fn recent_flush_dentry_reconcile_applies_deferred_foreign_base_entry() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
-    let local_file = pg
-        .create_file(ROOT_INO, b"slot.txt", 0, 0, 0o644)
-        .expect("create local slot");
+    // Acknowledgement can release a published file, never a private empty draft.
+    let local_file = create_published_small_file(&pg, ROOT_INO, b"slot.txt", 91_100);
     let local_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("local end");
     let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
     let slot_key = encode_dentry_key(ROOT_INO, b"slot.txt");
@@ -5183,7 +5182,325 @@ fn publish_without_ready_attr_preserves_protected_base_graph() {
 }
 
 #[test]
-fn recent_flush_reconcile_resets_stale_regular_file_serving_attr() {
+fn unpublished_name_protection_uses_canonical_parents() {
+    for merge_in_page in [false, true] {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let (canonical, alias) = (ROOT_INO + 9_500, ROOT_INO + 9_600);
+        replay_foreign_page(&pg, 1, create_dir_events(canonical, ROOT_INO, b"merged"));
+        if !merge_in_page {
+            replay_foreign_page(&pg, 2, create_dir_events(alias, ROOT_INO, b"merged"));
+        }
+        let draft = pg.create_file(canonical, b"private", 0, 0, 0o644).unwrap();
+        let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+        pg.persist_flushed_event_seq(end).unwrap();
+        let mut batches = Vec::new();
+        if merge_in_page {
+            batches.push(DecodedReplayBatch {
+                batch_version: 2,
+                is_self_batch: false,
+                events: create_dir_events(alias, ROOT_INO, b"merged"),
+            });
+        }
+        batches.push(DecodedReplayBatch {
+            batch_version: 3,
+            is_self_batch: false,
+            events: create_dir_events(ROOT_INO + 9_601, alias, b"private"),
+        });
+        pg.apply_replay_page_atomically(
+            batches,
+            None,
+            RemoteReplayApplyContext {
+                last_seq: if merge_in_page { 1 } else { 2 },
+                current_namespace_version: 1,
+                flushed_event_seq: end,
+                next_event_seq: end,
+                initial_overlay: pg.local_overlay_conflicts().unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            pg.lookup(canonical, b"private")
+                .expect("canonical private binding")
+                .ino,
+            draft.ino,
+            "alias rewrite must preserve local ownership, merge_in_page={merge_in_page}"
+        );
+    }
+}
+
+#[test]
+fn acknowledged_unpublished_namespace_stays_local_until_publication() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let draft = pg
+        .create_file(ROOT_INO, b"local-only", 0, 0, 0o644)
+        .unwrap();
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    pg.create_dir(ROOT_INO, b"visible-anchor", 0, 0, 0o755)
+        .unwrap();
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events = pg.local.read_events_range(start, end).unwrap();
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: projected.events,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq: start,
+            next_event_seq: end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), end);
+
+    let recent = RecentFlush {
+        batch_version: 1,
+        overlay: OverlayConflictSets {
+            dentry_keys: HashSet::from([encode_dentry_key(ROOT_INO, b"local-only")]),
+            ..OverlayConflictSets::default()
+        },
+    };
+    RemoteApplyCoordinator::new(&pg.local)
+        .reconcile_recent_flush(Some(&recent), 1, &pg.local_overlay_conflicts().unwrap())
+        .unwrap();
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"local-only")
+            .expect("post-pull keeps private name")
+            .ino,
+        draft.ino
+    );
+
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 2,
+            is_self_batch: false,
+            events: vec![
+                MetaEvent::SetAttr {
+                    attr: InodeAttr::new_dir(88_401, ROOT_INO, 0, 0, 0o755),
+                },
+                MetaEvent::AddEntry {
+                    parent: ROOT_INO,
+                    name: b"local-only".to_vec(),
+                    entry: DirEntryValue {
+                        ino: 88_401,
+                        kind: FileType::Directory,
+                    },
+                },
+            ],
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 1,
+            current_namespace_version: 1,
+            flushed_event_seq: end,
+            next_event_seq: end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"local-only")
+            .expect("next page keeps private name")
+            .ino,
+        draft.ino
+    );
+
+    set_file_state(&pg, draft.ino, 64, 1);
+    pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(77_403, 64))
+        .unwrap();
+    mark_overlay_objects_uploaded(&pg, draft.ino, 1, &[77_403]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(draft.ino, 1)
+            .unwrap()
+    );
+    let publish_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events = pg.local.read_events_range(end, publish_end).unwrap();
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    let range = LocalEventRange {
+        start: end,
+        end: publish_end,
+    };
+    pg.mark_local_event_ranges_published_with_prefix(&[range], Some((3, vec![range])))
+        .unwrap();
+    pg.apply_replay_page_atomically(
+        vec![
+            DecodedReplayBatch {
+                batch_version: 3,
+                events: projected.events,
+                is_self_batch: true,
+            },
+            DecodedReplayBatch {
+                batch_version: 4,
+                events: vec![
+                    MetaEvent::RemoveEntry {
+                        parent: ROOT_INO,
+                        name: b"local-only".to_vec(),
+                    },
+                    MetaEvent::RemoveAttr { ino: draft.ino },
+                ],
+                is_self_batch: false,
+            },
+        ],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 2,
+            current_namespace_version: 2,
+            flushed_event_seq: end,
+            next_event_seq: publish_end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            pg.lookup(ROOT_INO, b"local-only"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "published names must follow a later foreign unlink, even in the same page"
+    );
+}
+
+#[test]
+fn self_ack_preserves_recreated_draft_hidden_inside_published_batch() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start).expect("ack setup");
+    create_published_small_file(&pg, ROOT_INO, b"NEWPCB.PPT", 77_402);
+    pg.rename_atomic(
+        ROOT_INO,
+        b"NEWPCB.PPT",
+        ROOT_INO,
+        b"PPTC402.TMP",
+        true,
+        false,
+    )
+    .expect("rename old version");
+    let draft = pg
+        .create_file(ROOT_INO, b"NEWPCB.PPT", 0, 0, 0o644)
+        .expect("recreate source");
+    pg.create_dir(ROOT_INO, b"other-client-visible-op", 0, 0, 0o755)
+        .expect("visible trailing operation");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+    let events = pg.local.read_events_range(start, end).expect("batch");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    assert!(
+        !projected.events.iter().any(|event| matches!(event,
+            MetaEvent::AddEntry { entry, .. } if entry.ino == draft.ino
+        )),
+        "new draft must stay private"
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&events, &projected.events, None)
+            .expect("match actual publication prefix"),
+        Some(events.len()),
+        "the trailing visible operation makes self ack consume the hidden draft"
+    );
+    let range = LocalEventRange { start, end };
+    pg.mark_local_event_ranges_published_with_prefix(&[range], Some((1, vec![range])))
+        .expect("publish projected batch");
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: projected.events,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq: start,
+            next_event_seq: end,
+            initial_overlay: pg.local_overlay_conflicts().expect("overlay"),
+        },
+    )
+    .expect("self replay");
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"NEWPCB.PPT")
+            .expect("hidden draft after self ack")
+            .ino,
+        draft.ino
+    );
+}
+
+#[test]
+fn hidden_uploading_rename_survives_recent_flush_reconciliation() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start).expect("ack setup");
+    let file = pg
+        .create_file(ROOT_INO, b"NEWTIPS.PPT", 0, 0, 0o644)
+        .expect("create");
+    set_file_state(&pg, file.ino, 4096, 1);
+    pg.rename_atomic(
+        ROOT_INO,
+        b"NEWTIPS.PPT",
+        ROOT_INO,
+        b"PPTC241.TMP",
+        true,
+        false,
+    )
+    .expect("rename uploading file");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+    let events = pg
+        .local
+        .read_events_range(start, end)
+        .expect("local events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    assert!(
+        !projected.events.iter().any(|event| matches!(event,
+            MetaEvent::SetAttr { attr } if attr.ino == file.ino
+        )),
+        "uploading inode must remain absent from the remote base"
+    );
+    pg.mark_local_event_ranges_published(&[LocalEventRange { start, end }])
+        .expect("mark published");
+    let recent = RecentFlush {
+        batch_version: 1,
+        overlay: projected.overlay,
+    };
+    apply_self_replay(
+        &pg,
+        projected.events,
+        start,
+        end,
+        pg.local_overlay_conflicts().expect("overlay"),
+    );
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"PPTC241.TMP")
+            .expect("name after replay")
+            .ino,
+        file.ino
+    );
+    pg.persist_local_version(1).expect("replay position");
+    let overlay = pg
+        .local_overlay_conflicts()
+        .expect("overlay before publication");
+    let mut ready = pg.get_attr(file.ino).expect("uploading attrs");
+    ready.committed_size = ready.size;
+    ready.committed_content_epoch = ready.content_epoch;
+    ready.upload_state = UploadState::Ready;
+    // Publication may commit after the post-pull pass samples journal protection.
+    pg.set_attr(&ready).expect("finish local publication");
+    RemoteApplyCoordinator::new(&pg.local)
+        .reconcile_recent_flush(Some(&recent), 1, &overlay)
+        .expect("recent flush reconcile");
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"PPTC241.TMP")
+            .expect("name after recent flush")
+            .ino,
+        file.ino
+    );
+    pg.unlink(ROOT_INO, b"PPTC241.TMP")
+        .expect("unlink successful rename destination");
+}
+
+#[test]
+fn replay_reconcile_resets_stale_regular_file_serving_attr() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg
         .create_file(ROOT_INO, b"recent-flush-stale-serving.txt", 0, 0, 0o644)
@@ -5213,17 +5530,9 @@ fn recent_flush_reconcile_resets_stale_regular_file_serving_attr() {
     remote_attr.content_epoch = 4;
     remote_attr.committed_content_epoch = 4;
     remote_attr.upload_state = UploadState::Ready;
-    pg.local
-        .apply_replica_events_to_base(&[MetaEvent::SetAttr {
-            attr: remote_attr.clone(),
-        }])
-        .expect("apply authoritative base attr");
-    pg.persist_local_version(7).expect("catch up local version");
-
     assert_eq!(
         pg.get_attr(file.ino).expect("load stale serving attr").size,
-        227,
-        "flushed local serving attr can remain stale after base advances"
+        227
     );
 
     let recent_flush = RecentFlush {
@@ -5232,12 +5541,29 @@ fn recent_flush_reconcile_resets_stale_regular_file_serving_attr() {
             &RemoteApplyCoordinator::project_remote_events(&local_events),
         ),
     };
-    reconcile_recent_flush_regular_files(&pg, Some(&recent_flush)).expect("reconcile recent flush");
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 7,
+            is_self_batch: false,
+            events: vec![MetaEvent::SetAttr {
+                attr: remote_attr.clone(),
+            }],
+        }],
+        Some(&recent_flush),
+        RemoteReplayApplyContext {
+            last_seq: 6,
+            current_namespace_version: 6,
+            flushed_event_seq: events_end,
+            next_event_seq: events_end,
+            initial_overlay: pg.local_overlay_conflicts().expect("overlay"),
+        },
+    )
+    .expect("replay authoritative base attr");
 
     assert_eq!(
         pg.get_attr(file.ino).expect("load reconciled attr").size,
         remote_attr.size,
-        "recent-flush reconciliation must reset stale regular-file serving attrs from base"
+        "transactional replay must reset stale regular-file serving attrs from base"
     );
 }
 
@@ -5542,6 +5868,69 @@ fn unit_remote_projection_keeps_published_file_visible_when_unpublished_epoch_is
             .iter()
             .all(|(object_id, _timestamp)| *object_id != 904),
         "last published object must remain referenced"
+    );
+    let pending = writer
+        .local
+        .read_events_range(upload_start, delete_end)
+        .expect("pending rollback");
+    apply_self_replay(
+        &writer,
+        RemoteApplyCoordinator::project_local_batch(&pending).events,
+        upload_start,
+        delete_end,
+        writer.local_overlay_conflicts().expect("rollback overlay"),
+    );
+    writer
+        .local
+        .apply_replica_serving_state_for_pending_replay(&pending)
+        .expect("pending rollback replay");
+    assert!(
+        matches!(
+            writer.lookup(dir.ino, b"final.bin"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "rollback echo and pending replay must preserve the local unlink"
+    );
+    let mut replacement = remote_attr;
+    replacement.ino += 100;
+    replacement.size = 0;
+    replacement.committed_size = 0;
+    apply_foreign_batch(
+        &writer,
+        &[
+            MetaEvent::SetAttr {
+                attr: replacement.clone(),
+            },
+            MetaEvent::PublishRegularFileBaseSlices {
+                ino: replacement.ino,
+                chunk_slices: vec![],
+            },
+            MetaEvent::AddEntry {
+                parent: dir.ino,
+                name: b"final.bin".to_vec(),
+                entry: DirEntryValue {
+                    ino: replacement.ino,
+                    kind: FileType::RegularFile,
+                },
+            },
+        ],
+        &OverlayConflictSets::default(),
+        &HashSet::new(),
+    )
+    .expect("foreign replacement");
+    RemoteApplyCoordinator::new(&writer.local)
+        .reconcile_serving_dentries_from_base_with_overlay(
+            &HashSet::from([encode_dentry_key(dir.ino, b"final.bin")]),
+            &OverlayConflictSets::default(),
+        )
+        .expect("reconcile foreign replacement");
+    assert_eq!(
+        writer
+            .lookup(dir.ino, b"final.bin")
+            .expect("foreign replacement stays visible")
+            .ino,
+        replacement.ino,
+        "local deletion authority must not hide a different foreign inode"
     );
 }
 
@@ -8888,6 +9277,258 @@ fn self_ack_of_local_create_preserves_later_rename_source_and_destination() {
             .ino,
         file.ino
     );
+}
+
+#[test]
+fn self_replay_of_rename_away_keeps_recreated_source_and_unlinked_destination() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let old = pg
+        .create_file(ROOT_INO, b"NEWTIPS.PPT", 0, 0, 0o644)
+        .expect("create local file");
+    let mut attr = pg.get_attr(old.ino).expect("load local attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make local file publishable");
+    pg.rename_atomic(
+        ROOT_INO,
+        b"NEWTIPS.PPT",
+        ROOT_INO,
+        b"PPTC241.TMP",
+        true,
+        false,
+    )
+    .expect("rename away locally");
+    let prefix_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("prefix end");
+    let prefix_events = pg
+        .local
+        .read_events_range(start, prefix_end)
+        .expect("read published prefix");
+    let published = RemoteApplyCoordinator::project_local_batch(&prefix_events).events;
+    assert!(
+        published
+            .iter()
+            .any(|event| matches!(event, MetaEvent::RenameEntry { .. })),
+        "published prefix must carry the rename: {published:?}"
+    );
+
+    let recreated = pg
+        .create_file(ROOT_INO, b"NEWTIPS.PPT", 0, 0, 0o644)
+        .expect("recreate source name locally");
+    pg.unlink(ROOT_INO, b"PPTC241.TMP")
+        .expect("unlink rename destination locally");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("suffix end");
+    let overlay = pg.local_overlay_conflicts().expect("local suffix overlay");
+
+    apply_self_replay(&pg, published, start, end, overlay);
+
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, b"NEWTIPS.PPT")
+            .expect("recreated source name must survive its own rename echo")
+            .ino,
+        recreated.ino
+    );
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"PPTC241.TMP"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "the echo must not resurrect a destination unlinked locally"
+    );
+}
+
+#[test]
+fn pending_replay_of_local_unlink_hides_echoed_rename_destination() {
+    assert_local_unlink_hides_echoed_destination(false);
+}
+
+#[test]
+fn pending_replay_of_open_unlink_write_and_close_hides_echoed_rename_destination() {
+    assert_local_unlink_hides_echoed_destination(true);
+}
+
+fn assert_local_unlink_hides_echoed_destination(open_handle: bool) {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let file = pg
+        .create_file(ROOT_INO, b"NEWTIPS.PPT", 0, 0, 0o644)
+        .expect("create local file");
+    let mut attr = pg.get_attr(file.ino).expect("load local attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make local file publishable");
+    // Canceling this overlay retains the committed version for peers, while
+    // the local journal must also retain the namespace removal.
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_033, 1))
+        .expect("stage unpublished overlay slice");
+    pg.rename_atomic(
+        ROOT_INO,
+        b"NEWTIPS.PPT",
+        ROOT_INO,
+        b"PPTC321.TMP",
+        true,
+        false,
+    )
+    .expect("rename away locally");
+    let prefix_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("prefix end");
+    let prefix_events = pg
+        .local
+        .read_events_range(start, prefix_end)
+        .expect("read published prefix");
+    let published = RemoteApplyCoordinator::project_local_batch(&prefix_events).events;
+    assert!(
+        published.iter().any(|event| matches!(
+            event,
+            MetaEvent::RenameEntry { new_name, .. } if new_name.as_slice() == b"PPTC321.TMP"
+        )),
+        "published prefix must carry the rename: {published:?}"
+    );
+
+    if open_handle {
+        pg.unlink_open_handle(ROOT_INO, b"PPTC321.TMP")
+            .expect("unlink open destination");
+        let mut unlinked = pg.get_attr(file.ino).expect("open inode attrs");
+        assert_eq!(unlinked.nlink, 0);
+        unlinked.content_epoch += 1;
+        unlinked.size += 1;
+        pg.set_attr(&unlinked)
+            .expect("write through unlinked handle");
+        pg.remove_attr(file.ino).expect("last close cleanup");
+    } else {
+        pg.unlink(ROOT_INO, b"PPTC321.TMP")
+            .expect("unlink rename destination locally");
+    }
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("suffix end");
+    let overlay = pg.local_overlay_conflicts().expect("local suffix overlay");
+    apply_self_replay(&pg, published, start, end, overlay);
+
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"PPTC321.TMP"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "self echo must preserve the local unlink"
+    );
+
+    // A replay page that reconciled serving keys re-applies the unflushed suffix.
+    let suffix = pg
+        .local
+        .read_events_range(prefix_end, end)
+        .expect("read unflushed suffix");
+    assert!(
+        suffix.iter().any(|event| matches!(event,
+            MetaEvent::RemoveLocalEntry { parent: ROOT_INO, name } if name == b"PPTC321.TMP"
+        )),
+        "the journal must retain the exact locally removed name"
+    );
+    let projected_suffix = RemoteApplyCoordinator::project_local_batch(&suffix).events;
+    assert!(
+        !projected_suffix.iter().any(|event| matches!(
+            event,
+            MetaEvent::RemoveEntry { .. } | MetaEvent::RemoveLocalEntry { .. }
+        )),
+        "canceling the update must retain the published peer name"
+    );
+    for _ in 0..2 {
+        pg.local
+            .apply_replica_serving_state_for_pending_replay(&suffix)
+            .expect("replay pending serving state");
+    }
+
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"PPTC321.TMP"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "replaying the local unlink must not expose the echoed base destination"
+    );
+    apply_self_replay(
+        &pg,
+        projected_suffix,
+        prefix_end,
+        end,
+        pg.local_overlay_conflicts().expect("suffix overlay"),
+    );
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"PPTC321.TMP"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "acknowledging rollback must keep the local name absent"
+    );
+
+    let pruned = pg
+        .local
+        .prune_local_event_log_before(end, 1024)
+        .expect("prune acknowledged journal");
+    assert!(
+        pruned.rows > 0,
+        "the new local event must survive pruning into authority state"
+    );
+    RemoteApplyCoordinator::new(&pg.local)
+        .reconcile_serving_dentries_from_base_with_overlay(
+            &HashSet::from([encode_dentry_key(ROOT_INO, b"PPTC321.TMP")]),
+            &OverlayConflictSets::default(),
+        )
+        .expect("post-pull reconciliation after pruning");
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"PPTC321.TMP"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "pruning must not release local deletion authority"
+    );
+
+    if !open_handle {
+        pg.persist_flushed_event_seq(end)
+            .expect("ack local journal");
+        pg.local
+            .get_attr(file.ino)
+            .expect("rollback retains the published inode attr");
+        // A peer deleting the same inode agrees with the local deletion.
+        apply_decoded_foreign_batches_locked(
+            &pg,
+            vec![DecodedReplayBatch {
+                batch_version: 2,
+                events: vec![
+                    MetaEvent::RemoveEntry {
+                        parent: ROOT_INO,
+                        name: b"PPTC321.TMP".to_vec(),
+                    },
+                    MetaEvent::RemoveAttr { ino: file.ino },
+                ],
+                is_self_batch: false,
+            }],
+            None,
+            1,
+        )
+        .expect("apply peer deletion");
+        assert!(
+            matches!(
+                pg.local.get_attr(file.ino),
+                Err(MetaError::InodeNotFound(_))
+            ),
+            "a peer removal of a locally deleted inode must not leave its served attr"
+        );
+    }
+
+    let recreated = pg
+        .create_file(ROOT_INO, b"PPTC321.TMP", 0, 0, 0o644)
+        .expect("exclusive recreate of the unlinked name");
+    assert_ne!(recreated.ino, file.ino);
 }
 
 #[test]

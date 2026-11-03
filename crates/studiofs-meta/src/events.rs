@@ -20,6 +20,8 @@ const TAG_SET_ACL_RULE: u8 = 12;
 const TAG_REMOVE_ACL_RULE: u8 = 13;
 const TAG_ADD_PENDING_DELETION: u8 = 14;
 const TAG_REMOVE_PENDING_DELETION: u8 = 15;
+// Tags 16 and 17 belonged to retired snapshot events and remain reserved.
+const TAG_REMOVE_LOCAL_ENTRY: u8 = 18;
 
 // These tag values are part of the persisted format: append new values, never
 // reorder or reuse an existing value.
@@ -56,6 +58,14 @@ pub enum MetaEvent {
     /// Remove a directory entry.
     RemoveEntry {
         /// Parent directory that currently contains the entry.
+        parent: u64,
+        /// Entry name encoded as raw bytes.
+        name: Vec<u8>,
+    },
+
+    /// Remove a name only from this client's serving view, retaining peer state.
+    RemoveLocalEntry {
+        /// Parent directory containing the locally removed name.
         parent: u64,
         /// Entry name encoded as raw bytes.
         name: Vec<u8>,
@@ -188,6 +198,7 @@ impl MetaEvent {
             Self::RemoveAttr { .. } => "remove_attr",
             Self::AddEntry { .. } => "add_entry",
             Self::RemoveEntry { .. } => "remove_entry",
+            Self::RemoveLocalEntry { .. } => "remove_local_entry",
             Self::RenameEntry { .. } => "rename_entry",
             Self::RemoveRegularFileGraph { .. } => "remove_regular_file_graph",
             Self::SetRegularFileOverlaySlices { .. } => "set_regular_file_overlay_slices",
@@ -208,6 +219,7 @@ impl MetaEvent {
             Self::RemoveAttr { .. } => TAG_REMOVE_ATTR,
             Self::AddEntry { .. } => TAG_ADD_ENTRY,
             Self::RemoveEntry { .. } => TAG_REMOVE_ENTRY,
+            Self::RemoveLocalEntry { .. } => TAG_REMOVE_LOCAL_ENTRY,
             Self::RenameEntry { .. } => TAG_RENAME_ENTRY,
             Self::RemoveRegularFileGraph { .. } => TAG_REMOVE_REGULAR_FILE_GRAPH,
             Self::SetRegularFileOverlaySlices { .. } => TAG_SET_REGULAR_FILE_OVERLAY_SLICES,
@@ -226,7 +238,10 @@ impl MetaEvent {
     pub fn is_namespace_mutation(&self) -> bool {
         matches!(
             self,
-            Self::AddEntry { .. } | Self::RemoveEntry { .. } | Self::RenameEntry { .. }
+            Self::AddEntry { .. }
+                | Self::RemoveEntry { .. }
+                | Self::RemoveLocalEntry { .. }
+                | Self::RenameEntry { .. }
         )
     }
 
@@ -237,7 +252,9 @@ impl MetaEvent {
             Self::SetAttr { attr } => Some(attr.ino),
             Self::RemoveAttr { ino } => Some(*ino),
             Self::AddEntry { parent, .. } => Some(*parent),
-            Self::RemoveEntry { parent, .. } => Some(*parent),
+            Self::RemoveEntry { parent, .. } | Self::RemoveLocalEntry { parent, .. } => {
+                Some(*parent)
+            }
             Self::RenameEntry { parent, .. } => Some(*parent),
             Self::RemoveRegularFileGraph { ino } => Some(*ino),
             Self::SetRegularFileOverlaySlices { ino, .. } => Some(*ino),
@@ -267,7 +284,9 @@ pub fn encode_event(event: &MetaEvent) -> MetaResult<Vec<u8>> {
             name,
             entry,
         } => encode_event_envelope(tag, &(*parent, name, entry)),
-        MetaEvent::RemoveEntry { parent, name } => encode_event_envelope(tag, &(*parent, name)),
+        MetaEvent::RemoveEntry { parent, name } | MetaEvent::RemoveLocalEntry { parent, name } => {
+            encode_event_envelope(tag, &(*parent, name))
+        }
         MetaEvent::RenameEntry {
             parent,
             name,
@@ -454,6 +473,10 @@ fn decode_tagged_event(tag: u8, payload: &[u8]) -> MetaResult<MetaEvent> {
         TAG_REMOVE_ENTRY => {
             let (parent, name) = decode_event_payload(tag, payload)?;
             Ok(MetaEvent::RemoveEntry { parent, name })
+        }
+        TAG_REMOVE_LOCAL_ENTRY => {
+            let (parent, name) = decode_event_payload(tag, payload)?;
+            Ok(MetaEvent::RemoveLocalEntry { parent, name })
         }
         TAG_RENAME_ENTRY => {
             let (
@@ -721,6 +744,19 @@ mod tests {
                 b"\x0e\x1d",
             ),
         ]
+    }
+
+    #[test]
+    fn local_entry_removal_has_a_stable_local_journal_tag() {
+        let event = MetaEvent::RemoveLocalEntry {
+            parent: 15,
+            name: b"old".to_vec(),
+        };
+        let bytes = b"SFS-EVT\x01\x12\x0f\x03old";
+        assert_eq!(encode_event(&event).unwrap(), bytes);
+        assert_eq!(decode_event(bytes).unwrap(), event);
+        assert!(event.is_namespace_mutation());
+        assert_eq!(event.primary_ino(), Some(15));
     }
 
     #[test]
