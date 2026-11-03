@@ -176,7 +176,7 @@ The combined behavior must preserve a recreated unpublished source through self-
 - [x] Combined replay module: 150 passed, zero failed, 45 infrastructure tests ignored; previously red SFS-963 test is green.
 - [x] Redb module: 391 passed, zero failed, one ignored. Event codec: 11 passed. Layout: three passed. Cargo check and Clippy --all-targets -D warnings passed.
 - [x] (2026-11-03) Backlog 79 passed; live peer-unlink test passed. Rebuilt integrated release product and passed fresh mounted smoke plus generic/241 outside sandbox.
-- [ ] Record final pair-validation evidence and update the existing SFS-960 PR branch.
+- [x] (2026-11-03) Recorded combined validation and updated PR #939 to 80fbe177; hosted CI is monitored separately.
 
 Integration revision: preserve the source history and define paired validation, superseding the earlier outstanding-SFS-963 limitation once the combined checks complete.
 
@@ -189,3 +189,13 @@ The release rebuild succeeded (3m48s), yielding binary SHA-256 `cadb42fb95b7e947
 This combined verification supersedes the earlier known-red SFS-963 limitation for SFS-960. No new implementation edits were necessary: the SFS-963 source branch was already based on the SFS-960 authority correction. The full workspace, full ignored suite, full generic suite, and native Windows/macOS mounts were not run locally. Ubuntu/Rocky hosted CI results remain separate from the local evidence until the updated PR head is checked.
 
 Integration acceptance revision: record the exact integrated code/binary, green joint regression set, original mounted workload and independently verified cleanup. Keep the local-journal tag-18 downgrade restriction visible.
+
+## Ubuntu CI test-fixture follow-up (2026-11-03)
+
+The hosted Ubuntu workspace job on `80fbe177` failed only `vfs::tests::test_release_fh_reports_sticky_error_after_persisting_current_changes`: `release_fh` returned Ok while the test unconditionally expected a sticky error. The metadata replay tests were green. The failing test is unchanged in main and uses `make_test_vfs`, which starts background workers. Those workers may drain pending writer state before release selects its action, or successfully recover an upload and clear a manually injected error. The explicit clean-close contract is already covered by `test_release_fh_clean_skip_does_not_reenter_sticky_error_barrier`; changing production to report that error on a clean close would violate that behavior. An isolated local run of the old test passed, consistent with its scheduler-dependent precondition.
+
+The three adjacent unit tests that manually inject and retain sticky errors now use the existing unstarted VFS fixture, so background persistence/recovery cannot consume their test state. The release regression also asserts its actual pending-local-state precondition before injection. This is a test-only correction: production release, metadata replication and publication behavior are unchanged. No sleeps, retries, ignored tests or weakened expected-error assertions were added.
+
+The focused `release_fh` selection passed 20 tests, including both sticky-error reporting and the complementary clean-skip path. The final sticky-error selection passed seven tests; `cargo check -p studiofs-vfs`, `cargo clippy -p studiofs-vfs --all-targets -- -D warnings`, crate formatting and diff checks passed. Retained CI log: `target/sfs960/integrated-15da9845/ubuntu-ci-failed.log`; local focused outputs: `vfs-release.log` and `vfs-sticky-final.log` in that directory. Mounted tests are not repeated for fixture-only edits; earlier integrated production-binary evidence remains separate.
+
+CI-fixture revision: remove competing background actors from tests that assume their manually injected error and dirty state cannot change; preserve the intentionally different clean-close production behavior.
