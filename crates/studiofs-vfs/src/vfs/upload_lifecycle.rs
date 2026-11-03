@@ -592,18 +592,16 @@ impl StudioVfs {
     /// teardown panics on their timers and redb is dropped while unwinding,
     /// which skips its clean-close header (SFS-961).
     async fn wait_for_orphaned_metadata_calls(&self, grace: Duration) {
-        if tokio::time::timeout(grace, self.meta.wait_for_idle())
-            .await
-            .is_ok()
-        {
+        let mut idle = std::pin::pin!(self.meta.wait_for_idle());
+        if tokio::time::timeout(grace, idle.as_mut()).await.is_ok() {
             return;
         }
         warn!(
             timeout_ms = grace.as_millis() as u64,
             active_calls = self.meta.activity_snapshot().active_calls,
-            "metadata calls from aborted background tasks are still running during shutdown; waiting for completion"
+            "metadata calls, including ones orphaned by aborted background tasks, are still running during shutdown; waiting for completion"
         );
-        self.meta.wait_for_idle().await;
+        idle.await;
     }
 
     async fn join_uploader_task(&self, timeout: Duration) {
