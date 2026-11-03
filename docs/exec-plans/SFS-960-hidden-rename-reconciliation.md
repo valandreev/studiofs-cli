@@ -12,8 +12,10 @@ A successful local rename must not lose its destination when this client's Postg
 - [x] (2026-11-03) Read metadata, mounted IO, replay contracts and ADR 0012; traced projection, publication exclusions, replay and recent-flush reconciliation.
 - [x] (2026-11-03) Observed the new regression fail with EntryNotFound after the post-pull protection snapshot and local Ready commit, then pass after the correction.
 - [x] (2026-11-03) Removed the redundant inode pass; retained dentry reconciliation. Transactional stale-attr regression and two live PostgreSQL publication/unlink tests pass.
-- [x] (2026-11-03) Ran focused replay/backlog/layout tests, check, Clippy, formatting and diff review; independent review found no important issues. Mounted validation is gated by missing /dev/fuse.
-- [ ] Create the separate EEXIST/EIO Linear issue after explicit approval: automatic approval review rejected its creation as an external disclosure. A local draft preserves the exact requested content.
+- [x] (2026-11-03) Ran focused replay/backlog/layout tests, check, Clippy, formatting and diff review; independent review found no important issues. Initial sandbox-only FUSE check was incomplete; the later host-level mounted rerun below supersedes that limitation.
+- [x] (2026-11-03) After explicit payload approval, created separate EEXIST/EIO issue SFS-963.
+- [x] (2026-11-03) Rebuilt release product and ran registered mounted smoke plus pinned generic/241 outside sandbox. Smoke passed; generic/241 reproduced the original unlink ENOENT.
+- [ ] SFS-960 remains unresolved: trace the remaining mounted ENOENT before proposing another correction.
 
 ## Surprises & Discoveries
 
@@ -74,3 +76,29 @@ Reuse `RemoteApplyCoordinator`, `RecentFlush`, `OverlayConflictSets`, `LocalEven
 Initial revision: scope option B and record the exact publication/reconciliation boundary before production edits.
 
 Completion revision (2026-11-03): record the actual Ready-publication race, minimal deletion, independent review, exact local/live validation, mounted prerequisite and rejected issue creation.
+
+## Mounted verification follow-up (2026-11-03)
+
+The user pointed out that FUSE exists outside the sandbox and requested verification. Host inspection confirmed `/dev/fuse`, fusermount3, dbench, sudo, ext4 and the existing pinned xfstests prerequisites. The earlier absence claim described only the sandbox view and is superseded by this host evidence.
+
+Ran `cargo build -p studiofs --release -j 8` successfully, then:
+
+    target/debug/studiofs-e2e run basic-multi-client-smoke --infra env --studiofs-bin target/release/studiofs --run-id sfs960-06fd7355-smoke --seed 960 --retain always --timeout 180s
+
+The registered smoke passed, including final mounted validation and cleanup. Its report is `target/e2e-runs/sfs960-06fd7355-smoke/report.json`.
+
+On two fresh, dedicated volumes initialized from the configured test services, ran only `generic/241` through `tools/xfstests/run.sh`. The upstream revision was `22348afe338c0f6d540c0d7ef0db749eaa51b218`, with the existing three-line common/rc FUSE subtype patch. No full suite was run. The product was commit `06fd7355fb108542a4e0442f3baf3bf14e1ea7fd`, binary SHA-256 `9761838dafc664880528e7fa5c321ff74f523e72e2a8b043a0dcdf17a8ce5a5b`.
+
+The test failed, exit 1, harness wall time 30 seconds. Dbench reached 13 seconds before:
+
+    [4114] unlink .../clients/client2/~dmtmp/PWRPNT/NEWPCB.PPT failed (No such file or directory) - expected NT_STATUS_OK
+    ERROR: child 2 failed at line 4114
+    Child failed with status 1
+
+Artifacts: `target/xfstests/sfs960-06fd7355-20261103T170712Z/generic241/manifest.tsv`, `metadata.tsv`, `cases/241/check.log`, `cases/241/results/generic/241.full`, and mount logs in the parent run's `mounts/`. The helper script/config and init logs are retained under target. Host checks after the run found neither test mount active and both recorded daemon PIDs exited.
+
+This reproduces the original SFS-960 symptom, so the passing unit regression and smoke do not establish that 06fd7355 fixes the issue. The retained post-pull dentry reconciliation still samples protection before acquiring its write transaction and only checks local payload overlays for newly encountered bindings. This is a candidate remaining race, not a proven explanation of this particular mounted failure; no additional production patch was made during verification.
+
+The separate EEXIST/EIO issue was created after explicit user approval as [SFS-963](https://linear.app/valandreev/issue/SFS-963/metadata-self-replay-resurrects-a-locally-unlinked-unpublished-rename). The earlier rejection entry above remains historical evidence, not a current blocker.
+
+Verification revision: correct the sandbox-only environment conclusion, record actual mounted red evidence and cleanup, and explicitly reopen SFS-960 rather than claiming the incomplete correction is sufficient.
