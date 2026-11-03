@@ -13,7 +13,7 @@ SFS-963 blocks SFS-960: a returning create/rename followed by pending journal re
 - [x] (2026-11-03) Isolated missing local name intent and implemented explicit local removal plus durable DeletedBeforePublish reconciliation protection.
 - [x] (2026-11-03) Validated echo, repeated pending replay, rollback acknowledgement, journal pruning, exclusive recreation, peer retention, foreign replacement and open-unlink/write/close.
 - [x] (2026-11-03) Read-only review identified a real foreign-unlink compatibility regression; restored the original base-dentry publication decision. Focused live peer-unlink test now passes.
-- [ ] Finish final crate checks, rebuild and repeat mounted smoke/generic/241 after the compatibility correction.
+- [x] (2026-11-03) Completed final crate checks, rebuilt release, repeated mounted smoke and generic/241, and independently verified cleanup.
 
 ## Surprises & Discoveries
 
@@ -83,3 +83,25 @@ On the final implementation, `cargo test -p studiofs-meta --lib pg_engine::tests
 The final release rebuild and new mounted runs remain pending. Intermediate mounted runs passed under binary SHA-256 `713fc2cf45784994cd966bef25d5d741495bf8bd87b57fd055d8ad2c6e41cfcc`: smoke report `target/e2e-runs/sfs963-smoke-20261103/report.json`; generic/241 artifacts `target/xfstests/sfs963-replay-20261103T182213Z/generic241/` report exit 0, 78 seconds, `Passed all 1 tests`. These are retained but do not establish final acceptance after the remote-policy correction.
 
 Validation revision: record the final local counts and live-test repair, and explicitly limit the metadata open-unlink model and intermediate binary evidence.
+
+## Final mounted acceptance and delivery
+
+Implementation commit `d4790195` is on `feature/sfs-963-metadata-self-replay-resurrects-a-locally-unlinked`, preserving the original SFS-960 history. The working tree was clean after that commit. No push, PR, merge or issue closure was requested or performed.
+
+Final `cargo build -p studiofs --release -j 8` passed (4m33s). Product SHA-256: `b0bb9ccdcd8cb3e62e7b09692919daab611f787e4bae7fee87d367f85cd4319e`. With that binary, ran:
+
+    target/debug/studiofs-e2e run basic-multi-client-smoke --infra env --studiofs-bin target/release/studiofs --run-id sfs963-d4790195-smoke --seed 963 --retain always --timeout 180s
+
+The registered smoke passed validation and cleanup; report `target/e2e-runs/sfs963-d4790195-smoke/report.json`.
+
+Reused the existing xfstests setup script with new dedicated volume names and all temporary mount/client roots under target. Its final command was:
+
+    tools/xfstests/run.sh /home/val/dev/studiofs-cli/target/xfstests/tools/xfstests /home/val/dev/studiofs-cli/target/xfstests/sfs963-replay-20261103T183017Z/generic241 generic/241
+
+The selected original dbench case passed, exit 0, 80 seconds, `Passed all 1 tests`. Artifacts: `target/xfstests/sfs963-replay-20261103T183017Z/generic241/manifest.tsv`, `metadata.tsv`, `cases/241/check.log`, and `cases/241/results/result.xml`. Independent host inspection found zero remaining mounts and zero live recorded daemon PIDs for the final smoke/xfstests roots. This final acceptance supersedes the intermediate binary results.
+
+Final focused results: replay 150 passed/45 ignored; redb 391 passed/1 ignored; backlog 79 passed/6 ignored; codec 11 passed; two selected live PostgreSQL tests each passed one test. `cargo check -p studiofs-meta`, `cargo clippy -p studiofs-meta --all-targets -- -D warnings`, `cargo fmt -p studiofs-meta -- --check`, and `git diff --check` passed. All logs are retained under `target/sfs963-*.log`. The initial live foreign-unlink failure is explained above and repaired; it is not an outstanding failure.
+
+Outcome: the committed deterministic SFS-963 regression is green through echo, repeated pending replay, rollback acknowledgement, pruning and exclusive recreation. Published peer content and pending cleanup eligibility retain their existing semantics. A different foreign inode can replace the locally hidden old binding. Open-unlink/write/last-close is covered at the metadata-call level. No full workspace, full ignored suite, full generic suite, Windows/macOS mount, or object-store GC end-to-end gate was run. The new local-only journal tag prevents downgrade to an older binary while such events remain in local state; it never reaches peer clients through PostgreSQL.
+
+Completion revision: record final exact binary, commands, mounted evidence, independent cleanup and the local-journal downgrade limitation.
