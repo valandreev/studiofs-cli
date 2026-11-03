@@ -4574,6 +4574,25 @@ mod tests {
             "attributes must not be returned as a reparse index"
         );
         assert_ne!(security.attributes & super::FILE_ATTRIBUTE_REPARSE_POINT, 0);
+        assert!(security.sz_security_descriptor > 0);
+
+        let missing = U16CString::from_str("\\missing\\child").expect("u16 path");
+        let security = <StudioFsContext as FileSystemContext>::get_security_by_name(
+            &ctx,
+            missing.as_ucstr(),
+            None,
+            |_| {
+                Some(winfsp::filesystem::FileSecurity {
+                    reparse: true,
+                    sz_security_descriptor: 0,
+                    attributes: 7,
+                })
+            },
+        )
+        .expect("resolver result must bypass namespace lookup");
+        assert!(security.reparse);
+        assert_eq!(security.attributes, 7);
+        assert_eq!(security.sz_security_descriptor, 0);
     }
 
     #[test]
