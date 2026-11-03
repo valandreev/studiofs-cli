@@ -1972,7 +1972,8 @@ impl FileSystemContext for StudioFsContext {
         let sd_len = self.copy_sd_to_buffer(security_descriptor);
 
         Ok(FileSecurity {
-            reparse: attr.kind == FileType::Symlink,
+            // Only the resolver returns a reparse index; this branch returns attributes.
+            reparse: false,
             sz_security_descriptor: sd_len,
             attributes: file_attributes,
         })
@@ -4553,6 +4554,26 @@ mod tests {
             encode_symlink_reparse(oversized_unicode_target.as_bytes()),
             Err(super::STATUS_IO_REPARSE_DATA_INVALID)
         );
+    }
+
+    #[test]
+    fn get_security_by_name_reports_attributes_when_resolver_skips_symlink() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("symlink-security-attributes");
+        vfs.symlink(ROOT_INO, b"dangling", b"missing", 0, 0)
+            .expect("create dangling symlink");
+        let name = U16CString::from_str("\\dangling").expect("u16 path");
+        let security = <StudioFsContext as FileSystemContext>::get_security_by_name(
+            &ctx,
+            name.as_ucstr(),
+            None,
+            |_| None,
+        )
+        .expect("query symlink itself");
+        assert!(
+            !security.reparse,
+            "attributes must not be returned as a reparse index"
+        );
+        assert_ne!(security.attributes & super::FILE_ATTRIBUTE_REPARSE_POINT, 0);
     }
 
     #[test]
