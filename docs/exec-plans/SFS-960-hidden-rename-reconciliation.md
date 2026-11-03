@@ -165,3 +165,27 @@ Final local evidence remains: replay module 148 passed, one unchanged SFS-963 fa
 Outcome: the selected approach is implemented and the original mounted acceptance case is now green. No new persisted table, configuration, public API or event format was introduced. No PR or external issue status change was made as part of this local delivery.
 
 Completion revision: record exact final release/mounted evidence, independently verified cleanup and remaining SFS-963 limitation; close the implementation milestones without overstating suite coverage.
+
+## SFS-963 integration into SFS-960 (2026-11-03)
+
+The user requested importing the completed SFS-963 correction and verifying both fixes together. Started at clean SFS-963 head `15da9845` in `/home/val/dev/studiofs-cli`; fetched both remote branches and verified SFS-960 `e8c3d66c` is an ancestor. Switched to the requested SFS-960 branch and fast-forwarded it to SFS-963, retaining all original commits: `d4790195` (explicit local unlink intent and deletion authority), `91e92455` (mounted evidence), and `15da9845` (allow a matching peer inode removal over a local DeletedBeforePublish marker). There were no conflicts or implementation edits in this integration.
+
+The combined behavior must preserve a recreated unpublished source through self-ack (SFS-960), keep a locally unlinked destination hidden through echo/ack/pruning (SFS-963), retain the old published peer payload when canceling a new version (SFS-234), and still apply genuine foreign removals and replacements. The existing replay regression set covers these paths together. The new local-only RemoveLocalEntry journal event uses tag 18 and is not projected to PostgreSQL; older binaries cannot reopen local journals containing this tag.
+
+- [x] Imported all three SFS-963 commits into SFS-960 without rewriting either history.
+- [x] Combined replay module: 150 passed, zero failed, 45 infrastructure tests ignored; previously red SFS-963 test is green.
+- [x] Redb module: 391 passed, zero failed, one ignored. Event codec: 11 passed. Layout: three passed. Cargo check and Clippy --all-targets -D warnings passed.
+- [x] (2026-11-03) Backlog 79 passed; live peer-unlink test passed. Rebuilt integrated release product and passed fresh mounted smoke plus generic/241 outside sandbox.
+- [ ] Record final pair-validation evidence and update the existing SFS-960 PR branch.
+
+Integration revision: preserve the source history and define paired validation, superseding the earlier outstanding-SFS-963 limitation once the combined checks complete.
+
+### Combined acceptance results
+
+On combined implementation head `15da984575a7ee76bc9b458445bed2866acd8bef`, replay passed 150/0 failed/45 ignored, redb 391/0 failed/1 ignored, backlog 79/0 failed/6 ignored, events 11/0 failed, and layout 3/0 failed. The formerly CI-failing `pending_replay_of_local_unlink_hides_echoed_rename_destination` and SFS-960 hidden-interior/release/alias regressions are all included in that green replay module. The targeted live PostgreSQL test `test_pg_peer_can_unlink_foreign_visible_uploading_entry` passed one test outside sandbox. Cargo check, Clippy --all-targets -D warnings, formatting and diff checks passed. Local logs are under `target/sfs960/integrated-15da9845/`.
+
+The release rebuild succeeded (3m48s), yielding binary SHA-256 `cadb42fb95b7e947215d126c35108a5e4e5403f47bb30be5243781f8c2f96f73`. The registered mounted smoke passed both validation and cleanup, report `target/e2e-runs/sfs960-963-15da9845-smoke/report.json`. The original generic/241 then passed the full 60-second four-client dbench workload, exit 0, harness wall time 78 seconds. Artifacts are under `target/xfstests/sfs960-963-pair-20261103T185032Z/generic241/`, including manifest.tsv, metadata.tsv, cases/241/check.log, results/generic/241.full and results/result.xml. Host inspection confirmed zero remaining test mounts and both recorded mount daemon PIDs exited.
+
+This combined verification supersedes the earlier known-red SFS-963 limitation for SFS-960. No new implementation edits were necessary: the SFS-963 source branch was already based on the SFS-960 authority correction. The full workspace, full ignored suite, full generic suite, and native Windows/macOS mounts were not run locally. Ubuntu/Rocky hosted CI results remain separate from the local evidence until the updated PR head is checked.
+
+Integration acceptance revision: record the exact integrated code/binary, green joint regression set, original mounted workload and independently verified cleanup. Keep the local-journal tag-18 downgrade restriction visible.
