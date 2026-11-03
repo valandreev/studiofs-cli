@@ -286,6 +286,16 @@ impl MetaPayloadObjects for PgMetaEngine {
         self.local.lookup_regular_file_slices(ino, offset, length)
     }
 
+    fn lookup_regular_file_stored_slices(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>> {
+        self.local
+            .lookup_regular_file_stored_slices(ino, offset, length)
+    }
+
     fn remove_regular_file_graph(
         &self,
         ino: Ino,

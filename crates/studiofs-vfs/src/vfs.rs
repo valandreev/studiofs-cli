@@ -6688,7 +6688,7 @@ impl StudioVfs {
         self.meta.run_sync_maintenance(|meta| {
             let mut object_ids = HashSet::new();
             if size > 0
-                && let Ok(spans) = meta.lookup_regular_file_slices(ino, 0, size)
+                && let Ok(spans) = meta.lookup_regular_file_stored_slices(ino, 0, size)
             {
                 for span in spans {
                     if let Some(block) = span.payload {
@@ -10382,7 +10382,7 @@ impl StudioVfs {
                 }
                 let generation = self
                     .sync_meta()
-                    .lookup_regular_file_slices(ino, 0, attr.size)
+                    .lookup_regular_file_stored_slices(ino, 0, attr.size)
                     .ok()
                     .map(|spans| OsCacheGeneration::new(attr.content_epoch, attr.size, &spans));
                 self.os_cache

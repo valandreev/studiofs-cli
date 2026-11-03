@@ -206,6 +206,58 @@ impl MetaPayloadObjects for RedbMetaEngine {
         Ok(merge_adjacent_spans(spans))
     }
 
+    fn lookup_regular_file_stored_slices(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| MetaError::Storage("regular-file lookup range overflow".to_string()))?;
+        let txn = self.begin_read_txn()?;
+        let overlay = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        let base = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            &txn,
+            REGULAR_FILE_BASE_TABLE,
+            ino,
+        )?;
+        let chunk_ids: std::collections::BTreeSet<ChunkId> =
+            overlay.keys().chain(base.keys()).copied().collect();
+        let mut spans = Vec::new();
+        for chunk_id in chunk_ids {
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            let chunk_end = chunk_start.saturating_add(u64::from(DEFAULT_CHUNK_SIZE));
+            let start = offset.max(chunk_start);
+            let stop = end.min(chunk_end);
+            if start >= stop {
+                continue;
+            }
+            let query = SliceRange::new((start - chunk_start) as u32, (stop - chunk_start) as u32)
+                .ok_or_else(|| {
+                    MetaError::Storage("invalid chunk-local lookup range".to_string())
+                })?;
+            spans.extend(
+                resolve_chunk_slice_spans(
+                    chunk_id,
+                    query,
+                    overlay.get(&chunk_id),
+                    base.get(&chunk_id),
+                )
+                .into_iter()
+                .filter(|span| span.source != ResolvedSliceSource::Hole),
+            );
+        }
+        Ok(merge_adjacent_spans(spans))
+    }
+
     fn remove_regular_file_graph(
         &self,
         ino: Ino,

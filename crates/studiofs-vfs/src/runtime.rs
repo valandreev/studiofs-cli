@@ -476,6 +476,14 @@ impl<M: ?Sized + MetaPayloadObjects> MetaPayloadObjects for RuntimeMetaHandle<M>
         ) -> MetaResult<Vec<ResolvedSliceSpan>>
     );
     forward_method!(
+        fn lookup_regular_file_stored_slices(
+            &self,
+            ino: Ino,
+            offset: u64,
+            length: u64,
+        ) -> MetaResult<Vec<ResolvedSliceSpan>>
+    );
+    forward_method!(
         fn remove_regular_file_graph(
             &self,
             ino: Ino,

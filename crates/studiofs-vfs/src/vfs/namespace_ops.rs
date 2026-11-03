@@ -1987,7 +1987,10 @@ impl StudioVfs {
         let mut retained =
             std::collections::BTreeMap::<u64, (super::overlay::ObjectUploadGeometry, u32)>::new();
         if size > 0 {
-            match self.sync_meta().lookup_regular_file_slices(ino, 0, size) {
+            match self
+                .sync_meta()
+                .lookup_regular_file_stored_slices(ino, 0, size)
+            {
                 Ok(spans) => {
                     for span in spans {
                         if span.source != ResolvedSliceSource::Overlay {
@@ -2122,7 +2125,10 @@ impl StudioVfs {
         }
 
         let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
-        for span in self.sync_meta().lookup_regular_file_slices(ino, 0, size)? {
+        for span in self
+            .sync_meta()
+            .lookup_regular_file_stored_slices(ino, 0, size)?
+        {
             match span.source {
                 ResolvedSliceSource::Base | ResolvedSliceSource::Hole => {}
                 ResolvedSliceSource::Overlay => {
@@ -2192,7 +2198,7 @@ impl StudioVfs {
         if new_size > 0 {
             for span in self
                 .sync_meta()
-                .lookup_regular_file_slices(ino, 0, new_size)?
+                .lookup_regular_file_stored_slices(ino, 0, new_size)?
             {
                 if let Some(block) = span.payload {
                     kept_object_ids.insert(block.object_id);

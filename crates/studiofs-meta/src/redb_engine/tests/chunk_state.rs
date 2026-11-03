@@ -2879,3 +2879,57 @@ fn sfs314_metadata_only_apply_keeps_attrs_and_file_graph_consistent() {
         "metadata-only apply must not rewrite or clear the published file graph"
     );
 }
+
+#[test]
+fn test_stored_slices_cover_huge_sparse_range_without_walking_holes() {
+    // SFS-958: 1 byte at 2^63-2 with logical size 2^63-1 spans ~2^37 chunks.
+    let engine = temp_engine();
+    let ino = 42;
+    let size = i64::MAX as u64;
+    let byte_offset = size - 1;
+    let chunk_id = chunk_id_from_offset(byte_offset, DEFAULT_CHUNK_SIZE);
+    let in_chunk = (byte_offset - chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE)) as u32;
+    let mut overlay = RegularFileChunkState::default();
+    overlay.insert_slice(SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(in_chunk, in_chunk + 1).unwrap(),
+        PayloadRef::new_partial(7, 1),
+    ));
+    let mut base = RegularFileChunkState::default();
+    base.insert_slice(local_payload_slice(8));
+    set_regular_file_chunk_rows(
+        &engine,
+        ino,
+        &[(chunk_id, overlay)],
+        &[(ChunkId(0), base)],
+    );
+
+    let spans = engine
+        .lookup_regular_file_stored_slices(ino, 0, size)
+        .unwrap();
+
+    assert!(spans.iter().all(|span| span.source != ResolvedSliceSource::Hole));
+    let objects: Vec<_> = spans
+        .iter()
+        .map(|span| (span.chunk_id, span.range, span.payload.map(|p| p.object_id)))
+        .collect();
+    assert_eq!(
+        objects,
+        vec![
+            (ChunkId(0), SliceRange::new(0, 4096).unwrap(), Some(8)),
+            (
+                chunk_id,
+                SliceRange::new(in_chunk, in_chunk + 1).unwrap(),
+                Some(7)
+            ),
+        ]
+    );
+    assert!(
+        engine
+            .lookup_regular_file_stored_slices(ino, 4096, byte_offset - 4096)
+            .unwrap()
+            .is_empty(),
+        "chunks outside the requested range must be clipped"
+    );
+}
