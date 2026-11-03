@@ -235,6 +235,10 @@ impl<'a> NamespaceCreateTxn<'a> {
                     name: event_name,
                     ..
                 }
+                | MetaEvent::RemoveLocalEntry {
+                    parent: event_parent,
+                    name: event_name,
+                }
                 | MetaEvent::RemoveEntry {
                     parent: event_parent,
                     name: event_name,
@@ -688,15 +692,18 @@ impl<'a> NamespaceDeleteTxn<'a> {
         deleted_base_dentry: bool,
     ) -> MetaResult<()> {
         if deleted_before_publish.is_some_and(|record| record.has_published_base) {
-            if deleted_base_dentry {
-                RedbMetaEngine::append_event_in_txn(
-                    self.txn,
-                    &crate::events::MetaEvent::RemoveEntry {
-                        parent: spec.parent,
-                        name: spec.name.to_vec(),
-                    },
-                )?;
-            }
+            let removal = if deleted_base_dentry {
+                crate::events::MetaEvent::RemoveEntry {
+                    parent: spec.parent,
+                    name: spec.name.to_vec(),
+                }
+            } else {
+                crate::events::MetaEvent::RemoveLocalEntry {
+                    parent: spec.parent,
+                    name: spec.name.to_vec(),
+                }
+            };
+            RedbMetaEngine::append_event_in_txn(self.txn, &removal)?;
             let published_base_chunks = published_base_chunks.ok_or_else(|| {
                 MetaError::Storage(
                     "missing published base chunk rows for deleted-before-publish rollback"
@@ -726,6 +733,13 @@ impl<'a> NamespaceDeleteTxn<'a> {
         if deleted_before_publish.is_some()
             || (attr.nlink == 0 && attr.is_unpublished_empty_draft())
         {
+            RedbMetaEngine::append_event_in_txn(
+                self.txn,
+                &crate::events::MetaEvent::RemoveLocalEntry {
+                    parent: spec.parent,
+                    name: spec.name.to_vec(),
+                },
+            )?;
             RedbMetaEngine::append_event_in_txn(
                 self.txn,
                 &crate::events::MetaEvent::RemoveRegularFileGraph { ino: attr.ino },

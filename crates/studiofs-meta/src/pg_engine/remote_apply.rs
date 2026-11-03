@@ -363,6 +363,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         !matches!(
             event,
             MetaEvent::SetRegularFileOverlaySlices { .. }
+                | MetaEvent::RemoveLocalEntry { .. }
                 | MetaEvent::RemoveRegularFileGraph { .. }
                 | MetaEvent::AddPendingDeletion { .. }
                 | MetaEvent::RemovePendingDeletion { .. }
@@ -621,6 +622,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::RemoveAttr { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RemoveLocalEntry { .. }
             | MetaEvent::RenameEntry { .. } => false,
             MetaEvent::PublishRegularFileBaseSlices { .. } => true,
             MetaEvent::SetSymlinkTarget { .. }
@@ -697,7 +699,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 overlay.symlink_inodes.insert(*ino);
                 overlay.xattr_inodes.insert(*ino);
             }
-            MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
+            MetaEvent::AddEntry { parent, name, .. }
+            | MetaEvent::RemoveEntry { parent, name }
+            | MetaEvent::RemoveLocalEntry { parent, name } => {
                 overlay.dentry_keys.insert(encode_dentry_key(*parent, name));
             }
             MetaEvent::RenameEntry {
@@ -865,6 +869,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             | MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RemoveLocalEntry { .. }
             | MetaEvent::RenameEntry { .. } => false,
         }
     }
@@ -920,6 +925,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             MetaEvent::SetAttr { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RemoveLocalEntry { .. }
             | MetaEvent::RenameEntry { .. }
             | MetaEvent::AddPendingDeletion { .. }
             | MetaEvent::RemovePendingDeletion { .. } => false,
@@ -950,11 +956,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     || overlay.symlink_inodes.contains(ino)
                     || overlay.xattr_inodes.contains(ino)
             }
-            MetaEvent::AddEntry { parent, name, .. } | MetaEvent::RemoveEntry { parent, name } => {
-                overlay
-                    .dentry_keys
-                    .contains(&encode_dentry_key(*parent, name))
-            }
+            MetaEvent::AddEntry { parent, name, .. }
+            | MetaEvent::RemoveEntry { parent, name }
+            | MetaEvent::RemoveLocalEntry { parent, name } => overlay
+                .dentry_keys
+                .contains(&encode_dentry_key(*parent, name)),
             MetaEvent::RenameEntry { .. } => false,
             MetaEvent::SetSymlinkTarget { ino, .. } => {
                 overlay.block_inodes.contains(ino)
@@ -1037,7 +1043,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let mut removed = HashSet::new();
         for event in batch_events {
             match event {
-                MetaEvent::RemoveEntry { parent, name } => {
+                MetaEvent::RemoveEntry { parent, name }
+                | MetaEvent::RemoveLocalEntry { parent, name } => {
                     if let Ok(Some(entry)) =
                         RedbMetaEngine::lookup_merged_in_write_txn(txn, *parent, name)
                     {
@@ -1074,6 +1081,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let Some(lifecycle) = RedbMetaEngine::get_inode_lifecycle_in_write_txn(txn, ino)? else {
             return Ok(false);
         };
+        if lifecycle.state == InodeLifecycleState::DeletedBeforePublish {
+            return Ok(true);
+        }
         if lifecycle.state == InodeLifecycleState::Published {
             return Ok(false);
         }
@@ -1137,7 +1147,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 }
                 MetaEvent::PublishRegularFileBaseSlices { ino, .. }
                 | MetaEvent::RemoveRegularFileGraph { ino } => *ino,
-                MetaEvent::RemoveEntry { parent, name } => {
+                MetaEvent::RemoveEntry { parent, name }
+                | MetaEvent::RemoveLocalEntry { parent, name } => {
                     let Ok(Some(entry)) =
                         RedbMetaEngine::lookup_merged_in_write_txn(txn, *parent, name)
                     else {
