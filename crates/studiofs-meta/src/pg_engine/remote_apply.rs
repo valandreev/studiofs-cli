@@ -1075,13 +1075,22 @@ impl<'a> RemoteApplyCoordinator<'a> {
         txn: &RedbWriteTransaction<'_>,
         ino: Ino,
     ) -> MetaResult<bool> {
+        self.local_regular_file_state_protection_in_txn(txn, ino, true)
+    }
+
+    fn local_regular_file_state_protection_in_txn(
+        &self,
+        txn: &RedbWriteTransaction<'_>,
+        ino: Ino,
+        protect_local_deletion: bool,
+    ) -> MetaResult<bool> {
         if RedbMetaEngine::has_local_regular_file_overlay_in_write_txn(txn, ino)? {
             return Ok(true);
         }
         let Some(lifecycle) = RedbMetaEngine::get_inode_lifecycle_in_write_txn(txn, ino)? else {
             return Ok(false);
         };
-        if lifecycle.state == InodeLifecycleState::DeletedBeforePublish {
+        if protect_local_deletion && lifecycle.state == InodeLifecycleState::DeletedBeforePublish {
             return Ok(true);
         }
         if lifecycle.state == InodeLifecycleState::Published {
@@ -1107,7 +1116,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
         txn: &RedbWriteTransaction<'_>,
         ino: Ino,
     ) -> MetaResult<bool> {
-        self.local_regular_file_state_needs_foreign_protection_in_txn(txn, ino)
+        // A peer removing the inode agrees with a local deletion; only live local state wins.
+        self.local_regular_file_state_protection_in_txn(txn, ino, false)
     }
 
     #[cfg(test)]
@@ -2633,12 +2643,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     && entry.kind == FileType::RegularFile
                     && Self::local_regular_file_namespace_is_unpublished_in_txn(txn, entry.ino)?
                 {
+                    overlay.dentry_keys.insert(key.clone());
                     protected_local_bindings.insert(key.clone(), Some(entry));
                 }
             }
-            overlay
-                .dentry_keys
-                .extend(protected_local_bindings.keys().cloned());
             reconcile_dentry_keys.extend(touched_keys);
             if batch.is_self_batch {
                 applied_any |= self.apply_visible_self_batch_in_txn(txn, &events)?;

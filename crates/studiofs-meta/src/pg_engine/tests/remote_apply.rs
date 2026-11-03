@@ -9492,6 +9492,39 @@ fn assert_local_unlink_hides_echoed_destination(open_handle: bool) {
         "pruning must not release local deletion authority"
     );
 
+    if !open_handle {
+        pg.persist_flushed_event_seq(end)
+            .expect("ack local journal");
+        pg.local
+            .get_attr(file.ino)
+            .expect("rollback retains the published inode attr");
+        // A peer deleting the same inode agrees with the local deletion.
+        apply_decoded_foreign_batches_locked(
+            &pg,
+            vec![DecodedReplayBatch {
+                batch_version: 2,
+                events: vec![
+                    MetaEvent::RemoveEntry {
+                        parent: ROOT_INO,
+                        name: b"PPTC321.TMP".to_vec(),
+                    },
+                    MetaEvent::RemoveAttr { ino: file.ino },
+                ],
+                is_self_batch: false,
+            }],
+            None,
+            1,
+        )
+        .expect("apply peer deletion");
+        assert!(
+            matches!(
+                pg.local.get_attr(file.ino),
+                Err(MetaError::InodeNotFound(_))
+            ),
+            "a peer removal of a locally deleted inode must not leave its served attr"
+        );
+    }
+
     let recreated = pg
         .create_file(ROOT_INO, b"PPTC321.TMP", 0, 0, 0o644)
         .expect("exclusive recreate of the unlinked name");
