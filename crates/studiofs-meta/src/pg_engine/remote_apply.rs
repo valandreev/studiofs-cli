@@ -1212,6 +1212,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
             && RedbMetaEngine::has_local_regular_file_overlay_in_write_txn(txn, ino)?)
     }
 
+    fn local_regular_file_namespace_is_unpublished_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        ino: Ino,
+    ) -> MetaResult<bool> {
+        Ok(
+            RedbMetaEngine::get_inode_lifecycle_in_write_txn(txn, ino)?.is_some_and(|lifecycle| {
+                !lifecycle.has_published_base
+                    && lifecycle.state != InodeLifecycleState::DeletedBeforePublish
+            }),
+        )
+    }
+
     fn grandfather_removed_local_regular_file_attrs_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
@@ -2462,7 +2474,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 continue;
             };
             if entry.kind == FileType::RegularFile
-                && RedbMetaEngine::has_local_regular_file_overlay_in_write_txn(txn, entry.ino)?
+                && (RedbMetaEngine::has_local_regular_file_overlay_in_write_txn(txn, entry.ino)?
+                    || Self::local_regular_file_namespace_is_unpublished_in_txn(txn, entry.ino)?)
             {
                 protected_dentry_keys.insert(key.clone());
             }
@@ -2531,7 +2544,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         context.next_event_seq = replay_next_event_seq;
         let mut overlay = std::mem::take(&mut context.initial_overlay);
         Self::extend_overlay_conflicts(&mut overlay, &appended_overlay);
-        let mut completed_bindings = HashMap::new();
+        let mut protected_local_bindings = HashMap::new();
         if !self.local_only_completed.is_empty() {
             let mut events = Vec::new();
             for range in &self.local_only_completed {
@@ -2549,14 +2562,14 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 if entry.is_some()
                     && RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)? == entry
                 {
-                    completed_bindings.insert(key, entry);
+                    protected_local_bindings.insert(key, entry);
                 }
             }
         }
         // Served local-only names are local authority in every page, not only self pages.
         overlay
             .dentry_keys
-            .extend(completed_bindings.keys().cloned());
+            .extend(protected_local_bindings.keys().cloned());
         let mut applied_any = false;
         let mut max_version = context.last_seq;
         let mut max_namespace_version = context.current_namespace_version;
@@ -2592,10 +2605,30 @@ impl<'a> RemoteApplyCoordinator<'a> {
             // Raw events still match the local journal; appliers see the merged namespace.
             let events = RedbMetaEngine::canonicalize_replay_batch_in_txn(txn, &batch.events)?;
             let rewritten = matches!(events, Cow::Owned(_)).then_some(&events[..]);
+            let mut touched_keys = HashSet::new();
             for events in std::iter::once(&batch.events[..]).chain(rewritten) {
                 Self::collect_replay_reconcile_inodes(&mut reconcile_inodes, events);
-                Self::collect_replay_reconcile_dentries(txn, &mut reconcile_dentry_keys, events)?;
+                Self::collect_replay_reconcile_dentries(txn, &mut touched_keys, events)?;
             }
+            // Hidden names outlive the journal cursor. Capture actual local
+            // ownership after alias resolution and before this batch can erase it.
+            for key in &touched_keys {
+                if let Some(execution) = execution {
+                    execution.check()?;
+                }
+                let (parent, name) = decode_dentry_key(key)?;
+                if let Some(entry) =
+                    RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)?
+                    && entry.kind == FileType::RegularFile
+                    && Self::local_regular_file_namespace_is_unpublished_in_txn(txn, entry.ino)?
+                {
+                    protected_local_bindings.insert(key.clone(), Some(entry));
+                }
+            }
+            overlay
+                .dentry_keys
+                .extend(protected_local_bindings.keys().cloned());
+            reconcile_dentry_keys.extend(touched_keys);
             if batch.is_self_batch {
                 applied_any |= self.apply_visible_self_batch_in_txn(txn, &events)?;
                 applied_self_batch = true;
@@ -2656,7 +2689,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 )?;
                 overlay
                     .dentry_keys
-                    .extend(completed_bindings.keys().cloned());
+                    .extend(protected_local_bindings.keys().cloned());
                 if batch.is_self_batch {
                     Self::clear_resolved_self_regular_file_protection(
                         &mut replay_protected_overlay,
@@ -2695,9 +2728,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
             .filter_map(|(index, event)| included(index).then_some(event))
             .collect::<Vec<_>>();
             let mut state = RedbMetaEngine::pending_local_namespace_bindings_in_txn(txn, &events)?;
-            // A still-served completed binding is the journal's final state for its key,
-            // so it outranks older included events such as an unreplayed rename source.
-            state.bindings.extend(completed_bindings);
+            // Captured local-only bindings outrank older included events such as
+            // an unreplayed rename source, even after their journal events are acked.
+            state.bindings.extend(protected_local_bindings);
             final_overlay
                 .dentry_keys
                 .extend(state.bindings.keys().cloned());

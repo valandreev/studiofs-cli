@@ -244,6 +244,15 @@ while they are at or above the journal cursor: every replay page treats their
 still-served names as overlay conflicts, and self-replay's local namespace
 rebase restores them, so the outcome does not depend on page boundaries. They must not be confused with applied publication prefixes: PostgreSQL has no batch that
 can restore a locally created hidden draft after an older rename replays.
+Still-served regular-file names with no published lifecycle base remain local
+namespace authority independently of the journal cursor. Before replay mutates
+a page's touched keys, it captures these exact bindings and shares them with
+the existing conflict protection and namespace rebase. A hidden create inside
+an acknowledged prefix therefore survives its older rename echo. Subsequent
+pages and post-pull dentry reconciliation recover the same ownership from the
+durable inode lifecycle, even after the journal prefix is retired. Once local
+publication establishes a published base, ordinary pending-event protection
+covers its in-flight publication and later remote namespace changes may converge.
 Fully canceled local windows remain excluded so they cannot erase a later
 foreign create at the same name.
 Replay of inode removal reconciles that inode's serving names against the base

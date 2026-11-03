@@ -3026,9 +3026,8 @@ fn foreign_unlink_during_unpublished_local_uploading_preserves_writer_dentry() {
 fn recent_flush_dentry_reconcile_applies_deferred_foreign_base_entry() {
     let (_dir, pg) = temp_pg_engine_for_unit();
 
-    let local_file = pg
-        .create_file(ROOT_INO, b"slot.txt", 0, 0, 0o644)
-        .expect("create local slot");
+    // Acknowledgement can release a published file, never a private empty draft.
+    let local_file = create_published_small_file(&pg, ROOT_INO, b"slot.txt", 91_100);
     let local_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("local end");
     let overlay = pg.local_overlay_conflicts().expect("overlay conflicts");
     let slot_key = encode_dentry_key(ROOT_INO, b"slot.txt");
@@ -5179,6 +5178,190 @@ fn publish_without_ready_attr_preserves_protected_base_graph() {
         object_ids,
         vec![local_head.object_id, remote_tail.object_id],
         "publish-only foreign batches are not authoritative enough to replace protected base ranges"
+    );
+}
+
+#[test]
+fn unpublished_name_protection_uses_canonical_parents() {
+    for merge_in_page in [false, true] {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let (canonical, alias) = (ROOT_INO + 9_500, ROOT_INO + 9_600);
+        replay_foreign_page(&pg, 1, create_dir_events(canonical, ROOT_INO, b"merged"));
+        if !merge_in_page {
+            replay_foreign_page(&pg, 2, create_dir_events(alias, ROOT_INO, b"merged"));
+        }
+        let draft = pg.create_file(canonical, b"private", 0, 0, 0o644).unwrap();
+        let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+        pg.persist_flushed_event_seq(end).unwrap();
+        let mut batches = Vec::new();
+        if merge_in_page {
+            batches.push(DecodedReplayBatch {
+                batch_version: 2,
+                is_self_batch: false,
+                events: create_dir_events(alias, ROOT_INO, b"merged"),
+            });
+        }
+        batches.push(DecodedReplayBatch {
+            batch_version: 3,
+            is_self_batch: false,
+            events: create_dir_events(ROOT_INO + 9_601, alias, b"private"),
+        });
+        pg.apply_replay_page_atomically(
+            batches,
+            None,
+            RemoteReplayApplyContext {
+                last_seq: if merge_in_page { 1 } else { 2 },
+                current_namespace_version: 1,
+                flushed_event_seq: end,
+                next_event_seq: end,
+                initial_overlay: pg.local_overlay_conflicts().unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            pg.lookup(canonical, b"private")
+                .expect("canonical private binding")
+                .ino,
+            draft.ino,
+            "alias rewrite must preserve local ownership, merge_in_page={merge_in_page}"
+        );
+    }
+}
+
+#[test]
+fn acknowledged_unpublished_namespace_stays_local_until_publication() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let draft = pg
+        .create_file(ROOT_INO, b"local-only", 0, 0, 0o644)
+        .unwrap();
+    let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+    pg.create_dir(ROOT_INO, b"visible-anchor", 0, 0, 0o755)
+        .unwrap();
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events = pg.local.read_events_range(start, end).unwrap();
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: projected.events,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq: start,
+            next_event_seq: end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(pg.flushed_event_seq.load(Ordering::SeqCst), end);
+
+    let recent = RecentFlush {
+        batch_version: 1,
+        overlay: OverlayConflictSets {
+            dentry_keys: HashSet::from([encode_dentry_key(ROOT_INO, b"local-only")]),
+            ..OverlayConflictSets::default()
+        },
+    };
+    RemoteApplyCoordinator::new(&pg.local)
+        .reconcile_recent_flush(Some(&recent), 1, &pg.local_overlay_conflicts().unwrap())
+        .unwrap();
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"local-only")
+            .expect("post-pull keeps private name")
+            .ino,
+        draft.ino
+    );
+
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 2,
+            is_self_batch: false,
+            events: vec![
+                MetaEvent::SetAttr {
+                    attr: InodeAttr::new_dir(88_401, ROOT_INO, 0, 0, 0o755),
+                },
+                MetaEvent::AddEntry {
+                    parent: ROOT_INO,
+                    name: b"local-only".to_vec(),
+                    entry: DirEntryValue {
+                        ino: 88_401,
+                        kind: FileType::Directory,
+                    },
+                },
+            ],
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 1,
+            current_namespace_version: 1,
+            flushed_event_seq: end,
+            next_event_seq: end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"local-only")
+            .expect("next page keeps private name")
+            .ino,
+        draft.ino
+    );
+
+    set_file_state(&pg, draft.ino, 64, 1);
+    pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(77_403, 64))
+        .unwrap();
+    mark_overlay_objects_uploaded(&pg, draft.ino, 1, &[77_403]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(draft.ino, 1)
+            .unwrap()
+    );
+    let publish_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events = pg.local.read_events_range(end, publish_end).unwrap();
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    let range = LocalEventRange {
+        start: end,
+        end: publish_end,
+    };
+    pg.mark_local_event_ranges_published_with_prefix(&[range], Some((3, vec![range])))
+        .unwrap();
+    pg.apply_replay_page_atomically(
+        vec![
+            DecodedReplayBatch {
+                batch_version: 3,
+                events: projected.events,
+                is_self_batch: true,
+            },
+            DecodedReplayBatch {
+                batch_version: 4,
+                events: vec![
+                    MetaEvent::RemoveEntry {
+                        parent: ROOT_INO,
+                        name: b"local-only".to_vec(),
+                    },
+                    MetaEvent::RemoveAttr { ino: draft.ino },
+                ],
+                is_self_batch: false,
+            },
+        ],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 2,
+            current_namespace_version: 2,
+            flushed_event_seq: end,
+            next_event_seq: publish_end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            pg.lookup(ROOT_INO, b"local-only"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "published names must follow a later foreign unlink, even in the same page"
     );
 }
 
