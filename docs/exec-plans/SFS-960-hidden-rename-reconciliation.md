@@ -16,7 +16,7 @@ A successful local rename must not lose its destination when this client's Postg
 - [x] (2026-11-03) After explicit payload approval, created separate EEXIST/EIO issue SFS-963.
 - [x] (2026-11-03) Rebuilt release product and ran registered mounted smoke plus pinned generic/241 outside sandbox. Smoke passed; generic/241 reproduced the original unlink ENOENT.
 - [x] (2026-11-03) Traced the remaining mounted ENOENT to destructive own-rename reconciliation and reproduced hidden-interior self-ack loss deterministically.
-- [ ] SFS-960 remains unresolved: correct hidden local namespace authority across self acknowledgment and both reconciliation passes, then rerun the original mounted case.
+- [x] (2026-11-03) Corrected hidden local namespace authority through self-ack and both reconciliation passes; the rebuilt product passed the original generic/241 case.
 
 ## Surprises & Discoveries
 
@@ -130,7 +130,7 @@ Milestone 1 is the existing red hidden-interior regression (rerun and confirmed)
 
 - [x] (2026-11-03) Implemented shared durable-lifecycle namespace ownership, captured before each raw/canonicalized batch, reusing the existing local-binding map/rebase; post-pull uses the same predicate.
 - [x] (2026-11-03) Root regression and boundary regression pass: protection survives self-ack/post-pull/next foreign page and ends after publication before same-page foreign unlink. Alias regression failed before canonical capture and passes for existing and same-page aliases.
-- [ ] Run focused checks, review and mounted verification; record exact outcomes.
+- [x] (2026-11-03) Completed focused checks and read-only review (canonical-parent finding repaired red/green); rebuilt product passed registered smoke and generic/241 on fresh volumes, with cleanup verified.
 
 Implementation-plan revision: record the user's selected approach and its publication/foreign-deletion boundary before editing production code.
 
@@ -145,3 +145,23 @@ Read-only review found one concrete issue: collecting only raw keys misses a can
 Current focused results: replay module 148 passed, one unchanged pre-existing SFS-963 failure (`pending_replay_of_local_unlink_hides_echoed_rename_destination`), 45 ignored; backlog module 79 passed, six ignored; layout three passed. Cargo check and Clippy --all-targets -D warnings passed. Two focused live PostgreSQL tests passed outside the sandbox: reopening an unpublished local create and nested temp rename/publication on a peer. Formatting and diff checks passed. The full workspace and full ignored suites were not run. Release rebuild and fresh mounted verification remain in progress; the preceding failed 06fd7355 run is not superseded until those results are recorded.
 
 Implementation revision: record common ownership semantics, red/green evidence, corrected fixture, canonical-parent review repair, and exact focused validation before the mounted acceptance check.
+
+## Final mounted acceptance (2026-11-03)
+
+Implementation commit `40c3002c8f19206a9499d00a09183fbfb1cdbbc1` preserves hidden local namespace authority using the existing durable lifecycle and binding/rebase mechanisms. The final release product was rebuilt after the canonical-parent repair with `cargo build -p studiofs --release -j 8`; binary SHA-256 is `6ae9b830e2ee2ba5437900a3db0fb02bb21dea8ae89f3d81444d1ae4d349d2c0`.
+
+Registered `basic-multi-client-smoke` passed, including mounted-tree validation and cleanup:
+
+    target/debug/studiofs-e2e run basic-multi-client-smoke --infra env --studiofs-bin target/release/studiofs --run-id sfs960-40c3002c-smoke --seed 960 --retain always --timeout 180s
+
+Report: `target/e2e-runs/sfs960-40c3002c-smoke/report.json`.
+
+The original pinned generic/241 was run outside sandbox on two fresh dedicated volumes through `tools/xfstests/run.sh`. It completed the full `dbench -t 60 ... 4` workload and passed, exit 0 (harness wall time 83 seconds). The check log reports `Passed all 1 tests`. This supersedes the earlier mounted ENOENT failures on 06fd7355 and its diagnostic build, without claiming a full generic-suite pass.
+
+Artifacts: `target/xfstests/sfs960-authority-20261103T173821Z/generic241/manifest.tsv`, `metadata.tsv`, `cases/241/check.log`, `cases/241/results/generic/241.full`, `cases/241/results/result.xml`, and parent `mounts/` logs. The metadata records exact product hash, upstream xfstests revision `22348afe338c0f6d540c0d7ef0db749eaa51b218`, adaptive Linux cache policy and mmap opt-in disabled. Host checks found zero remaining run mounts and both recorded mount daemon PIDs exited. The upstream scratch-unmount message in the full log did not affect the case verdict; cleanup was checked independently.
+
+Final local evidence remains: replay module 148 passed, one unchanged SFS-963 failure, 45 ignored; backlog 79 passed, six ignored; layout three passed; focused `unpublished_` selection 17 passed, three ignored; cargo check, Clippy --all-targets -D warnings, formatting and diff checks passed. Live PostgreSQL reopen-before-publication and nested rename/publication tests passed. The full workspace, full ignored suite and full generic suite were not run. SFS-963 (`pending_replay_of_local_unlink_hides_echoed_rename_destination`) remains outside the selected ENOENT correction; one mounted pass does not establish that separate bug is fixed.
+
+Outcome: the selected approach is implemented and the original mounted acceptance case is now green. No new persisted table, configuration, public API or event format was introduced. No PR or external issue status change was made as part of this local delivery.
+
+Completion revision: record exact final release/mounted evidence, independently verified cleanup and remaining SFS-963 limitation; close the implementation milestones without overstating suite coverage.
