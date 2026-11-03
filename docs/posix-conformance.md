@@ -81,7 +81,8 @@ auto-repair ([SFS-961](https://linear.app/valandreev/issue/SFS-961)).
 `generic/089`, `/127`, `/476`, `/538`, `/551` and `/750` hit the 300-second
 budget; /013 hit the 60-second one. These cases had no failure output and no
 daemon warning in their windows (for /013 see above). All six 300-second cases
-also timed out in run 1. A budget outcome is not a proven deadlock.
+also timed out in run 1. A budget outcome is not a proven deadlock; the
+investigation is [SFS-962](https://linear.app/valandreev/issue/SFS-962).
 
 ### Notrun: not supposed to run
 
