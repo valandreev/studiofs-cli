@@ -27768,3 +27768,67 @@ fn xattr_mutations_invalidate_cached_attr_ctime() {
         );
     }
 }
+
+// SFS-961: a background task aborted at the shutdown join deadline leaves its
+// spawn_blocking metadata call running. Shutdown must wait for that owner
+// before the final local metadata barrier instead of handing it to runtime
+// teardown, where it panics on a stopped timer driver and leaves redb dirty.
+#[test]
+fn shutdown_waits_for_metadata_call_orphaned_by_background_abort() {
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "shutdown-orphaned-meta-call");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let orphan_finished = Arc::new(AtomicBool::new(false));
+        let task_vfs = Arc::clone(&vfs);
+        let task_finished = Arc::clone(&orphan_finished);
+        vfs.track_background_task(tokio::spawn(async move {
+            let _dropped = DropSignal(Some(dropped_tx));
+            let _ = task_vfs
+                .meta
+                .run_maintenance(move |_| {
+                    started_tx.send(()).expect("test receiver remains live");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(30))
+                        .expect("test releases metadata call");
+                    task_finished.store(true, AtomicOrdering::Release);
+                    Ok::<(), MetaError>(())
+                })
+                .await;
+        }));
+        started_rx.await.expect("metadata call started");
+
+        let shutdown_vfs = Arc::clone(&vfs);
+        let mut shutdown = tokio::spawn(async move { shutdown_vfs.shutdown(Duration::ZERO).await });
+        tokio::time::timeout(Duration::from_secs(10), dropped_rx)
+            .await
+            .expect("shutdown aborts the stalled background task")
+            .expect("drop signal is sent");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown must not complete while an orphaned metadata call owns redb"
+        );
+
+        release_tx.send(()).expect("metadata call is blocked");
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("shutdown completes after the orphaned call returns")
+            .expect("shutdown task joins")
+            .expect("shutdown succeeds");
+        assert!(orphan_finished.load(AtomicOrdering::Acquire));
+    });
+}

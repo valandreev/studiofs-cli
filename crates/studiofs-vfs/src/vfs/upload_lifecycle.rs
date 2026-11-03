@@ -586,6 +586,26 @@ impl StudioVfs {
         }
     }
 
+    /// Wait for blocking metadata calls left behind by aborted background tasks.
+    ///
+    /// They still own the metadata engine. If they outlive shutdown, runtime
+    /// teardown panics on their timers and redb is dropped while unwinding,
+    /// which skips its clean-close header (SFS-961).
+    async fn wait_for_orphaned_metadata_calls(&self, grace: Duration) {
+        if tokio::time::timeout(grace, self.meta.wait_for_idle())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        warn!(
+            timeout_ms = grace.as_millis() as u64,
+            active_calls = self.meta.activity_snapshot().active_calls,
+            "metadata calls from aborted background tasks are still running during shutdown; waiting for completion"
+        );
+        self.meta.wait_for_idle().await;
+    }
+
     async fn join_uploader_task(&self, timeout: Duration) {
         let handle = self.state.shutdown.uploader_task.lock().take();
         let Some(handle) = handle else {
@@ -840,6 +860,8 @@ impl StudioVfs {
         // Their remote sync path takes the replication lock and must not hold
         // shutdown behind a PostgreSQL command timeout.
         let metadata_close_error = self.meta.run(|meta| meta.prepare_for_close()).await.err();
+        self.wait_for_orphaned_metadata_calls(background_join_timeout)
+            .await;
 
         // Phase 4: persist metadata + cache checkpoint.
         info!(
