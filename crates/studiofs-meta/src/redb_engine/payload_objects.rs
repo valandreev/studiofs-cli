@@ -206,6 +206,32 @@ impl MetaPayloadObjects for RedbMetaEngine {
         Ok(merge_adjacent_spans(spans))
     }
 
+    fn lookup_regular_file_stored_slices(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| MetaError::Storage("regular-file lookup range overflow".to_string()))?;
+        let txn = self.begin_read_txn()?;
+        let overlay = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        let base = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            &txn,
+            REGULAR_FILE_BASE_TABLE,
+            ino,
+        )?;
+        Self::resolve_stored_regular_file_slices(&overlay, &base, offset, end)
+    }
+
     fn remove_regular_file_graph(
         &self,
         ino: Ino,

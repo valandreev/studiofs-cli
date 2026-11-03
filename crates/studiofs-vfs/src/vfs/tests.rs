@@ -27931,3 +27931,54 @@ fn shutdown_joins_timed_out_metadata_sync_within_owner_limit() {
     drop(meta);
     drop(RedbMetaEngine::open(&db_path).expect("redb reopens right after shutdown"));
 }
+
+#[test]
+fn startup_replay_finishes_for_huge_sparse_file_with_pending_upload() {
+    // SFS-958 (xfstests generic/525): 1 byte at 2^63-2 left pending upload.
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let offset = i64::MAX as u64 - 1;
+    let ino = {
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-958-huge-sparse-replay");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let ino = vfs
+                .create(ROOT_INO, b"sfs-958-huge-sparse.bin", 0, 0, 0o644)
+                .expect("create sparse file")
+                .ino;
+            let fh = vfs
+                .open_file(ino, OpenFlags::RDWR, false)
+                .expect("open sparse file");
+            vfs.write_fh(fh, ino, offset, b"a")
+                .await
+                .expect("write byte near the maximum offset");
+            vfs.flush_fh(fh)
+                .await
+                .expect("make the sparse byte locally durable");
+            assert!(
+                !vfs.pending_uploads_for_inode(ino).is_empty(),
+                "the sparse byte must still be pending upload at shutdown"
+            );
+            ino
+        })
+    };
+
+    // Startup replay runs in the constructor; bound it so a regression fails instead of hanging.
+    let tmp = Arc::new(tmp);
+    let (reopened_tx, reopened_rx) = std::sync::mpsc::channel();
+    let reopener = {
+        let tmp = tmp.clone();
+        thread::spawn(move || {
+            let _ = reopened_tx.send(reopen_existing_test_vfs(&tmp));
+        })
+    };
+    let (rt, vfs, _meta) = reopened_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("startup replay must not walk every chunk of the sparse range");
+    reopener.join().expect("join reopen thread");
+    let _guard = rt.enter();
+    vfs.start().expect("start reopened vfs");
+    let read = rt
+        .block_on(vfs.read(ino, offset, 1))
+        .expect("read back the sparse byte");
+    assert_eq!(read.as_ref(), b"a");
+}

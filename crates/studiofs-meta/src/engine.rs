@@ -1629,6 +1629,18 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
         length: u64,
     ) -> MetaResult<Vec<ResolvedSliceSpan>>;
 
+    /// Resolve stored (non-hole) slice coverage for a file range.
+    ///
+    /// Same precedence as [`Self::lookup_regular_file_slices`], but hole spans
+    /// are omitted, so cost scales with stored chunks rather than the logical
+    /// range. Use this for whole-file scans of possibly huge sparse files.
+    fn lookup_regular_file_stored_slices(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>>;
+
     /// Remove the regular-file graph for an inode (used when deleting).
     /// Returns the unique removed object IDs. With `Some(timestamp)`, queues
     /// their GC deletions in the same transaction, so a marker-write failure

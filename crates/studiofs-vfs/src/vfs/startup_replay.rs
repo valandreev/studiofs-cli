@@ -232,7 +232,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         let spans = self
             .vfs
             .sync_meta()
-            .lookup_regular_file_slices(attr.ino, 0, attr.size)?;
+            .lookup_regular_file_stored_slices(attr.ino, 0, attr.size)?;
         let mut objects = Vec::new();
         let mut geometries = HashMap::<u64, ObjectUploadGeometry>::new();
         for span in spans {
