@@ -684,17 +684,18 @@ pub(crate) struct MetaExecutorActivitySnapshot {
 struct MetaExecutorActivity {
     generation: AtomicU64,
     active_calls: AtomicUsize,
+    idle: tokio::sync::Notify,
 }
 
-struct MetaExecutorActivityGuard<'a>(&'a MetaExecutorActivity);
+struct MetaExecutorActivityGuard(Arc<MetaExecutorActivity>);
 
 impl MetaExecutorActivity {
-    fn enter(&self) -> MetaExecutorActivityGuard<'_> {
+    fn enter(self: &Arc<Self>) -> MetaExecutorActivityGuard {
         self.active_calls.fetch_add(1, Ordering::SeqCst);
-        MetaExecutorActivityGuard(self)
+        MetaExecutorActivityGuard(Arc::clone(self))
     }
 
-    fn enter_activity(&self) -> MetaExecutorActivityGuard<'_> {
+    fn enter_activity(self: &Arc<Self>) -> MetaExecutorActivityGuard {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.enter()
     }
@@ -711,9 +712,11 @@ impl MetaExecutorActivity {
     }
 }
 
-impl Drop for MetaExecutorActivityGuard<'_> {
+impl Drop for MetaExecutorActivityGuard {
     fn drop(&mut self) {
-        self.0.active_calls.fetch_sub(1, Ordering::SeqCst);
+        if self.0.active_calls.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
     }
 }
 
@@ -753,6 +756,20 @@ impl<M: ?Sized + Send + Sync + 'static> MetaExecutor<M> {
         self.activity.snapshot()
     }
 
+    /// Wait until no metadata call holds the engine, including blocking-pool
+    /// calls whose awaiting task was aborted: `abort` does not cancel them.
+    pub(crate) async fn wait_for_idle(&self) {
+        loop {
+            let notified = self.activity.idle.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            if self.activity.active_calls.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Execute a metadata operation synchronously on the current thread.
     pub fn run_sync<T>(&self, operation: impl FnOnce(Arc<M>) -> MetaResult<T>) -> VfsResult<T> {
         let _activity = self.activity.enter_activity();
@@ -789,9 +806,11 @@ impl<M: ?Sized + Send + Sync + 'static> MetaExecutor<M> {
         if records_activity {
             self.activity.record_activity();
         }
-        let activity = self.activity.clone();
+        // Count the call from submission so a queued or orphaned blocking
+        // closure stays visible to shutdown until it releases the engine.
+        let activity = self.activity.enter();
         execute_sync_meta(self.backend.clone(), move |engine| {
-            let _activity = activity.enter();
+            let _activity = activity;
             operation(engine)
         })
         .await
@@ -1148,6 +1167,45 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    // SFS-961: aborting the awaiting task does not cancel spawn_blocking work,
+    // so shutdown must keep waiting for the orphaned call that still owns redb.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn meta_executor_wait_for_idle_covers_call_orphaned_by_task_abort() {
+        let temp = studiofs_test_support::workspace_target_tempdir("runtime-meta-orphan-");
+        let path = temp.path().join("meta.redb");
+        let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
+        let executor = MetaExecutor::new(into_vfs_meta(engine));
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let running_executor = executor.clone();
+        let running = tokio::spawn(async move {
+            running_executor
+                .run_maintenance(move |_| {
+                    started_tx.send(()).expect("test receiver remains live");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("test releases metadata operation");
+                    Ok::<(), MetaError>(())
+                })
+                .await
+        });
+        started_rx.await.expect("metadata operation started");
+        running.abort();
+        assert!(running.await.expect_err("task is aborted").is_cancelled());
+
+        let mut idle = std::pin::pin!(executor.wait_for_idle());
+        assert!(
+            futures::poll!(idle.as_mut()).is_pending(),
+            "orphaned blocking metadata call must keep the executor busy"
+        );
+        release_tx.send(()).expect("metadata operation is blocked");
+        tokio::time::timeout(Duration::from_secs(5), idle)
+            .await
+            .expect("executor becomes idle after the orphaned call returns");
+        assert_eq!(executor.activity_snapshot().active_calls, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
