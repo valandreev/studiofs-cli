@@ -5183,7 +5183,79 @@ fn publish_without_ready_attr_preserves_protected_base_graph() {
 }
 
 #[test]
-fn recent_flush_reconcile_resets_stale_regular_file_serving_attr() {
+fn hidden_uploading_rename_survives_recent_flush_reconciliation() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start).expect("ack setup");
+    let file = pg
+        .create_file(ROOT_INO, b"NEWTIPS.PPT", 0, 0, 0o644)
+        .expect("create");
+    set_file_state(&pg, file.ino, 4096, 1);
+    pg.rename_atomic(
+        ROOT_INO,
+        b"NEWTIPS.PPT",
+        ROOT_INO,
+        b"PPTC241.TMP",
+        true,
+        false,
+    )
+    .expect("rename uploading file");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+    let events = pg
+        .local
+        .read_events_range(start, end)
+        .expect("local events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    assert!(
+        !projected.events.iter().any(|event| matches!(event,
+            MetaEvent::SetAttr { attr } if attr.ino == file.ino
+        )),
+        "uploading inode must remain absent from the remote base"
+    );
+    pg.mark_local_event_ranges_published(&[LocalEventRange { start, end }])
+        .expect("mark published");
+    let recent = RecentFlush {
+        batch_version: 1,
+        overlay: projected.overlay,
+    };
+    apply_self_replay(
+        &pg,
+        projected.events,
+        start,
+        end,
+        pg.local_overlay_conflicts().expect("overlay"),
+    );
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"PPTC241.TMP")
+            .expect("name after replay")
+            .ino,
+        file.ino
+    );
+    pg.persist_local_version(1).expect("replay position");
+    let overlay = pg
+        .local_overlay_conflicts()
+        .expect("overlay before publication");
+    let mut ready = pg.get_attr(file.ino).expect("uploading attrs");
+    ready.committed_size = ready.size;
+    ready.committed_content_epoch = ready.content_epoch;
+    ready.upload_state = UploadState::Ready;
+    // Publication may commit after the post-pull pass samples journal protection.
+    pg.set_attr(&ready).expect("finish local publication");
+    RemoteApplyCoordinator::new(&pg.local)
+        .reconcile_recent_flush(Some(&recent), 1, &overlay)
+        .expect("recent flush reconcile");
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"PPTC241.TMP")
+            .expect("name after recent flush")
+            .ino,
+        file.ino
+    );
+    pg.unlink(ROOT_INO, b"PPTC241.TMP")
+        .expect("unlink successful rename destination");
+}
+
+#[test]
+fn replay_reconcile_resets_stale_regular_file_serving_attr() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg
         .create_file(ROOT_INO, b"recent-flush-stale-serving.txt", 0, 0, 0o644)
@@ -5213,17 +5285,9 @@ fn recent_flush_reconcile_resets_stale_regular_file_serving_attr() {
     remote_attr.content_epoch = 4;
     remote_attr.committed_content_epoch = 4;
     remote_attr.upload_state = UploadState::Ready;
-    pg.local
-        .apply_replica_events_to_base(&[MetaEvent::SetAttr {
-            attr: remote_attr.clone(),
-        }])
-        .expect("apply authoritative base attr");
-    pg.persist_local_version(7).expect("catch up local version");
-
     assert_eq!(
         pg.get_attr(file.ino).expect("load stale serving attr").size,
-        227,
-        "flushed local serving attr can remain stale after base advances"
+        227
     );
 
     let recent_flush = RecentFlush {
@@ -5232,12 +5296,29 @@ fn recent_flush_reconcile_resets_stale_regular_file_serving_attr() {
             &RemoteApplyCoordinator::project_remote_events(&local_events),
         ),
     };
-    reconcile_recent_flush_regular_files(&pg, Some(&recent_flush)).expect("reconcile recent flush");
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 7,
+            is_self_batch: false,
+            events: vec![MetaEvent::SetAttr {
+                attr: remote_attr.clone(),
+            }],
+        }],
+        Some(&recent_flush),
+        RemoteReplayApplyContext {
+            last_seq: 6,
+            current_namespace_version: 6,
+            flushed_event_seq: events_end,
+            next_event_seq: events_end,
+            initial_overlay: pg.local_overlay_conflicts().expect("overlay"),
+        },
+    )
+    .expect("replay authoritative base attr");
 
     assert_eq!(
         pg.get_attr(file.ino).expect("load reconciled attr").size,
         remote_attr.size,
-        "recent-flush reconciliation must reset stale regular-file serving attrs from base"
+        "transactional replay must reset stale regular-file serving attrs from base"
     );
 }
 

@@ -642,18 +642,6 @@ fn apply_decoded_foreign_batches_locked(
     Ok(outcome.changed)
 }
 
-fn reconcile_recent_flush_regular_files(
-    pg: &PgMetaEngine,
-    recent_flush: Option<&RecentFlush>,
-) -> MetaResult<bool> {
-    let overlay = pg.local_overlay_conflicts()?;
-    RemoteApplyCoordinator::new(&pg.local).reconcile_recent_flush(
-        recent_flush,
-        pg.local_version.load(Ordering::SeqCst),
-        &overlay,
-    )
-}
-
 const SETUP_PG_VOLUME_ADVISORY_LOCK_ID: i64 = 902_202_603;
 
 fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaResult<i64> {

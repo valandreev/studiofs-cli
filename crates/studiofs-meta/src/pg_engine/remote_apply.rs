@@ -2802,14 +2802,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
         if local_version < recent_flush.batch_version {
             return Ok(false);
         }
-        let mut reconcile_inodes = recent_flush.overlay.attr_inodes.clone();
-        reconcile_inodes.extend(recent_flush.overlay.block_inodes.iter().copied());
-        let mut changed =
-            self.reconcile_regular_file_serving_from_base_with_overlay(&reconcile_inodes, overlay)?;
-        changed |= self.reconcile_serving_dentries_from_base_with_overlay(
+        // Replay reconciles inode state transactionally; rename conflict keys can
+        // also name a local inode whose attr was hidden from the published batch.
+        self.reconcile_serving_dentries_from_base_with_overlay(
             &recent_flush.overlay.dentry_keys,
             overlay,
-        )?;
-        Ok(changed)
+        )
     }
 }
