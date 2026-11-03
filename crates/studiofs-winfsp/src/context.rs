@@ -1972,7 +1972,8 @@ impl FileSystemContext for StudioFsContext {
         let sd_len = self.copy_sd_to_buffer(security_descriptor);
 
         Ok(FileSecurity {
-            reparse: attr.kind == FileType::Symlink,
+            // Only the resolver returns a reparse index; this branch returns attributes.
+            reparse: false,
             sz_security_descriptor: sd_len,
             attributes: file_attributes,
         })
@@ -4553,6 +4554,75 @@ mod tests {
             encode_symlink_reparse(oversized_unicode_target.as_bytes()),
             Err(super::STATUS_IO_REPARSE_DATA_INVALID)
         );
+    }
+
+    #[test]
+    fn get_security_by_name_reports_attributes_when_resolver_skips_symlink() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("symlink-security-attributes");
+        vfs.symlink(ROOT_INO, b"dangling", b"missing", 0, 0)
+            .expect("create dangling symlink");
+        let name = U16CString::from_str("\\dangling").expect("u16 path");
+        let security = <StudioFsContext as FileSystemContext>::get_security_by_name(
+            &ctx,
+            name.as_ucstr(),
+            None,
+            |_| None,
+        )
+        .expect("query symlink itself");
+        assert!(
+            !security.reparse,
+            "attributes must not be returned as a reparse index"
+        );
+        assert_ne!(security.attributes & super::FILE_ATTRIBUTE_REPARSE_POINT, 0);
+        assert!(security.sz_security_descriptor > 0);
+    }
+
+    #[test]
+    fn get_security_by_name_returns_resolver_result_without_lookup() {
+        let (_tmp, _vfs, ctx, _queue) = make_test_context("resolver-security-passthrough");
+        let missing = U16CString::from_str("\\missing\\child").expect("u16 path");
+        let security = <StudioFsContext as FileSystemContext>::get_security_by_name(
+            &ctx,
+            missing.as_ucstr(),
+            None,
+            |_| {
+                Some(winfsp::filesystem::FileSecurity {
+                    reparse: true,
+                    sz_security_descriptor: 0,
+                    attributes: 7,
+                })
+            },
+        )
+        .expect("resolver result must bypass namespace lookup");
+        assert!(security.reparse);
+        assert_eq!(security.attributes, 7);
+        assert_eq!(security.sz_security_descriptor, 0);
+    }
+
+    #[test]
+    fn cleanup_delete_removes_dangling_symlink() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("dangling-symlink-delete");
+        let link = vfs
+            .symlink(ROOT_INO, b"dangling", b"missing", 0, 0)
+            .expect("create dangling symlink");
+        let handle = StudioFileHandle::new(link.ino, false, 0, OpenFlags::RDWR);
+        let file_name = U16CString::from_str(r"\dangling").expect("u16 path");
+
+        <StudioFsContext as FileSystemContext>::set_delete(
+            &ctx,
+            &handle,
+            file_name.as_ucstr(),
+            true,
+        )
+        .expect("delete precheck");
+        <StudioFsContext as FileSystemContext>::cleanup(
+            &ctx,
+            &handle,
+            Some(file_name.as_ucstr()),
+            0x01,
+        );
+
+        assert!(vfs.meta().lookup(ROOT_INO, b"dangling").is_err());
     }
 
     #[test]
