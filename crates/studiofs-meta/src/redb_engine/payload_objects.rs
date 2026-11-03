@@ -229,33 +229,7 @@ impl MetaPayloadObjects for RedbMetaEngine {
             REGULAR_FILE_BASE_TABLE,
             ino,
         )?;
-        let chunk_ids: std::collections::BTreeSet<ChunkId> =
-            overlay.keys().chain(base.keys()).copied().collect();
-        let mut spans = Vec::new();
-        for chunk_id in chunk_ids {
-            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
-            let chunk_end = chunk_start.saturating_add(u64::from(DEFAULT_CHUNK_SIZE));
-            let start = offset.max(chunk_start);
-            let stop = end.min(chunk_end);
-            if start >= stop {
-                continue;
-            }
-            let query = SliceRange::new((start - chunk_start) as u32, (stop - chunk_start) as u32)
-                .ok_or_else(|| {
-                    MetaError::Storage("invalid chunk-local lookup range".to_string())
-                })?;
-            spans.extend(
-                resolve_chunk_slice_spans(
-                    chunk_id,
-                    query,
-                    overlay.get(&chunk_id),
-                    base.get(&chunk_id),
-                )
-                .into_iter()
-                .filter(|span| span.source != ResolvedSliceSource::Hole),
-            );
-        }
-        Ok(merge_adjacent_spans(spans))
+        Self::resolve_stored_regular_file_slices(&overlay, &base, offset, end)
     }
 
     fn remove_regular_file_graph(

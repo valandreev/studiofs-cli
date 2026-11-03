@@ -1639,11 +1639,7 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
         ino: Ino,
         offset: u64,
         length: u64,
-    ) -> MetaResult<Vec<ResolvedSliceSpan>> {
-        let mut spans = self.lookup_regular_file_slices(ino, offset, length)?;
-        spans.retain(|span| span.source != ResolvedSliceSource::Hole);
-        Ok(spans)
-    }
+    ) -> MetaResult<Vec<ResolvedSliceSpan>>;
 
     /// Remove the regular-file graph for an inode (used when deleting).
     /// Returns the unique removed object IDs. With `Some(timestamp)`, queues

@@ -1397,16 +1397,15 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     return Ok(event.clone());
                 }
                 if base_attr.committed_size > 0 {
-                    let object_backed = RedbMetaEngine::lookup_regular_file_slices_in_write_txn(
-                        txn,
-                        base_attr.ino,
-                        0,
-                        base_attr.committed_size,
-                        true,
-                        true,
-                    )?
-                    .iter()
-                    .any(|span| span.payload.is_some());
+                    let object_backed =
+                        RedbMetaEngine::lookup_regular_file_stored_slices_in_write_txn(
+                            txn,
+                            base_attr.ino,
+                            0,
+                            base_attr.committed_size,
+                        )?
+                        .iter()
+                        .any(|span| span.payload.is_some());
                     if !object_backed {
                         return Ok(event.clone());
                     }
