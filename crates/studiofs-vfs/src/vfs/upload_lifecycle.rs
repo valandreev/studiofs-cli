@@ -5,7 +5,7 @@ pub(super) use worker::UploadLifecycleWorker;
 use super::{
     BackgroundCleanupThreadTask, Ino, MetadataSyncOutcome, ShutdownClaim, ShutdownError,
     ShutdownPhase, StudioVfs, VfsError, VfsIngressStats, VfsResult, VfsZeroIoShutdownSnapshot,
-    info, warn,
+    error, info, warn,
 };
 use crate::OrderedMutex;
 use futures::FutureExt as _;
@@ -16,6 +16,15 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::utils::now_unix_millis;
+
+/// Hard limit for shutdown to keep owning metadata work that still holds redb
+/// (SFS-961). Exceeding it is a defect: shutdown fails and redb is left for
+/// startup repair instead of blocking unmount forever.
+const SHUTDOWN_METADATA_OWNER_LIMIT: Duration = if cfg!(test) {
+    Duration::from_secs(5)
+} else {
+    Duration::from_secs(30)
+};
 
 fn shutdown_recoverable_on_restart(
     dirty_after: usize,
@@ -591,17 +600,47 @@ impl StudioVfs {
     /// They still own the metadata engine. If they outlive shutdown, runtime
     /// teardown panics on their timers and redb is dropped while unwinding,
     /// which skips its clean-close header (SFS-961).
-    async fn wait_for_orphaned_metadata_calls(&self, grace: Duration) {
+    async fn wait_for_orphaned_metadata_calls(&self, grace: Duration) -> Option<VfsError> {
         let mut idle = std::pin::pin!(self.meta.wait_for_idle());
         if tokio::time::timeout(grace, idle.as_mut()).await.is_ok() {
-            return;
+            return None;
         }
         warn!(
             timeout_ms = grace.as_millis() as u64,
             active_calls = self.meta.activity_snapshot().active_calls,
             "metadata calls, including ones orphaned by aborted background tasks, are still running during shutdown; waiting for completion"
         );
-        idle.await;
+        let remaining = SHUTDOWN_METADATA_OWNER_LIMIT.saturating_sub(grace);
+        if tokio::time::timeout(remaining, idle).await.is_ok() {
+            return None;
+        }
+        let limit_ms = SHUTDOWN_METADATA_OWNER_LIMIT.as_millis() as u64;
+        let active_calls = self.meta.activity_snapshot().active_calls;
+        error!(
+            limit_ms,
+            active_calls,
+            "metadata calls are still running after the shutdown owner limit; local metadata is left for startup repair"
+        );
+        Some(VfsError::ShutdownJoin(format!(
+            "{active_calls} metadata call(s) still running after {limit_ms} ms"
+        )))
+    }
+
+    /// Keep owning a final local metadata sync that missed its deadline, up to
+    /// the hard owner limit, so it does not run into runtime teardown (SFS-961).
+    async fn join_timed_out_metadata_sync(&self, flush_timeout: Duration) {
+        let remaining = SHUTDOWN_METADATA_OWNER_LIMIT.saturating_sub(flush_timeout);
+        let join = super::join_pending_metadata_sync_task(&self.state.shutdown.metadata_sync_task);
+        match tokio::time::timeout(remaining, join).await {
+            Ok(Ok(())) => info!("timed-out local metadata sync finished during shutdown"),
+            Ok(Err(error)) => {
+                warn!(error = %error, "timed-out local metadata sync failed during shutdown");
+            }
+            Err(_) => error!(
+                limit_ms = SHUTDOWN_METADATA_OWNER_LIMIT.as_millis() as u64,
+                "local metadata sync is still running after the shutdown owner limit; local metadata is left for startup repair"
+            ),
+        }
     }
 
     async fn join_uploader_task(&self, timeout: Duration) {
@@ -717,8 +756,10 @@ impl StudioVfs {
     /// upload queue, cancel uploader tasks, then persist upload state.
     ///
     /// If the local metadata barrier exceeds its configured timeout, shutdown
-    /// returns a terminal error but does not cancel the running blocking sync.
-    /// After any shutdown error, call
+    /// returns a terminal error but does not cancel the running blocking sync;
+    /// it keeps waiting for that sync, and for metadata calls orphaned by
+    /// aborted background tasks, up to a 30 s owner limit. After any shutdown
+    /// error, call
     /// [`join_pending_metadata_sync`](Self::join_pending_metadata_sync) before
     /// dropping this VFS if the process needs to reopen the same database.
     /// Dropping the VFS without joining leaves the task detached until it finishes;
@@ -858,8 +899,10 @@ impl StudioVfs {
         // Their remote sync path takes the replication lock and must not hold
         // shutdown behind a PostgreSQL command timeout.
         let metadata_close_error = self.meta.run(|meta| meta.prepare_for_close()).await.err();
-        self.wait_for_orphaned_metadata_calls(background_join_timeout)
+        let orphaned_metadata_error = self
+            .wait_for_orphaned_metadata_calls(background_join_timeout)
             .await;
+        let metadata_close_error = metadata_close_error.or(orphaned_metadata_error);
 
         // Phase 4: persist metadata + cache checkpoint.
         info!(
@@ -875,6 +918,10 @@ impl StudioVfs {
             move || meta.sync_local_metadata().map_err(VfsError::Meta),
         )
         .await;
+        if matches!(metadata_flush_result, Ok(MetadataSyncOutcome::TimedOut)) {
+            self.join_timed_out_metadata_sync(metadata_flush_timeout)
+                .await;
+        }
         let overlay_health_error = self.ensure_volatile_overlay_metadata_healthy().err();
         let mut metadata_barrier_error = select_metadata_barrier_error(
             local_dirty_drain_error,

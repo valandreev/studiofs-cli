@@ -27832,3 +27832,102 @@ fn shutdown_waits_for_metadata_call_orphaned_by_background_abort() {
         assert!(orphan_finished.load(AtomicOrdering::Acquire));
     });
 }
+
+// SFS-961: an orphaned metadata call that outlives the owner limit fails
+// shutdown instead of blocking unmount forever.
+#[test]
+fn shutdown_fails_when_orphaned_metadata_call_exceeds_owner_limit() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "shutdown-orphaned-meta-limit");
+    let _guard = rt.enter();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    rt.block_on(async {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task_vfs = Arc::clone(&vfs);
+        vfs.track_background_task(tokio::spawn(async move {
+            let _ = task_vfs
+                .meta
+                .run_maintenance(move |_| {
+                    started_tx.send(()).expect("test receiver remains live");
+                    release_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .expect("test releases metadata call");
+                    Ok::<(), MetaError>(())
+                })
+                .await;
+        }));
+        started_rx.await.expect("metadata call started");
+
+        let error = tokio::time::timeout(Duration::from_secs(20), vfs.shutdown(Duration::ZERO))
+            .await
+            .expect("shutdown must honor the metadata owner limit")
+            .expect_err("an orphaned call past the owner limit fails shutdown");
+        assert!(
+            matches!(&error, VfsError::ShutdownJoin(message) if message.contains("metadata call")),
+            "unexpected shutdown error: {error}"
+        );
+        assert!(
+            !vfs.zeroio_runtime_snapshot()
+                .last_graceful_shutdown
+                .expect("shutdown outcome is recorded")
+                .recoverable_on_restart
+        );
+    });
+    release_tx.send(()).expect("orphaned call is still blocked");
+    rt.block_on(vfs.meta.wait_for_idle());
+}
+
+// SFS-961: a final local metadata sync that misses its deadline stays owned by
+// shutdown until it finishes (within the owner limit) instead of running into
+// runtime teardown with redb still open.
+#[test]
+fn shutdown_joins_timed_out_metadata_sync_within_owner_limit() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = tmp.path().join("meta.redb");
+    let config = VfsConfig {
+        shutdown_metadata_flush_timeout_secs: 1,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "shutdown-metadata-sync-owned", config);
+    let _guard = rt.enter();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let finished = Arc::new(AtomicBool::new(false));
+    let sync_meta = Arc::clone(&meta);
+    let sync_finished = Arc::clone(&finished);
+    // The stalled sync is the scenario under test: it outlasts the 1 s flush
+    // deadline but finishes inside the owner limit.
+    let metadata_task = tokio::task::spawn_blocking(move || {
+        let _ = started_tx.send(());
+        std::thread::sleep(Duration::from_millis(1_500));
+        let result = sync_meta.sync_local_metadata().map_err(VfsError::Meta);
+        sync_finished.store(true, AtomicOrdering::Release);
+        result
+    });
+    rt.block_on(async {
+        started_rx
+            .await
+            .expect("controlled metadata sync has started");
+        *vfs.state.shutdown.metadata_sync_task.lock().await = Some(metadata_task);
+    });
+
+    let error = rt
+        .block_on(tokio::time::timeout(
+            Duration::from_secs(20),
+            vfs.shutdown(Duration::ZERO),
+        ))
+        .expect("shutdown must honor the metadata owner limit")
+        .expect_err("a sync past its deadline still fails shutdown");
+    assert!(matches!(&error, VfsError::ShutdownMetadataTimeout(1_000)));
+    assert!(
+        finished.load(AtomicOrdering::Acquire),
+        "shutdown returns only after the timed-out sync released redb"
+    );
+    assert!(
+        rt.block_on(async { vfs.state.shutdown.metadata_sync_task.lock().await.is_none() }),
+        "the joined sync handle is cleared"
+    );
+    drop(vfs);
+    drop(meta);
+    drop(RedbMetaEngine::open(&db_path).expect("redb reopens right after shutdown"));
+}
