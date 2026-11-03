@@ -8891,6 +8891,139 @@ fn self_ack_of_local_create_preserves_later_rename_source_and_destination() {
 }
 
 #[test]
+fn self_replay_of_rename_away_keeps_recreated_source_and_unlinked_destination() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let old = pg
+        .create_file(ROOT_INO, b"NEWTIPS.PPT", 0, 0, 0o644)
+        .expect("create local file");
+    let mut attr = pg.get_attr(old.ino).expect("load local attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make local file publishable");
+    pg.rename_atomic(
+        ROOT_INO,
+        b"NEWTIPS.PPT",
+        ROOT_INO,
+        b"PPTC241.TMP",
+        true,
+        false,
+    )
+    .expect("rename away locally");
+    let prefix_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("prefix end");
+    let prefix_events = pg
+        .local
+        .read_events_range(start, prefix_end)
+        .expect("read published prefix");
+    let published = RemoteApplyCoordinator::project_local_batch(&prefix_events).events;
+    assert!(
+        published
+            .iter()
+            .any(|event| matches!(event, MetaEvent::RenameEntry { .. })),
+        "published prefix must carry the rename: {published:?}"
+    );
+
+    let recreated = pg
+        .create_file(ROOT_INO, b"NEWTIPS.PPT", 0, 0, 0o644)
+        .expect("recreate source name locally");
+    pg.unlink(ROOT_INO, b"PPTC241.TMP")
+        .expect("unlink rename destination locally");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("suffix end");
+    let overlay = pg.local_overlay_conflicts().expect("local suffix overlay");
+
+    apply_self_replay(&pg, published, start, end, overlay);
+
+    assert_eq!(
+        pg.local
+            .lookup(ROOT_INO, b"NEWTIPS.PPT")
+            .expect("recreated source name must survive its own rename echo")
+            .ino,
+        recreated.ino
+    );
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"PPTC241.TMP"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "the echo must not resurrect a destination unlinked locally"
+    );
+}
+
+#[test]
+fn pending_replay_of_local_unlink_hides_echoed_rename_destination() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start)
+        .expect("ack initial local state");
+
+    let file = pg
+        .create_file(ROOT_INO, b"NEWTIPS.PPT", 0, 0, 0o644)
+        .expect("create local file");
+    let mut attr = pg.get_attr(file.ino).expect("load local attrs");
+    attr.size = 1;
+    attr.committed_size = 1;
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).expect("make local file publishable");
+    // Unpublished overlay rows make the later unlink a deleted-before-publish
+    // removal, which journals RemoveAttr without a RemoveEntry.
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_033, 1))
+        .expect("stage unpublished overlay slice");
+    pg.rename_atomic(
+        ROOT_INO,
+        b"NEWTIPS.PPT",
+        ROOT_INO,
+        b"PPTC321.TMP",
+        true,
+        false,
+    )
+    .expect("rename away locally");
+    let prefix_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("prefix end");
+    let prefix_events = pg
+        .local
+        .read_events_range(start, prefix_end)
+        .expect("read published prefix");
+    let published = RemoteApplyCoordinator::project_local_batch(&prefix_events).events;
+    assert!(
+        published.iter().any(|event| matches!(
+            event,
+            MetaEvent::RenameEntry { new_name, .. } if new_name.as_slice() == b"PPTC321.TMP"
+        )),
+        "published prefix must carry the rename: {published:?}"
+    );
+
+    pg.unlink(ROOT_INO, b"PPTC321.TMP")
+        .expect("unlink rename destination locally");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("suffix end");
+    let overlay = pg.local_overlay_conflicts().expect("local suffix overlay");
+    apply_self_replay(&pg, published, start, end, overlay);
+
+    // A replay page that reconciled serving keys re-applies the unflushed suffix.
+    let suffix = pg
+        .local
+        .read_events_range(prefix_end, end)
+        .expect("read unflushed suffix");
+    pg.local
+        .apply_replica_serving_state_for_pending_replay(&suffix)
+        .expect("replay pending serving state");
+
+    assert!(
+        matches!(
+            pg.local.lookup(ROOT_INO, b"PPTC321.TMP"),
+            Err(MetaError::EntryNotFound { .. })
+        ),
+        "replaying the local unlink must not expose the echoed base destination"
+    );
+}
+
+#[test]
 fn self_replay_uses_local_namespace_events_committed_after_context_capture() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
