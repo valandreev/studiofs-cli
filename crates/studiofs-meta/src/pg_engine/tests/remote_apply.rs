@@ -5183,6 +5183,68 @@ fn publish_without_ready_attr_preserves_protected_base_graph() {
 }
 
 #[test]
+fn self_ack_preserves_recreated_draft_hidden_inside_published_batch() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
+    pg.persist_flushed_event_seq(start).expect("ack setup");
+    create_published_small_file(&pg, ROOT_INO, b"NEWPCB.PPT", 77_402);
+    pg.rename_atomic(
+        ROOT_INO,
+        b"NEWPCB.PPT",
+        ROOT_INO,
+        b"PPTC402.TMP",
+        true,
+        false,
+    )
+    .expect("rename old version");
+    let draft = pg
+        .create_file(ROOT_INO, b"NEWPCB.PPT", 0, 0, 0o644)
+        .expect("recreate source");
+    pg.create_dir(ROOT_INO, b"other-client-visible-op", 0, 0, 0o755)
+        .expect("visible trailing operation");
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+    let events = pg.local.read_events_range(start, end).expect("batch");
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    assert!(
+        !projected.events.iter().any(|event| matches!(event,
+            MetaEvent::AddEntry { entry, .. } if entry.ino == draft.ino
+        )),
+        "new draft must stay private"
+    );
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(&events, &projected.events, None)
+            .expect("match actual publication prefix"),
+        Some(events.len()),
+        "the trailing visible operation makes self ack consume the hidden draft"
+    );
+    let range = LocalEventRange { start, end };
+    pg.mark_local_event_ranges_published_with_prefix(&[range], Some((1, vec![range])))
+        .expect("publish projected batch");
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: projected.events,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 0,
+            current_namespace_version: 0,
+            flushed_event_seq: start,
+            next_event_seq: end,
+            initial_overlay: pg.local_overlay_conflicts().expect("overlay"),
+        },
+    )
+    .expect("self replay");
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"NEWPCB.PPT")
+            .expect("hidden draft after self ack")
+            .ino,
+        draft.ino
+    );
+}
+
+#[test]
 fn hidden_uploading_rename_survives_recent_flush_reconciliation() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event start");
