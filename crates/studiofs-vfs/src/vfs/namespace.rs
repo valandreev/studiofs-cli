@@ -87,6 +87,14 @@ impl DeferredNamespaceOp {
         }
     }
 
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            Self::CreateFile { .. } => "create_file",
+            Self::CreateDir { .. } => "create_dir",
+            Self::SetAttr { .. } => "setattr",
+        }
+    }
+
     /// Parent directory whose attributes this operation updates.
     pub(super) fn created_parent(&self) -> Option<Ino> {
         match self {

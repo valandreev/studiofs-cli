@@ -19055,10 +19055,13 @@ fn deferred_namespace_progress_distinguishes_readmitted_inode() {
 #[test]
 fn deferred_namespace_drain_abandons_permanent_failure() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "deferred-namespace-abandons-failure");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "deferred-namespace-abandons-failure");
     let _guard = rt.enter();
     rt.block_on(async {
+        // A regular-file parent is a failure no conflict handling can contain.
         let parent = 9_000_001;
+        meta.create_file_with_ino(parent, ROOT_INO, b"file-parent", 0, 0, 0o644)
+            .expect("create regular-file parent");
         let attr = InodeAttr::new_file(9_000_002, parent, 0, 0, 0o644);
         vfs.enqueue_deferred_namespace_op(
             Some(super::namespace::DeferredNamespaceKey::new(
@@ -19620,6 +19623,148 @@ fn deferred_namespace_entry_conflict_abandons_setattr_for_created_inode() {
             "dependent operations from a namespace conflict must not degrade the mount"
         );
     });
+}
+
+/// Admit a deferred create under a committed directory with the drain held back.
+fn admit_deferred_child_with_drain_held(
+    vfs: &Arc<StudioVfs>,
+    meta: &Arc<RedbMetaEngine>,
+    rt: &Runtime,
+) -> (Ino, InodeAttr) {
+    let dir = meta
+        .create_dir(ROOT_INO, b"dir", 0, 0, 0o755)
+        .expect("create committed directory");
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(true, AtomicOrdering::Release);
+    let child = vfs
+        .create_with_deferred_metadata_admission(dir.ino, b"child", 0, 0, 0o644, rt.handle())
+        .expect("admit deferred child create");
+    (dir.ino, child)
+}
+
+fn release_deferred_drain(vfs: &Arc<StudioVfs>, rt: &Runtime) {
+    vfs.state
+        .namespace
+        .deferred
+        .draining
+        .store(false, AtomicOrdering::Release);
+    vfs.schedule_deferred_namespace_metadata_drain(rt.handle());
+}
+
+#[test]
+fn rmdir_waits_for_pending_deferred_child_and_reports_not_empty() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rmdir-pending-child");
+    let _guard = rt.enter();
+    let (dir, child) = admit_deferred_child_with_drain_held(&vfs, &meta, &rt);
+
+    rt.block_on(async {
+        let rmdir_vfs = Arc::clone(&vfs);
+        let mut rmdir = tokio::task::spawn_blocking(move || rmdir_vfs.rmdir(ROOT_INO, b"dir"));
+        // The child is not committed, so rmdir has no answer until the drain runs.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut rmdir)
+                .await
+                .is_err(),
+            "rmdir must not finish while an acknowledged child create is pending"
+        );
+        release_deferred_drain(&vfs, &rt);
+        let result = tokio::time::timeout(Duration::from_secs(5), rmdir)
+            .await
+            .expect("rmdir should finish after the drain")
+            .expect("rmdir task");
+        assert!(
+            matches!(result, Err(VfsError::Meta(MetaError::DirNotEmpty(ino))) if ino == dir),
+            "unexpected rmdir result: {result:?}"
+        );
+    });
+
+    assert_eq!(meta.lookup(dir, b"child").expect("child").ino, child.ino);
+    vfs.ensure_deferred_namespace_metadata_healthy()
+        .expect("mount stays healthy");
+}
+
+#[test]
+fn rename_over_dir_waits_for_pending_deferred_child_and_reports_not_empty() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "rename-pending-child");
+    let _guard = rt.enter();
+    meta.create_dir(ROOT_INO, b"source", 0, 0, 0o755)
+        .expect("create source directory");
+    let (dir, child) = admit_deferred_child_with_drain_held(&vfs, &meta, &rt);
+
+    rt.block_on(async {
+        let rename_vfs = Arc::clone(&vfs);
+        let mut rename = tokio::task::spawn_blocking(move || {
+            rename_vfs.rename(ROOT_INO, b"source", ROOT_INO, b"dir", true)
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut rename)
+                .await
+                .is_err(),
+            "rename must not replace a directory while a child create is pending"
+        );
+        release_deferred_drain(&vfs, &rt);
+        let result = tokio::time::timeout(Duration::from_secs(5), rename)
+            .await
+            .expect("rename should finish after the drain")
+            .expect("rename task");
+        assert!(
+            matches!(result, Err(VfsError::Meta(MetaError::DirNotEmpty(_)))),
+            "unexpected rename result: {result:?}"
+        );
+    });
+
+    assert_eq!(meta.lookup(dir, b"child").expect("child").ino, child.ino);
+    vfs.ensure_deferred_namespace_metadata_healthy()
+        .expect("mount stays healthy");
+}
+
+#[test]
+fn deferred_create_under_removed_parent_abandons_only_that_create() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-removed-parent");
+    let _guard = rt.enter();
+    let (_, child) = admit_deferred_child_with_drain_held(&vfs, &meta, &rt);
+    let independent = vfs
+        .create_with_deferred_metadata_admission(ROOT_INO, b"independent", 0, 0, 0o644, rt.handle())
+        .expect("admit independent create");
+    // A removal that bypasses this mount's VFS, as peer replay does.
+    meta.rmdir(ROOT_INO, b"dir").expect("remove parent");
+    release_deferred_drain(&vfs, &rt);
+
+    rt.block_on(async {
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            vfs.wait_for_deferred_namespace_metadata(child.ino),
+        )
+        .await
+        .expect("child create should settle")
+        .expect_err("a create under a removed parent cannot commit");
+        assert!(
+            error.to_string().contains("inode not found"),
+            "unexpected child error: {error}"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            vfs.wait_for_deferred_namespace_metadata(independent.ino),
+        )
+        .await
+        .expect("independent create should settle")
+        .expect("independent create should commit");
+    });
+
+    assert_eq!(
+        meta.lookup(ROOT_INO, b"independent")
+            .expect("independent entry")
+            .ino,
+        independent.ino
+    );
+    vfs.ensure_deferred_namespace_metadata_healthy()
+        .expect("one lost create must not degrade the mount");
 }
 
 #[test]
