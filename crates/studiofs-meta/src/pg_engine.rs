@@ -1722,10 +1722,17 @@ impl PgMetaEngine {
                     .local
                     .set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 0)?;
                 if catch_up_succeeded {
-                    engine.metadata_startup_target_version.store(
-                        engine.local_version.load(Ordering::Acquire),
-                        Ordering::Release,
-                    );
+                    // A session that already completed cleared its target; freezing
+                    // one again would stop all later replay.
+                    if matches!(
+                        engine.current_pg_sync_lifecycle(),
+                        PgSyncLifecycle::CatchingUp | PgSyncLifecycle::Degraded
+                    ) {
+                        engine.metadata_startup_target_version.store(
+                            engine.local_version.load(Ordering::Acquire),
+                            Ordering::Release,
+                        );
+                    }
                     // Like a failed background completion: degrade, don't fail open.
                     if let Err(error) = engine.try_complete_catchup_sync() {
                         engine.record_pg_sync_failure(&error);
