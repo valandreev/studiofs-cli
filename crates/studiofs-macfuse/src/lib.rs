@@ -2089,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_io_read_only_open_enables_sequential_ram_readahead() {
+    fn read_only_open_enables_sequential_ram_readahead() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-direct-io-ram-readahead",
         )
@@ -2114,7 +2114,7 @@ mod tests {
         let reader = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open unpublished reader through macFUSE adapter");
-        assert!(reader.direct_io());
+        assert!(!reader.direct_io());
         assert!(vfs.sequential_ram_readahead_enabled(reader.file_handle()));
 
         let writer = adapter
@@ -2164,8 +2164,8 @@ mod tests {
             .open(attr.ino, libc::O_RDONLY)
             .expect("open unpublished reader through macFUSE adapter");
         assert!(
-            reader.direct_io(),
-            "unpublished local payload must use the VFS read path"
+            !reader.direct_io(),
+            "unpublished local payload must stay mappable: direct_io fails page-ins on the vnode"
         );
 
         let first = adapter
@@ -3292,8 +3292,8 @@ mod tests {
             .open(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle while write-capable handle remains active");
         assert!(
-            read_while_writer_active.direct_io(),
-            "read-only opens during a writer epoch must keep reads on the VFS path: {read_while_writer_active:?}"
+            !read_while_writer_active.direct_io(),
+            "read-only opens during a writer epoch must stay mappable: {read_while_writer_active:?}"
         );
         assert!(
             !read_while_writer_active.keep_cache(),
@@ -3421,8 +3421,8 @@ mod tests {
             "first read-only open after local-stable release should drop cache: {read_after_local_release:?}"
         );
         assert!(
-            read_after_local_release.direct_io(),
-            "locally materialized unpublished payload must keep reads on the VFS path: {read_after_local_release:?}"
+            !read_after_local_release.direct_io(),
+            "locally materialized unpublished payload must stay mappable: {read_after_local_release:?}"
         );
         let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
         assert_eq!(cache_decisions.clean_write_release_seeded, 0);

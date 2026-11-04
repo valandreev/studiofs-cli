@@ -377,6 +377,21 @@ write reaches the VFS as a 16 KiB page write.
 runtime snapshots before/after fsync. Unit tests alone do not establish mounted
 latency acceptance.
 
+### macOS Page-Ins for Unpublished Local State
+
+A `direct_io` open makes macFUSE fail later page-ins on the vnode, which surfaces as
+`SIGBUS` on `mmap` access or `exec`. `mounted-macos-mmap-exec` maps a just-closed
+file, writes through a mapping of a created handle, and executes a just-copied
+binary twice; each mapping runs in a forked child, and `macos-mmap-exec.json` records
+how each step ended. Mapping a file reopened for write remains a known limitation
+(`docs/platform-bridges.md`), so the scenario does not cover it. It needs macOS and
+reports `Unsupported` elsewhere.
+
+```sh
+cargo build -p studiofs -p studiofs-e2e
+target/debug/studiofs-e2e run mounted-macos-mmap-exec --studiofs-bin target/debug/studiofs --run-id macos-mmap-exec --retain always --timeout 300s
+```
+
 ### SFS-915 Truncate, Attribute Updates and Payload Lifetime
 
 A size change advances the inode's content epoch while an upload for the old

@@ -1496,11 +1496,11 @@ impl StudioVfsAdapter {
         // the inode generation and make the next fitting open purge pages that
         // other handles may still be reusing.
         let policy = MacFuseOpenCachePolicy {
-            // Unpublished local state cannot safely use the kernel's cached size or pages.
-            // Buffered reads are kept only for observed-generation decisions
-            // (published or locally stable); unknown, local-dirty, and active-writer
-            // state uses direct_io.
-            direct_io: !decision.reason().observes_generation() || memory_direct_io.is_some(),
+            // An open's direct_io makes macFUSE fail page-ins on the vnode until it is reclaimed,
+            // so it must not depend on transient local state: a just-built binary or a file
+            // still flushing would die with SIGBUS on exec or mmap. keep_cache stays false for
+            // these states, and same-mount writes stay coherent with these reads in the kernel.
+            direct_io: memory_direct_io.is_some(),
             keep_cache,
             write_capable: false,
         };
@@ -3068,6 +3068,32 @@ mod open_cache_snapshot_tests {
         let stats = vfs.write_path_observability_snapshot().macfuse_open_cache;
         assert_eq!(stats.read_only_memory_unavailable_direct_io, 0);
         assert_eq!(stats.read_only_exceeds_memory_direct_io, 0);
+    }
+
+    #[test]
+    fn memory_direct_io_open_enables_sequential_ram_readahead() {
+        let fixture =
+            ContractVfsFixture::new("macfuse-open-direct-readahead").expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let attr = vfs
+            .create(CONTRACT_ROOT_INO, b"direct-readahead.bin", 501, 20, 0o644)
+            .expect("create file");
+        vfs.setattr(attr.ino, studiofs_meta::SetattrArgs::size_only(1024 * 1024))
+            .expect("set size");
+        let adapter = StudioVfsAdapter::new_with_read_queue_byte_limit(
+            vfs.clone(),
+            fixture.runtime().handle().clone(),
+            false,
+            super::MACFUSE_READ_MAX_PENDING_BYTES,
+            super::SystemMemorySampler::started(|| Some(1)),
+        );
+
+        let opened = adapter.open(attr.ino, libc::O_RDONLY).expect("open file");
+        assert!(opened.direct_io(), "the file exceeds the sampled memory");
+        assert!(vfs.sequential_ram_readahead_enabled(opened.file_handle()));
+        adapter
+            .release(attr.ino, opened.file_handle())
+            .expect("release file");
     }
 
     #[test]
