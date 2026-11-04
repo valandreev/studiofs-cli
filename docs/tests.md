@@ -571,6 +571,19 @@ cargo build -p studiofs -p studiofs-e2e
 target/debug/studiofs-e2e run mounted-posix-acl-xattr-rejection --studiofs-bin target/debug/studiofs --run-id sfs934-acl --retain always --timeout 300s
 ```
 
+### SFS-957 Xattr Changes Against Pending Deferred Creates
+
+`setxattr` and `removexattr` settle a pending deferred create before they touch
+the inode row, so they no longer report `ENOENT` on a just-created file, and
+report a failed create as that failure. They run in a `Write` file session, so a
+flush cannot overwrite the new ctime, and a dirty attribute carries the same
+ctime as the inode row. Mounted xfstests generic/037,
+/093, /097, /337, /377, /403, /486, /611, /618, and /728 are a separate gate:
+
+```sh
+cargo test -p studiofs-vfs --lib xattr_
+```
+
 ### SFS-959 Directory Removal Against Pending Deferred Creates
 
 `rmdir` and a rename replacing a directory report `ENOTEMPTY` while an

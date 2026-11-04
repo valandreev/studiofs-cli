@@ -50,7 +50,7 @@ no longer occurs, but /241 still fails (see below).
 
 | Test | Why it fails | Issue |
 |---|---|---|
-| `generic/037`, `/093`, `/097`, `/337`, `/377`, `/403`, `/486`, `/611`, `/618` | **Regression** (all passed in run 1). `setxattr`/`fsetxattr` on a just-created file returns ENOENT. The SFS-952 ctime touch looks the inode up in redb before the deferred create has committed. | [SFS-957](https://linear.app/valandreev/issue/SFS-957) |
+| `generic/037`, `/093`, `/097`, `/337`, `/377`, `/403`, `/486`, `/611`, `/618` | **Regression** (all passed in run 1). `setxattr`/`fsetxattr` on a just-created file returns ENOENT. The SFS-952 ctime touch looks the inode up in redb before the deferred create has committed. Fixed: a targeted rerun on 2026-11-04 passes all nine and `/728`. | [SFS-957](https://linear.app/valandreev/issue/SFS-957) |
 | `generic/525` | **Regression in observed result**: the startup code did not change. A remount with a pending upload for a byte at offset 2^63−2 hangs, because startup replay walks every chunk up to the file size. The killed start leaves redb needing repair, and the scratch volume stays unmountable. | [SFS-958](https://linear.app/valandreev/issue/SFS-958) |
 | `generic/795` | Same startup-replay hang after fsstress, with 214 pending uploads on large sparse files. The remount is not ready within 120 s, then `cmp` gets EIO. | [SFS-958](https://linear.app/valandreev/issue/SFS-958) |
 | `generic/013` (timeout) | Times out at 60 s. At 300 s it fails: a deferred namespace batch is abandoned with `inode not found`, and `rm -rf` of the fsstress tree gets EIO. The same abandonment appears in run 1's logs. | [SFS-959](https://linear.app/valandreev/issue/SFS-959) |
