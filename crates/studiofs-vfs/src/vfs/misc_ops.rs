@@ -1,5 +1,6 @@
 use super::{
-    AccessLevel, FileType, Ino, MetaError, ROOT_INO, StudioVfs, VfsError, VfsResult, debug, warn,
+    AccessLevel, FileSessionOperation, FileType, Ino, MetaError, ROOT_INO, StudioVfs, VfsError,
+    VfsResult, debug, warn,
 };
 use crate::runtime::run_local_cache_io_blocking;
 
@@ -34,7 +35,7 @@ impl StudioVfs {
 
     /// Set an extended attribute.
     pub fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> VfsResult<()> {
-        let _operation = self.try_mutating_operation_admission()?;
+        let operation = self.try_mutating_operation_admission()?;
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
@@ -45,19 +46,54 @@ impl StudioVfs {
                 limit: self.max_xattr_bytes,
             }));
         }
-        self.sync_meta().set_xattr(ino, name, value, flags)?;
-        self.invalidate_attr_read_cache([ino]);
-        Ok(())
+        self.commit_xattr_mutation(&operation, ino, || {
+            self.sync_meta().set_xattr(ino, name, value, flags)
+        })
     }
 
     /// Remove an extended attribute.
     pub fn remove_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<()> {
-        let _operation = self.try_mutating_operation_admission()?;
+        let operation = self.try_mutating_operation_admission()?;
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if self.ignored_entry_attr(ino).is_some() {
             return Ok(());
         }
-        self.sync_meta().remove_xattr(ino, name)?;
+        self.commit_xattr_mutation(&operation, ino, || self.sync_meta().remove_xattr(ino, name))
+    }
+
+    /// Run an xattr mutation, whose ctime touch updates the inode row.
+    fn commit_xattr_mutation(
+        &self,
+        operation: &MutatingOperationAdmission<'_>,
+        ino: Ino,
+        mutate: impl FnOnce() -> Result<(), MetaError>,
+    ) -> VfsResult<()> {
+        // A queued create has not committed the inode row yet.
+        if self.has_deferred_namespace_metadata(ino) {
+            self.run_sync_future_with_admission(
+                operation,
+                self.drain_deferred_namespace_metadata_for_barrier(),
+            )?;
+        }
+        self.ensure_no_deferred_namespace_error(ino)?;
+        // A flush persisting its dirty attr snapshot would overwrite the new ctime.
+        let cleanup = self.file_session_cleanup(ino);
+        let permit = self.run_sync_future_with_admission(operation, async {
+            Ok(self
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Write)
+                .await)
+        })?;
+        let _cleanup = cleanup.with_permit(permit);
+        mutate()?;
+        // getattr prefers a dirty attr, and a later flush persists it over the inode row.
+        if self.peek_dirty_attr(ino).is_some() {
+            let ctime = self.sync_meta().get_attr(ino)?.ctime;
+            if let Some(attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
+                attr.ctime = ctime;
+            }
+        }
         self.invalidate_attr_read_cache([ino]);
         Ok(())
     }

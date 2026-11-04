@@ -27990,6 +27990,159 @@ fn xattr_mutations_invalidate_cached_attr_ctime() {
     }
 }
 
+fn admit_held_deferred_create(
+    rt: &tokio::runtime::Runtime,
+    vfs: &Arc<StudioVfs>,
+    is_dir: bool,
+    name: &[u8],
+) -> InodeAttr {
+    // Keep the background drain off so the create stays queued until a barrier runs it.
+    let draining = &vfs.state.namespace.deferred.draining;
+    draining.store(true, AtomicOrdering::Release);
+    let attr = if is_dir {
+        vfs.mkdir_with_deferred_metadata_admission(ROOT_INO, name, 0, 0, 0o755, rt.handle())
+    } else {
+        vfs.create_with_deferred_metadata_admission(ROOT_INO, name, 0, 0, 0o644, rt.handle())
+    }
+    .expect("admit deferred create");
+    draining.store(false, AtomicOrdering::Release);
+    attr
+}
+
+// SFS-957: the xattr ctime touch needs the inode row a queued create has not committed.
+#[test]
+fn xattr_mutations_settle_pending_deferred_create() {
+    const XATTR_CREATE: u32 = 1;
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "deferred-create-xattr");
+    let _guard = rt.enter();
+
+    for (is_dir, name) in [(false, b"file".as_slice()), (true, b"dir".as_slice())] {
+        let attr = admit_held_deferred_create(&rt, &vfs, is_dir, name);
+        assert!(vfs.has_deferred_namespace_metadata(attr.ino));
+        assert!(matches!(
+            meta.get_attr(attr.ino),
+            Err(MetaError::InodeNotFound(_))
+        ));
+
+        vfs.set_xattr(attr.ino, b"user.a", b"v", XATTR_CREATE)
+            .expect("setxattr right after create");
+
+        assert_eq!(
+            vfs.get_xattr(attr.ino, b"user.a").unwrap().as_deref(),
+            Some(b"v".as_slice())
+        );
+        assert_eq!(vfs.list_xattrs(attr.ino).unwrap(), vec![b"user.a".to_vec()]);
+        assert!(matches!(
+            vfs.set_xattr(attr.ino, b"user.a", b"w", XATTR_CREATE),
+            Err(VfsError::Meta(MetaError::EntryExists { .. }))
+        ));
+        let after_set = vfs.getattr(attr.ino).expect("attr after setxattr").ctime;
+        assert!(after_set > attr.ctime, "is_dir={is_dir}");
+
+        vfs.remove_xattr(attr.ino, b"user.a")
+            .expect("removexattr after create");
+        assert_eq!(vfs.get_xattr(attr.ino, b"user.a").unwrap(), None);
+        assert!(vfs.getattr(attr.ino).unwrap().ctime > after_set);
+    }
+}
+
+// A written file answers getattr from its dirty attr, which must show the xattr ctime too.
+#[test]
+fn xattr_ctime_is_visible_through_dirty_attr() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "dirty-attr-xattr");
+    let _guard = rt.enter();
+    let attr = admit_held_deferred_create(&rt, &vfs, false, b"file");
+    let fh = vfs
+        .open_created_file_with_known_attr(&attr, OpenFlags::RDWR, false)
+        .expect("open created file");
+    rt.block_on(vfs.write_fh(fh, attr.ino, 0, b"data"))
+        .expect("write");
+    let before = vfs.getattr(attr.ino).expect("attr after write");
+    assert!(vfs.peek_dirty_attr(attr.ino).is_some());
+
+    vfs.set_xattr(attr.ino, b"user.a", b"v", 0).unwrap();
+
+    let after = vfs.getattr(attr.ino).expect("attr after setxattr");
+    assert_eq!(after.size, before.size);
+    assert!(after.ctime > before.ctime);
+    assert_eq!(after.ctime, meta.get_attr(attr.ino).unwrap().ctime);
+    rt.block_on(vfs.release_fh(fh)).expect("release");
+    assert_eq!(vfs.peek_dirty_attr(attr.ino), None);
+    assert_eq!(meta.get_attr(attr.ino).unwrap().ctime, after.ctime);
+}
+
+// A flush persists its dirty attr snapshot, so it must not interleave with the ctime update.
+#[test]
+fn xattr_mutations_wait_for_active_flush_session() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "xattr-flush-session");
+    let attr = {
+        let _guard = rt.enter();
+        vfs.create(ROOT_INO, b"file", 0, 0, 0o644)
+            .expect("create file")
+    };
+    let flush = rt.block_on(
+        vfs.state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Flush),
+    );
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = rt.handle().clone();
+    let xattr_vfs = vfs.clone();
+    let worker = std::thread::spawn(move || {
+        let _guard = handle.enter();
+        done_tx
+            .send(xattr_vfs.set_xattr(attr.ino, b"user.a", b"v", 0))
+            .expect("report result");
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while vfs.file_session_stats().queued_ops == 0 {
+        assert!(
+            done_rx.try_recv().is_err(),
+            "setxattr finished during an active flush session"
+        );
+        assert!(Instant::now() < deadline, "setxattr never queued");
+        std::thread::yield_now();
+    }
+    assert!(done_rx.try_recv().is_err());
+    drop(flush);
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("setxattr finishes after the flush session")
+        .expect("setxattr");
+    worker.join().expect("join worker");
+}
+
+#[test]
+fn xattr_mutations_report_failed_deferred_create() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "xattr-failed-create");
+    let _guard = rt.enter();
+    let attr = admit_held_deferred_create(&rt, &vfs, false, b"file");
+    // Drop the queued create and keep only its failure, like an abandoned batch.
+    {
+        let mut inner = vfs.state.namespace.deferred.inner.lock();
+        inner.queue.clear();
+        inner.pending_inodes.remove(&attr.ino);
+        inner.errors.insert(attr.ino, "commit failed".into());
+    }
+
+    for result in [
+        vfs.set_xattr(attr.ino, b"user.a", b"v", 0),
+        vfs.remove_xattr(attr.ino, b"user.a"),
+    ] {
+        let error = result.expect_err("failed create must be reported");
+        assert!(
+            error.to_string().contains("commit failed"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
 // SFS-961: a background task aborted at the shutdown join deadline leaves its
 // spawn_blocking metadata call running. Shutdown must wait for that owner
 // before the final local metadata barrier instead of handing it to runtime
