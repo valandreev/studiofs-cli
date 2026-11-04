@@ -368,8 +368,11 @@ The scenario performs 15 seconds of random 4 KiB writes over a 256 MiB file and
 samples the upload queue every 100 ms. It fails unless an active upload with a
 pending backlog appears within 5 s, fsync stays within three times the local
 metadata commit time it spans plus 500 ms, readback matches, physical payload
-objects stay within accepted bytes divided by pack size plus partial drains, and
-the live runtime stats text stays within half of its 64 KiB reported size.
+objects stay within `vfs_write.accepted_bytes` divided by pack size plus partial
+drains, accepted bytes cover every requested write, and the live runtime stats
+text stays within half of its 64 KiB reported size. Accepted bytes can exceed the
+requested bytes: on a 16 KiB-page Mac the created handle uses UBC, so each 4 KiB
+write reaches the VFS as a 16 KiB page write.
 `random-write-packing.json` retains these values, the upload samples and public
 runtime snapshots before/after fsync. Unit tests alone do not establish mounted
 latency acceptance.

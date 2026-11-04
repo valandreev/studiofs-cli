@@ -775,6 +775,13 @@ Write-capable handles use per-handle `direct_io`: macFUSE's buffered Apple
 copy path can otherwise replace valid large-write buffers before the low-level
 write callback. Read-only handles retain the adaptive UBC policy above.
 
+macFUSE 5.5 ignores `FOPEN_DIRECT_IO` in a create reply, so this policy takes effect
+only from the next `open`. Until then the handle from `create` uses UBC: on a
+16 KiB-page Mac each 4 KiB write reaches the VFS as a 16 KiB page write, usually
+after a 16 KiB page read. Removing the `create` callback makes the kernel use `mknod`
+plus `open` and honors `direct_io`, but measured runs then fail `mmap` page-ins on new
+files with `SIGBUS` (`ENOTSUP`), which the UBC-backed create handle avoids.
+
 A read-only handle that gets `direct_io` has no UBC or kernel read-ahead.
 An `F_NOCACHE` reader such as AJA System Test or NLE playback bypasses UBC
 even on a cached handle and issues callbacks one at a time. The adapter cannot
