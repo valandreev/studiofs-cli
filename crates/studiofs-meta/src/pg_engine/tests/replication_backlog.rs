@@ -4149,6 +4149,60 @@ fn pg_redb_repair_catch_up_stops_at_deadline_and_stays_degraded() {
     redb_repair_unpublished_child_scenario(20, false);
 }
 
+/// A repair catch-up that completes inside its session must not leave a frozen
+/// target behind: later peer batches would stop replaying without any error.
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_redb_repair_without_recovery_rows_keeps_replaying_peer_batches() {
+    let dsn = pg_dsn().expect("PostgreSQL regression requires STUDIOFS_TEST_PG_DSN");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    let peer_path = dir.path().join("peer.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-repair-keeps-replaying");
+    seed_local(&path, &volume.format_info());
+    seed_local(&peer_path, &volume.format_info());
+    let options = PgOpenOptions {
+        background_poll: false,
+        ..Default::default()
+    };
+    let pg = PgMetaEngine::open_with_options(&path, options).expect("open writer");
+    pg.create_dir(ROOT_INO, b"before-crash", 0, 0, 0o755)
+        .expect("seed entry");
+    pg.pending_state.lock().unwrap().force_flush = true;
+    pg.flush_due_pending().expect("publish seed entry");
+    pg.write_checkpoint_with_lease()
+        .expect("publish checkpoint");
+    drop(pg);
+
+    studiofs_test_support::mark_redb_repair_required(&path).expect("mark repair");
+    {
+        let redb = RedbMetaEngine::open(&path).expect("redb auto-repair");
+        redb.set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)
+            .expect("set repair marker");
+    }
+    let pg = PgMetaEngine::open_with_options(&path, options).expect("repair reopen");
+    assert_eq!(pg.pg_sync_status().lifecycle, PgSyncLifecycle::Live);
+    assert_eq!(pg.pg_sync_diagnostics().startup_target_version, None);
+
+    let peer = PgMetaEngine::open_with_options(&peer_path, options).expect("open peer");
+    peer.sync_metadata_with_source(MetadataSyncSource::Manual)
+        .expect("peer catch-up");
+    peer.create_dir(ROOT_INO, b"after-repair", 0, 0, 0o755)
+        .expect("peer entry");
+    peer.pending_state.lock().unwrap().force_flush = true;
+    peer.flush_due_pending().expect("publish peer entry");
+    assert_eq!(peer.replication_backlog().total_ops(), 0, "peer published");
+
+    pg.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)
+        .expect("sync after repair");
+    assert!(
+        pg.lookup(ROOT_INO, b"after-repair").is_ok(),
+        "a repaired client must keep applying peer batches"
+    );
+    peer.prepare_for_close().expect("close peer");
+    pg.prepare_for_close().expect("close repaired writer");
+}
+
 fn redb_repair_restores_unpublished_child(tail_batches: usize) {
     redb_repair_unpublished_child_scenario(tail_batches, true);
 }

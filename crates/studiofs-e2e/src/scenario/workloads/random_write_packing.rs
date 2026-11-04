@@ -3,7 +3,7 @@
 use super::*;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use studiofs_vfs::RuntimeStatsSnapshot;
+use studiofs_vfs::{RUNTIME_STATS_FILE_REPORTED_SIZE, RuntimeStatsSnapshot};
 
 const SUMMARY: &str = "random-write-packing.json";
 const FILE_BYTES: usize = 256 * 1024 * 1024;
@@ -16,6 +16,8 @@ const FIRST_UPLOAD_DEADLINE_MS: u64 = 5_000;
 // fsync must be bounded by its metadata commits, not by per-fragment payload work.
 const FSYNC_COMMIT_MULTIPLE: f64 = 3.0;
 const FSYNC_FLOOR_MS: f64 = 500.0;
+// WinFSP may bound reads by the reported size, so live snapshots must stay well below it.
+const RUNTIME_STATS_MAX_BYTES: usize = RUNTIME_STATS_FILE_REPORTED_SIZE as usize / 2;
 
 pub(in crate::scenario) struct RandomWritePacking;
 
@@ -73,6 +75,7 @@ impl Scenario for RandomWritePacking {
             ))
         })?;
         let fsync_bound_ms = FSYNC_COMMIT_MULTIPLE * fsync_commit_ms + FSYNC_FLOOR_MS;
+        let stats_bytes = summary["after_fsync"].as_str().map_or(usize::MAX, str::len);
         // Each drain can add a partial pack; 32 exceeds the number of aged drains in 15 seconds.
         let bound = writes
             .saturating_mul(WRITE_BYTES as u64)
@@ -85,10 +88,11 @@ impl Scenario for RandomWritePacking {
             || first_upload_ms > FIRST_UPLOAD_DEADLINE_MS
             || fsync_ms > fsync_bound_ms
             || summary["readback_matches"].as_bool() != Some(true)
+            || stats_bytes > RUNTIME_STATS_MAX_BYTES
         {
             return Err(io::Error::other(format!(
                 "random-write packing acceptance failed (object bound {bound}, \
-                 first upload deadline {FIRST_UPLOAD_DEADLINE_MS} ms, fsync bound {fsync_bound_ms:.1} ms): {summary}"
+                 first upload deadline {FIRST_UPLOAD_DEADLINE_MS} ms, fsync bound {fsync_bound_ms:.1} ms,                  runtime stats {stats_bytes}/{RUNTIME_STATS_MAX_BYTES} bytes): {summary}"
             ))
             .into());
         }
