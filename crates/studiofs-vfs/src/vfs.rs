@@ -2754,6 +2754,8 @@ struct MetricsState {
     flush_barrier_calls: AtomicU64,
     #[cfg(test)]
     metadata_sync_barrier_calls: AtomicU64,
+    #[cfg(test)]
+    deferred_materialize_linger_interrupts: AtomicU64,
     local_cache_io_calls: AtomicU64,
     local_cache_io_handoff_total_ns: AtomicU64,
     local_cache_io_handoff_max_ns: AtomicU64,
@@ -2960,6 +2962,8 @@ impl MetricsState {
             flush_barrier_calls: AtomicU64::new(0),
             #[cfg(test)]
             metadata_sync_barrier_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            deferred_materialize_linger_interrupts: AtomicU64::new(0),
             local_cache_io_calls: AtomicU64::new(0),
             local_cache_io_handoff_total_ns: AtomicU64::new(0),
             local_cache_io_handoff_max_ns: AtomicU64::new(0),

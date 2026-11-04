@@ -895,6 +895,30 @@ impl StudioVfs {
         Ok(())
     }
 
+    /// Return whether an acknowledged create under `dir` has not settled yet.
+    ///
+    /// Metadata emptiness checks cannot see such a child, so `dir` is not empty.
+    fn has_deferred_namespace_children(&self, dir: Ino) -> bool {
+        self.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .parent_updates
+            .contains_key(&dir)
+    }
+
+    /// Wait until no admitted create under `dir` is pending.
+    async fn wait_for_deferred_namespace_children(&self, dir: Ino) {
+        loop {
+            let notified = self.state.namespace.deferred.notify.notified();
+            if !self.has_deferred_namespace_children(dir) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Return whether deferred namespace metadata is currently pending for `ino`.
     ///
     /// This is a non-blocking snapshot and may change immediately after return.
@@ -1229,14 +1253,20 @@ impl StudioVfs {
                         break;
                     }
                     Err(error) => {
-                        if let Some(conflict_index) = Self::namespace_entry_conflict_index(&error)
-                            .filter(|index| *index < batch.len())
+                        if let Some(conflict_index) = Self::namespace_conflict_index(&error, &batch)
                         {
                             let conflicting_operation = batch.remove(conflict_index);
+                            let conflict_op = conflicting_operation.kind();
+                            // Siblings under a removed parent fail the same way;
+                            // drop them now instead of one rolled-back commit each.
+                            let removed_parent = Self::namespace_conflict_removed_parent(&error);
                             let mut abandoned_inodes = HashSet::from([conflicting_operation.ino()]);
                             let mut abandoned_operations = vec![conflicting_operation];
                             for op in batch.split_off(conflict_index) {
-                                if Self::deferred_namespace_op_depends_on(&op, &abandoned_inodes) {
+                                if Self::deferred_namespace_op_depends_on(&op, &abandoned_inodes)
+                                    || (removed_parent.is_some()
+                                        && op.created_parent() == removed_parent)
+                                {
                                     abandoned_inodes.insert(op.ino());
                                     abandoned_operations.push(op);
                                 } else {
@@ -1252,6 +1282,7 @@ impl StudioVfs {
                             warn!(
                                 error = %error,
                                 conflict_index,
+                                conflict_op,
                                 abandoned_operations = batch_abandoned + queued_abandoned,
                                 queued_abandoned_operations = queued_abandoned,
                                 remaining_operations = batch.len(),
@@ -1276,6 +1307,10 @@ impl StudioVfs {
                             continue;
                         }
                         attempts += 1;
+                        let batch_ops = batch
+                            .iter()
+                            .map(|op| (op.kind(), op.ino()))
+                            .collect::<Vec<_>>();
                         if attempts >= DEFERRED_NAMESPACE_MAX_RETRIES {
                             self.state
                                 .namespace
@@ -1295,6 +1330,7 @@ impl StudioVfs {
                             error!(
                                 error = %error,
                                 operations = failed_operations,
+                                ?batch_ops,
                                 "deferred namespace metadata batch commit failed permanently; abandoning batch"
                             );
                             break;
@@ -1304,6 +1340,7 @@ impl StudioVfs {
                             max_attempts = DEFERRED_NAMESPACE_MAX_RETRIES,
                             error = %error,
                             operations = batch.len(),
+                            ?batch_ops,
                             "deferred namespace metadata batch commit failed; retrying"
                         );
                         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1316,13 +1353,29 @@ impl StudioVfs {
         }
     }
 
-    fn namespace_entry_conflict_index(error: &VfsError) -> Option<usize> {
-        match error {
-            VfsError::Meta(MetaError::NamespaceBatchOperation { index, source })
-                if matches!(source.as_ref(), MetaError::EntryExists { .. }) =>
-            {
+    /// Return the batch position of a create that can never commit: its name was
+    /// taken, or its parent directory is gone. Retrying cannot help, and only
+    /// that create and its dependents are lost.
+    fn namespace_conflict_index(error: &VfsError, batch: &[DeferredNamespaceOp]) -> Option<usize> {
+        let VfsError::Meta(MetaError::NamespaceBatchOperation { index, source }) = error else {
+            return None;
+        };
+        let op = batch.get(*index)?;
+        match source.as_ref() {
+            MetaError::EntryExists { .. } => Some(*index),
+            MetaError::InodeNotFound(missing) if op.created_parent() == Some(*missing) => {
                 Some(*index)
             }
+            _ => None,
+        }
+    }
+
+    fn namespace_conflict_removed_parent(error: &VfsError) -> Option<Ino> {
+        let VfsError::Meta(MetaError::NamespaceBatchOperation { source, .. }) = error else {
+            return None;
+        };
+        match source.as_ref() {
+            MetaError::InodeNotFound(missing) => Some(*missing),
             _ => None,
         }
     }
@@ -3528,6 +3581,9 @@ impl StudioVfs {
                 rechecked_after_skipped_heal = false;
                 last_target_ino = Some(target_ino);
             }
+            if self.has_deferred_namespace_children(target_ino) {
+                return Err(VfsError::Meta(MetaError::DirNotEmpty(target_ino)));
+            }
             let rmdir_result = {
                 // A child unlink/rmdir takes the target directory's Delete
                 // gate. Hold its fair Read barrier across the emptiness
@@ -3704,6 +3760,8 @@ impl StudioVfs {
                 current_kind,
                 true,
             ));
+            // Committed readdir cannot list a child whose create is still queued.
+            self.wait_for_deferred_namespace_children(current_ino).await;
             for entry in self.sync_meta().readdir(current_ino)? {
                 stack.push((current_ino, entry.name, entry.ino, entry.kind, false));
             }
@@ -3926,6 +3984,9 @@ impl StudioVfs {
                 "VFS rename checking displaced target lock"
             );
             self.enforce_no_known_foreign_hard_lock(target_entry.ino)?;
+            if self.has_deferred_namespace_children(target_entry.ino) {
+                return Err(VfsError::Meta(MetaError::DirNotEmpty(target_entry.ino)));
+            }
         }
         debug!(
             parent,

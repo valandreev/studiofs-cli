@@ -668,7 +668,14 @@ impl StudioVfs {
                 {
                     DeferredMaterializationPassOutcome::Reschedule => continue,
                     DeferredMaterializationPassOutcome::Idle => break (true, false),
-                    DeferredMaterializationPassOutcome::Interrupted => break (true, true),
+                    DeferredMaterializationPassOutcome::Interrupted => {
+                        #[cfg(test)]
+                        vfs.state
+                            .metrics
+                            .deferred_materialize_linger_interrupts
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        break (true, true);
+                    }
                     DeferredMaterializationPassOutcome::Completed { allow_reschedule } => {
                         break (allow_reschedule, false);
                     }
