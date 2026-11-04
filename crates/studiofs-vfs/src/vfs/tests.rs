@@ -28120,16 +28120,12 @@ fn xattr_mutations_wait_for_active_flush_session() {
 #[test]
 fn xattr_mutations_report_failed_deferred_create() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "xattr-failed-create");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "xattr-failed-create");
     let _guard = rt.enter();
     let attr = admit_held_deferred_create(&rt, &vfs, false, b"file");
-    // Drop the queued create and keep only its failure, like an abandoned batch.
-    {
-        let mut inner = vfs.state.namespace.deferred.inner.lock();
-        inner.queue.clear();
-        inner.pending_inodes.remove(&attr.ino);
-        inner.errors.insert(attr.ino, "commit failed".into());
-    }
+    // A competing entry, as peer replay can install, makes the queued create fail.
+    meta.create_file(ROOT_INO, b"file", 0, 0, 0o644)
+        .expect("create competing entry");
 
     for result in [
         vfs.set_xattr(attr.ino, b"user.a", b"v", 0),
@@ -28137,8 +28133,28 @@ fn xattr_mutations_report_failed_deferred_create() {
     ] {
         let error = result.expect_err("failed create must be reported");
         assert!(
-            error.to_string().contains("commit failed"),
+            error
+                .to_string()
+                .contains("deferred namespace metadata commit failed"),
             "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
+fn xattr_mutations_reject_runtime_stats_file() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "xattr-runtime-stats");
+    let _guard = rt.enter();
+    let ino = vfs.runtime_stats_file_attr().ino;
+
+    for result in [
+        vfs.set_xattr(ino, b"user.a", b"v", 0),
+        vfs.remove_xattr(ino, b"user.a"),
+    ] {
+        assert!(
+            matches!(result, Err(VfsError::Meta(MetaError::AccessDenied { .. }))),
+            "unexpected result: {result:?}"
         );
     }
 }

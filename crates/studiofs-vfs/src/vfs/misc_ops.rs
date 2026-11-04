@@ -68,6 +68,9 @@ impl StudioVfs {
         ino: Ino,
         mutate: impl FnOnce() -> Result<(), MetaError>,
     ) -> VfsResult<()> {
+        if self.is_runtime_stats_file_ino(ino) {
+            return Err(Self::runtime_stats_access_denied_error());
+        }
         // A queued create has not committed the inode row yet.
         if self.has_deferred_namespace_metadata(ino) {
             self.run_sync_future_with_admission(
@@ -88,10 +91,16 @@ impl StudioVfs {
         let _cleanup = cleanup.with_permit(permit);
         mutate()?;
         // getattr prefers a dirty attr, and a later flush persists it over the inode row.
-        if self.peek_dirty_attr(ino).is_some() {
-            let ctime = self.sync_meta().get_attr(ino)?.ctime;
-            if let Some(attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
-                attr.ctime = ctime;
+        let has_dirty_attr = self.state.namespace.dirty_attrs.lock().contains_key(&ino);
+        if has_dirty_attr {
+            // The mutation already committed, so a failed read must not report it as failed.
+            match self.sync_meta().get_attr(ino) {
+                Ok(committed) => {
+                    if let Some(attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
+                        attr.ctime = committed.ctime;
+                    }
+                }
+                Err(error) => warn!(ino, %error, "xattr ctime not copied to dirty attr"),
             }
         }
         self.invalidate_attr_read_cache([ino]);

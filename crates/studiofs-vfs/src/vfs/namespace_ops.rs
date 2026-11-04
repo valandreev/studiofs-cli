@@ -130,7 +130,7 @@ impl StudioVfs {
         })
     }
 
-    fn runtime_stats_access_denied_error() -> VfsError {
+    pub(super) fn runtime_stats_access_denied_error() -> VfsError {
         VfsError::Meta(MetaError::AccessDenied {
             ino: super::RUNTIME_STATS_FILE_INO,
             principal: "runtime-stats-surface".to_string(),
