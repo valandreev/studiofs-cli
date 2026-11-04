@@ -368,11 +368,29 @@ The scenario performs 15 seconds of random 4 KiB writes over a 256 MiB file and
 samples the upload queue every 100 ms. It fails unless an active upload with a
 pending backlog appears within 5 s, fsync stays within three times the local
 metadata commit time it spans plus 500 ms, readback matches, physical payload
-objects stay within accepted bytes divided by pack size plus partial drains, and
-the live runtime stats text stays within half of its 64 KiB reported size.
+objects stay within `vfs_write.accepted_bytes` divided by pack size plus partial
+drains, accepted bytes cover every requested write, and the live runtime stats
+text stays within half of its 64 KiB reported size. Accepted bytes can exceed the
+requested bytes: on a 16 KiB-page Mac the created handle uses UBC, so each 4 KiB
+write reaches the VFS as a 16 KiB page write.
 `random-write-packing.json` retains these values, the upload samples and public
 runtime snapshots before/after fsync. Unit tests alone do not establish mounted
 latency acceptance.
+
+### macOS Page-Ins for Unpublished Local State
+
+A `direct_io` open makes macFUSE fail later page-ins on the vnode, which surfaces as
+`SIGBUS` on `mmap` access or `exec`. `mounted-macos-mmap-exec` maps a just-closed
+file, writes through a mapping of a created handle, and executes a just-copied
+binary twice; each mapping runs in a forked child, and `macos-mmap-exec.json` records
+how each step ended. Mapping a file reopened for write remains a known limitation
+(`docs/platform-bridges.md`), so the scenario does not cover it. It needs macOS and
+reports `Unsupported` elsewhere, so the Linux full E2E target leaves it out.
+
+```sh
+cargo build -p studiofs -p studiofs-e2e
+target/debug/studiofs-e2e run mounted-macos-mmap-exec --studiofs-bin target/debug/studiofs --run-id macos-mmap-exec --retain always --timeout 300s
+```
 
 ### SFS-915 Truncate, Attribute Updates and Payload Lifetime
 

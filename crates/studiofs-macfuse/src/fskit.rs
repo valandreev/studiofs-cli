@@ -1660,19 +1660,23 @@ impl FsKitDispatcher {
                 return;
             }
         };
-        let entries = match self.adapter.directory_entries_for_fskit(input.fh) {
-            Ok(entries) => entries,
-            Err(errno) => {
-                let _ = request.reply_error(errno);
-                return;
-            }
-        };
+        let (parent_ino, entries) =
+            match self
+                .adapter
+                .directory_read_entries(header.nodeid, input.fh, input.offset == 0)
+            {
+                Ok(snapshot) => snapshot,
+                Err(errno) => {
+                    let _ = request.reply_error(errno);
+                    return;
+                }
+            };
         match encode_dirents(
             header.nodeid,
-            entries.parent_ino,
+            parent_ino,
             input.offset,
             input.size as usize,
-            &entries.entries,
+            &entries,
         ) {
             Ok(bytes) => {
                 let _ = request.reply_bytes(bytes);

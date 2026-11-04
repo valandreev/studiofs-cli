@@ -76,12 +76,11 @@ impl Scenario for RandomWritePacking {
         })?;
         let fsync_bound_ms = FSYNC_COMMIT_MULTIPLE * fsync_commit_ms + FSYNC_FLOOR_MS;
         let stats_bytes = summary["after_fsync"].as_str().map_or(usize::MAX, str::len);
-        // Each drain can add a partial pack; 32 exceeds the number of aged drains in 15 seconds.
-        let bound = writes
-            .saturating_mul(WRITE_BYTES as u64)
-            .div_ceil(PACK_BYTES as u64)
-            + 32;
+        let requested_bytes = writes.saturating_mul(WRITE_BYTES as u64);
+        let accepted_bytes = accepted_write_bytes(summary["after_fsync"].as_str().unwrap_or(""))?;
+        let bound = payload_object_bound(accepted_bytes);
         if writes == 0
+            || accepted_bytes < requested_bytes
             || objects == 0
             || objects > bound
             || summary["upload_during_writes"].as_bool() != Some(true)
@@ -91,8 +90,10 @@ impl Scenario for RandomWritePacking {
             || stats_bytes > RUNTIME_STATS_MAX_BYTES
         {
             return Err(io::Error::other(format!(
-                "random-write packing acceptance failed (object bound {bound}, \
-                 first upload deadline {FIRST_UPLOAD_DEADLINE_MS} ms, fsync bound {fsync_bound_ms:.1} ms,                  runtime stats {stats_bytes}/{RUNTIME_STATS_MAX_BYTES} bytes): {summary}"
+                "random-write packing acceptance failed (object bound {bound} for \
+                 {accepted_bytes} accepted bytes, {requested_bytes} requested, \
+                 first upload deadline {FIRST_UPLOAD_DEADLINE_MS} ms, fsync bound {fsync_bound_ms:.1} ms, \
+                 runtime stats {stats_bytes}/{RUNTIME_STATS_MAX_BYTES} bytes): {summary}"
             ))
             .into());
         }
@@ -210,6 +211,22 @@ fn metadata_commit_ms(stats_text: &str) -> io::Result<f64> {
     Ok(histogram.sum as f64 / 1_000_000.0)
 }
 
+/// Bytes the VFS accepted from write callbacks; macFUSE rounds UBC writes up to whole pages.
+fn accepted_write_bytes(stats_text: &str) -> io::Result<u64> {
+    let stats = RuntimeStatsSnapshot::parse_text(stats_text).map_err(io::Error::other)?;
+    stats
+        .vfs_write
+        .counters
+        .get("accepted_bytes")
+        .map(|metric| metric.value)
+        .ok_or_else(|| io::Error::other("runtime stats lack the vfs_write.accepted_bytes counter"))
+}
+
+/// Each drain can add a partial pack; 32 exceeds the number of aged drains in 15 seconds.
+fn payload_object_bound(accepted_bytes: u64) -> u64 {
+    accepted_bytes.div_ceil(PACK_BYTES as u64) + 32
+}
+
 fn cache_entries(cache_dir: &Path) -> io::Result<BTreeSet<OsString>> {
     fs::read_dir(cache_dir)?
         .map(|entry| entry.map(|entry| entry.file_name()))
@@ -269,6 +286,23 @@ mod tests {
         assert_eq!(
             count_new_volume_payload_objects(tmp.path(), &preexisting).unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn object_bound_follows_bytes_accepted_after_kernel_page_rounding() {
+        // A retained macOS run: 50,682 random 4 KiB writes reached the VFS as 16 KiB pages and
+        // packed into 170 objects, which is about 4 MiB per object.
+        let text = "# studiofs_runtime_stats schema_version=1\n\
+                    counter vfs_write.accepted_bytes bytes 830373888\n";
+        assert_eq!(
+            payload_object_bound(accepted_write_bytes(text).unwrap()),
+            230
+        );
+        assert_eq!(payload_object_bound(50_682 * WRITE_BYTES as u64), 82);
+        assert!(
+            accepted_write_bytes("# studiofs_runtime_stats schema_version=1\n").is_err(),
+            "a renamed counter must not turn into a zero object bound"
         );
     }
 

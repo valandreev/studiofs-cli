@@ -2089,7 +2089,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_io_read_only_open_enables_sequential_ram_readahead() {
+    fn read_only_open_enables_sequential_ram_readahead() {
         let fixture = studiofs_vfs::contract_harness::ContractVfsFixture::new(
             "macfuse-direct-io-ram-readahead",
         )
@@ -2114,7 +2114,7 @@ mod tests {
         let reader = adapter
             .open(attr.ino, libc::O_RDONLY)
             .expect("open unpublished reader through macFUSE adapter");
-        assert!(reader.direct_io());
+        assert!(!reader.direct_io());
         assert!(vfs.sequential_ram_readahead_enabled(reader.file_handle()));
 
         let writer = adapter
@@ -2164,8 +2164,8 @@ mod tests {
             .open(attr.ino, libc::O_RDONLY)
             .expect("open unpublished reader through macFUSE adapter");
         assert!(
-            reader.direct_io(),
-            "unpublished local payload must use the VFS read path"
+            !reader.direct_io(),
+            "unpublished local payload must stay mappable: direct_io fails page-ins on the vnode"
         );
 
         let first = adapter
@@ -3292,8 +3292,8 @@ mod tests {
             .open(attr.ino, libc::O_RDONLY)
             .expect("open read-only handle while write-capable handle remains active");
         assert!(
-            read_while_writer_active.direct_io(),
-            "read-only opens during a writer epoch must keep reads on the VFS path: {read_while_writer_active:?}"
+            !read_while_writer_active.direct_io(),
+            "read-only opens during a writer epoch must stay mappable: {read_while_writer_active:?}"
         );
         assert!(
             !read_while_writer_active.keep_cache(),
@@ -3421,8 +3421,8 @@ mod tests {
             "first read-only open after local-stable release should drop cache: {read_after_local_release:?}"
         );
         assert!(
-            read_after_local_release.direct_io(),
-            "locally materialized unpublished payload must keep reads on the VFS path: {read_after_local_release:?}"
+            !read_after_local_release.direct_io(),
+            "locally materialized unpublished payload must stay mappable: {read_after_local_release:?}"
         );
         let cache_decisions = vfs.write_path_observability_snapshot().macfuse_open_cache;
         assert_eq!(cache_decisions.clean_write_release_seeded, 0);
@@ -4058,11 +4058,54 @@ mod tests {
         );
 
         let file_handle = adapter.opendir(child.ino).expect("open child directory");
-        let handle = adapter
-            .directory_entries_for_fskit(file_handle)
-            .expect("get FSKit directory handle");
+        let (parent_ino, _entries) = adapter
+            .directory_read_entries(child.ino, file_handle, true)
+            .expect("read FSKit directory handle");
 
-        assert_eq!(handle.parent_ino, root);
+        assert_eq!(parent_ino, root);
+        adapter.releasedir(file_handle).expect("close directory");
+    }
+
+    /// The kernel can share one open directory handle between enumerations, so
+    /// `opendir` is not a usable freshness boundary: a read at offset 0 is.
+    #[test]
+    fn adapter_readdir_at_offset_zero_observes_namespace_changes_on_reused_handle() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("macfuse-readdir-rewind")
+                .expect("create VFS fixture");
+        let vfs = fixture.vfs();
+        let root = studiofs_vfs::contract_harness::CONTRACT_ROOT_INO;
+        let adapter =
+            super::adapter::StudioVfsAdapter::new(vfs.clone(), fixture.runtime().handle().clone());
+        let lists_name = |buffer: &[u8], name: &[u8]| {
+            buffer
+                .windows(name.len())
+                .any(|candidate| candidate == name)
+        };
+
+        let file_handle = adapter.opendir(root).expect("open directory");
+        vfs.create(root, b"after-open.txt", 501, 20, 0o644)
+            .expect("create file after opendir");
+        let first = adapter
+            .readdir_for_test_with_handle(root, file_handle, 0, 4096)
+            .expect("first enumeration");
+        assert!(lists_name(first.as_slice(), b"after-open.txt\0"));
+
+        vfs.create(root, b"after-read.txt", 501, 20, 0o644)
+            .expect("create file after first enumeration");
+        let continued = adapter
+            .readdir_for_test_with_handle(root, file_handle, 3, 4096)
+            .expect("continue first enumeration");
+        assert!(
+            !lists_name(continued.as_slice(), b"after-read.txt\0"),
+            "a nonzero offset must stay on the captured snapshot"
+        );
+        let second = adapter
+            .readdir_for_test_with_handle(root, file_handle, 0, 4096)
+            .expect("second enumeration on the same handle");
+        assert!(lists_name(second.as_slice(), b"after-open.txt\0"));
+        assert!(lists_name(second.as_slice(), b"after-read.txt\0"));
+
         adapter.releasedir(file_handle).expect("close directory");
     }
 

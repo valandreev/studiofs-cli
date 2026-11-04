@@ -148,6 +148,16 @@ checks that the loop waits for the held callback after exit is requested:
 This requires a native legacy macFUSE mount; an ignored result does not prove
 callback concurrency.
 
+macFUSE can serve repeated enumerations of a directory from one open handle
+without a new `opendir`; a volume root was observed to keep its handle for the
+whole mount. `opendir` therefore does not enumerate children. Both macOS
+transports capture a handle's snapshot on its first read and replace it on every
+read at offset 0, so a new enumeration observes the current namespace, including
+peer changes. Reads at a nonzero offset keep the captured snapshot and its
+offsets. Enumerations that overlap on one shared handle share its snapshot, so a
+rewind by one of them can shift the offsets of the other across a namespace
+change.
+
 The FSKit path uses macFUSE `MFMount.framework` and does not open `/dev/fuse` or
 call the legacy libfuse session/reply APIs. It reuses the existing
 `StudioVfsAdapter`, keeps the received message alive until its reply is sent,
@@ -700,7 +710,7 @@ fallback). Rocky Linux 8.6+ remains best-effort.
 | Kernel `congestion_threshold` | macOS: `40` by default |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
-| macOS: cache policy | UBC for fitting read-only files with a clean content generation; direct I/O for write-capable, oversized, or locally dirty/unknown read-only handles |
+| macOS: cache policy | UBC for fitting read-only files, with `keep_cache` only for a stable content generation; direct I/O for write-capable `open`, oversized, or unknown-state read-only handles |
 | macOS: validated macFUSE | 5.2.0 |
 
 ### macOS cache and I/O policy
@@ -726,13 +736,26 @@ fetches from object storage only on a payload-cache miss. Memory-driven
 `direct_io` keeps the handle's OS-cache participation and `keep_cache` decision,
 so it does not clear the observed generation that other handles may reuse.
 
-Read-only handles also use `direct_io` unless the VFS cache decision observed a
-content generation: a first observation, a changed generation, or a stable
-generation. An observed generation covers both published content and locally
-stable content. Locally dirty, actively written, and unknown-state files bypass
-UBC and kernel readahead until their state settles, because the kernel's cached
-size and pages cannot track unpublished local state. The file-size and
-available-memory check still applies to every read-only handle.
+A `direct_io` open makes macFUSE 5.5 fail every later page-in on that vnode with
+`ENOTSUP` until the kernel reclaims it, so a mapping or `exec` dies with `SIGBUS`
+even through a handle opened without `direct_io`. `purge_ubc`, `purge_attr`,
+`keep_cache`, inode and entry invalidation, `rename` and `link` do not clear this.
+Read-only handles therefore never request `direct_io` because of local state:
+locally dirty and actively written files use UBC with `keep_cache` off, so a
+just-built binary runs and a file still flushing can be mapped. In live checks these
+handles returned every preceding same-mount write, from both created and reopened
+writers. The file-size and available-memory check still applies to every read-only
+handle, so a file larger than that estimate still gets `direct_io` and cannot be
+mapped.
+
+Known limitation, unsupported by design: a write-capable `open` of an existing file
+still requests `direct_io`, below. Until the vnode is reclaimed, mapping or executing
+that file fails with `SIGBUS` or `EIO`, including through later read-only handles, so
+overwriting a binary in place and then running it fails. Handles from `create` avoid
+this because macFUSE ignores the flag there, so replacing a file through a new name
+and `rename`, or removing it first, keeps it mappable. Dropping `direct_io` from these
+opens makes the mapping work but measured about nine times fewer random 4 KiB writes
+per second on existing files (about 45,000 to 5,000), so it is not the default.
 
 The estimate is `free + speculative + inactive` pages from
 `host_statistics64`. Unlike `sysinfo::available_memory`, it does not subtract
@@ -764,6 +787,13 @@ large sequential media callbacks into smaller requests. StudioFS does not pass
 Write-capable handles use per-handle `direct_io`: macFUSE's buffered Apple
 copy path can otherwise replace valid large-write buffers before the low-level
 write callback. Read-only handles retain the adaptive UBC policy above.
+
+macFUSE 5.5 ignores `FOPEN_DIRECT_IO` in a create reply, so this policy takes effect
+only from the next `open`. Until then the handle from `create` uses UBC: on a
+16 KiB-page Mac each 4 KiB write reaches the VFS as a 16 KiB page write, usually
+after a 16 KiB page read. Removing the `create` callback makes the kernel use `mknod`
+plus `open` and honors `direct_io`, but measured runs then fail `mmap` page-ins on new
+files with `SIGBUS` (`ENOTSUP`), which the UBC-backed create handle avoids.
 
 A read-only handle that gets `direct_io` has no UBC or kernel read-ahead.
 An `F_NOCACHE` reader such as AJA System Test or NLE playback bypasses UBC
