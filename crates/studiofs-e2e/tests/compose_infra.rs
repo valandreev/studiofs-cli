@@ -54,10 +54,10 @@ fn compose_file_defines_required_services_healthchecks_and_project_ports() {
         "named volumes must be explicit so down --volumes can remove them"
     );
     assert!(
-        compose.contains("rustfs/rustfs:1.0.0-alpha.94"),
-        "RustFS image must stay pinned for baseline E2E infra"
+        compose.contains("rustfs/rustfs:latest"),
+        "baseline E2E infra must use the latest RustFS image"
     );
-    assert!(!compose.contains("rustfs/rustfs:latest"));
+    assert!(!compose.contains("rustfs/rustfs:1.0.0-alpha.94"));
 }
 
 #[test]
@@ -93,7 +93,7 @@ services:
   postgres:
     image: "postgres:18-alpine"
   rustfs:
-    image: 'rustfs/rustfs:1.0.0-alpha.94'
+    image: 'rustfs/rustfs:latest'
 "#,
     )
     .unwrap();
@@ -124,7 +124,7 @@ fn compose_preflight_accepts_yaml_aliases_for_baseline_images() {
         r#"
 x-images:
   postgres: &postgres-image postgres:18-alpine
-  rustfs: &rustfs-image rustfs/rustfs:1.0.0-alpha.94
+  rustfs: &rustfs-image rustfs/rustfs:latest
 
 services:
   postgres:
@@ -163,7 +163,7 @@ services:
   "postgres":
     image: "postgres:18-\u0061lpine"
   "rustfs":
-    image: "rustfs/rustfs:1.0.0-alpha.94"
+    image: "rustfs/rustfs:latest"
 "#,
     )
     .unwrap();

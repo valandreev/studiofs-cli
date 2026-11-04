@@ -223,7 +223,7 @@ jobs:
             --health-timeout 5s \
             --health-retries 30 \
             --health-start-period 10s \
-            rustfs/rustfs:1.0.0-alpha.94 \
+            rustfs/rustfs:latest \
             --address :9000 --console-enable /data)"
 
           wait_for_healthy_service "${postgres_container}" "PostgreSQL"

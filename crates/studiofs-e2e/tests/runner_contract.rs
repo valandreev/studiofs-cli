@@ -224,17 +224,17 @@ fn scenario_list_first_eight_matches_local_first_baseline_gate() {
 }
 
 #[test]
-fn e2e_compose_pins_rustfs_baseline_image() {
+fn e2e_compose_uses_latest_rustfs_image() {
     let compose_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("docker/compose.e2e.yml");
     let compose = fs::read_to_string(compose_path).unwrap();
 
     assert!(
-        compose.contains("image: rustfs/rustfs:1.0.0-alpha.94"),
-        "SFS-405 baseline gate must reject accidental RustFS latest usage"
+        compose.contains("image: rustfs/rustfs:latest"),
+        "E2E baseline must use the latest RustFS image"
     );
-    assert!(!compose.contains("image: rustfs/rustfs:latest"));
+    assert!(!compose.contains("image: rustfs/rustfs:1.0.0-alpha.94"));
 }
 
 #[test]

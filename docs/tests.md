@@ -123,8 +123,8 @@ cargo test -p studiofs --bin studiofs cli:: -- --ignored --test-threads=1 --noca
 
 ### SFS-772 Live S3 and Combined S3/PostgreSQL CI Gate
 
-The automatic Linux gate in `.github/workflows/linux.yml` starts the repository-pinned
-`rustfs/rustfs:1.0.0-alpha.94` image on a loopback-only dynamic port, then checks
+The automatic Linux gate in `.github/workflows/linux.yml` starts the
+`rustfs/rustfs:latest` image on a loopback-only dynamic port, then checks
 service health before running tests. The DataStore tests create the disposable
 `studiofs-test` bucket before the later VFS and combined tests use it. The gate
 passes fixed `studiofs` / `studiofs123` test-only credentials to RustFS through

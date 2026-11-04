@@ -665,15 +665,9 @@ impl DockerComposeStack {
         }
         if !images
             .iter()
-            .any(|image| image.image == "rustfs/rustfs:1.0.0-alpha.94")
-        {
-            errors.push("RustFS image must stay pinned to rustfs/rustfs:1.0.0-alpha.94");
-        }
-        if images
-            .iter()
             .any(|image| image.image == "rustfs/rustfs:latest")
         {
-            errors.push("RustFS latest is rejected by the Local First baseline gate");
+            errors.push("RustFS image must use rustfs/rustfs:latest");
         }
 
         InfraCheck {

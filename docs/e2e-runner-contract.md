@@ -209,10 +209,9 @@ checksums are diagnostics, not convergence oracles.
 
 For Windows/WinFSP runs, the gate checks for stale runner-owned
 `studiofs.exe` / `studiofs-e2e.exe` processes before starting the first
-iteration. Compose preflight also rejects environment drift before scenario
-execution: PostgreSQL must use `postgres:18-alpine`, RustFS must use
-`rustfs/rustfs:1.0.0-alpha.94`, and accidental RustFS `latest` usage is a
-preflight failure, not a product failure.
+iteration. Compose preflight also checks the expected baseline images before
+scenario execution: PostgreSQL must use `postgres:18-alpine` and RustFS must use
+`rustfs/rustfs:latest`.
 
 ## Mounted Levels 9+ Promotion Gate
 
