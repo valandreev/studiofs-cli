@@ -4510,6 +4510,20 @@ fn startup_compaction_does_not_record_foreground_metadata_activity() {
 }
 
 #[test]
+fn runtime_stats_text_keeps_margin_below_reported_size() {
+    let tmp = runtime_stats_test_tempdir();
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-surface-size-margin");
+
+    let len = vfs.runtime_stats_file_text().len() as u64;
+
+    // WinFSP may bound reads by the reported size, so growth past it could lose the tail.
+    assert!(
+        len > 0 && len <= RUNTIME_STATS_FILE_REPORTED_SIZE / 2,
+        "runtime stats text is {len} bytes; revisit the reported size before it reaches {RUNTIME_STATS_FILE_REPORTED_SIZE}"
+    );
+}
+
+#[test]
 fn runtime_stats_surface_has_stable_attributes() {
     let tmp = runtime_stats_test_tempdir();
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "runtime-stats-surface-stable-attr");
