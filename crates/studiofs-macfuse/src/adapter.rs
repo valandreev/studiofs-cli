@@ -112,9 +112,11 @@ pub(crate) struct StudioVfsAdapter {
     symlink_deferred_wait_entered: Arc<tokio::sync::Notify>,
 }
 
-pub(crate) struct DirectoryHandle {
-    pub(crate) parent_ino: u64,
-    pub(crate) entries: Vec<DirEntry>,
+struct DirectoryHandle {
+    parent_ino: u64,
+    /// Entries of the current enumeration, captured by its first read so that
+    /// chunked reads keep stable offsets across namespace mutations.
+    entries: ParkingMutex<Option<Arc<Vec<DirEntry>>>>,
 }
 
 #[derive(Debug)]
@@ -2297,16 +2299,12 @@ impl StudioVfsAdapter {
 
     pub(crate) fn opendir(&self, ino: u64) -> Result<u64, i32> {
         let parent_ino = self.directory_parent(ino)?;
-        let entries = self
-            .vfs
-            .readdir(ino)
-            .map_err(|error| vfs_err_to_errno(&error))?;
         let file_handle = self.next_directory_handle.fetch_add(1, Ordering::Relaxed);
         self.directory_handles.lock().insert(
             file_handle,
             Arc::new(DirectoryHandle {
                 parent_ino,
-                entries,
+                entries: ParkingMutex::new(None),
             }),
         );
         Ok(file_handle)
@@ -2317,16 +2315,38 @@ impl StudioVfsAdapter {
         Ok(())
     }
 
-    #[cfg(studiofs_fskit)]
-    pub(crate) fn directory_entries_for_fskit(
+    /// Returns the handle's parent inode and the entries to serve a read from.
+    ///
+    /// macFUSE shares one open handle between enumerations of a directory for
+    /// as long as the kernel keeps it open, which for a volume root can be the
+    /// whole mount. `opendir` therefore does not mark a new enumeration; as on
+    /// the Linux and WinFSP bridges, a read at offset 0 does.
+    pub(crate) fn directory_read_entries(
         &self,
+        ino: u64,
         file_handle: u64,
-    ) -> Result<Arc<DirectoryHandle>, i32> {
-        self.directory_handles
+        starts_enumeration: bool,
+    ) -> Result<(u64, Arc<Vec<DirEntry>>), i32> {
+        let handle = self
+            .directory_handles
             .lock()
             .get(&file_handle)
             .cloned()
-            .ok_or(libc::EBADF)
+            .ok_or(libc::EBADF)?;
+        let mut captured = handle.entries.lock();
+        let entries = match captured.as_ref() {
+            Some(entries) if !starts_enumeration => Arc::clone(entries),
+            _ => {
+                let entries = Arc::new(
+                    self.vfs
+                        .readdir(ino)
+                        .map_err(|error| vfs_err_to_errno(&error))?,
+                );
+                *captured = Some(Arc::clone(&entries));
+                entries
+            }
+        };
+        Ok((handle.parent_ino, entries))
     }
 
     pub(crate) fn readdir_with_handle(
@@ -2337,18 +2357,13 @@ impl StudioVfsAdapter {
         offset: i64,
         size: usize,
     ) -> Result<DirectoryEntryBuffer, i32> {
-        let entries = self
-            .directory_handles
-            .lock()
-            .get(&file_handle)
-            .cloned()
-            .ok_or(libc::EBADF)?;
+        let (parent_ino, entries) = self.directory_read_entries(ino, file_handle, offset == 0)?;
         self.readdir_from_entries(
             ino,
-            entries.parent_ino,
+            parent_ino,
             offset,
             size,
-            &entries.entries,
+            &entries,
             |buffer, name, attr, next_offset| {
                 buffer
                     .push(request, name, attr, next_offset)
@@ -2365,18 +2380,13 @@ impl StudioVfsAdapter {
         offset: i64,
         size: usize,
     ) -> Result<DirectoryEntryBuffer, i32> {
-        let entries = self
-            .directory_handles
-            .lock()
-            .get(&file_handle)
-            .cloned()
-            .ok_or(libc::EBADF)?;
+        let (parent_ino, entries) = self.directory_read_entries(ino, file_handle, offset == 0)?;
         self.readdir_from_entries(
             ino,
-            entries.parent_ino,
+            parent_ino,
             offset,
             size,
-            &entries.entries,
+            &entries,
             |buffer, name, _attr, next_offset| {
                 buffer
                     .push_for_test(0, name, next_offset)

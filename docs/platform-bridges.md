@@ -148,6 +148,16 @@ checks that the loop waits for the held callback after exit is requested:
 This requires a native legacy macFUSE mount; an ignored result does not prove
 callback concurrency.
 
+macFUSE can serve repeated enumerations of a directory from one open handle
+without a new `opendir`; a volume root was observed to keep its handle for the
+whole mount. `opendir` therefore does not enumerate children. Both macOS
+transports capture a handle's snapshot on its first read and replace it on every
+read at offset 0, so a new enumeration observes the current namespace, including
+peer changes. Reads at a nonzero offset keep the captured snapshot and its
+offsets. Enumerations that overlap on one shared handle share its snapshot, so a
+rewind by one of them can shift the offsets of the other across a namespace
+change.
+
 The FSKit path uses macFUSE `MFMount.framework` and does not open `/dev/fuse` or
 call the legacy libfuse session/reply APIs. It reuses the existing
 `StudioVfsAdapter`, keeps the received message alive until its reply is sent,
