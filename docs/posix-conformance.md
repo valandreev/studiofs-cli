@@ -27,7 +27,8 @@ and no manual exclusions.
 Of the 53 failures, **12 are StudioFS defects**: ten regressed from a run-1
 pass, and two (/241, /795) were not passes before. The other **41 are
 expected** under the current contract, mount profile or environment. One
-timeout (/013) is also a defect; the other six have no assigned cause. Run 1's
+timeout (/013) is also a defect; the other six are budget outcomes (see
+[Timeout](#timeout-budget-outcomes-not-hangs)). Run 1's
 canonical rows predate the environment fixes (dbench, fsverity, dbtest and so
 on) made at the end of that run, which is why /010, /241 and /597 move from
 notrun to a measured verdict.
@@ -76,13 +77,51 @@ auto-repair ([SFS-961](https://linear.app/valandreev/issue/SFS-961)).
 | `generic/597` | Environment/harness: the kernel returns EACCES rather than EPERM for hardlink protection. An ext4 control on the same kernel behaves identically. |
 | `generic/732` | Environment/harness: needs extra mount targets, which the helper deliberately refuses. |
 
-### Timeout (cause unassigned)
+### Timeout: budget outcomes, not hangs
 
 `generic/089`, `/127`, `/476`, `/538`, `/551` and `/750` hit the 300-second
-budget; /013 hit the 60-second one. These cases had no failure output and no
-daemon warning in their windows (for /013 see above). All six 300-second cases
-also timed out in run 1. A budget outcome is not a proven deadlock; the
-investigation is [SFS-962](https://linear.app/valandreev/issue/SFS-962).
+budget in both SFS-940 runs; /013 hit the 60-second one (see above).
+[SFS-962](https://linear.app/valandreev/issue/SFS-962) reran the six
+300-second cases alone with an 1800-second budget. None is a proven hang. These
+are supplemental measurements on `f4c77120` on the same VM and profile, not a
+gate rerun. They used one fresh volume pair, reused across the cases. Raw
+evidence stays local under `target/xfstests/sfs962-f4c77120-20261104T115503Z/`.
+
+| Case | StudioFS, 1800 s budget | Same workload on ext4 | Why it exceeds 300 s |
+|---|---|---:|---|
+| `generic/538` | Pass, 359 s | 0.7 s | StudioFS reports `f_frsize` = 4 MiB and the test uses it as the block size: about 3,073 iterations of 8 MiB writes, against 25 iterations of 8 KiB on ext4. |
+| `generic/089` | Pass, 1101 s | 7.5 s | About 30,450 lock, link and rename cycles at roughly 36 ms each. Slow, but progressing. |
+| `generic/476` | Pass, 808 s | 131.5 s | fsstress metadata and upload throughput. |
+| `generic/750` | Pass, 1026 s | not measured | Same fsstress load as /476, plus memory compaction. |
+| `generic/127` | Fail, 252 s | 238.7 s, legs run one after another | Within budget in this run. The failure is the expected `ENODEV` for this profile (see below). |
+| `generic/551` | Timeout, 1812 s | about 27 min, extrapolated | Did not finish, but kept progressing. See below. |
+
+The ext4 column replays each workload directly, not through `check`, so treat
+it as an order of magnitude.
+
+**`generic/127`.** All mapped legs fail with `ENODEV`, as expected with the mmap
+opt-in off. The `-f -R -W` leg fails too, despite its "nommap" label, because
+`fsx -f` calls `mmap` in `doflush`. Alone, that leg stops with `doflush: mmap`,
+and the `-R -W` leg without `-f` passes 100,000 operations in 187 s. The legs
+share one `$tmp.output`, so `out.bad` can pair a header with another leg's
+output. With the opt-in on, parallel legs report `READ BAD DATA`:
+[SFS-1021](https://linear.app/valandreev/issue/SFS-1021).
+
+**`generic/551`.** Without `STATX_DIOALIGN` or a block device,
+`min_dio_alignment` falls back to the 4096-byte page size, against 512 on ext4.
+Single writes then reach 128 MiB, and the program holds two buffers per write,
+which pushed the 7 GiB VM into swap. Arguments and PIDs kept changing between
+samples, so the test was progressing, but the full 100 iterations were not
+measured to completion. Over the same 5 seeded iterations with 4096 alignment,
+ext4 took 81 s and StudioFS 443 s. Of those, 407 s were the first iteration,
+which overlapped a backlog of 1.2 GB of uploads with S3 retries; the other
+four took 36 s, faster than ext4's 53 s.
+
+During these runs the test S3 endpoint returned 502s, and some uploads
+exhausted their retries. The cases still passed, so durations of /476 and the
+551 sample include that noise. The 300-second budget stays as it is: these
+cases need a longer budget if they are to give a verdict, and that budget should
+be labeled as supplemental.
 
 ### Notrun: not supposed to run
 
