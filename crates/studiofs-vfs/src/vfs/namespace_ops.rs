@@ -895,20 +895,24 @@ impl StudioVfs {
         Ok(())
     }
 
-    /// Wait until no admitted create under `dir` is pending, so a metadata
-    /// emptiness check sees every child this mount has already acknowledged.
+    /// Return whether an acknowledged create under `dir` has not settled yet.
+    ///
+    /// Metadata emptiness checks cannot see such a child, so `dir` is not empty.
+    fn has_deferred_namespace_children(&self, dir: Ino) -> bool {
+        self.state
+            .namespace
+            .deferred
+            .inner
+            .lock()
+            .parent_updates
+            .contains_key(&dir)
+    }
+
+    /// Wait until no admitted create under `dir` is pending.
     async fn wait_for_deferred_namespace_children(&self, dir: Ino) {
         loop {
             let notified = self.state.namespace.deferred.notify.notified();
-            if !self
-                .state
-                .namespace
-                .deferred
-                .inner
-                .lock()
-                .parent_updates
-                .contains_key(&dir)
-            {
+            if !self.has_deferred_namespace_children(dir) {
                 return;
             }
             notified.await;
@@ -1253,10 +1257,16 @@ impl StudioVfs {
                         {
                             let conflicting_operation = batch.remove(conflict_index);
                             let conflict_op = conflicting_operation.kind();
+                            // Siblings under a removed parent fail the same way;
+                            // drop them now instead of one rolled-back commit each.
+                            let removed_parent = Self::namespace_conflict_removed_parent(&error);
                             let mut abandoned_inodes = HashSet::from([conflicting_operation.ino()]);
                             let mut abandoned_operations = vec![conflicting_operation];
                             for op in batch.split_off(conflict_index) {
-                                if Self::deferred_namespace_op_depends_on(&op, &abandoned_inodes) {
+                                if Self::deferred_namespace_op_depends_on(&op, &abandoned_inodes)
+                                    || (removed_parent.is_some()
+                                        && op.created_parent() == removed_parent)
+                                {
                                     abandoned_inodes.insert(op.ino());
                                     abandoned_operations.push(op);
                                 } else {
@@ -1356,6 +1366,16 @@ impl StudioVfs {
             MetaError::InodeNotFound(missing) if op.created_parent() == Some(*missing) => {
                 Some(*index)
             }
+            _ => None,
+        }
+    }
+
+    fn namespace_conflict_removed_parent(error: &VfsError) -> Option<Ino> {
+        let VfsError::Meta(MetaError::NamespaceBatchOperation { source, .. }) = error else {
+            return None;
+        };
+        match source.as_ref() {
+            MetaError::InodeNotFound(missing) => Some(*missing),
             _ => None,
         }
     }
@@ -3561,7 +3581,9 @@ impl StudioVfs {
                 rechecked_after_skipped_heal = false;
                 last_target_ino = Some(target_ino);
             }
-            self.wait_for_deferred_namespace_children(target_ino).await;
+            if self.has_deferred_namespace_children(target_ino) {
+                return Err(VfsError::Meta(MetaError::DirNotEmpty(target_ino)));
+            }
             let rmdir_result = {
                 // A child unlink/rmdir takes the target directory's Delete
                 // gate. Hold its fair Read barrier across the emptiness
@@ -3738,6 +3760,8 @@ impl StudioVfs {
                 current_kind,
                 true,
             ));
+            // Committed readdir cannot list a child whose create is still queued.
+            self.wait_for_deferred_namespace_children(current_ino).await;
             for entry in self.sync_meta().readdir(current_ino)? {
                 stack.push((current_ino, entry.name, entry.ino, entry.kind, false));
             }
@@ -3909,11 +3933,6 @@ impl StudioVfs {
             self.wait_for_deferred_namespace_entry(parent, name).await?;
             self.wait_for_deferred_namespace_entry(new_parent, new_name)
                 .await?;
-            if let Ok(target) = meta.lookup(new_parent, new_name)
-                && target.kind == FileType::Directory
-            {
-                self.wait_for_deferred_namespace_children(target.ino).await;
-            }
             meta.lookup(parent, name)?
         };
         debug!(
@@ -3965,6 +3984,9 @@ impl StudioVfs {
                 "VFS rename checking displaced target lock"
             );
             self.enforce_no_known_foreign_hard_lock(target_entry.ino)?;
+            if self.has_deferred_namespace_children(target_entry.ino) {
+                return Err(VfsError::Meta(MetaError::DirNotEmpty(target_entry.ino)));
+            }
         }
         debug!(
             parent,

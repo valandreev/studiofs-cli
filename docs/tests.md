@@ -573,14 +573,18 @@ target/debug/studiofs-e2e run mounted-posix-acl-xattr-rejection --studiofs-bin t
 
 ### SFS-959 Directory Removal Against Pending Deferred Creates
 
-`rmdir` and a rename replacing a directory wait for acknowledged child creates,
-so they report `ENOTEMPTY` instead of removing the parent. A create whose parent
-is already gone loses only that create and its dependents, and the mount stays
-healthy. Mounted xfstests generic/013 is a separate gate:
+`rmdir` and a rename replacing a directory report `ENOTEMPTY` while an
+acknowledged child create is pending, without waiting for it to commit. A trash
+rename waits for those creates so it deletes the whole tree. A create whose
+parent is already gone loses only the creates under that parent and their
+dependents, and the mount stays healthy. Mounted xfstests generic/013 is a
+separate gate:
 
 ```sh
-cargo test -p studiofs-vfs --lib rmdir_waits_for_pending_deferred_child_and_reports_not_empty
-cargo test -p studiofs-vfs --lib rename_over_dir_waits_for_pending_deferred_child_and_reports_not_empty
+cargo test -p studiofs-vfs --lib rmdir_reports_not_empty_for_pending_deferred_child
+cargo test -p studiofs-vfs --lib rename_over_dir_reports_not_empty_for_pending_deferred_child
+cargo test -p studiofs-vfs --lib trash_rename_deletes_pending_deferred_child_of_source_tree
+cargo test -p studiofs-vfs --lib deferred_create_after_vfs_rmdir_reports_missing_parent
 cargo test -p studiofs-vfs --lib deferred_create_under_removed_parent_abandons_only_that_create
 ```
 
