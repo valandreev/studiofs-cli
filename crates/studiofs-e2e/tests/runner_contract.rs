@@ -124,7 +124,8 @@ fn run_scenario_selection_expands_comma_separated_numbers() {
 }
 
 /// Registered scenarios deliberately left out of the full mounted gate.
-const FULL_E2E_OPT_IN_SCENARIOS: &[&str] = &[];
+/// The gate runs on Linux, while `mounted-macos-mmap-exec` covers macFUSE page-ins.
+const FULL_E2E_OPT_IN_SCENARIOS: &[&str] = &["mounted-macos-mmap-exec"];
 
 #[test]
 fn full_e2e_selects_every_registered_scenario() {

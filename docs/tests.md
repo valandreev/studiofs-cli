@@ -385,7 +385,7 @@ file, writes through a mapping of a created handle, and executes a just-copied
 binary twice; each mapping runs in a forked child, and `macos-mmap-exec.json` records
 how each step ended. Mapping a file reopened for write remains a known limitation
 (`docs/platform-bridges.md`), so the scenario does not cover it. It needs macOS and
-reports `Unsupported` elsewhere.
+reports `Unsupported` elsewhere, so the Linux full E2E target leaves it out.
 
 ```sh
 cargo build -p studiofs -p studiofs-e2e
