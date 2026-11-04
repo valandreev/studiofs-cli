@@ -571,6 +571,19 @@ cargo build -p studiofs -p studiofs-e2e
 target/debug/studiofs-e2e run mounted-posix-acl-xattr-rejection --studiofs-bin target/debug/studiofs --run-id sfs934-acl --retain always --timeout 300s
 ```
 
+### SFS-959 Directory Removal Against Pending Deferred Creates
+
+`rmdir` and a rename replacing a directory wait for acknowledged child creates,
+so they report `ENOTEMPTY` instead of removing the parent. A create whose parent
+is already gone loses only that create and its dependents, and the mount stays
+healthy. Mounted xfstests generic/013 is a separate gate:
+
+```sh
+cargo test -p studiofs-vfs --lib rmdir_waits_for_pending_deferred_child_and_reports_not_empty
+cargo test -p studiofs-vfs --lib rename_over_dir_waits_for_pending_deferred_child_and_reports_not_empty
+cargo test -p studiofs-vfs --lib deferred_create_under_removed_parent_abandons_only_that_create
+```
+
 ### SFS-936 Setuid/Setgid Cleared on Direct Writes and O_TRUNC
 
 The unit tests cover the conditional setgid rule, empty writes, a uid 0 caller,
