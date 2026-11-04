@@ -39,8 +39,8 @@ use studiofs_vfs::{
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, trace, warn};
 use windows::Win32::Foundation::{
-    NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_DISK_FULL, STATUS_IO_DEVICE_ERROR,
-    STATUS_IO_REPARSE_DATA_INVALID, STATUS_NOT_SUPPORTED,
+    NTSTATUS, STATUS_BUFFER_TOO_SMALL, STATUS_DISK_FULL, STATUS_END_OF_FILE,
+    STATUS_IO_DEVICE_ERROR, STATUS_IO_REPARSE_DATA_INVALID, STATUS_NOT_SUPPORTED,
 };
 use windows::Win32::Security::{
     Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -2552,6 +2552,11 @@ impl AsyncFileSystemContext for StudioFsContext {
         // synthetic runtime stats file must be served from this callback.
         let runtime_stats_read = self.vfs.is_runtime_stats_file_ino(context.ino).then(|| {
             match context.runtime_stats_snapshot.as_deref() {
+                // The reported size exceeds the snapshot; a zero-byte success inside it can
+                // make an on-access reader retry forever and hold every open in the kernel.
+                Some(bytes) if offset >= bytes.len() as u64 => {
+                    Err(winfsp::FspError::from(STATUS_END_OF_FILE))
+                }
                 Some(bytes) => Ok(studiofs_vfs::read_runtime_stats_buffer(
                     bytes, offset, buffer,
                 )),
@@ -2709,13 +2714,13 @@ mod tests {
         PreparedWinfspNotifications, READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED,
         STATUS_BAD_NETWORK_PATH, STATUS_BUFFER_TOO_SMALL, STATUS_DATA_ERROR,
         STATUS_DIRECTORY_NOT_EMPTY, STATUS_DISK_CORRUPT_ERROR, STATUS_DISK_FULL,
-        STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR, STATUS_IO_TIMEOUT,
-        STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_NAME_NOT_FOUND,
-        SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext, WinfspAsyncCallbackTracker,
-        WinfspInvalidationQueue, WinfspKernelInvalidator, WinfspMetadataCachePolicy,
-        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
-        encode_symlink_reparse, hidden_platform_root_path_component, ino_to_windows_path,
-        is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
+        STATUS_EA_TOO_LARGE, STATUS_END_OF_FILE, STATUS_INVALID_PARAMETER, STATUS_IO_DEVICE_ERROR,
+        STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID,
+        STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext,
+        WinfspAsyncCallbackTracker, WinfspInvalidationQueue, WinfspKernelInvalidator,
+        WinfspMetadataCachePolicy, attr_to_file_info, build_basic_info_setattr_args,
+        build_notify_info, encode_symlink_reparse, hidden_platform_root_path_component,
+        ino_to_windows_path, is_runtime_stats_windows_path, maybe_hide_platform_root_entry,
         maybe_hide_platform_root_path, notify_filter_for_kind, open_flags_from_access,
         resolve_create_callback_kind, resolve_file_size_callback_action,
         should_disable_winfsp_file_cache, should_truncate_existing_file_on_open,
@@ -2737,7 +2742,7 @@ mod tests {
         DirectoryEnumerationObservation, KernelInvalidator, LocalSyncPolicy, OpenFlags,
         ReadAheadOwner, StudioVfs, VfsConfig,
     };
-    use studiofs_vfs::{RUNTIME_STATS_FILE_INO, VfsError};
+    use studiofs_vfs::{RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_REPORTED_SIZE, VfsError};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
@@ -4272,6 +4277,18 @@ mod tests {
             .expect("runtime stats read_async");
 
         assert_eq!(&buf[..n as usize], snapshot.as_slice());
+
+        // A zero-byte success inside the reported size can make a reader retry forever.
+        for offset in [snapshot.len() as u64, RUNTIME_STATS_FILE_REPORTED_SIZE - 1] {
+            let status = ctx
+                .rt
+                .block_on(AsyncFileSystemContext::read_async(
+                    &ctx, &handle, &mut buf, offset,
+                ))
+                .expect_err("read past the snapshot must report end of file")
+                .to_ntstatus();
+            assert_eq!(status, STATUS_END_OF_FILE.0);
+        }
     }
 
     #[test]
