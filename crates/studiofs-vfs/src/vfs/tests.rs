@@ -24314,10 +24314,19 @@ fn deferred_materialization_coalesces_synchronous_small_callbacks() {
             "the coalescing window must not emit one persisted object per callback"
         );
 
-        tokio::time::timeout(Duration::from_millis(500), vfs.flush_fh(fh))
+        // The flush itself does disk I/O, so its duration cannot prove the interrupt.
+        tokio::time::timeout(Duration::from_secs(30), vfs.flush_fh(fh))
             .await
-            .expect("strict flush must interrupt the coalescing window")
+            .expect("strict flush should finish")
             .expect("flush coalesced callbacks");
+        assert_eq!(
+            vfs.state
+                .metrics
+                .deferred_materialize_linger_interrupts
+                .load(AtomicOrdering::Relaxed),
+            1,
+            "strict flush must interrupt the coalescing window"
+        );
         assert_eq!(
             vfs.pending_uploads_for_inode(ino).len(),
             1,
