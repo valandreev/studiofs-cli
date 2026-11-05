@@ -74,18 +74,22 @@ impl QosController {
         self.fetch_slots.clone().acquire_owned().await
     }
 
-    /// Waits for a foreground local cache I/O slot without occupying a thread.
+    /// Waits for foreground local cache I/O slots without occupying a thread.
     ///
-    /// Hold the permit only around the I/O itself: its holder must never wait
-    /// on a lock or on another permit.
+    /// Pass one slot for each call that runs at once. Hold the permit only
+    /// around local I/O: never across a remote fetch or a second acquisition.
     pub async fn acquire_foreground_local_io(
         &self,
+        slots: u32,
     ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
-        self.foreground_local_io_slots.clone().acquire_owned().await
+        self.foreground_local_io_slots
+            .clone()
+            .acquire_many_owned(slots)
+            .await
     }
 
-    /// Returns currently available foreground local cache I/O permits.
-    pub fn foreground_local_io_available(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn foreground_local_io_available(&self) -> usize {
         self.foreground_local_io_slots.available_permits()
     }
 

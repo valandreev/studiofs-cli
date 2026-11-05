@@ -1079,33 +1079,52 @@ the mount:
   a worker out of service.
 - Read planning checks payload presence after releasing `pending_payloads`.
   Dispatcher callbacks such as `flush` and `cleanup` need that lock.
-- On Windows, at most 64 foreground local cache calls run at once. That covers
-  payload reads, cache lookups in the fetcher, and the presence checks for cold
-  reads. An excess read waits on a Tokio semaphore, holds no thread, and stays
-  pending in WinFSP. The 64 slots keep a stall well below Tokio's 512 blocking
-  threads, which metadata work also needs. Linux and macOS have no such limit.
+- On Windows, at most 64 calls from the paths below run at once. Linux and
+  macOS have no such limit, though the rules above apply to them too.
+  - Payload reads, with one slot for each thread in a concurrent read.
+  - Upload stage reads on the read path.
+  - Cache lookups and cold-read cache writes in the fetcher.
+  - Presence checks for cold reads.
+  - Write path `put_batch` and upload stage links.
 
-While all 64 slots are stalled, reads that need the local cache wait. Metadata
+  A caller over the limit waits on a Tokio semaphore. A mounted `read` or `write`
+  holds no thread while it waits and stays pending in WinFSP. The slots keep a
+  stall below Tokio's 512 blocking threads, which metadata work also needs.
+
+While all 64 slots are stalled, work that needs a slot waits. Other metadata
 requests and reads served from memory keep working.
 
 Remaining limits:
 
-- Dirty read span checks and pending-overlay checks run outside the 64 slots
-  because they sit inside synchronous read planning. They affect only inodes
-  with pending local extents, and Tokio's blocking pool still bounds them.
+- Prefetch shares the 64 slots, so stalled prefetch reads can delay foreground
+  reads.
+- A read waiting for a slot keeps its file session. A size-changing callback on
+  that file waits for the read and holds a dispatcher thread meanwhile.
+- These local calls run outside the slots:
+  - Dirty read span checks and pending-overlay checks, because they sit inside
+    synchronous read planning. They affect only inodes with pending local
+    extents.
+  - `sync_data`, payload removal, and upload lifecycle work.
+
+  Tokio's blocking pool is their only limit.
+- If a read future is dropped during an upload stage fallback, its slot is
+  released while the blocking call keeps running.
 - Local dirty commit still reads local extents under `pending_payloads`
   (`snapshot_dirty_local_dirty_payloads`). A stall there can block dispatcher
   callbacks that need the lock.
-- `create`, `open` with truncate, `overwrite`, `set_file_size`, `rename`, and
-  `cleanup` with delete still run on dispatcher threads. Truncation can touch
-  the upload stage and remove payload files inline. Enough of these stalled at
-  once can still use up the dispatcher threads.
-- The limit does not remove a stall or prove what causes it. The stalled read
-  still fails or finishes only when the filter driver returns.
+- These callbacks still run on dispatcher threads:
+  - `flush` waits for up to `STUDIOFS_WINFSP_FLUSH_CALLBACK_TIMEOUT_MS`.
+  - `create`, `open` with truncate, `overwrite`, `set_file_size`, `rename`, and
+    `cleanup` with delete wait without a time limit. Truncation can touch the
+    upload stage and remove payload files inline.
+
+  Enough of these stalled at once can still use up the dispatcher threads.
+- The limit does not remove a stall or prove what causes it. A stalled call
+  finishes only when the filter driver returns.
 
 The gated regressions need no mount or Defender:
 
-    cargo test -p studiofs-vfs --lib -- stalled_ span_snapshot_releases
+    cargo test -p studiofs-vfs --lib -- stalled_ span_snapshot_releases local_read_fan_out write_path_staging
 
 ## Opt-in payload read stage diagnostics
 

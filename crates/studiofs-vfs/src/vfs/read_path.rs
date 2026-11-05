@@ -510,7 +510,7 @@ impl<'a> DataReader<'a> {
                 if matches!(
                     &source,
                     PendingOverlayBlockSource::Extent(object_id)
-                        if !Self::has_local_payload_for_read(vfs, *object_id)
+                        if !vfs.has_local_payload(*object_id)
                 ) {
                     continue;
                 }
@@ -744,10 +744,6 @@ impl<'a> DataReader<'a> {
         Self::fetch_remote_blocks(vfs, segments, RemoteFetchMode::ForegroundColdRead).await
     }
 
-    fn has_local_payload_for_read(vfs: &StudioVfs, object_id: u64) -> bool {
-        vfs.has_local_payload(object_id)
-    }
-
     async fn fetch_remote_blocks(
         vfs: &StudioVfs,
         segments: &[ReadSegment],
@@ -777,7 +773,7 @@ impl<'a> DataReader<'a> {
         if remote_blocks.is_empty() {
             return Ok(());
         }
-        let local_io = vfs.foreground_local_io_permit().await?;
+        let local_io = vfs.foreground_local_io_permit(1).await?;
         if matches!(mode, RemoteFetchMode::BestEffortPrefetch) {
             for object_id in remote_blocks.keys() {
                 if run_local_cache_io(|| vfs.local_payload_backend.contains(*object_id)).0 {
@@ -785,7 +781,7 @@ impl<'a> DataReader<'a> {
                 }
             }
         }
-        remote_blocks.retain(|object_id, _| !Self::has_local_payload_for_read(vfs, *object_id));
+        remote_blocks.retain(|object_id, _| !vfs.has_local_payload(*object_id));
         drop(local_io);
         if remote_blocks.is_empty() {
             return Ok(());
@@ -1119,7 +1115,8 @@ impl<'a> DataReader<'a> {
         }
 
         // The serial path reads these runs itself, under its own permits.
-        let Ok(_local_io) = vfs.foreground_local_io_permit().await else {
+        let concurrent_reads = runs.len().min(PARALLEL_LOCAL_READ_MAX_THREADS) as u32;
+        let Ok(_local_io) = vfs.foreground_local_io_permit(concurrent_reads).await else {
             return Vec::new();
         };
         let mut jobs = Vec::with_capacity(runs.len());
@@ -1307,9 +1304,14 @@ impl<'a> DataReader<'a> {
             }
         }
 
-        if !span_resolved && let Some(data) = vfs.upload_stage_get_async(payload.object_id).await? {
-            vfs.copy_committed_payload_into_range(data.as_ref(), payload, file_offset, dst)?;
-            span_resolved = true;
+        if !span_resolved {
+            let local_io = vfs.foreground_local_io_permit(1).await?;
+            let staged = vfs.upload_stage_get_async(payload.object_id).await?;
+            drop(local_io);
+            if let Some(data) = staged {
+                vfs.copy_committed_payload_into_range(data.as_ref(), payload, file_offset, dst)?;
+                span_resolved = true;
+            }
         }
 
         if !span_resolved {
@@ -3055,17 +3057,23 @@ pub(super) mod tests {
     /// Holds a backend call until released, so a test can observe a stalled filter open.
     #[derive(Default)]
     pub(in crate::vfs) struct IoGate {
-        state: Mutex<(bool, usize)>,
+        state: Mutex<IoGateState>,
         changed: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct IoGateState {
+        held: bool,
+        entered: usize,
     }
 
     impl IoGate {
         pub(in crate::vfs) fn hold(&self) {
-            self.state.lock().expect("gate").0 = true;
+            self.state.lock().expect("gate").held = true;
         }
 
         pub(in crate::vfs) fn release(&self) {
-            self.state.lock().expect("gate").0 = false;
+            self.state.lock().expect("gate").held = false;
             self.changed.notify_all();
         }
 
@@ -3075,30 +3083,45 @@ pub(super) mod tests {
                 .wait_timeout_while(
                     self.state.lock().expect("gate"),
                     std::time::Duration::from_secs(30),
-                    |state| state.1 < expected,
+                    |state| state.entered < expected,
                 )
                 .expect("gate");
             assert!(
                 !timeout.timed_out(),
                 "gate saw {} of {expected} calls",
-                state.1
+                state.entered
             );
         }
 
         fn entered(&self) -> usize {
-            self.state.lock().expect("gate").1
+            self.state.lock().expect("gate").entered
         }
 
         fn pass(&self) {
             let mut state = self.state.lock().expect("gate");
-            state.1 += 1;
+            state.entered += 1;
             self.changed.notify_all();
             // Bounded so a failing assertion cannot hang the runtime's shutdown.
             let _state = self
                 .changed
-                .wait_timeout_while(state, std::time::Duration::from_secs(30), |state| state.0)
+                .wait_timeout_while(state, std::time::Duration::from_secs(30), |state| {
+                    state.held
+                })
                 .expect("gate");
         }
+    }
+
+    /// Replaces the backend of an unstarted test VFS with a gated one.
+    pub(in crate::vfs) fn install_counting_backend(
+        vfs: &mut Arc<StudioVfs>,
+    ) -> Arc<CountingLocalPayloadBackend> {
+        let backend = Arc::new(CountingLocalPayloadBackend::new(
+            vfs.local_payload_backend.clone(),
+        ));
+        Arc::get_mut(vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_payload_backend = backend.clone();
+        backend
     }
 
     pub(in crate::vfs) struct CountingLocalPayloadBackend {
@@ -3113,7 +3136,7 @@ pub(super) mod tests {
     }
 
     impl CountingLocalPayloadBackend {
-        pub(in crate::vfs) fn new(inner: Arc<dyn LocalPayloadBackend>) -> Self {
+        fn new(inner: Arc<dyn LocalPayloadBackend>) -> Self {
             Self {
                 contains_gate: IoGate::default(),
                 read_into_gate: IoGate::default(),
@@ -3409,7 +3432,7 @@ pub(super) mod tests {
                 .expect("evict primary local payload");
 
             assert!(
-                DataReader::has_local_payload_for_read(&vfs, object_id),
+                vfs.has_local_payload(object_id),
                 "prefetch must recognize the durable upload-stage copy after cache eviction"
             );
 
@@ -3461,7 +3484,7 @@ pub(super) mod tests {
                 .expect("evict primary local payload");
 
             assert!(
-                DataReader::has_local_payload_for_read(&vfs, object_id),
+                vfs.has_local_payload(object_id),
                 "pending extent setup must retain a readable local stage"
             );
             let segment = ReadSegment {
@@ -6671,12 +6694,7 @@ pub(super) mod tests {
         Arc<CountingLocalPayloadBackend>,
     ) {
         let (rt, mut vfs, meta) = make_unstarted_test_vfs(tmp, suffix);
-        let backend = Arc::new(CountingLocalPayloadBackend::new(
-            vfs.local_payload_backend.clone(),
-        ));
-        Arc::get_mut(&mut vfs)
-            .expect("unstarted test VFS should be uniquely owned")
-            .local_payload_backend = backend.clone();
+        let backend = install_counting_backend(&mut vfs);
         (rt, vfs, meta, backend)
     }
 
@@ -6697,7 +6715,7 @@ pub(super) mod tests {
         let checks: Vec<_> = (0..workers as u64)
             .map(|object_id| {
                 let vfs = vfs.clone();
-                rt.spawn(async move { DataReader::has_local_payload_for_read(&vfs, object_id) })
+                rt.spawn(async move { vfs.has_local_payload(object_id) })
             })
             .collect();
         backend.contains_gate.wait_entered(workers);
@@ -6708,6 +6726,87 @@ pub(super) mod tests {
         for check in checks {
             assert!(!rt.block_on(check).expect("presence check task"));
         }
+    }
+
+    #[test]
+    fn local_read_fan_out_takes_one_slot_per_concurrent_read() {
+        const OBJECT_BYTES: usize = 2 * 1024 * 1024;
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta, backend) = gated_test_vfs(&tmp, "read-fan-out-slots");
+        let object_ids = [8_110, 8_111];
+        for object_id in object_ids {
+            vfs.local_payload_backend()
+                .put(object_id, &vec![7; OBJECT_BYTES], false)
+                .expect("persist local payload");
+        }
+        let available = vfs.qos.foreground_local_io_available();
+        backend.read_into_gate.hold();
+
+        let read = rt.spawn({
+            let vfs = vfs.clone();
+            async move {
+                let segments: Vec<_> = object_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, object_id)| {
+                        let start = (index * OBJECT_BYTES) as u64;
+                        ReadSegment {
+                            range: read_range(start, start + OBJECT_BYTES as u64),
+                            source: ReadSegmentSource::PendingExtent {
+                                object_id: *object_id,
+                                block_offset: 0,
+                            },
+                        }
+                    })
+                    .collect();
+                let mut out = vec![0; OBJECT_BYTES * object_ids.len()];
+                let reader = DataReader::new(&vfs, ROOT_INO, 0, out.len() as u64, None, None);
+                reader.assemble_into(&segments, &mut out).await
+            }
+        });
+        backend.read_into_gate.wait_entered(object_ids.len());
+
+        assert_eq!(
+            vfs.qos.foreground_local_io_available(),
+            available - object_ids.len()
+        );
+
+        backend.read_into_gate.release();
+        rt.block_on(read)
+            .expect("fan-out task")
+            .expect("fan-out read");
+        assert_eq!(vfs.qos.foreground_local_io_available(), available);
+    }
+
+    #[test]
+    fn write_path_staging_waits_for_a_local_io_slot() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "write-staging-slot");
+        let available = vfs.qos.foreground_local_io_available();
+        vfs.qos
+            .forget_foreground_local_io_permits_for_test(available);
+        // With no slots left, neither call can reach the backend before the timeout.
+        let pending = std::time::Duration::from_millis(100);
+        rt.block_on(async {
+            assert!(
+                tokio::time::timeout(
+                    pending,
+                    vfs.payload_store_put_batch_async(vec![LocalPayloadPut {
+                        object_id: 8_120,
+                        data: Bytes::from_static(b"staged"),
+                        evictable: false,
+                    }]),
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                tokio::time::timeout(pending, vfs.upload_stage_link_batch_async(vec![8_120]))
+                    .await
+                    .is_err()
+            );
+        });
+        assert!(!vfs.local_payload_backend().contains(8_120));
     }
 
     #[test]
@@ -6742,12 +6841,13 @@ pub(super) mod tests {
 
         // Metadata reads and runtime scheduling stay available for dispatcher threads.
         assert_runtime_schedules_work(&rt);
-        let attr = std::thread::scope(|scope| {
-            scope
-                .spawn(|| vfs.getattr(ROOT_INO).expect("getattr during stall"))
-                .join()
-                .expect("dispatcher-like thread")
-        });
+        let (attr_tx, attr_rx) = std::sync::mpsc::channel();
+        let dispatcher_vfs = vfs.clone();
+        std::thread::spawn(move || attr_tx.send(dispatcher_vfs.getattr(ROOT_INO)));
+        let attr = attr_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("getattr must not wait for a stalled local read")
+            .expect("getattr during stall");
         assert_eq!(attr.ino, ROOT_INO);
         assert_eq!(vfs.qos.foreground_local_io_available(), 0);
         assert_eq!(backend.read_into_gate.entered(), LIMIT);

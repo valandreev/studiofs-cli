@@ -1879,16 +1879,9 @@ mod tests {
         seed: impl FnOnce(&StudioVfs),
         snapshot: impl FnOnce(&StudioVfs) -> Vec<PendingDirtyReadSpan> + Send,
     ) {
-        use crate::vfs::read_path::tests::CountingLocalPayloadBackend;
-
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, suffix);
-        let backend = Arc::new(CountingLocalPayloadBackend::new(
-            vfs.local_payload_backend.clone(),
-        ));
-        Arc::get_mut(&mut vfs)
-            .expect("unstarted test VFS should be uniquely owned")
-            .local_payload_backend = backend.clone();
+        let backend = crate::vfs::read_path::tests::install_counting_backend(&mut vfs);
         seed(&vfs);
         backend.contains_gate.hold();
 

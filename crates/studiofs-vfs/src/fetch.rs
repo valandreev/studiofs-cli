@@ -940,17 +940,24 @@ impl FetchScheduler {
         Ok(payload)
     }
 
-    async fn payload_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
-        let _local_io = self
-            .qos
-            .acquire_foreground_local_io()
+    async fn foreground_local_io_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, FetchError> {
+        self.qos
+            .acquire_foreground_local_io(1)
             .await
             .map_err(|error| {
                 FetchError::CacheAccess(format!("local cache I/O permit failed: {error}"))
-            })?;
+            })
+    }
+
+    async fn payload_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
+        let local_io = self.foreground_local_io_permit().await?;
         let cached_store = self.cached_store.clone();
         let submitted_at = Instant::now();
         let (result, timing) = task::spawn_blocking(move || {
+            // The closure keeps running if this future is dropped, so it owns the slot.
+            let _local_io = local_io;
             let io_started = Instant::now();
             let handoff_ns = io_started
                 .checked_duration_since(submitted_at)
@@ -980,9 +987,12 @@ impl FetchScheduler {
         payload: Bytes,
         evictable: bool,
     ) -> Result<(), FetchError> {
+        let local_io = self.foreground_local_io_permit().await?;
         let cached_store = self.cached_store.clone();
         let submitted_at = Instant::now();
         let (result, timing) = task::spawn_blocking(move || {
+            // The closure keeps running if this future is dropped, so it owns the slot.
+            let _local_io = local_io;
             let io_started = Instant::now();
             let handoff_ns = io_started
                 .checked_duration_since(submitted_at)
@@ -1692,6 +1702,34 @@ mod tests {
         assert!(remote.starts_with(SFEC_MAGIC));
         assert!(!remote.starts_with(STFS_MAGIC));
         remote
+    }
+
+    #[tokio::test]
+    async fn fetcher_cache_io_waits_for_a_local_io_slot() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (scheduler, _raw, cached_store, _config) =
+            make_encrypted_fetch_scheduler(&tmp, "local-io-slot");
+        let available = scheduler.qos.foreground_local_io_available();
+        scheduler
+            .qos
+            .forget_foreground_local_io_permits_for_test(available);
+        // With no slots left, neither call can reach the cache before the timeout.
+        let pending = Duration::from_millis(100);
+        let object_id = 0x3532;
+        assert!(
+            tokio::time::timeout(pending, scheduler.payload_store_get_async(object_id))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                pending,
+                scheduler.payload_store_put_async(object_id, Bytes::from_static(b"cold"), true),
+            )
+            .await
+            .is_err()
+        );
+        assert!(cached_store.get(object_id).is_none());
     }
 
     #[tokio::test]
