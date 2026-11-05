@@ -1083,12 +1083,12 @@ change the payload operation result.
 The E2E runner inherits this environment variable and redirects each mounted
 client's stderr directly to
 `<run-dir>/artifacts/clients/<client>/studiofs.stderr.log`.
-Run the prepared diagnostic binary from PowerShell:
+Run a diagnostic binary from PowerShell:
 
 ```powershell
 $env:STUDIOFS_PAYLOAD_READ_STAGE_DIAGNOSTICS = '1'
 try {
-    target/debug/studiofs-e2e.exe run --scenario mounted-worker-concurrency --studiofs-bin .\target\sfs-1022-diagnostics\studiofs.exe --seed 0 --retain always --timeout 180s
+    target/debug/studiofs-e2e.exe run --scenario mounted-worker-concurrency --studiofs-bin .\target\release\studiofs.exe --seed 0 --retain always --timeout 180s
 } finally {
     Remove-Item Env:STUDIOFS_PAYLOAD_READ_STAGE_DIAGNOSTICS
 }

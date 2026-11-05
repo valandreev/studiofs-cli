@@ -202,17 +202,17 @@ on whichever read crossed the threshold and stalled it for tens of
 milliseconds. Eviction and `sync_data` still force a synchronous flush.
 
 On Windows, after a payload is committed, the bounded read-descriptor cache retains the
-read-capable handle that wrote its staging file. A warm read of that newly
-materialized payload can reuse the handle without opening the final path again.
-The handle keeps its actual I/O mode. On Windows, the default buffered writer
-therefore serves the first read through buffered I/O even though later cold
-opens use unbuffered reads where supported. Batched staging retains handles for
-at most the existing read-cache capacity, keeping temporary open descriptors
-bounded; entries beyond that bound and later cache evictions may still require a
-cold open. Other platforms keep their existing read-open behavior. Restart also
-removes retained handles. This change reduces one cold-read open path; mounted
-Windows acceptance is still needed to determine whether it addresses the observed
-stalled-call chain.
+read-capable handle that wrote its staging file. A read of that newly materialized
+payload can reuse the handle without opening the final path again. The handle
+keeps its actual I/O mode, and a displaced entry closes outside the cache shard lock.
+The default Windows writer is buffered, so every read of a payload stays buffered
+while its handle is retained, even under the unbuffered read policy; that can
+duplicate payload and mounted-file pages. Later cold opens use unbuffered reads
+where supported. Batched staging retains handles for at most the existing
+read-cache capacity, keeping temporary open descriptors bounded. Entries beyond
+that bound, cache evictions and restarts still require a cold open. Other platforms
+keep their existing read-open behavior. Staging file creation and renames are not
+covered by this retention.
 
 Outstanding markers are
 replayed only before startup begins serving operations; a successful live retry

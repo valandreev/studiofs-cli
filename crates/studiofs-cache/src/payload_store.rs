@@ -10,10 +10,10 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use lru::LruCache;
@@ -50,15 +50,18 @@ static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 static BATCH_INTENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 static PAYLOAD_READ_STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+// Read once: this guards every hot payload read, even with diagnostics off.
+static PAYLOAD_READ_STAGE_DIAGNOSTICS: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("STUDIOFS_PAYLOAD_READ_STAGE_DIAGNOSTICS").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+});
 
 fn payload_read_stage<T>(
     object_id: u64,
     stage: &str,
     operation: impl FnOnce() -> io::Result<T>,
 ) -> io::Result<T> {
-    if std::env::var_os("STUDIOFS_PAYLOAD_READ_STAGE_DIAGNOSTICS").as_deref()
-        != Some(std::ffi::OsStr::new("1"))
-    {
+    if !*PAYLOAD_READ_STAGE_DIAGNOSTICS {
         return operation();
     }
     payload_read_stage_to(object_id, stage, &mut io::stderr(), operation)
@@ -314,6 +317,7 @@ impl FilePayloadStore {
         let start = u64::try_from(data_offset).ok()?;
 
         if self.read_mode == LocalPayloadReadMode::Unbuffered {
+            #[cfg(windows)]
             if let Some(file) = self.cached_buffered_read_handle(object_id) {
                 return self.read_into_buffered_handle(object_id, data_offset, start, out, &file);
             }
@@ -325,6 +329,7 @@ impl FilePayloadStore {
                 return self.read_into_buffered_fallback(object_id, data_offset, start, out);
             }
             let file = self.cached_read_handle(object_id).ok()?;
+            #[cfg(windows)]
             if file.io_mode == PayloadFileIoMode::Buffered {
                 return self.read_into_buffered_handle(object_id, data_offset, start, out, &file);
             }
@@ -989,13 +994,13 @@ impl FilePayloadStore {
         match platform::rename_atomic(&staged.temp_path, &staged.payload_path) {
             Ok(()) => Ok(()),
             Err(error) if platform::is_cross_device_link_error(&error) => {
+                let _ = std::fs::remove_file(&staged.temp_path);
                 let payload_local_temp = self.write_temp_payload_file(
                     &staged.payload_dir,
                     staged.entry.object_id,
                     staged.entry.data,
                     durable_sync,
                 )?;
-                let _ = std::fs::remove_file(&staged.temp_path);
                 if let Err(rename_error) =
                     platform::rename_atomic(&payload_local_temp.path, &staged.payload_path)
                 {
@@ -1372,6 +1377,7 @@ impl FilePayloadStore {
         &self,
         object_id: u64,
     ) -> io::Result<Arc<CachedReadHandle>> {
+        #[cfg(windows)]
         if let Some(file) = self.cached_buffered_read_handle(object_id) {
             return Ok(file);
         }
@@ -1384,6 +1390,7 @@ impl FilePayloadStore {
         )
     }
 
+    #[cfg(windows)]
     fn cached_buffered_read_handle(&self, object_id: u64) -> Option<Arc<CachedReadHandle>> {
         let handle = self.shared.read_handles.shards[read_fd_shard_idx(object_id)]
             .lock()
@@ -1448,11 +1455,7 @@ impl FilePayloadStore {
             cache.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(existing);
         }
-        let evicted_lru = handles.len() == handles.cap().get();
-        let _ = handles.put(object_id, Arc::clone(&file));
-        if evicted_lru {
-            cache.evictions.fetch_add(1, Ordering::Relaxed);
-        }
+        cache.insert_and_unlock(handles, object_id, Arc::clone(&file));
         Ok(file)
     }
 
@@ -1468,45 +1471,22 @@ impl FilePayloadStore {
             let Some(handle) = staged_handle else {
                 return;
             };
-            match handle.io_mode {
-                PayloadFileIoMode::Buffered => {
-                    self.cache_read_handle(object_id, &self.shared.read_handles, &handle);
-                }
-                PayloadFileIoMode::Unbuffered
-                    if self.read_mode == LocalPayloadReadMode::Unbuffered =>
-                {
-                    self.cache_read_handle(object_id, &self.shared.read_handles, &handle);
-                }
-                PayloadFileIoMode::Unbuffered => {}
+            if handle.io_mode == PayloadFileIoMode::Unbuffered
+                && self.read_mode != LocalPayloadReadMode::Unbuffered
+            {
+                return;
             }
-        }
-    }
-
-    #[cfg(windows)]
-    fn cache_read_handle(
-        &self,
-        object_id: u64,
-        cache: &ReadHandleCache,
-        file: &Arc<CachedReadHandle>,
-    ) {
-        let path = self.layout.payload_object_path(object_id);
-        if let Err(error) = platform::advise_random(file.as_ref()) {
-            warn!(
-                object_id,
-                path = %path.display(),
-                error = ?error,
-                "local payload runtime payload open advise_random failed"
-            );
-        }
-
-        let mut handles = cache.shards[read_fd_shard_idx(object_id)].lock();
-        if handles.contains(&object_id) {
-            return;
-        }
-        let evicted_lru = handles.len() == handles.cap().get();
-        let _ = handles.put(object_id, Arc::clone(file));
-        if evicted_lru {
-            cache.evictions.fetch_add(1, Ordering::Relaxed);
+            if let Err(error) = platform::advise_random(handle.as_ref()) {
+                warn!(
+                    object_id,
+                    error = ?error,
+                    "local payload runtime staged handle advise_random failed"
+                );
+            }
+            // Overwrite: a racing reader may have cached the replaced file since invalidation.
+            let cache = &self.shared.read_handles;
+            let handles = cache.shards[read_fd_shard_idx(object_id)].lock();
+            cache.insert_and_unlock(handles, object_id, handle);
         }
     }
 
@@ -1528,12 +1508,14 @@ impl FilePayloadStore {
     }
 
     fn invalidate_cached_read_handle(&self, object_id: u64) {
-        self.shared.read_handles.shards[read_fd_shard_idx(object_id)]
+        // Bound before dropping so the handles close after each shard lock is released.
+        let _primary = self.shared.read_handles.shards[read_fd_shard_idx(object_id)]
             .lock()
             .pop(&object_id);
-        self.shared.buffered_read_fallback_handles.shards[read_fd_shard_idx(object_id)]
-            .lock()
-            .pop(&object_id);
+        let _fallback = self.shared.buffered_read_fallback_handles.shards
+            [read_fd_shard_idx(object_id)]
+        .lock()
+        .pop(&object_id);
     }
 
     #[cfg(test)]
@@ -1775,6 +1757,22 @@ impl ReadHandleCache {
             .iter()
             .map(|shard| shard.lock().cap().get())
             .sum()
+    }
+
+    /// Closes the displaced handle after unlocking: closing a written file can stall in a filter.
+    fn insert_and_unlock(
+        &self,
+        mut handles: parking_lot::MutexGuard<'_, LruCache<u64, Arc<CachedReadHandle>>>,
+        object_id: u64,
+        file: Arc<CachedReadHandle>,
+    ) {
+        let evicted_lru = !handles.contains(&object_id) && handles.len() == handles.cap().get();
+        let displaced = handles.push(object_id, file);
+        drop(handles);
+        drop(displaced);
+        if evicted_lru {
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn evict_under_pressure(&self) -> usize {
@@ -2363,6 +2361,16 @@ mod tests {
         let mut out = vec![0_u8; 4096];
         assert_eq!(store.read_into(4299, 0, &mut out), Some(4096));
         assert_eq!(out, payload);
+        #[cfg(windows)]
+        {
+            // Documented SFS-1022 trade-off: the retained buffered writer serves reads
+            // until it leaves the cache, because changing its mode needs a new open.
+            assert_eq!(store.read_mode_snapshot().unbuffered_read_attempts, 0);
+            store.invalidate_cached_read_handle(4299);
+            out.fill(0);
+            assert_eq!(store.read_into(4299, 0, &mut out), Some(4096));
+            assert_eq!(out, payload);
+        }
         let reads = store.read_mode_snapshot();
         if cfg!(any(target_os = "macos", windows)) {
             assert_eq!(reads.unbuffered_read_attempts, 1);
@@ -2478,6 +2486,29 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn staged_install_replaces_stale_handle_cached_by_racing_reader() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let store =
+            FilePayloadStore::open(LocalPayloadLayout::from_cache_root(temp.path())).unwrap();
+        store.put(4310, b"old").unwrap();
+        let stale = store.cached_read_handle(4310).unwrap();
+        store.put(4310, b"new").unwrap();
+        let staged = store.cached_read_handle(4310).unwrap();
+
+        // A reader that opened the old file can insert between commit invalidation and install.
+        store.invalidate_cached_read_handle(4310);
+        store.shared.read_handles.shards[read_fd_shard_idx(4310)]
+            .lock()
+            .put(4310, stale);
+        store.install_staged_read_handle(4310, Some(staged));
+
+        let mut out = [0; 3];
+        assert_eq!(store.read_into(4310, 0, &mut out), Some(3));
+        assert_eq!(&out, b"new");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn batch_staging_retains_at_most_read_cache_capacity_handles() {
         let temp = studiofs_test_support::workspace_target_tempdir("test-");
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
@@ -2543,6 +2574,8 @@ mod tests {
             .unwrap()
             .set_len(64 * 1024 * 1024)
             .unwrap();
+        // The retained writer's cursor sits after the write; observe a fresh read handle.
+        store.invalidate_cached_read_handle(748);
         let file = store.cached_read_handle(748).unwrap();
         let mut cursor = &file.file;
         assert_eq!(cursor.stream_position().unwrap(), 0);
