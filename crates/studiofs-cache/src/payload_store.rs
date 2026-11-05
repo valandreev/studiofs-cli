@@ -1479,6 +1479,7 @@ impl FilePayloadStore {
             if let Err(error) = platform::advise_random(handle.as_ref()) {
                 warn!(
                     object_id,
+                    path = %self.payload_object_path(object_id).display(),
                     error = ?error,
                     "local payload runtime staged handle advise_random failed"
                 );
