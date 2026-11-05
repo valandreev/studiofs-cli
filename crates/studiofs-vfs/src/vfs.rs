@@ -6830,10 +6830,29 @@ impl StudioVfs {
         cached
     }
 
+    /// Checks every local payload location. The file checks are opens on
+    /// Windows, so callers must not hold a lock across this call.
+    fn has_local_payload(&self, object_id: u64) -> bool {
+        self.cached_store.get_hot_upload(object_id).is_some()
+            || run_local_cache_io(|| {
+                self.local_payload_backend.contains(object_id)
+                    || self.cached_store.has_staged_upload(object_id)
+            })
+            .0
+    }
+
+    async fn foreground_local_io_permit(&self) -> VfsResult<tokio::sync::OwnedSemaphorePermit> {
+        self.qos
+            .acquire_foreground_local_io()
+            .await
+            .map_err(|error| VfsError::Other(format!("local cache I/O permit failed: {error}")))
+    }
+
     async fn payload_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
         if let Some(payload) = self.upload_hot_get(object_id) {
             return Ok(Some(payload));
         }
+        let _local_io = self.foreground_local_io_permit().await?;
         let (result, timing) = run_local_cache_io(|| self.local_payload_backend.get(object_id));
         self.record_local_cache_io_timing(timing);
         Ok(result)
@@ -6850,6 +6869,7 @@ impl StudioVfs {
             self.record_foreground_local_payload_read(read as u64, 0);
             return Ok(Some(read));
         }
+        let _local_io = self.foreground_local_io_permit().await?;
         let (result, timing) = run_local_cache_io(|| {
             self.local_payload_backend
                 .read_into(object_id, data_offset, out)

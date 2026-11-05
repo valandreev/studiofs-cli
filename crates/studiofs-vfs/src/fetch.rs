@@ -941,6 +941,13 @@ impl FetchScheduler {
     }
 
     async fn payload_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
+        let _local_io = self
+            .qos
+            .acquire_foreground_local_io()
+            .await
+            .map_err(|error| {
+                FetchError::CacheAccess(format!("local cache I/O permit failed: {error}"))
+            })?;
         let cached_store = self.cached_store.clone();
         let submitted_at = Instant::now();
         let (result, timing) = task::spawn_blocking(move || {

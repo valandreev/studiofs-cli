@@ -745,9 +745,7 @@ impl<'a> DataReader<'a> {
     }
 
     fn has_local_payload_for_read(vfs: &StudioVfs, object_id: u64) -> bool {
-        vfs.local_payload_backend.contains(object_id)
-            || vfs.cached_store.has_staged_upload(object_id)
-            || vfs.cached_store.get_hot_upload(object_id).is_some()
+        vfs.has_local_payload(object_id)
     }
 
     async fn fetch_remote_blocks(
@@ -779,14 +777,16 @@ impl<'a> DataReader<'a> {
         if remote_blocks.is_empty() {
             return Ok(());
         }
+        let local_io = vfs.foreground_local_io_permit().await?;
         if matches!(mode, RemoteFetchMode::BestEffortPrefetch) {
             for object_id in remote_blocks.keys() {
-                if vfs.local_payload_backend.contains(*object_id) {
+                if run_local_cache_io(|| vfs.local_payload_backend.contains(*object_id)).0 {
                     vfs.local_payload_backend.advise_will_need(*object_id);
                 }
             }
         }
         remote_blocks.retain(|object_id, _| !Self::has_local_payload_for_read(vfs, *object_id));
+        drop(local_io);
         if remote_blocks.is_empty() {
             return Ok(());
         }
@@ -890,7 +890,7 @@ impl<'a> DataReader<'a> {
         let mut written = 0usize;
         let mut index = 0usize;
         let prefetched_runs =
-            Self::read_committed_local_runs_concurrently(vfs, offset, segments, buffer);
+            Self::read_committed_local_runs_concurrently(vfs, offset, segments, buffer).await;
         while index < segments.len() {
             let segment = &segments[index];
             let dst_start = segment.range.start().saturating_sub(offset) as usize;
@@ -1055,7 +1055,7 @@ impl<'a> DataReader<'a> {
     /// run that was fully served (the first index for a committed run, every
     /// index for an extent run); failed, short, or upload-hot runs are left for
     /// the serial path so all fallbacks are unchanged.
-    fn read_committed_local_runs_concurrently(
+    async fn read_committed_local_runs_concurrently(
         vfs: &StudioVfs,
         offset: u64,
         segments: &[ReadSegment],
@@ -1118,6 +1118,10 @@ impl<'a> DataReader<'a> {
             return Vec::new();
         }
 
+        // The serial path reads these runs itself, under its own permits.
+        let Ok(_local_io) = vfs.foreground_local_io_permit().await else {
+            return Vec::new();
+        };
         let mut jobs = Vec::with_capacity(runs.len());
         let mut rest = &mut *buffer;
         let mut consumed = 0usize;
@@ -2552,7 +2556,7 @@ fn copy_partial_committed_payload_into(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #[test]
     fn short_partial_committed_payload_is_an_error() {
         let mut dst = [0xAA; 4];
@@ -3048,7 +3052,58 @@ mod tests {
         }
     }
 
-    struct CountingLocalPayloadBackend {
+    /// Holds a backend call until released, so a test can observe a stalled filter open.
+    #[derive(Default)]
+    pub(in crate::vfs) struct IoGate {
+        state: Mutex<(bool, usize)>,
+        changed: std::sync::Condvar,
+    }
+
+    impl IoGate {
+        pub(in crate::vfs) fn hold(&self) {
+            self.state.lock().expect("gate").0 = true;
+        }
+
+        pub(in crate::vfs) fn release(&self) {
+            self.state.lock().expect("gate").0 = false;
+            self.changed.notify_all();
+        }
+
+        pub(in crate::vfs) fn wait_entered(&self, expected: usize) {
+            let (state, timeout) = self
+                .changed
+                .wait_timeout_while(
+                    self.state.lock().expect("gate"),
+                    std::time::Duration::from_secs(30),
+                    |state| state.1 < expected,
+                )
+                .expect("gate");
+            assert!(
+                !timeout.timed_out(),
+                "gate saw {} of {expected} calls",
+                state.1
+            );
+        }
+
+        fn entered(&self) -> usize {
+            self.state.lock().expect("gate").1
+        }
+
+        fn pass(&self) {
+            let mut state = self.state.lock().expect("gate");
+            state.1 += 1;
+            self.changed.notify_all();
+            // Bounded so a failing assertion cannot hang the runtime's shutdown.
+            let _state = self
+                .changed
+                .wait_timeout_while(state, std::time::Duration::from_secs(30), |state| state.0)
+                .expect("gate");
+        }
+    }
+
+    pub(in crate::vfs) struct CountingLocalPayloadBackend {
+        pub(in crate::vfs) contains_gate: IoGate,
+        read_into_gate: IoGate,
         inner: Arc<dyn LocalPayloadBackend>,
         get_calls: AtomicU64,
         read_into_calls: AtomicU64,
@@ -3058,8 +3113,10 @@ mod tests {
     }
 
     impl CountingLocalPayloadBackend {
-        fn new(inner: Arc<dyn LocalPayloadBackend>) -> Self {
+        pub(in crate::vfs) fn new(inner: Arc<dyn LocalPayloadBackend>) -> Self {
             Self {
+                contains_gate: IoGate::default(),
+                read_into_gate: IoGate::default(),
                 inner,
                 get_calls: AtomicU64::new(0),
                 read_into_calls: AtomicU64::new(0),
@@ -3108,6 +3165,7 @@ mod tests {
         }
 
         fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
+            self.read_into_gate.pass();
             self.read_into_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.read_threads
                 .lock()
@@ -3126,6 +3184,7 @@ mod tests {
         }
 
         fn contains(&self, object_id: u64) -> bool {
+            self.contains_gate.pass();
             self.inner.contains(object_id)
         }
 
@@ -6600,5 +6659,103 @@ mod tests {
             64,
             "foreground cold-prime should not create hundreds of active fetch futures for one oversized read"
         );
+    }
+
+    fn gated_test_vfs(
+        tmp: &TempDir,
+        suffix: &str,
+    ) -> (
+        Arc<Runtime>,
+        Arc<StudioVfs>,
+        Arc<RedbMetaEngine>,
+        Arc<CountingLocalPayloadBackend>,
+    ) {
+        let (rt, mut vfs, meta) = make_unstarted_test_vfs(tmp, suffix);
+        let backend = Arc::new(CountingLocalPayloadBackend::new(
+            vfs.local_payload_backend.clone(),
+        ));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_payload_backend = backend.clone();
+        (rt, vfs, meta, backend)
+    }
+
+    /// Proves the runtime still schedules work, which every WinFSP callback needs.
+    fn assert_runtime_schedules_work(rt: &Runtime) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt.spawn(async move { tx.send(()) });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a stalled local cache call must not stop the Tokio runtime");
+    }
+
+    #[test]
+    fn stalled_payload_presence_checks_leave_runtime_workers_available() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta, backend) = gated_test_vfs(&tmp, "read-stalled-presence-check");
+        let workers = rt.metrics().num_workers();
+        backend.contains_gate.hold();
+        let checks: Vec<_> = (0..workers as u64)
+            .map(|object_id| {
+                let vfs = vfs.clone();
+                rt.spawn(async move { DataReader::has_local_payload_for_read(&vfs, object_id) })
+            })
+            .collect();
+        backend.contains_gate.wait_entered(workers);
+
+        assert_runtime_schedules_work(&rt);
+
+        backend.contains_gate.release();
+        for check in checks {
+            assert!(!rt.block_on(check).expect("presence check task"));
+        }
+    }
+
+    #[test]
+    fn stalled_local_reads_beyond_the_limit_wait_without_stopping_other_requests() {
+        const LIMIT: usize = 2;
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta, backend) = gated_test_vfs(&tmp, "read-stalled-local-limit");
+        let object_id = 8_100;
+        let data = b"payload behind a stalled open";
+        vfs.local_payload_backend()
+            .put(object_id, data, false)
+            .expect("persist local payload");
+        let excess = vfs.qos.foreground_local_io_available() - LIMIT;
+        vfs.qos.forget_foreground_local_io_permits_for_test(excess);
+        backend.read_into_gate.hold();
+
+        let reads: Vec<_> = (0..LIMIT * 2)
+            .map(|_| {
+                let vfs = vfs.clone();
+                rt.spawn(async move {
+                    let mut out = vec![0; data.len()];
+                    let read = vfs
+                        .payload_store_read_into_async(object_id, 0, &mut out)
+                        .await
+                        .expect("local read");
+                    assert_eq!(read, Some(data.len()));
+                    assert_eq!(out, data);
+                })
+            })
+            .collect();
+        backend.read_into_gate.wait_entered(LIMIT);
+
+        // Metadata reads and runtime scheduling stay available for dispatcher threads.
+        assert_runtime_schedules_work(&rt);
+        let attr = std::thread::scope(|scope| {
+            scope
+                .spawn(|| vfs.getattr(ROOT_INO).expect("getattr during stall"))
+                .join()
+                .expect("dispatcher-like thread")
+        });
+        assert_eq!(attr.ino, ROOT_INO);
+        assert_eq!(vfs.qos.foreground_local_io_available(), 0);
+        assert_eq!(backend.read_into_gate.entered(), LIMIT);
+
+        backend.read_into_gate.release();
+        for read in reads {
+            rt.block_on(read).expect("limited read task");
+        }
+        assert_eq!(vfs.qos.foreground_local_io_available(), LIMIT);
     }
 }

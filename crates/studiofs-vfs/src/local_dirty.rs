@@ -3312,12 +3312,6 @@ impl StudioVfs {
             };
 
             let (data, object_id) = if let Some(object_id) = slice.object_id {
-                if !self.local_payload_backend.contains(object_id)
-                    && !self.cached_store.has_staged_upload(object_id)
-                    && self.cached_store.get_hot_upload(object_id).is_none()
-                {
-                    continue;
-                }
                 (Bytes::new(), Some(object_id))
             } else if let Some(data) = buffered_block_data.get(&slice.block_index) {
                 (data.clone(), None)
@@ -3366,6 +3360,8 @@ impl StudioVfs {
                 data,
             });
         }
+        drop(pending_payloads);
+        spans.retain(|span| span.object_id.is_none_or(|id| self.has_local_payload(id)));
         spans.sort_by_key(|span| std::cmp::Reverse(span.seq));
         spans
     }
@@ -3403,16 +3399,6 @@ impl StudioVfs {
                 let object_id = block
                     .local_extent_id()
                     .expect("local extent pending payload must have an object id");
-                if !self.local_payload_backend.contains(object_id)
-                    && !self.cached_store.has_staged_upload(object_id)
-                    && self.cached_store.get_hot_upload(object_id).is_none()
-                {
-                    warn!(
-                        object_id,
-                        ino, "local payload missing during dirty read span resolution"
-                    );
-                    continue;
-                }
                 let block_start =
                     u64::from(*block_index).saturating_mul(u64::from(self.block_size));
                 let block_end = block_start.saturating_add(block.logical_len() as u64);
@@ -3460,6 +3446,21 @@ impl StudioVfs {
                 data: block.data.clone().freeze(),
             });
         }
+        drop(indexes);
+        drop(pending);
+        spans.retain(|span| {
+            let Some(object_id) = span.object_id else {
+                return true;
+            };
+            let present = self.has_local_payload(object_id);
+            if !present {
+                warn!(
+                    object_id,
+                    ino, "local payload missing during dirty read span resolution"
+                );
+            }
+            present
+        });
         spans.sort_by_key(|span| span.start);
         spans
     }

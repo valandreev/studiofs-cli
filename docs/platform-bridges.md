@@ -347,7 +347,7 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 
 I/O buffer behavior on Windows callbacks:
 - `read`: WinFSP-provided output buffers are forwarded directly to the VFS `read_into_fh()` data-reader path; `StudioFsContext` does not allocate an intermediate payload buffer for file data reads.
-- Mounted `read`, `write`, and `read_directory` use WinFSP async completion (`STATUS_PENDING` + later response) through `AsyncFileSystemContext`, so dispatcher threads are not parked while Tokio/VFS work is in progress.
+- Mounted `read`, `write`, and `read_directory` use WinFSP async completion (`STATUS_PENDING` + later response) through `AsyncFileSystemContext`, so dispatcher threads are not parked while Tokio/VFS work is in progress. See [WinFSP local cache stalls](#winfsp-local-cache-stalls).
 - `write`: WinFSP-provided input buffers are forwarded directly to `write_fh_with_deferred_materialize()`; `StudioFsContext` does not allocate an intermediate payload buffer before the VFS writer accepts the bytes.
 - Handles opened with Windows `FILE_WRITE_THROUGH` or `FILE_NO_INTERMEDIATE_BUFFERING`
   are mapped to the explicit `WriteThrough` local sync policy. Ordinary handles
@@ -1065,6 +1065,47 @@ failure is not evidence about permission decisions.
 MFMount/experimental FSKit receives the same read-only policy through
 `rdonly` in its mount options. Native MFMount acceptance remains gated on
 successful provider/channel startup; option tests alone do not prove access(2).
+
+## WinFSP local cache stalls
+
+A filter driver can hold a local cache file open for minutes. On Windows a
+`try_exists` check is also an open. These rules keep such a stall from stopping
+the mount:
+
+- Mounted `read` and `write` return `STATUS_PENDING`, so they never hold a
+  dispatcher thread during local cache I/O.
+- Foreground payload reads and presence checks on a Tokio worker run inside
+  `run_local_cache_io` or on the blocking pool, so a stalled call does not take
+  a worker out of service.
+- Read planning checks payload presence after releasing `pending_payloads`.
+  Dispatcher callbacks such as `flush` and `cleanup` need that lock.
+- On Windows, at most 64 foreground local cache calls run at once. That covers
+  payload reads, cache lookups in the fetcher, and the presence checks for cold
+  reads. An excess read waits on a Tokio semaphore, holds no thread, and stays
+  pending in WinFSP. The 64 slots keep a stall well below Tokio's 512 blocking
+  threads, which metadata work also needs. Linux and macOS have no such limit.
+
+While all 64 slots are stalled, reads that need the local cache wait. Metadata
+requests and reads served from memory keep working.
+
+Remaining limits:
+
+- Dirty read span checks and pending-overlay checks run outside the 64 slots
+  because they sit inside synchronous read planning. They affect only inodes
+  with pending local extents, and Tokio's blocking pool still bounds them.
+- Local dirty commit still reads local extents under `pending_payloads`
+  (`snapshot_dirty_local_dirty_payloads`). A stall there can block dispatcher
+  callbacks that need the lock.
+- `create`, `open` with truncate, `overwrite`, `set_file_size`, `rename`, and
+  `cleanup` with delete still run on dispatcher threads. Truncation can touch
+  the upload stage and remove payload files inline. Enough of these stalled at
+  once can still use up the dispatcher threads.
+- The limit does not remove a stall or prove what causes it. The stalled read
+  still fails or finishes only when the filter driver returns.
+
+The gated regressions need no mount or Defender:
+
+    cargo test -p studiofs-vfs --lib -- stalled_ span_snapshot_releases
 
 ## Opt-in payload read stage diagnostics
 
