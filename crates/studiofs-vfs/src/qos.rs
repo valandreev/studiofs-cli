@@ -7,6 +7,16 @@ use tokio_util::sync::CancellationToken;
 
 use crate::vfs::VfsConfig;
 
+/// Foreground local cache calls admitted at once. Each one occupies a Tokio
+/// blocking thread, so a stalled filter driver must not reach the pool limit
+/// of 512, which metadata work also needs. 64 matches the concurrent readers in
+/// `mounted-worker-concurrency`, which showed no measurable slowdown.
+const FOREGROUND_LOCAL_IO_SLOTS: usize = if cfg!(windows) {
+    64
+} else {
+    Semaphore::MAX_PERMITS
+};
+
 #[derive(Debug)]
 /// Controls concurrent request budgets for the four main VFS pipelines.
 ///
@@ -17,6 +27,7 @@ pub struct QosController {
     materialize_slots: Arc<Semaphore>,
     commit_slots: Arc<Semaphore>,
     fetch_slots: Arc<Semaphore>,
+    foreground_local_io_slots: Arc<Semaphore>,
 }
 
 impl QosController {
@@ -30,6 +41,7 @@ impl QosController {
             materialize_slots: Arc::new(Semaphore::new(config.qos_materialize_slots.max(1))),
             commit_slots: Arc::new(Semaphore::new(config.qos_commit_slots.max(1))),
             fetch_slots: Arc::new(Semaphore::new(config.qos_fetch_slots.max(1))),
+            foreground_local_io_slots: Arc::new(Semaphore::new(FOREGROUND_LOCAL_IO_SLOTS)),
         }
     }
 
@@ -60,6 +72,30 @@ impl QosController {
     /// Acquires one fetch permit, waiting until one becomes available.
     pub async fn acquire_fetch(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.fetch_slots.clone().acquire_owned().await
+    }
+
+    /// Waits for foreground local cache I/O slots without occupying a thread.
+    ///
+    /// Pass one slot for each call that runs at once. Hold the permit only
+    /// around local I/O: never across a remote fetch or a second acquisition.
+    pub async fn acquire_foreground_local_io(
+        &self,
+        slots: u32,
+    ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.foreground_local_io_slots
+            .clone()
+            .acquire_many_owned(slots)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn foreground_local_io_available(&self) -> usize {
+        self.foreground_local_io_slots.available_permits()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forget_foreground_local_io_permits_for_test(&self, count: usize) {
+        self.foreground_local_io_slots.forget_permits(count);
     }
 
     /// Returns currently available accept permits.

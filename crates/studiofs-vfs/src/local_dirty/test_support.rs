@@ -1874,6 +1874,82 @@ mod tests {
         );
     }
 
+    fn assert_span_snapshot_releases_pending_payloads_during_presence_check(
+        suffix: &str,
+        seed: impl FnOnce(&StudioVfs),
+        snapshot: impl FnOnce(&StudioVfs) -> Vec<PendingDirtyReadSpan> + Send,
+    ) {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, suffix);
+        let backend = crate::vfs::read_path::tests::install_counting_backend(&mut vfs);
+        seed(&vfs);
+        backend.contains_gate.hold();
+
+        let vfs = &*vfs;
+        std::thread::scope(|scope| {
+            let spans = scope.spawn(move || snapshot(vfs));
+            backend.contains_gate.wait_entered(1);
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                drop(vfs.state.local_dirty.pending_payloads.lock());
+                let _ = locked_tx.send(());
+            });
+            let unlocked = locked_rx.recv_timeout(Duration::from_secs(5));
+            backend.contains_gate.release();
+            assert!(
+                unlocked.is_ok(),
+                "a stalled open must not hold the lock dispatcher callbacks need"
+            );
+            assert!(spans.join().expect("span thread").is_empty());
+        });
+    }
+
+    #[test]
+    fn block_span_snapshot_releases_pending_payloads_during_presence_check() {
+        let ino = 83;
+        assert_span_snapshot_releases_pending_payloads_during_presence_check(
+            "snapshot-block-stalled-presence",
+            |vfs| {
+                vfs.replace_pending_local_dirty_payload(
+                    ino,
+                    0,
+                    PendingPayload::local_extent(8_007, 4),
+                );
+            },
+            |vfs| vfs.snapshot_pending_local_dirty_block_read_spans(ino, 0, 4),
+        );
+    }
+
+    #[test]
+    fn slice_span_snapshot_releases_pending_payloads_during_presence_check() {
+        let ino = 84;
+        assert_span_snapshot_releases_pending_payloads_during_presence_check(
+            "snapshot-slice-stalled-presence",
+            |vfs| {
+                vfs.state
+                    .local_dirty
+                    .pending_chunk_slices
+                    .lock()
+                    .entry(ino)
+                    .or_default()
+                    .insert(
+                        0,
+                        vec![PendingDirtySlice {
+                            range: studiofs_meta::schema::SliceRange::new(0, 4)
+                                .expect("slice range"),
+                            block_index: 0,
+                            block_offset: 0,
+                            seq: 1,
+                            object_id: Some(8_008),
+                            object_offset: 0,
+                            created_at: Instant::now(),
+                        }],
+                    );
+            },
+            |vfs| vfs.snapshot_pending_dirty_slice_read_spans(ino, 0, 4),
+        );
+    }
+
     #[test]
     fn assign_reserved_object_ids_reuses_existing_ids_and_stores_new_ones() {
         let ino = 42;

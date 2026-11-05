@@ -6830,10 +6830,33 @@ impl StudioVfs {
         cached
     }
 
+    /// Checks every local payload location. The file checks are opens on
+    /// Windows, so callers must not hold a lock across this call.
+    fn has_local_payload(&self, object_id: u64) -> bool {
+        // Not recorded as local cache I/O: that metric counts payload transfers.
+        self.cached_store.get_hot_upload(object_id).is_some()
+            || run_local_cache_io(|| {
+                self.local_payload_backend.contains(object_id)
+                    || self.cached_store.has_staged_upload(object_id)
+            })
+            .0
+    }
+
+    async fn foreground_local_io_permit(
+        &self,
+        slots: u32,
+    ) -> VfsResult<tokio::sync::OwnedSemaphorePermit> {
+        self.qos
+            .acquire_foreground_local_io(slots)
+            .await
+            .map_err(|error| VfsError::Other(format!("local cache I/O permit failed: {error}")))
+    }
+
     async fn payload_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
         if let Some(payload) = self.upload_hot_get(object_id) {
             return Ok(Some(payload));
         }
+        let _local_io = self.foreground_local_io_permit(1).await?;
         let (result, timing) = run_local_cache_io(|| self.local_payload_backend.get(object_id));
         self.record_local_cache_io_timing(timing);
         Ok(result)
@@ -6850,6 +6873,7 @@ impl StudioVfs {
             self.record_foreground_local_payload_read(read as u64, 0);
             return Ok(Some(read));
         }
+        let _local_io = self.foreground_local_io_permit(1).await?;
         let (result, timing) = run_local_cache_io(|| {
             self.local_payload_backend
                 .read_into(object_id, data_offset, out)
@@ -6940,7 +6964,10 @@ impl StudioVfs {
             return Ok(());
         }
         let cached_store = self.cached_store.clone();
+        let local_io = self.foreground_local_io_permit(1).await?;
         let ((), timing) = run_local_cache_io_blocking(move || {
+            // The closure keeps running if this future is dropped, so it owns the slot.
+            let _local_io = local_io;
             cached_store
                 .link_upload_stage_batch(&object_ids)
                 .map_err(VfsError::UploadStage)?;
@@ -6986,7 +7013,10 @@ impl StudioVfs {
             return Ok(());
         }
         let payload_store = self.local_payload_backend.clone();
+        let local_io = self.foreground_local_io_permit(1).await?;
         let ((), timing) = run_local_cache_io_blocking(move || {
+            // The closure keeps running if this future is dropped, so it owns the slot.
+            let _local_io = local_io;
             payload_store
                 .put_batch(&entries)
                 .map_err(VfsError::LocalPayload)
