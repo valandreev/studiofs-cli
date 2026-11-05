@@ -10,10 +10,10 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use lru::LruCache;
@@ -48,6 +48,64 @@ const MAX_RETAINED_UNBUFFERED_READ_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 // Process-local sequence for PID-prefixed names; create_new handles collisions.
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 static BATCH_INTENT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+static PAYLOAD_READ_STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+// Read once: this guards every hot payload read, even with diagnostics off.
+static PAYLOAD_READ_STAGE_DIAGNOSTICS: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("STUDIOFS_PAYLOAD_READ_STAGE_DIAGNOSTICS").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+});
+
+fn payload_read_stage<T>(
+    object_id: u64,
+    stage: &str,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    if !*PAYLOAD_READ_STAGE_DIAGNOSTICS {
+        return operation();
+    }
+    payload_read_stage_to(object_id, stage, &mut io::stderr(), operation)
+}
+
+fn payload_read_stage_to<T>(
+    object_id: u64,
+    stage: &str,
+    output: &mut impl io::Write,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let operation_id = PAYLOAD_READ_STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let thread_id = std::thread::current().id();
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    // Flush before the call: asynchronous tracing cannot identify a stuck OS operation.
+    let _ = writeln!(
+        output,
+        "payload_read_stage operation_id={operation_id} object_id={object_id} thread_id={thread_id:?} stage={stage} event=begin unix_ms={unix_ms}"
+    );
+    let _ = output.flush();
+    let started = std::time::Instant::now();
+    let result = operation();
+    let elapsed_us = started.elapsed().as_micros();
+    match &result {
+        Ok(_) => {
+            let _ = writeln!(
+                output,
+                "payload_read_stage operation_id={operation_id} object_id={object_id} thread_id={thread_id:?} stage={stage} event=end status=ok elapsed_us={elapsed_us}"
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                output,
+                "payload_read_stage operation_id={operation_id} object_id={object_id} thread_id={thread_id:?} stage={stage} event=end status=error elapsed_us={elapsed_us} error_kind={:?} os_error={:?}",
+                error.kind(),
+                error.raw_os_error()
+            );
+        }
+    }
+    let _ = output.flush();
+    result
+}
 
 #[derive(Clone, Copy, Debug)]
 /// A single payload entry for a batched [`FilePayloadStore::put_batch`] operation.
@@ -259,6 +317,10 @@ impl FilePayloadStore {
         let start = u64::try_from(data_offset).ok()?;
 
         if self.read_mode == LocalPayloadReadMode::Unbuffered {
+            #[cfg(windows)]
+            if let Some(file) = self.cached_buffered_read_handle(object_id) {
+                return self.read_into_buffered_handle(object_id, data_offset, start, out, &file);
+            }
             if !platform::can_read_unbuffered_range(
                 start,
                 out.len(),
@@ -267,14 +329,22 @@ impl FilePayloadStore {
                 return self.read_into_buffered_fallback(object_id, data_offset, start, out);
             }
             let file = self.cached_read_handle(object_id).ok()?;
-            let Some(alignment) = file.unbuffered_alignment() else {
+            #[cfg(windows)]
+            if file.io_mode == PayloadFileIoMode::Buffered {
+                return self.read_into_buffered_handle(object_id, data_offset, start, out, &file);
+            }
+            let Some(alignment) =
+                payload_read_stage(object_id, "alignment", || Ok(file.unbuffered_alignment()))
+                    .ok()
+                    .flatten()
+            else {
                 return self.read_into_buffered_fallback(object_id, data_offset, start, out);
             };
             if !platform::can_read_unbuffered_range(start, out.len(), alignment) {
                 return self.read_into_buffered_fallback(object_id, data_offset, start, out);
             }
 
-            match self.try_read_into_unbuffered(file.as_ref(), alignment, start, out) {
+            match self.try_read_into_unbuffered(object_id, file.as_ref(), alignment, start, out) {
                 Ok(Some(read)) => return Some(read),
                 Ok(None) => {
                     return self.read_into_buffered_fallback(object_id, data_offset, start, out);
@@ -305,7 +375,20 @@ impl FilePayloadStore {
             }
         }
 
-        match platform::pread(file.as_ref(), out, start) {
+        self.read_into_buffered_handle(object_id, data_offset, start, out, &file)
+    }
+
+    fn read_into_buffered_handle(
+        &self,
+        object_id: u64,
+        data_offset: usize,
+        start: u64,
+        out: &mut [u8],
+        file: &CachedReadHandle,
+    ) -> Option<usize> {
+        match payload_read_stage(object_id, "buffered_read", || {
+            platform::pread(file, out, start)
+        }) {
             Ok(read) => Some(read),
             Err(error) => {
                 warn!(
@@ -399,18 +482,20 @@ impl FilePayloadStore {
         })?;
         std::fs::create_dir_all(payload_dir)?;
 
-        let temp_path =
+        let staged_file =
             self.write_temp_payload_file(&self.layout.tmp_dir, object_id, data, durable_sync)?;
-        let staged = StagedBatchPayload {
+        let mut staged = StagedBatchPayload {
             entry: PayloadBatchEntry { object_id, data },
             payload_path: payload_path.clone(),
             payload_dir: payload_dir.to_path_buf(),
-            temp_path,
+            temp_path: staged_file.path,
+            read_handle: staged_read_handle(staged_file.file, staged_file.io_mode, true),
         };
         let intent_path =
             self.write_batch_payload_intent(std::slice::from_ref(&staged), durable_sync)?;
-        self.commit_staged_batch_payload(&staged, durable_sync)?;
+        self.commit_staged_batch_payload(&mut staged, durable_sync)?;
         self.invalidate_cached_read_handle(object_id);
+        self.install_staged_read_handle(object_id, staged.read_handle.take());
         if durable_sync {
             self.sync_directory_put_barrier(&self.layout.tmp_dir)?;
             self.sync_directory_put_barrier(payload_dir)?;
@@ -458,17 +543,18 @@ impl FilePayloadStore {
                 payload_dir,
             });
         }
-        let staged = self.stage_batch_payloads(&prepared, durable_sync)?;
+        let mut staged = self.stage_batch_payloads(&prepared, durable_sync)?;
 
         let intent = self.write_batch_payload_intent(&staged, durable_sync)?;
         for idx in 0..staged.len() {
-            let staged_entry = &staged[idx];
-            if let Err(error) = self.commit_staged_batch_payload(staged_entry, durable_sync) {
+            if let Err(error) = self.commit_staged_batch_payload(&mut staged[idx], durable_sync) {
                 self.cleanup_staged_batch_payloads(&staged[idx + 1..]);
                 // The intent lets startup preserve indexed files and remove orphan outputs.
                 return Err(error);
             }
-            self.invalidate_cached_read_handle(staged_entry.entry.object_id);
+            let object_id = staged[idx].entry.object_id;
+            self.invalidate_cached_read_handle(object_id);
+            self.install_staged_read_handle(object_id, staged[idx].read_handle.take());
         }
 
         if durable_sync {
@@ -497,10 +583,16 @@ impl FilePayloadStore {
         durable_sync: bool,
     ) -> Result<Vec<StagedBatchPayload<'a>>, FilePayloadStoreError> {
         let concurrency = batch_staging_concurrency(prepared.len(), durable_sync);
+        let retained_from = prepared
+            .len()
+            .saturating_sub(self.shared.read_handles.capacity());
         if concurrency <= 1 {
             return prepared
                 .iter()
-                .map(|entry| self.stage_one_batch_payload(entry, durable_sync))
+                .enumerate()
+                .map(|(idx, entry)| {
+                    self.stage_one_batch_payload(entry, durable_sync, idx >= retained_from)
+                })
                 .collect();
         }
 
@@ -523,6 +615,7 @@ impl FilePayloadStore {
                                     &prepared[idx],
                                     durable_sync,
                                     &mut unbuffered_scratch,
+                                    idx >= retained_from,
                                 )?,
                             ));
                         }
@@ -564,12 +657,14 @@ impl FilePayloadStore {
         &self,
         entry: &PreparedBatchPayload<'a>,
         durable_sync: bool,
+        retain_read_handle: bool,
     ) -> Result<StagedBatchPayload<'a>, FilePayloadStoreError> {
         let mut unbuffered_scratch = platform::UnbufferedWriteBuffer::new();
         self.stage_one_batch_payload_with_unbuffered_buffer(
             entry,
             durable_sync,
             &mut unbuffered_scratch,
+            retain_read_handle,
         )
     }
 
@@ -578,13 +673,14 @@ impl FilePayloadStore {
         entry: &PreparedBatchPayload<'a>,
         durable_sync: bool,
         unbuffered_scratch: &mut platform::UnbufferedWriteBuffer,
+        retain_read_handle: bool,
     ) -> Result<StagedBatchPayload<'a>, FilePayloadStoreError> {
         let temp_dir = if durable_sync {
             self.layout.tmp_dir.as_path()
         } else {
             entry.payload_dir.as_path()
         };
-        let temp_path = self.write_temp_payload_file_with_unbuffered_buffer(
+        let staged_file = self.write_temp_payload_file_with_unbuffered_buffer(
             temp_dir,
             entry.entry.object_id,
             entry.entry.data,
@@ -595,7 +691,12 @@ impl FilePayloadStore {
             entry: entry.entry,
             payload_path: entry.payload_path.clone(),
             payload_dir: entry.payload_dir.clone(),
-            temp_path,
+            temp_path: staged_file.path,
+            read_handle: staged_read_handle(
+                staged_file.file,
+                staged_file.io_mode,
+                retain_read_handle,
+            ),
         })
     }
 
@@ -743,7 +844,7 @@ impl FilePayloadStore {
         object_id: u64,
         data: &[u8],
         sync_file_data: bool,
-    ) -> Result<PathBuf, FilePayloadStoreError> {
+    ) -> Result<StagedPayloadFile, FilePayloadStoreError> {
         let mut unbuffered_scratch = platform::UnbufferedWriteBuffer::new();
         self.write_temp_payload_file_with_unbuffered_buffer(
             temp_dir,
@@ -761,7 +862,7 @@ impl FilePayloadStore {
         data: &[u8],
         sync_file_data: bool,
         unbuffered_scratch: &mut platform::UnbufferedWriteBuffer,
-    ) -> Result<PathBuf, FilePayloadStoreError> {
+    ) -> Result<StagedPayloadFile, FilePayloadStoreError> {
         #[cfg(test)]
         let _staging_probe = self.enter_test_staging_probe();
 
@@ -773,8 +874,8 @@ impl FilePayloadStore {
                 sync_file_data,
                 unbuffered_scratch,
             )?;
-            if let Some(temp_path) = unbuffered_temp_path {
-                return Ok(temp_path);
+            if let Some(staged_file) = unbuffered_temp_path {
+                return Ok(staged_file);
             }
             #[cfg(test)]
             self.shared
@@ -792,8 +893,11 @@ impl FilePayloadStore {
                 .per_put_file_sync_calls
                 .fetch_add(1, Ordering::Relaxed);
         }
-        drop(temp_file);
-        Ok(temp_path)
+        Ok(StagedPayloadFile {
+            path: temp_path,
+            file: temp_file,
+            io_mode: PayloadFileIoMode::Buffered,
+        })
     }
 
     fn try_write_temp_payload_file_unbuffered(
@@ -803,7 +907,7 @@ impl FilePayloadStore {
         data: &[u8],
         sync_file_data: bool,
         unbuffered_scratch: &mut platform::UnbufferedWriteBuffer,
-    ) -> Result<Option<PathBuf>, FilePayloadStoreError> {
+    ) -> Result<Option<StagedPayloadFile>, FilePayloadStoreError> {
         if !platform::can_write_unbuffered_payload(data, platform::MINIMUM_UNBUFFERED_ALIGNMENT) {
             return Ok(None);
         }
@@ -866,18 +970,25 @@ impl FilePayloadStore {
                 .per_put_file_sync_calls
                 .fetch_add(1, Ordering::Relaxed);
         }
-        drop(temp_file);
         #[cfg(test)]
         self.shared
             .write_counters
             .unbuffered_write_successes
             .fetch_add(1, Ordering::Relaxed);
-        Ok(Some(temp_path))
+        Ok(Some(StagedPayloadFile {
+            path: temp_path,
+            file: temp_file,
+            io_mode: if cfg!(windows) {
+                PayloadFileIoMode::Unbuffered
+            } else {
+                PayloadFileIoMode::Buffered
+            },
+        }))
     }
 
     fn commit_staged_batch_payload(
         &self,
-        staged: &StagedBatchPayload<'_>,
+        staged: &mut StagedBatchPayload<'_>,
         durable_sync: bool,
     ) -> Result<(), FilePayloadStoreError> {
         match platform::rename_atomic(&staged.temp_path, &staged.payload_path) {
@@ -891,11 +1002,17 @@ impl FilePayloadStore {
                     durable_sync,
                 )?;
                 if let Err(rename_error) =
-                    platform::rename_atomic(&payload_local_temp, &staged.payload_path)
+                    platform::rename_atomic(&payload_local_temp.path, &staged.payload_path)
                 {
-                    let _ = std::fs::remove_file(&payload_local_temp);
+                    let _ = std::fs::remove_file(&payload_local_temp.path);
                     return Err(FilePayloadStoreError::Io(rename_error));
                 }
+                let retain_read_handle = staged.read_handle.is_some();
+                staged.read_handle = staged_read_handle(
+                    payload_local_temp.file,
+                    payload_local_temp.io_mode,
+                    retain_read_handle,
+                );
                 Ok(())
             }
             Err(error) => {
@@ -1161,7 +1278,9 @@ impl FilePayloadStore {
                 return None;
             }
         };
-        match platform::pread(file.as_ref(), out, start) {
+        match payload_read_stage(object_id, "buffered_read", || {
+            platform::pread(file.as_ref(), out, start)
+        }) {
             Ok(read) => Some(read),
             Err(error) => {
                 warn!(
@@ -1178,6 +1297,7 @@ impl FilePayloadStore {
 
     fn try_read_into_unbuffered(
         &self,
+        object_id: u64,
         file: &File,
         alignment: usize,
         start: u64,
@@ -1208,8 +1328,9 @@ impl FilePayloadStore {
         };
         #[cfg(not(windows))]
         let mut scratch = platform::UnbufferedReadBuffer::new();
-        let result =
-            platform::read_unbuffered_with_buffer(file, out, start, &mut scratch, alignment);
+        let result = payload_read_stage(object_id, "unbuffered_read", || {
+            platform::read_unbuffered_with_buffer(file, out, start, &mut scratch, alignment)
+        });
         // Recycle only after the synchronous read returned; oversized or surplus buffers drop.
         #[cfg(windows)]
         if pooled && scratch.retained_bytes() <= MAX_RETAINED_UNBUFFERED_READ_BUFFER_BYTES {
@@ -1232,16 +1353,17 @@ impl FilePayloadStore {
         }
     }
 
-    fn open_for_read(&self, path: &Path) -> io::Result<File> {
+    fn open_for_read(&self, path: &Path) -> io::Result<(File, PayloadFileIoMode)> {
         if self.read_mode == LocalPayloadReadMode::Unbuffered {
             match platform::open_read_only_unbuffered(path) {
                 Err(error) if platform::is_unbuffered_io_unsupported_error(&error) => {
-                    platform::open_read_only(path)
+                    platform::open_read_only(path).map(|file| (file, PayloadFileIoMode::Buffered))
                 }
-                result => result,
+                Ok(file) => Ok((file, PayloadFileIoMode::Unbuffered)),
+                Err(error) => Err(error),
             }
         } else {
-            platform::open_read_only(path)
+            platform::open_read_only(path).map(|file| (file, PayloadFileIoMode::Buffered))
         }
     }
 
@@ -1255,18 +1377,40 @@ impl FilePayloadStore {
         &self,
         object_id: u64,
     ) -> io::Result<Arc<CachedReadHandle>> {
+        #[cfg(windows)]
+        if let Some(file) = self.cached_buffered_read_handle(object_id) {
+            return Ok(file);
+        }
         self.cached_read_handle_from_cache(
             object_id,
             &self.shared.buffered_read_fallback_handles,
-            |_this, path| platform::open_read_only(path),
+            |_this, path| {
+                platform::open_read_only(path).map(|file| (file, PayloadFileIoMode::Buffered))
+            },
         )
+    }
+
+    #[cfg(windows)]
+    fn cached_buffered_read_handle(&self, object_id: u64) -> Option<Arc<CachedReadHandle>> {
+        let handle = self.shared.read_handles.shards[read_fd_shard_idx(object_id)]
+            .lock()
+            .get(&object_id)
+            .filter(|file| file.io_mode == PayloadFileIoMode::Buffered)
+            .cloned();
+        if handle.is_some() {
+            self.shared
+                .read_handles
+                .hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        handle
     }
 
     fn cached_read_handle_from_cache(
         &self,
         object_id: u64,
         cache: &ReadHandleCache,
-        mut opener: impl FnMut(&Self, &Path) -> io::Result<File>,
+        mut opener: impl FnMut(&Self, &Path) -> io::Result<(File, PayloadFileIoMode)>,
     ) -> io::Result<Arc<CachedReadHandle>> {
         let shard = read_fd_shard_idx(object_id);
         if let Some(file) = cache.shards[shard].lock().get(&object_id).cloned() {
@@ -1276,7 +1420,8 @@ impl FilePayloadStore {
 
         cache.misses.fetch_add(1, Ordering::Relaxed);
         let path = self.payload_object_path(object_id);
-        let file = match opener(self, &path) {
+        let opened = match payload_read_stage(object_id, "descriptor_open", || opener(self, &path))
+        {
             Ok(file) => file,
             Err(first_error) if platform::is_too_many_open_files_error(&first_error) => {
                 let evicted = self.evict_cached_read_handles_under_pressure();
@@ -1290,11 +1435,12 @@ impl FilePayloadStore {
                 if evicted == 0 {
                     return Err(first_error);
                 }
-                opener(self, &path)?
+                payload_read_stage(object_id, "descriptor_open_retry", || opener(self, &path))?
             }
             Err(error) => return Err(error),
         };
-        let file = Arc::new(CachedReadHandle::new(file));
+        let (file, io_mode) = opened;
+        let file = Arc::new(CachedReadHandle::new(file, io_mode));
         if let Err(error) = platform::advise_random(file.as_ref()) {
             warn!(
                 object_id,
@@ -1309,12 +1455,40 @@ impl FilePayloadStore {
             cache.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(existing);
         }
-        let evicted_lru = handles.len() == handles.cap().get();
-        let _ = handles.put(object_id, Arc::clone(&file));
-        if evicted_lru {
-            cache.evictions.fetch_add(1, Ordering::Relaxed);
-        }
+        cache.insert_and_unlock(handles, object_id, Arc::clone(&file));
         Ok(file)
+    }
+
+    fn install_staged_read_handle(
+        &self,
+        object_id: u64,
+        staged_handle: Option<Arc<CachedReadHandle>>,
+    ) {
+        #[cfg(not(windows))]
+        let _ = (object_id, staged_handle);
+        #[cfg(windows)]
+        {
+            let Some(handle) = staged_handle else {
+                return;
+            };
+            if handle.io_mode == PayloadFileIoMode::Unbuffered
+                && self.read_mode != LocalPayloadReadMode::Unbuffered
+            {
+                return;
+            }
+            if let Err(error) = platform::advise_random(handle.as_ref()) {
+                warn!(
+                    object_id,
+                    path = %self.payload_object_path(object_id).display(),
+                    error = ?error,
+                    "local payload runtime staged handle advise_random failed"
+                );
+            }
+            // Overwrite: a racing reader may have cached the replaced file since invalidation.
+            let cache = &self.shared.read_handles;
+            let handles = cache.shards[read_fd_shard_idx(object_id)].lock();
+            cache.insert_and_unlock(handles, object_id, handle);
+        }
     }
 
     fn payload_object_path(&self, object_id: u64) -> PathBuf {
@@ -1335,12 +1509,14 @@ impl FilePayloadStore {
     }
 
     fn invalidate_cached_read_handle(&self, object_id: u64) {
-        self.shared.read_handles.shards[read_fd_shard_idx(object_id)]
+        // Bound before dropping so the handles close after each shard lock is released.
+        let _primary = self.shared.read_handles.shards[read_fd_shard_idx(object_id)]
             .lock()
             .pop(&object_id);
-        self.shared.buffered_read_fallback_handles.shards[read_fd_shard_idx(object_id)]
-            .lock()
-            .pop(&object_id);
+        let _fallback = self.shared.buffered_read_fallback_handles.shards
+            [read_fd_shard_idx(object_id)]
+        .lock()
+        .pop(&object_id);
     }
 
     #[cfg(test)]
@@ -1519,6 +1695,7 @@ struct ReadHandleCache {
 #[derive(Debug)]
 struct CachedReadHandle {
     file: File,
+    io_mode: PayloadFileIoMode,
     #[cfg(windows)]
     unbuffered_alignment: OnceLock<Option<usize>>,
     #[cfg(all(windows, test))]
@@ -1526,9 +1703,10 @@ struct CachedReadHandle {
 }
 
 impl CachedReadHandle {
-    fn new(file: File) -> Self {
+    fn new(file: File, io_mode: PayloadFileIoMode) -> Self {
         Self {
             file,
+            io_mode,
             #[cfg(windows)]
             unbuffered_alignment: OnceLock::new(),
             #[cfg(all(windows, test))]
@@ -1539,6 +1717,9 @@ impl CachedReadHandle {
     fn unbuffered_alignment(&self) -> Option<usize> {
         #[cfg(windows)]
         {
+            if self.io_mode != PayloadFileIoMode::Unbuffered {
+                return None;
+            }
             *self.unbuffered_alignment.get_or_init(|| {
                 #[cfg(test)]
                 self.alignment_discoveries.fetch_add(1, Ordering::Relaxed);
@@ -1547,6 +1728,7 @@ impl CachedReadHandle {
         }
         #[cfg(not(windows))]
         {
+            let _ = self.io_mode;
             platform::unbuffered_alignment_for_file(&self.file)
         }
     }
@@ -1571,12 +1753,27 @@ impl ReadHandleCache {
         }
     }
 
-    #[cfg(test)]
     fn capacity(&self) -> usize {
         self.shards
             .iter()
             .map(|shard| shard.lock().cap().get())
             .sum()
+    }
+
+    /// Closes the displaced handle after unlocking: closing a written file can stall in a filter.
+    fn insert_and_unlock(
+        &self,
+        mut handles: parking_lot::MutexGuard<'_, LruCache<u64, Arc<CachedReadHandle>>>,
+        object_id: u64,
+        file: Arc<CachedReadHandle>,
+    ) {
+        let evicted_lru = !handles.contains(&object_id) && handles.len() == handles.cap().get();
+        let displaced = handles.push(object_id, file);
+        drop(handles);
+        drop(displaced);
+        if evicted_lru {
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn evict_under_pressure(&self) -> usize {
@@ -1831,6 +2028,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn payload_read_stage_flushes_before_blocking_open_and_records_error() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        #[derive(Clone, Default)]
+        struct Output(Arc<Mutex<(Vec<u8>, usize)>>);
+        impl io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.lock().1 += 1;
+                Ok(())
+            }
+        }
+
+        let output = Output::default();
+        let mut worker_output = output.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            payload_read_stage_to(99, "descriptor_open", &mut worker_output, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                Err::<File, _>(io::Error::from(io::ErrorKind::NotFound))
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        {
+            let recorded = output.0.lock();
+            let begin = String::from_utf8_lossy(&recorded.0);
+            assert!(begin.contains("object_id=99 thread_id=ThreadId("));
+            assert!(begin.contains("stage=descriptor_open event=begin"));
+            assert!(!begin.contains("event=end"));
+            assert_eq!(recorded.1, 1);
+        }
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let recorded = output.0.lock();
+        let lines = String::from_utf8_lossy(&recorded.0);
+        assert!(lines.contains("event=end status=error elapsed_us="));
+        assert!(lines.contains("error_kind=NotFound"));
+        assert_eq!(recorded.1, 2);
+        let ids: Vec<_> = lines
+            .lines()
+            .map(|line| line.split_whitespace().nth(1).unwrap())
+            .collect();
+        assert_eq!(ids[0], ids[1]);
+        drop(recorded);
+        let mut success_output = Vec::new();
+        assert_eq!(
+            payload_read_stage_to(99, "buffered_read", &mut success_output, || Ok(7)).unwrap(),
+            7
+        );
+        assert!(
+            String::from_utf8(success_output)
+                .unwrap()
+                .contains("event=end status=ok elapsed_us=")
+        );
+    }
+
+    #[test]
     fn batch_intent_path_hex_appends_and_normalizes_in_memory() {
         for (path, expected) in [
             ("", "prefix="),
@@ -1863,6 +2126,7 @@ mod tests {
                 payload_path: layout.runtime_root.join(path),
                 payload_dir: layout.runtime_root.clone(),
                 temp_path: layout.runtime_root.join(path),
+                read_handle: None,
             };
             let intent = store.write_batch_payload_intent(&[staged], false).unwrap();
             let expected = format!(
@@ -2098,6 +2362,16 @@ mod tests {
         let mut out = vec![0_u8; 4096];
         assert_eq!(store.read_into(4299, 0, &mut out), Some(4096));
         assert_eq!(out, payload);
+        #[cfg(windows)]
+        {
+            // Documented SFS-1022 trade-off: the retained buffered writer serves reads
+            // until it leaves the cache, because changing its mode needs a new open.
+            assert_eq!(store.read_mode_snapshot().unbuffered_read_attempts, 0);
+            store.invalidate_cached_read_handle(4299);
+            out.fill(0);
+            assert_eq!(store.read_into(4299, 0, &mut out), Some(4096));
+            assert_eq!(out, payload);
+        }
         let reads = store.read_mode_snapshot();
         if cfg!(any(target_os = "macos", windows)) {
             assert_eq!(reads.unbuffered_read_attempts, 1);
@@ -2124,6 +2398,7 @@ mod tests {
         let payload = vec![0xCD; 4096];
 
         store.put(4300, &payload).unwrap();
+        store.invalidate_cached_read_handle(4300);
 
         let mut out = vec![0_u8; 4096];
         assert_eq!(store.read_into(4300, 0, &mut out), Some(4096));
@@ -2139,6 +2414,143 @@ mod tests {
             assert_eq!(reads.unbuffered_read_attempts, 0);
             assert_eq!(reads.unbuffered_read_fallbacks, 1);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_writer_handle_serves_single_and_batch_reads_without_cold_open() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let store =
+            FilePayloadStore::open(LocalPayloadLayout::from_cache_root(temp.path())).unwrap();
+        let old_payload = vec![0xAB; 4096];
+        store.put(4304, &old_payload).unwrap();
+
+        let mut out = vec![0; old_payload.len()];
+        assert_eq!(store.read_into(4304, 0, &mut out), Some(out.len()));
+        assert_eq!(out, old_payload);
+        assert_eq!(store.read_handle_stats().misses, 0);
+
+        store
+            .put_batch(&[
+                PayloadBatchEntry {
+                    object_id: 4305,
+                    data: b"batch-one",
+                },
+                PayloadBatchEntry {
+                    object_id: 4306,
+                    data: b"batch-two",
+                },
+            ])
+            .unwrap()
+            .complete();
+        for (object_id, expected) in [(4305, b"batch-one"), (4306, b"batch-two")] {
+            let mut bytes = vec![0; expected.len()];
+            assert_eq!(store.read_into(object_id, 0, &mut bytes), Some(bytes.len()));
+            assert_eq!(bytes, expected);
+        }
+        assert_eq!(store.read_handle_stats().misses, 0);
+        store
+            .cached_read_handle_from_cache(
+                4304,
+                &store.shared.buffered_read_fallback_handles,
+                |_this, path| {
+                    platform::open_read_only(path).map(|file| (file, PayloadFileIoMode::Buffered))
+                },
+            )
+            .unwrap();
+        let misses_before_fallback_eviction = store.read_handle_stats().misses;
+        store
+            .shared
+            .buffered_read_fallback_handles
+            .evict_under_pressure();
+        out.fill(0);
+        assert_eq!(store.read_into(4304, 0, &mut out), Some(out.len()));
+        assert_eq!(out, old_payload);
+        assert_eq!(
+            store.read_handle_stats().misses,
+            misses_before_fallback_eviction
+        );
+
+        let old_handle = store.cached_buffered_read_fallback_handle(4304).unwrap();
+        store.put(4304, b"new").unwrap();
+        let mut old_bytes = vec![0; old_payload.len()];
+        platform::pread(old_handle.as_ref(), &mut old_bytes, 0).unwrap();
+        assert_eq!(old_bytes, old_payload);
+        let mut new_bytes = [0; 3];
+        assert_eq!(store.read_into(4304, 0, &mut new_bytes), Some(3));
+        assert_eq!(&new_bytes, b"new");
+        assert_eq!(
+            store.read_handle_stats().misses,
+            misses_before_fallback_eviction
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_install_replaces_stale_handle_cached_by_racing_reader() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let store =
+            FilePayloadStore::open(LocalPayloadLayout::from_cache_root(temp.path())).unwrap();
+        store.put(4310, b"old").unwrap();
+        let stale = store.cached_read_handle(4310).unwrap();
+        store.put(4310, b"new").unwrap();
+        let staged = store.cached_read_handle(4310).unwrap();
+
+        // A reader that opened the old file can insert between commit invalidation and install.
+        store.invalidate_cached_read_handle(4310);
+        store.shared.read_handles.shards[read_fd_shard_idx(4310)]
+            .lock()
+            .put(4310, stale);
+        store.install_staged_read_handle(4310, Some(staged));
+
+        let mut out = [0; 3];
+        assert_eq!(store.read_into(4310, 0, &mut out), Some(3));
+        assert_eq!(&out, b"new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_staging_retains_at_most_read_cache_capacity_handles() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open(layout.clone()).unwrap();
+        let count = store.read_handle_family_capacity_for_test() + 4;
+        let prepared: Vec<_> = (0..count)
+            .map(|index| {
+                let object_id = u64::try_from(index).unwrap();
+                let payload_path = layout.payload_object_path(object_id);
+                let payload_dir = payload_path.parent().unwrap().to_path_buf();
+                std::fs::create_dir_all(&payload_dir).unwrap();
+                PreparedBatchPayload {
+                    entry: PayloadBatchEntry {
+                        object_id,
+                        data: b"x",
+                    },
+                    payload_path,
+                    payload_dir,
+                }
+            })
+            .collect();
+
+        let unretained = store
+            .stage_one_batch_payload(&prepared[0], false, false)
+            .unwrap();
+        assert!(unretained.read_handle.is_none());
+        store.cleanup_staged_batch_payloads(std::slice::from_ref(&unretained));
+
+        let staged = store.stage_batch_payloads(&prepared, false).unwrap();
+        let retained_from = count - store.read_handle_family_capacity_for_test();
+        assert!(
+            staged[..retained_from]
+                .iter()
+                .all(|entry| entry.read_handle.is_none())
+        );
+        assert!(
+            staged[retained_from..]
+                .iter()
+                .all(|entry| entry.read_handle.is_some())
+        );
+        store.cleanup_staged_batch_payloads(&staged);
     }
 
     #[cfg(windows)]
@@ -2163,6 +2575,8 @@ mod tests {
             .unwrap()
             .set_len(64 * 1024 * 1024)
             .unwrap();
+        // The retained writer's cursor sits after the write; observe a fresh read handle.
+        store.invalidate_cached_read_handle(748);
         let file = store.cached_read_handle(748).unwrap();
         let mut cursor = &file.file;
         assert_eq!(cursor.stream_position().unwrap(), 0);
@@ -2203,6 +2617,7 @@ mod tests {
         )
         .unwrap();
         store.put(4300, &payload).unwrap();
+        store.invalidate_cached_read_handle(4300);
         let (entered_tx, entered_rx) = mpsc::channel();
 
         std::thread::scope(|scope| {
@@ -2252,6 +2667,7 @@ mod tests {
         .unwrap();
         let large = MAX_RETAINED_UNBUFFERED_READ_BUFFER_BYTES + 4096;
         store.put(4302, &vec![0xAB; large]).unwrap();
+        store.invalidate_cached_read_handle(4302);
         // Offset the destination by one byte so the read must use pooled scratch.
         let mut backing = vec![0_u8; large + 1];
 
@@ -2283,6 +2699,7 @@ mod tests {
         )
         .unwrap();
         store.put(4303, &[0xCD; 4096]).unwrap();
+        store.invalidate_cached_read_handle(4303);
         let mut backing = vec![0_u8; 2 * 4096 + 1];
         let base = backing.as_ptr() as usize;
         let aligned = base.next_multiple_of(4096) - base;
@@ -2327,6 +2744,7 @@ mod tests {
         .unwrap();
 
         store.put(4301, b"abcdef").unwrap();
+        store.invalidate_cached_read_handle(4301);
 
         let mut out = [0_u8; 3];
         assert_eq!(store.read_into(4301, 1, &mut out), Some(3));
@@ -2367,6 +2785,7 @@ mod tests {
         )
         .unwrap();
         store.put(4302, &vec![b'x'; 8192]).unwrap();
+        store.invalidate_cached_read_handle(4302);
         let cloned_store = store.clone();
         let handle = store.cached_read_handle(4302).unwrap();
         let mut out = vec![0; 4096];
@@ -2606,7 +3025,7 @@ mod tests {
         assert_eq!(&out, b"abc");
         assert_eq!(
             store.read_mode_snapshot().payload_path_builds,
-            paths_before + 1
+            paths_before + u64::from(!cfg!(windows))
         );
         assert_eq!(store.read_into(700, 1, &mut out), Some(3));
         assert_eq!(&out, b"bcd");
@@ -2616,11 +3035,11 @@ mod tests {
         store.advise_will_need(700);
         assert_eq!(
             store.read_mode_snapshot().payload_path_builds,
-            paths_before + 1
+            paths_before + u64::from(!cfg!(windows))
         );
 
         let stats = store.read_handle_stats();
-        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.misses, u64::from(!cfg!(windows)));
         assert!(
             stats.hits >= 2,
             "expected repeated reads to hit descriptor cache"
@@ -2644,7 +3063,7 @@ mod tests {
         assert_eq!(&out, b"payl");
         assert_eq!(
             store.read_mode_snapshot().payload_path_builds,
-            paths_before + 1
+            paths_before + u64::from(!cfg!(windows))
         );
         assert_eq!(
             store.read_into_buffered_fallback(702, 1, 1, &mut out),
@@ -2653,7 +3072,7 @@ mod tests {
         assert_eq!(&out, b"aylo");
         assert_eq!(
             store.read_mode_snapshot().payload_path_builds,
-            paths_before + 1
+            paths_before + u64::from(!cfg!(windows))
         );
     }
 
@@ -2673,7 +3092,7 @@ mod tests {
         assert_eq!(store.get(703).unwrap().as_ref(), b"payload");
         assert_eq!(
             store.read_mode_snapshot().payload_path_builds,
-            paths_before + 1
+            paths_before + u64::from(!cfg!(windows))
         );
         assert_eq!(store.read_handle_stats().cached, 1);
         store.put(703, b"new").unwrap();
@@ -2751,6 +3170,7 @@ mod tests {
         assert!(cached_before >= 4);
 
         store.put(99, b"y").unwrap();
+        store.invalidate_cached_read_handle(99);
         let mut attempts = 0usize;
         let file = store
             .cached_read_handle_from_cache(99, &store.shared.read_handles, |_this, path| {
@@ -2758,7 +3178,7 @@ mod tests {
                 if attempts == 1 {
                     return Err(platform::too_many_open_files_error_for_test());
                 }
-                platform::open_read_only(path)
+                platform::open_read_only(path).map(|file| (file, PayloadFileIoMode::Buffered))
             })
             .unwrap();
         drop(file);
@@ -2774,6 +3194,7 @@ mod tests {
         let store = FilePayloadStore::open(layout).unwrap();
 
         store.put(99, b"y").unwrap();
+        store.invalidate_cached_read_handle(99);
         let mut attempts = 0usize;
         let error = store
             .cached_read_handle_from_cache(99, &store.shared.read_handles, |_this, _path| {
@@ -2799,6 +3220,7 @@ mod tests {
         }
 
         store.put(99, b"y").unwrap();
+        store.invalidate_cached_read_handle(99);
         let mut attempts = 0usize;
         let error = store
             .cached_read_handle_from_cache(99, &store.shared.read_handles, |_this, _path| {
@@ -3303,7 +3725,9 @@ mod tests {
         };
         std::fs::create_dir_all(&prepared.payload_dir).unwrap();
 
-        let staged = store.stage_one_batch_payload(&prepared, false).unwrap();
+        let staged = store
+            .stage_one_batch_payload(&prepared, false, true)
+            .unwrap();
 
         assert_eq!(
             staged.temp_path.parent(),
@@ -3326,4 +3750,34 @@ struct StagedBatchPayload<'a> {
     payload_path: PathBuf,
     payload_dir: PathBuf,
     temp_path: PathBuf,
+    read_handle: Option<Arc<CachedReadHandle>>,
+}
+
+#[derive(Debug)]
+struct StagedPayloadFile {
+    path: PathBuf,
+    file: File,
+    io_mode: PayloadFileIoMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadFileIoMode {
+    Buffered,
+    Unbuffered,
+}
+
+fn staged_read_handle(
+    file: File,
+    io_mode: PayloadFileIoMode,
+    retain: bool,
+) -> Option<Arc<CachedReadHandle>> {
+    #[cfg(windows)]
+    {
+        retain.then(|| Arc::new(CachedReadHandle::new(file, io_mode)))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (file, io_mode, retain);
+        None
+    }
 }

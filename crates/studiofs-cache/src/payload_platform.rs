@@ -282,7 +282,7 @@ pub fn open_read_only_unbuffered(path: &Path) -> io::Result<File> {
 ///
 /// Returns the number of bytes read, or `0` at EOF.
 pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(all(test, any(windows, target_os = "macos")))]
     wait_pread_test_gate();
     let mut total = 0;
     while total < buf.len() {

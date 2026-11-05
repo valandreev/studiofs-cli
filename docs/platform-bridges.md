@@ -1065,3 +1065,34 @@ failure is not evidence about permission decisions.
 MFMount/experimental FSKit receives the same read-only policy through
 `rdonly` in its mount options. Native MFMount acceptance remains gated on
 successful provider/channel startup; option tests alone do not prove access(2).
+
+## Opt-in payload read stage diagnostics
+
+For a Windows cold-read stall, set `STUDIOFS_PAYLOAD_READ_STAGE_DIAGNOSTICS=1`
+for the diagnostic binary. Each payload descriptor open (including a descriptor
+pressure retry), alignment query, and buffered or unbuffered read emits a
+synchronous stderr `payload_read_stage` line before the operation and another
+after it returns. Each line is flushed. `operation_id` is a process-local
+monotonic stage invocation ID; `object_id` and Rust `thread_id` help correlate
+stages. Begin lines include `unix_ms`; end lines include `elapsed_us` and
+success or the I/O error kind and OS error code. An unmatched begin identifies
+the stage that had not returned when capture stopped; it does not establish
+the cause of a kernel or filter-driver stall. Diagnostic output errors do not
+change the payload operation result.
+
+The E2E runner inherits this environment variable and redirects each mounted
+client's stderr directly to
+`<run-dir>/artifacts/clients/<client>/studiofs.stderr.log`.
+Run a diagnostic binary from PowerShell:
+
+```powershell
+$env:STUDIOFS_PAYLOAD_READ_STAGE_DIAGNOSTICS = '1'
+try {
+    target/debug/studiofs-e2e.exe run --scenario mounted-worker-concurrency --studiofs-bin .\target\release\studiofs.exe --seed 0 --retain always --timeout 180s
+} finally {
+    Remove-Item Env:STUDIOFS_PAYLOAD_READ_STAGE_DIAGNOSTICS
+}
+```
+
+This opt-in adds synchronous diagnostic I/O and can affect timing. With the
+variable unset (or any value other than `1`), it emits no stage diagnostics.
