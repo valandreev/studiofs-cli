@@ -1736,6 +1736,22 @@ gate. The manually dispatched `rust.yml` macOS workspace tests also include it;
 Windows and Linux do not execute this macOS-specific regression. The downstream
 API test checks the public unbuffered-read interface and returned bytes.
 
+### SFS-1022 Retained Payload Handle Regressions
+
+Run the whole cache crate when changing payload handle retention, because read
+mode and cursor tests also observe the retained writer:
+
+```powershell
+cargo test -p studiofs-cache --lib
+```
+
+`staged_writer_handle_serves_single_and_batch_reads_without_cold_open` and
+`staged_install_replaces_stale_handle_cached_by_racing_reader` cover handle reuse
+and replacement on Windows. They do not exercise a live mount or Defender. The
+mounted check is `mounted-worker-concurrency` with default Defender settings; see
+the [cache limits](cache.md) for payloads that still need a cold open. Staging
+file creation and renames are not covered by handle retention.
+
 ### CI smoke workflow
 
 Smoke tests also run in the separate `.github/workflows/smoke.yml` workflow:
