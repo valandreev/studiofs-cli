@@ -49,6 +49,61 @@ const MAX_RETAINED_UNBUFFERED_READ_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 static BATCH_INTENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
+static PAYLOAD_READ_STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn payload_read_stage<T>(
+    object_id: u64,
+    stage: &str,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    if std::env::var_os("STUDIOFS_PAYLOAD_READ_STAGE_DIAGNOSTICS").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return operation();
+    }
+    payload_read_stage_to(object_id, stage, &mut io::stderr(), operation)
+}
+
+fn payload_read_stage_to<T>(
+    object_id: u64,
+    stage: &str,
+    output: &mut impl io::Write,
+    operation: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    let operation_id = PAYLOAD_READ_STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let thread_id = std::thread::current().id();
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    // Flush before the call: asynchronous tracing cannot identify a stuck OS operation.
+    let _ = writeln!(
+        output,
+        "payload_read_stage operation_id={operation_id} object_id={object_id} thread_id={thread_id:?} stage={stage} event=begin unix_ms={unix_ms}"
+    );
+    let _ = output.flush();
+    let started = std::time::Instant::now();
+    let result = operation();
+    let elapsed_us = started.elapsed().as_micros();
+    match &result {
+        Ok(_) => {
+            let _ = writeln!(
+                output,
+                "payload_read_stage operation_id={operation_id} object_id={object_id} thread_id={thread_id:?} stage={stage} event=end status=ok elapsed_us={elapsed_us}"
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(
+                output,
+                "payload_read_stage operation_id={operation_id} object_id={object_id} thread_id={thread_id:?} stage={stage} event=end status=error elapsed_us={elapsed_us} error_kind={:?} os_error={:?}",
+                error.kind(),
+                error.raw_os_error()
+            );
+        }
+    }
+    let _ = output.flush();
+    result
+}
+
 #[derive(Clone, Copy, Debug)]
 /// A single payload entry for a batched [`FilePayloadStore::put_batch`] operation.
 pub struct PayloadBatchEntry<'a> {
@@ -267,14 +322,18 @@ impl FilePayloadStore {
                 return self.read_into_buffered_fallback(object_id, data_offset, start, out);
             }
             let file = self.cached_read_handle(object_id).ok()?;
-            let Some(alignment) = file.unbuffered_alignment() else {
+            let Some(alignment) =
+                payload_read_stage(object_id, "alignment", || Ok(file.unbuffered_alignment()))
+                    .ok()
+                    .flatten()
+            else {
                 return self.read_into_buffered_fallback(object_id, data_offset, start, out);
             };
             if !platform::can_read_unbuffered_range(start, out.len(), alignment) {
                 return self.read_into_buffered_fallback(object_id, data_offset, start, out);
             }
 
-            match self.try_read_into_unbuffered(file.as_ref(), alignment, start, out) {
+            match self.try_read_into_unbuffered(object_id, file.as_ref(), alignment, start, out) {
                 Ok(Some(read)) => return Some(read),
                 Ok(None) => {
                     return self.read_into_buffered_fallback(object_id, data_offset, start, out);
@@ -305,7 +364,9 @@ impl FilePayloadStore {
             }
         }
 
-        match platform::pread(file.as_ref(), out, start) {
+        match payload_read_stage(object_id, "buffered_read", || {
+            platform::pread(file.as_ref(), out, start)
+        }) {
             Ok(read) => Some(read),
             Err(error) => {
                 warn!(
@@ -1161,7 +1222,9 @@ impl FilePayloadStore {
                 return None;
             }
         };
-        match platform::pread(file.as_ref(), out, start) {
+        match payload_read_stage(object_id, "buffered_read", || {
+            platform::pread(file.as_ref(), out, start)
+        }) {
             Ok(read) => Some(read),
             Err(error) => {
                 warn!(
@@ -1178,6 +1241,7 @@ impl FilePayloadStore {
 
     fn try_read_into_unbuffered(
         &self,
+        object_id: u64,
         file: &File,
         alignment: usize,
         start: u64,
@@ -1208,8 +1272,9 @@ impl FilePayloadStore {
         };
         #[cfg(not(windows))]
         let mut scratch = platform::UnbufferedReadBuffer::new();
-        let result =
-            platform::read_unbuffered_with_buffer(file, out, start, &mut scratch, alignment);
+        let result = payload_read_stage(object_id, "unbuffered_read", || {
+            platform::read_unbuffered_with_buffer(file, out, start, &mut scratch, alignment)
+        });
         // Recycle only after the synchronous read returned; oversized or surplus buffers drop.
         #[cfg(windows)]
         if pooled && scratch.retained_bytes() <= MAX_RETAINED_UNBUFFERED_READ_BUFFER_BYTES {
@@ -1276,7 +1341,7 @@ impl FilePayloadStore {
 
         cache.misses.fetch_add(1, Ordering::Relaxed);
         let path = self.payload_object_path(object_id);
-        let file = match opener(self, &path) {
+        let file = match payload_read_stage(object_id, "descriptor_open", || opener(self, &path)) {
             Ok(file) => file,
             Err(first_error) if platform::is_too_many_open_files_error(&first_error) => {
                 let evicted = self.evict_cached_read_handles_under_pressure();
@@ -1290,7 +1355,7 @@ impl FilePayloadStore {
                 if evicted == 0 {
                     return Err(first_error);
                 }
-                opener(self, &path)?
+                payload_read_stage(object_id, "descriptor_open_retry", || opener(self, &path))?
             }
             Err(error) => return Err(error),
         };
@@ -1829,6 +1894,72 @@ fn write_batch_intent_path_hex(content: &mut String, path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_read_stage_flushes_before_blocking_open_and_records_error() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        #[derive(Clone, Default)]
+        struct Output(Arc<Mutex<(Vec<u8>, usize)>>);
+        impl io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.lock().1 += 1;
+                Ok(())
+            }
+        }
+
+        let output = Output::default();
+        let mut worker_output = output.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            payload_read_stage_to(99, "descriptor_open", &mut worker_output, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                Err::<File, _>(io::Error::from(io::ErrorKind::NotFound))
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        {
+            let recorded = output.0.lock();
+            let begin = String::from_utf8_lossy(&recorded.0);
+            assert!(begin.contains("object_id=99 thread_id=ThreadId("));
+            assert!(begin.contains("stage=descriptor_open event=begin"));
+            assert!(!begin.contains("event=end"));
+            assert_eq!(recorded.1, 1);
+        }
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            worker.join().unwrap().unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let recorded = output.0.lock();
+        let lines = String::from_utf8_lossy(&recorded.0);
+        assert!(lines.contains("event=end status=error elapsed_us="));
+        assert!(lines.contains("error_kind=NotFound"));
+        assert_eq!(recorded.1, 2);
+        let ids: Vec<_> = lines
+            .lines()
+            .map(|line| line.split_whitespace().nth(1).unwrap())
+            .collect();
+        assert_eq!(ids[0], ids[1]);
+        drop(recorded);
+        let mut success_output = Vec::new();
+        assert_eq!(
+            payload_read_stage_to(99, "buffered_read", &mut success_output, || Ok(7)).unwrap(),
+            7
+        );
+        assert!(
+            String::from_utf8(success_output)
+                .unwrap()
+                .contains("event=end status=ok elapsed_us=")
+        );
+    }
 
     #[test]
     fn batch_intent_path_hex_appends_and_normalizes_in_memory() {
