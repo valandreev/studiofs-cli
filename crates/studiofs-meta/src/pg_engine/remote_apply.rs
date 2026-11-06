@@ -2055,11 +2055,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let batch_events = batch_events
             .into_iter()
             .filter(|event| {
-                !matches!(
-                    event,
-                    MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                        if stale_self_publish_inodes.contains(ino) || superseded_publish_inodes.contains(ino)
-                )
+                let ino = match event {
+                    MetaEvent::PublishRegularFileBaseSlices { ino, .. } => *ino,
+                    MetaEvent::SetAttr { attr } => attr.ino,
+                    _ => return true,
+                };
+                !stale_self_publish_inodes.contains(&ino)
+                    && !superseded_publish_inodes.contains(&ino)
             })
             .collect::<Vec<_>>();
         let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);

@@ -8794,7 +8794,12 @@ fn stale_complete_self_publish_does_not_rewind_newer_local_base() {
     };
     pg.local
         .apply_replica_events_to_base_preserving_protected_base_ranges(
-            &[publish(77_312, 0x1000)],
+            &[
+                MetaEvent::SetAttr {
+                    attr: local_attr.clone(),
+                },
+                publish(77_312, 0x1000),
+            ],
             &HashSet::new(),
         )
         .expect("seed newer local base");
@@ -8816,6 +8821,11 @@ fn stale_complete_self_publish_does_not_rewind_newer_local_base() {
     apply_visible_self_batch(&pg, &stale_batch).expect("apply stale self publish");
 
     assert_eq!(
+        pg.local.get_base_attr(file.ino).unwrap(),
+        Some(local_attr),
+        "an older self publication must not rewind base attributes beside the preserved graph"
+    );
+    assert_eq!(
         lookup_object_ids(&pg, file.ino, 0x2000).expect("lookup graph"),
         vec![77_312],
         "a stale self publish must not rewind the newer local base graph"
@@ -8830,6 +8840,11 @@ fn older_self_publish_preserves_later_local_same_epoch_same_size_graph() {
     pg.persist_flushed_event_seq(start).unwrap();
     let mut first_end = 0;
     for object_id in [77_317, 77_318] {
+        if object_id == 77_318 {
+            let mut attr = pg.get_attr(file.ino).unwrap();
+            attr.mode = 0o600;
+            pg.set_attr(&attr).unwrap();
+        }
         set_file_state(&pg, file.ino, 152, 2);
         pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(object_id, 152))
             .unwrap();
@@ -8842,6 +8857,12 @@ fn older_self_publish_preserves_later_local_same_epoch_same_size_graph() {
             first_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
         }
     }
+    let latest_attr = pg.get_attr(file.ino).unwrap();
+    pg.local
+        .apply_replica_events_to_base(&[MetaEvent::SetAttr {
+            attr: latest_attr.clone(),
+        }])
+        .unwrap();
     let batch = RemoteApplyCoordinator::project_local_batch(
         &pg.local.read_events_range(start, first_end).unwrap(),
     );
@@ -8861,6 +8882,11 @@ fn older_self_publish_preserves_later_local_same_epoch_same_size_graph() {
         },
     )
     .unwrap();
+    assert_eq!(
+        pg.local.get_base_attr(file.ino).unwrap(),
+        Some(latest_attr),
+        "a superseded same-epoch publication must preserve newer base attributes too"
+    );
     assert_eq!(
         lookup_object_ids(&pg, file.ino, 152).unwrap(),
         vec![77_318],
