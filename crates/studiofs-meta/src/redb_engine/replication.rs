@@ -2437,16 +2437,12 @@ impl RedbMetaEngine {
             if Self::invalidation_binding(txn, key)? != binding_before
                 && !txn.invalidations_suppressed()
             {
-                #[cfg(test)]
-                record_replica_invalidation_derivation();
-                txn.invalidate(InvalidationIntent::Entry {
+                Self::invalidate_serving_binding_in_txn(
+                    txn,
                     parent,
-                    name: name.to_vec(),
-                    ancestors: Self::invalidation_ancestors(txn, parent)?,
-                    ino: binding_before.as_ref().map(|entry| entry.ino),
-                });
-                txn.invalidate(InvalidationIntent::Directory { ino: parent });
-                txn.invalidate(InvalidationIntent::Attributes { ino: parent });
+                    name,
+                    binding_before.as_ref().map(|entry| entry.ino),
+                )?;
                 for displaced in [&serving_entry, &base_entry].into_iter().flatten() {
                     txn.invalidate(InvalidationIntent::Attributes { ino: displaced.ino });
                 }

@@ -2885,6 +2885,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
             // an unreplayed rename source, even after their journal events are acked.
             state.bindings.extend(protected_local_bindings);
             for key in state.bindings.keys() {
+                if let Some(execution) = execution {
+                    execution.check()?;
+                }
                 if !self_bindings_before.contains_key(key) {
                     let (parent, name) = decode_dentry_key(key)?;
                     self_bindings_before.insert(
@@ -2912,14 +2915,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
         )?;
         if let Some(pending_namespace) = &pending_namespace {
             // A self batch reaches base before its local prefix is necessarily
-            // acknowledged, so restore the journal's final namespace state. The
-            // foreground writes that produced it already announced it to the
-            // kernel; the reducer only clears names still bound to removed inodes.
+            // acknowledged, so restore the journal's final namespace state. Writing
+            // it is silent because the foreground writes already announced it; the
+            // comparison below announces what foreign replay changed in between.
+            // The reducer only clears names still bound to removed inodes.
             applied_any |= txn.without_invalidations(|| {
                 RedbMetaEngine::rebase_pending_local_namespace_in_txn(txn, pending_namespace)
             })?;
         }
         for (key, before) in &self_bindings_before {
+            if let Some(execution) = execution {
+                execution.check()?;
+            }
             let (parent, name) = decode_dentry_key(key)?;
             let after = RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)?;
             if after != *before {
