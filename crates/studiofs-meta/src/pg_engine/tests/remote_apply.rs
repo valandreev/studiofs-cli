@@ -8768,52 +8768,34 @@ fn stale_self_publish_does_not_fill_truncate_tombstone() {
 #[test]
 fn stale_complete_self_publish_does_not_rewind_newer_local_base() {
     let (_dir, pg) = temp_pg_engine_for_unit();
-    let file = pg
-        .create_file(ROOT_INO, b"stale-complete-self-publish.bin", 0, 0, 0o644)
-        .expect("create file");
-    let mut local_attr = pg.get_attr(file.ino).expect("load attr");
-    local_attr.size = 0x1000;
-    local_attr.committed_size = 0x1000;
-    local_attr.content_epoch = 5;
-    local_attr.committed_content_epoch = 5;
-    local_attr.upload_state = UploadState::Ready;
-    pg.set_attr(&local_attr).expect("set local attr");
-
-    let publish = |object_id, end| MetaEvent::PublishRegularFileBaseSlices {
-        ino: file.ino,
-        chunk_slices: vec![(
-            ChunkId(0),
-            vec![SliceRecord {
-                slice_id: SliceId(0),
-                order: SliceOrder(0),
-                range: SliceRange::new(0, end).expect("payload range"),
-                payload: Some(PayloadRef::new_partial(object_id, end)),
-                payload_state: PayloadRefState::Published,
-            }],
-        )],
+    let file = create_published_small_file(&pg, ROOT_INO, b"stale-complete.bin", 77_310);
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let publish = |object_id, size: u32, epoch| {
+        set_file_state(&pg, file.ino, u64::from(size), epoch);
+        pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(object_id, size))
+            .unwrap();
+        mark_overlay_objects_uploaded(&pg, file.ino, epoch, &[object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, epoch)
+                .unwrap()
+        );
     };
-    pg.local
-        .apply_replica_events_to_base_preserving_protected_base_ranges(
-            &[
-                MetaEvent::SetAttr {
-                    attr: local_attr.clone(),
-                },
-                publish(77_312, 0x1000),
-            ],
-            &HashSet::new(),
-        )
-        .expect("seed newer local base");
+    publish(77_311, 0x2000, 4);
+    let stale_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    publish(77_312, 0x1000, 5);
+    let local_attr = pg.get_attr(file.ino).unwrap();
+    let base_attr = pg.local.get_base_attr(file.ino).unwrap();
+    assert_ne!(
+        base_attr.as_ref().map(|attr| attr.committed_content_epoch),
+        Some(5),
+        "local publication must leave base attributes for replay"
+    );
 
     // A complete publish takes the replacing merge path, not the partial one.
-    let mut stale_attr = local_attr.clone();
-    stale_attr.size = 0x2000;
-    stale_attr.committed_size = 0x2000;
-    stale_attr.content_epoch = 4;
-    stale_attr.committed_content_epoch = 4;
-    let stale_batch = vec![
-        publish(77_311, 0x2000),
-        MetaEvent::SetAttr { attr: stale_attr },
-    ];
+    let stale_batch = RemoteApplyCoordinator::project_local_batch(
+        &pg.local.read_events_range(start, stale_end).unwrap(),
+    )
+    .events;
     assert!(
         RemoteApplyCoordinator::partial_regular_file_publish_inodes(&stale_batch).is_empty(),
         "the stale publish must cover its committed extent"
@@ -8822,11 +8804,12 @@ fn stale_complete_self_publish_does_not_rewind_newer_local_base() {
 
     assert_eq!(
         pg.local.get_base_attr(file.ino).unwrap(),
-        Some(local_attr),
+        base_attr,
         "an older self publication must not rewind base attributes beside the preserved graph"
     );
+    assert_eq!(pg.get_attr(file.ino).unwrap(), local_attr);
     assert_eq!(
-        lookup_object_ids(&pg, file.ino, 0x2000).expect("lookup graph"),
+        lookup_object_ids(&pg, file.ino, 0x1000).expect("lookup graph"),
         vec![77_312],
         "a stale self publish must not rewind the newer local base graph"
     );
@@ -11713,4 +11696,224 @@ fn self_publish_does_not_fill_chunk_removed_by_later_truncate() {
 #[test]
 fn self_publish_does_not_fill_chunk_removed_by_later_truncate_to_zero() {
     assert_self_publish_stays_out_of_truncated_chunk(0);
+}
+
+/// When the first writer's publication reaches the second writer.
+#[derive(Clone, Copy, Debug)]
+enum FirstPublicationArrives {
+    BeforeLocalPublish,
+    AfterLocalPublish,
+    /// The local publication is already in PostgreSQL at a later version, so its
+    /// journal range no longer protects the inode from the older foreign batch.
+    AfterLocalFlush,
+}
+
+/// One publication per writer, with `first` ahead of `second` in PostgreSQL.
+#[derive(Clone, Copy, Debug)]
+struct ConflictingPublications {
+    first_epoch: u64,
+    first_size: u32,
+    second_epoch: u64,
+    second_size: u32,
+    /// The second writer also wrote first in wall-clock time, so its attr has older timestamps.
+    second_wrote_first: bool,
+    arrives: FirstPublicationArrives,
+}
+
+fn replay_conflict_batch(pg: &PgMetaEngine, version: i64, events: &[MetaEvent], is_self: bool) {
+    let next_event_seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: version,
+            events: events.to_vec(),
+            is_self_batch: is_self,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: version - 1,
+            current_namespace_version: 0,
+            flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
+            next_event_seq,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+}
+
+/// Returns each client that does not end on the later PostgreSQL publication.
+fn conflicting_publication_mismatches(case: ConflictingPublications) -> Vec<String> {
+    const FIRST_VERSION: i64 = 20;
+    const SECOND_VERSION: i64 = 21;
+    const FIRST_OBJECT: u64 = 77_401;
+    const SECOND_OBJECT: u64 = 77_402;
+    let (_first_dir, first) = temp_pg_engine_for_unit();
+    let (_second_dir, second) = temp_pg_engine_for_unit();
+    let (_peer_dir, peer) = temp_pg_engine_for_unit();
+
+    let start = first.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let file = create_published_small_file(&first, ROOT_INO, b"conflict.bin", 77_400);
+    let seed_end = first.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let seed = RemoteApplyCoordinator::project_local_batch(
+        &first.local.read_events_range(start, seed_end).unwrap(),
+    )
+    .events;
+    replay_conflict_batch(&first, 10, &seed, true);
+    first.persist_flushed_event_seq(seed_end).unwrap();
+    replay_conflict_batch(&second, 10, &seed, false);
+    replay_conflict_batch(&peer, 10, &seed, false);
+    let second_start = second.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    second.persist_flushed_event_seq(second_start).unwrap();
+
+    let stage_second = || {
+        set_file_state(
+            &second,
+            file.ino,
+            u64::from(case.second_size),
+            case.second_epoch,
+        );
+        second
+            .stage_payload_slice(
+                file.ino,
+                0,
+                &PayloadRef::new_partial(SECOND_OBJECT, case.second_size),
+            )
+            .unwrap();
+        mark_overlay_objects_uploaded(&second, file.ino, case.second_epoch, &[SECOND_OBJECT]);
+    };
+    if case.second_wrote_first {
+        stage_second();
+    }
+    set_file_state(
+        &first,
+        file.ino,
+        u64::from(case.first_size),
+        case.first_epoch,
+    );
+    first
+        .stage_payload_slice(
+            file.ino,
+            0,
+            &PayloadRef::new_partial(FIRST_OBJECT, case.first_size),
+        )
+        .unwrap();
+    mark_overlay_objects_uploaded(&first, file.ino, case.first_epoch, &[FIRST_OBJECT]);
+    assert!(
+        first
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, case.first_epoch)
+            .unwrap()
+    );
+    let first_end = first.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let first_batch = RemoteApplyCoordinator::project_local_batch(
+        &first.local.read_events_range(seed_end, first_end).unwrap(),
+    )
+    .events;
+    if !case.second_wrote_first {
+        stage_second();
+    }
+
+    let publish_second = || {
+        assert!(
+            second
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, case.second_epoch)
+                .unwrap(),
+            "the second writer's upload must still own its epoch: {case:?}"
+        );
+        let second_end = second.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+        (
+            second_end,
+            RemoteApplyCoordinator::project_local_batch(
+                &second
+                    .local
+                    .read_events_range(second_start, second_end)
+                    .unwrap(),
+            )
+            .events,
+        )
+    };
+    let second_batch = match case.arrives {
+        FirstPublicationArrives::BeforeLocalPublish => {
+            replay_conflict_batch(&second, FIRST_VERSION, &first_batch, false);
+            publish_second().1
+        }
+        FirstPublicationArrives::AfterLocalPublish => {
+            let (_, batch) = publish_second();
+            replay_conflict_batch(&second, FIRST_VERSION, &first_batch, false);
+            batch
+        }
+        FirstPublicationArrives::AfterLocalFlush => {
+            let (second_end, batch) = publish_second();
+            let range = LocalEventRange {
+                start: second_start,
+                end: second_end,
+            };
+            second
+                .mark_local_event_ranges_published_with_prefix(
+                    &[range],
+                    Some((SECOND_VERSION, vec![range])),
+                )
+                .unwrap();
+            replay_conflict_batch(&second, FIRST_VERSION, &first_batch, false);
+            batch
+        }
+    };
+
+    replay_conflict_batch(&first, FIRST_VERSION, &first_batch, true);
+    replay_conflict_batch(&peer, FIRST_VERSION, &first_batch, false);
+    replay_conflict_batch(&first, SECOND_VERSION, &second_batch, false);
+    replay_conflict_batch(&second, SECOND_VERSION, &second_batch, true);
+    replay_conflict_batch(&peer, SECOND_VERSION, &second_batch, false);
+
+    let expected = (
+        u64::from(case.second_size),
+        case.second_epoch,
+        vec![SECOND_OBJECT],
+    );
+    [("first", &first), ("second", &second), ("peer", &peer)]
+        .into_iter()
+        .filter_map(|(name, client)| {
+            let attr = client.get_attr(file.ino).unwrap();
+            let actual = (
+                attr.size,
+                attr.committed_content_epoch,
+                lookup_object_ids(client, file.ino, attr.size).unwrap(),
+            );
+            (actual != expected)
+                .then(|| format!("{name}: {actual:?} instead of {expected:?} in {case:?}"))
+        })
+        .collect()
+}
+
+#[test]
+fn conflicting_publications_converge_on_later_postgresql_write() {
+    let mut mismatches = Vec::new();
+    for (first_epoch, first_size, second_epoch, second_size) in [
+        (3, 217, 2, 426),
+        (3, 426, 2, 217),
+        (2, 426, 2, 217),
+        (2, 217, 2, 426),
+    ] {
+        for second_wrote_first in [false, true] {
+            for arrives in [
+                FirstPublicationArrives::BeforeLocalPublish,
+                FirstPublicationArrives::AfterLocalPublish,
+                FirstPublicationArrives::AfterLocalFlush,
+            ] {
+                mismatches.extend(conflicting_publication_mismatches(
+                    ConflictingPublications {
+                        first_epoch,
+                        first_size,
+                        second_epoch,
+                        second_size,
+                        second_wrote_first,
+                        arrives,
+                    },
+                ));
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "clients diverged from PostgreSQL order:\n{}",
+        mismatches.join("\n")
+    );
 }

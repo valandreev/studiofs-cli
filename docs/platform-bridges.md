@@ -605,7 +605,10 @@ under the adaptive policy; SFS-921 and SFS-922 fixed the two causes, and the
 flag stays opt-in until broader mounted validation. SFS-1021 also identified
 metadata self-replay rewinding a newer local base or filling truncate
 tombstones, independently of mapped writeback. Self-publish replay preserves
-those tombstones and skips graphs older than the local committed epoch/size.
+those tombstones and skips graphs older than local committed state that has not
+replayed into base attributes. Once replay installs newer state there, every
+client has it, so PostgreSQL order decides. The later PostgreSQL publication wins
+a conflict on every client, even with an older epoch or older timestamps.
 For same-epoch rewrites, the local journal identifies a later publication;
 its graph is protected only while it exactly matches the current local base,
 so foreign replay still follows PostgreSQL order.
