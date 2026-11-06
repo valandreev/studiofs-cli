@@ -79,7 +79,7 @@ impl RedbMetaEngine {
         Ok(chunks)
     }
 
-    pub(super) fn regular_file_chunk_rows_for_inode_in_write_txn(
+    pub(crate) fn regular_file_chunk_rows_for_inode_in_write_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -508,6 +508,7 @@ impl RedbMetaEngine {
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
         preserve_current_tombstoned_ranges: bool,
+        own_publish: bool,
     ) -> MetaResult<()> {
         // A published base event carries the sender's complete visible base graph.
         // When there is no protected local base, replay it as an authoritative
@@ -559,7 +560,13 @@ impl RedbMetaEngine {
                     let uncovered_ranges =
                         resolve_chunk_slice_spans(*chunk_id, incoming.range, Some(&state), None)
                             .into_iter()
-                            .filter_map(|span| span.payload.is_none().then_some(span.range))
+                            // This client's publish can replay after its own later truncate,
+                            // so an own publish fills only true holes, never a tombstone.
+                            .filter(|span| {
+                                span.source == ResolvedSliceSource::Hole
+                                    || (!own_publish && span.payload.is_none())
+                            })
+                            .map(|span| span.range)
                             .collect::<Vec<_>>();
                     for uncovered in uncovered_ranges {
                         let offset_delta = uncovered

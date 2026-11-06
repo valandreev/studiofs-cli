@@ -3,7 +3,8 @@ use super::local_state::{merge_local_event_ranges, subtract_local_event_ranges};
 use crate::engine::{MetaError, MetaResult};
 use crate::events::{MetaEvent, decode_event_with_type};
 use crate::redb_engine::layout::{
-    decode_dentry_key, encode_acl_rule_key, encode_dentry_key, encode_xattr_key,
+    REGULAR_FILE_BASE_TABLE, decode_dentry_key, encode_acl_rule_key, encode_dentry_key,
+    encode_xattr_key,
 };
 use crate::redb_engine::{RedbMetaEngine, RedbWriteTransaction};
 use crate::schema::{DEFAULT_CHUNK_SIZE, chunk_start_offset};
@@ -2011,7 +2012,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
     #[cfg(test)]
     pub(super) fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
         let txn = self.local.begin_write_txn()?;
-        let result = self.apply_visible_self_batch_in_txn(&txn, batch_events);
+        let result = self.apply_visible_self_batch_in_txn(&txn, batch_events, &HashSet::new());
         match result {
             Ok(changed) => {
                 txn.commit()
@@ -2029,6 +2030,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         &self,
         txn: &RedbWriteTransaction<'_>,
         batch_events: &[MetaEvent],
+        superseded_publish_inodes: &HashSet<Ino>,
     ) -> MetaResult<bool> {
         if batch_events.is_empty() {
             return Ok(false);
@@ -2049,6 +2051,19 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 )
             })
             .collect::<Vec<_>>();
+        let stale_self_publish_inodes = Self::stale_self_publish_inodes_in_txn(txn, &batch_events)?;
+        let batch_events = batch_events
+            .into_iter()
+            .filter(|event| {
+                let ino = match event {
+                    MetaEvent::PublishRegularFileBaseSlices { ino, .. } => *ino,
+                    MetaEvent::SetAttr { attr } => attr.ino,
+                    _ => return true,
+                };
+                !stale_self_publish_inodes.contains(&ino)
+                    && !superseded_publish_inodes.contains(&ino)
+            })
+            .collect::<Vec<_>>();
         let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
         // These events already changed the local serving view and reached the
         // mounted kernel through this client's own callbacks. Mirroring them into
@@ -2056,7 +2071,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         // cache data and, for writers or removed inodes, fail adapter admission and
         // degrade cache coherence. Serving reconciliation below keeps its intents.
         txn.without_invalidations(|| {
-            RedbMetaEngine::apply_replica_events_to_base_in_txn(
+            RedbMetaEngine::apply_own_events_to_base_in_txn(
                 txn,
                 &batch_events,
                 &partial_publish_inodes,
@@ -2087,6 +2102,37 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
 
         Ok(changed)
+    }
+
+    /// Local publication writes the base graph before PostgreSQL echoes it, so
+    /// a batch older than the local committed epoch would rewind that graph.
+    fn stale_self_publish_inodes_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        batch_events: &[MetaEvent],
+    ) -> MetaResult<HashSet<Ino>> {
+        let mut batch_epochs = HashMap::new();
+        for event in batch_events {
+            if let MetaEvent::SetAttr { attr } = event
+                && attr.kind == FileType::RegularFile
+                && attr.upload_state == UploadState::Ready
+            {
+                let epoch = batch_epochs.entry(attr.ino).or_insert((0, 0));
+                *epoch = (attr.committed_content_epoch, attr.committed_size).max(*epoch);
+            }
+        }
+        let mut stale = HashSet::new();
+        for (ino, batch_epoch) in batch_epochs {
+            match RedbMetaEngine::get_attr_merged_in_write_txn(txn, ino) {
+                Ok(current)
+                    if (current.committed_content_epoch, current.committed_size) > batch_epoch =>
+                {
+                    stale.insert(ino);
+                }
+                Ok(_) | Err(MetaError::InodeNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(stale)
     }
 
     fn stale_self_updating_regular_file_inodes_in_txn(
@@ -2217,30 +2263,69 @@ impl<'a> RemoteApplyCoordinator<'a> {
         RedbMetaEngine::retire_xattr_tombstones_in_txn(txn, &keys, &inodes)
     }
 
-    fn acknowledge_local_prefix_from_self_batch_in_txn(
+    /// Match the local prefix before replay changes its graph, reusing the journal scan
+    /// to identify later local publications that still own the current base.
+    fn prepare_self_batch_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
+        batch_version: i64,
         batch_events: &[MetaEvent],
         flushed_event_seq: u64,
         next_event_seq: u64,
         execution: Option<&RemoteReplayExecution<'_>>,
-    ) -> MetaResult<Option<u64>> {
-        if batch_events.is_empty() {
-            return Ok(None);
+    ) -> MetaResult<(Option<u64>, HashSet<Ino>)> {
+        if batch_events.is_empty() || next_event_seq <= flushed_event_seq {
+            return Ok((None, HashSet::new()));
         }
-        let start = flushed_event_seq;
-        let end = next_event_seq;
-        if end <= start {
-            return Ok(None);
+        let start = flushed_event_seq.max(1);
+        let local_events = RedbMetaEngine::read_events_range_in_write_txn_with_check(
+            txn,
+            flushed_event_seq,
+            next_event_seq,
+            || execution.map_or(Ok(()), RemoteReplayExecution::check),
+        )?;
+        let acknowledged = Self::matching_local_prefix(&local_events, batch_events, execution)?
+            .map(|consumed| start.saturating_add(consumed as u64));
+        let boundary = acknowledged.or_else(|| {
+            self.published_prefixes
+                .iter()
+                .find(|(version, _)| *version == batch_version)
+                .and_then(|(_, ranges)| ranges.iter().map(|range| range.end).max())
+        });
+        let Some(boundary) = boundary else {
+            return Ok((acknowledged, HashSet::new()));
+        };
+        let touched: HashSet<_> = batch_events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::PublishRegularFileBaseSlices { ino, .. } => Some(*ino),
+                _ => None,
+            })
+            .collect();
+        let mut latest = HashMap::new();
+        for (index, event) in local_events.iter().enumerate() {
+            if let Some(execution) = execution {
+                execution.check()?;
+            }
+            if start.saturating_add(index as u64) >= boundary
+                && let MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } = event
+                && touched.contains(ino)
+            {
+                latest.insert(*ino, chunk_slices);
+            }
         }
-        let local_events =
-            RedbMetaEngine::read_events_range_in_write_txn_with_check(txn, start, end, || {
-                execution.map_or(Ok(()), RemoteReplayExecution::check)
-            })?;
-        Ok(
-            Self::matching_local_prefix(&local_events, batch_events, execution)?
-                .map(|consumed| start.max(1).saturating_add(consumed as u64)),
-        )
+        let mut superseded = HashSet::new();
+        for (ino, latest_graph) in latest {
+            let current = RedbMetaEngine::regular_file_chunk_rows_for_inode_in_write_txn(
+                txn,
+                REGULAR_FILE_BASE_TABLE,
+                ino,
+            )?;
+            if &current == latest_graph {
+                superseded.insert(ino);
+            }
+        }
+        Ok((acknowledged, superseded))
     }
 
     pub(super) fn matching_local_prefix(
@@ -2649,15 +2734,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
             }
             reconcile_dentry_keys.extend(touched_keys);
             if batch.is_self_batch {
-                applied_any |= self.apply_visible_self_batch_in_txn(txn, &events)?;
+                let (acknowledged_seq, superseded_publish_inodes) = self
+                    .prepare_self_batch_in_txn(
+                        txn,
+                        batch.batch_version,
+                        &batch.events,
+                        context.flushed_event_seq,
+                        context.next_event_seq,
+                        execution,
+                    )?;
+                applied_any |=
+                    self.apply_visible_self_batch_in_txn(txn, &events, &superseded_publish_inodes)?;
                 applied_self_batch = true;
-                let acknowledged_seq = self.acknowledge_local_prefix_from_self_batch_in_txn(
-                    txn,
-                    &batch.events,
-                    context.flushed_event_seq,
-                    context.next_event_seq,
-                    execution,
-                )?;
                 if let Some(next_flushed_event_seq) = acknowledged_seq
                     && self
                         .local_event_ack_barrier

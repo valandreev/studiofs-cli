@@ -8706,6 +8706,238 @@ fn sparse_ready_self_batch_with_holes_preserves_disjoint_payload_ranges() {
 }
 
 #[test]
+fn stale_self_publish_does_not_fill_truncate_tombstone() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"stale-self-publish.bin", 0, 0, 0o644)
+        .expect("create file");
+    set_file_state(&pg, file.ino, 0x2000, 3);
+
+    let publish = |object_id, end, tombstone_from: Option<u32>| {
+        let mut slices = vec![SliceRecord {
+            slice_id: SliceId(0),
+            order: SliceOrder(0),
+            range: SliceRange::new(0, end).expect("payload range"),
+            payload: Some(PayloadRef::new_partial(object_id, end)),
+            payload_state: PayloadRefState::Published,
+        }];
+        slices.extend(tombstone_from.map(|start| SliceRecord {
+            slice_id: SliceId(1),
+            order: SliceOrder(1),
+            range: SliceRange::new(start, DEFAULT_CHUNK_SIZE).expect("tombstone range"),
+            payload: None,
+            payload_state: PayloadRefState::Published,
+        }));
+        MetaEvent::PublishRegularFileBaseSlices {
+            ino: file.ino,
+            chunk_slices: vec![(ChunkId(0), slices)],
+        }
+    };
+    pg.local
+        .apply_replica_events_to_base_preserving_protected_base_ranges(
+            &[publish(77_302, 0x1000, Some(0x1000))],
+            &HashSet::new(),
+        )
+        .expect("seed truncated base");
+
+    // The publish from before the truncate reaches this client after the truncate.
+    let stale_batch = vec![publish(77_301, 0x2000, None)];
+    assert!(
+        RemoteApplyCoordinator::partial_regular_file_publish_inodes(&stale_batch)
+            .contains(&file.ino),
+        "a publish without a ready attr takes the partial merge path"
+    );
+    apply_visible_self_batch(&pg, &stale_batch).expect("apply stale self publish");
+
+    let payload_ranges = pg
+        .lookup_regular_file_slices(file.ino, 0, 0x2000)
+        .expect("lookup graph")
+        .into_iter()
+        .filter_map(|span| {
+            span.payload
+                .map(|payload| (payload.object_id, span.range.start, span.range.end))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payload_ranges,
+        vec![(77_302, 0, 0x1000)],
+        "a stale self publish must not bring back bytes removed by a truncate"
+    );
+}
+
+#[test]
+fn stale_complete_self_publish_does_not_rewind_newer_local_base() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"stale-complete-self-publish.bin", 0, 0, 0o644)
+        .expect("create file");
+    let mut local_attr = pg.get_attr(file.ino).expect("load attr");
+    local_attr.size = 0x1000;
+    local_attr.committed_size = 0x1000;
+    local_attr.content_epoch = 5;
+    local_attr.committed_content_epoch = 5;
+    local_attr.upload_state = UploadState::Ready;
+    pg.set_attr(&local_attr).expect("set local attr");
+
+    let publish = |object_id, end| MetaEvent::PublishRegularFileBaseSlices {
+        ino: file.ino,
+        chunk_slices: vec![(
+            ChunkId(0),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(0, end).expect("payload range"),
+                payload: Some(PayloadRef::new_partial(object_id, end)),
+                payload_state: PayloadRefState::Published,
+            }],
+        )],
+    };
+    pg.local
+        .apply_replica_events_to_base_preserving_protected_base_ranges(
+            &[
+                MetaEvent::SetAttr {
+                    attr: local_attr.clone(),
+                },
+                publish(77_312, 0x1000),
+            ],
+            &HashSet::new(),
+        )
+        .expect("seed newer local base");
+
+    // A complete publish takes the replacing merge path, not the partial one.
+    let mut stale_attr = local_attr.clone();
+    stale_attr.size = 0x2000;
+    stale_attr.committed_size = 0x2000;
+    stale_attr.content_epoch = 4;
+    stale_attr.committed_content_epoch = 4;
+    let stale_batch = vec![
+        publish(77_311, 0x2000),
+        MetaEvent::SetAttr { attr: stale_attr },
+    ];
+    assert!(
+        RemoteApplyCoordinator::partial_regular_file_publish_inodes(&stale_batch).is_empty(),
+        "the stale publish must cover its committed extent"
+    );
+    apply_visible_self_batch(&pg, &stale_batch).expect("apply stale self publish");
+
+    assert_eq!(
+        pg.local.get_base_attr(file.ino).unwrap(),
+        Some(local_attr),
+        "an older self publication must not rewind base attributes beside the preserved graph"
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, 0x2000).expect("lookup graph"),
+        vec![77_312],
+        "a stale self publish must not rewind the newer local base graph"
+    );
+}
+
+#[test]
+fn older_self_publish_preserves_later_local_same_epoch_same_size_graph() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"same-epoch-local-rewrite.bin", 77_316);
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.persist_flushed_event_seq(start).unwrap();
+    let mut first_end = 0;
+    for object_id in [77_317, 77_318] {
+        if object_id == 77_318 {
+            let mut attr = pg.get_attr(file.ino).unwrap();
+            attr.mode = 0o600;
+            pg.set_attr(&attr).unwrap();
+        }
+        set_file_state(&pg, file.ino, 152, 2);
+        pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(object_id, 152))
+            .unwrap();
+        mark_overlay_objects_uploaded(&pg, file.ino, 2, &[object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+                .unwrap()
+        );
+        if first_end == 0 {
+            first_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+        }
+    }
+    let latest_attr = pg.get_attr(file.ino).unwrap();
+    pg.local
+        .apply_replica_events_to_base(&[MetaEvent::SetAttr {
+            attr: latest_attr.clone(),
+        }])
+        .unwrap();
+    let batch = RemoteApplyCoordinator::project_local_batch(
+        &pg.local.read_events_range(start, first_end).unwrap(),
+    );
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 20,
+            events: batch.events,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 19,
+            current_namespace_version: 0,
+            flushed_event_seq: start,
+            next_event_seq: pg.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+            initial_overlay: OverlayConflictSets::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pg.local.get_base_attr(file.ino).unwrap(),
+        Some(latest_attr),
+        "a superseded same-epoch publication must preserve newer base attributes too"
+    );
+    assert_eq!(
+        lookup_object_ids(&pg, file.ino, 152).unwrap(),
+        vec![77_318],
+        "the local journal proves a later publication already installed this exact base"
+    );
+}
+
+#[test]
+fn stale_same_epoch_self_publish_does_not_rewind_later_append() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let mut attr = pg
+        .create_file(ROOT_INO, b"stale-self-append.bin", 0, 0, 0o644)
+        .unwrap();
+    attr.size = 8192;
+    attr.committed_size = 8192;
+    attr.content_epoch = 5;
+    attr.committed_content_epoch = 5;
+    attr.upload_state = UploadState::Ready;
+    pg.set_attr(&attr).unwrap();
+    let publish = |object_id, end| MetaEvent::PublishRegularFileBaseSlices {
+        ino: attr.ino,
+        chunk_slices: vec![(
+            ChunkId(0),
+            vec![SliceRecord {
+                slice_id: SliceId(0),
+                order: SliceOrder(0),
+                range: SliceRange::new(0, end).unwrap(),
+                payload: Some(PayloadRef::new_partial(object_id, end)),
+                payload_state: PayloadRefState::Published,
+            }],
+        )],
+    };
+    pg.local
+        .apply_replica_events_to_base(&[publish(77_315, 8192)])
+        .unwrap();
+    let mut stale = attr.clone();
+    stale.size = 4096;
+    stale.committed_size = 4096;
+    apply_visible_self_batch(
+        &pg,
+        &[publish(77_314, 4096), MetaEvent::SetAttr { attr: stale }],
+    )
+    .unwrap();
+    assert_eq!(
+        lookup_object_ids(&pg, attr.ino, 8192).unwrap(),
+        vec![77_315],
+        "append publication may grow the base without advancing its committed epoch"
+    );
+}
+
+#[test]
 fn sparse_ready_foreign_publish_sets_serving_size_when_payload_graph_is_partial() {
     let (_writer_dir, writer) = temp_pg_engine_for_unit();
     let (_remote_dir, remote) = temp_pg_engine_for_unit();

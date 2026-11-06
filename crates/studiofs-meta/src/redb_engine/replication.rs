@@ -1275,6 +1275,7 @@ impl RedbMetaEngine {
                         *ino,
                         chunk_slices.as_slice(),
                         false,
+                        false,
                     )?;
                 }
                 crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
@@ -1387,6 +1388,24 @@ impl RedbMetaEngine {
         txn: &RedbWriteTransaction<'_>,
         events: impl IntoIterator<Item = &'event crate::events::MetaEvent>,
         protected_regular_file_inodes: &HashSet<Ino>,
+    ) -> MetaResult<()> {
+        Self::apply_events_to_base_in_txn(txn, events, protected_regular_file_inodes, false)
+    }
+
+    /// Mirrors this client's own events, which are never newer than its local base.
+    pub(crate) fn apply_own_events_to_base_in_txn<'event>(
+        txn: &RedbWriteTransaction<'_>,
+        events: impl IntoIterator<Item = &'event crate::events::MetaEvent>,
+        protected_regular_file_inodes: &HashSet<Ino>,
+    ) -> MetaResult<()> {
+        Self::apply_events_to_base_in_txn(txn, events, protected_regular_file_inodes, true)
+    }
+
+    fn apply_events_to_base_in_txn<'event>(
+        txn: &RedbWriteTransaction<'_>,
+        events: impl IntoIterator<Item = &'event crate::events::MetaEvent>,
+        protected_regular_file_inodes: &HashSet<Ino>,
+        own_publish: bool,
     ) -> MetaResult<()> {
         for event in events {
             Self::invalidate_replica_event(txn, event)?;
@@ -1587,6 +1606,7 @@ impl RedbMetaEngine {
                         *ino,
                         chunk_slices.as_slice(),
                         protected_regular_file_inodes.contains(ino),
+                        own_publish,
                     )?;
                 }
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
