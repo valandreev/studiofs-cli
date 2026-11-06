@@ -2012,7 +2012,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
     #[cfg(test)]
     pub(super) fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
         let txn = self.local.begin_write_txn()?;
-        let result = self.apply_visible_self_batch_in_txn(&txn, batch_events, &HashSet::new());
+        let result = self.apply_visible_self_batch_in_txn(
+            &txn,
+            batch_events,
+            &HashSet::new(),
+            &mut HashSet::new(),
+        );
         match result {
             Ok(changed) => {
                 txn.commit()
@@ -2031,6 +2036,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         txn: &RedbWriteTransaction<'_>,
         batch_events: &[MetaEvent],
         superseded_publish_inodes: &HashSet<Ino>,
+        reconcile_inodes: &mut HashSet<Ino>,
     ) -> MetaResult<bool> {
         if batch_events.is_empty() {
             return Ok(false);
@@ -2064,6 +2070,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     && !superseded_publish_inodes.contains(&ino)
             })
             .collect::<Vec<_>>();
+        // Local publication does not write base attrs, so they stay behind serving until
+        // the later publication replays; a later batch in this page re-adds its inodes.
+        reconcile_inodes.retain(|ino| {
+            !stale_self_publish_inodes.contains(ino) && !superseded_publish_inodes.contains(ino)
+        });
         let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
         // These events already changed the local serving view and reached the
         // mounted kernel through this client's own callbacks. Mirroring them into
@@ -2292,24 +2303,26 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 .find(|(version, _)| *version == batch_version)
                 .and_then(|(_, ranges)| ranges.iter().map(|range| range.end).max())
         });
-        let Some(boundary) = boundary else {
-            return Ok((acknowledged, HashSet::new()));
-        };
-        let touched: HashSet<_> = batch_events
+        let incoming: HashMap<_, _> = batch_events
             .iter()
             .filter_map(|event| match event {
-                MetaEvent::PublishRegularFileBaseSlices { ino, .. } => Some(*ino),
+                MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
+                    Some((*ino, chunk_slices))
+                }
                 _ => None,
             })
             .collect();
+        if incoming.is_empty() {
+            return Ok((acknowledged, HashSet::new()));
+        }
         let mut latest = HashMap::new();
         for (index, event) in local_events.iter().enumerate() {
             if let Some(execution) = execution {
                 execution.check()?;
             }
-            if start.saturating_add(index as u64) >= boundary
+            if boundary.is_none_or(|boundary| start.saturating_add(index as u64) >= boundary)
                 && let MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } = event
-                && touched.contains(ino)
+                && incoming.contains_key(ino)
             {
                 latest.insert(*ino, chunk_slices);
             }
@@ -2321,7 +2334,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 REGULAR_FILE_BASE_TABLE,
                 ino,
             )?;
-            if &current == latest_graph {
+            // With no boundary the latest journal publication may be this batch itself.
+            if &current == latest_graph
+                && (boundary.is_some() || incoming.get(&ino) != Some(&latest_graph))
+            {
                 superseded.insert(ino);
             }
         }
@@ -2743,8 +2759,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
                         context.next_event_seq,
                         execution,
                     )?;
-                applied_any |=
-                    self.apply_visible_self_batch_in_txn(txn, &events, &superseded_publish_inodes)?;
+                applied_any |= self.apply_visible_self_batch_in_txn(
+                    txn,
+                    &events,
+                    &superseded_publish_inodes,
+                    &mut reconcile_inodes,
+                )?;
                 applied_self_batch = true;
                 if let Some(next_flushed_event_seq) = acknowledged_seq
                     && self
