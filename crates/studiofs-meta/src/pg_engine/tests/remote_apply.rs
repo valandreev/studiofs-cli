@@ -11917,3 +11917,105 @@ fn conflicting_publications_converge_on_later_postgresql_write() {
         mismatches.join("\n")
     );
 }
+
+/// Replays a create racing another writer's create and rename of the same name, and
+/// returns what the creator's mount must learn: whether replay of the other writer
+/// hid the name, the name's final inode, and the intents its own replay journaled.
+fn creator_replay_after_racing_rename(
+    arrives: FirstPublicationArrives,
+) -> (bool, Option<Ino>, Vec<crate::coherence::InvalidationIntent>) {
+    const NAME: &[u8] = b"slot.txt";
+    const RENAMED: &[u8] = b"slot-renamed.txt";
+    let (_first_dir, first) = temp_pg_engine_for_unit();
+    let (_second_dir, second) = temp_pg_engine_for_unit();
+    // Different clients allocate inodes from different ranges in production.
+    second.next_inode().unwrap();
+    let second_start = second.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    second.persist_flushed_event_seq(second_start).unwrap();
+    let first_start = first.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    first.persist_flushed_event_seq(first_start).unwrap();
+
+    // The rename crosses the first writer's upload, so its publication follows the rename.
+    let first_file = first.create_file(ROOT_INO, NAME, 0, 0, 0o644).unwrap();
+    set_file_state(&first, first_file.ino, 64, 1);
+    first
+        .stage_payload_slice(first_file.ino, 0, &PayloadRef::new_partial(77_410, 64))
+        .unwrap();
+    first
+        .rename_atomic(ROOT_INO, NAME, ROOT_INO, RENAMED, true, false)
+        .unwrap();
+    mark_overlay_objects_uploaded(&first, first_file.ino, 1, &[77_410]);
+    assert!(
+        first
+            .publish_regular_file_overlay_to_base_if_matches(first_file.ino, 1)
+            .unwrap()
+    );
+    let first_end = first.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let first_batch = RemoteApplyCoordinator::project_local_batch(
+        &first
+            .local
+            .read_events_range(first_start, first_end)
+            .unwrap(),
+    )
+    .events;
+
+    create_published_small_file(&second, ROOT_INO, NAME, 77_411);
+    let second_end = second.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let second_batch = RemoteApplyCoordinator::project_local_batch(
+        &second
+            .local
+            .read_events_range(second_start, second_end)
+            .unwrap(),
+    )
+    .events;
+    if matches!(arrives, FirstPublicationArrives::AfterLocalFlush) {
+        let range = LocalEventRange {
+            start: second_start,
+            end: second_end,
+        };
+        second
+            .mark_local_event_ranges_published_with_prefix(&[range], Some((21, vec![range])))
+            .unwrap();
+    }
+    replay_conflict_batch(&second, 20, &first_batch, false);
+    let hidden = second.lookup(ROOT_INO, NAME).is_err();
+    journaled_invalidation_intents(&second);
+
+    replay_conflict_batch(&second, 21, &second_batch, true);
+    let intents = journaled_invalidation_intents(&second);
+    let restored = second.lookup(ROOT_INO, NAME).ok().map(|attr| attr.ino);
+    (hidden, restored, intents)
+}
+
+/// The Linux bridge reuses a directory snapshot and negative lookups until an intent
+/// bumps the directory generation, so a silent restore stays hidden from the mount.
+#[test]
+fn self_replay_announces_a_name_that_foreign_replay_hid() {
+    use crate::coherence::InvalidationIntent;
+
+    for arrives in [
+        FirstPublicationArrives::AfterLocalPublish,
+        FirstPublicationArrives::AfterLocalFlush,
+    ] {
+        let (hidden, restored, intents) = creator_replay_after_racing_rename(arrives);
+        assert!(
+            hidden,
+            "{arrives:?}: the race needs foreign replay to hide the name"
+        );
+        assert!(
+            restored.is_some(),
+            "{arrives:?}: the creator keeps its name"
+        );
+        assert!(
+            intents.iter().any(|intent| matches!(
+                intent,
+                InvalidationIntent::Entry { parent: ROOT_INO, name, .. } if name == b"slot.txt"
+            )),
+            "{arrives:?}: the restored name must be announced: {intents:?}"
+        );
+        assert!(
+            intents.contains(&InvalidationIntent::Directory { ino: ROOT_INO }),
+            "{arrives:?}: the restored name must refresh the directory: {intents:?}"
+        );
+    }
+}

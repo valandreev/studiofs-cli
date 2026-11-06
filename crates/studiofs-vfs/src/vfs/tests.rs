@@ -2350,6 +2350,50 @@ fn semantic_invalidation_legacy_adapter_explicitly_reports_unsupported() {
     );
 }
 
+/// Replay can restore a name without a foreground write. Until its intents arrive,
+/// lookups keep the negative entry and the bridge keeps its directory snapshot.
+#[test]
+fn semantic_invalidation_reveals_a_name_restored_behind_the_mount() {
+    use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
+    let tmp = studiofs_test_support::workspace_target_tempdir("semantic-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "semantic-restored-name");
+    let _guard = rt.enter();
+    let name = b"restored.txt";
+    assert!(vfs.lookup(ROOT_INO, name).is_err());
+    let observed = vfs.directory_enumeration_observation(ROOT_INO).unwrap();
+
+    let restored = meta.create_file(ROOT_INO, name, 0, 0, 0o644).unwrap();
+    assert!(
+        vfs.lookup(ROOT_INO, name).is_err(),
+        "the negative entry stands until an intent retires it"
+    );
+    assert_eq!(
+        vfs.directory_enumeration_observation(ROOT_INO).unwrap(),
+        observed,
+        "the bridge reuses its snapshot until an intent retires it"
+    );
+
+    vfs.apply_semantic_invalidation_batch(InvalidationBatch {
+        generation: 1,
+        intents: vec![
+            InvalidationIntent::Entry {
+                parent: ROOT_INO,
+                name: name.to_vec(),
+                ancestors: None,
+                ino: Some(restored.ino),
+            },
+            InvalidationIntent::Directory { ino: ROOT_INO },
+        ],
+    });
+
+    assert_eq!(vfs.lookup(ROOT_INO, name).unwrap().ino, restored.ino);
+    assert_ne!(
+        vfs.directory_enumeration_observation(ROOT_INO).unwrap(),
+        observed,
+        "a directory intent must force a new snapshot"
+    );
+}
+
 #[test]
 fn semantic_invalidation_falls_back_without_losing_content_or_attributes() {
     use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
