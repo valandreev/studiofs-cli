@@ -602,7 +602,14 @@ libfuse older than 3.13 has no custom IO hook; with opt-in, the mount logs a
 warning and shared writable mappings of `direct_io` handles keep failing with
 `ENODEV`. The opt-in first reproduced durable size loss after a mapped write
 under the adaptive policy; SFS-921 and SFS-922 fixed the two causes, and the
-flag stays opt-in until broader mounted validation. Mapped pages go
+flag stays opt-in until broader mounted validation. SFS-1021 also identified
+metadata self-replay rewinding a newer local base or filling truncate
+tombstones, independently of mapped writeback. Self-publish replay preserves
+those tombstones and skips graphs older than the local committed epoch/size.
+For same-epoch rewrites, the local journal identifies a later publication;
+its graph is protected only while it exactly matches the current local base,
+so foreign replay still follows PostgreSQL order.
+Mapped pages go
 through the kernel page cache and reach StudioFS as
 ordinary `write` callbacks on the mapping's handle, so they follow the `write`
 local durability contract. `msync`, `fsync`, and `flush` write dirty pages back

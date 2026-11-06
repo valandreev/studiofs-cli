@@ -116,7 +116,7 @@ pub(super) const REGULAR_FILE_OVERLAY_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("regular_file_overlay");
 
 /// Remote-visible base regular-file chunk rows: (ino, chunk_id) -> RegularFileChunkState.
-pub(super) const REGULAR_FILE_BASE_TABLE: TableDefinition<&[u8], &[u8]> =
+pub(crate) const REGULAR_FILE_BASE_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("regular_file_base");
 
 /// Pending overlay chunk compaction work: (ino, chunk_id) -> marker.
