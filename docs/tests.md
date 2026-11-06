@@ -473,6 +473,27 @@ fsx gate:
 STUDIOFS_FSX_STRESS_SEED=11 cargo test -p studiofs-vfs --lib vfs::tests::fsx_like_write_truncate_stress_keeps_overlay_payloads -- --ignored --exact --nocapture
 ```
 
+### SFS-1021 Self-Publish Replay Preserves the Local Graph
+
+The metadata regressions cover truncate tombstones, an older complete publish,
+a later append in the same epoch, and a same-epoch/same-size local rewrite:
+`stale_self_publish_does_not_fill_truncate_tombstone`,
+`stale_complete_self_publish_does_not_rewind_newer_local_base`,
+`stale_same_epoch_self_publish_does_not_rewind_later_append`, and
+`older_self_publish_preserves_later_local_same_epoch_same_size_graph`.
+Run them with the foreign-ordering checks in the same module:
+
+```sh
+cargo test -p studiofs-meta --lib remote_apply
+```
+
+Mounted acceptance additionally requires all six parallel generic/127 fsx legs
+with `STUDIOFS_FUSE_DIRECT_IO_MMAP=1`, adaptive policy, and
+`-q -l 262144 -o 65536 -S 191110531 -N 100000`. Retain separate leg logs;
+every leg must finish successfully. Compare buffered and direct reads, then
+verify file contents after a clean remount. A timed-out leg is not a pass.
+Interrupted-startup/redb-repair corruption is tracked separately as SFS-1024.
+
 ### SFS-892 Linux FUSE Small I/O Regressions
 
 Linux registered no `readdirplus` callback, so `ls -l` and `find` sent one
