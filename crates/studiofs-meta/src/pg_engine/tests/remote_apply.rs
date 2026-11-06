@@ -11538,3 +11538,179 @@ fn superseded_self_publish_keeps_serving_attr_while_later_publish_is_unreplayed(
     .unwrap();
     assert_eq!(pg.local.get_base_attr(file.ino).unwrap(), Some(latest_attr));
 }
+
+fn replay_self_batch(pg: &PgMetaEngine, version: i64, events: Vec<MetaEvent>, flushed: u64) {
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: version,
+            events,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: version - 1,
+            current_namespace_version: 0,
+            flushed_event_seq: flushed,
+            next_event_seq: pg.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+            initial_overlay: OverlayConflictSets::default(),
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn self_publish_without_journal_boundary_preserves_later_local_graph() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"no-boundary-rewrite.bin", 77_340);
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.persist_flushed_event_seq(start).unwrap();
+    let mut first_end = 0;
+    for object_id in [77_341, 77_342] {
+        set_file_state(&pg, file.ino, 152, 2);
+        pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(object_id, 152))
+            .unwrap();
+        mark_overlay_objects_uploaded(&pg, file.ino, 2, &[object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+                .unwrap()
+        );
+        if first_end == 0 {
+            first_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+        }
+    }
+    let older = RemoteApplyCoordinator::project_local_batch(
+        &pg.local.read_events_range(start, first_end).unwrap(),
+    );
+    // The cursor is past the older publication, so it matches no journal prefix.
+    replay_self_batch(&pg, 20, older.events, first_end);
+    assert_eq!(lookup_object_ids(&pg, file.ino, 152).unwrap(), vec![77_342]);
+}
+
+#[test]
+fn self_publish_without_journal_boundary_still_applies_its_own_graph() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let other = pg
+        .create_file(ROOT_INO, b"no-boundary-other.bin", 0, 0, 0o644)
+        .unwrap();
+    let file = create_published_small_file(&pg, ROOT_INO, b"no-boundary-own.bin", 77_343);
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.persist_flushed_event_seq(start).unwrap();
+    set_file_state(&pg, file.ino, 152, 2);
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_344, 152))
+        .unwrap();
+    mark_overlay_objects_uploaded(&pg, file.ino, 2, &[77_344]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+            .unwrap()
+    );
+    let attr = pg.get_attr(file.ino).unwrap();
+    let mut events = RemoteApplyCoordinator::project_local_batch(
+        &pg.local
+            .read_events_range(start, pg.local.get_counter(NEXT_EVENT_SEQ).unwrap())
+            .unwrap(),
+    )
+    .events;
+    // An extra event defeats the prefix match while the journal still holds this graph.
+    events.insert(0, MetaEvent::SetAttr { attr: other });
+    replay_self_batch(&pg, 20, events, start);
+    assert_eq!(pg.local.get_base_attr(file.ino).unwrap(), Some(attr));
+    assert_eq!(lookup_object_ids(&pg, file.ino, 152).unwrap(), vec![77_344]);
+}
+
+fn assert_self_publish_stays_out_of_truncated_chunk(new_size: u32) {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = pg
+        .create_file(ROOT_INO, b"removed-chunk.bin", 0, 0, 0o644)
+        .unwrap();
+    let chunk = u64::from(DEFAULT_CHUNK_SIZE);
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.persist_flushed_event_seq(start).unwrap();
+    set_file_state(&pg, file.ino, chunk + 4096, 2);
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_350, 4096))
+        .unwrap();
+    pg.stage_payload_slice(
+        file.ino,
+        DEFAULT_CHUNK_SIZE / DEFAULT_BLOCK_SIZE,
+        &PayloadRef::new_partial(77_351, 4096),
+    )
+    .unwrap();
+    mark_overlay_objects_uploaded(&pg, file.ino, 2, &[77_350, 77_351]);
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+            .unwrap()
+    );
+    let first_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let older_events = pg.local.read_events_range(start, first_end).unwrap();
+
+    let mut attr = pg.get_attr(file.ino).unwrap();
+    attr.size = u64::from(new_size);
+    attr.content_epoch = 3;
+    attr.mtime = InodeAttr::now_nanos();
+    attr.ctime = attr.mtime;
+    // Same tombstones as the VFS truncate path.
+    pg.flush_regular_file_overlay_slices_with_attr(
+        file.ino,
+        &[
+            (
+                ChunkId(0),
+                vec![SliceRecord::tombstone(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(new_size, DEFAULT_CHUNK_SIZE).unwrap(),
+                )],
+            ),
+            (
+                ChunkId(1),
+                vec![SliceRecord::tombstone(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(0, DEFAULT_CHUNK_SIZE).unwrap(),
+                )],
+            ),
+        ],
+        Some(&attr),
+    )
+    .unwrap();
+    if new_size > 0 {
+        pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_352, new_size))
+            .unwrap();
+        mark_overlay_objects_uploaded(&pg, file.ino, 3, &[77_352]);
+    }
+    assert!(
+        pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .unwrap()
+    );
+    let chunk_payload = |pg: &PgMetaEngine| {
+        pg.lookup_regular_file_slices(file.ino, chunk, 4096)
+            .unwrap()
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        chunk_payload(&pg).is_empty(),
+        "later publish removes chunk 1"
+    );
+
+    // Transport splitting can deliver the older publish with no ready attr beside it.
+    let publish_only = older_events
+        .into_iter()
+        .filter(|event| matches!(event, MetaEvent::PublishRegularFileBaseSlices { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(publish_only.len(), 1);
+    replay_self_batch(&pg, 20, publish_only, start);
+    assert!(
+        chunk_payload(&pg).is_empty(),
+        "an older own publish must not bring removed chunk bytes back"
+    );
+}
+
+#[test]
+fn self_publish_does_not_fill_chunk_removed_by_later_truncate() {
+    assert_self_publish_stays_out_of_truncated_chunk(4096);
+}
+
+#[test]
+fn self_publish_does_not_fill_chunk_removed_by_later_truncate_to_zero() {
+    assert_self_publish_stays_out_of_truncated_chunk(0);
+}

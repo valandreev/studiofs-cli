@@ -2303,17 +2303,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 .find(|(version, _)| *version == batch_version)
                 .and_then(|(_, ranges)| ranges.iter().map(|range| range.end).max())
         });
-        let Some(boundary) = boundary else {
-            return Ok((acknowledged, HashSet::new()));
-        };
-        let touched: HashSet<_> = batch_events
+        let incoming: HashMap<_, _> = batch_events
             .iter()
             .filter_map(|event| match event {
-                MetaEvent::PublishRegularFileBaseSlices { ino, .. } => Some(*ino),
+                MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
+                    Some((*ino, chunk_slices))
+                }
                 _ => None,
             })
             .collect();
-        if touched.is_empty() {
+        if incoming.is_empty() {
             return Ok((acknowledged, HashSet::new()));
         }
         let mut latest = HashMap::new();
@@ -2321,9 +2320,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
             if let Some(execution) = execution {
                 execution.check()?;
             }
-            if start.saturating_add(index as u64) >= boundary
+            if boundary.is_none_or(|boundary| start.saturating_add(index as u64) >= boundary)
                 && let MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } = event
-                && touched.contains(ino)
+                && incoming.contains_key(ino)
             {
                 latest.insert(*ino, chunk_slices);
             }
@@ -2335,7 +2334,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 REGULAR_FILE_BASE_TABLE,
                 ino,
             )?;
-            if &current == latest_graph {
+            // With no boundary the latest journal publication may be this batch itself.
+            if &current == latest_graph
+                && (boundary.is_some() || incoming.get(&ino) != Some(&latest_graph))
+            {
                 superseded.insert(ino);
             }
         }
