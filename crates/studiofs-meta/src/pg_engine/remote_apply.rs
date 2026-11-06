@@ -1955,6 +1955,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 && attr.committed_size > current.committed_size
                 && attr.mtime < current.mtime
                 && attr.ctime < current.ctime
+                // The writer applies its own publication over replayed state, so peers must too.
+                && !Self::committed_state_reached_base_in_txn(txn, &current)?
             {
                 stale.insert(attr.ino);
             }
@@ -2115,8 +2117,22 @@ impl<'a> RemoteApplyCoordinator<'a> {
         Ok(changed)
     }
 
+    /// Replay installs PostgreSQL state in base attrs and local publication does not, so
+    /// a matching base means every client has this state and PostgreSQL order decides.
+    fn committed_state_reached_base_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        current: &InodeAttr,
+    ) -> MetaResult<bool> {
+        Ok(
+            RedbMetaEngine::get_base_attr_in_write_txn(txn, current.ino)?.is_some_and(|base| {
+                (base.committed_content_epoch, base.committed_size)
+                    == (current.committed_content_epoch, current.committed_size)
+            }),
+        )
+    }
+
     /// Local publication writes the base graph before PostgreSQL echoes it, so
-    /// a batch older than the local committed epoch would rewind that graph.
+    /// a batch older than the unreplayed local committed state would rewind that graph.
     fn stale_self_publish_inodes_in_txn(
         txn: &RedbWriteTransaction<'_>,
         batch_events: &[MetaEvent],
@@ -2135,7 +2151,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
         for (ino, batch_epoch) in batch_epochs {
             match RedbMetaEngine::get_attr_merged_in_write_txn(txn, ino) {
                 Ok(current)
-                    if (current.committed_content_epoch, current.committed_size) > batch_epoch =>
+                    if (current.committed_content_epoch, current.committed_size) > batch_epoch
+                        && !Self::committed_state_reached_base_in_txn(txn, &current)? =>
                 {
                     stale.insert(ino);
                 }
