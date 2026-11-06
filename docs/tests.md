@@ -479,8 +479,9 @@ The metadata regressions cover truncate tombstones, an older complete publish,
 a later append in the same epoch, and a same-epoch/same-size local rewrite:
 `stale_self_publish_does_not_fill_truncate_tombstone`,
 `stale_complete_self_publish_does_not_rewind_newer_local_base`,
-`stale_same_epoch_self_publish_does_not_rewind_later_append`, and
-`older_self_publish_preserves_later_local_same_epoch_same_size_graph`.
+`stale_same_epoch_self_publish_does_not_rewind_later_append`,
+`older_self_publish_preserves_later_local_same_epoch_same_size_graph`, and
+`superseded_self_publish_keeps_serving_attr_while_later_publish_is_unreplayed`.
 Run them with the foreign-ordering checks in the same module:
 
 ```sh

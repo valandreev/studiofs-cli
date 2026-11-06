@@ -2012,7 +2012,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
     #[cfg(test)]
     pub(super) fn apply_visible_self_batch(&self, batch_events: &[MetaEvent]) -> MetaResult<bool> {
         let txn = self.local.begin_write_txn()?;
-        let result = self.apply_visible_self_batch_in_txn(&txn, batch_events, &HashSet::new());
+        let result = self.apply_visible_self_batch_in_txn(
+            &txn,
+            batch_events,
+            &HashSet::new(),
+            &mut HashSet::new(),
+        );
         match result {
             Ok(changed) => {
                 txn.commit()
@@ -2031,6 +2036,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         txn: &RedbWriteTransaction<'_>,
         batch_events: &[MetaEvent],
         superseded_publish_inodes: &HashSet<Ino>,
+        reconcile_inodes: &mut HashSet<Ino>,
     ) -> MetaResult<bool> {
         if batch_events.is_empty() {
             return Ok(false);
@@ -2064,6 +2070,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     && !superseded_publish_inodes.contains(&ino)
             })
             .collect::<Vec<_>>();
+        // Local publication does not write base attrs, so they stay behind serving until
+        // the later publication replays; a later batch in this page re-adds its inodes.
+        reconcile_inodes.retain(|ino| {
+            !stale_self_publish_inodes.contains(ino) && !superseded_publish_inodes.contains(ino)
+        });
         let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
         // These events already changed the local serving view and reached the
         // mounted kernel through this client's own callbacks. Mirroring them into
@@ -2302,6 +2313,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 _ => None,
             })
             .collect();
+        if touched.is_empty() {
+            return Ok((acknowledged, HashSet::new()));
+        }
         let mut latest = HashMap::new();
         for (index, event) in local_events.iter().enumerate() {
             if let Some(execution) = execution {
@@ -2743,8 +2757,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
                         context.next_event_seq,
                         execution,
                     )?;
-                applied_any |=
-                    self.apply_visible_self_batch_in_txn(txn, &events, &superseded_publish_inodes)?;
+                applied_any |= self.apply_visible_self_batch_in_txn(
+                    txn,
+                    &events,
+                    &superseded_publish_inodes,
+                    &mut reconcile_inodes,
+                )?;
                 applied_self_batch = true;
                 if let Some(next_flushed_event_seq) = acknowledged_seq
                     && self

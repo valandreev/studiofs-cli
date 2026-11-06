@@ -11451,3 +11451,90 @@ fn self_batch_after_hidden_draft_rename_matches_its_local_prefix() {
         "the self batch must acknowledge the whole window"
     );
 }
+
+#[test]
+fn superseded_self_publish_keeps_serving_attr_while_later_publish_is_unreplayed() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"unreplayed-later-publish.bin", 77_320);
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.persist_flushed_event_seq(start).unwrap();
+    let mut first_end = 0;
+    for (object_id, epoch, size) in [(77_321, 2, 152), (77_322, 3, 304)] {
+        set_file_state(&pg, file.ino, size, epoch);
+        pg.stage_payload_slice(
+            file.ino,
+            0,
+            &PayloadRef::new_partial(object_id, size as u32),
+        )
+        .unwrap();
+        mark_overlay_objects_uploaded(&pg, file.ino, epoch, &[object_id]);
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, epoch)
+                .unwrap()
+        );
+        if first_end == 0 {
+            first_end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+        }
+    }
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let latest_attr = pg.get_attr(file.ino).unwrap();
+    // Both publications reached PostgreSQL, so neither reserves local overlay conflicts.
+    let first = LocalEventRange {
+        start,
+        end: first_end,
+    };
+    let later = LocalEventRange {
+        start: first_end,
+        end,
+    };
+    pg.mark_local_event_ranges_published_with_prefix(&[first], Some((20, vec![first])))
+        .unwrap();
+    pg.mark_local_event_ranges_published_with_prefix(&[later], Some((21, vec![later])))
+        .unwrap();
+    let batch = RemoteApplyCoordinator::project_local_batch(
+        &pg.local.read_events_range(start, first_end).unwrap(),
+    );
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 20,
+            events: batch.events,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 19,
+            current_namespace_version: 0,
+            flushed_event_seq: start,
+            next_event_seq: end,
+            initial_overlay: OverlayConflictSets::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        pg.get_attr(file.ino).unwrap(),
+        latest_attr,
+        "skipping an older self publication must not roll serving attrs back to the older base"
+    );
+    assert_eq!(lookup_object_ids(&pg, file.ino, 304).unwrap(), vec![77_322]);
+
+    let batch = RemoteApplyCoordinator::project_local_batch(
+        &pg.local.read_events_range(first_end, end).unwrap(),
+    );
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 21,
+            events: batch.events,
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: 20,
+            current_namespace_version: 0,
+            flushed_event_seq: first_end,
+            next_event_seq: end,
+            initial_overlay: OverlayConflictSets::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!(pg.local.get_base_attr(file.ino).unwrap(), Some(latest_attr));
+}
