@@ -253,6 +253,10 @@ pages and post-pull dentry reconciliation recover the same ownership from the
 durable inode lifecycle, even after the journal prefix is retired. Once local
 publication establishes a published base, ordinary pending-event protection
 covers its in-flight publication and later remote namespace changes may converge.
+Self-replay writes base and rebases names without intents, because the foreground
+writes already announced them. It compares the bindings it can change before and
+after, and journals entry and directory intents for any that changed: an earlier
+foreign batch can have hidden one of those names from the mount.
 Fully canceled local windows remain excluded so they cannot erase a later
 foreign create at the same name.
 Replay of inode removal reconciles that inode's serving names against the base

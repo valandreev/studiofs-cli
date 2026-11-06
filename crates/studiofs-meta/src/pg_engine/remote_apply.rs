@@ -2683,6 +2683,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
         context.next_event_seq = replay_next_event_seq;
         let mut overlay = std::mem::take(&mut context.initial_overlay);
         Self::extend_overlay_conflicts(&mut overlay, &appended_overlay);
+        // Self replay writes base and restores names without intents, because it
+        // normally changes nothing the mount saw. A foreign batch can have hidden
+        // one of those names in an earlier transaction, so compare and announce.
+        let mut self_bindings_before = HashMap::new();
         let mut protected_local_bindings = HashMap::new();
         if !self.local_only_completed.is_empty() {
             let mut events = Vec::new();
@@ -2756,8 +2760,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     execution.check()?;
                 }
                 let (parent, name) = decode_dentry_key(key)?;
-                if let Some(entry) =
-                    RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)?
+                let binding = RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)?;
+                if batch.is_self_batch {
+                    self_bindings_before
+                        .entry(key.clone())
+                        .or_insert_with(|| binding.clone());
+                }
+                if let Some(entry) = binding
                     && entry.kind == FileType::RegularFile
                     && Self::local_regular_file_namespace_is_unpublished_in_txn(txn, entry.ino)?
                 {
@@ -2875,6 +2884,18 @@ impl<'a> RemoteApplyCoordinator<'a> {
             // Captured local-only bindings outrank older included events such as
             // an unreplayed rename source, even after their journal events are acked.
             state.bindings.extend(protected_local_bindings);
+            for key in state.bindings.keys() {
+                if let Some(execution) = execution {
+                    execution.check()?;
+                }
+                if !self_bindings_before.contains_key(key) {
+                    let (parent, name) = decode_dentry_key(key)?;
+                    self_bindings_before.insert(
+                        key.clone(),
+                        RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)?,
+                    );
+                }
+            }
             final_overlay
                 .dentry_keys
                 .extend(state.bindings.keys().cloned());
@@ -2894,12 +2915,24 @@ impl<'a> RemoteApplyCoordinator<'a> {
         )?;
         if let Some(pending_namespace) = &pending_namespace {
             // A self batch reaches base before its local prefix is necessarily
-            // acknowledged, so restore the journal's final namespace state. The
-            // foreground writes that produced it already announced it to the
-            // kernel; the reducer only clears names still bound to removed inodes.
+            // acknowledged, so restore the journal's final namespace state. Writing
+            // it is silent because the foreground writes already announced it; the
+            // comparison below announces what foreign replay changed in between.
+            // The reducer only clears names still bound to removed inodes.
             applied_any |= txn.without_invalidations(|| {
                 RedbMetaEngine::rebase_pending_local_namespace_in_txn(txn, pending_namespace)
             })?;
+        }
+        for (key, before) in &self_bindings_before {
+            if let Some(execution) = execution {
+                execution.check()?;
+            }
+            let (parent, name) = decode_dentry_key(key)?;
+            let after = RedbMetaEngine::lookup_merged_exact_in_write_txn(txn, parent, name)?;
+            if after != *before {
+                let ino = before.as_ref().or(after.as_ref()).map(|entry| entry.ino);
+                RedbMetaEngine::invalidate_serving_binding_in_txn(txn, parent, name, ino)?;
+            }
         }
         if let Some(execution) = execution {
             execution.check()?;

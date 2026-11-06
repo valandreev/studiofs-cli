@@ -2437,16 +2437,12 @@ impl RedbMetaEngine {
             if Self::invalidation_binding(txn, key)? != binding_before
                 && !txn.invalidations_suppressed()
             {
-                #[cfg(test)]
-                record_replica_invalidation_derivation();
-                txn.invalidate(InvalidationIntent::Entry {
+                Self::invalidate_serving_binding_in_txn(
+                    txn,
                     parent,
-                    name: name.to_vec(),
-                    ancestors: Self::invalidation_ancestors(txn, parent)?,
-                    ino: binding_before.as_ref().map(|entry| entry.ino),
-                });
-                txn.invalidate(InvalidationIntent::Directory { ino: parent });
-                txn.invalidate(InvalidationIntent::Attributes { ino: parent });
+                    name,
+                    binding_before.as_ref().map(|entry| entry.ino),
+                )?;
                 for displaced in [&serving_entry, &base_entry].into_iter().flatten() {
                     txn.invalidate(InvalidationIntent::Attributes { ino: displaced.ino });
                 }
@@ -2831,6 +2827,27 @@ impl RedbMetaEngine {
         Ok(changed)
     }
 
+    /// Journals the name and directory intents for a serving binding that changed.
+    /// The bound inode's attributes did not, so its open writers are not disturbed.
+    pub(crate) fn invalidate_serving_binding_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        parent: Ino,
+        name: &[u8],
+        ino: Option<Ino>,
+    ) -> MetaResult<()> {
+        #[cfg(test)]
+        record_replica_invalidation_derivation();
+        txn.invalidate(InvalidationIntent::Entry {
+            parent,
+            name: name.to_vec(),
+            ancestors: Self::invalidation_ancestors(txn, parent)?,
+            ino,
+        });
+        txn.invalidate(InvalidationIntent::Directory { ino: parent });
+        txn.invalidate(InvalidationIntent::Attributes { ino: parent });
+        Ok(())
+    }
+
     /// Journals, after the write, the name and inode intents
     /// [`Self::reconcile_serving_rename_from_base_in_txn`] derives before it,
     /// using the bindings captured in `before`. Directory descendants are
@@ -2850,16 +2867,7 @@ impl RedbMetaEngine {
             .map(|(ino, ((_, dentries), _))| (*ino, dentries))
             .collect();
         let journal_entry = |parent: Ino, name: &[u8], ino: Option<Ino>| -> MetaResult<()> {
-            #[cfg(test)]
-            record_replica_invalidation_derivation();
-            txn.invalidate(InvalidationIntent::Entry {
-                parent,
-                name: name.to_vec(),
-                ancestors: Self::invalidation_ancestors(txn, parent)?,
-                ino,
-            });
-            txn.invalidate(InvalidationIntent::Directory { ino: parent });
-            txn.invalidate(InvalidationIntent::Attributes { ino: parent });
+            Self::invalidate_serving_binding_in_txn(txn, parent, name, ino)?;
             if let Some(ino) = ino {
                 txn.invalidate(InvalidationIntent::Attributes { ino });
             }

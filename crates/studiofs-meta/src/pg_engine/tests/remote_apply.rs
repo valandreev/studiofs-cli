@@ -11917,3 +11917,180 @@ fn conflicting_publications_converge_on_later_postgresql_write() {
         mismatches.join("\n")
     );
 }
+
+const RACED_NAME: &[u8] = b"slot.txt";
+
+/// Publishes a create and rename of `RACED_NAME` that crossed its writer's upload, so
+/// replaying the batch hides any other writer's `RACED_NAME` from before its flush.
+fn racing_rename_batch(first: &PgMetaEngine) -> Vec<MetaEvent> {
+    let first_start = first.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    first.persist_flushed_event_seq(first_start).unwrap();
+    let first_file = first
+        .create_file(ROOT_INO, RACED_NAME, 0, 0, 0o644)
+        .unwrap();
+    set_file_state(first, first_file.ino, 64, 1);
+    first
+        .stage_payload_slice(first_file.ino, 0, &PayloadRef::new_partial(77_410, 64))
+        .unwrap();
+    first
+        .rename_atomic(
+            ROOT_INO,
+            RACED_NAME,
+            ROOT_INO,
+            b"slot-renamed.txt",
+            true,
+            false,
+        )
+        .unwrap();
+    mark_overlay_objects_uploaded(first, first_file.ino, 1, &[77_410]);
+    assert!(
+        first
+            .publish_regular_file_overlay_to_base_if_matches(first_file.ino, 1)
+            .unwrap()
+    );
+    let first_end = first.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    RemoteApplyCoordinator::project_local_batch(
+        &first
+            .local
+            .read_events_range(first_start, first_end)
+            .unwrap(),
+    )
+    .events
+}
+
+fn assert_raced_name_announced(
+    label: &str,
+    created: Ino,
+    second: &PgMetaEngine,
+    intents: &[crate::coherence::InvalidationIntent],
+) {
+    use crate::coherence::InvalidationIntent;
+
+    assert_eq!(
+        second
+            .lookup(ROOT_INO, RACED_NAME)
+            .ok()
+            .map(|attr| attr.ino),
+        Some(created),
+        "{label}: the creator keeps its name"
+    );
+    assert!(
+        intents.iter().any(|intent| matches!(
+            intent,
+            InvalidationIntent::Entry { parent: ROOT_INO, name, ino, .. }
+                if name == RACED_NAME && *ino == Some(created)
+        )),
+        "{label}: the restored name must be announced: {intents:?}"
+    );
+    assert!(
+        intents.contains(&InvalidationIntent::Directory { ino: ROOT_INO }),
+        "{label}: the restored name must refresh the directory: {intents:?}"
+    );
+}
+
+/// The Linux bridge reuses a directory snapshot and negative lookups until an intent
+/// bumps the directory generation, so a silent restore stays hidden from the mount.
+#[test]
+fn self_replay_announces_a_name_that_foreign_replay_hid() {
+    for arrives in [
+        FirstPublicationArrives::AfterLocalPublish,
+        FirstPublicationArrives::AfterLocalFlush,
+    ] {
+        let (_first_dir, first) = temp_pg_engine_for_unit();
+        let (_second_dir, second) = temp_pg_engine_for_unit();
+        // Different clients allocate inodes from different ranges in production.
+        second.next_inode().unwrap();
+        let second_start = second.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+        second.persist_flushed_event_seq(second_start).unwrap();
+
+        let first_batch = racing_rename_batch(&first);
+        let created = create_published_small_file(&second, ROOT_INO, RACED_NAME, 77_411);
+        let second_end = second.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+        let second_batch = RemoteApplyCoordinator::project_local_batch(
+            &second
+                .local
+                .read_events_range(second_start, second_end)
+                .unwrap(),
+        )
+        .events;
+        if matches!(arrives, FirstPublicationArrives::AfterLocalFlush) {
+            let range = LocalEventRange {
+                start: second_start,
+                end: second_end,
+            };
+            second
+                .mark_local_event_ranges_published_with_prefix(&[range], Some((21, vec![range])))
+                .unwrap();
+        }
+        replay_conflict_batch(&second, 20, &first_batch, false);
+        assert!(
+            second.lookup(ROOT_INO, RACED_NAME).is_err(),
+            "{arrives:?}: the race needs foreign replay to hide the name"
+        );
+        journaled_invalidation_intents(&second);
+
+        replay_conflict_batch(&second, 21, &second_batch, true);
+        assert_raced_name_announced(
+            &format!("{arrives:?}"),
+            created.ino,
+            &second,
+            &journaled_invalidation_intents(&second),
+        );
+    }
+}
+
+/// Self replay rebases a published prefix whose own batch has not replayed yet, so it can
+/// restore a name that no event of the replayed batch touches.
+#[test]
+fn self_replay_announces_a_hidden_name_restored_by_an_unreplayed_prefix() {
+    let (_first_dir, first) = temp_pg_engine_for_unit();
+    let (_second_dir, second) = temp_pg_engine_for_unit();
+    second.next_inode().unwrap();
+    let start = second.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    second.persist_flushed_event_seq(start).unwrap();
+
+    let first_batch = racing_rename_batch(&first);
+    create_published_small_file(&second, ROOT_INO, b"earlier.txt", 77_412);
+    let boundary = second.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let created = create_published_small_file(&second, ROOT_INO, RACED_NAME, 77_411);
+    let end = second.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let earlier_batch = RemoteApplyCoordinator::project_local_batch(
+        &second.local.read_events_range(start, boundary).unwrap(),
+    )
+    .events;
+    for (version, range) in [
+        (
+            21,
+            LocalEventRange {
+                start,
+                end: boundary,
+            },
+        ),
+        (
+            22,
+            LocalEventRange {
+                start: boundary,
+                end,
+            },
+        ),
+    ] {
+        second
+            .mark_local_event_ranges_published_with_prefix(&[range], Some((version, vec![range])))
+            .unwrap();
+    }
+
+    replay_conflict_batch(&second, 20, &first_batch, false);
+    assert!(
+        second.lookup(ROOT_INO, RACED_NAME).is_err(),
+        "the race needs foreign replay to hide the name"
+    );
+    journaled_invalidation_intents(&second);
+
+    replay_conflict_batch(&second, 21, &earlier_batch, true);
+    assert_raced_name_announced(
+        "unreplayed prefix",
+        created.ino,
+        &second,
+        &journaled_invalidation_intents(&second),
+    );
+}
