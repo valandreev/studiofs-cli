@@ -664,17 +664,15 @@ impl<'a> StartupReplayCoordinator<'a> {
             return;
         }
         let orphan_object_ids: Vec<_> = self.dirty_set.iter().copied().collect();
-        let mut removed_count = 0_u64;
         for object_id in &orphan_object_ids {
             warn!(
                 object_id,
                 "removing orphan dirty payload object without metadata reference"
             );
-            if self.remove_startup_local_payload(*object_id) {
-                self.removed_orphan_dirty_object_ids.insert(*object_id);
-                removed_count = removed_count.saturating_add(1);
-            }
         }
+        let removed = self.remove_startup_local_payloads(&orphan_object_ids);
+        let removed_count = removed.len() as u64;
+        self.removed_orphan_dirty_object_ids.extend(removed);
         self.orphan_dirty_payloads_removed = self
             .orphan_dirty_payloads_removed
             .saturating_add(removed_count);
@@ -691,31 +689,61 @@ impl<'a> StartupReplayCoordinator<'a> {
             .retain(|object_id| !self.removed_orphan_dirty_object_ids.contains(object_id));
     }
 
-    fn remove_startup_local_payload(&self, object_id: u64) -> bool {
-        if let Err(error) = self.vfs.cached_store.remove_staged_upload(object_id) {
-            warn!(
-                object_id,
-                error = %error,
-                "startup replay upload-stage cleanup failed"
-            );
-            return false;
+    /// Returns the objects actually removed; the rest stay for the next startup.
+    fn remove_startup_local_payloads(&self, object_ids: &[u64]) -> Vec<u64> {
+        let unstaged: Vec<u64> = object_ids
+            .iter()
+            .copied()
+            .filter(
+                |&object_id| match self.vfs.cached_store.remove_staged_upload(object_id) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(
+                            object_id,
+                            error = %error,
+                            "startup replay upload-stage cleanup failed"
+                        );
+                        false
+                    }
+                },
+            )
+            .collect();
+        // A per-object removal costs one durable index commit, which kept mounts
+        // from becoming ready for minutes after heavy overwrites (SFS-1029).
+        let removed = match self.vfs.local_payload_backend.remove_batch(&unstaged) {
+            Ok(()) => unstaged,
+            // The batch stops at its first failure without naming the objects it reached.
+            Err(error) => {
+                warn!(
+                    object_count = unstaged.len(),
+                    error = %error,
+                    "startup replay batched local payload cleanup failed; retrying each object"
+                );
+                unstaged
+                    .into_iter()
+                    .filter(
+                        |&object_id| match self.vfs.local_payload_backend.remove(object_id) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                warn!(
+                                    object_id,
+                                    error = %error,
+                                    "startup replay local payload cleanup failed"
+                                );
+                                false
+                            }
+                        },
+                    )
+                    .collect()
+            }
+        };
+        self.vfs.cached_store.remove_hot_upload_batch(&removed);
+        let mut pending_evictions = self.vfs.state.upload.pending_evictions.lock();
+        for object_id in &removed {
+            pending_evictions.remove(object_id);
         }
-        if let Err(error) = self.vfs.local_payload_backend.remove(object_id) {
-            warn!(
-                object_id,
-                error = %error,
-                "startup replay local payload cleanup failed"
-            );
-            return false;
-        }
-        self.vfs.cached_store.remove_hot_upload(object_id);
-        self.vfs
-            .state
-            .upload
-            .pending_evictions
-            .lock()
-            .remove(&object_id);
-        true
+        drop(pending_evictions);
+        removed
     }
 
     fn cleanup_unreferenced_local_payloads(
@@ -745,12 +773,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             return;
         }
 
-        let mut removed_count = 0_u64;
-        for object_id in &stale_object_ids {
-            if self.remove_startup_local_payload(*object_id) {
-                removed_count = removed_count.saturating_add(1);
-            }
-        }
+        let removed_count = self.remove_startup_local_payloads(&stale_object_ids).len() as u64;
 
         self.unreferenced_local_payloads_removed = self
             .unreferenced_local_payloads_removed

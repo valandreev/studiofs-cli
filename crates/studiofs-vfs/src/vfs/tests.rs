@@ -6766,6 +6766,103 @@ fn startup_replay_removes_unreferenced_warm_payloads_and_stage_links() {
     assert_eq!(summary.unreferenced_local_payloads_removed, 1);
 }
 
+fn seed_unreferenced_warm_payload(vfs: &StudioVfs, object_id: u64) {
+    let backend = vfs.local_payload_backend();
+    backend
+        .put(object_id, b"unreferenced-payload", true)
+        .expect("persist unreferenced payload");
+    backend
+        .mark_uploaded(object_id)
+        .expect("mark unreferenced payload uploaded");
+}
+
+#[test]
+fn startup_replay_removes_stale_payloads_in_batches() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "startup-replay-batched-cleanup");
+    let _guard = rt.enter();
+    let backend = crate::vfs::read_path::tests::install_counting_backend(&mut vfs);
+    let warm_object_ids: Vec<u64> = (991_400..991_440).collect();
+    let dirty_object_ids: Vec<u64> = (991_500..991_540).collect();
+    for &object_id in &warm_object_ids {
+        seed_unreferenced_warm_payload(&vfs, object_id);
+    }
+    for &object_id in &dirty_object_ids {
+        vfs.local_payload_backend()
+            .put(object_id, b"orphan-dirty-payload", false)
+            .expect("persist orphan dirty payload");
+    }
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], &[]);
+
+    assert_eq!(
+        backend.remove_calls(),
+        0,
+        "each per-object removal commits the payload index durably"
+    );
+    for &object_id in warm_object_ids.iter().chain(&dirty_object_ids) {
+        assert!(!vfs.local_payload_backend().contains(object_id));
+    }
+    let summary = vfs
+        .zeroio_runtime_snapshot()
+        .startup_replay
+        .expect("startup replay summary should be visible");
+    assert_eq!(summary.orphan_dirty_payloads_removed, 40);
+    assert_eq!(summary.unreferenced_local_payloads_removed, 40);
+}
+
+#[test]
+fn startup_replay_failed_batch_still_removes_and_counts_healthy_payloads() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-batch-failure");
+    let layout = studiofs_cache::LocalPayloadLayout::from_cache_root(tmp.path().join("cache"));
+    let stage_blocked = 991_600;
+    let unlink_blocked = 991_601;
+    let healthy_object_ids: Vec<u64> = (991_610..991_650).collect();
+    for &object_id in [stage_blocked, unlink_blocked]
+        .iter()
+        .chain(&healthy_object_ids)
+    {
+        seed_unreferenced_warm_payload(&vfs, object_id);
+        vfs.state.upload.pending_evictions.lock().insert(object_id);
+    }
+    std::fs::create_dir_all(layout.upload_stage_object_path(stage_blocked))
+        .expect("seed failing upload-stage path");
+    let payload_path = layout.payload_object_path(unlink_blocked);
+    std::fs::remove_file(&payload_path).expect("remove payload file");
+    std::fs::create_dir(&payload_path).expect("seed failing payload path");
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], &[]);
+
+    for &object_id in &healthy_object_ids {
+        assert!(!vfs.local_payload_backend().contains(object_id));
+    }
+    assert!(
+        vfs.local_payload_backend().contains(stage_blocked),
+        "a failed stage unlink must retain the payload"
+    );
+    let pending_evictions = vfs.state.upload.pending_evictions.lock().clone();
+    assert!(pending_evictions.contains(&stage_blocked));
+    assert!(pending_evictions.contains(&unlink_blocked));
+    assert!(
+        healthy_object_ids
+            .iter()
+            .all(|id| !pending_evictions.contains(id))
+    );
+    let summary = vfs
+        .zeroio_runtime_snapshot()
+        .startup_replay
+        .expect("startup replay summary should be visible");
+    assert_eq!(summary.unreferenced_local_payloads_removed, 40);
+    assert_eq!(
+        vfs.state
+            .upload
+            .upload_canceled_stale
+            .load(Ordering::Relaxed),
+        40
+    );
+}
+
 #[test]
 fn zeroio_snapshot_distinguishes_single_store_payload_classes_and_publish_backlog() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");

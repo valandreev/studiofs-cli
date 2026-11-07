@@ -3131,6 +3131,7 @@ pub(super) mod tests {
         get_calls: AtomicU64,
         read_into_calls: AtomicU64,
         advise_will_need_calls: AtomicU64,
+        remove_calls: AtomicU64,
         force_short_read: AtomicBool,
         read_threads: std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
     }
@@ -3144,9 +3145,14 @@ pub(super) mod tests {
                 get_calls: AtomicU64::new(0),
                 read_into_calls: AtomicU64::new(0),
                 advise_will_need_calls: AtomicU64::new(0),
+                remove_calls: AtomicU64::new(0),
                 force_short_read: AtomicBool::new(false),
                 read_threads: std::sync::Mutex::new(std::collections::HashSet::new()),
             }
+        }
+
+        pub(in crate::vfs) fn remove_calls(&self) -> u64 {
+            self.remove_calls.load(AtomicOrdering::Relaxed)
         }
 
         fn read_thread_count(&self) -> usize {
@@ -3275,6 +3281,7 @@ pub(super) mod tests {
             &self,
             object_id: u64,
         ) -> Result<(), studiofs_cache::local::LocalPayloadBackendError> {
+            self.remove_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.remove(object_id)
         }
 

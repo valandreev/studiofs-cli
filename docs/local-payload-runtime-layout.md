@@ -124,6 +124,10 @@ Safety rules:
   diagnostics snapshot: `replayed_bytes`, `queued_uploads`,
   `discarded_memory_only_bytes`, `orphan_dirty_payloads_removed`, and
   `unreferenced_local_payloads_removed`.
+- Startup cleanup removes payloads without metadata references in batches, so
+  index commits grow with batches rather than objects. It finishes before VFS
+  workers start and the mount attaches, so no foreground operation or upload
+  worker can re-reference, pin, or read a payload it is removing.
 
 ## 6. Remediation Flow for Stale Local Artifacts
 
