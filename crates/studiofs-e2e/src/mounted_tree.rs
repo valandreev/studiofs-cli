@@ -5,7 +5,8 @@ use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -19,6 +20,10 @@ const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 /// Maximum wall time for a single mounted tree snapshot attempt.
 const SNAPSHOT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Extra time a timed-out attempt gets to finish, separating a stall from a hang in diagnostics.
+const SNAPSHOT_TIMEOUT_DIAGNOSTIC_GRACE: Duration = Duration::from_secs(5);
+/// Finished snapshot steps at least this slow are listed in timeout diagnostics.
+const SNAPSHOT_SLOW_STEP: Duration = Duration::from_millis(100);
 
 /// Metadata for a single mounted client under convergence checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,10 +248,14 @@ pub enum MountedTreeError {
         source: Box<MountedTreeError>,
     },
     /// A single snapshot attempt blocked longer than the per-attempt bound.
-    #[error("mounted filesystem tree snapshot attempt timed out after {timeout_ms}ms")]
+    #[error(
+        "mounted filesystem tree snapshot attempt timed out after {timeout_ms}ms at {blocked_at}"
+    )]
     SnapshotAttemptTimedOut {
         /// Per-attempt timeout in milliseconds.
         timeout_ms: u128,
+        /// Client, operation, and path the attempt was on when the bound expired.
+        blocked_at: String,
     },
     /// A scanned path was not valid UTF-8.
     #[error("mounted tree path is not valid UTF-8: {path}")]
@@ -270,10 +279,20 @@ pub fn snapshot_client_tree_with_options(
     mount_point: impl AsRef<Path>,
     options: &MountedTreeSnapshotOptions,
 ) -> Result<MountedTreeSnapshot, MountedTreeError> {
+    snapshot_client_tree_with_probe(client, mount_point, options, &SnapshotProbe::default())
+}
+
+fn snapshot_client_tree_with_probe(
+    client: impl Into<String>,
+    mount_point: impl AsRef<Path>,
+    options: &MountedTreeSnapshotOptions,
+    probe: &SnapshotProbe,
+) -> Result<MountedTreeSnapshot, MountedTreeError> {
     let client = client.into();
     let mount_point = mount_point.as_ref();
     let mut entries = Vec::new();
-    scan_dir(mount_point, mount_point, options, &mut entries)?;
+    probe.enter_client(&client);
+    scan_dir(mount_point, mount_point, options, probe, &mut entries)?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
 
     Ok(MountedTreeSnapshot {
@@ -450,7 +469,13 @@ pub fn wait_for_convergence_with_options(
 
     loop {
         attempts += 1;
-        match snapshot_mounts_with_timeout(mounts, snapshot_attempt_timeout, snapshot_options) {
+        let probe = Arc::new(SnapshotProbe::default());
+        match snapshot_mounts_with_timeout(
+            mounts,
+            snapshot_attempt_timeout,
+            snapshot_options,
+            &probe,
+        ) {
             Ok(snapshots) => {
                 let comparison = compare_snapshots(&snapshots);
                 let elapsed_ms = started.elapsed().as_millis();
@@ -467,6 +492,12 @@ pub fn wait_for_convergence_with_options(
             Err(error) => {
                 let elapsed_ms = started.elapsed().as_millis();
                 if matches!(error, MountedTreeError::SnapshotAttemptTimedOut { .. }) {
+                    write_snapshot_timeout_diagnostics(
+                        artifact_dir,
+                        mounts,
+                        &probe,
+                        last_snapshot_error.as_ref(),
+                    );
                     return Err(MountedTreeError::SnapshotUnavailableTimedOut {
                         attempts,
                         elapsed_ms,
@@ -518,8 +549,10 @@ fn scan_dir(
     root: &Path,
     current: &Path,
     options: &MountedTreeSnapshotOptions,
+    probe: &SnapshotProbe,
     entries: &mut Vec<TreeEntry>,
 ) -> Result<(), MountedTreeError> {
+    probe.enter("read_dir", current);
     let mut children = read_dir_entries(current)?;
     children.sort_by_key(|left| left.file_name());
     let current_relative_path = relative_path(root, current)?;
@@ -561,7 +594,7 @@ fn scan_dir(
                 symlink_target: None,
             });
             if file_type.is_dir() {
-                scan_dir(root, &path, options, entries)?;
+                scan_dir(root, &path, options, probe, entries)?;
             }
             continue;
         }
@@ -587,11 +620,12 @@ fn scan_dir(
                 symlink_target: None,
             });
             if file_type.is_dir() {
-                scan_dir(root, &path, options, entries)?;
+                scan_dir(root, &path, options, probe, entries)?;
             }
             continue;
         }
 
+        probe.enter("lstat", &path);
         let metadata = symlink_metadata(&path)?;
         let file_type = metadata.file_type();
 
@@ -604,8 +638,9 @@ fn scan_dir(
                 checksum_sha256: None,
                 symlink_target: None,
             });
-            scan_dir(root, &path, options, entries)?;
+            scan_dir(root, &path, options, probe, entries)?;
         } else if file_type.is_file() {
+            probe.enter("read_file", &path);
             entries.push(TreeEntry {
                 path: relative_path,
                 entry_type: TreeEntryKind::File,
@@ -616,6 +651,7 @@ fn scan_dir(
             });
         } else {
             let symlink_target = if file_type.is_symlink() {
+                probe.enter("readlink", &path);
                 Some(read_link_target(&path)?)
             } else {
                 None
@@ -723,10 +759,13 @@ fn compare_entry(
 fn snapshot_mounts(
     mounts: &[ClientMount],
     options: &MountedTreeSnapshotOptions,
+    probe: &SnapshotProbe,
 ) -> Result<Vec<MountedTreeSnapshot>, MountedTreeError> {
     mounts
         .iter()
-        .map(|mount| snapshot_client_tree_with_options(&mount.client, &mount.mount_point, options))
+        .map(|mount| {
+            snapshot_client_tree_with_probe(&mount.client, &mount.mount_point, options, probe)
+        })
         .collect()
 }
 
@@ -734,27 +773,242 @@ fn snapshot_mounts_with_timeout(
     mounts: &[ClientMount],
     timeout: Duration,
     options: &MountedTreeSnapshotOptions,
+    probe: &Arc<SnapshotProbe>,
 ) -> Result<Vec<MountedTreeSnapshot>, MountedTreeError> {
     let mounts = mounts.to_vec();
     let options = options.clone();
-    run_snapshot_attempt_with_timeout(timeout, move || snapshot_mounts(&mounts, &options))
+    run_snapshot_attempt_with_timeout(timeout, probe, move |probe| {
+        snapshot_mounts(&mounts, &options, probe)
+    })
 }
 
 fn run_snapshot_attempt_with_timeout<F>(
     timeout: Duration,
+    probe: &Arc<SnapshotProbe>,
     snapshot: F,
 ) -> Result<Vec<MountedTreeSnapshot>, MountedTreeError>
 where
-    F: FnOnce() -> Result<Vec<MountedTreeSnapshot>, MountedTreeError> + Send + 'static,
+    F: FnOnce(&SnapshotProbe) -> Result<Vec<MountedTreeSnapshot>, MountedTreeError>
+        + Send
+        + 'static,
 {
     let (tx, rx) = mpsc::channel();
+    let worker_probe = Arc::clone(probe);
     thread::spawn(move || {
-        let _ = tx.send(snapshot());
+        worker_probe.record_current_task();
+        let result = snapshot(&worker_probe);
+        worker_probe.finished.store(true, Ordering::Release);
+        let _ = tx.send(result);
     });
     rx.recv_timeout(timeout)
         .map_err(|_| MountedTreeError::SnapshotAttemptTimedOut {
             timeout_ms: timeout.as_millis(),
+            blocked_at: probe.position(),
         })?
+}
+
+/// Where a snapshot attempt currently is, readable while its thread blocks in the kernel.
+#[derive(Debug, Default)]
+struct SnapshotProbe {
+    client: Mutex<String>,
+    step: Mutex<SnapshotStep>,
+    task_dir: Mutex<Option<PathBuf>>,
+    finished: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotStep {
+    position: String,
+    entered: Option<Instant>,
+    completed_steps: usize,
+    slow_steps: Vec<String>,
+}
+
+impl SnapshotStep {
+    fn advance(&mut self, position: String) {
+        if let Some(entered) = self.entered {
+            self.completed_steps += 1;
+            let elapsed = entered.elapsed();
+            if elapsed >= SNAPSHOT_SLOW_STEP {
+                self.slow_steps
+                    .push(format!("{}ms {}", elapsed.as_millis(), self.position));
+            }
+        }
+        self.position = position;
+        self.entered = Some(Instant::now());
+    }
+}
+
+impl SnapshotProbe {
+    fn enter_client(&self, client: &str) {
+        *lock_ignoring_poison(&self.client) = client.to_string();
+        lock_ignoring_poison(&self.step).advance(format!("{client} start"));
+    }
+
+    fn enter(&self, operation: &str, path: &Path) {
+        let position = format!(
+            "{} {operation} {}",
+            lock_ignoring_poison(&self.client),
+            path.display()
+        );
+        lock_ignoring_poison(&self.step).advance(position);
+    }
+
+    fn position(&self) -> String {
+        lock_ignoring_poison(&self.step).position.clone()
+    }
+
+    fn record_current_task(&self) {
+        // Resolves to `<pid>/task/<tid>`; absent outside Linux, where diagnostics stay position-only.
+        if let Ok(task) = fs::read_link("/proc/thread-self") {
+            *lock_ignoring_poison(&self.task_dir) = Some(Path::new("/proc").join(task));
+        }
+    }
+}
+
+fn lock_ignoring_poison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Best-effort report for a timed-out attempt; a failure here must not hide the timeout itself.
+fn write_snapshot_timeout_diagnostics(
+    artifact_dir: &Path,
+    mounts: &[ClientMount],
+    probe: &SnapshotProbe,
+    previous_error: Option<&MountedTreeError>,
+) {
+    let mut report = String::new();
+    if let Some(error) = previous_error {
+        let _ = writeln!(report, "previous attempt error: {error}");
+    }
+    let _ = writeln!(report, "== at timeout ==");
+    write_snapshot_state_sample(&mut report, mounts, probe);
+
+    let started = Instant::now();
+    while !probe.finished.load(Ordering::Acquire)
+        && started.elapsed() < SNAPSHOT_TIMEOUT_DIAGNOSTIC_GRACE
+    {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let waited_ms = started.elapsed().as_millis();
+    if probe.finished.load(Ordering::Acquire) {
+        let _ = writeln!(report, "== attempt finished {waited_ms}ms after timeout ==");
+    } else {
+        let _ = writeln!(
+            report,
+            "== attempt still blocked {waited_ms}ms after timeout =="
+        );
+        write_snapshot_state_sample(&mut report, mounts, probe);
+    }
+
+    let path = artifact_dir.join("snapshot-timeout.txt");
+    if let Err(error) = create_dir_all(artifact_dir)
+        .and_then(|()| fs::write(&path, &report).map_err(|source| io_error(&path, source)))
+    {
+        eprintln!("studiofs-e2e: failed to write snapshot timeout diagnostics: {error}");
+    }
+}
+
+/// Reads only `/proc` and `/sys`, which stay responsive while a FUSE request is stuck.
+fn write_snapshot_state_sample(report: &mut String, mounts: &[ClientMount], probe: &SnapshotProbe) {
+    {
+        let step = lock_ignoring_poison(&probe.step);
+        let _ = writeln!(
+            report,
+            "position: {} (for {}ms, after {} completed steps)",
+            step.position,
+            step.entered
+                .map_or(0, |entered| entered.elapsed().as_millis()),
+            step.completed_steps
+        );
+        for slow_step in &step.slow_steps {
+            let _ = writeln!(report, "slow step: {slow_step}");
+        }
+    }
+    if let Some(task_dir) = lock_ignoring_poison(&probe.task_dir).as_deref() {
+        let _ = writeln!(report, "snapshot thread: {}", proc_task_summary(task_dir));
+    }
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    for mount in mounts {
+        let _ = writeln!(
+            report,
+            "client {} mount {}: fuse waiting={}",
+            mount.client,
+            mount.mount_point.display(),
+            fuse_waiting_requests(&mountinfo, &mount.mount_point)
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        for pid in daemon_pids_for_mount(&mount.mount_point) {
+            let _ = writeln!(report, "  daemon pid {pid}");
+            let tasks = fs::read_dir(format!("/proc/{pid}/task"));
+            for task in tasks.into_iter().flatten().flatten() {
+                let _ = writeln!(report, "    {}", proc_task_summary(&task.path()));
+            }
+        }
+    }
+}
+
+fn proc_task_summary(task_dir: &Path) -> String {
+    let read = |name: &str| {
+        fs::read_to_string(task_dir.join(name))
+            .map(|value| value.trim().to_string())
+            .unwrap_or_else(|error| format!("<{error}>"))
+    };
+    // `stat` is `pid (comm) state ...`, and comm can contain spaces.
+    let stat = read("stat");
+    let state = stat
+        .rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split(' ').next())
+        .unwrap_or("?");
+    format!(
+        "tid={} comm={} state={state} wchan={} syscall={} stack={:?}",
+        task_dir
+            .file_name()
+            .map(|tid| tid.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        read("comm"),
+        read("wchan"),
+        read("syscall"),
+        read("stack"),
+    )
+}
+
+/// Pending requests on the mount's FUSE connection, named by the mount's minor device number.
+fn fuse_waiting_requests(mountinfo: &str, mount_point: &Path) -> Option<String> {
+    let mount_point = mount_point.to_str()?;
+    let minor = mountinfo.lines().find_map(|line| {
+        let mut fields = line.split(' ');
+        let device = fields.nth(2)?;
+        (fields.nth(1)? == mount_point).then_some(device.split_once(':')?.1)
+    })?;
+    fs::read_to_string(format!("/sys/fs/fuse/connections/{minor}/waiting"))
+        .ok()
+        .map(|waiting| waiting.trim().to_string())
+}
+
+/// Finds the mounted client processes by the mount point on their command line.
+fn daemon_pids_for_mount(mount_point: &Path) -> Vec<String> {
+    let Some(mount_point) = mount_point.to_str() else {
+        return Vec::new();
+    };
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().into_string().ok()?;
+            pid.bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then_some(())?;
+            let cmdline = fs::read(entry.path().join("cmdline")).ok()?;
+            cmdline
+                .split(|byte| *byte == 0)
+                .any(|argument| argument == mount_point.as_bytes())
+                .then_some(pid)
+        })
+        .collect()
 }
 
 /// Computes a relative path from `root` to `path`, normalized with `/` separators.
@@ -952,7 +1206,10 @@ mod tests {
     #[test]
     fn snapshot_attempt_timeout_returns_without_waiting_for_blocked_probe() {
         let started = Instant::now();
-        let err = run_snapshot_attempt_with_timeout(Duration::from_millis(25), || {
+        let probe = Arc::new(SnapshotProbe::default());
+        let err = run_snapshot_attempt_with_timeout(Duration::from_millis(25), &probe, |probe| {
+            probe.enter_client("client-b");
+            probe.enter("read_file", Path::new("/mnt/client-b/slot.txt"));
             thread::sleep(Duration::from_secs(5));
             Ok(Vec::new())
         })
@@ -966,5 +1223,57 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "blocked snapshot attempt must not consume the scenario-child timeout"
         );
+    }
+
+    #[test]
+    fn snapshot_probe_reports_client_operation_and_path() {
+        let probe = SnapshotProbe::default();
+        probe.enter_client("client-b");
+        probe.enter("read_file", Path::new("/mnt/client-b/slot.txt"));
+        assert_eq!(
+            probe.position(),
+            "client-b read_file /mnt/client-b/slot.txt"
+        );
+    }
+
+    #[test]
+    fn snapshot_probe_keeps_only_slow_finished_steps() {
+        let mut step = SnapshotStep::default();
+        step.advance("fast".to_string());
+        step.advance("slow".to_string());
+        step.entered = Some(Instant::now() - SNAPSHOT_SLOW_STEP);
+        step.advance("current".to_string());
+
+        assert_eq!(step.completed_steps, 2);
+        assert_eq!(step.slow_steps.len(), 1);
+        assert!(
+            step.slow_steps[0].ends_with("ms slow"),
+            "{:?}",
+            step.slow_steps
+        );
+    }
+
+    #[test]
+    fn timeout_diagnostics_report_previous_error_and_completion() {
+        let temp = studiofs_test_support::workspace_target_tempdir("mounted-tree-timeout-");
+        let probe = SnapshotProbe::default();
+        probe.enter_client("client-b");
+        probe.record_current_task();
+        probe.finished.store(true, Ordering::Release);
+        let previous = io_error(Path::new("/mnt/gone"), io::ErrorKind::NotFound.into());
+
+        write_snapshot_timeout_diagnostics(
+            temp.path(),
+            &[ClientMount::new("client-b", temp.path())],
+            &probe,
+            Some(&previous),
+        );
+
+        let report = fs::read_to_string(temp.path().join("snapshot-timeout.txt")).unwrap();
+        assert!(report.contains("previous attempt error: mounted tree I/O failed at /mnt/gone"));
+        assert!(report.contains("position: client-b start"));
+        assert!(report.contains("attempt finished"));
+        #[cfg(target_os = "linux")]
+        assert!(report.contains("snapshot thread: tid="), "{report}");
     }
 }
