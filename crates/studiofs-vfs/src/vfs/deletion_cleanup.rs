@@ -1,8 +1,12 @@
 use super::{DeletedInodeCleanup, Ino, MetaError, StudioVfs, VfsMeta, VfsResult};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::runtime::{run_local_cache_io_blocking, run_meta};
+
+/// Inodes whose session gates one reachability recheck and metadata sync may cover.
+const RETIRED_PAYLOAD_INODES_PER_PASS: usize = 64;
 
 pub(super) struct RegularFileGraphUsage {
     pub(super) object_ids: Vec<u64>,
@@ -10,6 +14,246 @@ pub(super) struct RegularFileGraphUsage {
 }
 
 impl StudioVfs {
+    pub(super) async fn reclaim_retired_local_payloads(&self) -> VfsResult<()> {
+        let cancel = &self.state.shutdown.background_shutdown_token;
+        self.reclaim_retired_payload_sweep(self.cached_store.take_retired_upload_sweep(), &|| {
+            cancel.is_cancelled()
+        })
+        .await
+    }
+
+    /// Final sweep over every candidate; what the budget cannot cover falls to startup cleanup.
+    pub(super) async fn reclaim_all_retired_local_payloads(
+        &self,
+        budget: std::time::Duration,
+    ) -> VfsResult<()> {
+        let deadline = std::time::Instant::now() + budget;
+        self.reclaim_retired_payload_sweep(self.cached_store.retired_uploads(), &|| {
+            std::time::Instant::now() >= deadline
+        })
+        .await
+    }
+
+    async fn reclaim_retired_payload_sweep(
+        &self,
+        sweep: HashMap<u64, Vec<u64>>,
+        should_stop: &(impl Fn() -> bool + Sync),
+    ) -> VfsResult<()> {
+        let mut unfinished: HashSet<u64> = sweep.keys().copied().collect();
+        let result = self
+            .reclaim_retired_payload_candidates(sweep, should_stop, &mut unfinished)
+            .await;
+        self.cached_store.requeue_retired_upload_sweep(unfinished);
+        result
+    }
+
+    async fn reclaim_retired_payload_candidates(
+        &self,
+        sweep: HashMap<u64, Vec<u64>>,
+        should_stop: &(impl Fn() -> bool + Sync),
+        unfinished: &mut HashSet<u64>,
+    ) -> VfsResult<()> {
+        // shortcut: a graph change without a later terminal upload (a foreign apply, a sweep
+        // racing a volatile overlay batch) waits for the final sweep; add a graph generation
+        // if such uploaded objects matter before LRU eviction or unmount.
+        let sweep: Vec<_> = sweep
+            .into_iter()
+            .filter(|(ino, _)| self.handle_table.open_count(*ino) == 0)
+            .collect();
+        let cached_store = self.cached_store.clone();
+        let backend = self.local_payload_backend.clone();
+        let (present, _) = run_local_cache_io_blocking(move || {
+            Ok(sweep
+                .into_iter()
+                .map(|(ino, candidates)| {
+                    let (absent, present): (Vec<_>, Vec<_>) =
+                        candidates.into_iter().partition(|id| {
+                            !backend.contains(*id) && !cached_store.has_staged_upload(*id)
+                        });
+                    cached_store.forget_retired_uploads(ino, &absent);
+                    (ino, present)
+                })
+                .collect::<Vec<_>>())
+        })
+        .await?;
+        let (empty, present): (Vec<_>, Vec<_>) = present
+            .into_iter()
+            .partition(|(_, candidates)| candidates.is_empty());
+        for (ino, _) in empty {
+            unfinished.remove(&ino);
+        }
+        if present.is_empty() {
+            return Ok(());
+        }
+
+        // One shared scan keeps inodes whose candidates are all current away from their gates.
+        let observed = self
+            .meta
+            .run_maintenance(|meta| meta.get_local_referenced_object_ids())
+            .await?;
+        let mut displaced = Vec::new();
+        for (ino, candidates) in present {
+            let candidates: Vec<_> = candidates
+                .into_iter()
+                .filter(|id| !observed.contains(id))
+                .collect();
+            if candidates.is_empty() {
+                unfinished.remove(&ino);
+            } else {
+                displaced.push((ino, candidates));
+            }
+        }
+        drop(observed);
+
+        let mut first_error = None;
+        for batch in displaced.chunks(RETIRED_PAYLOAD_INODES_PER_PASS) {
+            if should_stop() {
+                break;
+            }
+            if let Err(error) = self.reclaim_retired_payload_batch(batch, unfinished).await {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Runs one reachability recheck and metadata sync for a bounded set of inodes.
+    async fn reclaim_retired_payload_batch(
+        &self,
+        batch: &[(u64, Vec<u64>)],
+        unfinished: &mut HashSet<u64>,
+    ) -> VfsResult<()> {
+        // Skip gate and scan work while read-ahead is busy; the barrier below is the safety check.
+        if self.state.read.prefetch_payload_gate.try_write().is_err() {
+            return Ok(());
+        }
+        let mut admitted = Vec::with_capacity(batch.len());
+        for (ino, candidates) in batch {
+            // Try-acquire: a queued writer would make later reads wait behind a slow reader.
+            let cleanup = self.file_session_cleanup(*ino);
+            let Some(permit) = self.state.file_session.try_enter_upload(*ino) else {
+                continue;
+            };
+            let session = cleanup.with_permit(permit);
+            if self.handle_table.open_count(*ino) == 0 {
+                admitted.push((*ino, candidates, session));
+            }
+        }
+        if admitted.is_empty() {
+            return Ok(());
+        }
+
+        // Recheck under the inode gates: rollback may have restored a candidate since the scan.
+        self.wait_for_volatile_overlay_batches().await?;
+        #[cfg(test)]
+        self.state
+            .read
+            .run_before_retired_payload_recheck_for_test();
+        let referenced = self
+            .meta
+            .run_maintenance(|meta| meta.get_local_referenced_object_ids())
+            .await?;
+        // Barrier: a prefetch that resolved before the recheck may still read a displaced object.
+        // Later ones resolve the rechecked graph, which the held inode gates keep unchanged.
+        if self.state.read.prefetch_payload_gate.try_write().is_err() {
+            return Ok(());
+        }
+        let mut removals = Vec::new();
+        for (ino, candidates, session) in admitted {
+            let owned: HashSet<_> = self
+                .pending_uploads_snapshot_for_inode(ino)
+                .into_iter()
+                .map(|op| op.object_id)
+                .chain(
+                    self.live_extent_records_for_inode(ino)
+                        .into_iter()
+                        .map(|(_, id, _)| id),
+                )
+                .collect();
+            let (busy, objects): (Vec<_>, Vec<_>) = candidates
+                .iter()
+                .copied()
+                .filter(|id| !referenced.contains(id))
+                .partition(|id| owned.contains(id) || self.cached_store.is_pinned(*id));
+            if !objects.is_empty() {
+                removals.push((ino, objects, busy.is_empty(), session));
+            } else if busy.is_empty() {
+                unfinished.remove(&ino);
+            }
+        }
+        if removals.is_empty() {
+            return Ok(());
+        }
+
+        // A crash must not restore an older redb graph after its dirty bytes are gone.
+        self.meta
+            .run_maintenance(|meta| meta.sync_local_metadata())
+            .await?;
+        let cached_store = self.cached_store.clone();
+        let backend = self.local_payload_backend.clone();
+        let state = self.state.clone();
+        let ((finished, first_error), _) = run_local_cache_io_blocking(move || {
+            #[cfg(test)]
+            state.read.run_before_retired_payload_removal_for_test();
+            let mut finished = Vec::new();
+            let mut first_error = None;
+            for (ino, objects, finishes_inode, _session) in removals {
+                let removed = objects
+                    .chunks(studiofs_cache::PAYLOAD_REMOVAL_CHUNK_OBJECTS)
+                    .try_for_each(|batch| -> VfsResult<()> {
+                        cached_store.remove_staged_upload_batch(batch)?;
+                        backend.remove_batch(batch)?;
+                        cached_store.remove_hot_upload_batch(batch);
+                        {
+                            let mut evictions = state.upload.pending_evictions.lock();
+                            for id in batch {
+                                evictions.remove(id);
+                            }
+                        }
+                        cached_store.forget_retired_uploads(ino, batch);
+                        Ok(())
+                    });
+                match removed {
+                    Ok(()) => {
+                        tracing::info!(
+                            ino,
+                            removed_objects = objects.len(),
+                            "reclaimed retired local payloads"
+                        );
+                        if finishes_inode {
+                            finished.push(ino);
+                        }
+                    }
+                    // One unremovable object must not block the other inodes.
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            Ok((finished, first_error))
+        })
+        .await?;
+        for ino in finished {
+            unfinished.remove(&ino);
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub(super) async fn background_local_payload_reclamation(self: Arc<Self>) {
+        let cancel = self.state.shutdown.background_shutdown_token.clone();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {}
+            }
+            if let Err(error) = self.reclaim_retired_local_payloads().await {
+                warn!(%error, "local payload reclamation deferred; retaining candidates for retry");
+            }
+        }
+    }
+
     pub(super) fn regular_file_graph_usage(
         &self,
         meta: &Arc<dyn VfsMeta>,

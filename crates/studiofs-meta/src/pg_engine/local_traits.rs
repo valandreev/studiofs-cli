@@ -450,6 +450,10 @@ impl MetaGc for PgMetaEngine {
         referenced.extend(self.load_pg_current_reference_object_ids()?);
         Ok(referenced)
     }
+
+    fn get_local_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.local.get_local_referenced_object_ids()
+    }
 }
 
 impl MetaRecovery for PgMetaEngine {

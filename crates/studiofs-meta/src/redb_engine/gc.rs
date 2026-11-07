@@ -571,6 +571,10 @@ impl MetaGc for RedbMetaEngine {
     }
 
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.get_local_referenced_object_ids()
+    }
+
+    fn get_local_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
         let txn = self.begin_read_txn()?;
         let mut refs = HashSet::new();
         Self::regular_file_graph_object_ids_from_table(

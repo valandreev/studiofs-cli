@@ -2057,6 +2057,7 @@ struct PublishedReadPlanCacheEntry {
 }
 
 struct ReadState {
+    prefetch_payload_gate: Arc<tokio::sync::RwLock<()>>,
     foreground_reads_inflight: AtomicUsize,
     last_foreground_read_ms: AtomicU64,
     foreground_idle_notify: tokio::sync::Notify,
@@ -2079,11 +2080,16 @@ struct ReadState {
     foreground_local_payload_read_io_max_ns: AtomicU64,
     #[cfg(test)]
     before_published_read_plan_cache_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_retired_payload_recheck: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_retired_payload_removal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl ReadState {
     fn new(shard_count: usize) -> Self {
         Self {
+            prefetch_payload_gate: Arc::new(tokio::sync::RwLock::new(())),
             foreground_reads_inflight: AtomicUsize::new(0),
             last_foreground_read_ms: AtomicU64::new(0),
             foreground_idle_notify: tokio::sync::Notify::new(),
@@ -2108,6 +2114,28 @@ impl ReadState {
             foreground_local_payload_read_io_max_ns: AtomicU64::new(0),
             #[cfg(test)]
             before_published_read_plan_cache_put: Mutex::new(None),
+            #[cfg(test)]
+            before_retired_payload_recheck: Mutex::new(None),
+            #[cfg(test)]
+            before_retired_payload_removal: Mutex::new(None),
+        }
+    }
+
+    /// Runs a test hook on the blocking pool just before reclamation removes payloads.
+    #[cfg(test)]
+    fn run_before_retired_payload_removal_for_test(&self) {
+        let hook = self.before_retired_payload_removal.lock().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Runs a test hook after reclamation's first scan, before its recheck under the gates.
+    #[cfg(test)]
+    fn run_before_retired_payload_recheck_for_test(&self) {
+        let hook = self.before_retired_payload_recheck.lock().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -5440,6 +5468,10 @@ impl StudioVfs {
         self.spawn_fetch_warmup_task();
         self.spawn_local_metadata_compaction_worker();
         self.spawn_gc_worker();
+        let vfs = self.clone();
+        self.spawn_background_cleanup_task_on(&tokio::runtime::Handle::current(), async move {
+            vfs.background_local_payload_reclamation().await;
+        });
         self.spawn_metadata_invalidation_worker();
         self.spawn_janitor_worker();
         self.spawn_snapshot_worker();

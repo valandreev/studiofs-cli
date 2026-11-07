@@ -492,6 +492,13 @@ impl UploadHotState {
     }
 }
 
+#[derive(Default)]
+struct RetiredUploads {
+    objects: HashMap<u64, HashSet<ObjectId>>,
+    // Inodes with a terminal upload since their last completed sweep.
+    sweep_due: HashSet<u64>,
+}
+
 /// Cached payload store backing the local-first mount runtime.
 pub struct CachedStore {
     /// Cache configuration used to build this runtime instance.
@@ -512,6 +519,8 @@ pub struct CachedStore {
     // Serializes staged queue ownership and its byte accounting with terminal removal.
     // ponytail: global accounting lock; per-object accounting if queue contention is measured.
     pending_upload_bytes_by_object: Mutex<HashMap<ObjectId, u64>>,
+    // Queue completion ends upload ownership, not the lifetime of the local payload.
+    retired_uploads: Mutex<RetiredUploads>,
     #[cfg(test)]
     upload_accounting_hook: Mutex<Option<UploadAccountingHook>>,
     /// Atomic counters for writer staging and upload metrics.
@@ -540,6 +549,7 @@ impl CachedStore {
             pinned: Mutex::new(PinnedState::default()),
             upload_queue,
             pending_upload_bytes_by_object: Mutex::new(HashMap::new()),
+            retired_uploads: Mutex::new(RetiredUploads::default()),
             #[cfg(test)]
             upload_accounting_hook: Mutex::new(None),
             writer_counters: CachedStoreWriterCounters::default(),
@@ -993,6 +1003,7 @@ impl CachedStore {
     pub fn complete_upload(&self, op: &PendingUpload) {
         let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
         if self.upload_queue.complete(op) {
+            self.retire_upload(op);
             #[cfg(test)]
             self.pause_upload_accounting_for_test();
             let accounted_bytes = self.record_upload_terminal(&mut pending_bytes, op.object_id);
@@ -1040,12 +1051,68 @@ impl CachedStore {
     pub fn cancel_upload(&self, op: &PendingUpload) {
         let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
         if self.upload_queue.cancel(op) {
+            self.retire_upload(op);
             #[cfg(test)]
             self.pause_upload_accounting_for_test();
             self.record_upload_terminal(&mut pending_bytes, op.object_id);
             drop(pending_bytes);
             self.unpin(op.object_id);
             self.metrics.upload_queue.record_cancel();
+        }
+    }
+
+    fn retire_upload(&self, op: &PendingUpload) {
+        let mut retired = self.retired_uploads.lock();
+        retired
+            .objects
+            .entry(op.ino)
+            .or_default()
+            .insert(op.object_id);
+        retired.sweep_due.insert(op.ino);
+    }
+
+    /// Local payload candidates grouped by their original inode owner.
+    ///
+    /// Completion or cancellation alone does not authorize deletion: callers must
+    /// protect readers, pending uploads and metadata/recovery references first.
+    pub fn retired_uploads(&self) -> HashMap<u64, Vec<ObjectId>> {
+        self.retired_uploads
+            .lock()
+            .objects
+            .iter()
+            .map(|(&ino, objects)| (ino, objects.iter().copied().collect()))
+            .collect()
+    }
+
+    /// Takes candidates of inodes with a terminal upload since their last sweep.
+    ///
+    /// Current objects stay candidates, so an idle mount must not rescan them.
+    pub fn take_retired_upload_sweep(&self) -> HashMap<u64, Vec<ObjectId>> {
+        let mut retired = self.retired_uploads.lock();
+        let due = std::mem::take(&mut retired.sweep_due);
+        due.into_iter()
+            .filter_map(|ino| {
+                let objects = retired.objects.get(&ino)?;
+                Some((ino, objects.iter().copied().collect()))
+            })
+            .collect()
+    }
+
+    /// Marks inodes whose sweep was deferred or failed for the next pass.
+    pub fn requeue_retired_upload_sweep(&self, inodes: impl IntoIterator<Item = u64>) {
+        self.retired_uploads.lock().sweep_due.extend(inodes);
+    }
+
+    /// Forgets candidates only after their local payloads have been removed.
+    pub fn forget_retired_uploads(&self, ino: u64, object_ids: &[ObjectId]) {
+        let mut retired = self.retired_uploads.lock();
+        if let Some(objects) = retired.objects.get_mut(&ino) {
+            for object_id in object_ids {
+                objects.remove(object_id);
+            }
+            if objects.is_empty() {
+                retired.objects.remove(&ino);
+            }
         }
     }
 
@@ -3403,6 +3470,19 @@ mod tests {
 
         assert!(!cached_store.is_pinned(101));
         assert_eq!(cached_store.pending_upload_count(), 0);
+        assert_eq!(
+            cached_store.retired_uploads(),
+            HashMap::from([(1, vec![101])])
+        );
+        assert_eq!(
+            cached_store.take_retired_upload_sweep(),
+            HashMap::from([(1, vec![101])])
+        );
+        assert!(cached_store.take_retired_upload_sweep().is_empty());
+        cached_store.requeue_retired_upload_sweep([1]);
+        assert_eq!(cached_store.take_retired_upload_sweep().len(), 1);
+        cached_store.forget_retired_uploads(1, &[101]);
+        assert!(cached_store.retired_uploads().is_empty());
     }
 
     #[tokio::test]
@@ -3417,6 +3497,10 @@ mod tests {
         assert!(!cached_store.is_pinned(202));
         assert_eq!(cached_store.pending_upload_count(), 0);
         assert!(cached_store.snapshot_pending_uploads().is_empty());
+        assert_eq!(
+            cached_store.retired_uploads(),
+            HashMap::from([(7, vec![202])])
+        );
     }
 
     #[tokio::test]
