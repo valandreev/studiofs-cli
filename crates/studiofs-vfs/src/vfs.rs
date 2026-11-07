@@ -2080,6 +2080,8 @@ struct ReadState {
     foreground_local_payload_read_io_max_ns: AtomicU64,
     #[cfg(test)]
     before_published_read_plan_cache_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_retired_payload_recheck: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl ReadState {
@@ -2110,6 +2112,17 @@ impl ReadState {
             foreground_local_payload_read_io_max_ns: AtomicU64::new(0),
             #[cfg(test)]
             before_published_read_plan_cache_put: Mutex::new(None),
+            #[cfg(test)]
+            before_retired_payload_recheck: Mutex::new(None),
+        }
+    }
+
+    /// Runs a test hook after reclamation's first scan, before its recheck under the gates.
+    #[cfg(test)]
+    fn run_before_retired_payload_recheck_for_test(&self) {
+        let hook = self.before_retired_payload_recheck.lock().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 

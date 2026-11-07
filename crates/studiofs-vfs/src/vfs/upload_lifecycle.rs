@@ -957,7 +957,9 @@ impl StudioVfs {
         };
         if deferred_namespace_error.is_none()
             && metadata_barrier_error.is_none()
-            && let Err(error) = self.reclaim_retired_local_payloads().await
+            && let Err(error) = self
+                .reclaim_all_retired_local_payloads(metadata_flush_timeout)
+                .await
         {
             warn!(%error, "VFS shutdown: local payload reclamation deferred to startup");
         }

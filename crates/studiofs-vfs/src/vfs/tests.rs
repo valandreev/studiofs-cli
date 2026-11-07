@@ -6903,6 +6903,95 @@ fn retired_payload_reclamation_preserves_canceled_upload_restored_in_metadata() 
 
         assert!(vfs.local_payload_backend().contains(old.object_id));
         assert!(vfs.cached_store.retired_uploads()[&attr.ino].contains(&old.object_id));
+        assert!(
+            vfs.cached_store.take_retired_upload_sweep().is_empty(),
+            "a finished sweep must not rescan current objects on an idle mount"
+        );
+    });
+}
+
+#[test]
+fn retired_payload_recheck_keeps_object_restored_after_first_scan() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("sfs-1032-recheck-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "retire-recheck");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let mut displaced = Vec::new();
+        for name in [&b"restored"[..], &b"displaced"[..]] {
+            let attr = vfs.create(ROOT_INO, name, 0, 0, 0o644).unwrap();
+            vfs.write(attr.ino, 0, b"first payload").await.unwrap();
+            vfs.fsync(attr.ino, false).await.unwrap();
+            let old = vfs.pending_uploads_snapshot_for_inode(attr.ino)[0].clone();
+            vfs.write(attr.ino, 0, b"newer payload").await.unwrap();
+            vfs.fsync(attr.ino, false).await.unwrap();
+            vfs.cached_store.cancel_upload(&old);
+            displaced.push((attr.ino, old.object_id));
+        }
+        let (restored_ino, restored) = displaced[0];
+        let (_, removed) = displaced[1];
+        let hook_meta = meta.clone();
+        *vfs.state.read.before_retired_payload_recheck.lock() = Some(Box::new(move || {
+            hook_meta
+                .flush_regular_file_overlay_slices_with_attr(
+                    restored_ino,
+                    &[(
+                        ChunkId(0),
+                        vec![SliceRecord::new(
+                            SliceId(0),
+                            SliceOrder(0),
+                            SliceRange::new(0, 13).unwrap(),
+                            PayloadRef::new_partial(restored, 13),
+                        )],
+                    )],
+                    None,
+                )
+                .unwrap();
+        }));
+
+        vfs.reclaim_retired_local_payloads().await.unwrap();
+
+        assert!(
+            vfs.local_payload_backend().contains(restored),
+            "an object restored after the first scan must survive"
+        );
+        assert!(
+            !vfs.local_payload_backend().contains(removed),
+            "one sweep must reclaim the other inode's displaced object"
+        );
+    });
+}
+
+#[test]
+fn retired_payload_reclamation_skips_busy_inode_without_queueing_on_its_gate() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("sfs-1032-busy-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "retire-busy");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(ROOT_INO, b"busy", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, b"first payload").await.unwrap();
+        vfs.fsync(attr.ino, false).await.unwrap();
+        let old = vfs.pending_uploads_snapshot_for_inode(attr.ino)[0].clone();
+        vfs.write(attr.ino, 0, b"newer payload").await.unwrap();
+        vfs.fsync(attr.ino, false).await.unwrap();
+        vfs.cached_store.cancel_upload(&old);
+
+        let reader = vfs
+            .state
+            .file_session
+            .enter_op(attr.ino, FileSessionOperation::Read)
+            .await;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            vfs.reclaim_retired_local_payloads(),
+        )
+        .await
+        .expect("a sweep must skip a busy inode instead of waiting for its reader")
+        .unwrap();
+        assert!(vfs.local_payload_backend().contains(old.object_id));
+
+        drop(reader);
+        vfs.reclaim_retired_local_payloads().await.unwrap();
+        assert!(!vfs.local_payload_backend().contains(old.object_id));
     });
 }
 

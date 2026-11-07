@@ -835,6 +835,26 @@ impl FileSessionState {
         }
     }
 
+    /// Enters the exclusive `Upload` gate for `ino` without queueing behind active operations.
+    pub(super) fn try_enter_upload(&self, ino: Ino) -> Option<FileSessionPermit> {
+        let op = FileSessionOperation::Upload;
+        let session = self.session(ino);
+        let materialize_write_guard = session.materialize_gate.clone().try_write_owned().ok()?;
+        let write_guard = session.gate.clone().try_write_owned().ok()?;
+        self.counters.note_transition();
+        session.note_active_start(op);
+        session.record_transition(op, "start");
+        Some(FileSessionPermit {
+            _finalize_gate: None,
+            _read_gate: None,
+            _write_gate: Some(write_guard),
+            _materialize_write_gate: Some(materialize_write_guard),
+            counters: self.counters.clone(),
+            session,
+            op,
+        })
+    }
+
     /// Increments handle counters for `ino` and returns new open handle count.
     pub(super) fn note_open_handle(&self, ino: Ino) -> u32 {
         let session = self.session(ino);

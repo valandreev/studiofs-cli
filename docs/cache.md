@@ -230,16 +230,22 @@ replayed staged bytes, queued uploads, discarded memory-only bytes, orphan dirty
 payload cleanup, and unreferenced warm-payload cleanup.
 
 Upload completion and cancellation retain the local payload's inode ownership
-until reclamation. Every five seconds, local maintenance checks terminal-upload
-objects and reclaims those absent from the local base, overlay and recovery
-graphs. It holds the same exclusive inode session as stale-upload cleanup,
-preserves open handles, live extents, queued uploads and pins, skips reclamation
-while prefetch holds a payload snapshot, drains admitted volatile metadata, and
-makes metadata removal durable before deleting dirty payload bytes. Upload-stage
-links are removed before the payload backend, in batches of at most 32 objects;
-failed cleanup retains candidates for retry. Shutdown joins maintenance and
-runs a final sweep after a successful metadata barrier. Crash leftovers still
-use startup cleanup. This maintenance performs no PostgreSQL queries or remote
+until reclamation. Every five seconds, local maintenance sweeps inodes with a
+terminal upload since their last completed sweep, so an idle mount does no
+namespace work, and reclaims objects absent from the local base, overlay and
+recovery graphs. An inode with an open handle stays deferred until release, so
+a long-lived writer's displaced objects remain until it closes or the mount
+stops. Maintenance try-acquires the same exclusive inode session as stale-upload
+cleanup and skips a busy inode rather than queueing ahead of its readers. It
+preserves live extents, queued uploads and pins, skips reclamation while
+prefetch holds a payload snapshot, drains admitted volatile metadata, and makes
+metadata removal durable before deleting dirty payload bytes; one recheck and
+sync covers up to 64 inodes. Upload-stage links are removed before the payload
+backend, in batches of at most 32 objects; failed cleanup retains candidates for
+retry. Shutdown joins maintenance, which stops between inode batches, and runs a
+final sweep over every candidate after a successful metadata barrier, bounded by
+the shutdown metadata flush timeout. Crash leftovers and whatever that budget
+misses use startup cleanup. This maintenance performs no PostgreSQL queries or remote
 deletion; immutable payloads retained by remote snapshots remain in object
 storage and follow the existing remote retention protocol.
 
