@@ -442,7 +442,10 @@ fn namespace_collision_mounted_tree_snapshot_timeout_uses_emergency_cleanup() {
         attempts: 2,
         elapsed_ms: 5_258,
         artifact_dir: scenario_dir.join("validation"),
-        source: Box::new(MountedTreeError::SnapshotAttemptTimedOut { timeout_ms: 5_000 }),
+        source: Box::new(MountedTreeError::SnapshotAttemptTimedOut {
+            timeout_ms: 5_000,
+            blocked_at: "client-a read_dir /mnt/client-a".to_string(),
+        }),
     });
 
     let err =
