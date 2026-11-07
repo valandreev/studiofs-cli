@@ -15,6 +15,9 @@ use studiofs_meta::schema::{
 use studiofs_meta::types::{FileType, Ino, InodeAttr, block_index_from_offset};
 use tracing::{debug, info, warn};
 
+/// Bounds the per-object retry after a failed batch; matches the backend's removal chunk.
+const STARTUP_PAYLOAD_REMOVAL_BATCH_OBJECTS: usize = 32;
+
 pub(super) struct StartupReplayCoordinator<'a> {
     vfs: &'a StudioVfs,
     pending_catalog: PendingUploadCatalog,
@@ -689,7 +692,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             .retain(|object_id| !self.removed_orphan_dirty_object_ids.contains(object_id));
     }
 
-    /// Returns the objects actually removed; the rest stay for the next startup.
+    /// Returns only the objects fully removed, for callers to count and forget.
     fn remove_startup_local_payloads(&self, object_ids: &[u64]) -> Vec<u64> {
         let unstaged: Vec<u64> = object_ids
             .iter()
@@ -710,33 +713,29 @@ impl<'a> StartupReplayCoordinator<'a> {
             .collect();
         // A per-object removal costs one durable index commit, which kept mounts
         // from becoming ready for minutes after heavy overwrites (SFS-1029).
-        let removed = match self.vfs.local_payload_backend.remove_batch(&unstaged) {
-            Ok(()) => unstaged,
-            // The batch stops at its first failure without naming the objects it reached.
-            Err(error) => {
+        let mut removed = Vec::with_capacity(unstaged.len());
+        for batch in unstaged.chunks(STARTUP_PAYLOAD_REMOVAL_BATCH_OBJECTS) {
+            if let Err(error) = self.vfs.local_payload_backend.remove_batch(batch) {
+                // A failed batch does not name the objects it reached.
                 warn!(
-                    object_count = unstaged.len(),
+                    object_count = batch.len(),
                     error = %error,
                     "startup replay batched local payload cleanup failed; retrying each object"
                 );
-                unstaged
-                    .into_iter()
-                    .filter(
-                        |&object_id| match self.vfs.local_payload_backend.remove(object_id) {
-                            Ok(()) => true,
-                            Err(error) => {
-                                warn!(
-                                    object_id,
-                                    error = %error,
-                                    "startup replay local payload cleanup failed"
-                                );
-                                false
-                            }
-                        },
-                    )
-                    .collect()
+                for &object_id in batch {
+                    match self.vfs.local_payload_backend.remove(object_id) {
+                        Ok(()) => removed.push(object_id),
+                        Err(error) => warn!(
+                            object_id,
+                            error = %error,
+                            "startup replay local payload cleanup failed"
+                        ),
+                    }
+                }
+            } else {
+                removed.extend_from_slice(batch);
             }
-        };
+        }
         self.vfs.cached_store.remove_hot_upload_batch(&removed);
         let mut pending_evictions = self.vfs.state.upload.pending_evictions.lock();
         for object_id in &removed {

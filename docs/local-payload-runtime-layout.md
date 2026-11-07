@@ -124,10 +124,12 @@ Safety rules:
   diagnostics snapshot: `replayed_bytes`, `queued_uploads`,
   `discarded_memory_only_bytes`, `orphan_dirty_payloads_removed`, and
   `unreferenced_local_payloads_removed`.
-- Startup cleanup removes payloads without metadata references in batches, so
-  index commits grow with batches rather than objects. It finishes before VFS
-  workers start and the mount attaches, so no foreground operation or upload
-  worker can re-reference, pin, or read a payload it is removing.
+- Startup cleanup removes payloads without metadata references in batches of up
+  to 32 objects, with one index commit per batch. A failed batch is retried per
+  object, one commit each. Cleanup finishes before VFS workers start and the
+  mount attaches, so no foreground operation or upload worker can re-reference,
+  pin, or read a payload it is removing. PostgreSQL metadata polling can already
+  be running, so cleanup does not run against frozen metadata.
 
 ## 6. Remediation Flow for Stale Local Artifacts
 
