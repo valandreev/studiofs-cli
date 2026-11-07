@@ -2404,6 +2404,7 @@ impl StudioVfs {
     }
 
     pub(super) async fn read_prefetch_batch(&self, batch: PrefetchBatch) {
+        let _payload_lifetime = self.state.read.prefetch_payload_gate.read().await;
         let PrefetchBatch {
             ino,
             mut block_indices,

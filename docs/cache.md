@@ -229,6 +229,20 @@ The zero-IO status snapshot reports startup recovery with counters for
 replayed staged bytes, queued uploads, discarded memory-only bytes, orphan dirty
 payload cleanup, and unreferenced warm-payload cleanup.
 
+Upload completion and cancellation retain the local payload's inode ownership
+until reclamation. Every five seconds, local maintenance checks terminal-upload
+objects and reclaims those absent from the local base, overlay and recovery
+graphs. It holds the same exclusive inode session as stale-upload cleanup,
+preserves open handles, live extents, queued uploads and pins, skips reclamation
+while prefetch holds a payload snapshot, drains admitted volatile metadata, and
+makes metadata removal durable before deleting dirty payload bytes. Upload-stage
+links are removed before the payload backend, in batches of at most 32 objects;
+failed cleanup retains candidates for retry. Shutdown joins maintenance and
+runs a final sweep after a successful metadata barrier. Crash leftovers still
+use startup cleanup. This maintenance performs no PostgreSQL queries or remote
+deletion; immutable payloads retained by remote snapshots remain in object
+storage and follow the existing remote retention protocol.
+
 ## CachedStore Responsibilities
 
 `CachedStore` is the canonical cache/object-store pipeline owner for the mount

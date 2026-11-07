@@ -6777,6 +6777,167 @@ fn seed_unreferenced_warm_payload(vfs: &StudioVfs, object_id: u64) {
 }
 
 #[test]
+fn shutdown_reclaims_displaced_dirty_payload_after_overwrite_and_truncate() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("sfs-1032-dirty-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "retire-dirty");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(ROOT_INO, b"overwrite", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, b"first payload").await.unwrap();
+        vfs.fsync(attr.ino, false).await.unwrap();
+        let displaced = vfs.pending_uploads_snapshot_for_inode(attr.ino)[0].object_id;
+        vfs.write(attr.ino, 0, b"newer payload").await.unwrap();
+        vfs.fsync(attr.ino, false).await.unwrap();
+        vfs.setattr(attr.ino, SetattrArgs::size_only(0)).unwrap();
+        assert!(vfs.pending_uploads_for_inode(attr.ino).is_empty());
+        assert!(vfs.local_payload_backend().contains(displaced));
+
+        vfs.shutdown(Duration::ZERO).await.unwrap();
+
+        assert!(
+            !vfs.local_payload_backend().contains(displaced),
+            "canceling an overwritten upload must not leave its dirty payload until remount"
+        );
+    });
+}
+
+#[test]
+fn shutdown_reclaims_displaced_uploaded_payload_but_keeps_current_dirty_payload() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("sfs-1032-uploaded-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "retire-uploaded");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(ROOT_INO, b"overwrite", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, b"first payload").await.unwrap();
+        vfs.fsync(attr.ino, false).await.unwrap();
+        let (_, uploaded) = mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        vfs.write(attr.ino, 0, b"newer payload").await.unwrap();
+        vfs.fsync(attr.ino, false).await.unwrap();
+        let current = vfs.pending_uploads_snapshot_for_inode(attr.ino)[0].object_id;
+        assert!(vfs.local_payload_backend().contains(uploaded[0]));
+
+        vfs.shutdown(Duration::ZERO).await.unwrap();
+
+        assert!(
+            !vfs.local_payload_backend().contains(uploaded[0]),
+            "uploaded objects displaced from metadata must be reclaimed before remount"
+        );
+        assert!(vfs.local_payload_backend().contains(current));
+        let out = vfs.read(attr.ino, 0, 13).await.unwrap();
+        assert_eq!(out.as_ref(), b"newer payload");
+    });
+}
+
+#[test]
+fn retired_payload_reclamation_waits_for_open_handles_and_keeps_referenced_payloads() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("sfs-1032-handles-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "retire-handles");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(ROOT_INO, b"overwrite", 0, 0, 0o644).unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(fh, attr.ino, 0, b"first payload")
+            .await
+            .unwrap();
+        vfs.fsync_fh(fh).await.unwrap();
+        let (_, uploaded) = mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        vfs.reclaim_retired_local_payloads().await.unwrap();
+        assert!(vfs.local_payload_backend().contains(uploaded[0]));
+
+        vfs.write_fh(fh, attr.ino, 0, b"newer payload")
+            .await
+            .unwrap();
+        vfs.fsync_fh(fh).await.unwrap();
+        vfs.reclaim_retired_local_payloads().await.unwrap();
+        assert!(vfs.local_payload_backend().contains(uploaded[0]));
+        vfs.release_fh(fh).await.unwrap();
+        let (_, current) = mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+
+        let prefetch_reader = vfs.state.read.prefetch_payload_gate.read().await;
+        vfs.reclaim_retired_local_payloads().await.unwrap();
+        assert!(
+            vfs.local_payload_backend().contains(uploaded[0]),
+            "an in-flight prefetch still owns its resolved payload snapshot"
+        );
+        drop(prefetch_reader);
+        vfs.reclaim_retired_local_payloads().await.unwrap();
+
+        assert!(!vfs.local_payload_backend().contains(uploaded[0]));
+        assert!(vfs.local_payload_backend().contains(current[0]));
+        assert_eq!(
+            vfs.read(attr.ino, 0, 13).await.unwrap().as_ref(),
+            b"newer payload"
+        );
+    });
+}
+
+#[test]
+fn retired_payload_reclamation_preserves_canceled_upload_restored_in_metadata() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("sfs-1032-restore-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "retire-restore");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(ROOT_INO, b"overwrite", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, b"first payload").await.unwrap();
+        vfs.fsync(attr.ino, false).await.unwrap();
+        let old = vfs.pending_uploads_snapshot_for_inode(attr.ino)[0].clone();
+        vfs.write(attr.ino, 0, b"newer payload").await.unwrap();
+        vfs.fsync(attr.ino, false).await.unwrap();
+        vfs.cached_store.cancel_upload(&old);
+        meta.flush_regular_file_overlay_slices_with_attr(
+            attr.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::new(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(0, 13).unwrap(),
+                    PayloadRef::new_partial(old.object_id, 13),
+                )],
+            )],
+            None,
+        )
+        .unwrap();
+
+        vfs.reclaim_retired_local_payloads().await.unwrap();
+
+        assert!(vfs.local_payload_backend().contains(old.object_id));
+        assert!(vfs.cached_store.retired_uploads()[&attr.ino].contains(&old.object_id));
+    });
+}
+
+#[test]
+fn retired_payload_reclamation_retries_stage_cleanup_failure() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("sfs-1032-retry-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "retire-retry");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(ROOT_INO, b"empty", 0, 0, 0o644).unwrap();
+        let id = 991_900;
+        vfs.local_payload_backend()
+            .put(id, b"orphan", false)
+            .unwrap();
+        vfs.cached_store.submit_upload(attr.ino, 0, id, 0);
+        let op = vfs
+            .pending_uploads_snapshot_for_inode(attr.ino)
+            .pop()
+            .unwrap();
+        vfs.cached_store.cancel_upload(&op);
+        let layout = studiofs_cache::LocalPayloadLayout::from_cache_root(tmp.path().join("cache"));
+        let stage_path = layout.upload_stage_object_path(id);
+        std::fs::create_dir_all(&stage_path).unwrap();
+
+        assert!(vfs.reclaim_retired_local_payloads().await.is_err());
+        assert!(vfs.local_payload_backend().contains(id));
+        assert!(vfs.cached_store.retired_uploads()[&attr.ino].contains(&id));
+        std::fs::remove_dir(stage_path).unwrap();
+        vfs.reclaim_retired_local_payloads().await.unwrap();
+        assert!(!vfs.local_payload_backend().contains(id));
+        assert!(vfs.cached_store.retired_uploads().is_empty());
+    });
+}
+
+#[test]
 fn startup_replay_removes_stale_payloads_in_batches() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
     let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "startup-replay-batched-cleanup");

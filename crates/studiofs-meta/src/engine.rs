@@ -1866,6 +1866,15 @@ pub trait MetaGc: Send + Sync {
     /// Prefer streaming the underlying rows into a shared accumulator instead
     /// of materializing intermediate per-table graphs.
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>>;
+
+    /// Local base, overlay and recovery roots for cache reclamation, without remote IO.
+    ///
+    /// Backends must opt in; the global GC query may consult PostgreSQL.
+    fn get_local_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        Err(MetaError::Storage(
+            "local payload reachability is unsupported".to_string(),
+        ))
+    }
 }
 
 /// Capability trait for crash recovery and replay of pending local operations.

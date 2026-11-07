@@ -1796,7 +1796,18 @@ mod tests {
             .unwrap()
             .remove(file.ino)
             .unwrap();
+        txn.open_table(REGULAR_FILE_OVERLAY_TABLE)
+            .unwrap()
+            .remove(encode_regular_file_chunk_key(file.ino, ChunkId(0)).as_slice())
+            .unwrap();
         txn.commit().unwrap();
+        assert!(
+            engine
+                .get_local_referenced_object_ids()
+                .unwrap()
+                .contains(&777_102),
+            "local cache reachability must include recovery-only objects"
+        );
         engine.reconcile_pending_regular_file_recoveries().unwrap();
         assert!(
             engine

@@ -512,6 +512,8 @@ pub struct CachedStore {
     // Serializes staged queue ownership and its byte accounting with terminal removal.
     // ponytail: global accounting lock; per-object accounting if queue contention is measured.
     pending_upload_bytes_by_object: Mutex<HashMap<ObjectId, u64>>,
+    // Queue completion ends upload ownership, not the lifetime of the local payload.
+    retired_uploads: Mutex<HashMap<u64, HashSet<ObjectId>>>,
     #[cfg(test)]
     upload_accounting_hook: Mutex<Option<UploadAccountingHook>>,
     /// Atomic counters for writer staging and upload metrics.
@@ -540,6 +542,7 @@ impl CachedStore {
             pinned: Mutex::new(PinnedState::default()),
             upload_queue,
             pending_upload_bytes_by_object: Mutex::new(HashMap::new()),
+            retired_uploads: Mutex::new(HashMap::new()),
             #[cfg(test)]
             upload_accounting_hook: Mutex::new(None),
             writer_counters: CachedStoreWriterCounters::default(),
@@ -993,6 +996,7 @@ impl CachedStore {
     pub fn complete_upload(&self, op: &PendingUpload) {
         let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
         if self.upload_queue.complete(op) {
+            self.retire_upload(op);
             #[cfg(test)]
             self.pause_upload_accounting_for_test();
             let accounted_bytes = self.record_upload_terminal(&mut pending_bytes, op.object_id);
@@ -1040,12 +1044,46 @@ impl CachedStore {
     pub fn cancel_upload(&self, op: &PendingUpload) {
         let mut pending_bytes = self.pending_upload_bytes_by_object.lock();
         if self.upload_queue.cancel(op) {
+            self.retire_upload(op);
             #[cfg(test)]
             self.pause_upload_accounting_for_test();
             self.record_upload_terminal(&mut pending_bytes, op.object_id);
             drop(pending_bytes);
             self.unpin(op.object_id);
             self.metrics.upload_queue.record_cancel();
+        }
+    }
+
+    fn retire_upload(&self, op: &PendingUpload) {
+        self.retired_uploads
+            .lock()
+            .entry(op.ino)
+            .or_default()
+            .insert(op.object_id);
+    }
+
+    /// Local payload candidates grouped by their original inode owner.
+    ///
+    /// Completion or cancellation alone does not authorize deletion: callers must
+    /// protect readers, pending uploads and metadata/recovery references first.
+    pub fn retired_uploads(&self) -> HashMap<u64, Vec<ObjectId>> {
+        self.retired_uploads
+            .lock()
+            .iter()
+            .map(|(&ino, objects)| (ino, objects.iter().copied().collect()))
+            .collect()
+    }
+
+    /// Forgets candidates only after their local payloads have been removed.
+    pub fn forget_retired_uploads(&self, ino: u64, object_ids: &[ObjectId]) {
+        let mut retired = self.retired_uploads.lock();
+        if let Some(objects) = retired.get_mut(&ino) {
+            for object_id in object_ids {
+                objects.remove(object_id);
+            }
+            if objects.is_empty() {
+                retired.remove(&ino);
+            }
         }
     }
 
@@ -3403,6 +3441,12 @@ mod tests {
 
         assert!(!cached_store.is_pinned(101));
         assert_eq!(cached_store.pending_upload_count(), 0);
+        assert_eq!(
+            cached_store.retired_uploads(),
+            HashMap::from([(1, vec![101])])
+        );
+        cached_store.forget_retired_uploads(1, &[101]);
+        assert!(cached_store.retired_uploads().is_empty());
     }
 
     #[tokio::test]
@@ -3417,6 +3461,10 @@ mod tests {
         assert!(!cached_store.is_pinned(202));
         assert_eq!(cached_store.pending_upload_count(), 0);
         assert!(cached_store.snapshot_pending_uploads().is_empty());
+        assert_eq!(
+            cached_store.retired_uploads(),
+            HashMap::from([(7, vec![202])])
+        );
     }
 
     #[tokio::test]

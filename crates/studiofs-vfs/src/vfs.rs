@@ -2057,6 +2057,7 @@ struct PublishedReadPlanCacheEntry {
 }
 
 struct ReadState {
+    prefetch_payload_gate: Arc<tokio::sync::RwLock<()>>,
     foreground_reads_inflight: AtomicUsize,
     last_foreground_read_ms: AtomicU64,
     foreground_idle_notify: tokio::sync::Notify,
@@ -2084,6 +2085,7 @@ struct ReadState {
 impl ReadState {
     fn new(shard_count: usize) -> Self {
         Self {
+            prefetch_payload_gate: Arc::new(tokio::sync::RwLock::new(())),
             foreground_reads_inflight: AtomicUsize::new(0),
             last_foreground_read_ms: AtomicU64::new(0),
             foreground_idle_notify: tokio::sync::Notify::new(),
@@ -5440,6 +5442,10 @@ impl StudioVfs {
         self.spawn_fetch_warmup_task();
         self.spawn_local_metadata_compaction_worker();
         self.spawn_gc_worker();
+        let vfs = self.clone();
+        self.spawn_background_cleanup_task_on(&tokio::runtime::Handle::current(), async move {
+            vfs.background_local_payload_reclamation().await;
+        });
         self.spawn_metadata_invalidation_worker();
         self.spawn_janitor_worker();
         self.spawn_snapshot_worker();

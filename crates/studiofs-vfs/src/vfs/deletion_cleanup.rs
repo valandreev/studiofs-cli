@@ -10,6 +10,128 @@ pub(super) struct RegularFileGraphUsage {
 }
 
 impl StudioVfs {
+    pub(super) async fn reclaim_retired_local_payloads(&self) -> VfsResult<()> {
+        let mut observed_references = None;
+        for (ino, candidates) in self.cached_store.retired_uploads() {
+            let cleanup = self.file_session_cleanup(ino);
+            let permit = self
+                .state
+                .file_session
+                .enter_op(ino, super::FileSessionOperation::Upload)
+                .await;
+            let _session = cleanup.with_permit(permit);
+            if self.handle_table.open_count(ino) > 0 {
+                continue;
+            }
+            let Ok(prefetch_guard) = self
+                .state
+                .read
+                .prefetch_payload_gate
+                .clone()
+                .try_write_owned()
+            else {
+                continue;
+            };
+            let (absent, candidates): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|id| {
+                !self.local_payload_backend.contains(*id)
+                    && !self.cached_store.has_staged_upload(*id)
+            });
+            self.cached_store.forget_retired_uploads(ino, &absent);
+            if candidates.is_empty() {
+                continue;
+            }
+
+            // One shared scan skips still-referenced candidates across all inodes.
+            let observed = match &observed_references {
+                Some(references) => references,
+                None => observed_references.insert(
+                    self.meta
+                        .run_maintenance(|meta| meta.get_local_referenced_object_ids())
+                        .await?,
+                ),
+            };
+            let candidates: Vec<_> = candidates
+                .into_iter()
+                .filter(|id| !observed.contains(id))
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+
+            // Recheck under the inode gate: rollback may have restored a candidate since the scan.
+            self.wait_for_volatile_overlay_batches().await?;
+            let referenced = self
+                .meta
+                .run_maintenance(|meta| meta.get_local_referenced_object_ids())
+                .await?;
+            let pending: std::collections::HashSet<_> = self
+                .pending_uploads_snapshot_for_inode(ino)
+                .into_iter()
+                .map(|op| op.object_id)
+                .chain(
+                    self.live_extent_records_for_inode(ino)
+                        .into_iter()
+                        .map(|(_, id, _)| id),
+                )
+                .collect();
+            let objects: Vec<_> = candidates
+                .into_iter()
+                .filter(|id| {
+                    !referenced.contains(id)
+                        && !pending.contains(id)
+                        && !self.cached_store.is_pinned(*id)
+                })
+                .collect();
+            if objects.is_empty() {
+                continue;
+            }
+
+            // A crash must not restore an older redb graph after its dirty bytes are gone.
+            self.meta
+                .run_maintenance(|meta| meta.sync_local_metadata())
+                .await?;
+            let cached_store = self.cached_store.clone();
+            let backend = self.local_payload_backend.clone();
+            let state = self.state.clone();
+            let removed_objects = objects.len();
+            run_local_cache_io_blocking(move || {
+                let _session = _session;
+                let _prefetch_guard = prefetch_guard;
+                for batch in objects.chunks(studiofs_cache::PAYLOAD_REMOVAL_CHUNK_OBJECTS) {
+                    cached_store.remove_staged_upload_batch(batch)?;
+                    backend.remove_batch(batch)?;
+                    cached_store.remove_hot_upload_batch(batch);
+                    {
+                        let mut evictions = state.upload.pending_evictions.lock();
+                        for id in batch {
+                            evictions.remove(id);
+                        }
+                    }
+                    cached_store.forget_retired_uploads(ino, batch);
+                }
+                Ok(())
+            })
+            .await?;
+            tracing::info!(ino, removed_objects, "reclaimed retired local payloads");
+        }
+        Ok(())
+    }
+
+    pub(super) async fn background_local_payload_reclamation(self: Arc<Self>) {
+        let cancel = self.state.shutdown.background_shutdown_token.clone();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {}
+            }
+            if let Err(error) = self.reclaim_retired_local_payloads().await {
+                warn!(%error, "local payload reclamation deferred; retaining candidates for retry");
+            }
+        }
+    }
+
     pub(super) fn regular_file_graph_usage(
         &self,
         meta: &Arc<dyn VfsMeta>,
