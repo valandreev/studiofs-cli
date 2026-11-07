@@ -509,7 +509,8 @@ into the older base.
 
 ```powershell
 cargo test -p studiofs-meta --lib reconcile_keeps_recovery_row -- --nocapture
-cargo test -p studiofs-meta --lib -- --ignored redb_repair --nocapture
+cargo test -p studiofs-meta --lib redb_repair_restores_pending_overlay_over_ready_baseline
+cargo test -p studiofs-meta --lib -- --ignored redb_repair --test-threads=1 --nocapture
 ```
 
 The ignored tests need `STUDIOFS_TEST_PG_DSN`. They do not prove mounted bytes.

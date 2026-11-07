@@ -1430,6 +1430,63 @@ fn redb_repair_restores_acknowledged_uploaded_overlay_before_startup_cleanup() {
 }
 
 #[test]
+fn redb_repair_restores_pending_overlay_over_ready_baseline() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let file = create_published_small_file(&pg, ROOT_INO, b"repair-ready-baseline.bin", 77_028);
+    let mut checkpoint = pg.local.export_snapshot().expect("export Ready baseline");
+    checkpoint.event_log.clear();
+
+    set_file_state(&pg, file.ino, 96, 2);
+    pg.local
+        .flush_regular_file_overlay_slices(
+            file.ino,
+            &[(
+                ChunkId(0),
+                vec![SliceRecord::new(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(64, 96).unwrap(),
+                    PayloadRef::new_partial(77_029, 32),
+                )],
+            )],
+        )
+        .expect("append pending payload");
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 2, 77_029)
+            .expect("upload pending payload")
+    );
+    let accepted = pg.get_attr(file.ino).expect("accepted attr");
+    let accepted_slices = pg.lookup_regular_file_slices(file.ino, 0, 96).unwrap();
+    pg.local
+        .import_remote_snapshot(&checkpoint)
+        .expect("restore published baseline without pending overlay");
+    assert_eq!(
+        pg.get_attr(file.ino).unwrap().upload_state,
+        UploadState::Ready
+    );
+
+    assert!(
+        pg.restore_acknowledged_uploaded_regular_file_overlays_after_redb_repair()
+            .expect("restore pending append over its published baseline")
+    );
+    let restored = pg.get_attr(file.ino).unwrap();
+    assert_eq!(
+        (restored.size, restored.content_epoch, restored.upload_state),
+        (accepted.size, accepted.content_epoch, accepted.upload_state)
+    );
+    assert_eq!(restored.committed_size, accepted.committed_size);
+    assert_eq!(
+        restored.committed_content_epoch,
+        accepted.committed_content_epoch
+    );
+    assert_eq!(
+        pg.lookup_regular_file_slices(file.ino, 0, 96).unwrap(),
+        accepted_slices,
+        "repair must retain both the published prefix and pending append"
+    );
+}
+
+#[test]
 fn redb_repair_does_not_restore_uploaded_overlay_over_conflicting_same_epoch_state() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let file = pg
