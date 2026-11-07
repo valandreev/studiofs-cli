@@ -15,9 +15,6 @@ use studiofs_meta::schema::{
 use studiofs_meta::types::{FileType, Ino, InodeAttr, block_index_from_offset};
 use tracing::{debug, info, warn};
 
-/// Bounds the per-object retry after a failed batch; matches the backend's removal chunk.
-const STARTUP_PAYLOAD_REMOVAL_BATCH_OBJECTS: usize = 32;
-
 pub(super) struct StartupReplayCoordinator<'a> {
     vfs: &'a StudioVfs,
     pending_catalog: PendingUploadCatalog,
@@ -694,27 +691,22 @@ impl<'a> StartupReplayCoordinator<'a> {
 
     /// Returns only the objects fully removed, for callers to count and forget.
     fn remove_startup_local_payloads(&self, object_ids: &[u64]) -> Vec<u64> {
-        let unstaged: Vec<u64> = object_ids
-            .iter()
-            .copied()
-            .filter(
-                |&object_id| match self.vfs.cached_store.remove_staged_upload(object_id) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        warn!(
-                            object_id,
-                            error = %error,
-                            "startup replay upload-stage cleanup failed"
-                        );
-                        false
-                    }
-                },
-            )
-            .collect();
+        let mut unstaged = Vec::with_capacity(object_ids.len());
+        for &object_id in object_ids {
+            match self.vfs.cached_store.remove_staged_upload(object_id) {
+                Ok(()) => unstaged.push(object_id),
+                Err(error) => warn!(
+                    object_id,
+                    error = %error,
+                    "startup replay upload-stage cleanup failed"
+                ),
+            }
+        }
         // A per-object removal costs one durable index commit, which kept mounts
         // from becoming ready for minutes after heavy overwrites (SFS-1029).
         let mut removed = Vec::with_capacity(unstaged.len());
-        for batch in unstaged.chunks(STARTUP_PAYLOAD_REMOVAL_BATCH_OBJECTS) {
+        // Chunking here bounds the per-object retry after a failed batch.
+        for batch in unstaged.chunks(studiofs_cache::PAYLOAD_REMOVAL_CHUNK_OBJECTS) {
             if let Err(error) = self.vfs.local_payload_backend.remove_batch(batch) {
                 // A failed batch does not name the objects it reached.
                 warn!(

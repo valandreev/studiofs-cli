@@ -37,7 +37,7 @@ pub use runtime::{
     LocalPayloadBackendOpenError as PersistentLocalPayloadBackendError,
     LocalPayloadBackendRuntime as PersistentLocalPayloadBackend, LocalPayloadLayout,
     LocalPayloadReadMode, LocalPayloadRuntimeDetection, LocalPayloadSyncMode,
-    LocalPayloadWriteMode,
+    LocalPayloadWriteMode, PAYLOAD_REMOVAL_CHUNK_OBJECTS,
 };
 pub use upload_queue::{ObjectFileMapping, PendingUpload, PendingUploadSummary};
 

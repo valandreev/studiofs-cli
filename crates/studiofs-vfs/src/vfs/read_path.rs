@@ -3133,6 +3133,7 @@ pub(super) mod tests {
         advise_will_need_calls: AtomicU64,
         remove_calls: AtomicU64,
         remove_batch_calls: AtomicU64,
+        fail_next_remove_batch: AtomicBool,
         force_short_read: AtomicBool,
         read_threads: std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
     }
@@ -3148,6 +3149,7 @@ pub(super) mod tests {
                 advise_will_need_calls: AtomicU64::new(0),
                 remove_calls: AtomicU64::new(0),
                 remove_batch_calls: AtomicU64::new(0),
+                fail_next_remove_batch: AtomicBool::new(false),
                 force_short_read: AtomicBool::new(false),
                 read_threads: std::sync::Mutex::new(std::collections::HashSet::new()),
             }
@@ -3159,6 +3161,12 @@ pub(super) mod tests {
 
         pub(in crate::vfs) fn remove_batch_calls(&self) -> u64 {
             self.remove_batch_calls.load(AtomicOrdering::Relaxed)
+        }
+
+        /// Fails the next batch before it touches the backend, leaving every object present.
+        pub(in crate::vfs) fn fail_next_remove_batch(&self) {
+            self.fail_next_remove_batch
+                .store(true, AtomicOrdering::Relaxed);
         }
 
         fn read_thread_count(&self) -> usize {
@@ -3297,6 +3305,12 @@ pub(super) mod tests {
         ) -> Result<(), studiofs_cache::local::LocalPayloadBackendError> {
             self.remove_batch_calls
                 .fetch_add(1, AtomicOrdering::Relaxed);
+            if self
+                .fail_next_remove_batch
+                .swap(false, AtomicOrdering::Relaxed)
+            {
+                return Err(std::io::Error::other("injected batch removal failure").into());
+            }
             self.inner.remove_batch(object_ids)
         }
 

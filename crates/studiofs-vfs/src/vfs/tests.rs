@@ -6800,10 +6800,10 @@ fn startup_replay_removes_stale_payloads_in_batches() {
         0,
         "each per-object removal commits the payload index durably"
     );
-    assert!(
-        backend.remove_batch_calls() <= 4,
-        "one-object batches would cost the same commits: {}",
-        backend.remove_batch_calls()
+    assert_eq!(
+        backend.remove_batch_calls(),
+        4,
+        "two batches per cleanup path; one-object batches would cost the same commits"
     );
     for &object_id in warm_object_ids.iter().chain(&dirty_object_ids) {
         assert!(!vfs.local_payload_backend().contains(object_id));
@@ -6813,6 +6813,35 @@ fn startup_replay_removes_stale_payloads_in_batches() {
         .startup_replay
         .expect("startup replay summary should be visible");
     assert_eq!(summary.orphan_dirty_payloads_removed, 40);
+    assert_eq!(summary.unreferenced_local_payloads_removed, 40);
+}
+
+#[test]
+fn startup_replay_retry_removes_objects_a_failed_batch_left_present() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "startup-replay-batch-retry");
+    let _guard = rt.enter();
+    let backend = crate::vfs::read_path::tests::install_counting_backend(&mut vfs);
+    let object_ids: Vec<u64> = (991_700..991_740).collect();
+    for &object_id in &object_ids {
+        seed_unreferenced_warm_payload(&vfs, object_id);
+    }
+    backend.fail_next_remove_batch();
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], &[]);
+
+    assert_eq!(
+        backend.remove_calls(),
+        studiofs_cache::PAYLOAD_REMOVAL_CHUNK_OBJECTS as u64,
+        "only the failed batch is retried per object"
+    );
+    for &object_id in &object_ids {
+        assert!(!vfs.local_payload_backend().contains(object_id));
+    }
+    let summary = vfs
+        .zeroio_runtime_snapshot()
+        .startup_replay
+        .expect("startup replay summary should be visible");
     assert_eq!(summary.unreferenced_local_payloads_removed, 40);
 }
 
@@ -6841,10 +6870,10 @@ fn startup_replay_failed_batch_still_removes_and_counts_healthy_payloads() {
 
     vfs.replay_dirty_uploads_from_local_backend(&[], &[]);
 
+    let retried = backend.remove_calls();
     assert!(
-        backend.remove_calls() <= 32,
-        "one bad payload must only slow its own batch: {}",
-        backend.remove_calls()
+        retried > 0 && retried <= studiofs_cache::PAYLOAD_REMOVAL_CHUNK_OBJECTS as u64,
+        "one bad payload must only slow its own batch: {retried}"
     );
     for &object_id in &healthy_object_ids {
         assert!(!vfs.local_payload_backend().contains(object_id));

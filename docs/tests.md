@@ -1640,6 +1640,7 @@ regressions:
   - `sfs316_delete_before_publish_tombstone_does_not_publish_deleted_content`
   - `startup_replay_cancels_ready_inode_stale_pending_upload`
   - `startup_replay_removes_stale_payloads_in_batches`
+  - `startup_replay_retry_removes_objects_a_failed_batch_left_present`
   - `startup_replay_failed_batch_still_removes_and_counts_healthy_payloads`
   - `graceful_shutdown_remount_preserves_newer_local_epoch_over_published_base` *(requires S3 env)*
   - `test_truncate_shrink_then_extend_zero_fills_old_tail`
