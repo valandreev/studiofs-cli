@@ -2082,6 +2082,8 @@ struct ReadState {
     before_published_read_plan_cache_put: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     before_retired_payload_recheck: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_retired_payload_removal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl ReadState {
@@ -2114,6 +2116,17 @@ impl ReadState {
             before_published_read_plan_cache_put: Mutex::new(None),
             #[cfg(test)]
             before_retired_payload_recheck: Mutex::new(None),
+            #[cfg(test)]
+            before_retired_payload_removal: Mutex::new(None),
+        }
+    }
+
+    /// Runs a test hook on the blocking pool just before reclamation removes payloads.
+    #[cfg(test)]
+    fn run_before_retired_payload_removal_for_test(&self) {
+        let hook = self.before_retired_payload_removal.lock().take();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 

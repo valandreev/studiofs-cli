@@ -6947,9 +6947,25 @@ fn retired_payload_recheck_keeps_object_restored_after_first_scan() {
                 )
                 .unwrap();
         }));
+        let free_during_removal = Arc::new(AtomicBool::new(false));
+        let hook_flag = free_during_removal.clone();
+        let hook_vfs = vfs.clone();
+        *vfs.state.read.before_retired_payload_removal.lock() = Some(Box::new(move || {
+            let prefetch_free = hook_vfs.state.read.prefetch_payload_gate.try_read().is_ok();
+            let restored_inode_free = hook_vfs
+                .state
+                .file_session
+                .try_enter_upload(restored_ino)
+                .is_some();
+            hook_flag.store(prefetch_free && restored_inode_free, Ordering::SeqCst);
+        }));
 
         vfs.reclaim_retired_local_payloads().await.unwrap();
 
+        assert!(
+            free_during_removal.load(Ordering::SeqCst),
+            "removal I/O must not hold the prefetch gate or an inode with nothing to remove"
+        );
         assert!(
             vfs.local_payload_backend().contains(restored),
             "an object restored after the first scan must survive"
@@ -6958,6 +6974,39 @@ fn retired_payload_recheck_keeps_object_restored_after_first_scan() {
             !vfs.local_payload_backend().contains(removed),
             "one sweep must reclaim the other inode's displaced object"
         );
+    });
+}
+
+#[test]
+fn retired_payload_barrier_defers_removal_for_prefetch_started_before_recheck() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("sfs-1032-barrier-");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "retire-barrier");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs.create(ROOT_INO, b"barrier", 0, 0, 0o644).unwrap();
+        vfs.write(attr.ino, 0, b"first payload").await.unwrap();
+        vfs.fsync(attr.ino, false).await.unwrap();
+        let old = vfs.pending_uploads_snapshot_for_inode(attr.ino)[0].clone();
+        vfs.write(attr.ino, 0, b"newer payload").await.unwrap();
+        vfs.fsync(attr.ino, false).await.unwrap();
+        vfs.cached_store.cancel_upload(&old);
+
+        let prefetch = Arc::new(Mutex::new(None));
+        let hook_prefetch = prefetch.clone();
+        let gate = vfs.state.read.prefetch_payload_gate.clone();
+        *vfs.state.read.before_retired_payload_recheck.lock() = Some(Box::new(move || {
+            *hook_prefetch.lock() = Some(gate.try_read_owned().unwrap());
+        }));
+
+        vfs.reclaim_retired_local_payloads().await.unwrap();
+        assert!(
+            vfs.local_payload_backend().contains(old.object_id),
+            "a prefetch admitted before the recheck may still read the displaced object"
+        );
+
+        prefetch.lock().take();
+        vfs.reclaim_retired_local_payloads().await.unwrap();
+        assert!(!vfs.local_payload_backend().contains(old.object_id));
     });
 }
 

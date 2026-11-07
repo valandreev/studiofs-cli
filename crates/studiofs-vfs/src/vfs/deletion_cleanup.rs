@@ -123,16 +123,10 @@ impl StudioVfs {
         batch: &[(u64, Vec<u64>)],
         unfinished: &mut HashSet<u64>,
     ) -> VfsResult<()> {
-        let Ok(prefetch_guard) = self
-            .state
-            .read
-            .prefetch_payload_gate
-            .clone()
-            .try_write_owned()
-        else {
+        // Skip gate and scan work while read-ahead is busy; the barrier below is the safety check.
+        if self.state.read.prefetch_payload_gate.try_write().is_err() {
             return Ok(());
-        };
-        let mut sessions = Vec::with_capacity(batch.len());
+        }
         let mut admitted = Vec::with_capacity(batch.len());
         for (ino, candidates) in batch {
             // Try-acquire: a queued writer would make later reads wait behind a slow reader.
@@ -140,9 +134,9 @@ impl StudioVfs {
             let Some(permit) = self.state.file_session.try_enter_upload(*ino) else {
                 continue;
             };
-            sessions.push(cleanup.with_permit(permit));
+            let session = cleanup.with_permit(permit);
             if self.handle_table.open_count(*ino) == 0 {
-                admitted.push((*ino, candidates));
+                admitted.push((*ino, candidates, session));
             }
         }
         if admitted.is_empty() {
@@ -159,8 +153,13 @@ impl StudioVfs {
             .meta
             .run_maintenance(|meta| meta.get_local_referenced_object_ids())
             .await?;
+        // Barrier: a prefetch that resolved before the recheck may still read a displaced object.
+        // Later ones resolve the rechecked graph, which the held inode gates keep unchanged.
+        if self.state.read.prefetch_payload_gate.try_write().is_err() {
+            return Ok(());
+        }
         let mut removals = Vec::new();
-        for (ino, candidates) in admitted {
+        for (ino, candidates, session) in admitted {
             let owned: HashSet<_> = self
                 .pending_uploads_snapshot_for_inode(ino)
                 .into_iter()
@@ -177,7 +176,7 @@ impl StudioVfs {
                 .filter(|id| !referenced.contains(id))
                 .partition(|id| owned.contains(id) || self.cached_store.is_pinned(*id));
             if !objects.is_empty() {
-                removals.push((ino, objects, busy.is_empty()));
+                removals.push((ino, objects, busy.is_empty(), session));
             } else if busy.is_empty() {
                 unfinished.remove(&ino);
             }
@@ -194,11 +193,11 @@ impl StudioVfs {
         let backend = self.local_payload_backend.clone();
         let state = self.state.clone();
         let ((finished, first_error), _) = run_local_cache_io_blocking(move || {
-            let _sessions = sessions;
-            let _prefetch_guard = prefetch_guard;
+            #[cfg(test)]
+            state.read.run_before_retired_payload_removal_for_test();
             let mut finished = Vec::new();
             let mut first_error = None;
-            for (ino, objects, finishes_inode) in removals {
+            for (ino, objects, finishes_inode, _session) in removals {
                 let removed = objects
                     .chunks(studiofs_cache::PAYLOAD_REMOVAL_CHUNK_OBJECTS)
                     .try_for_each(|batch| -> VfsResult<()> {
