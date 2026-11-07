@@ -459,10 +459,21 @@ For an inode present in the checkpoint, repair keeps its metadata and link
 count, reapplies locally changed metadata fields, adds only missing saved
 dentries, and restores the pending size and overlay.
 
+Repair records the remote head right after the checkpoint import. This client's
+own events up to that version predate the rebuilt base, so replay applies them
+through the foreign path and installs each publication's exact graph, holes and
+tombstones included, instead of merging it as an echo older than base. Peers
+never see a pending attr, so head can hold exactly the Ready state a row's
+pending epoch was written over. That state matches the row's committed fields
+and is its own base, so repair restores the row over it rather than treating it
+as a conflicting identity.
+
 Repair retires a row when the inode identity changed, a previously published
-inode is absent, a strictly newer content epoch superseded it, or the published
-base contains every payload object retained by the row. A same-numbered
-committed epoch alone does not prove that the row's payload was published. An
+inode is absent from both the serving and base views, a strictly newer content
+epoch superseded it, or a Ready inode at the row's exact content epoch has a
+published base containing every payload object retained by the row. A
+same-numbered committed epoch alone does not prove that the row's payload was
+published, and neither do object IDs held by an older publication. An
 ambiguous identity or namespace conflict keeps the recovery row and its object
 references. The local-graph repair marker keeps the mount degraded and
 read-only while recovery rows remain unresolved. After remote replay reaches

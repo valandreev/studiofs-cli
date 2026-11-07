@@ -1731,6 +1731,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             batch_events,
             overlay,
             base_protected_regular_file_inodes,
+            false,
         );
         match result {
             Ok(outcome) => {
@@ -1751,6 +1752,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         batch_events: &[MetaEvent],
         overlay: &OverlayConflictSets,
         base_protected_regular_file_inodes: &HashSet<Ino>,
+        replays_own_history: bool,
     ) -> MetaResult<RemoteApplyBatchOutcome> {
         let batch_events =
             self.preserve_published_content_state_for_attr_only_events_in_txn(txn, batch_events)?;
@@ -1788,13 +1790,22 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 removed_inodes_with_local_regular_file_state.insert(*ino);
             }
         }
-        let partial_publish_inodes = Self::partial_regular_file_publish_inodes(&batch_events);
+        // A publication carries the sender's whole graph, and own history replays onto a rebuilt
+        // base in PostgreSQL order, so it replaces base instead of merging as a partial update.
+        let partial_publish_inodes = if replays_own_history {
+            HashSet::new()
+        } else {
+            Self::partial_regular_file_publish_inodes(&batch_events)
+        };
         let mut base_range_preserve_inodes = self.protected_base_range_preserve_inodes_in_txn(
             txn,
             &batch_events,
             &protected_regular_file_inodes,
         )?;
         base_range_preserve_inodes.extend(partial_publish_inodes.iter().copied());
+        if replays_own_history {
+            base_range_preserve_inodes.clear();
+        }
         let mut stale_partial_ready_attr_inodes = HashSet::new();
         for event in &batch_events {
             let MetaEvent::SetAttr { attr } = event else {
@@ -2741,6 +2752,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
         if let Some(inodes) = self_removed_inodes {
             txn.exempt_from_serving_corrections(inodes);
         }
+        let repair_self_replay_end =
+            txn.get_counter(super::LOCAL_PG_REPAIR_SELF_REPLAY_END_COUNTER)?;
         for batch in batches {
             if let Some(execution) = execution {
                 execution.check()?;
@@ -2775,58 +2788,72 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 }
             }
             reconcile_dentry_keys.extend(touched_keys);
-            if batch.is_self_batch {
-                let (acknowledged_seq, superseded_publish_inodes) = self
-                    .prepare_self_batch_in_txn(
+            // Own events from before a redb repair replay onto serving and base rebuilt from
+            // an older checkpoint, so they are ordered like any other client's history.
+            let replay_as_self = batch.is_self_batch
+                && u64::try_from(batch.batch_version)
+                    .is_ok_and(|version| version > repair_self_replay_end);
+            let prepared_self_batch = batch
+                .is_self_batch
+                .then(|| {
+                    self.prepare_self_batch_in_txn(
                         txn,
                         batch.batch_version,
                         &batch.events,
                         context.flushed_event_seq,
                         context.next_event_seq,
                         execution,
-                    )?;
-                applied_any |= self.apply_visible_self_batch_in_txn(
-                    txn,
-                    &events,
-                    &superseded_publish_inodes,
-                    &mut reconcile_inodes,
-                )?;
-                applied_self_batch = true;
-                if let Some(next_flushed_event_seq) = acknowledged_seq
-                    && self
-                        .local_event_ack_barrier
-                        .is_none_or(|barrier| next_flushed_event_seq <= barrier)
-                {
-                    context.flushed_event_seq = next_flushed_event_seq;
-                    acknowledged_flushed_event_seq = Some(next_flushed_event_seq);
-                    overlay_is_dirty = true;
-                    Self::retire_acknowledged_xattr_tombstones_in_txn(
+                    )
+                })
+                .transpose()?;
+            match &prepared_self_batch {
+                Some((_, superseded_publish_inodes)) if replay_as_self => {
+                    applied_any |= self.apply_visible_self_batch_in_txn(
                         txn,
-                        &batch.events,
-                        next_flushed_event_seq,
-                        replay_next_event_seq,
-                        execution,
+                        &events,
+                        superseded_publish_inodes,
+                        &mut reconcile_inodes,
                     )?;
+                    applied_self_batch = true;
                 }
-            } else {
-                let effective_overlay =
-                    Self::effective_replay_overlay(&overlay, recent_flush, batch.batch_version);
-                let protected_base_inodes = Self::protected_base_inodes_for_replay(recent_flush)
-                    .unwrap_or(&empty_protected_base_inodes);
-                let outcome = self.apply_foreign_batch_in_txn(
-                    txn,
-                    &events,
-                    &effective_overlay,
-                    protected_base_inodes,
-                )?;
-                applied_any |= outcome.changed;
-                Self::extend_overlay_conflicts(
-                    &mut replay_protected_overlay,
-                    &Self::regular_file_protection_owned_by_local_suffix(
-                        outcome.protected_overlay,
+                _ => {
+                    let effective_overlay =
+                        Self::effective_replay_overlay(&overlay, recent_flush, batch.batch_version);
+                    let protected_base_inodes =
+                        Self::protected_base_inodes_for_replay(recent_flush)
+                            .unwrap_or(&empty_protected_base_inodes);
+                    let outcome = self.apply_foreign_batch_in_txn(
+                        txn,
+                        &events,
                         &effective_overlay,
-                    ),
-                );
+                        protected_base_inodes,
+                        batch.is_self_batch,
+                    )?;
+                    applied_any |= outcome.changed;
+                    Self::extend_overlay_conflicts(
+                        &mut replay_protected_overlay,
+                        &Self::regular_file_protection_owned_by_local_suffix(
+                            outcome.protected_overlay,
+                            &effective_overlay,
+                        ),
+                    );
+                }
+            }
+            if let Some((Some(next_flushed_event_seq), _)) = prepared_self_batch
+                && self
+                    .local_event_ack_barrier
+                    .is_none_or(|barrier| next_flushed_event_seq <= barrier)
+            {
+                context.flushed_event_seq = next_flushed_event_seq;
+                acknowledged_flushed_event_seq = Some(next_flushed_event_seq);
+                overlay_is_dirty = true;
+                Self::retire_acknowledged_xattr_tombstones_in_txn(
+                    txn,
+                    &batch.events,
+                    next_flushed_event_seq,
+                    replay_next_event_seq,
+                    execution,
+                )?;
             }
             if batch.events.iter().any(MetaEvent::is_namespace_mutation) {
                 max_namespace_version = max_namespace_version.max(batch.batch_version);

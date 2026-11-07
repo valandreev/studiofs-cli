@@ -1392,7 +1392,8 @@ impl RedbMetaEngine {
         Self::apply_events_to_base_in_txn(txn, events, protected_regular_file_inodes, false)
     }
 
-    /// Mirrors this client's own events, which are never newer than its local base.
+    /// Mirrors this client's own events. A protected merge assumes an echo older than the local
+    /// base, so a caller must not protect events published before a repair rebuilt that base.
     pub(crate) fn apply_own_events_to_base_in_txn<'event>(
         txn: &RedbWriteTransaction<'_>,
         events: impl IntoIterator<Item = &'event crate::events::MetaEvent>,
