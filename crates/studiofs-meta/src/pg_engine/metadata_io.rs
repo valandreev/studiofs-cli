@@ -531,7 +531,7 @@ impl PgMetaEngine {
         }
     }
 
-    fn read_remote_metadata_head_version_unrecorded(&self) -> MetaResult<i64> {
+    pub(super) fn read_remote_metadata_head_version_unrecorded(&self) -> MetaResult<i64> {
         self.run_async(read_remote_metadata_head_version_with_pool(
             self.command_pool.clone(),
             self.volume_id,

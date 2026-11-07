@@ -499,6 +499,23 @@ every leg must finish successfully. Compare buffered and direct reads, then
 verify file contents after a clean remount. A timed-out leg is not a pass.
 Interrupted-startup/redb-repair corruption is tracked separately as SFS-1024.
 
+### SFS-1024 Redb Repair Preserves Pending File Contents
+
+A SIGKILL during startup followed by redb repair could change a pending file.
+Reconciliation read only the serving inode table during repair catch-up, so an
+inode served from base looked deleted and lost its recovery row. Own events from
+before the repair also left serving at the checkpoint and merged sparse graphs
+into the older base.
+
+```powershell
+cargo test -p studiofs-meta --lib reconcile_keeps_recovery_row -- --nocapture
+cargo test -p studiofs-meta --lib -- --ignored redb_repair --nocapture
+```
+
+The ignored tests need `STUDIOFS_TEST_PG_DSN`. They do not prove mounted bytes.
+The mounted evidence is short fsx legs with a SIGKILL during startup or shortly
+after it, compared before and after repair through buffered and O_DIRECT reads.
+
 ### SFS-892 Linux FUSE Small I/O Regressions
 
 Linux registered no `readdirplus` callback, so `ls -l` and `find` sent one

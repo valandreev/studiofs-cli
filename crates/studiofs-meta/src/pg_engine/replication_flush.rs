@@ -100,6 +100,20 @@ fn attrs_match_repair_candidate(current: &InodeAttr, candidate: &InodeAttr) -> b
         && (current.size == candidate.size || current.size == candidate.committed_size)
 }
 
+/// Peers never see a pending attr, so head can hold exactly the published state the row's
+/// pending epoch was written over. That is the row's own base, not a conflicting identity.
+fn attrs_are_repair_candidate_baseline(current: &InodeAttr, candidate: &InodeAttr) -> bool {
+    current.ino == candidate.ino
+        && current.kind == candidate.kind
+        && current.crtime == candidate.crtime
+        && current.upload_state == UploadState::Ready
+        && candidate.is_upload_pending()
+        && current.size == candidate.committed_size
+        && current.committed_size == candidate.committed_size
+        && current.content_epoch == candidate.committed_content_epoch
+        && current.committed_content_epoch == candidate.committed_content_epoch
+}
+
 fn push_repaired_overlay_events(
     events: &mut Vec<MetaEvent>,
     attr: InodeAttr,
@@ -688,9 +702,11 @@ impl PgMetaEngine {
                 obsolete_recovery_inodes.push(ino);
                 continue;
             }
-            if !attrs_match_repair_candidate(current, &attr) {
+            let over_baseline = attrs_are_repair_candidate_baseline(current, &attr);
+            if !over_baseline && !attrs_match_repair_candidate(current, &attr) {
                 if current.content_epoch > attr.content_epoch
                     || (!current.is_upload_pending()
+                        && current.content_epoch == attr.content_epoch
                         && self
                             .local
                             .pending_recovery_payloads_are_published(&recovery)?)
@@ -732,6 +748,8 @@ impl PgMetaEngine {
             };
             let mut restored_attr = current.clone();
             restored_attr.size = attr.size;
+            restored_attr.content_epoch = attr.content_epoch;
+            restored_attr.upload_state = attr.upload_state;
             if let Some(baseline) = recovery.baseline_attr.as_ref()
                 && baseline.ino == attr.ino
                 && baseline.crtime == attr.crtime

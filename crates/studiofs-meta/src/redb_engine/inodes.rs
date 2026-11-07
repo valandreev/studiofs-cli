@@ -569,9 +569,13 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         recovery: &PendingRegularFileRecoveryRecord,
     ) -> MetaResult<bool> {
-        let Some(current) = Self::get_attr_from_write_table(txn, INODES_TABLE, recovery.attr.ino)?
-        else {
-            return Ok(recovery.had_published_inode == Some(true));
+        // Serving rows are sparse over base, so only the merged view can prove a deletion.
+        let current = match Self::get_attr_merged_in_write_txn(txn, recovery.attr.ino) {
+            Ok(current) => current,
+            Err(MetaError::InodeNotFound(_)) => {
+                return Ok(recovery.had_published_inode == Some(true));
+            }
+            Err(error) => return Err(error),
         };
         if current.kind != FileType::RegularFile || current.crtime != recovery.attr.crtime {
             return Ok(true);
@@ -579,7 +583,9 @@ impl RedbMetaEngine {
         if current.content_epoch > recovery.attr.content_epoch {
             return Ok(true);
         }
-        if !current.is_upload_pending() {
+        // An older publication can hold the same objects at other ranges; only a publication
+        // of this exact epoch proves the row's graph.
+        if !current.is_upload_pending() && current.content_epoch == recovery.attr.content_epoch {
             let base = Self::regular_file_chunk_states_for_inode_in_write_txn(
                 txn,
                 REGULAR_FILE_BASE_TABLE,
@@ -1715,6 +1721,165 @@ mod tests {
             .unwrap();
         let recoveries = engine.pending_uploaded_regular_file_recoveries().unwrap();
         assert_eq!(recoveries[0].had_published_inode, Some(true));
+    }
+
+    /// Serving rows are sparse over base: replay after a repair import can leave a
+    /// pending inode only in the base table, which must not read as a deletion.
+    #[test]
+    fn reconcile_keeps_recovery_row_for_inode_served_from_base() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let db_path = temp.path().join("pending-file-recovery-base-only.redb");
+        let engine = RedbMetaEngine::open(&db_path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+        engine
+            .set_format_info(&test_format_info("pending-file-recovery-base-only"))
+            .unwrap();
+        let file = engine
+            .create_file(ROOT_INO, b"base-only.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let mut attr = engine.get_attr(file.ino).unwrap();
+        attr.size = 4096;
+        attr.content_epoch = 1;
+        engine.set_attr(&attr).unwrap();
+        engine
+            .flush_regular_file_overlay_slices(
+                file.ino,
+                &[(
+                    ChunkId(0),
+                    vec![SliceRecord::new(
+                        SliceId(0),
+                        SliceOrder(0),
+                        SliceRange::new(0, 4096).unwrap(),
+                        PayloadRef::new_partial(777_102, 4096),
+                    )],
+                )],
+            )
+            .unwrap();
+        assert!(
+            engine
+                .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, 777_102)
+                .unwrap()
+        );
+        let pending = engine.get_attr(file.ino).unwrap();
+        let mut record = engine.pending_uploaded_regular_file_recoveries().unwrap()[0].clone();
+        record.had_published_inode = Some(true);
+        let bytes = encode_pending_regular_file_recovery(&record).unwrap();
+
+        let txn = engine.begin_write_txn().unwrap();
+        txn.open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .unwrap()
+            .insert(file.ino, bytes.as_slice())
+            .unwrap();
+        txn.open_table(BASE_INODES_TABLE)
+            .unwrap()
+            .insert(file.ino, encode(&pending).unwrap().as_slice())
+            .unwrap();
+        txn.open_table(INODES_TABLE)
+            .unwrap()
+            .remove(file.ino)
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(engine.get_attr(file.ino).unwrap(), pending);
+
+        engine.reconcile_pending_regular_file_recoveries().unwrap();
+        assert_eq!(
+            engine
+                .pending_uploaded_regular_file_recoveries()
+                .unwrap()
+                .len(),
+            1,
+            "a pending inode served from base has not been deleted"
+        );
+
+        let txn = engine.begin_write_txn().unwrap();
+        txn.open_table(BASE_INODES_TABLE)
+            .unwrap()
+            .remove(file.ino)
+            .unwrap();
+        txn.commit().unwrap();
+        engine.reconcile_pending_regular_file_recoveries().unwrap();
+        assert!(
+            engine
+                .pending_uploaded_regular_file_recoveries()
+                .unwrap()
+                .is_empty(),
+            "a published inode absent from serving and base is really deleted"
+        );
+    }
+
+    /// A publication from an older epoch can hold the same object IDs at other ranges,
+    /// so ID inclusion alone does not prove the recovery row's newer graph was published.
+    #[test]
+    fn reconcile_keeps_recovery_row_when_only_older_publication_holds_its_objects() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let db_path = temp.path().join("pending-file-recovery-older-ready.redb");
+        let engine = RedbMetaEngine::open(&db_path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+        engine
+            .set_format_info(&test_format_info("pending-file-recovery-older-ready"))
+            .unwrap();
+        let file = engine
+            .create_file(ROOT_INO, b"older-ready.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let mut attr = engine.get_attr(file.ino).unwrap();
+        attr.size = 4096;
+        attr.content_epoch = 2;
+        engine.set_attr(&attr).unwrap();
+        let slice = |end| {
+            SliceRecord::new(
+                SliceId(0),
+                SliceOrder(0),
+                SliceRange::new(0, end).unwrap(),
+                PayloadRef::new_partial(777_103, end),
+            )
+        };
+        engine
+            .flush_regular_file_overlay_slices(file.ino, &[(ChunkId(0), vec![slice(4096)])])
+            .unwrap();
+        assert!(
+            engine
+                .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 2, 777_103)
+                .unwrap()
+        );
+        assert_eq!(
+            engine
+                .pending_uploaded_regular_file_recoveries()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut older = engine.get_attr(file.ino).unwrap();
+        older.size = 1024;
+        older.committed_size = 1024;
+        older.content_epoch = 1;
+        older.committed_content_epoch = 1;
+        older.upload_state = UploadState::Ready;
+        let txn = engine.begin_write_txn().unwrap();
+        txn.open_table(INODES_TABLE)
+            .unwrap()
+            .insert(file.ino, encode(&older).unwrap().as_slice())
+            .unwrap();
+        RedbMetaEngine::set_regular_file_chunk_state_in_txn(
+            &txn,
+            REGULAR_FILE_BASE_TABLE,
+            false,
+            file.ino,
+            ChunkId(0),
+            &[slice(1024)],
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        engine.reconcile_pending_regular_file_recoveries().unwrap();
+        assert_eq!(
+            engine
+                .pending_uploaded_regular_file_recoveries()
+                .unwrap()
+                .len(),
+            1,
+            "the older publication does not contain the row's 4096-byte graph"
+        );
     }
 
     #[test]

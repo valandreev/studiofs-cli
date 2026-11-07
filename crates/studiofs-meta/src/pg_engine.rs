@@ -115,6 +115,7 @@ const LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS: usize = 256;
 const LOCAL_EVENT_LOG_PRUNE_MAX_BATCHES_PER_POLL: usize = 16;
 pub(crate) const LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER: &str =
     "pgRedbRepairLocalGraphRecoveryPending";
+pub(crate) const LOCAL_PG_REPAIR_SELF_REPLAY_END_COUNTER: &str = "pgRedbRepairSelfReplayEnd";
 pub(crate) const LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER: &str = "pgFreshClientPending";
 const LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER: &str = "pgInodeActiveRangeStart";
 const LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER: &str = "pgInodeActiveRangeEnd";
@@ -155,6 +156,7 @@ pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
             | crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION
             | LOCAL_PG_CLIENT_SLOT_COUNTER
             | LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER
+            | LOCAL_PG_REPAIR_SELF_REPLAY_END_COUNTER
             | LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER
             | LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER
             | LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER
@@ -1684,6 +1686,13 @@ impl PgMetaEngine {
                 .backfill_missing_uploaded_regular_file_recoveries()?;
             engine.pull_snapshot_locked(
                 StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog,
+            )?;
+            // Nothing can publish before this open returns, so every own event replayed up to
+            // this version predates the repair. Kept durable for a catch-up that stops early.
+            let self_replay_end = engine.read_remote_metadata_head_version_unrecorded()?;
+            engine.local.set_counter(
+                LOCAL_PG_REPAIR_SELF_REPLAY_END_COUNTER,
+                u64::try_from(self_replay_end).unwrap_or(0),
             )?;
             engine.restore_pending_state_from_local_log()?;
             // The checkpoint can predate published parents of recovery rows; judge

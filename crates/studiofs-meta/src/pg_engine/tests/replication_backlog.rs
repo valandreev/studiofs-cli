@@ -4309,3 +4309,129 @@ fn redb_repair_unpublished_child_scenario(tail_batches: usize, expect_restored: 
     assert!(pg.pg_sync_status().allows_new_mutations());
     pg.prepare_for_close().expect("close repaired writer");
 }
+
+/// A real repair over a published sparse file with newer pending uploads: the rebuilt base
+/// must equal the accepted graph, and the pending size and overlay must survive catch-up.
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn redb_repair_preserves_sparse_published_graph_and_pending_overlay() {
+    use crate::schema::{ChunkId, SliceId, SliceOrder, SliceRange, SliceRecord};
+
+    let dsn = pg_dsn().expect("PostgreSQL regression requires STUDIOFS_TEST_PG_DSN");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let path = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-sfs1024-repair-sparse-pending");
+    seed_local(&path, &volume.format_info());
+    let options = PgOpenOptions {
+        background_poll: false,
+        ..Default::default()
+    };
+    let pg = PgMetaEngine::open_with_options(&path, options).expect("open writer");
+    let flush = |pg: &PgMetaEngine| {
+        pg.pending_state.lock().unwrap().force_flush = true;
+        pg.flush_due_pending().expect("publish batch");
+    };
+    let file = pg
+        .create_file(ROOT_INO, b"sparse-pending.bin", 0, 0, 0o644)
+        .expect("create file");
+    let publish = |epoch, slices: Vec<SliceRecord>| {
+        set_file_state(&pg, file.ino, 16_384, epoch);
+        pg.local
+            .flush_regular_file_overlay_slices(file.ino, &[(ChunkId(0), slices)])
+            .expect("stage overlay");
+        let ids = pg
+            .lookup_regular_file_slices(file.ino, 0, 16_384)
+            .unwrap()
+            .into_iter()
+            .filter_map(|span| span.payload.map(|payload| payload.object_id))
+            .collect::<HashSet<_>>();
+        for id in ids {
+            let _ = pg.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, epoch, id);
+        }
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, epoch)
+                .expect("publish overlay")
+        );
+    };
+    let slice = |start, end, object| {
+        SliceRecord::new(
+            SliceId(0),
+            SliceOrder(0),
+            SliceRange::new(start, end).unwrap(),
+            PayloadRef::new_partial(object, end - start),
+        )
+    };
+    publish(1, vec![slice(0, 4_096, 92_101)]);
+    flush(&pg);
+    pg.write_checkpoint_with_lease()
+        .expect("publish checkpoint with the older head");
+    // Newer sparse publication: a new head and a disjoint tail, with holes before EOF.
+    publish(
+        2,
+        vec![
+            slice(0, 4_096, 92_102),
+            SliceRecord::new(
+                SliceId(1),
+                SliceOrder(1),
+                SliceRange::new(8_192, 12_288).unwrap(),
+                PayloadRef::new_partial(92_103, 4_096),
+            ),
+        ],
+    );
+    flush(&pg);
+    let spans = |pg: &PgMetaEngine, size| {
+        pg.lookup_regular_file_slices(file.ino, 0, size)
+            .unwrap()
+            .into_iter()
+            .filter_map(|span| {
+                span.payload
+                    .map(|payload| (payload.object_id, span.range.start, span.range.end))
+            })
+            .collect::<Vec<_>>()
+    };
+    let published = spans(&pg, 16_384);
+    assert!(published.contains(&(92_102, 0, 4_096)), "{published:?}");
+
+    // Pending uploaded rewrite, smaller than the published size.
+    set_file_state(&pg, file.ino, 12_000, 3);
+    pg.local
+        .flush_regular_file_overlay_slices(file.ino, &[(ChunkId(0), vec![slice(0, 2_048, 92_104)])])
+        .expect("stage pending overlay");
+    assert!(
+        pg.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 3, 92_104)
+            .expect("mark pending uploaded")
+    );
+    flush(&pg);
+    let accepted = pg.get_attr(file.ino).expect("accepted attr");
+    assert!(accepted.is_upload_pending());
+    let accepted_spans = spans(&pg, accepted.size);
+    pg.local.sync_local_metadata().expect("durable local state");
+    drop(pg);
+
+    studiofs_test_support::mark_redb_repair_required(&path).expect("mark repair");
+    {
+        // Same resets as the production redb auto-repair open.
+        let redb = RedbMetaEngine::open(&path).expect("redb auto-repair");
+        redb.set_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)
+            .expect("set repair marker");
+        redb.set_counter(LOCAL_PG_VERSION_COUNTER, 0)
+            .expect("reset version");
+        redb.set_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER, 0)
+            .expect("reset namespace version");
+    }
+    let pg = PgMetaEngine::open_with_options(&path, options).expect("repair reopen");
+
+    let repaired = pg.get_attr(file.ino).expect("repaired attr");
+    assert_eq!(
+        (repaired.size, repaired.content_epoch),
+        (accepted.size, accepted.content_epoch)
+    );
+    assert_eq!(spans(&pg, accepted.size), accepted_spans);
+    assert!(
+        pg.local
+            .get_counter(LOCAL_PG_REPAIR_SELF_REPLAY_END_COUNTER)
+            .expect("repair boundary")
+            > 0
+    );
+    pg.prepare_for_close().expect("close repaired writer");
+}
