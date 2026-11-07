@@ -29,7 +29,7 @@ use crate::local::{
 
 const PAYLOAD_MUTATION_STRIPES: usize = 64;
 /// Upper bound on payloads removed under one set of mutation stripes.
-const PAYLOAD_REMOVAL_CHUNK_OBJECTS: usize = 32;
+pub const PAYLOAD_REMOVAL_CHUNK_OBJECTS: usize = 32;
 
 /// Cache index (redb) backing store for the local payload runtime.
 #[path = "payload_index.rs"]
