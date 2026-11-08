@@ -1472,6 +1472,15 @@ the former five-second budget. Check `fetch.local_cache_backend_io_max_ms`,
 or a blocked kernel callback. A timed-out probe still poisons its limiter and
 fails the scenario without spawning more probes.
 
+Mounted tree snapshots use a 15-second budget on every OS, since slow storage
+can delay cache commits on any test host. The cold observer in scenario 20
+completed its tree snapshot about 9.2 seconds after starting while local `fdatasync` calls waited
+for the ext4 journal; the former five-second snapshot limit falsely failed
+that run. Snapshot timeouts still fail immediately without starting another
+snapshot worker and retain `validation/snapshot-timeout.txt` diagnostics.
+Run `cargo test -p studiofs-e2e --lib snapshot_` for the cold-commit budget and
+blocked-snapshot containment regressions.
+
 Linux mounted write/readback operations also have a 15-second I/O budget.
 Cold creates include durable local inode-ID reservation: scenario 23 recorded
 4.464 seconds in `namespace_create.inode_allocation.max_ms`, exceeding the

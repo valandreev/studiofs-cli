@@ -19,7 +19,8 @@ const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Buffer size in bytes for streaming file reads during checksum generation.
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 /// Maximum wall time for a single mounted tree snapshot attempt.
-const SNAPSHOT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+// Cold reads include cache/index commits that can wait for the local disk journal.
+const SNAPSHOT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Extra time a timed-out attempt gets to finish, separating a stall from a hang in diagnostics.
 const SNAPSHOT_TIMEOUT_DIAGNOSTIC_GRACE: Duration = Duration::from_secs(5);
 /// Finished snapshot steps at least this slow are listed in timeout diagnostics.
@@ -1201,6 +1202,35 @@ mod tests {
         assert_eq!(marker.entry_type, TreeEntryKind::File);
         assert_eq!(marker.size, None);
         assert_eq!(marker.checksum_sha256, None);
+    }
+
+    #[test]
+    fn snapshot_budget_allows_cold_cache_commit_beyond_five_seconds() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let probe = Arc::new(SnapshotProbe::default());
+            let result =
+                run_snapshot_attempt_with_timeout(SNAPSHOT_ATTEMPT_TIMEOUT, &probe, move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(Vec::new())
+                });
+            result_tx.send(result).unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Model a cold cache commit still in flight after the former deadline.
+        let early_result = result_rx.recv_timeout(Duration::from_millis(5200));
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(early_result, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_ok()
+        );
     }
 
     #[test]
