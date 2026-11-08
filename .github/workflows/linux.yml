@@ -9,6 +9,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "41 5 * * 0"
 
 permissions:
   contents: read
@@ -25,6 +27,7 @@ env:
 jobs:
   quality:
     name: Quality gates
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -98,6 +101,7 @@ jobs:
 
   ubuntu-tests:
     name: Ubuntu workspace tests
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -148,6 +152,7 @@ jobs:
 
   s3-and-postgresql:
     name: S3 and PostgreSQL tests
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -309,6 +314,7 @@ jobs:
 
   rocky-tests:
     name: Rocky Linux workspace tests
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     container:
       image: rockylinux:9

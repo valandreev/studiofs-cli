@@ -1,5 +1,12 @@
 # StudioFS release downloads and builds
 
+Published releases are
+[v0.2.1](https://github.com/valandreev/studiofs-cli/releases/tag/v0.2.1)
+(19 assets, published 2026-11-08) and
+[v0.2.0](https://github.com/valandreev/studiofs-cli/releases/tag/v0.2.0).
+The current `main` workspace version is `0.2.2`; the platform instructions
+below describe the published v0.2.1 packages.
+
 StudioFS 0.2.1 targets these five native platforms:
 
 | Download suffix | System | GitHub builder |
@@ -101,20 +108,19 @@ platform components (WinFsp, macFUSE, libfuse3 and desktop libraries) are not
 redistributed. The [publication gate](legal/v0.2.0-publication-gate.md) records
 the approval of this delivery method.
 
-## Prepare a release on GitHub
+## Prepare the next release on GitHub
 
-The next distribution version is 0.2.1. Its working release notes are in
-[release-notes/v0.2.1.md](release-notes/v0.2.1.md). Keep the historical 0.2.0
-artifact and publication details above tied to their published version.
+The current workspace version is 0.2.2. Tag the exact reviewed commit with
+the matching version after the release workflow has reached the default branch:
 
 The [Release builds workflow](../.github/workflows/release.yml) runs on a pushed
-version tag or manually from Actions. Use `v0.2.1` for workspace version `0.2.1`;
-a mismatched tag fails. Push the reviewed source branch first. After it is
-merged, the maintainer can tag that exact approved commit:
+version tag or manually from Actions. The tag must match the workspace version;
+for current `main`, use `v0.2.2`. Push the reviewed source branch first. After
+it is merged, the maintainer can tag that exact approved commit:
 
 ```bash
-git tag -a v0.2.1 <approved-commit> -m "StudioFS v0.2.1"
-git push origin v0.2.1
+git tag -a v0.2.2 <approved-commit> -m "StudioFS v0.2.2"
+git push origin v0.2.2
 ```
 
 Do not retag a published version. Manual runs on a branch create workflow
@@ -129,13 +135,12 @@ GitHub Release and uploads all archives, checksum files, linkage logs and the
 project source archive. A retry may update that draft; it refuses to overwrite
 an already published release. No personal access token is required.
 
-After the [v0.2.1 release-preparation checklist](legal/v0.2.1-release-preparation.md)
-records approval for those exact artifacts, publish the draft using GitHub's
-**Publish release** button. The v0.2.0 publication record does not approve
-v0.2.1. Then readers can download from Releases
-when the repository is public. Standard hosted ARM runners are available for
-private repositories too; private builds consume the account's Actions minutes
-and can incur runner charges. This workflow does not change repository visibility.
+After the new release's checklist records approval for those exact artifacts,
+publish the draft using GitHub's **Publish release** button. Then readers can
+download from Releases when the repository is public. Standard hosted ARM
+runners are available for private repositories too; private builds consume the
+account's Actions minutes and can incur runner charges. This workflow does not
+change repository visibility.
 
 GitHub references: [hosted runner labels](https://docs.github.com/en/actions/reference/runners/github-hosted-runners),
 [release creation](https://cli.github.com/manual/gh_release_create),
