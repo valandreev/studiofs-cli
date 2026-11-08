@@ -140,6 +140,11 @@ issues when a direction is selected.
   revive chunk grouping.
 - Multi-volume runtime sharing where deployments demonstrate a need; a native
   LAN peer cache only after the simpler proxy experiment establishes value.
+- Fast same-volume copies that share immutable payloads instead of downloading
+  and uploading file contents again. Start with an explicit copy operation;
+  gate implementation on copy-on-write isolation, encrypted object identity,
+  shared-reference accounting, snapshots, and garbage-collection safety. This
+  is distinct from automatic content deduplication.
 
 ### Long-term research
 
@@ -148,6 +153,14 @@ conflict versions, multi-region storage/failover, storage tiering, content
 deduplication, and pipeline hooks/events remain exploratory. Define concurrent
 writer, integrity, availability, encryption, and authorization limits before
 committing to these features. FSKit stays deferred under the gate above.
+
+OS-backed encrypted local storage for metadata, payload cache, and upload staging
+is also exploratory, starting with one platform and a demonstrated need beyond
+normal system-disk encryption. This would extend the current
+[encryption contract](encryption-at-rest-contract.md), which intentionally leaves
+local state in plaintext; it needs explicit unlock, key-recovery, startup, and
+performance rules before becoming a product commitment. Reuse OS encryption
+rather than introducing a custom cipher or changing remote encryption.
 
 ## 1.0 readiness
 
