@@ -500,7 +500,8 @@ fn assert_probe_user_can_search_parent(probe_user: &str, mount_point: &std::path
     let traversal = run_as_probe_user(probe_user, &["test", "-x"], parent);
     assert!(
         traversal.status.success(),
-        "{probe_user} must be able to search {} (sudo -n and directory modes); stderr: {}",
+        "{probe_user} must be able to search {} (sudo -n and directory modes; host setup in \
+         docs/platform-bridges.md); stderr: {}",
         parent.display(),
         String::from_utf8_lossy(&traversal.stderr)
     );

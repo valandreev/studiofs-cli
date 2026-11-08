@@ -123,7 +123,9 @@ Read these entry points as needed:
   `git diff --check` are appropriate for every code or documentation change.
 - Never run workspace-wide or full ignored suites unless the user explicitly
   requests them. A result with `running 0 tests` is invalid evidence.
-- Rebuild the product binary before counting a mounted E2E rerun. Use the
+- After a product source change, rebuild the binary before counting a mounted
+  E2E rerun, so it tests the change. Back-to-back runs of an unchanged build,
+  such as flakiness loops, reuse that binary. Use the
   registered `studiofs-e2e` scenario runner, bounded observable-state polling,
   retained diagnostics, and no fixed coordination sleeps.
 - Before a PR, commit every intended task change, including related docs/config

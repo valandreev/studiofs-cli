@@ -1054,7 +1054,21 @@ the legacy uid/gid zero translation still reports root-created inodes as the
 mount user. Snapshot `smount` sessions never request `allow_other`. The opt-in native
 check probes a `0600` and a `0644` file as a second account through
 `sudo -n -u "${STUDIOFS_ALLOW_OTHER_PROBE_USER:-nobody}"`; that account must be
-able to search the workspace target directory:
+able to search the workspace target directory. Acting as a different kernel
+uid always needs a privileged helper (`sudo`, or setuid `newuidmap` for
+subuid namespaces), so the check cannot run unprivileged. One-time host setup:
+
+    # Passwordless sudo to the probe account only (not to root).
+    echo "$USER ALL=(nobody) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/studiofs-probe
+    sudo chmod 440 /etc/sudoers.d/studiofs-probe && sudo visudo -c
+    # Ubuntu creates home directories as 0750; let other accounts traverse
+    # (search only, no listing) so the probe reaches target/studiofs-tests.
+    chmod o+x "$HOME"
+
+The preflight fails before mounting with `sudo: a password is required` when
+the sudoers rule is missing, and with empty stderr when an ancestor directory
+is not searchable. Set `STUDIOFS_ALLOW_OTHER_PROBE_USER` (see `.env.example`)
+to probe as a different account and adjust the sudoers rule to match.
 
     cargo test -p studiofs-linux-fuse --test posix_access mounted_allow_other -- --ignored --nocapture --test-threads=1
 
