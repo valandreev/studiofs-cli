@@ -6,7 +6,8 @@ cleanup, and artifact reporting. Read the root `AGENTS.md`, `docs/tests.md`,
 
 - Start with `cargo run -p studiofs-e2e -- list` and use a registered scenario;
   inspect the current runner contract instead of inventing a scenario name.
-- Rebuild the product binary before counting a rerun. Keep separate client roots,
+- After a product source change, rebuild the binary before counting a rerun;
+  repeat runs of an unchanged build need no rebuild. Keep separate client roots,
   cache directories, logs, failure reports, validation trees, and Docker
   diagnostics under `target/e2e-runs/<run-id>/`.
 - Synchronize on observable state with bounded polling. Fixed coordination sleeps,

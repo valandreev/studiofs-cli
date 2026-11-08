@@ -449,7 +449,7 @@ The mount ran as regular user `valen`, outside the home directory so secondary
 pjdfstest accounts could traverse it. The ignored `.env` was loaded only in
 the mount and per-case runner shells.
 
-Rebuild before a repeat run. Start the mount in a shell with the required
+Rebuild before a repeat run if the source changed. Start the mount in a shell with the required
 environment loaded, then run the group suites and per-case runner using the
 same 398-case list:
 
