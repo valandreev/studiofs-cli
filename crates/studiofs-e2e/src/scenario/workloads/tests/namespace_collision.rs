@@ -315,23 +315,33 @@ fn namespace_collision_operation_timeout_reports_pending_without_waiting_forever
     let mount = temp.path().join("mounts").join("client-a");
     std::fs::create_dir_all(&mount).unwrap();
     let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
-    let started = Instant::now();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let watchdog = Duration::from_secs(30);
 
-    let err = run_concurrent_namespace_operations(
-        started,
+    let result = run_concurrent_namespace_operations(
+        Instant::now(),
         vec![NamespaceCollisionTask::new(
             1,
             client,
             "rename",
             "shared/file.txt -> shared/renamed-a.txt",
-            |_client| {
-                thread::sleep(Duration::from_millis(200));
+            move |_client| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(watchdog).unwrap();
+                finished_tx.send(()).unwrap();
                 Ok(())
             },
         )],
         Duration::from_millis(20),
-    )
-    .unwrap_err();
+    );
+
+    entered_rx.recv_timeout(watchdog).unwrap();
+    let worker_still_pending = matches!(finished_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+    release_tx.send(()).unwrap();
+    finished_rx.recv_timeout(watchdog).unwrap();
+    let err = result.unwrap_err();
 
     assert!(matches!(
         err,
@@ -342,8 +352,8 @@ fn namespace_collision_operation_timeout_reports_pending_without_waiting_forever
             .contains("client-a rename shared/file.txt -> shared/renamed-a.txt")
     );
     assert!(
-        started.elapsed() < Duration::from_millis(150),
-        "timeout must not wait for the hung namespace worker to finish"
+        worker_still_pending,
+        "timeout must return before the blocked namespace worker is released"
     );
 }
 
@@ -467,27 +477,37 @@ fn namespace_collision_collect_timeout_allows_helper_cleanup_grace() {
     let mount = temp.path().join("mounts").join("client-a");
     std::fs::create_dir_all(&mount).unwrap();
     let client = client_spec_for(&sandbox, "projectfs", "client-a", mount);
-    let started = Instant::now();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let watchdog = Duration::from_secs(30);
 
-    let operations = run_concurrent_namespace_operations(
-        started,
-        vec![
-            NamespaceCollisionTask::new(1, client, "rename", "shared/file.txt", |_client| {
-                thread::sleep(Duration::from_millis(80));
-                Ok(())
-            })
-            .with_completion_grace(Duration::from_millis(100)),
-        ],
-        Duration::from_millis(20),
-    )
-    .unwrap();
+    // A zero operation timeout makes successful collection depend on the grace.
+    let collector = thread::spawn(move || {
+        run_concurrent_namespace_operations(
+            Instant::now(),
+            vec![
+                NamespaceCollisionTask::new(
+                    1,
+                    client,
+                    "rename",
+                    "shared/file.txt",
+                    move |_client| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(watchdog).unwrap();
+                        Ok(())
+                    },
+                )
+                .with_completion_grace(watchdog),
+            ],
+            Duration::ZERO,
+        )
+    });
+    entered_rx.recv_timeout(watchdog).unwrap();
+    release_tx.send(()).unwrap();
+    let operations = collector.join().unwrap().unwrap();
 
     assert_eq!(operations.len(), 1);
     assert_eq!(operations[0].result, "accepted");
-    assert!(
-        started.elapsed() >= Duration::from_millis(80),
-        "helper-backed namespace operations must be allowed to finish bounded cleanup after the operation timeout"
-    );
 }
 
 #[test]
