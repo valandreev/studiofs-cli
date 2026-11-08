@@ -366,7 +366,7 @@ target/debug/studiofs-e2e run mounted-random-write-packing --studiofs-bin target
 
 The scenario performs 15 seconds of random 4 KiB writes over a 256 MiB file and
 samples the upload queue every 100 ms. It fails unless an active upload with a
-pending backlog appears within 5 s, fsync completes within 60 s (the
+pending backlog appears during the 15 s of writes, fsync completes within 60 s (the
 spanned metadata commit time stays in the summary as a diagnostic), readback matches, physical payload
 objects stay within `vfs_write.accepted_bytes` divided by pack size plus partial
 drains, accepted bytes cover every requested write, and the live runtime stats

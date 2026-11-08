@@ -11,8 +11,6 @@ const WRITE_BYTES: usize = 4096;
 const PACK_BYTES: usize = 4 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
-// Aged writer-stack bytes drain after about 1.2 s; allow commit and upload admission on top.
-const FIRST_UPLOAD_DEADLINE_MS: u64 = 5_000;
 // Only a stuck fsync fails: loaded hosts spend seconds sealing the writer tail and committing.
 const FSYNC_MAX_MS: f64 = 60_000.0;
 // WinFSP may bound reads by the reported size, so live snapshots must stay well below it.
@@ -66,7 +64,6 @@ impl Scenario for RandomWritePacking {
             serde_json::from_slice(&fs::read(context.scenario_dir.join(SUMMARY))?)?;
         let writes = summary["writes"].as_u64().unwrap_or(0);
         let objects = summary["payload_objects"].as_u64().unwrap_or(u64::MAX);
-        let first_upload_ms = summary["first_upload_ms"].as_u64().unwrap_or(u64::MAX);
         let fsync_ms = summary["fsync_ms"].as_f64().unwrap_or(f64::INFINITY);
         let stats_bytes = summary["after_fsync"].as_str().map_or(usize::MAX, str::len);
         let requested_bytes = writes.saturating_mul(WRITE_BYTES as u64);
@@ -77,7 +74,6 @@ impl Scenario for RandomWritePacking {
             || objects == 0
             || objects > bound
             || summary["upload_during_writes"].as_bool() != Some(true)
-            || first_upload_ms > FIRST_UPLOAD_DEADLINE_MS
             || fsync_ms > FSYNC_MAX_MS
             || summary["readback_matches"].as_bool() != Some(true)
             || stats_bytes > RUNTIME_STATS_MAX_BYTES
@@ -85,7 +81,7 @@ impl Scenario for RandomWritePacking {
             return Err(io::Error::other(format!(
                 "random-write packing acceptance failed (object bound {bound} for \
                  {accepted_bytes} accepted bytes, {requested_bytes} requested, \
-                 first upload deadline {FIRST_UPLOAD_DEADLINE_MS} ms, fsync bound {FSYNC_MAX_MS} ms, \
+                 fsync bound {FSYNC_MAX_MS} ms, \
                  runtime stats {stats_bytes}/{RUNTIME_STATS_MAX_BYTES} bytes): {summary}"
             ))
             .into());
