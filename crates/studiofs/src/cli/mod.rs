@@ -46,7 +46,7 @@ pub mod winfsp_bootstrap;
 
 #[derive(Parser)]
 #[command(name = "studiofs")]
-#[command(version)]
+#[command(version = env!("STUDIOFS_BUILD_VERSION"))]
 #[command(about = "Mount S3-compatible storage as a local filesystem")]
 #[command(long_about = "\
 StudioFS — a high-performance, cross-platform virtual filesystem backed by \

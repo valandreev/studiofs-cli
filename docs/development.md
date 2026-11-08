@@ -49,6 +49,24 @@ S3-compatible backend.
 cargo build --release
 ```
 
+### Binary version
+
+The workspace package version in `Cargo.toml` is the manually maintained base
+version. A binary built from a local checkout reports `BASE-dev.N (SHORT_SHA)`, where `N`
+counts first-parent commits since the commit that last changed the workspace
+package version; that version-change commit is count zero. A clean checkout at
+an exact matching `vBASE` release tag reports `BASE`. Dirty checkouts include a
+`-dirty` marker for changes to tracked files, for example
+`0.2.2-dev.17-dirty (a1b2c3d4)`. On development branches, the counter follows
+that checkout's first-parent history; compare counters within the same base
+version and branch history.
+
+Calculating the development counter requires complete Git history and tags.
+When that history is unavailable, the binary falls back to `BASE-dev.unknown`
+(with a short commit SHA when available); it does not guess the counter.
+GitHub Actions jobs that compile `studiofs` fetch full history and tags for this
+reason.
+
 On macOS, `crates/studiofs-macfuse` requires real macFUSE headers for Cargo
 builds and tests. The experimental FSKit path links `MFMount.framework` when it
 is installed; otherwise the legacy bridge remains available and selecting FSKit

@@ -12,6 +12,9 @@ workspace = true
 name = "studiofs"
 path = "src/main.rs"
 
+[build-dependencies]
+toml = "1.0.7"
+
 [dependencies]
 studiofs-meta.workspace = true
 studiofs-data.workspace = true
