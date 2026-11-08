@@ -129,8 +129,10 @@ GitHub Release and uploads all archives, checksum files, linkage logs and the
 project source archive. A retry may update that draft; it refuses to overwrite
 an already published release. No personal access token is required.
 
-After SFS-854 records GO for those exact artifacts, publish the draft using
-GitHub's **Publish release** button. Then readers can download from Releases
+After the [v0.2.1 release-preparation checklist](legal/v0.2.1-release-preparation.md)
+records approval for those exact artifacts, publish the draft using GitHub's
+**Publish release** button. The v0.2.0 publication record does not approve
+v0.2.1. Then readers can download from Releases
 when the repository is public. Standard hosted ARM runners are available for
 private repositories too; private builds consume the account's Actions minutes
 and can incur runner charges. This workflow does not change repository visibility.
