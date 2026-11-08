@@ -8,6 +8,9 @@ on:
       - "docs/user-guide/**"
       - "wrangler.jsonc"
       - ".github/workflows/deploy-site.yml"
+      - "tools/site/**"
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -22,9 +25,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: main
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Render latest stable release badge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -B -m unittest discover -s tools/site -p 'test_*.py'
+          mkdir -p target
+          gh api repos/valandreev/studiofs-cli/releases/latest > target/latest-release.json
+          python tools/site/render_release.py target/latest-release.json site/index.html
       - run: pip install -r docs/user-guide/requirements.txt
       - run: docs/user-guide/build-site.sh
       - uses: cloudflare/wrangler-action@v4
