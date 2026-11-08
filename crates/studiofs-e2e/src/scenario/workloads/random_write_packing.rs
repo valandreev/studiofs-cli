@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(metadata_commit_ms(text).unwrap(), 2_490.462_652);
         assert!(
             metadata_commit_ms("# studiofs_runtime_stats schema_version=1\n").is_err(),
-            "a renamed commit metric must not turn into a zero fsync bound"
+            "a renamed commit metric must fail, not record a zero commit diagnostic"
         );
     }
 }
