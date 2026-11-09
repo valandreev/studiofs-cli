@@ -4,24 +4,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use studiofs_data::janitor::{
-    JanitorAge, JanitorDeleteError, JanitorEntry, JanitorKeyStat, janitor_age, pending_deletion_age,
+    JanitorAge, JanitorDeleteError, JanitorEntry, JanitorFailureClass, JanitorKeyStat,
+    classify_object_error, janitor_age, pending_deletion_age,
 };
 use studiofs_data::object::canonical_object_delete_keys;
 use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
 use studiofs_meta::{
-    JanitorEligibility, JanitorSweepCheckpoint, JanitorSweepScope, MAX_JANITOR_ELIGIBILITY_BATCH,
+    JanitorEligibility, JanitorMetadataError, JanitorSweepCheckpoint, JanitorSweepScope,
+    MAX_JANITOR_ELIGIBILITY_BATCH,
 };
 
 /// Bound for one remote DELETE. All canonical keys of an object must finish
 /// inside the 60-second deletion-claim lease, or the finish is fenced out.
 const DELETE_KEY_TIMEOUT: Duration = if cfg!(test) {
-    Duration::from_millis(200)
+    // Short for stalled fakes, yet above live RustFS latency spikes seen on CI (>200 ms).
+    Duration::from_secs(1)
 } else {
     Duration::from_secs(20)
 };
 /// Bound for one fallback HEAD, issued only for keys listed without `LastModified`.
 const HEAD_KEY_TIMEOUT: Duration = if cfg!(test) {
-    Duration::from_millis(200)
+    Duration::from_secs(1)
 } else {
     Duration::from_secs(20)
 };
@@ -37,6 +40,37 @@ const _: () = assert!(
     (studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64 + 1) * 20 < 60,
     "canonical key deletes must fit inside the deletion-claim lease"
 );
+/// Consecutive objects whose S3 work failed transiently (after the transport's own
+/// bounded retries) before the cycle stops admitting work as overloaded.
+pub(super) const OVERLOAD_TRIP_OBJECTS: u32 = 5;
+
+/// A bounded operation that did not answer in time; always transient.
+#[derive(Debug, thiserror::Error)]
+#[error("{0} timed out")]
+pub(super) struct OperationTimedOut(pub(super) &'static str);
+
+/// Classify a cycle error by its typed causes. Unrecognized errors (malformed keys,
+/// unordered listings, invalid checkpoints) are terminal so they never loop.
+pub(super) fn classify_error(error: &anyhow::Error) -> JanitorFailureClass {
+    for cause in error.chain() {
+        if let Some(error) = cause.downcast_ref::<opendal::Error>() {
+            return classify_object_error(error);
+        }
+        if let Some(error) = cause.downcast_ref::<JanitorMetadataError>() {
+            return match error {
+                JanitorMetadataError::UnsafeToDelete(_) => JanitorFailureClass::Terminal,
+                // A lost connection or fenced-out claim leaves durable state to a later cycle.
+                JanitorMetadataError::BackendUnavailable(_) | JanitorMetadataError::StaleClaim => {
+                    JanitorFailureClass::Transient
+                }
+            };
+        }
+        if cause.is::<OperationTimedOut>() {
+            return JanitorFailureClass::Transient;
+        }
+    }
+    JanitorFailureClass::Terminal
+}
 
 #[derive(Debug, Default)]
 pub(super) struct JanitorStats {
@@ -63,9 +97,25 @@ pub(super) struct JanitorStats {
     pub(super) head_elapsed: Duration,
     pub(super) delete_requests: u64,
     pub(super) delete_elapsed: Duration,
+    /// HEAD probes that failed transiently; their objects were skipped as unknown age.
+    pub(super) head_errors: u64,
+    /// Objects in a row whose S3 work failed transiently.
+    transient_streak: u32,
     pub(super) outcome: CycleOutcome,
     pub(super) scan_position: String,
     pub(super) scan_complete: bool,
+}
+
+impl JanitorStats {
+    pub(super) fn cycle_outcome(&self) -> CycleOutcome {
+        if self.outcome != CycleOutcome::Overloaded
+            && (self.head_errors > 0 || self.delete_errors > 0)
+        {
+            CycleOutcome::TransientErrors
+        } else {
+            self.outcome
+        }
+    }
 }
 
 /// Why a cycle stopped admitting work.
@@ -74,6 +124,8 @@ pub(super) enum CycleOutcome {
     /// The whole prefix was listed and every listed candidate was decided.
     #[default]
     Complete,
+    /// A cycle had transient object-store or claim-confirmation errors.
+    TransientErrors,
     /// `max_deletes` successful deletions were confirmed and admission stopped. Listing
     /// never looks ahead, so the cap met on the last entry also reports this.
     DeleteCapReached,
@@ -81,6 +133,9 @@ pub(super) enum CycleOutcome {
     ScanBudgetExhausted,
     /// The wall-clock budget ran out before all listed work was admitted.
     TimeBudgetExhausted,
+    /// [`OVERLOAD_TRIP_OBJECTS`] objects in a row failed transiently; admission stopped
+    /// and the unfinished batch stays queued or before the saved checkpoint.
+    Overloaded,
 }
 
 impl CycleOutcome {
@@ -90,6 +145,8 @@ impl CycleOutcome {
             Self::DeleteCapReached => "capped (max deletes reached)",
             Self::ScanBudgetExhausted => "partial (scan budget exhausted)",
             Self::TimeBudgetExhausted => "partial (time budget exhausted)",
+            Self::Overloaded => "partial (S3 overload circuit open)",
+            Self::TransientErrors => "partial (transient errors)",
         }
     }
 }
@@ -272,49 +329,78 @@ fn discover_object(
 }
 
 /// Object-level age: the newest timestamp over listed keys plus HEADs of untimed
-/// keys. Any HEAD failure, timeout or missing value leaves the age unknown.
+/// keys. A vanished key, missing value, or transient HEAD failure or timeout leaves the
+/// age unknown; a terminal HEAD failure (e.g. access denied) fails the cycle.
 async fn observed_object_age<S: JanitorObjectStore>(
     store: &S,
     candidate: &Candidate,
     stats: &mut JanitorStats,
-) -> Option<SystemTime> {
-    if candidate.refresh_age {
-        let mut newest = None;
-        for key in &candidate.delete_keys {
-            if stats.head_requests == 0 {
-                eprintln!("janitor phase=head started");
-            }
-            stats.head_requests = stats.head_requests.saturating_add(1);
-            let head_started = Instant::now();
-            let result = tokio::time::timeout(HEAD_KEY_TIMEOUT, store.stat_key(key)).await;
-            stats.head_elapsed += head_started.elapsed();
-            let Ok(Ok(stat)) = result else {
-                return None;
-            };
-            match stat {
-                JanitorKeyStat::Missing => {}
-                JanitorKeyStat::Found(Some(time)) => newest = newest.max(Some(time)),
-                JanitorKeyStat::Found(None) => return None,
-            }
-        }
-        return newest;
-    }
-
-    let mut newest = candidate.newest_listed;
-    for key in &candidate.untimed_keys {
+) -> anyhow::Result<Option<SystemTime>> {
+    let keys = if candidate.refresh_age {
+        &candidate.delete_keys
+    } else {
+        &candidate.untimed_keys
+    };
+    let mut newest = if candidate.refresh_age {
+        None
+    } else {
+        candidate.newest_listed
+    };
+    for key in keys {
         if stats.head_requests == 0 {
             eprintln!("janitor phase=head started");
         }
         stats.head_requests = stats.head_requests.saturating_add(1);
         let head_started = Instant::now();
-        let last_modified = tokio::time::timeout(HEAD_KEY_TIMEOUT, store.last_modified(key)).await;
+        let result = tokio::time::timeout(HEAD_KEY_TIMEOUT, async {
+            if candidate.refresh_age {
+                store.stat_key(key).await
+            } else {
+                // A listed key without a timestamp must still exist to prove its age.
+                store.last_modified(key).await.map(JanitorKeyStat::Found)
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err(OperationTimedOut("HEAD").into()));
         stats.head_elapsed += head_started.elapsed();
-        let Ok(Ok(Some(time))) = last_modified else {
-            return None;
-        };
-        newest = newest.max(Some(time));
+        match result {
+            Ok(JanitorKeyStat::Missing) => {}
+            Ok(JanitorKeyStat::Found(Some(time))) => newest = newest.max(Some(time)),
+            Ok(JanitorKeyStat::Found(None)) => return Ok(None),
+            Err(error) => match classify_error(&error) {
+                JanitorFailureClass::Vanished => return Ok(None),
+                JanitorFailureClass::Transient => {
+                    eprintln!(
+                        "janitor: HEAD failed class=transient key={key} object_id={}: {error:#}",
+                        candidate.object_id
+                    );
+                    stats.head_errors = stats.head_errors.saturating_add(1);
+                    record_transient_failure(stats);
+                    return Ok(None);
+                }
+                JanitorFailureClass::Terminal => {
+                    return Err(error.context(format!(
+                        "terminal HEAD failure for janitor object {}",
+                        candidate.object_id
+                    )));
+                }
+            },
+        }
     }
-    newest
+    Ok(newest)
+}
+
+/// Counts one object whose S3 work failed transiently and opens the overload circuit
+/// after [`OVERLOAD_TRIP_OBJECTS`] in a row.
+fn record_transient_failure(stats: &mut JanitorStats) {
+    stats.transient_streak = stats.transient_streak.saturating_add(1);
+    if stats.transient_streak >= OVERLOAD_TRIP_OBJECTS && stats.outcome == CycleOutcome::Complete {
+        eprintln!(
+            "janitor: S3 overload circuit open after {} objects failed in a row; stopping admission",
+            stats.transient_streak
+        );
+        stats.outcome = CycleOutcome::Overloaded;
+    }
 }
 
 async fn process_orphan<S: JanitorObjectStore>(
@@ -335,7 +421,7 @@ async fn process_orphan<S: JanitorObjectStore>(
             if candidate.refresh_age {
                 // Keys listed by an earlier run are not in `newest_listed`; stat every key.
                 let observed = observed_object_age(ctx.store, candidate, stats).await;
-                pending.max(janitor_age(now, observed, grace))
+                pending.max(janitor_age(now, observed?, grace))
             } else {
                 candidate.newest_listed.map_or(pending, |listed| {
                     pending.max(janitor_age(now, Some(listed), grace))
@@ -344,7 +430,7 @@ async fn process_orphan<S: JanitorObjectStore>(
         }
         None => janitor_age(
             now,
-            observed_object_age(ctx.store, candidate, stats).await,
+            observed_object_age(ctx.store, candidate, stats).await?,
             grace,
         ),
     };
@@ -375,7 +461,8 @@ async fn process_orphan<S: JanitorObjectStore>(
         return Ok(());
     };
 
-    let mut delete_failed = false;
+    let mut s3_delete_failed = false;
+    let mut terminal = None;
     for key in &candidate.delete_keys {
         if stats.delete_requests == 0 {
             eprintln!("janitor phase=delete started");
@@ -386,20 +473,22 @@ async fn process_orphan<S: JanitorObjectStore>(
             .await
             .unwrap_or_else(|_| Err(JanitorDeleteError::Other("delete timed out".to_owned())));
         stats.delete_elapsed += delete_started.elapsed();
-        if let Err(error) = result {
-            match error {
-                JanitorDeleteError::NotFound => {}
-                JanitorDeleteError::Other(error) => {
-                    delete_failed = true;
-                    eprintln!(
-                        "janitor: failed to delete object key={} object_id={}: {}",
-                        key, object_id, error
-                    );
-                }
-            }
+        let (class, error) = match result {
+            Ok(()) | Err(JanitorDeleteError::NotFound) => continue,
+            Err(JanitorDeleteError::Other(error)) => ("transient", error),
+            Err(JanitorDeleteError::Terminal(error)) => ("terminal", error),
+        };
+        s3_delete_failed = true;
+        eprintln!(
+            "janitor: failed to delete object class={class} key={key} object_id={object_id}: {error}"
+        );
+        if class == "terminal" {
+            terminal = Some(error);
         }
+        // The whole object is retried later; more requests now only add load.
+        break;
     }
-    let outcome = if delete_failed {
+    let outcome = if s3_delete_failed {
         UploadedObjectDeletionOutcome::Retryable
     } else {
         UploadedObjectDeletionOutcome::Deleted
@@ -409,20 +498,34 @@ async fn process_orphan<S: JanitorObjectStore>(
         ctx.metadata
             .finish_deletion(object_id, fencing_token, outcome)
     });
-    match finish {
-        Ok(()) => stats.claim_finishes = stats.claim_finishes.saturating_add(1),
-        Err(error) => {
-            delete_failed = true;
-            eprintln!("janitor: failed to finish deletion claim object_id={object_id}: {error:#}");
+    let finish_failed = match finish {
+        Ok(()) => {
+            stats.claim_finishes = stats.claim_finishes.saturating_add(1);
+            false
         }
-    }
+        Err(error) => {
+            eprintln!("janitor: failed to finish deletion claim object_id={object_id}: {error:#}");
+            true
+        }
+    };
+    let delete_failed = s3_delete_failed || finish_failed;
     if delete_failed {
         let retry = tokio::task::block_in_place(|| ctx.metadata.retry_gc_candidate(object_id));
         if let Err(error) = retry {
             eprintln!("janitor: failed to defer GC candidate object_id={object_id}: {error:#}");
         }
         stats.delete_errors = stats.delete_errors.saturating_add(1);
+        // A successful finish leaves no live fence; a failed finish expires for a later cycle.
+        if let Some(error) = terminal {
+            anyhow::bail!("terminal S3 delete failure for janitor object {object_id}: {error}");
+        }
+        if s3_delete_failed {
+            record_transient_failure(stats);
+        } else {
+            stats.transient_streak = 0;
+        }
     } else {
+        stats.transient_streak = 0;
         // The fenced finish already confirmed deletion; an unacked row is only re-claimed later.
         let ack = tokio::task::block_in_place(|| ctx.metadata.ack_gc_candidate(object_id));
         if let Err(error) = ack {
@@ -553,7 +656,9 @@ async fn run_one_cycle_inner<S: JanitorObjectStore>(
             &mut stats,
         )
         .await?;
-        if let Some(stop) = ctx.budget.admission_stop(&stats, cycle_started) {
+        if stats.outcome == CycleOutcome::Complete
+            && let Some(stop) = ctx.budget.admission_stop(&stats, cycle_started)
+        {
             stats.outcome = stop;
         }
         candidate_cursor = page.last().map(|(id, eligible_at)| (*eligible_at, *id));
@@ -949,7 +1054,7 @@ async fn bounded_list_step<T>(
 ) -> anyhow::Result<T> {
     tokio::time::timeout(LIST_PAGE_TIMEOUT, step)
         .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("listing page timed out")))
+        .unwrap_or_else(|_| Err(OperationTimedOut("listing page").into()))
         .with_context(|| format!("failed to list janitor objects after {listed_entries} entries"))
 }
 
@@ -994,6 +1099,9 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     for (candidate, decision) in decisions {
+        if stats.outcome != CycleOutcome::Complete {
+            return Ok(());
+        }
         if let Some(stop) = ctx.budget.admission_stop(stats, cycle_started) {
             stats.outcome = stop;
             return Ok(());

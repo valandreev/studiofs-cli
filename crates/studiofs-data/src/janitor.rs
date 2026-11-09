@@ -1,19 +1,31 @@
 //! OpenDAL operations used by the standalone janitor.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use futures::TryStreamExt as _;
-use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer};
+use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer, RetryInterceptor, RetryLayer};
 use opendal::raw::{HttpBody, HttpClient, HttpFetch};
 use opendal::services::S3;
 use opendal::{Buffer, EntryMode, ErrorKind, Operator, Result};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+/// Retries after the first attempt of one idempotent LIST page, HEAD or DELETE.
+pub const JANITOR_S3_MAX_RETRIES: usize = 3;
+const RETRY_MIN_DELAY: Duration = Duration::from_millis(100);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+/// Longest service-level pause a throttle response (or its `Retry-After`) can impose.
+pub const JANITOR_S3_MAX_COOLDOWN: Duration = Duration::from_secs(30);
+/// Slowest request spacing the adaptive gate backs off to under sustained throttling.
+pub const JANITOR_S3_MAX_REQUEST_INTERVAL: Duration = Duration::from_secs(8);
+
 /// OpenDAL adapter for listing and mutating payload objects.
 #[derive(Clone)]
 pub struct JanitorObjectStore {
     operator: Operator,
+    transport: Arc<TransportCounters>,
 }
 
 /// Result category for deleting one fragment.
@@ -22,15 +34,85 @@ pub enum JanitorDeleteError {
     /// The fragment was already absent.
     #[error("fragment not found")]
     NotFound,
-    /// The provider rejected the delete request.
+    /// The provider rejected the request in a way retrying cannot fix (e.g. access denied).
+    #[error("{0}")]
+    Terminal(String),
+    /// The request failed transiently (throttle, 5xx, network, timeout) after bounded retries.
     #[error("{0}")]
     Other(String),
+}
+
+/// How the janitor must treat a failed object-store request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JanitorFailureClass {
+    /// The key no longer exists; nothing is left to retry.
+    Vanished,
+    /// Throttling, server, network or timeout failure; a later attempt may succeed.
+    Transient,
+    /// Authorization, configuration or malformed-request failure; retrying cannot help.
+    Terminal,
+}
+
+/// Classify one OpenDAL error by kind: OpenDAL's retry layer marks every final error
+/// persistent, so its retryable flag is gone by now. Unrecognized failures (5xx,
+/// network, unknown status) are transient and bounded by the caller's overload breaker.
+pub fn classify_object_error(error: &opendal::Error) -> JanitorFailureClass {
+    match error.kind() {
+        ErrorKind::NotFound => JanitorFailureClass::Vanished,
+        ErrorKind::PermissionDenied
+        | ErrorKind::ConfigInvalid
+        | ErrorKind::Unsupported
+        | ErrorKind::IsADirectory
+        | ErrorKind::NotADirectory => JanitorFailureClass::Terminal,
+        _ => JanitorFailureClass::Transient,
+    }
+}
+
+/// Provider pressure observed by one store since it was created.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JanitorTransportStats {
+    /// HTTP 429/503 responses and transport-level failures.
+    pub throttled: u64,
+    /// Request retries issued by the bounded retry policy.
+    pub retries: u64,
+    /// Current spacing between request starts; grows on throttle, shrinks on success.
+    pub request_interval: Duration,
+}
+
+#[derive(Debug, Default)]
+struct TransportCounters {
+    throttled: AtomicU64,
+    retries: AtomicU64,
+    interval_micros: AtomicU64,
+}
+
+struct RetryCounter(Arc<TransportCounters>);
+
+impl RetryInterceptor for RetryCounter {
+    fn intercept(&self, err: &opendal::Error, dur: Duration) {
+        self.0.retries.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(kind = ?err.kind(), delay_ms = dur.as_millis(), "janitor S3 request retry");
+    }
 }
 
 impl JanitorObjectStore {
     /// Wrap a configured object-storage operator.
     pub fn new(operator: Operator) -> Self {
-        Self { operator }
+        Self {
+            operator,
+            transport: Arc::default(),
+        }
+    }
+
+    /// Throttle, retry and pacing counters of the request gate.
+    pub fn transport_stats(&self) -> JanitorTransportStats {
+        JanitorTransportStats {
+            throttled: self.transport.throttled.load(Ordering::Relaxed),
+            retries: self.transport.retries.load(Ordering::Relaxed),
+            request_interval: Duration::from_micros(
+                self.transport.interval_micros.load(Ordering::Relaxed),
+            ),
+        }
     }
 
     /// Configure a provider-neutral S3-compatible endpoint without loading user credentials.
@@ -49,10 +131,20 @@ impl JanitorObjectStore {
                 "janitor S3 request limits must be between 1 and 32",
             ));
         }
-        let request_rate = RateLimitedHttpClient {
+        let transport = Arc::<TransportCounters>::default();
+        let base_interval = Duration::from_secs_f64(1.0 / f64::from(requests_per_second));
+        transport.interval_micros.store(
+            u64::try_from(base_interval.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let request_rate = AdaptiveRateLimitedHttpClient {
             inner: HttpClient::new()?,
-            interval: Duration::from_secs_f64(1.0 / f64::from(requests_per_second)),
-            next_request_at: Mutex::new(Instant::now()),
+            base_interval,
+            pace: Mutex::new(Pace {
+                next_request_at: Instant::now(),
+                interval: base_interval,
+            }),
+            counters: transport.clone(),
         };
         let operator = Operator::new(
             S3::default()
@@ -74,8 +166,21 @@ impl JanitorObjectStore {
             ConcurrentLimitLayer::new(studiofs_meta::MAX_JANITOR_ELIGIBILITY_BATCH + 1)
                 .with_http_concurrent_limit(max_in_flight),
         )
+        // Outermost, so every retry attempt passes the request gate and in-flight limit again.
+        // The janitor issues only idempotent requests: LIST pages, HEAD and DELETE.
+        .layer(
+            RetryLayer::new()
+                .with_jitter()
+                .with_min_delay(RETRY_MIN_DELAY)
+                .with_max_delay(RETRY_MAX_DELAY)
+                .with_max_times(JANITOR_S3_MAX_RETRIES)
+                .with_notify(RetryCounter(transport.clone())),
+        )
         .finish();
-        Ok(Self::new(operator))
+        Ok(Self {
+            operator,
+            transport,
+        })
     }
 
     /// Whether this provider can resume its listing after one key.
@@ -126,35 +231,76 @@ impl JanitorObjectStore {
 
     /// Delete one object fragment.
     pub async fn delete(&self, key: &str) -> std::result::Result<(), JanitorDeleteError> {
-        self.operator.delete(key).await.map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                JanitorDeleteError::NotFound
-            } else {
-                JanitorDeleteError::Other(error.to_string())
-            }
-        })
+        self.operator
+            .delete(key)
+            .await
+            .map_err(|error| match classify_object_error(&error) {
+                JanitorFailureClass::Vanished => JanitorDeleteError::NotFound,
+                JanitorFailureClass::Terminal => JanitorDeleteError::Terminal(error.to_string()),
+                JanitorFailureClass::Transient => JanitorDeleteError::Other(error.to_string()),
+            })
     }
 }
 
-/// Spreads actual provider HTTP request starts across the configured rate window.
-struct RateLimitedHttpClient {
+/// Spreads provider HTTP request starts across an adaptive rate window.
+///
+/// A 429/503 response or a transport failure doubles the spacing (up to
+/// [`JANITOR_S3_MAX_REQUEST_INTERVAL`]) and pauses every request for the provider's
+/// `Retry-After` or the new spacing, capped at [`JANITOR_S3_MAX_COOLDOWN`]. Each other
+/// response shrinks the spacing by 1/8 back toward the configured rate.
+struct AdaptiveRateLimitedHttpClient {
     inner: HttpClient,
-    interval: Duration,
-    next_request_at: Mutex<Instant>,
+    base_interval: Duration,
+    pace: Mutex<Pace>,
+    counters: Arc<TransportCounters>,
 }
 
-impl HttpFetch for RateLimitedHttpClient {
-    async fn fetch(&self, request: http::Request<Buffer>) -> Result<http::Response<HttpBody>> {
-        let mut next_request_at = self.next_request_at.lock().await;
-        let now = Instant::now();
-        if *next_request_at > now {
-            tokio::time::sleep_until(*next_request_at).await;
-        }
-        *next_request_at = Instant::now() + self.interval;
-        drop(next_request_at);
+struct Pace {
+    next_request_at: Instant,
+    interval: Duration,
+}
 
-        self.inner.fetch(request).await
+impl HttpFetch for AdaptiveRateLimitedHttpClient {
+    async fn fetch(&self, request: http::Request<Buffer>) -> Result<http::Response<HttpBody>> {
+        let mut pace = self.pace.lock().await;
+        tokio::time::sleep_until(pace.next_request_at).await;
+        pace.next_request_at = Instant::now() + pace.interval;
+        drop(pace);
+
+        let result = self.inner.fetch(request).await;
+        let throttle = match &result {
+            Ok(response) => matches!(response.status().as_u16(), 429 | 503)
+                .then(|| retry_after(response.headers())),
+            Err(error) => error.is_temporary().then_some(None),
+        };
+        let mut pace = self.pace.lock().await;
+        match throttle {
+            Some(retry_after) => {
+                self.counters.throttled.fetch_add(1, Ordering::Relaxed);
+                pace.interval = pace
+                    .interval
+                    .saturating_mul(2)
+                    .min(JANITOR_S3_MAX_REQUEST_INTERVAL);
+                let cooldown = retry_after
+                    .unwrap_or(pace.interval)
+                    .min(JANITOR_S3_MAX_COOLDOWN);
+                pace.next_request_at = pace.next_request_at.max(Instant::now() + cooldown);
+            }
+            None => pace.interval = (pace.interval - pace.interval / 8).max(self.base_interval),
+        }
+        self.counters.interval_micros.store(
+            u64::try_from(pace.interval.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        result
     }
+}
+
+/// `Retry-After` in delta-seconds form.
+// ponytail: the HTTP-date form falls back to the doubled spacing; parse it if a provider sends one.
+fn retry_after(headers: &http::HeaderMap) -> Option<Duration> {
+    let seconds = headers.get(http::header::RETRY_AFTER)?.to_str().ok()?;
+    seconds.trim().parse().ok().map(Duration::from_secs)
 }
 
 /// Result of statting one exact object key.
@@ -224,6 +370,24 @@ pub fn pending_deletion_age(now_unix: i64, deleted_at_unix: i64, grace: Duration
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_transport_stats_start_at_the_configured_request_interval() {
+        let store = JanitorObjectStore::from_s3(
+            "http://127.0.0.1:9000",
+            "test",
+            "test",
+            "test",
+            "us-east-1",
+            2,
+            4,
+        )
+        .unwrap();
+
+        let stats = store.transport_stats();
+        assert_eq!(stats.request_interval, Duration::from_millis(250));
+        assert_eq!((stats.throttled, stats.retries), (0, 0));
+    }
 
     #[test]
     fn janitor_age_skips_missing_future_and_young_timestamps() {

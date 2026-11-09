@@ -356,6 +356,22 @@ Each cycle stops admitting new work at the first limit it meets and reports an
   for stat/HEAD and DELETE; PostgreSQL commands use the metadata crate's
   command timeout. These are per-process limits, not a cluster-wide capacity
   guarantee.
+- Failures are classified. S3 throttling (429, `SlowDown`, 503), other 5xx,
+  network errors and timeouts are transient: each LIST page, HEAD and DELETE is
+  retried at most 3 times with jittered exponential backoff (100 ms to 2 s).
+  A throttle response halves the request rate (down to one start per 8 s),
+  pauses all requests for its `Retry-After` (at most 30 s), and the rate
+  recovers by 1/8 per later response. Access denied, a missing bucket and
+  similar provider errors are terminal and stop the run. PostgreSQL
+  `backend_unavailable` (lost connection, timeout) is transient;
+  `unsafe_to_delete` (volume or binding mismatch) is terminal; a stale claim
+  fence leaves that object queued for a later cycle.
+- After 5 objects in a row fail transiently, the cycle stops admitting work and
+  reports `partial (S3 overload circuit open)`; unprocessed candidates stay in
+  the queue or before the saved scan position. A single run then exits with an
+  error. Under `--loop`, a transient or overloaded cycle waits
+  `interval x 2^(n-1)` (at most 8x the interval) and the command exits with an
+  error after 5 such cycles in a row; terminal errors exit immediately.
 
 ### `fsck`
 

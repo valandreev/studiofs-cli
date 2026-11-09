@@ -8,6 +8,12 @@ The command accepts `--pg-concurrency` (default 1, range 1–8), `--s3-concurren
 
 The provider-neutral pipeline admits no more than one candidate at a time for destructive claim/delete/finish and buffers at most one eligibility page (64 candidates); the rate and transport limits therefore remain effective if provider internals add parallel requests later. Existing deadlines bound listing to 60 seconds and stat/HEAD and DELETE to 20 seconds; PostgreSQL janitor commands use the metadata session's command timeout. These are per-process budgets, not cluster-wide coordination. The mounted VFS janitor is unchanged.
 
+## Retries, backoff and overload (SFS-975)
+
+OpenDAL's `RetryLayer` sits outside the request gate, so each retry attempt passes the in-flight limit and rate pacing again. It retries only temporary errors, at most 3 times per request, with jittered exponential backoff. The request gate is adaptive: an HTTP 429/503 response or a transport failure doubles the spacing between request starts (up to 8 s) and pauses every request for the provider's `Retry-After` or the new spacing (at most 30 s); every other response shrinks the spacing by 1/8 back toward `--s3-requests-per-second`. The cycle summary prints per-cycle deltas for `s3_throttled` and `s3_retries`, and the current `s3_request_interval_ms` (initialized to the configured interval before the first request), plus `head errors` for objects skipped because their age probe failed transiently.
+
+OpenDAL marks every error leaving its retry layer as persistent, so the janitor classifies by error kind: `NotFound` is a vanished key, `PermissionDenied`, `ConfigInvalid`, `Unsupported` and directory-kind errors are terminal, and everything else is transient. A DELETE failure stops that object's remaining key deletes, finishes its claim as retryable, and defers its queue row. Five transiently failed objects in a row stop the cycle as overloaded; `--loop` backs off and gives up after five failed cycles in a row.
+
 The public OpenDAL `Lister` does not expose how many S3 pages it fetched. Production output therefore marks `list_pages=unavailable`. The test fixture below counts actual S3-compatible HTTP list requests. It uses the real OpenDAL S3 operator pointed at a loopback TCP server and never contacts external services.
 
 ## Streaming listing (SFS-969)

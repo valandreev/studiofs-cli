@@ -241,6 +241,22 @@ wire-request peak and request-start pacing, including serial mode:
 cargo test -p studiofs --bin studiofs s3_transport_budget_limits_live_http_requests_and_request_rate -- --nocapture
 ```
 
+SFS-975's fault-injection checks script 429/503 (with and without
+`Retry-After`), dropped connections, 403 and 404 answers on the same loopback
+server, and drive the pipeline and `--loop` breaker with fake stores and
+PostgreSQL errors. They verify bounded request counts, failure classes, a
+slower request gate under throttling, and that an overloaded cycle keeps its
+claims retryable and its scan position unchanged:
+
+```powershell
+cargo test -p studiofs --bin studiofs cli::janitor::tests::s3_ -- --nocapture
+cargo test -p studiofs --bin studiofs cli::janitor::tests::failure_classes_follow_the_retry_policy
+cargo test -p studiofs --bin studiofs cli::janitor::tests::loop_breaker_backs_off_recovers_and_stops_after_bounded_failures
+cargo test -p studiofs --bin studiofs cli::janitor::tests::transient_object_errors_fail_cycles_and_healthy_cycles_reset_loop_breaker
+cargo test -p studiofs --bin studiofs cli::janitor::tests::transient_object_failures_open_the_overload_circuit_without_losing_work
+cargo test -p studiofs --bin studiofs cli::janitor::tests::terminal_delete_failure_releases_its_claim_and_stops_the_cycle
+```
+
 The SFS-973 live check runs the resumable janitor sweep against a real S3
 listing. It verifies `start_after` resume, partial hex prefixes without a trailing `/`,
 and repeated one-entry runs of both the `start_after` and the forced prefix-trie

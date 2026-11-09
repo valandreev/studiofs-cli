@@ -17,9 +17,70 @@ mod pipeline;
 #[cfg(test)]
 use pipeline::run_one_cycle;
 use pipeline::{
-    JanitorCycleContext, JanitorListing, JanitorObjectStore, RunBudget, run_one_cycle_resumable,
+    CycleOutcome, JanitorCycleContext, JanitorListing, JanitorObjectStore, RunBudget,
+    classify_error, run_one_cycle_resumable,
 };
-use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry, JanitorLister};
+use studiofs_data::janitor::{
+    JanitorDeleteError, JanitorEntry, JanitorFailureClass, JanitorLister,
+};
+
+/// `--loop` gives up after this many failed or overloaded cycles in a row.
+const MAX_CONSECUTIVE_FAILED_CYCLES: u32 = 5;
+
+/// Decides what follows a cycle: the next sleep, a clean stop, or the run's error.
+#[derive(Debug, Default)]
+struct LoopBreaker {
+    consecutive_failures: u32,
+}
+
+impl LoopBreaker {
+    /// Terminal errors end the run at once. A transient error or an overloaded cycle
+    /// ends a single run; under `--loop` it backs off (interval x 2^(n-1), at most 8x)
+    /// and opens the circuit after [`MAX_CONSECUTIVE_FAILED_CYCLES`]. Success resets it.
+    fn after_cycle(
+        &mut self,
+        cycle: anyhow::Result<CycleOutcome>,
+        loop_mode: bool,
+        interval: Duration,
+    ) -> anyhow::Result<Option<Duration>> {
+        let failure = match cycle {
+            Ok(CycleOutcome::Overloaded) => anyhow::anyhow!(
+                "janitor cycle stopped early: S3 overload circuit open; unfinished work stays queued or checkpointed"
+            ),
+            Ok(CycleOutcome::TransientErrors) => {
+                anyhow::anyhow!("janitor cycle completed with transient errors")
+            }
+            Ok(_) => {
+                self.consecutive_failures = 0;
+                return Ok(loop_mode.then_some(interval));
+            }
+            Err(error) if classify_error(&error) == JanitorFailureClass::Terminal => {
+                return Err(
+                    error.context("janitor stopped: terminal failure, retrying cannot help")
+                );
+            }
+            Err(error) => error.context("janitor cycle failed: transient failure"),
+        };
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if !loop_mode {
+            return Err(failure);
+        }
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILED_CYCLES {
+            return Err(failure.context(format!(
+                "janitor circuit open after {} consecutive failed cycles",
+                self.consecutive_failures
+            )));
+        }
+        let delay = interval.saturating_mul(1 << (self.consecutive_failures - 1).min(3));
+        eprintln!(
+            "janitor: {failure:#}; retry {} of {} in {}s",
+            self.consecutive_failures,
+            MAX_CONSECUTIVE_FAILED_CYCLES - 1,
+            delay.as_secs()
+        );
+        Ok(Some(delay))
+    }
+}
 
 struct OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore);
 
@@ -577,11 +638,24 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
     }
 
     let mut restart_pending = full_scan || reset_scan;
+    let interval = Duration::from_secs(interval_minutes.max(1).saturating_mul(60));
+    let mut breaker = LoopBreaker::default();
     loop {
         let cycle_started = Instant::now();
         let lock_started = Instant::now();
         eprintln!("janitor phase=global_lock started");
-        let lock_acquired = JanitorMetadataSource::try_acquire_global_janitor_lock(&mut metadata)?;
+        let lock_acquired =
+            match JanitorMetadataSource::try_acquire_global_janitor_lock(&mut metadata) {
+                Ok(acquired) => acquired,
+                Err(error) => {
+                    let error = error.context("failed to acquire global janitor lock");
+                    match breaker.after_cycle(Err(error), loop_mode, interval)? {
+                        Some(delay) => std::thread::sleep(delay),
+                        None => break,
+                    }
+                    continue;
+                }
+            };
         let lock_wait_elapsed = lock_started.elapsed();
         eprintln!(
             "janitor phase=global_lock completed acquired={} duration_ms={}",
@@ -596,9 +670,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             if !loop_mode {
                 break;
             }
-            std::thread::sleep(Duration::from_secs(
-                interval_minutes.max(1).saturating_mul(60),
-            ));
+            std::thread::sleep(interval);
             continue;
         }
 
@@ -637,6 +709,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 };
             }
 
+            let transport_before = store.0.transport_stats();
             let stats = rt.block_on(run_one_cycle_resumable(
                 JanitorCycleContext {
                     store: &store,
@@ -662,10 +735,20 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 JanitorMetadataSource::prune_deletion_fences(metadata)?
             };
 
-            Ok((stats, fences_pruned))
+            Ok((stats, fences_pruned, transport_before))
         });
         let cycle_elapsed = cycle_started.elapsed();
-        let (stats, fences_pruned) = cycle_result?;
+        let (stats, fences_pruned, transport_before) = match cycle_result {
+            Ok(done) => done,
+            Err(error) => {
+                match breaker.after_cycle(Err(error), loop_mode, interval)? {
+                    Some(delay) => std::thread::sleep(delay),
+                    None => break,
+                }
+                continue;
+            }
+        };
+        let transport = store.0.transport_stats();
 
         println!("Janitor cycle done:");
         println!("  scanned:              {}", stats.scanned_files);
@@ -674,7 +757,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         println!("  skipped young:        {}", stats.skipped_young);
         println!("  skipped unknown age:  {}", stats.skipped_unknown_age);
         println!("  deferred candidates: {}", stats.skipped_deferred);
-        println!("  outcome:              {}", stats.outcome.label());
+        println!("  outcome:              {}", stats.cycle_outcome().label());
         println!(
             "  scan coverage:        {} (next={})",
             if stats.scan_complete {
@@ -690,6 +773,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             stats.deleted
         );
         println!("  delete errors:        {}", stats.delete_errors);
+        println!("  head errors:          {}", stats.head_errors);
         println!("  fences pruned:        {fences_pruned}");
         println!(
             "  janitor timings: metadata_open_ms={} global_lock_wait_ms={} protection_ms={} initial_listing_ms={} head_ms={} delete_ms={} object_work_ms={} cycle_ms={}",
@@ -703,7 +787,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             duration_ms(cycle_elapsed),
         );
         println!(
-            "  janitor counts: listed_entries={} peak_buffered_candidates={} scanned={} first_entry_ms={} first_candidate_ms={} opendal_head_calls={} opendal_delete_calls={} list_pages=unavailable claims={} claim_protected={} claim_finish={} skipped_non_canonical={}",
+            "  janitor counts: listed_entries={} peak_buffered_candidates={} scanned={} first_entry_ms={} first_candidate_ms={} opendal_head_calls={} opendal_delete_calls={} list_pages=unavailable claims={} claim_protected={} claim_finish={} skipped_non_canonical={} s3_throttled={} s3_retries={} s3_request_interval_ms={}",
             stats.initial_listing_entries,
             stats.peak_buffered_candidates,
             stats.scanned_files,
@@ -723,13 +807,16 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             stats.claim_protected,
             stats.claim_finishes,
             stats.skipped_non_canonical,
+            transport
+                .throttled
+                .saturating_sub(transport_before.throttled),
+            transport.retries.saturating_sub(transport_before.retries),
+            duration_ms(transport.request_interval),
         );
-        if !loop_mode {
-            break;
+        match breaker.after_cycle(Ok(stats.cycle_outcome()), loop_mode, interval)? {
+            Some(delay) => std::thread::sleep(delay),
+            None => break,
         }
-        std::thread::sleep(Duration::from_secs(
-            interval_minutes.max(1).saturating_mul(60),
-        ));
     }
 
     Ok(())
@@ -764,6 +851,8 @@ mod tests {
         head_missing: bool,
         head_young: bool,
         fail_delete: bool,
+        /// Reject every delete as access denied.
+        deny_delete: bool,
         missing_delete: bool,
         hang_delete: bool,
     }
@@ -821,7 +910,11 @@ mod tests {
         async fn last_modified(&self, _key: &str) -> anyhow::Result<Option<SystemTime>> {
             self.head_requests.fetch_add(1, Ordering::Relaxed);
             if self.fail_head {
-                anyhow::bail!("head failed")
+                return Err(
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "head failed")
+                        .set_temporary()
+                        .into(),
+                );
             }
             if self.hang_head {
                 std::future::pending::<()>().await;
@@ -838,7 +931,9 @@ mod tests {
             if self.hang_delete {
                 std::future::pending::<()>().await;
             }
-            if self.fail_delete {
+            if self.deny_delete {
+                Err(JanitorDeleteError::Terminal("access denied".to_string()))
+            } else if self.fail_delete {
                 Err(JanitorDeleteError::Other("delete failed".to_string()))
             } else if self.missing_delete {
                 Err(JanitorDeleteError::NotFound)
@@ -1549,15 +1644,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unconfirmed_finish_and_failed_delete_are_not_reported_as_deleted() {
-        let entries: Vec<_> = canonical_keys(2)
-            .into_iter()
-            .map(|key| JanitorEntry {
-                key,
-                is_file: true,
-                last_modified: None,
-            })
-            .collect();
-        // A stale finish token after successful S3 deletes must not count as success.
+        let entries = fragment_entries(u64::from(pipeline::OVERLOAD_TRIP_OBJECTS + 1));
+        // Repeated PG finish failures after successful S3 deletes must not trip the S3 breaker.
         let store = FakeJanitorStore {
             entries: entries.clone(),
             ..FakeJanitorStore::default()
@@ -1571,14 +1659,27 @@ mod tests {
             .unwrap();
         assert_eq!(
             (stats.deleted, stats.delete_errors, stats.claim_finishes),
-            (0, 1, 0)
+            (0, u64::from(pipeline::OVERLOAD_TRIP_OBJECTS + 1), 0)
         );
-        assert_eq!(*store.deleted.lock().unwrap(), canonical_keys(2));
+        assert_eq!(stats.outcome, CycleOutcome::Complete);
+        assert_eq!(stats.cycle_outcome(), CycleOutcome::TransientErrors);
+        assert_eq!(store.deleted.lock().unwrap().len(), entries.len() * 2);
+        assert_eq!(
+            metadata.gc_candidate_retries.len(),
+            u64::from(pipeline::OVERLOAD_TRIP_OBJECTS + 1) as usize
+        );
 
         // A failed or hung S3 delete records a retryable outcome under the same claim.
         for (fail_delete, hang_delete) in [(true, false), (false, true)] {
             let store = FakeJanitorStore {
-                entries: entries.clone(),
+                entries: canonical_keys(2)
+                    .into_iter()
+                    .map(|key| JanitorEntry {
+                        key,
+                        is_file: true,
+                        last_modified: None,
+                    })
+                    .collect(),
                 fail_delete,
                 hang_delete,
                 ..FakeJanitorStore::default()
@@ -2050,6 +2151,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stats.skipped_unknown_age, 1);
+        assert_eq!(stats.head_errors, 1);
         assert_eq!(stats.deleted, 0);
         assert!(head_failure.deleted.lock().unwrap().is_empty());
 
@@ -2327,6 +2429,10 @@ mod tests {
         active_requests: AtomicU64,
         peak_active_requests: AtomicU64,
         request_starts: std::sync::Mutex<Vec<Instant>>,
+        /// Fault responses served, in order, before normal ones: an HTTP status line plus
+        /// headers (`"503 Service Unavailable|Retry-After: 1"`), or `"DROP"` to close the
+        /// connection without an answer.
+        faults: std::sync::Mutex<std::collections::VecDeque<&'static str>>,
     }
 
     async fn fake_s3_request(listener: tokio::net::TcpListener, fake: std::sync::Arc<FakeS3>) {
@@ -2411,6 +2517,24 @@ mod tests {
                 } else {
                     ("501 Not Implemented", String::new(), "")
                 };
+                let fault = fake.faults.lock().unwrap().pop_front();
+                if fault == Some("DROP") {
+                    fake.active_requests.fetch_sub(1, Ordering::Relaxed);
+                    return;
+                }
+                let fault_headers;
+                let (status, body, extra_headers) = match fault {
+                    Some(fault) => {
+                        let (status, headers) = fault.split_once('|').unwrap_or((fault, ""));
+                        fault_headers = if headers.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{headers}\r\n")
+                        };
+                        (status, String::new(), fault_headers.as_str())
+                    }
+                    None => (status, body, extra_headers),
+                };
                 let response = format!(
                     "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -2476,6 +2600,7 @@ mod tests {
             active_requests: AtomicU64::new(0),
             peak_active_requests: AtomicU64::new(0),
             request_starts: std::sync::Mutex::new(Vec::new()),
+            faults: std::sync::Mutex::default(),
         });
         let task = tokio::spawn(fake_s3_request(listener, fake.clone()));
         let op = Operator::new(
@@ -2579,6 +2704,376 @@ mod tests {
         assert_eq!(fake.head_requests.load(Ordering::Relaxed), 2);
         server.abort();
         let _ = server.await;
+    }
+
+    const FAULT_KEY: &str = "test/objects/0000/0000000000000001/0";
+
+    fn fault_store(endpoint: &str) -> studiofs_data::janitor::JanitorObjectStore {
+        studiofs_data::janitor::JanitorObjectStore::from_s3(
+            endpoint,
+            "test",
+            "test",
+            "test",
+            "us-east-1",
+            2,
+            32,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn s3_throttle_honors_retry_after_and_slows_the_request_gate() {
+        let (_op, fake, endpoint, server) = fake_s3_operator(0).await;
+        fake.faults.lock().unwrap().extend([
+            "503 Service Unavailable|Retry-After: 1",
+            "429 Too Many Requests",
+        ]);
+        let store = fault_store(&endpoint);
+        let base = Duration::from_secs(1) / 32;
+
+        let stat = store.stat_key(FAULT_KEY).await;
+        assert!(
+            matches!(stat, Ok(studiofs_data::janitor::JanitorKeyStat::Found(_))),
+            "{stat:?}"
+        );
+        // One attempt plus one retry per throttle, then success: no unbounded retrying.
+        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 3);
+        let transport = store.transport_stats();
+        assert_eq!((transport.throttled, transport.retries), (2, 2));
+        // Two throttles doubled the spacing twice; one success shrank it by only 1/8.
+        assert!(transport.request_interval > base * 3, "{transport:?}");
+        let starts = fake.request_starts.lock().unwrap().clone();
+        assert!(
+            starts[1].duration_since(starts[0]) >= Duration::from_secs(1),
+            "Retry-After must hold back the next request"
+        );
+
+        let cycle_start = store.transport_stats();
+        assert!(store.stat_key(FAULT_KEY).await.is_ok());
+        let next_cycle = store.transport_stats();
+        assert_eq!((cycle_start.throttled, cycle_start.retries), (2, 2));
+        assert_eq!(
+            (
+                next_cycle.throttled.saturating_sub(cycle_start.throttled),
+                next_cycle.retries.saturating_sub(cycle_start.retries),
+            ),
+            (0, 0)
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn s3_sustained_throttle_and_dropped_connections_stop_after_bounded_retries() {
+        let (_op, fake, endpoint, server) = fake_s3_operator(0).await;
+        fake.faults.lock().unwrap().extend([
+            "DROP",
+            "503 Service Unavailable",
+            "503 Service Unavailable",
+            "503 Service Unavailable",
+            "503 Service Unavailable",
+        ]);
+        let store = fault_store(&endpoint);
+        let base = Duration::from_secs(1) / 32;
+
+        let result = store.delete(FAULT_KEY).await;
+        assert!(
+            matches!(result, Err(JanitorDeleteError::Other(_))),
+            "{result:?}"
+        );
+        let attempts = 1 + studiofs_data::janitor::JANITOR_S3_MAX_RETRIES as u64;
+        assert_eq!(fake.delete_requests.load(Ordering::Relaxed), attempts);
+        assert_eq!(fake.faults.lock().unwrap().len(), 1, "no extra attempt");
+        let transport = store.transport_stats();
+        assert_eq!(transport.retries, attempts - 1);
+        assert_eq!(transport.throttled, attempts);
+        // Every failure halved the request rate.
+        assert!(transport.request_interval >= base * 16, "{transport:?}");
+        let starts = fake.request_starts.lock().unwrap().clone();
+        let gaps: Vec<_> = starts.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|w| w[1] >= w[0]), "{gaps:?}");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn s3_permission_denied_is_terminal_and_vanished_keys_are_not_failures() {
+        use studiofs_data::janitor::{JanitorKeyStat, classify_object_error};
+
+        let (_op, fake, endpoint, server) = fake_s3_operator(0).await;
+        fake.faults.lock().unwrap().extend([
+            "403 Forbidden",
+            "403 Forbidden",
+            "404 Not Found",
+            "404 Not Found",
+        ]);
+        let store = fault_store(&endpoint);
+
+        let delete = store.delete(FAULT_KEY).await;
+        assert!(
+            matches!(delete, Err(JanitorDeleteError::Terminal(_))),
+            "{delete:?}"
+        );
+        let stat = store.stat_key(FAULT_KEY).await.unwrap_err();
+        assert_eq!(classify_object_error(&stat), JanitorFailureClass::Terminal);
+        // An already-deleted key is success for DELETE and absence for HEAD.
+        let vanished = store.delete(FAULT_KEY).await;
+        assert!(
+            matches!(vanished, Ok(()) | Err(JanitorDeleteError::NotFound)),
+            "{vanished:?}"
+        );
+        assert!(matches!(
+            store.stat_key(FAULT_KEY).await,
+            Ok(JanitorKeyStat::Missing)
+        ));
+        assert_eq!(fake.delete_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(store.transport_stats().retries, 0);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn failure_classes_follow_the_retry_policy() {
+        use opendal::ErrorKind;
+        use studiofs_meta::JanitorMetadataError;
+
+        let class = |error: anyhow::Error| classify_error(&error);
+        let transient = JanitorFailureClass::Transient;
+        let terminal = JanitorFailureClass::Terminal;
+        assert_eq!(
+            class(JanitorMetadataError::BackendUnavailable("connection reset".into()).into()),
+            transient
+        );
+        assert_eq!(
+            class(anyhow::Error::new(JanitorMetadataError::StaleClaim).context("finish")),
+            transient
+        );
+        assert_eq!(
+            class(JanitorMetadataError::UnsafeToDelete("volume binding mismatch").into()),
+            terminal
+        );
+        assert_eq!(
+            class(anyhow::Error::new(pipeline::OperationTimedOut("listing page")).context("list")),
+            transient
+        );
+        assert_eq!(
+            class(opendal::Error::new(ErrorKind::RateLimited, "slow down").into()),
+            transient
+        );
+        assert_eq!(
+            class(
+                opendal::Error::new(ErrorKind::Unexpected, "reset")
+                    .set_temporary()
+                    .into()
+            ),
+            transient
+        );
+        assert_eq!(
+            class(opendal::Error::new(ErrorKind::PermissionDenied, "denied").into()),
+            terminal
+        );
+        assert_eq!(
+            class(opendal::Error::new(ErrorKind::ConfigInvalid, "NoSuchBucket").into()),
+            terminal
+        );
+        // OpenDAL's retry layer marks final errors persistent; the kind still decides.
+        assert_eq!(
+            class(
+                opendal::Error::new(ErrorKind::PermissionDenied, "denied")
+                    .set_persistent()
+                    .into()
+            ),
+            terminal
+        );
+        assert_eq!(class(anyhow::anyhow!("listing is out of order")), terminal);
+    }
+
+    #[test]
+    fn loop_breaker_backs_off_recovers_and_stops_after_bounded_failures() {
+        use pipeline::CycleOutcome::{Complete, Overloaded, ScanBudgetExhausted};
+        use studiofs_meta::JanitorMetadataError;
+
+        let interval = Duration::from_secs(60);
+        let pg_down = || -> anyhow::Result<CycleOutcome> {
+            Err(JanitorMetadataError::BackendUnavailable("connection reset".into()).into())
+        };
+        // A single run reports transient and overloaded cycles as failures; budgets are not.
+        assert!(
+            LoopBreaker::default()
+                .after_cycle(pg_down(), false, interval)
+                .is_err()
+        );
+        assert!(
+            LoopBreaker::default()
+                .after_cycle(Ok(Overloaded), false, interval)
+                .is_err()
+        );
+        assert_eq!(
+            LoopBreaker::default()
+                .after_cycle(Ok(ScanBudgetExhausted), false, interval)
+                .unwrap(),
+            None
+        );
+
+        // Under --loop a PG disconnect or overload backs off; a healthy cycle resets it.
+        let mut breaker = LoopBreaker::default();
+        assert_eq!(
+            breaker.after_cycle(pg_down(), true, interval).unwrap(),
+            Some(interval)
+        );
+        assert_eq!(
+            breaker.after_cycle(Ok(Overloaded), true, interval).unwrap(),
+            Some(interval * 2)
+        );
+        assert_eq!(
+            breaker.after_cycle(Ok(Complete), true, interval).unwrap(),
+            Some(interval)
+        );
+        // Sustained failure grows the delay and then gives up instead of spinning.
+        let delays: Vec<_> = (1..MAX_CONSECUTIVE_FAILED_CYCLES)
+            .map(|_| breaker.after_cycle(pg_down(), true, interval).unwrap())
+            .collect();
+        assert_eq!(delays, [1, 2, 4, 8].map(|factor| Some(interval * factor)));
+        let error = breaker.after_cycle(pg_down(), true, interval).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("circuit open after 5 consecutive failed cycles"),
+            "{error:#}"
+        );
+
+        // Terminal failures never retry, even in loop mode.
+        let error = LoopBreaker::default()
+            .after_cycle(
+                Err(JanitorMetadataError::UnsafeToDelete("volume binding mismatch").into()),
+                true,
+                interval,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("terminal failure"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn transient_object_errors_fail_cycles_and_healthy_cycles_reset_loop_breaker() {
+        use CycleOutcome::{Complete, DeleteCapReached, TransientErrors};
+
+        let interval = Duration::from_secs(10);
+        for (head_errors, delete_errors) in [(1, 0), (0, 1)] {
+            let mut stats = pipeline::JanitorStats::default();
+            stats.head_errors = head_errors;
+            stats.delete_errors = delete_errors;
+            assert_eq!(stats.cycle_outcome(), TransientErrors);
+            assert!(
+                LoopBreaker::default()
+                    .after_cycle(Ok(stats.cycle_outcome()), false, interval)
+                    .is_err()
+            );
+
+            let mut breaker = LoopBreaker::default();
+            for _ in 0..MAX_CONSECUTIVE_FAILED_CYCLES - 1 {
+                assert!(
+                    breaker
+                        .after_cycle(Ok(stats.cycle_outcome()), true, interval)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            assert!(
+                breaker
+                    .after_cycle(Ok(stats.cycle_outcome()), true, interval)
+                    .is_err()
+            );
+            assert_eq!(
+                breaker.after_cycle(Ok(Complete), true, interval).unwrap(),
+                Some(interval)
+            );
+            assert_eq!(
+                breaker
+                    .after_cycle(Ok(DeleteCapReached), true, interval)
+                    .unwrap(),
+                Some(interval)
+            );
+            assert!(
+                breaker
+                    .after_cycle(Ok(stats.cycle_outcome()), true, interval)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        let mut budget_limited = pipeline::JanitorStats::default();
+        budget_limited.outcome = DeleteCapReached;
+        budget_limited.delete_errors = 1;
+        assert_eq!(budget_limited.cycle_outcome(), TransientErrors);
+        budget_limited.delete_errors = 0;
+        assert_eq!(budget_limited.cycle_outcome(), DeleteCapReached);
+        budget_limited.delete_errors = 1;
+        budget_limited.outcome = CycleOutcome::Overloaded;
+        assert_eq!(budget_limited.cycle_outcome(), CycleOutcome::Overloaded);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transient_object_failures_open_the_overload_circuit_without_losing_work() {
+        let start = JanitorSweepCheckpoint {
+            after_key: Some("test/objects/0000".to_string()),
+            ..sweep_checkpoint()
+        };
+        let store = FakeJanitorStore {
+            entries: fragment_entries(8),
+            fail_delete: true,
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let mut ctx = fake_cycle_context(&store, &mut metadata);
+        ctx.budget.max_deletes = u64::MAX;
+        let stats = run_one_cycle_resumable(ctx, start.clone(), &sweep_scope(), true)
+            .await
+            .unwrap();
+
+        let trip = u64::from(pipeline::OVERLOAD_TRIP_OBJECTS);
+        assert_eq!(stats.outcome, pipeline::CycleOutcome::Overloaded);
+        assert_eq!(metadata.claims, (1..=trip).collect::<Vec<_>>());
+        // One DELETE per failed object; its other keys wait for the object's retry.
+        assert_eq!(store.deleted.lock().unwrap().len() as u64, trip);
+        // Every claim was released as retryable and its queue row deferred.
+        assert!(
+            metadata
+                .finishes
+                .iter()
+                .all(|(_, _, outcome)| *outcome == UploadedObjectDeletionOutcome::Retryable)
+        );
+        assert_eq!(metadata.gc_candidate_retries, metadata.claims);
+        // The listed batch replays next cycle: the saved scan position did not move.
+        assert!(!stats.scan_complete);
+        assert_eq!(metadata.sweep_checkpoint, Some(start));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_delete_failure_releases_its_claim_and_stops_the_cycle() {
+        let store = FakeJanitorStore {
+            entries: fragment_entries(3),
+            deny_delete: true,
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let mut ctx = fake_cycle_context(&store, &mut metadata);
+        ctx.budget.max_deletes = u64::MAX;
+        let error = run_one_cycle(ctx).await.unwrap_err();
+
+        assert_eq!(
+            classify_error(&error),
+            JanitorFailureClass::Terminal,
+            "{error:#}"
+        );
+        assert_eq!(metadata.claims, [1]);
+        assert_eq!(
+            metadata.finishes,
+            [(1, fake_token(1), UploadedObjectDeletionOutcome::Retryable)]
+        );
+        assert_eq!(metadata.gc_candidate_retries, [1]);
+        assert_eq!(store.deleted.lock().unwrap().len(), 1);
     }
 
     fn create_local_metadata_fixture(meta_dir: &std::path::Path, endpoint: &str) -> PathBuf {
@@ -3293,7 +3788,7 @@ mod tests {
                 &secret_key,
                 &region,
                 2,
-                // Keep each gated HEAD below the cfg(test) 200 ms HEAD timeout.
+                // Keep each gated HEAD well below the cfg(test) 1 s HEAD timeout.
                 32,
             )
             .unwrap(),
