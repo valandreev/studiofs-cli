@@ -3,6 +3,8 @@
 use crate::cli::cache_layout::describe_cache_layout_state;
 use clap::Args;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
@@ -129,6 +131,208 @@ struct JanitorOptions {
     s3_requests_per_second: u32,
     full_scan: bool,
     reset_scan: bool,
+    output: JanitorOutput,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum JanitorOutput {
+    Text,
+    Jsonl,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ProgressSnapshot {
+    phase: &'static str,
+    phase_started: Instant,
+    scanned: Option<u64>,
+    listed_entries: Option<u64>,
+    candidates: Option<u64>,
+    protected: Option<u64>,
+    young: Option<u64>,
+    unknown: Option<u64>,
+    head_attempted: Option<u64>,
+    delete_attempted: Option<u64>,
+    delete_confirmed: Option<u64>,
+    would_delete: Option<u64>,
+    queue_depth: Option<u64>,
+    s3_rate_limit_per_second: u32,
+}
+
+struct ProgressReporter {
+    state: Arc<Mutex<ProgressSnapshot>>,
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+fn publish_live_progress(
+    progress: Option<&Arc<Mutex<ProgressSnapshot>>>,
+    stats: &pipeline::JanitorStats,
+    dry_run: bool,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    if let Ok(mut state) = progress.lock() {
+        state.scanned = Some(stats.scanned_files);
+        state.listed_entries = Some(stats.initial_listing_entries);
+        state.candidates = Some(stats.orphan_candidates);
+        state.protected = Some(stats.referenced_files);
+        state.young = Some(stats.skipped_young);
+        state.unknown = Some(stats.skipped_unknown_age);
+        state.head_attempted = Some(stats.head_requests);
+        state.delete_attempted = Some(stats.delete_requests);
+        state.delete_confirmed = Some(if dry_run { 0 } else { stats.deleted });
+        state.would_delete = Some(if dry_run { stats.deleted } else { 0 });
+    }
+}
+
+fn set_live_progress_phase(progress: Option<&Arc<Mutex<ProgressSnapshot>>>, phase: &'static str) {
+    if let Some(progress) = progress
+        && let Ok(mut state) = progress.lock()
+        && state.phase != phase
+    {
+        state.phase = phase;
+        state.phase_started = Instant::now();
+    }
+}
+
+impl ProgressReporter {
+    fn start(output: JanitorOutput, s3_rate_limit_per_second: u32) -> Self {
+        let state = Arc::new(Mutex::new(ProgressSnapshot {
+            phase: "metadata_open",
+            phase_started: Instant::now(),
+            scanned: None,
+            listed_entries: None,
+            candidates: None,
+            protected: None,
+            young: None,
+            unknown: None,
+            head_attempted: None,
+            delete_attempted: None,
+            delete_confirmed: None,
+            would_delete: None,
+            queue_depth: None,
+            s3_rate_limit_per_second,
+        }));
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let thread = spawn_progress_events(
+            Arc::clone(&state),
+            Duration::from_secs(5),
+            stopped,
+            move |snapshot, elapsed| {
+                emit_progress(output, &snapshot, elapsed);
+            },
+        );
+        Self {
+            state,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn phase(&self, phase: &'static str) {
+        set_live_progress_phase(Some(&self.state), phase);
+    }
+
+    fn begin_cycle(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.scanned = Some(0);
+            state.listed_entries = Some(0);
+            state.candidates = Some(0);
+            state.protected = Some(0);
+            state.young = Some(0);
+            state.unknown = Some(0);
+            state.head_attempted = Some(0);
+            state.delete_attempted = Some(0);
+            state.delete_confirmed = Some(0);
+            state.would_delete = Some(0);
+            state.queue_depth = None;
+        }
+    }
+}
+
+fn spawn_progress_events(
+    state: Arc<Mutex<ProgressSnapshot>>,
+    interval: Duration,
+    stopped: std::sync::mpsc::Receiver<()>,
+    mut emit: impl FnMut(ProgressSnapshot, u64) + Send + 'static,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        loop {
+            match stopped.recv_timeout(interval) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let Ok(snapshot) = state.lock().map(|state| state.clone()) else {
+                break;
+            };
+            let elapsed = duration_ms(snapshot.phase_started.elapsed());
+            emit(snapshot, elapsed);
+        }
+    })
+}
+
+impl Drop for ProgressReporter {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn emit_progress(output: JanitorOutput, state: &ProgressSnapshot, elapsed_ms: u64) {
+    match output {
+        JanitorOutput::Text => println!("{}", progress_text_line(state, elapsed_ms)),
+        JanitorOutput::Jsonl => println!("{}", progress_json_event(state, elapsed_ms)),
+    }
+}
+
+fn progress_text_line(state: &ProgressSnapshot, elapsed_ms: u64) -> String {
+    format!(
+        "Janitor progress: phase={} phase_elapsed={}s scanned={} listed_entries={} candidates={} protected={} young={} unknown={} HEAD={} DELETE_attempted={} DELETE_confirmed={} DELETE_would={} queue_depth={} s3_rate_limit_per_second={}",
+        state.phase,
+        elapsed_ms / 1000,
+        optional_count(state.scanned),
+        optional_count(state.listed_entries),
+        optional_count(state.candidates),
+        optional_count(state.protected),
+        optional_count(state.young),
+        optional_count(state.unknown),
+        optional_count(state.head_attempted),
+        optional_count(state.delete_attempted),
+        optional_count(state.delete_confirmed),
+        optional_count(state.would_delete),
+        optional_count(state.queue_depth),
+        state.s3_rate_limit_per_second,
+    )
+}
+
+fn progress_json_event(state: &ProgressSnapshot, elapsed_ms: u64) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "event": "progress",
+        "phase": state.phase,
+        "phase_elapsed_ms": elapsed_ms,
+        "scanned": state.scanned,
+        "listed_entries": state.listed_entries,
+        "orphan_candidates": state.candidates,
+        "protected": state.protected,
+        "skipped_young": state.young,
+        "skipped_unknown": state.unknown,
+        "head_attempted": state.head_attempted,
+        "delete_attempted": state.delete_attempted,
+        "delete_confirmed": state.delete_confirmed,
+        "would_delete": state.would_delete,
+        "s3_rate_limit_per_second": state.s3_rate_limit_per_second,
+        "retryable_queue_depth": state.queue_depth,
+        "s3_in_flight": null,
+        "pg_in_flight": null,
+    })
+}
+
+fn optional_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |count| count.to_string())
 }
 
 struct JanitorRunRequest {
@@ -296,6 +500,7 @@ impl JanitorRunRequest {
                 s3_requests_per_second: args.s3_requests_per_second,
                 full_scan: args.full_scan,
                 reset_scan: args.reset_scan,
+                output: args.output,
             },
         })
     }
@@ -365,11 +570,60 @@ pub(crate) struct JanitorArgs {
     /// Clear saved scan progress before starting a new sweep
     #[arg(long, conflicts_with = "full_scan")]
     reset_scan: bool,
+
+    /// Output readable text or versioned JSON Lines events
+    #[arg(long, value_enum, default_value = "text")]
+    output: JanitorOutput,
 }
 
 impl JanitorArgs {
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
-        run(JanitorRunRequest::from_args(self)?)
+        let output = self.output;
+        let result = JanitorRunRequest::from_args(self).and_then(run);
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.downcast_ref::<crate::cli::CommandExit>().is_some() => Err(error),
+            Err(error) => {
+                eprintln!("janitor error: {error:#}");
+                let unsafe_metadata = error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<studiofs_meta::JanitorMetadataError>()
+                        .is_some_and(|metadata_error| {
+                            matches!(
+                                metadata_error,
+                                studiofs_meta::JanitorMetadataError::UnsafeToDelete(_)
+                            )
+                        })
+                });
+                let (code, label, outcome) = if unsafe_metadata {
+                    (
+                        4,
+                        "janitor stopped: unsafe metadata state; verify volume protection and format binding",
+                        "unsafe",
+                    )
+                } else {
+                    (
+                        5,
+                        "janitor stopped: backend unavailable; verify PostgreSQL/S3 connectivity and retry",
+                        "backend_failure",
+                    )
+                };
+                if output == JanitorOutput::Jsonl {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema_version": 1,
+                            "event": "summary",
+                            "outcome": outcome,
+                            "coverage": "unknown",
+                            "exit_code": code,
+                            "message": label,
+                        })
+                    );
+                }
+                Err(anyhow::Error::new(crate::cli::CommandExit { code, label }))
+            }
+        }
     }
 }
 
@@ -572,6 +826,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         s3_requests_per_second,
         full_scan,
         reset_scan,
+        output,
     } = options;
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
@@ -582,6 +837,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         ));
     }
 
+    let progress = ProgressReporter::start(output, s3_requests_per_second);
     eprintln!("janitor phase=metadata_open started");
     let metadata_open_started = Instant::now();
     let mut metadata = JanitorMetadataSession::open(&db_path)?;
@@ -591,6 +847,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         "janitor phase=metadata_open completed duration_ms={}",
         duration_ms(metadata_open_elapsed)
     );
+    progress.phase("storage_setup");
 
     let prefix = normalize_prefix(&format_info);
     let local_cache_report = if let Some(cache_dir) = cache_dir.as_deref() {
@@ -620,6 +877,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
     } else {
         "hex-prefix-trie-v1"
     };
+    progress.phase("waiting_for_cycle");
     let sweep_scope = JanitorSweepScope {
         volume_uuid: &format_info.uuid,
         endpoint: &format_info.endpoint,
@@ -656,19 +914,27 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         s3_concurrency,
         s3_requests_per_second,
     }) {
-        println!("{line}");
+        if output == JanitorOutput::Text {
+            println!("{line}");
+        }
     }
 
     let mut restart_pending = full_scan || reset_scan;
     let interval = Duration::from_secs(interval_minutes.max(1).saturating_mul(60));
     let mut breaker = LoopBreaker::default();
+    let mut command_exit: Option<(u8, &'static str)> = None;
     loop {
         if cancellation.is_cancelled() {
-            println!("Janitor stopped: cancellation requested");
+            if output == JanitorOutput::Text {
+                println!("Janitor stopped: cancellation requested");
+            }
+            command_exit = Some((2, "janitor stopped: cancellation requested"));
             break;
         }
         let cycle_started = Instant::now();
         let lock_started = Instant::now();
+        progress.begin_cycle();
+        progress.phase("global_lock");
         eprintln!("janitor phase=global_lock started");
         let lock_acquired =
             match JanitorMetadataSource::try_acquire_global_janitor_lock(&mut metadata) {
@@ -676,7 +942,10 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 Err(error) => {
                     let error = error.context("failed to acquire global janitor lock");
                     match breaker.after_cycle(Err(error), loop_mode, interval)? {
-                        Some(delay) => wait_or_cancel(&rt, &cancellation, delay),
+                        Some(delay) => {
+                            progress.phase("waiting_for_cycle");
+                            wait_or_cancel(&rt, &cancellation, delay);
+                        }
                         None => break,
                     }
                     continue;
@@ -689,19 +958,24 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             duration_ms(lock_wait_elapsed)
         );
         if !lock_acquired {
-            println!(
-                "Janitor cycle skipped: lock_busy (wait_ms={})",
-                duration_ms(lock_wait_elapsed)
-            );
+            if output == JanitorOutput::Text {
+                println!(
+                    "Janitor cycle skipped: lock_busy (wait_ms={})",
+                    duration_ms(lock_wait_elapsed)
+                );
+            }
             if !loop_mode {
+                command_exit = Some((3, "janitor stopped: global lock is busy"));
                 break;
             }
+            progress.phase("waiting_for_cycle");
             wait_or_cancel(&rt, &cancellation, interval);
             continue;
         }
         let global_lock_acquired = Instant::now();
 
         let protection_started = Instant::now();
+        progress.phase("protection");
         eprintln!("janitor phase=protection started");
         let mut protection_elapsed = Duration::ZERO;
         let cycle_result = with_acquired_global_janitor_lock(&mut metadata, |metadata| {
@@ -737,6 +1011,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             }
 
             let transport_before = store.0.transport_stats();
+            progress.phase("object_scan");
             let stats = rt.block_on(run_one_cycle_resumable(
                 JanitorCycleContext {
                     store: &store,
@@ -749,6 +1024,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                         max_runtime: max_runtime_minutes
                             .map(|minutes| Duration::from_secs(minutes.saturating_mul(60))),
                         cancel: cancellation.clone(),
+                        progress: Some(Arc::clone(&progress.state)),
                     },
                     metadata,
                 },
@@ -771,94 +1047,255 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             Ok(done) => done,
             Err(error) => {
                 match breaker.after_cycle(Err(error), loop_mode, interval)? {
-                    Some(delay) => wait_or_cancel(&rt, &cancellation, delay),
+                    Some(delay) => {
+                        progress.phase("waiting_for_cycle");
+                        wait_or_cancel(&rt, &cancellation, delay);
+                    }
                     None => break,
                 }
                 continue;
             }
         };
         let transport = store.0.transport_stats();
+        progress.phase("cycle_summary");
 
-        println!("Janitor cycle done:");
-        println!("  scanned:              {}", stats.scanned_files);
-        println!("  referenced:           {}", stats.referenced_files);
-        println!("  orphan candidates:    {}", stats.orphan_candidates);
-        println!("  skipped young:        {}", stats.skipped_young);
-        println!("  skipped unknown age:  {}", stats.skipped_unknown_age);
-        println!("  deferred candidates: {}", stats.skipped_deferred);
-        println!("  outcome:              {}", stats.cycle_outcome().label());
-        println!(
-            "  scan coverage:        {} (next={})",
-            if stats.scan_complete {
-                "complete"
-            } else {
-                "partial"
-            },
-            stats.scan_position
-        );
-        println!(
-            "  {}: {}",
-            if dry_run { "would delete" } else { "deleted" },
-            stats.deleted
-        );
-        println!("  delete errors:        {}", stats.delete_errors);
-        println!("  head errors:          {}", stats.head_errors);
-        println!("  fences pruned:        {fences_pruned}");
-        println!(
-            "  janitor timings: metadata_open_ms={} global_lock_wait_ms={} global_lock_hold_ms={} protection_ms={} initial_listing_ms={} head_ms={} delete_ms={} object_work_ms={} cycle_ms={}",
-            duration_ms(metadata_open_elapsed),
-            duration_ms(lock_wait_elapsed),
-            duration_ms(global_lock_hold_elapsed),
-            duration_ms(protection_elapsed),
-            duration_ms(stats.initial_listing_elapsed),
-            duration_ms(stats.head_elapsed),
-            duration_ms(stats.delete_elapsed),
-            duration_ms(stats.cycle_elapsed),
-            duration_ms(cycle_elapsed),
-        );
-        println!(
-            "  janitor counts: listed_entries={} peak_buffered_candidates={} scanned={} first_entry_ms={} first_candidate_ms={} opendal_head_calls={} opendal_delete_calls={} list_pages=unavailable claims={} claim_protected={} claim_finish={} skipped_non_canonical={} s3_throttled={} s3_retries={} s3_request_interval_ms={}",
-            stats.initial_listing_entries,
-            stats.peak_buffered_candidates,
-            stats.scanned_files,
-            stats
-                .first_listing_entry
-                .map(duration_ms)
-                .map(|ms| ms.to_string())
-                .unwrap_or_else(|| "unavailable".to_string()),
-            stats
-                .time_to_first_candidate
-                .map(duration_ms)
-                .map(|ms| ms.to_string())
-                .unwrap_or_else(|| "unavailable".to_string()),
-            stats.head_requests,
-            stats.delete_requests,
-            stats.claims,
-            stats.claim_protected,
-            stats.claim_finishes,
-            stats.skipped_non_canonical,
-            transport
-                .throttled
-                .saturating_sub(transport_before.throttled),
-            transport.retries.saturating_sub(transport_before.retries),
-            duration_ms(transport.request_interval),
-        );
+        if output == JanitorOutput::Jsonl {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1,
+                    "event": "cycle",
+                    "outcome": stats.cycle_outcome().label(),
+                    "partial": stats.cycle_outcome() != CycleOutcome::Complete,
+                    "coverage": if stats.scan_complete { "complete" } else { "partial" },
+                    "scanned": stats.scanned_files,
+                    "listed_entries": stats.initial_listing_entries,
+                    "protected": stats.referenced_files,
+                    "orphan_candidates": stats.orphan_candidates,
+                    "skipped_young": stats.skipped_young,
+                    "skipped_unknown": stats.skipped_unknown_age,
+                    "delete_attempted": stats.delete_requests,
+                    "delete_confirmed": if dry_run { 0 } else { stats.deleted },
+                    "would_delete": if dry_run { stats.deleted } else { 0 },
+                    "retryable_queue_depth": null,
+                    "metadata_open_ms": duration_ms(metadata_open_elapsed),
+                    "global_lock_wait_ms": duration_ms(lock_wait_elapsed),
+                    "global_lock_hold_ms": duration_ms(global_lock_hold_elapsed),
+                    "protection_ms": duration_ms(protection_elapsed),
+                    "initial_listing_ms": duration_ms(stats.initial_listing_elapsed),
+                    "head_ms": duration_ms(stats.head_elapsed),
+                    "delete_ms": duration_ms(stats.delete_elapsed),
+                    "cycle_ms": duration_ms(cycle_elapsed),
+                    "s3_throttled": transport.throttled.saturating_sub(transport_before.throttled),
+                    "s3_retries": transport.retries.saturating_sub(transport_before.retries),
+                    "s3_rate_limit_per_second": s3_requests_per_second,
+                    "s3_in_flight": null,
+                    "pg_in_flight": null,
+                })
+            );
+        } else {
+            println!("Janitor cycle done:");
+            println!("  scanned:              {}", stats.scanned_files);
+            println!("  referenced:           {}", stats.referenced_files);
+            println!("  orphan candidates:    {}", stats.orphan_candidates);
+            println!("  skipped young:        {}", stats.skipped_young);
+            println!("  skipped unknown age:  {}", stats.skipped_unknown_age);
+            println!("  deferred candidates: {}", stats.skipped_deferred);
+            println!("  outcome:              {}", stats.cycle_outcome().label());
+            println!(
+                "  scan coverage:        {} (next={})",
+                if stats.scan_complete {
+                    "complete"
+                } else {
+                    "partial"
+                },
+                stats.scan_position
+            );
+            println!(
+                "  {}: {}",
+                if dry_run { "would delete" } else { "deleted" },
+                stats.deleted
+            );
+            println!("  delete errors:        {}", stats.delete_errors);
+            println!("  head errors:          {}", stats.head_errors);
+            println!("  fences pruned:        {fences_pruned}");
+            println!(
+                "  janitor timings: metadata_open_ms={} global_lock_wait_ms={} global_lock_hold_ms={} protection_ms={} initial_listing_ms={} head_ms={} delete_ms={} object_work_ms={} cycle_ms={}",
+                duration_ms(metadata_open_elapsed),
+                duration_ms(lock_wait_elapsed),
+                duration_ms(global_lock_hold_elapsed),
+                duration_ms(protection_elapsed),
+                duration_ms(stats.initial_listing_elapsed),
+                duration_ms(stats.head_elapsed),
+                duration_ms(stats.delete_elapsed),
+                duration_ms(stats.cycle_elapsed),
+                duration_ms(cycle_elapsed),
+            );
+            println!(
+                "  janitor counts: listed_entries={} peak_buffered_candidates={} scanned={} first_entry_ms={} first_candidate_ms={} opendal_head_calls={} opendal_delete_calls={} list_pages=unavailable claims={} claim_protected={} claim_finish={} skipped_non_canonical={} s3_throttled={} s3_retries={} s3_request_interval_ms={}",
+                stats.initial_listing_entries,
+                stats.peak_buffered_candidates,
+                stats.scanned_files,
+                stats
+                    .first_listing_entry
+                    .map(duration_ms)
+                    .map(|ms| ms.to_string())
+                    .unwrap_or_else(|| "unavailable".to_string()),
+                stats
+                    .time_to_first_candidate
+                    .map(duration_ms)
+                    .map(|ms| ms.to_string())
+                    .unwrap_or_else(|| "unavailable".to_string()),
+                stats.head_requests,
+                stats.delete_requests,
+                stats.claims,
+                stats.claim_protected,
+                stats.claim_finishes,
+                stats.skipped_non_canonical,
+                transport
+                    .throttled
+                    .saturating_sub(transport_before.throttled),
+                transport.retries.saturating_sub(transport_before.retries),
+                duration_ms(transport.request_interval),
+            );
+        }
         if cancellation.is_cancelled() || stats.cycle_outcome() == CycleOutcome::Cancelled {
-            println!("Janitor stopped: cancellation requested after admitted work drained");
+            if output == JanitorOutput::Text {
+                println!("Janitor stopped: cancellation requested after admitted work drained");
+            }
+            command_exit = Some((
+                2,
+                "janitor stopped: cancellation requested after admitted work drained",
+            ));
             break;
         }
+        // Loop mode reports the latest cycle, not a partial result from an earlier one.
+        command_exit = (stats.cycle_outcome() != CycleOutcome::Complete).then_some((
+            2,
+            "janitor completed with partial scan coverage or retryable work",
+        ));
         match breaker.after_cycle(Ok(stats.cycle_outcome()), loop_mode, interval)? {
-            Some(delay) => wait_or_cancel(&rt, &cancellation, delay),
+            Some(delay) => {
+                progress.phase("waiting_for_cycle");
+                wait_or_cancel(&rt, &cancellation, delay);
+            }
             None => break,
         }
     }
 
-    Ok(())
+    // Join the heartbeat so no progress event can follow the final summary.
+    drop(progress);
+    if let Some((code, label)) = command_exit {
+        if output == JanitorOutput::Jsonl {
+            let outcome = match code {
+                2 => "partial",
+                3 => "lock_busy",
+                4 => "unsafe",
+                _ => "backend_failure",
+            };
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":1,"event":"summary","outcome":outcome,"coverage":if code==2 {"partial"} else {"unknown"},"exit_code":code,"message":label})
+            );
+        }
+        Err(anyhow::Error::new(crate::cli::CommandExit { code, label }))
+    } else {
+        if output == JanitorOutput::Jsonl {
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":1,"event":"summary","outcome":"complete","coverage":"complete","exit_code":0})
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_jsonl_reports_versioned_fields_and_unknown_counts() {
+        let state = ProgressSnapshot {
+            phase: "object_scan",
+            phase_started: Instant::now(),
+            scanned: Some(12),
+            listed_entries: Some(8),
+            candidates: Some(3),
+            protected: Some(4),
+            young: Some(2),
+            unknown: Some(1),
+            head_attempted: Some(3),
+            delete_attempted: None,
+            delete_confirmed: None,
+            would_delete: None,
+            queue_depth: None,
+            s3_rate_limit_per_second: 4,
+        };
+        let event = progress_json_event(&state, 1_800_000);
+        assert_eq!(event["schema_version"], 1);
+        assert_eq!(event["event"], "progress");
+        assert_eq!(event["phase_elapsed_ms"], 1_800_000);
+        assert_eq!(event["scanned"], 12);
+        assert!(event["delete_attempted"].is_null());
+        assert!(event["retryable_queue_depth"].is_null());
+        assert!(event["s3_in_flight"].is_null());
+        assert!(event["pg_in_flight"].is_null());
+        let text = progress_text_line(&state, 1_800_000);
+        assert!(text.contains("phase=object_scan phase_elapsed=1800s"));
+        assert!(text.contains("DELETE_attempted=unknown"));
+
+        let state = Arc::new(Mutex::new(state));
+        let mut dry_run_stats = pipeline::JanitorStats::default();
+        dry_run_stats.deleted = 2;
+        publish_live_progress(Some(&state), &dry_run_stats, true);
+        let event = progress_json_event(&state.lock().unwrap(), 50);
+        assert_eq!(event["delete_confirmed"], 0);
+        assert_eq!(event["would_delete"], 2);
+    }
+
+    #[test]
+    fn progress_heartbeat_runs_while_operation_is_pending_and_reports_long_elapsed_time() {
+        let state = Arc::new(Mutex::new(ProgressSnapshot {
+            phase: "metadata_open",
+            phase_started: Instant::now()
+                .checked_sub(Duration::from_secs(30 * 60))
+                .unwrap_or_else(Instant::now),
+            scanned: None,
+            listed_entries: None,
+            candidates: None,
+            protected: None,
+            young: None,
+            unknown: None,
+            head_attempted: None,
+            delete_attempted: None,
+            delete_confirmed: None,
+            would_delete: None,
+            queue_depth: None,
+            s3_rate_limit_per_second: 4,
+        }));
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let (events, received) = std::sync::mpsc::channel();
+        let reporter = spawn_progress_events(
+            state,
+            Duration::from_millis(10),
+            stopped,
+            move |snapshot, elapsed| {
+                events
+                    .send(progress_json_event(&snapshot, elapsed))
+                    .unwrap();
+            },
+        );
+        let pending_operation = received.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(pending_operation["event"], "progress");
+        assert_eq!(
+            pending_operation["phase_elapsed_ms"].as_u64().unwrap() / 60_000,
+            30
+        );
+        assert_eq!(pending_operation["phase"], "metadata_open");
+        stop.send(()).unwrap();
+        reporter.join().unwrap();
+    }
     use anyhow::Context;
     use opendal::Operator;
     use opendal::services::S3;
@@ -1257,6 +1694,7 @@ mod tests {
                             max_scan_entries: Some(1),
                             max_runtime: None,
                             cancel: CancellationToken::new(),
+                            progress: None,
                         },
                         metadata: &mut metadata,
                     },
@@ -1402,6 +1840,7 @@ mod tests {
                         max_scan_entries: None,
                         max_runtime: None,
                         cancel: cancellation.clone(),
+                        progress: None,
                     },
                     metadata,
                 },
@@ -1578,6 +2017,7 @@ mod tests {
                             max_scan_entries: Some(1),
                             max_runtime: None,
                             cancel: CancellationToken::new(),
+                            progress: None,
                         },
                         metadata: &mut metadata,
                     },
@@ -2196,6 +2636,49 @@ mod tests {
             metadata.gc_candidate_backfills, 0,
             "dry run must not write the queue"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dry_run_counts_queued_object_once_when_listing_revisits_it() {
+        let old = i64::try_from(
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+            - 3600;
+        let store = FakeJanitorStore {
+            entries: studiofs_data::object::format_object_fragment_keys("test/objects/", 5)
+                .into_iter()
+                .map(|key| JanitorEntry {
+                    key,
+                    is_file: true,
+                    last_modified: None,
+                })
+                .collect(),
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata {
+            gc_candidates: vec![(5, old)],
+            ..FakeJanitorMetadata::eligible()
+        };
+        let stats = run_one_cycle(JanitorCycleContext {
+            store: &store,
+            prefix: "test/objects/",
+            dry_run: true,
+            skip_newer_than_secs: 0,
+            budget: RunBudget::deletes(10),
+            metadata: &mut metadata,
+        })
+        .await
+        .expect("dry-run cycle");
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.orphan_candidates, 1);
+        assert_eq!(store.list_requests.load(Ordering::Relaxed), 1);
+        assert!(store.deleted.lock().unwrap().is_empty());
+        assert!(metadata.claims.is_empty());
+        assert!(metadata.gc_candidate_acks.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3466,6 +3949,7 @@ mod tests {
                     s3_requests_per_second: 4,
                     full_scan: false,
                     reset_scan: false,
+                    output: JanitorOutput::Text,
                 },
             })
         })
@@ -3519,6 +4003,7 @@ mod tests {
                     s3_requests_per_second: 4,
                     full_scan: false,
                     reset_scan: false,
+                    output: JanitorOutput::Text,
                 },
             });
             if let Some(session) = holder.as_mut() {
@@ -3582,7 +4067,11 @@ mod tests {
             .expect("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)");
         let run = run_postgres_fixture_once(url, true).await;
 
-        run.result.unwrap();
+        let error = run.result.unwrap_err();
+        let exit = error
+            .downcast_ref::<crate::cli::CommandExit>()
+            .expect("busy global lock maps to a typed command exit");
+        assert_eq!(exit.code, 3);
         assert_eq!(run.s3_requests, 0);
         assert!(run.metadata_unchanged);
     }
@@ -3621,6 +4110,7 @@ mod tests {
                 s3_requests_per_second,
                 full_scan,
                 reset_scan,
+                ..
             }) => {
                 assert_eq!(name, "vol");
                 assert_eq!(cache_dir, Some(PathBuf::from("D:\\cache\\studiofs")));
@@ -4016,6 +4506,7 @@ mod tests {
                         max_scan_entries: None,
                         max_runtime: None,
                         cancel,
+                        progress: None,
                     },
                     metadata,
                 },
@@ -4111,6 +4602,202 @@ mod tests {
         )?;
         drop(engine);
         Ok((volume_id, db_path, format_info))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires local STUDIOFS_TEST_PG_DSN and a live STUDIOFS_S3_* bucket"]
+    async fn live_cli_dry_run_keeps_eligible_candidate_and_object() -> anyhow::Result<()> {
+        let postgres_url = test_env("STUDIOFS_TEST_PG_DSN")
+            .expect("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)");
+        let env = |key: &str, default: &str| test_env(key).unwrap_or_else(|| default.to_string());
+        let endpoint = env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
+        let bucket = env("STUDIOFS_S3_BUCKET", "studiofs-test");
+        let access_key = env("STUDIOFS_S3_ACCESS_KEY", "studiofs");
+        let secret_key = env("STUDIOFS_S3_SECRET_KEY", "studiofs123");
+        let region = env("STUDIOFS_S3_REGION", "us-east-1");
+        // CI passes a libpq key-value DSN, so parse it as a PostgreSQL config, not a URL.
+        let pg_config: tokio_postgres::Config = postgres_url.parse()?;
+        let s3_url = url::Url::parse(&endpoint)?;
+        let is_loopback =
+            |host: Option<&str>| matches!(host, Some("127.0.0.1" | "localhost" | "[::1]" | "::1"));
+        let pg_hosts = pg_config.get_hosts();
+        anyhow::ensure!(
+            !pg_hosts.is_empty()
+                && pg_hosts.iter().all(|host| match host {
+                    tokio_postgres::config::Host::Tcp(host) => is_loopback(Some(host)),
+                    #[cfg(unix)]
+                    tokio_postgres::config::Host::Unix(_) => true,
+                })
+                && is_loopback(s3_url.host_str()),
+            "live janitor test requires local PostgreSQL and S3 endpoints"
+        );
+        let object_id = u64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_nanos()
+                % u128::try_from(i64::MAX)?,
+        )?;
+        let prefix = format!("sfs977-dry-run-{object_id:016x}/objects/");
+        let s3 = LiveS3Config {
+            endpoint: &endpoint,
+            bucket: &bucket,
+            access_key: &access_key,
+            secret_key: &secret_key,
+            region: &region,
+            prefix: &prefix,
+        };
+        let writer = Operator::new(
+            S3::default()
+                .endpoint(&endpoint)
+                .bucket(&bucket)
+                .access_key_id(&access_key)
+                .secret_access_key(&secret_key)
+                .region(&region),
+        )?
+        .finish();
+        let key = studiofs_data::object::format_object_key(&prefix, object_id);
+        writer.write(&key, b"sfs977 dry-run".to_vec()).await?;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("janitor-sfs977-dry-run-");
+        let client_root = temp.path().join("client");
+        let meta_dir = client_root.join("meta/janitor-live");
+        let (volume_id, _db_path, _) =
+            create_live_postgres_janitor_fixture(&postgres_url, &s3, &meta_dir, object_id).await?;
+        let (client, connection) =
+            tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls).await?;
+        let connection_task = tokio::spawn(connection);
+        let object_id_sql = i64::try_from(object_id)?;
+        let candidate_before: String = client
+            .query_one(
+                "SELECT row_to_json(candidate)::text FROM snapshot_payload_gc_candidates AS candidate WHERE vol = $1 AND object_id = $2",
+                &[&volume_id, &object_id_sql],
+            )
+            .await?
+            .get(0);
+        let state_before: String = client
+            .query_one(
+                "SELECT concat_ws('|', (SELECT count(*) FROM snapshot_payload_sweep_checkpoints WHERE vol = $1), (SELECT count(*) FROM snapshot_payload_upload_objects WHERE vol = $1), (SELECT count(*) FROM snapshot_payload_upload_watermarks WHERE vol = $1))",
+                &[&volume_id],
+            )
+            .await?
+            .get(0);
+
+        let mut binary = std::env::current_exe()?;
+        binary.pop();
+        binary.pop();
+        binary.push(if cfg!(windows) {
+            "studiofs.exe"
+        } else {
+            "studiofs"
+        });
+        anyhow::ensure!(
+            binary.is_file(),
+            "build the studiofs CLI binary before this ignored test"
+        );
+        let output = std::process::Command::new(&binary)
+            .args([
+                "janitor",
+                "janitor-live",
+                "--dry-run",
+                "--output",
+                "jsonl",
+                "--full-scan",
+                "--skip-newer-minutes",
+                "0",
+                "--max-deletes",
+                "10",
+            ])
+            .env("STUDIOFS_CLIENT_ROOT", &client_root)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "live dry-run CLI exited with {}",
+            output.status
+        );
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        let cycle = events
+            .iter()
+            .find(|event| event["event"] == "cycle")
+            .expect("JSONL cycle event");
+        let summary = events
+            .iter()
+            .find(|event| event["event"] == "summary")
+            .expect("JSONL final summary");
+        assert_eq!(cycle["would_delete"], 1);
+        assert_eq!(cycle["delete_attempted"], 0);
+        assert_eq!(cycle["delete_confirmed"], 0);
+        assert_eq!(summary["outcome"], "complete");
+        assert_eq!(summary["exit_code"], 0);
+
+        let partial = std::process::Command::new(&binary)
+            .args([
+                "janitor",
+                "janitor-live",
+                "--dry-run",
+                "--output",
+                "jsonl",
+                "--full-scan",
+                "--skip-newer-minutes",
+                "0",
+                "--max-deletes",
+                "1",
+            ])
+            .env("STUDIOFS_CLIENT_ROOT", &client_root)
+            .output()?;
+        assert_eq!(partial.status.code(), Some(2));
+        let partial_events: Vec<serde_json::Value> = std::str::from_utf8(&partial.stdout)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        let partial_summary = partial_events
+            .iter()
+            .find(|event| event["event"] == "summary")
+            .expect("JSONL partial summary");
+        assert_eq!(partial_summary["outcome"], "partial");
+        assert_eq!(partial_summary["exit_code"], 2);
+
+        let candidate_after: String = client
+            .query_one(
+                "SELECT row_to_json(candidate)::text FROM snapshot_payload_gc_candidates AS candidate WHERE vol = $1 AND object_id = $2",
+                &[&volume_id, &object_id_sql],
+            )
+            .await?
+            .get(0);
+        let state_after: String = client
+            .query_one(
+                "SELECT concat_ws('|', (SELECT count(*) FROM snapshot_payload_sweep_checkpoints WHERE vol = $1), (SELECT count(*) FROM snapshot_payload_upload_objects WHERE vol = $1), (SELECT count(*) FROM snapshot_payload_upload_watermarks WHERE vol = $1))",
+                &[&volume_id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(candidate_after, candidate_before);
+        assert_eq!(state_after, state_before);
+        let object_store =
+            OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::from_s3(
+                &endpoint,
+                &bucket,
+                &access_key,
+                &secret_key,
+                &region,
+                2,
+                32,
+            )?);
+        assert!(
+            listed_files(&object_store, &prefix, None)
+                .await
+                .contains(&key)
+        );
+
+        client
+            .execute("DELETE FROM volumes WHERE vol = $1", &[&volume_id])
+            .await?;
+        connection_task.abort();
+        writer.delete(&key).await?;
+        drop(temp);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4393,6 +5080,7 @@ mod tests {
                     max_scan_entries: Some(1),
                     max_runtime: None,
                     cancel: CancellationToken::new(),
+                    progress: None,
                 };
                 let fallback = NoStartAfterStore(&store);
                 let stats = if strategy == "start_after" {

@@ -299,6 +299,8 @@ jobs:
           run_ignored_tests "studiofs-data S3 delete idempotency" "" true -p studiofs-data --test integration_test delete_object_idempotent
           run_ignored_tests "studiofs-data S3 multi-object write" "" true -p studiofs-data --test integration_test large_multi_object_write
           # After the DataStore tests: they create the bucket the live janitor listing test uses.
+          # The live CLI janitor test spawns target/debug/studiofs; --bin test runs do not build it.
+          cargo build -p studiofs --bin studiofs
           run_ignored_tests "studiofs CLI" "" false -p studiofs --bin studiofs cli::
           run_ignored_tests "studiofs-vfs published cold-read payload" "" true -p studiofs-vfs --test vfs_test committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen
           run_ignored_tests "studiofs-vfs partial-overwrite publication" "" true -p studiofs-vfs --test vfs_test large_file_partial_overwrite_reuploads_only_touched_extents

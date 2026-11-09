@@ -137,6 +137,20 @@ impl Cli {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct CommandExit {
+    pub(crate) code: u8,
+    pub(crate) label: &'static str,
+}
+
+impl std::fmt::Display for CommandExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label)
+    }
+}
+
+impl std::error::Error for CommandExit {}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     Bench(bench::BenchArgs),

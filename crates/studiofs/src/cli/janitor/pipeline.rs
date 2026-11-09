@@ -1,5 +1,6 @@
 //! Provider-neutral standalone janitor cycle.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -108,6 +109,8 @@ pub(super) struct JanitorStats {
     pub(super) delete_elapsed: Duration,
     /// HEAD probes that failed transiently; their objects were skipped as unknown age.
     pub(super) head_errors: u64,
+    /// Dry-run objects already counted as would-delete; bounded by the delete cap.
+    dry_run_counted: std::collections::HashSet<u64>,
     /// Objects in a row whose S3 work failed transiently.
     transient_streak: u32,
     pub(super) outcome: CycleOutcome,
@@ -176,6 +179,7 @@ pub(super) struct RunBudget {
     pub(super) max_runtime: Option<Duration>,
     /// Stops new listing/candidate admission while an admitted delete drains.
     pub(super) cancel: CancellationToken,
+    pub(super) progress: Option<Arc<Mutex<super::ProgressSnapshot>>>,
 }
 
 impl RunBudget {
@@ -186,6 +190,7 @@ impl RunBudget {
             max_scan_entries: None,
             max_runtime: None,
             cancel: CancellationToken::new(),
+            progress: None,
         }
     }
 
@@ -353,6 +358,8 @@ async fn observed_object_age<S: JanitorObjectStore>(
     store: &S,
     candidate: &Candidate,
     stats: &mut JanitorStats,
+    progress: Option<&Arc<Mutex<super::ProgressSnapshot>>>,
+    dry_run: bool,
 ) -> anyhow::Result<Option<SystemTime>> {
     let keys = if candidate.refresh_age {
         &candidate.delete_keys
@@ -365,10 +372,12 @@ async fn observed_object_age<S: JanitorObjectStore>(
         candidate.newest_listed
     };
     for key in keys {
+        super::set_live_progress_phase(progress, "head");
         if stats.head_requests == 0 {
             eprintln!("janitor phase=head started");
         }
         stats.head_requests = stats.head_requests.saturating_add(1);
+        super::publish_live_progress(progress, stats, dry_run);
         let head_started = Instant::now();
         let result = tokio::time::timeout(HEAD_KEY_TIMEOUT, async {
             if candidate.refresh_age {
@@ -438,7 +447,14 @@ async fn process_orphan<S: JanitorObjectStore>(
             let pending = pending_deletion_age(now_unix, pending_ts, grace);
             if candidate.refresh_age {
                 // Keys listed by an earlier run are not in `newest_listed`; stat every key.
-                let observed = observed_object_age(ctx.store, candidate, stats).await;
+                let observed = observed_object_age(
+                    ctx.store,
+                    candidate,
+                    stats,
+                    ctx.budget.progress.as_ref(),
+                    ctx.dry_run,
+                )
+                .await;
                 pending.max(janitor_age(now, observed?, grace))
             } else {
                 candidate.newest_listed.map_or(pending, |listed| {
@@ -448,7 +464,14 @@ async fn process_orphan<S: JanitorObjectStore>(
         }
         None => janitor_age(
             now,
-            observed_object_age(ctx.store, candidate, stats).await?,
+            observed_object_age(
+                ctx.store,
+                candidate,
+                stats,
+                ctx.budget.progress.as_ref(),
+                ctx.dry_run,
+            )
+            .await?,
             grace,
         ),
     };
@@ -456,20 +479,26 @@ async fn process_orphan<S: JanitorObjectStore>(
         JanitorAge::Eligible => {}
         JanitorAge::Young => {
             stats.skipped_young = stats.skipped_young.saturating_add(1);
+            super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
             return Ok(());
         }
         JanitorAge::Unknown => {
             stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
+            super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
             return Ok(());
         }
     }
 
     if ctx.dry_run {
+        // Dry-run neither deletes nor acks, so the listing can revisit a queued object.
+        stats.dry_run_counted.insert(object_id);
         stats.deleted = stats.deleted.saturating_add(1);
+        super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
         return Ok(());
     }
 
     // A claim failure means safety cannot be proven; stop the cycle instead of guessing.
+    super::set_live_progress_phase(ctx.budget.progress.as_ref(), "metadata_claim");
     let claim = tokio::task::block_in_place(|| ctx.metadata.claim_deletion(object_id))
         .with_context(|| format!("failed to claim janitor object {object_id} for deletion"))?;
     stats.claims = stats.claims.saturating_add(1);
@@ -482,10 +511,12 @@ async fn process_orphan<S: JanitorObjectStore>(
     let mut s3_delete_failed = false;
     let mut terminal = None;
     for key in &candidate.delete_keys {
+        super::set_live_progress_phase(ctx.budget.progress.as_ref(), "delete");
         if stats.delete_requests == 0 {
             eprintln!("janitor phase=delete started");
         }
         stats.delete_requests = stats.delete_requests.saturating_add(1);
+        super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
         let delete_started = Instant::now();
         let result = tokio::time::timeout(DELETE_KEY_TIMEOUT, ctx.store.delete(key))
             .await
@@ -512,6 +543,7 @@ async fn process_orphan<S: JanitorObjectStore>(
         UploadedObjectDeletionOutcome::Deleted
     };
     // Success needs PostgreSQL confirmation; an unfinished claim expires and is retried.
+    super::set_live_progress_phase(ctx.budget.progress.as_ref(), "metadata_finish");
     let finish = tokio::task::block_in_place(|| {
         ctx.metadata
             .finish_deletion(object_id, fencing_token, outcome)
@@ -552,6 +584,7 @@ async fn process_orphan<S: JanitorObjectStore>(
             );
         }
         stats.deleted = stats.deleted.saturating_add(1);
+        super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
     }
     Ok(())
 }
@@ -659,6 +692,7 @@ async fn run_one_cycle_inner<S: JanitorObjectStore>(
         stats.scanned_files = stats
             .scanned_files
             .saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX));
+        super::publish_live_progress(ctx.budget.progress.as_ref(), &stats, ctx.dry_run);
         let candidates = page
             .iter()
             .map(|(object_id, eligible_at)| {
@@ -768,6 +802,7 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
 ) -> anyhow::Result<()> {
     // Last position whose closed candidates were fully processed; a stop rolls back only to here.
     let mut committed = checkpoint.clone();
+    super::set_live_progress_phase(ctx.budget.progress.as_ref(), "listing");
     eprintln!("janitor phase=initial_listing started");
     let listing_started = Instant::now();
     let mut listing = bounded_list_step(
@@ -795,6 +830,7 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
             stats.outcome = stop;
             break;
         }
+        super::set_live_progress_phase(ctx.budget.progress.as_ref(), "listing");
         let wait_started = Instant::now();
         let entry = match bounded_list_step(
             listing.next_entry(),
@@ -851,6 +887,7 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
         if let Some(candidate) = discover_object(entry, ctx.prefix, &mut current, stats) {
             candidates.push(candidate);
         }
+        super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
         checkpoint.pending_object_id = current.as_ref().map(|candidate| candidate.object_id);
         checkpoint.pending_key = current
             .as_ref()
@@ -938,6 +975,7 @@ async fn run_prefix_trie_listing<S: JanitorObjectStore>(
     now_unix: i64,
     cycle_started: Instant,
 ) -> anyhow::Result<()> {
+    super::set_live_progress_phase(ctx.budget.progress.as_ref(), "listing");
     let mut cursor = checkpoint.next_prefix.clone();
     loop {
         if let Some(stop) = ctx.budget.admission_stop(stats, cycle_started) {
@@ -993,6 +1031,7 @@ async fn run_prefix_trie_listing<S: JanitorObjectStore>(
             if remaining != u64::MAX && entries_in_prefix >= remaining {
                 break;
             }
+            super::set_live_progress_phase(ctx.budget.progress.as_ref(), "listing");
             let wait_started = Instant::now();
             let entry = match bounded_list_step(
                 listing.next_entry(),
@@ -1034,6 +1073,7 @@ async fn run_prefix_trie_listing<S: JanitorObjectStore>(
             if let Some(candidate) = discover_object(entry, ctx.prefix, &mut current, stats) {
                 candidates.push(candidate);
             }
+            super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
             if candidates.len() == MAX_JANITOR_ELIGIBILITY_BATCH && !leaf {
                 process_candidate_batch(
                     ctx,
@@ -1128,12 +1168,18 @@ async fn bounded_list_step<T>(
 
 async fn process_candidate_batch<S: JanitorObjectStore>(
     ctx: &mut JanitorCycleContext<'_, S>,
-    candidates: Vec<Candidate>,
+    mut candidates: Vec<Candidate>,
     now: SystemTime,
     now_unix: i64,
     cycle_started: Instant,
     stats: &mut JanitorStats,
 ) -> anyhow::Result<()> {
+    if ctx.dry_run {
+        candidates.retain(|candidate| !stats.dry_run_counted.contains(&candidate.object_id));
+        if candidates.is_empty() {
+            return Ok(());
+        }
+    }
     let ids: Vec<u64> = candidates
         .iter()
         .map(|candidate| candidate.object_id)
@@ -1141,6 +1187,7 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
     // The metadata session owns a synchronous runtime; leave this worker before its block_on.
     let eligible_before =
         now_unix.saturating_sub(i64::try_from(ctx.skip_newer_than_secs).unwrap_or(i64::MAX));
+    super::set_live_progress_phase(ctx.budget.progress.as_ref(), "metadata_eligibility");
     let protection =
         tokio::task::block_in_place(|| ctx.metadata.check_eligibility(&ids, eligible_before))?;
     // Resolve every decision before any delete so one unknown outcome retains the whole batch.
@@ -1177,6 +1224,7 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
         match decision {
             Decision::Protected => {
                 stats.referenced_files = stats.referenced_files.saturating_add(1);
+                super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
                 defer_queued_candidate(ctx, &candidate);
             }
             Decision::Deferred => {
