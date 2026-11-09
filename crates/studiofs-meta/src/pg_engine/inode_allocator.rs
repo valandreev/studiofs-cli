@@ -16,8 +16,9 @@ pub(super) struct AllocatorRuntime {
     state: Option<AllocatorStateV1>,
     inode_batch: Range<u64>,
     payload_batch: Range<u64>,
-    /// Set by the first payload ID handout; reactivation never clears it.
-    payload_ids_handed_out: bool,
+    /// Closed by the first payload ID handout or the first capture, so one engine
+    /// captures at most once; reactivation never reopens it.
+    payload_watermark_capture_closed: bool,
     /// `(namespace, counter)` captured from a quiescent state, awaiting PostgreSQL.
     pending_payload_watermark: Option<(u32, u64)>,
 }
@@ -42,9 +43,11 @@ impl PgMetaEngine {
             return Ok(None);
         };
         let through = state.payload.reserved_through();
-        if runtime.payload_ids_handed_out || through == 0 {
+        if runtime.payload_watermark_capture_closed || through == 0 {
             return Ok(None);
         }
+        // A second caller could not prove its own payload store quiescent for this engine.
+        runtime.payload_watermark_capture_closed = true;
         runtime.pending_payload_watermark = Some((state.payload.namespace(), through));
         Ok(Some(through))
     }
@@ -357,7 +360,7 @@ impl PgMetaEngine {
             runtime.inode_batch.start = end;
         } else {
             runtime.payload_batch.start = end;
-            runtime.payload_ids_handed_out = true;
+            runtime.payload_watermark_capture_closed = true;
         }
         Ok(Some(value))
     }

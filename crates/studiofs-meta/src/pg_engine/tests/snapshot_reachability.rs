@@ -1059,6 +1059,13 @@ fn quiescent_payload_watermark_captures_reserved_through_below_later_handouts() 
             .expect("pending watermark"),
         Some((31, 8_192))
     );
+    // One capture per engine: another caller's payload store was never checked.
+    assert_eq!(
+        engine
+            .report_quiescent_payload_upload_watermark()
+            .expect("second capture"),
+        None
+    );
     // A handout after the capture comes from a fresh reservation at or above it.
     let object_id = engine.allocate_object_ids(1).expect("allocate object id")[0];
     assert!(payload_counter(object_id) >= 8_192);
@@ -1157,14 +1164,17 @@ fn reported_payload_watermark_bounds_cli_janitor_fences() {
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db_path = dir.path().join("meta.redb");
     seed_local(&db_path, &volume.format_info());
-    let engine = PgMetaEngine::open_with_options(
-        &db_path,
-        PgOpenOptions {
-            background_poll: false,
-            ..Default::default()
-        },
-    )
-    .expect("open postgres engine");
+    // Each mount session opens its own engine, which captures at most once.
+    let mount = || {
+        PgMetaEngine::open_with_options(
+            &db_path,
+            PgOpenOptions {
+                background_poll: false,
+                ..Default::default()
+            },
+        )
+        .expect("open postgres engine")
+    };
     let volume_id = volume.volume_id;
     let query = |statement: String| -> i64 {
         let dsn = dsn.clone();
@@ -1201,6 +1211,7 @@ fn reported_payload_watermark_bounds_cli_janitor_fences() {
     for round in 0..3_u64 {
         let first = round * 4_096;
         let reserved_through = first + 4_096;
+        let engine = mount();
         activate_payload_allocator(&engine, namespace, reserved_through);
         assert_eq!(
             query(format!(
@@ -1238,6 +1249,7 @@ fn reported_payload_watermark_bounds_cli_janitor_fences() {
     }
 
     // A stale lower capture never moves the watermark backwards.
+    let engine = mount();
     activate_payload_allocator(&engine, namespace, 4_096);
     engine
         .report_quiescent_payload_upload_watermark()

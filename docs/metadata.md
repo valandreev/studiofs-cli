@@ -673,9 +673,9 @@ Janitor policy:
 - a mounted client reports its payload namespace watermark at mount bootstrap.
   After startup recovery, the VFS checks that the local payload store has no
   dirty, uploading, or queued payload. The metadata engine then captures
-  `acked_through = reserved_through`, but only if this engine has handed out no
-  payload ID (reactivation does not reset this) and the local upload ledger is
-  empty. Later handouts come from fresh reservations at or above the captured
+  `acked_through = reserved_through`, but only once per engine, only if this
+  engine has handed out no payload ID (reactivation does not reset either
+  check), and only if the local upload ledger is empty. Later handouts come from fresh reservations at or above the captured
   counter, so the capture stays valid until the replication worker stores it
   with `GREATEST` after the next ledger replay. A failed store stays pending and
   never fails metadata replication. Long-lived mounts do not advance the
