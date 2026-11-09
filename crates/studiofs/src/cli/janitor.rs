@@ -12,34 +12,22 @@ use studiofs_cache::runtime::{
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::open_meta_engine;
 mod pipeline;
-use pipeline::{
-    JanitorCycleContext, JanitorObjectStore, JanitorStats, JanitorStoreError, run_one_cycle,
-};
+use pipeline::{JanitorCycleContext, JanitorObjectStore, JanitorStats, run_one_cycle};
+use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry};
 
 struct OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore);
 
 impl JanitorObjectStore for OpenDalJanitorStore {
-    async fn list(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<studiofs_data::janitor::JanitorEntry>, String> {
-        self.0.list(prefix).await.map_err(|error| error.to_string())
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<JanitorEntry>> {
+        Ok(self.0.list(prefix).await?)
     }
 
-    async fn last_modified(&self, key: &str) -> Result<Option<SystemTime>, String> {
-        self.0
-            .last_modified(key)
-            .await
-            .map_err(|error| error.to_string())
+    async fn last_modified(&self, key: &str) -> anyhow::Result<Option<SystemTime>> {
+        Ok(self.0.last_modified(key).await?)
     }
 
-    async fn delete(&self, key: &str) -> Result<(), JanitorStoreError> {
-        self.0.delete(key).await.map_err(|error| match error {
-            studiofs_data::janitor::JanitorDeleteError::NotFound => JanitorStoreError::NotFound,
-            studiofs_data::janitor::JanitorDeleteError::Other(message) => {
-                JanitorStoreError::Other(message)
-            }
-        })
+    async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError> {
+        self.0.delete(key).await
     }
 }
 
@@ -477,36 +465,37 @@ mod tests {
         deleted: Mutex<Vec<String>>,
         fail_list: bool,
         fail_head: bool,
+        head_missing: bool,
+        head_young: bool,
         fail_delete: bool,
         missing_delete: bool,
     }
 
     impl JanitorObjectStore for FakeJanitorStore {
-        async fn list(
-            &self,
-            _prefix: &str,
-        ) -> Result<Vec<studiofs_data::janitor::JanitorEntry>, String> {
+        async fn list(&self, _prefix: &str) -> anyhow::Result<Vec<JanitorEntry>> {
             if self.fail_list {
-                Err("list failed".to_string())
-            } else {
-                Ok(self.entries.clone())
+                anyhow::bail!("list failed")
             }
+            Ok(self.entries.clone())
         }
 
-        async fn last_modified(&self, _key: &str) -> Result<Option<SystemTime>, String> {
+        async fn last_modified(&self, _key: &str) -> anyhow::Result<Option<SystemTime>> {
             if self.fail_head {
-                Err("head failed".to_string())
-            } else {
-                Ok(Some(SystemTime::now() - Duration::from_secs(3600)))
+                anyhow::bail!("head failed")
             }
+            if self.head_missing {
+                return Ok(None);
+            }
+            let age = if self.head_young { 0 } else { 3600 };
+            Ok(Some(SystemTime::now() - Duration::from_secs(age)))
         }
 
-        async fn delete(&self, key: &str) -> Result<(), JanitorStoreError> {
+        async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError> {
             self.deleted.lock().unwrap().push(key.to_string());
             if self.fail_delete {
-                Err(JanitorStoreError::Other("delete failed".to_string()))
+                Err(JanitorDeleteError::Other("delete failed".to_string()))
             } else if self.missing_delete {
-                Err(JanitorStoreError::NotFound)
+                Err(JanitorDeleteError::NotFound)
             } else {
                 Ok(())
             }
@@ -620,6 +609,95 @@ mod tests {
             .unwrap();
         assert_eq!(stats.delete_errors, 0);
         assert_eq!(stats.deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn fake_store_age_and_cap_gates_skip_deletion() {
+        let entries_for = |object_ids: &[u64]| {
+            object_ids
+                .iter()
+                .flat_map(|&id| {
+                    studiofs_data::object::format_object_fragment_keys("test/objects/", id)
+                })
+                .map(|key| JanitorEntry { key, is_file: true })
+                .collect::<Vec<_>>()
+        };
+        let empty = HashSet::new();
+        let no_pending = HashMap::new();
+
+        // Unknown and young HEAD ages never delete.
+        for (store, young, unknown) in [
+            (
+                FakeJanitorStore {
+                    entries: entries_for(&[5]),
+                    head_missing: true,
+                    ..FakeJanitorStore::default()
+                },
+                0,
+                1,
+            ),
+            (
+                FakeJanitorStore {
+                    entries: entries_for(&[5]),
+                    head_young: true,
+                    ..FakeJanitorStore::default()
+                },
+                1,
+                0,
+            ),
+        ] {
+            let stats = run_one_cycle(fake_cycle_context(&store, &empty, &no_pending))
+                .await
+                .unwrap();
+            assert_eq!(
+                (stats.skipped_young, stats.skipped_unknown_age),
+                (young, unknown)
+            );
+            assert_eq!(stats.deleted, 0);
+            assert!(store.deleted.lock().unwrap().is_empty());
+        }
+
+        // Pending-deletion timestamps decide age without HEAD; future timestamps are unknown.
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let store = FakeJanitorStore {
+            entries: entries_for(&[6, 7, 8]),
+            fail_head: true,
+            ..FakeJanitorStore::default()
+        };
+        let pending = HashMap::from([(6, now), (7, now + 3600), (8, now - 3600)]);
+        let stats = run_one_cycle(fake_cycle_context(&store, &empty, &pending))
+            .await
+            .unwrap();
+        assert_eq!(stats.head_requests, 0);
+        assert_eq!(stats.skipped_young, 1);
+        assert_eq!(stats.skipped_unknown_age, 1);
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(
+            *store.deleted.lock().unwrap(),
+            studiofs_data::object::format_object_fragment_keys("test/objects/", 8)
+        );
+
+        // The delete cap stops further candidates before any HEAD or delete request.
+        let store = FakeJanitorStore {
+            entries: entries_for(&[9, 10, 11]),
+            ..FakeJanitorStore::default()
+        };
+        let stats = run_one_cycle(fake_cycle_context(&store, &empty, &no_pending))
+            .await
+            .unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.skipped_cap, 2);
+        assert_eq!(stats.head_requests, 1);
+        assert_eq!(
+            *store.deleted.lock().unwrap(),
+            studiofs_data::object::format_object_fragment_keys("test/objects/", 9)
+        );
     }
 
     struct FakeS3 {

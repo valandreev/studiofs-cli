@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use studiofs_data::janitor::JanitorEntry;
+use anyhow::Context as _;
+use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry};
 use studiofs_data::object::{format_object_fragment_keys, parse_object_id_from_key};
 
 #[derive(Debug, Default)]
@@ -38,16 +39,10 @@ pub(super) struct JanitorCycleContext<'a, S> {
     pub(super) max_deletes: u64,
 }
 
-#[derive(Debug)]
-pub(super) enum JanitorStoreError {
-    NotFound,
-    Other(String),
-}
-
 pub(super) trait JanitorObjectStore {
-    async fn list(&self, prefix: &str) -> Result<Vec<JanitorEntry>, String>;
-    async fn last_modified(&self, key: &str) -> Result<Option<SystemTime>, String>;
-    async fn delete(&self, key: &str) -> Result<(), JanitorStoreError>;
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<JanitorEntry>>;
+    async fn last_modified(&self, key: &str) -> anyhow::Result<Option<SystemTime>>;
+    async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError>;
 }
 
 fn discover_object(
@@ -135,8 +130,8 @@ async fn process_orphan<S: JanitorObjectStore>(
         stats.delete_elapsed += delete_started.elapsed();
         if let Err(error) = result {
             match error {
-                JanitorStoreError::NotFound => {}
-                JanitorStoreError::Other(error) => {
+                JanitorDeleteError::NotFound => {}
+                JanitorDeleteError::Other(error) => {
                     delete_failed = true;
                     eprintln!(
                         "janitor: failed to delete fragment key={} object_id={}: {}",
@@ -173,7 +168,7 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
         .store
         .list(ctx.prefix)
         .await
-        .map_err(|error| anyhow::anyhow!("failed to list janitor objects: {error}"))?;
+        .context("failed to list janitor objects")?;
     stats.initial_listing_elapsed = listing_started.elapsed();
     stats.initial_listing_entries = u64::try_from(entries.len()).unwrap_or(u64::MAX);
     stats.peak_listing_entries = stats.initial_listing_entries;

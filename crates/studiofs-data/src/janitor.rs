@@ -10,11 +10,13 @@ pub struct JanitorObjectStore {
 }
 
 /// Result category for deleting one fragment.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum JanitorDeleteError {
     /// The fragment was already absent.
+    #[error("fragment not found")]
     NotFound,
     /// The provider rejected the delete request.
+    #[error("{0}")]
     Other(String),
 }
 
