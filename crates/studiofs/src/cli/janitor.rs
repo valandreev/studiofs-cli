@@ -3788,7 +3788,7 @@ mod tests {
                 &secret_key,
                 &region,
                 2,
-                // Keep each gated HEAD below the cfg(test) 200 ms HEAD timeout.
+                // Keep each gated HEAD well below the cfg(test) 1 s HEAD timeout.
                 32,
             )
             .unwrap(),

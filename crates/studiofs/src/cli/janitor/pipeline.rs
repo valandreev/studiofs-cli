@@ -17,13 +17,14 @@ use studiofs_meta::{
 /// Bound for one remote DELETE. All canonical keys of an object must finish
 /// inside the 60-second deletion-claim lease, or the finish is fenced out.
 const DELETE_KEY_TIMEOUT: Duration = if cfg!(test) {
-    Duration::from_millis(200)
+    // Short for stalled fakes, yet above live RustFS latency spikes seen on CI (>200 ms).
+    Duration::from_secs(1)
 } else {
     Duration::from_secs(20)
 };
 /// Bound for one fallback HEAD, issued only for keys listed without `LastModified`.
 const HEAD_KEY_TIMEOUT: Duration = if cfg!(test) {
-    Duration::from_millis(200)
+    Duration::from_secs(1)
 } else {
     Duration::from_secs(20)
 };
