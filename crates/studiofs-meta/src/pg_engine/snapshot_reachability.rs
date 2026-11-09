@@ -33,6 +33,17 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 /// upload registration never revives and publication rejects.
 pub(super) const FINISH_UPLOADED_OBJECT_DELETION_SQL: &str = "UPDATE snapshot_payload_upload_objects SET closed_at = COALESCE(closed_at, clock_timestamp()), next_retry_at = NULL, last_error = $5, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE vol = $1 AND object_id = $2 AND reconcile_owner = $3 AND reconcile_fence = $4 AND state = 'delete_pending'";
 
+/// SQL predicate (parameter `$1` = vol): `object_id`'s counter is below the
+/// acknowledged watermark of its payload namespace (`namespace << 39 | counter`).
+/// The owning client never registers or publishes a new ID there, so a row-less
+/// ID below the watermark is a pruned deletion fence and stays fenced.
+macro_rules! below_payload_watermark {
+    () => {
+        "EXISTS (SELECT 1 FROM snapshot_payload_upload_watermarks AS watermark WHERE watermark.vol = $1 AND watermark.payload_namespace = (object_id >> 39) AND (object_id & 549755813887) < watermark.acked_through)"
+    };
+}
+pub(super) use below_payload_watermark;
+
 const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
 const SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE: usize = 1_024;
 
@@ -239,6 +250,40 @@ where
                 "delete_pending" | "deleted"
             )
         }) {
+            return Err(MetaError::Storage(
+                "snapshot payload publication requires a new object id after deletion has started"
+                    .to_owned(),
+            ));
+        }
+        let tracked = states
+            .iter()
+            .map(|row| row.get::<_, i64>(0))
+            .collect::<HashSet<_>>();
+        let untracked = published_object_ids
+            .iter()
+            .copied()
+            .filter(|object_id| !tracked.contains(object_id))
+            .collect::<Vec<_>>();
+        // A row-less, unreferenced ID below its watermark is a pruned fence.
+        if !untracked.is_empty()
+            && client
+                .query_one(
+                    concat!(
+                        "SELECT EXISTS (SELECT 1 FROM unnest($2::BIGINT[]) AS ids(object_id) WHERE ",
+                        below_payload_watermark!(),
+                        " AND NOT EXISTS (SELECT 1 FROM snapshot_current_references AS reference WHERE reference.vol = $1 AND reference.object_id = ids.object_id))"
+                    ),
+                    &[&volume_id, &untracked],
+                )
+                .await
+                .map_err(|error| {
+                    PgMetaEngine::classify_pg_error(
+                        "postgres snapshot upload publication watermark read failed",
+                        error,
+                    )
+                })?
+                .get::<_, bool>(0)
+        {
             return Err(MetaError::Storage(
                 "snapshot payload publication requires a new object id after deletion has started"
                     .to_owned(),
@@ -1128,8 +1173,26 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
+                        // Serializes with a watermark advance, so the check below sees a settled watermark.
                         tx.execute(
-                            "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) SELECT $1, object_id, 'uploading' FROM unnest($2::BIGINT[]) AS object_ids(object_id) GROUP BY object_id ON CONFLICT (vol, object_id) DO NOTHING",
+                            "SELECT 1 FROM snapshot_payload_upload_watermarks WHERE vol = $1 FOR SHARE",
+                            &[&volume_id],
+                        )
+                        .await
+                        .map_err(|error| {
+                            Self::classify_pg_error(
+                                "postgres snapshot upload watermark lock failed",
+                                error,
+                            )
+                        })?;
+                        // A row-less ID below its namespace watermark had its fence pruned:
+                        // register it as a fence again instead of reopening publication.
+                        tx.execute(
+                            concat!(
+                                "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at) SELECT $1, object_id, CASE WHEN fenced THEN 'delete_pending' ELSE 'uploading' END, CASE WHEN fenced THEN clock_timestamp() END FROM (SELECT object_id, ",
+                                below_payload_watermark!(),
+                                " AS fenced FROM unnest($2::BIGINT[]) AS object_ids(object_id) GROUP BY object_id) AS registrations ON CONFLICT (vol, object_id) DO NOTHING"
+                            ),
                             &[&volume_id, &object_ids_for_objects],
                         )
                         .await
@@ -1416,6 +1479,18 @@ mod tests {
             payload: Some(PayloadRef::new_full(object_id, 1)),
             payload_state: PayloadRefState::Published,
         }
+    }
+
+    #[test]
+    fn payload_watermark_sql_matches_allocator_id_layout() {
+        use crate::allocator_state::{COUNTER_BITS, COUNTER_LIMIT};
+        let predicate = below_payload_watermark!();
+        assert!(predicate.contains(&format!("(object_id >> {COUNTER_BITS})")));
+        assert!(predicate.contains(&format!("(object_id & {})", COUNTER_LIMIT - 1)));
+        assert!(
+            super::super::schema::studiofs_pg_schema_sql()
+                .contains(&format!("acked_through <= {COUNTER_LIMIT}"))
+        );
     }
 
     #[test]

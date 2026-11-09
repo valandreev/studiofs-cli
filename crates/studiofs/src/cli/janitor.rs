@@ -57,6 +57,7 @@ trait JanitorMetadataSource {
         fencing_token: i64,
         outcome: UploadedObjectDeletionOutcome,
     ) -> anyhow::Result<()>;
+    fn prune_deletion_fences(&mut self) -> anyhow::Result<u64>;
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()>;
 }
 
@@ -85,6 +86,10 @@ impl JanitorMetadataSource for JanitorMetadataSession {
     ) -> anyhow::Result<()> {
         JanitorMetadataSession::finish_deletion(self, object_id, fencing_token, outcome)
             .map_err(anyhow::Error::new)
+    }
+
+    fn prune_deletion_fences(&mut self) -> anyhow::Result<u64> {
+        JanitorMetadataSession::prune_deletion_fences(self).map_err(anyhow::Error::new)
     }
 
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
@@ -444,11 +449,16 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 max_deletes: max_deletes.max(1),
                 metadata,
             }))?;
+            let fences_pruned = if dry_run {
+                0
+            } else {
+                JanitorMetadataSource::prune_deletion_fences(metadata)?
+            };
 
-            Ok(stats)
+            Ok((stats, fences_pruned))
         });
         let cycle_elapsed = cycle_started.elapsed();
-        let stats = cycle_result?;
+        let (stats, fences_pruned) = cycle_result?;
 
         println!("Janitor cycle done:");
         println!("  scanned:              {}", stats.scanned_files);
@@ -463,6 +473,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             stats.deleted
         );
         println!("  delete errors:        {}", stats.delete_errors);
+        println!("  fences pruned:        {fences_pruned}");
         println!(
             "  janitor timings: metadata_open_ms={} global_lock_wait_ms={} protection_ms={} initial_listing_ms={} head_ms={} delete_ms={} object_work_ms={} cycle_ms={}",
             duration_ms(metadata_open_elapsed),
@@ -664,6 +675,10 @@ mod tests {
                 anyhow::bail!(error);
             }
             Ok(())
+        }
+
+        fn prune_deletion_fences(&mut self) -> anyhow::Result<u64> {
+            Ok(0)
         }
 
         fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
