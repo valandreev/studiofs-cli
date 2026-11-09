@@ -187,6 +187,7 @@ impl PgJanitorSession {
         &mut self,
         local_info: &FormatInfo,
         local_version: u64,
+        object_ids: &[u64],
     ) -> Result<PgJanitorProtection, JanitorMetadataError> {
         let (Some(client), Some(runtime)) = (self.client.as_mut(), self.runtime.as_ref()) else {
             return Err(JanitorMetadataError::UnsafeToDelete(
@@ -196,6 +197,14 @@ impl PgJanitorSession {
         let volume_id = self.volume_id;
         let command_timeout = self.command_timeout;
         let local_info = local_info.clone();
+        let object_ids = object_ids
+            .iter()
+            .map(|id| {
+                i64::try_from(*id).map_err(|_| {
+                    JanitorMetadataError::UnsafeToDelete("janitor object id is invalid")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let result = runtime.block_on(async {
             tokio::time::timeout(command_timeout, async {
                 let transaction = client.transaction().await.map_err(|error| {
@@ -288,8 +297,8 @@ impl PgJanitorSession {
                 }
                 let reference_rows = transaction
                     .query(
-                        "SELECT DISTINCT object_id FROM snapshot_current_references WHERE vol = $1",
-                        &[&volume_id],
+                        "SELECT DISTINCT object_id FROM snapshot_current_references WHERE vol = $1 AND object_id = ANY($2::BIGINT[])",
+                        &[&volume_id, &object_ids],
                     )
                     .await
                     .map_err(|error| {
@@ -297,8 +306,8 @@ impl PgJanitorSession {
                     })?;
                 let pin_rows = transaction
                     .query(
-                        SNAPSHOT_PIN_QUERY,
-                        &[&volume_id],
+                        &format!("{SNAPSHOT_PIN_QUERY} AND reachability.object_id = ANY($2::BIGINT[])"),
+                        &[&volume_id, &object_ids],
                     )
                     .await
                     .map_err(|error| {
@@ -309,11 +318,16 @@ impl PgJanitorSession {
                     .map_err(|error| janitor_pg_error("janitor current references are invalid", error))?;
                 let snapshot_pins = decode_janitor_object_ids(pin_rows)
                     .map_err(|error| janitor_pg_error("janitor snapshot pins are invalid", error))?;
+                let lease_rows = transaction.query(
+                    "SELECT DISTINCT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) AND (state IN ('uploading', 'uploaded', 'retry_wait') OR (reconcile_owner IS NOT NULL AND reconcile_lease_expires_at > clock_timestamp()))",
+                    &[&volume_id, &object_ids],
+                ).await.map_err(|error| janitor_pg_error("janitor upload lease query failed", error))?;
+                let active_uploads = decode_janitor_object_ids(lease_rows).map_err(|error| janitor_pg_error("janitor upload lease IDs are invalid", error))?;
                 transaction.commit().await.map_err(|error| {
                     janitor_pg_error("janitor metadata read commit failed", error)
                 })?;
                 Ok(PgJanitorProtection {
-                    referenced,
+                    referenced: referenced.union(&active_uploads).copied().collect(),
                     snapshot_pins,
                 })
             })
@@ -325,6 +339,24 @@ impl PgJanitorSession {
                 "PostgreSQL janitor metadata query timed out".to_owned(),
             )),
         }
+    }
+
+    pub(crate) fn validate_protection(
+        &mut self,
+        local_info: &FormatInfo,
+        local_version: u64,
+    ) -> Result<(), JanitorMetadataError> {
+        self.read_protection(local_info, local_version, &[])
+            .map(|_| ())
+    }
+
+    pub(crate) fn check_eligibility(
+        &mut self,
+        local_info: &FormatInfo,
+        local_version: u64,
+        object_ids: &[u64],
+    ) -> Result<PgJanitorProtection, JanitorMetadataError> {
+        self.read_protection(local_info, local_version, object_ids)
     }
 }
 
@@ -489,7 +521,7 @@ impl PgMetaEngine {
     }
 }
 
-pub(super) fn pg_janitor_lock_key(volume_id: i64) -> i64 {
+pub(crate) fn pg_janitor_lock_key(volume_id: i64) -> i64 {
     volume_id.wrapping_mul(1_000_003) ^ PG_JANITOR_LOCK_SALT
 }
 

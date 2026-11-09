@@ -1,11 +1,12 @@
 //! Provider-neutral standalone janitor cycle.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry};
 use studiofs_data::object::{format_object_fragment_keys, parse_object_id_from_key};
+use studiofs_meta::{JanitorEligibility, MAX_JANITOR_ELIGIBILITY_BATCH};
 
 #[derive(Debug, Default)]
 pub(super) struct JanitorStats {
@@ -31,12 +32,10 @@ pub(super) struct JanitorStats {
 pub(super) struct JanitorCycleContext<'a, S> {
     pub(super) store: &'a S,
     pub(super) prefix: &'a str,
-    pub(super) referenced: &'a HashSet<u64>,
-    pub(super) global_snapshot_pins: &'a HashSet<u64>,
-    pub(super) pending: &'a HashMap<u64, i64>,
     pub(super) dry_run: bool,
     pub(super) skip_newer_than_secs: u64,
     pub(super) max_deletes: u64,
+    pub(super) metadata: &'a mut dyn super::JanitorMetadataSource,
 }
 
 pub(super) trait JanitorObjectStore {
@@ -60,10 +59,6 @@ fn discover_object(
         .then_some((object_id, entry.key))
 }
 
-fn is_protected(object_id: u64, referenced: &HashSet<u64>, snapshot_pins: &HashSet<u64>) -> bool {
-    referenced.contains(&object_id) || snapshot_pins.contains(&object_id)
-}
-
 async fn process_orphan<S: JanitorObjectStore>(
     ctx: &JanitorCycleContext<'_, S>,
     object_id: u64,
@@ -71,14 +66,15 @@ async fn process_orphan<S: JanitorObjectStore>(
     now: SystemTime,
     now_unix: i64,
     stats: &mut JanitorStats,
+    pending_ts: Option<i64>,
 ) {
     if stats.deleted >= ctx.max_deletes {
         stats.skipped_cap = stats.skipped_cap.saturating_add(1);
         return;
     }
 
-    if let Some(pending_ts) = ctx.pending.get(&object_id) {
-        match u64::try_from(now_unix.saturating_sub(*pending_ts)) {
+    if let Some(pending_ts) = pending_ts {
+        match u64::try_from(now_unix.saturating_sub(pending_ts)) {
             Ok(age_secs) if age_secs >= ctx.skip_newer_than_secs => {}
             Ok(_) => {
                 stats.skipped_young = stats.skipped_young.saturating_add(1);
@@ -149,7 +145,7 @@ async fn process_orphan<S: JanitorObjectStore>(
 }
 
 pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
-    ctx: JanitorCycleContext<'_, S>,
+    mut ctx: JanitorCycleContext<'_, S>,
 ) -> anyhow::Result<JanitorStats> {
     let mut stats = JanitorStats::default();
     let cycle_started = Instant::now();
@@ -178,19 +174,34 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
         stats.initial_listing_entries
     );
 
+    let mut candidates = Vec::with_capacity(MAX_JANITOR_ELIGIBILITY_BATCH);
     for entry in entries {
         let Some((object_id, path)) = discover_object(entry, &mut seen_objects, &mut stats) else {
             continue;
         };
-        if is_protected(object_id, ctx.referenced, ctx.global_snapshot_pins) {
-            stats.referenced_files = stats.referenced_files.saturating_add(1);
-            continue;
+        candidates.push((object_id, path));
+        if candidates.len() == MAX_JANITOR_ELIGIBILITY_BATCH {
+            process_candidate_batch(
+                &mut ctx,
+                std::mem::take(&mut candidates),
+                now,
+                now_unix,
+                cycle_started,
+                &mut stats,
+            )
+            .await?;
         }
-        stats.orphan_candidates = stats.orphan_candidates.saturating_add(1);
-        if stats.time_to_first_candidate.is_none() {
-            stats.time_to_first_candidate = Some(cycle_started.elapsed());
-        }
-        process_orphan(&ctx, object_id, &path, now, now_unix, &mut stats).await;
+    }
+    if !candidates.is_empty() {
+        process_candidate_batch(
+            &mut ctx,
+            candidates,
+            now,
+            now_unix,
+            cycle_started,
+            &mut stats,
+        )
+        .await?;
     }
 
     stats.cycle_elapsed = cycle_started.elapsed();
@@ -205,4 +216,54 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
         super::duration_ms(stats.delete_elapsed)
     );
     Ok(stats)
+}
+
+async fn process_candidate_batch<S: JanitorObjectStore>(
+    ctx: &mut JanitorCycleContext<'_, S>,
+    candidates: Vec<(u64, String)>,
+    now: SystemTime,
+    now_unix: i64,
+    cycle_started: Instant,
+    stats: &mut JanitorStats,
+) -> anyhow::Result<()> {
+    let ids: Vec<u64> = candidates.iter().map(|(id, _)| *id).collect();
+    // The metadata session owns a synchronous runtime; leave this worker before its block_on.
+    let protection = tokio::task::block_in_place(|| ctx.metadata.check_eligibility(&ids))?;
+    if ids
+        .iter()
+        .any(|id| matches!(protection.get(id), None | Some(JanitorEligibility::Unknown)))
+    {
+        anyhow::bail!("janitor eligibility is unknown; refusing to delete candidate batch");
+    }
+    for (object_id, path) in candidates {
+        match protection
+            .get(&object_id)
+            .copied()
+            .unwrap_or(JanitorEligibility::Unknown)
+        {
+            JanitorEligibility::Protected => {
+                stats.referenced_files = stats.referenced_files.saturating_add(1);
+            }
+            JanitorEligibility::Eligible { pending_deletion } => {
+                stats.orphan_candidates = stats.orphan_candidates.saturating_add(1);
+                if stats.time_to_first_candidate.is_none() {
+                    stats.time_to_first_candidate = Some(cycle_started.elapsed());
+                }
+                process_orphan(
+                    ctx,
+                    object_id,
+                    &path,
+                    now,
+                    now_unix,
+                    stats,
+                    pending_deletion,
+                )
+                .await;
+            }
+            JanitorEligibility::Unknown => {
+                anyhow::bail!("janitor eligibility is unknown; refusing to delete candidate")
+            }
+        }
+    }
+    Ok(())
 }

@@ -491,6 +491,8 @@ mod inode_allocator;
 #[path = "pg_engine/janitor.rs"]
 mod janitor;
 pub(crate) use janitor::PgJanitorSession;
+#[cfg(test)]
+pub(crate) use janitor::pg_janitor_lock_key;
 #[path = "pg_engine/lifecycle.rs"]
 mod lifecycle;
 #[path = "pg_engine/local_state.rs"]

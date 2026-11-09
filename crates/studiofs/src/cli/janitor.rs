@@ -47,7 +47,8 @@ struct JanitorRunRequest {
 
 trait JanitorMetadataSource {
     fn try_acquire_global_janitor_lock(&mut self) -> anyhow::Result<bool>;
-    fn collect_protection(&mut self) -> anyhow::Result<JanitorProtection>;
+    fn validate_protection(&mut self) -> anyhow::Result<()>;
+    fn check_eligibility(&mut self, object_ids: &[u64]) -> anyhow::Result<JanitorProtection>;
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()>;
 }
 
@@ -56,8 +57,12 @@ impl JanitorMetadataSource for JanitorMetadataSession {
         JanitorMetadataSession::try_acquire_global_janitor_lock(self).map_err(anyhow::Error::new)
     }
 
-    fn collect_protection(&mut self) -> anyhow::Result<JanitorProtection> {
-        JanitorMetadataSession::collect_protection(self).map_err(anyhow::Error::new)
+    fn validate_protection(&mut self) -> anyhow::Result<()> {
+        JanitorMetadataSession::validate_protection(self).map_err(anyhow::Error::new)
+    }
+
+    fn check_eligibility(&mut self, object_ids: &[u64]) -> anyhow::Result<JanitorProtection> {
+        JanitorMetadataSession::check_eligibility(self, object_ids).map_err(anyhow::Error::new)
     }
 
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
@@ -402,35 +407,29 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         eprintln!("janitor phase=protection started");
         let mut protection_elapsed = Duration::ZERO;
         let cycle_result = with_acquired_global_janitor_lock(&mut metadata, |metadata| {
-            let protection = JanitorMetadataSource::collect_protection(metadata)?;
+            JanitorMetadataSource::validate_protection(metadata)?;
             protection_elapsed = protection_started.elapsed();
             eprintln!(
-                "janitor phase=protection completed duration_ms={} references={} snapshot_pins={} pending={}",
-                duration_ms(protection_elapsed),
-                protection.referenced.len(),
-                protection.snapshot_pins.len(),
-                protection.pending_deletions.len()
+                "janitor phase=protection completed duration_ms={}",
+                duration_ms(protection_elapsed)
             );
 
             let stats = rt.block_on(run_one_cycle(JanitorCycleContext {
                 store: &store,
                 prefix: &prefix,
-                referenced: &protection.referenced,
-                global_snapshot_pins: &protection.snapshot_pins,
-                pending: &protection.pending_deletions,
                 dry_run,
                 skip_newer_than_secs: skip_secs,
                 max_deletes: max_deletes.max(1),
+                metadata,
             }))?;
 
-            Ok((stats, protection.referenced, protection.snapshot_pins))
+            Ok(stats)
         });
         let cycle_elapsed = cycle_started.elapsed();
-        let (stats, referenced, global_snapshot_pins) = cycle_result?;
+        let stats = cycle_result?;
 
         println!("Janitor cycle done:");
         println!("  scanned:              {}", stats.scanned_files);
-        println!("  metadata refs:        {}", referenced.len());
         println!("  referenced:           {}", stats.referenced_files);
         println!("  orphan candidates:    {}", stats.orphan_candidates);
         println!("  skipped young:        {}", stats.skipped_young);
@@ -466,11 +465,6 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             stats.head_requests,
             stats.delete_requests,
         );
-        println!(
-            "  artifact-protected objects: {}",
-            global_snapshot_pins.len()
-        );
-
         if !loop_mode {
             break;
         }
@@ -487,10 +481,11 @@ mod tests {
     use super::*;
     use opendal::Operator;
     use opendal::services::S3;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use studiofs_cache::runtime::LocalPayloadLayout;
+    use studiofs_meta::{JanitorEligibility, MAX_JANITOR_ELIGIBILITY_BATCH};
     use studiofs_meta::{MetaFormat, RedbMetaEngine};
 
     #[derive(Default)]
@@ -540,12 +535,29 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct FakeJanitorMetadata {
         lock_acquired: bool,
-        protection: Option<JanitorProtection>,
-        protection_error: Option<&'static str>,
-        protection_reads: u64,
+        validation_error: Option<&'static str>,
+        eligibility_error: Option<&'static str>,
+        default_eligibility: Option<JanitorEligibility>,
+        outcomes: JanitorProtection,
+        validation_reads: u64,
+        eligibility_reads: Vec<Vec<u64>>,
+        nested_runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
         releases: u64,
+    }
+
+    impl FakeJanitorMetadata {
+        fn eligible() -> Self {
+            Self {
+                lock_acquired: true,
+                default_eligibility: Some(JanitorEligibility::Eligible {
+                    pending_deletion: None,
+                }),
+                ..Self::default()
+            }
+        }
     }
 
     impl JanitorMetadataSource for FakeJanitorMetadata {
@@ -553,14 +565,31 @@ mod tests {
             Ok(self.lock_acquired)
         }
 
-        fn collect_protection(&mut self) -> anyhow::Result<JanitorProtection> {
-            self.protection_reads += 1;
-            if let Some(error) = self.protection_error {
+        fn validate_protection(&mut self) -> anyhow::Result<()> {
+            self.validation_reads += 1;
+            if let Some(error) = self.validation_error {
                 anyhow::bail!(error);
             }
-            self.protection
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("fake protection was already consumed"))
+            Ok(())
+        }
+
+        fn check_eligibility(&mut self, object_ids: &[u64]) -> anyhow::Result<JanitorProtection> {
+            self.eligibility_reads.push(object_ids.to_vec());
+            if let Some(error) = self.eligibility_error {
+                anyhow::bail!(error);
+            }
+            if let Some(runtime) = &self.nested_runtime {
+                runtime.block_on(async {});
+            }
+            Ok(object_ids
+                .iter()
+                .filter_map(|id| {
+                    self.outcomes
+                        .get(id)
+                        .or(self.default_eligibility.as_ref())
+                        .map(|eligibility| (*id, *eligibility))
+                })
+                .collect())
         }
 
         fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
@@ -578,11 +607,8 @@ mod tests {
             "backend_unavailable: PostgreSQL timeout",
         ] {
             let mut metadata = FakeJanitorMetadata {
-                lock_acquired: true,
-                protection: None,
-                protection_error: Some(error),
-                protection_reads: 0,
-                releases: 0,
+                validation_error: Some(error),
+                ..FakeJanitorMetadata::eligible()
             };
             let store = FakeJanitorStore {
                 entries: studiofs_data::object::format_object_fragment_keys("test/objects/", 9)
@@ -596,16 +622,14 @@ mod tests {
                 "{error}"
             );
             let result = with_acquired_global_janitor_lock(&mut metadata, |metadata| {
-                let protection = metadata.collect_protection()?;
+                metadata.validate_protection()?;
                 rt.block_on(run_one_cycle(JanitorCycleContext {
                     store: &store,
                     prefix: "test/objects/",
-                    referenced: &protection.referenced,
-                    global_snapshot_pins: &protection.snapshot_pins,
-                    pending: &protection.pending_deletions,
                     dry_run: false,
                     skip_newer_than_secs: 0,
                     max_deletes: 1,
+                    metadata,
                 }))
             });
             assert!(result.is_err(), "{error}");
@@ -613,7 +637,8 @@ mod tests {
             assert_eq!(store.head_requests.load(Ordering::Relaxed), 0, "{error}");
             assert!(store.deleted.lock().unwrap().is_empty(), "{error}");
             assert_eq!(metadata.releases, 1, "{error}");
-            assert_eq!(metadata.protection_reads, 1, "{error}");
+            assert_eq!(metadata.validation_reads, 1, "{error}");
+            assert!(metadata.eligibility_reads.is_empty(), "{error}");
         }
     }
 
@@ -628,25 +653,17 @@ mod tests {
             entries,
             ..FakeJanitorStore::default()
         };
-        let mut metadata = FakeJanitorMetadata {
-            lock_acquired: true,
-            protection: Some(JanitorProtection::default()),
-            protection_error: None,
-            protection_reads: 0,
-            releases: 0,
-        };
+        let mut metadata = FakeJanitorMetadata::eligible();
         assert!(metadata.try_acquire_global_janitor_lock().unwrap());
         let stats = with_acquired_global_janitor_lock(&mut metadata, |metadata| {
-            let protection = metadata.collect_protection()?;
+            metadata.validate_protection()?;
             rt.block_on(run_one_cycle(JanitorCycleContext {
                 store: &store,
                 prefix: "test/objects/",
-                referenced: &protection.referenced,
-                global_snapshot_pins: &protection.snapshot_pins,
-                pending: &protection.pending_deletions,
                 dry_run: false,
                 skip_newer_than_secs: 0,
                 max_deletes: 1,
+                metadata,
             }))
         })
         .unwrap();
@@ -654,31 +671,24 @@ mod tests {
         assert_eq!(store.list_requests.load(Ordering::Relaxed), 1);
         assert!(!store.deleted.lock().unwrap().is_empty());
         assert_eq!(metadata.releases, 1);
-        assert_eq!(metadata.protection_reads, 1);
+        assert_eq!(metadata.validation_reads, 1);
+        assert_eq!(metadata.eligibility_reads.len(), 1);
 
         let dry_run_store = FakeJanitorStore {
             entries: store.entries.clone(),
             ..FakeJanitorStore::default()
         };
-        let mut dry_run_metadata = FakeJanitorMetadata {
-            lock_acquired: true,
-            protection: Some(JanitorProtection::default()),
-            protection_error: None,
-            protection_reads: 0,
-            releases: 0,
-        };
+        let mut dry_run_metadata = FakeJanitorMetadata::eligible();
         assert!(dry_run_metadata.try_acquire_global_janitor_lock().unwrap());
         let stats = with_acquired_global_janitor_lock(&mut dry_run_metadata, |metadata| {
-            let protection = metadata.collect_protection()?;
+            metadata.validate_protection()?;
             rt.block_on(run_one_cycle(JanitorCycleContext {
                 store: &dry_run_store,
                 prefix: "test/objects/",
-                referenced: &protection.referenced,
-                global_snapshot_pins: &protection.snapshot_pins,
-                pending: &protection.pending_deletions,
                 dry_run: true,
                 skip_newer_than_secs: 0,
                 max_deletes: 1,
+                metadata,
             }))
         })
         .unwrap();
@@ -687,27 +697,25 @@ mod tests {
         assert_eq!(dry_run_store.head_requests.load(Ordering::Relaxed), 1);
         assert!(dry_run_store.deleted.lock().unwrap().is_empty());
         assert_eq!(dry_run_metadata.releases, 1);
-        assert_eq!(dry_run_metadata.protection_reads, 1);
+        assert_eq!(dry_run_metadata.validation_reads, 1);
+        assert_eq!(dry_run_metadata.eligibility_reads.len(), 1);
     }
 
     fn fake_cycle_context<'a>(
         store: &'a FakeJanitorStore,
-        empty: &'a HashSet<u64>,
-        pending: &'a HashMap<u64, i64>,
+        metadata: &'a mut FakeJanitorMetadata,
     ) -> JanitorCycleContext<'a, FakeJanitorStore> {
         JanitorCycleContext {
             store,
             prefix: "test/objects/",
-            referenced: empty,
-            global_snapshot_pins: empty,
-            pending,
             dry_run: false,
             skip_newer_than_secs: 60,
             max_deletes: 1,
+            metadata,
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fake_store_deletes_only_discovered_unprotected_objects() {
         let keys_for = |object_id| {
             studiofs_data::object::format_object_fragment_keys("test/objects/", object_id)
@@ -723,15 +731,20 @@ mod tests {
             deleted: Mutex::new(Vec::new()),
             ..FakeJanitorStore::default()
         };
+        let mut metadata = FakeJanitorMetadata {
+            outcomes: HashMap::from([
+                (1, JanitorEligibility::Protected),
+                (2, JanitorEligibility::Protected),
+            ]),
+            ..FakeJanitorMetadata::eligible()
+        };
         let stats = run_one_cycle(JanitorCycleContext {
             store: &store,
             prefix: "test/objects/",
-            referenced: &HashSet::from([1]),
-            global_snapshot_pins: &HashSet::from([2]),
-            pending: &HashMap::new(),
             dry_run: false,
             skip_newer_than_secs: 60,
             max_deletes: 1,
+            metadata: &mut metadata,
         })
         .await
         .unwrap();
@@ -745,20 +758,129 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_missing_or_failed_eligibility_aborts_batch_before_any_deletes() {
+        for failure in ["unknown", "missing", "error"] {
+            let entries = [1, 2]
+                .into_iter()
+                .flat_map(|id| {
+                    studiofs_data::object::format_object_fragment_keys("test/objects/", id)
+                })
+                .map(|key| JanitorEntry { key, is_file: true })
+                .collect();
+            let store = FakeJanitorStore {
+                entries,
+                ..FakeJanitorStore::default()
+            };
+            let eligible = JanitorEligibility::Eligible {
+                pending_deletion: None,
+            };
+            let mut metadata = match failure {
+                "unknown" => FakeJanitorMetadata {
+                    outcomes: HashMap::from([(1, eligible), (2, JanitorEligibility::Unknown)]),
+                    ..FakeJanitorMetadata::eligible()
+                },
+                "missing" => FakeJanitorMetadata {
+                    outcomes: HashMap::from([(1, eligible)]),
+                    default_eligibility: None,
+                    ..FakeJanitorMetadata::eligible()
+                },
+                _ => FakeJanitorMetadata {
+                    eligibility_error: Some("metadata query failed"),
+                    ..FakeJanitorMetadata::eligible()
+                },
+            };
+
+            assert!(
+                run_one_cycle(fake_cycle_context(&store, &mut metadata))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(metadata.eligibility_reads, [vec![1, 2]], "{failure}");
+            assert_eq!(store.head_requests.load(Ordering::Relaxed), 0, "{failure}");
+            assert!(store.deleted.lock().unwrap().is_empty(), "{failure}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eligibility_requests_are_split_into_bounded_batches() {
+        let entries = (1..=129)
+            .flat_map(|id| studiofs_data::object::format_object_fragment_keys("test/objects/", id))
+            .map(|key| JanitorEntry { key, is_file: true })
+            .collect();
+        let store = FakeJanitorStore {
+            entries,
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let stats = run_one_cycle(JanitorCycleContext {
+            store: &store,
+            prefix: "test/objects/",
+            dry_run: true,
+            skip_newer_than_secs: 0,
+            max_deletes: 1,
+            metadata: &mut metadata,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            metadata
+                .eligibility_reads
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+            [64, 64, 1]
+        );
+        assert!(
+            metadata
+                .eligibility_reads
+                .iter()
+                .all(|batch| batch.len() <= MAX_JANITOR_ELIGIBILITY_BATCH)
+        );
+        assert_eq!(stats.orphan_candidates, 129);
+    }
+
+    #[test]
+    fn metadata_owned_runtime_works_inside_the_cli_runtime() {
+        let entries = studiofs_data::object::format_object_fragment_keys("test/objects/", 1)
+            .into_iter()
+            .map(|key| JanitorEntry { key, is_file: true })
+            .collect();
+        let store = FakeJanitorStore {
+            entries,
+            ..FakeJanitorStore::default()
+        };
+        let metadata_runtime = std::sync::Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let mut metadata = FakeJanitorMetadata {
+            nested_runtime: Some(std::sync::Arc::clone(&metadata_runtime)),
+            ..FakeJanitorMetadata::eligible()
+        };
+        let cli_runtime = tokio::runtime::Runtime::new().unwrap();
+        let stats = cli_runtime
+            .block_on(run_one_cycle(fake_cycle_context(&store, &mut metadata)))
+            .unwrap();
+
+        assert_eq!(stats.orphan_candidates, 1);
+        assert_eq!(metadata.eligibility_reads.len(), 1);
+        drop(cli_runtime);
+        drop(metadata);
+        drop(metadata_runtime);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fake_store_failures_skip_deletion_and_not_found_fragments_are_tolerated() {
         let entries = studiofs_data::object::format_object_fragment_keys("test/objects/", 4)
             .into_iter()
             .map(|key| studiofs_data::janitor::JanitorEntry { key, is_file: true })
             .collect::<Vec<_>>();
-        let empty = HashSet::new();
-        let pending = HashMap::new();
         let listing_failure = FakeJanitorStore {
             fail_list: true,
             ..FakeJanitorStore::default()
         };
+        let mut listing_metadata = FakeJanitorMetadata::eligible();
         assert!(
-            run_one_cycle(fake_cycle_context(&listing_failure, &empty, &pending))
+            run_one_cycle(fake_cycle_context(&listing_failure, &mut listing_metadata))
                 .await
                 .is_err()
         );
@@ -769,7 +891,8 @@ mod tests {
             fail_head: true,
             ..FakeJanitorStore::default()
         };
-        let stats = run_one_cycle(fake_cycle_context(&head_failure, &empty, &pending))
+        let mut head_metadata = FakeJanitorMetadata::eligible();
+        let stats = run_one_cycle(fake_cycle_context(&head_failure, &mut head_metadata))
             .await
             .unwrap();
         assert_eq!(stats.skipped_unknown_age, 1);
@@ -781,7 +904,8 @@ mod tests {
             fail_delete: true,
             ..FakeJanitorStore::default()
         };
-        let stats = run_one_cycle(fake_cycle_context(&delete_failure, &empty, &pending))
+        let mut delete_metadata = FakeJanitorMetadata::eligible();
+        let stats = run_one_cycle(fake_cycle_context(&delete_failure, &mut delete_metadata))
             .await
             .unwrap();
         assert_eq!(stats.delete_errors, 1);
@@ -792,14 +916,18 @@ mod tests {
             missing_delete: true,
             ..FakeJanitorStore::default()
         };
-        let stats = run_one_cycle(fake_cycle_context(&missing_fragments, &empty, &pending))
-            .await
-            .unwrap();
+        let mut missing_metadata = FakeJanitorMetadata::eligible();
+        let stats = run_one_cycle(fake_cycle_context(
+            &missing_fragments,
+            &mut missing_metadata,
+        ))
+        .await
+        .unwrap();
         assert_eq!(stats.delete_errors, 0);
         assert_eq!(stats.deleted, 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fake_store_age_and_cap_gates_skip_deletion() {
         let entries_for = |object_ids: &[u64]| {
             object_ids
@@ -810,9 +938,6 @@ mod tests {
                 .map(|key| JanitorEntry { key, is_file: true })
                 .collect::<Vec<_>>()
         };
-        let empty = HashSet::new();
-        let no_pending = HashMap::new();
-
         // Unknown and young HEAD ages never delete.
         for (store, young, unknown) in [
             (
@@ -834,7 +959,8 @@ mod tests {
                 0,
             ),
         ] {
-            let stats = run_one_cycle(fake_cycle_context(&store, &empty, &no_pending))
+            let mut metadata = FakeJanitorMetadata::eligible();
+            let stats = run_one_cycle(fake_cycle_context(&store, &mut metadata))
                 .await
                 .unwrap();
             assert_eq!(
@@ -858,8 +984,34 @@ mod tests {
             fail_head: true,
             ..FakeJanitorStore::default()
         };
-        let pending = HashMap::from([(6, now), (7, now + 3600), (8, now - 3600)]);
-        let stats = run_one_cycle(fake_cycle_context(&store, &empty, &pending))
+        let pending = HashMap::from([
+            (
+                6,
+                JanitorEligibility::Eligible {
+                    pending_deletion: Some(now),
+                },
+            ),
+            (
+                7,
+                JanitorEligibility::Eligible {
+                    pending_deletion: Some(now + 3600),
+                },
+            ),
+            (
+                8,
+                JanitorEligibility::Eligible {
+                    pending_deletion: Some(now - 3600),
+                },
+            ),
+        ]);
+        let mut metadata = FakeJanitorMetadata {
+            outcomes: pending,
+            default_eligibility: Some(JanitorEligibility::Eligible {
+                pending_deletion: None,
+            }),
+            ..FakeJanitorMetadata::eligible()
+        };
+        let stats = run_one_cycle(fake_cycle_context(&store, &mut metadata))
             .await
             .unwrap();
         assert_eq!(stats.head_requests, 0);
@@ -876,7 +1028,8 @@ mod tests {
             entries: entries_for(&[9, 10, 11]),
             ..FakeJanitorStore::default()
         };
-        let stats = run_one_cycle(fake_cycle_context(&store, &empty, &no_pending))
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let stats = run_one_cycle(fake_cycle_context(&store, &mut metadata))
             .await
             .unwrap();
         assert_eq!(stats.deleted, 1);
@@ -1072,21 +1225,20 @@ mod tests {
         db_path
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn janitor_eager_listing_baseline_reads_all_pages_before_low_delete_cap() {
         let (op, fake, _endpoint, server) = fake_s3_operator(2505).await;
         let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::new(op));
+        let mut metadata = FakeJanitorMetadata::eligible();
         let stats = tokio::time::timeout(
             Duration::from_secs(30),
             run_one_cycle(JanitorCycleContext {
                 store: &store,
                 prefix: "test/objects/",
-                referenced: &HashSet::new(),
-                global_snapshot_pins: &HashSet::new(),
-                pending: &HashMap::new(),
                 dry_run: false,
                 skip_newer_than_secs: 60,
                 max_deletes: 2,
+                metadata: &mut metadata,
             }),
         )
         .await
@@ -1129,21 +1281,20 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn janitor_dry_run_never_sends_delete_requests() {
         let (op, fake, _endpoint, server) = fake_s3_operator(1).await;
         let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::new(op));
+        let mut metadata = FakeJanitorMetadata::eligible();
         let result = tokio::time::timeout(
             Duration::from_secs(30),
             run_one_cycle(JanitorCycleContext {
                 store: &store,
                 prefix: "test/objects/",
-                referenced: &HashSet::new(),
-                global_snapshot_pins: &HashSet::new(),
-                pending: &HashMap::new(),
                 dry_run: true,
                 skip_newer_than_secs: 60,
                 max_deletes: 1,
+                metadata: &mut metadata,
             }),
         )
         .await

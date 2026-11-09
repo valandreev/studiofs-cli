@@ -1,10 +1,13 @@
-//! Metadata protection snapshot used by standalone object cleanup.
+//! Bounded metadata eligibility checks used by standalone object cleanup.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::{MetaGc, MetaInodes, RedbMetaEngine};
 use std::path::Path;
+
+/// Maximum number of candidates accepted by one authoritative janitor query.
+pub const MAX_JANITOR_ELIGIBILITY_BATCH: usize = 64;
 
 /// A categorized error from the standalone janitor's read-only metadata gate.
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +37,7 @@ pub struct JanitorMetadataSession {
     local: RedbMetaEngine,
     format_info: crate::FormatInfo,
     postgres: crate::pg_engine::PgJanitorSession,
+    validated_local_version: Option<u64>,
 }
 
 impl JanitorMetadataSession {
@@ -59,6 +63,7 @@ impl JanitorMetadataSession {
             local,
             format_info,
             postgres,
+            validated_local_version: None,
         })
     }
 
@@ -81,13 +86,12 @@ impl JanitorMetadataSession {
             .map_err(|_| pg_backend_unavailable())
     }
 
-    /// Reads a complete protection snapshot without mutating either backend.
-    pub fn collect_protection(&mut self) -> Result<JanitorProtection, JanitorMetadataError> {
-        if !self
+    /// Validates the metadata binding before the janitor lists object-store entries.
+    pub fn validate_protection(&mut self) -> Result<(), JanitorMetadataError> {
+        if self
             .local
-            .pending_uploaded_regular_file_recoveries()
+            .has_pending_uploaded_regular_file_recoveries()
             .map_err(backend_unavailable)?
-            .is_empty()
         {
             return Err(JanitorMetadataError::UnsafeToDelete(
                 "local metadata has pending file recovery state",
@@ -131,25 +135,65 @@ impl JanitorMetadataSession {
                 "local PostgreSQL metadata has pending sync or recovery state",
             ));
         }
-        let remote = self
-            .postgres
-            .read_protection(&self.format_info, local_version)?;
-        let mut referenced = self
+        self.postgres
+            .validate_protection(&self.format_info, local_version)?;
+        self.validated_local_version = Some(local_version);
+        Ok(())
+    }
+
+    /// Checks only the supplied object IDs against authoritative local and shared metadata.
+    pub fn check_eligibility(
+        &mut self,
+        object_ids: &[u64],
+    ) -> Result<JanitorProtection, JanitorMetadataError> {
+        if object_ids.len() > MAX_JANITOR_ELIGIBILITY_BATCH {
+            return Err(JanitorMetadataError::UnsafeToDelete(
+                "janitor eligibility batch exceeds the configured limit",
+            ));
+        }
+        if !self.postgres.lock_is_held() {
+            return Err(JanitorMetadataError::UnsafeToDelete(
+                "PostgreSQL janitor lock is not held",
+            ));
+        }
+        let local = self
             .local
-            .get_local_referenced_object_ids()
+            .get_local_janitor_protection(object_ids)
             .map_err(backend_unavailable)?;
-        referenced.extend(remote.referenced);
-        let pending_deletions = self
+        let local_version = self
             .local
-            .get_pending_deletions()
-            .map_err(backend_unavailable)?
-            .into_iter()
-            .collect();
-        Ok(JanitorProtection {
-            referenced,
-            snapshot_pins: remote.snapshot_pins,
-            pending_deletions,
-        })
+            .get_counter(crate::pg_engine::LOCAL_PG_VERSION_COUNTER)
+            .map_err(backend_unavailable)?;
+        let Some(validated_local_version) = self.validated_local_version else {
+            return Err(JanitorMetadataError::UnsafeToDelete(
+                "janitor protection was not validated",
+            ));
+        };
+        if local_version != validated_local_version {
+            return Err(JanitorMetadataError::UnsafeToDelete(
+                "local metadata changed during janitor cycle",
+            ));
+        }
+        let remote =
+            self.postgres
+                .check_eligibility(&self.format_info, local_version, object_ids)?;
+        let mut protection = HashMap::with_capacity(object_ids.len());
+        for object_id in object_ids {
+            let is_protected = local.0.contains(object_id)
+                || remote.referenced.contains(object_id)
+                || remote.snapshot_pins.contains(object_id);
+            protection.insert(
+                *object_id,
+                if is_protected {
+                    JanitorEligibility::Protected
+                } else {
+                    JanitorEligibility::Eligible {
+                        pending_deletion: local.1.get(object_id).copied(),
+                    }
+                },
+            );
+        }
+        Ok(protection)
     }
 }
 
@@ -159,13 +203,19 @@ impl Drop for JanitorMetadataSession {
     }
 }
 
-/// Metadata facts that protect objects from standalone janitor deletion.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct JanitorProtection {
-    /// Objects reachable from the current metadata namespace.
-    pub referenced: HashSet<u64>,
-    /// Objects retained by global snapshot or lifecycle pins.
-    pub snapshot_pins: HashSet<u64>,
-    /// Objects with pending deletion timestamps.
-    pub pending_deletions: HashMap<u64, i64>,
+/// Authoritative outcome for one standalone janitor candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JanitorEligibility {
+    /// Metadata still reaches or leases this object.
+    Protected,
+    /// Metadata proves the object is not reachable.
+    Eligible {
+        /// Timestamp of the local pending deletion marker, when one exists.
+        pending_deletion: Option<i64>,
+    },
+    /// Metadata could not prove either result; callers must retain the object.
+    Unknown,
 }
+
+/// Per-object authoritative results. Missing IDs are Unknown.
+pub type JanitorProtection = HashMap<u64, JanitorEligibility>;

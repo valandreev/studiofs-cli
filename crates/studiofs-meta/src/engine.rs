@@ -7,7 +7,7 @@
 
 use crate::types::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Aggregate latency for one metadata storage stage.
@@ -1873,6 +1873,17 @@ pub trait MetaGc: Send + Sync {
     fn get_local_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
         Err(MetaError::Storage(
             "local payload reachability is unsupported".to_string(),
+        ))
+    }
+
+    /// Return local references and pending deletion timestamps for a bounded candidate set.
+    fn get_local_janitor_protection(
+        &self,
+        object_ids: &[u64],
+    ) -> MetaResult<(HashSet<u64>, HashMap<u64, i64>)> {
+        let _ = object_ids;
+        Err(MetaError::Storage(
+            "bounded janitor eligibility is unsupported".to_string(),
         ))
     }
 }

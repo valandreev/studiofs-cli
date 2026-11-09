@@ -392,6 +392,52 @@ impl RedbMetaEngine {
 }
 
 impl MetaGc for RedbMetaEngine {
+    fn get_local_janitor_protection(
+        &self,
+        object_ids: &[u64],
+    ) -> MetaResult<(HashSet<u64>, std::collections::HashMap<u64, i64>)> {
+        if object_ids.len() > crate::MAX_JANITOR_ELIGIBILITY_BATCH {
+            return Err(MetaError::Storage(
+                "janitor eligibility batch exceeds the configured limit".to_owned(),
+            ));
+        }
+        let candidates: HashSet<u64> = object_ids.iter().copied().collect();
+        let txn = self.begin_read_txn()?;
+        let mut protected = HashSet::new();
+        for table_def in [REGULAR_FILE_OVERLAY_TABLE, REGULAR_FILE_BASE_TABLE] {
+            let table = txn
+                .open_table(table_def)
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+            {
+                let (_, value) = row.map_err(MetaError::from)?;
+                let chunk: RegularFileChunkState = decode(value.value())?;
+                for slice in chunk.slices.values() {
+                    if let Some(payload) = &slice.payload
+                        && candidates.contains(&payload.object_id)
+                    {
+                        protected.insert(payload.object_id);
+                    }
+                }
+            }
+        }
+        let table = txn
+            .open_table(PENDING_DELETIONS_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let mut pending = std::collections::HashMap::new();
+        for object_id in object_ids {
+            if let Some(timestamp) = table
+                .get(object_id)
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+            {
+                pending.insert(*object_id, timestamp.value());
+            }
+        }
+        Ok((protected, pending))
+    }
+
     fn reconcile_pending_regular_file_recoveries(&self) -> MetaResult<()> {
         RedbMetaEngine::reconcile_pending_regular_file_recoveries(self)
     }
