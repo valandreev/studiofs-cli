@@ -4,7 +4,7 @@ use crate::cli::cache_layout::describe_cache_layout_state;
 use clap::Args;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use opendal::services::S3;
 use opendal::{EntryMode, ErrorKind, Operator};
@@ -25,6 +25,15 @@ struct JanitorStats {
     skipped_cap: u64,
     deleted: u64,
     delete_errors: u64,
+    initial_listing_elapsed: Duration,
+    initial_listing_entries: u64,
+    peak_listing_entries: u64,
+    time_to_first_candidate: Option<Duration>,
+    cycle_elapsed: Duration,
+    head_requests: u64,
+    head_elapsed: Duration,
+    delete_requests: u64,
+    delete_elapsed: Duration,
 }
 
 struct JanitorCycleContext<'a> {
@@ -221,6 +230,10 @@ fn format_minutes(minutes: u64) -> String {
     }
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn inspect_local_cache_runtime(
     meta_dir: &std::path::Path,
     cache_dir: Option<&std::path::Path>,
@@ -271,6 +284,7 @@ fn inspect_local_cache_runtime(
 
 async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorStats> {
     let mut stats = JanitorStats::default();
+    let cycle_started = Instant::now();
     let mut seen_objects = HashSet::new();
     let now = SystemTime::now();
     let now_unix = i64::try_from(
@@ -280,7 +294,17 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
     )
     .unwrap_or(i64::MAX);
 
+    eprintln!("janitor phase=initial_listing started");
+    let listing_started = Instant::now();
     let entries = ctx.op.list_with(ctx.prefix).recursive(true).await?;
+    stats.initial_listing_elapsed = listing_started.elapsed();
+    stats.initial_listing_entries = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    stats.peak_listing_entries = stats.initial_listing_entries;
+    eprintln!(
+        "janitor phase=initial_listing completed duration_ms={} entries={}",
+        duration_ms(stats.initial_listing_elapsed),
+        stats.initial_listing_entries
+    );
     for entry in entries {
         if entry.metadata().mode() != EntryMode::FILE {
             continue;
@@ -306,6 +330,9 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
             continue;
         }
         stats.orphan_candidates = stats.orphan_candidates.saturating_add(1);
+        if stats.time_to_first_candidate.is_none() {
+            stats.time_to_first_candidate = Some(cycle_started.elapsed());
+        }
 
         if stats.deleted >= ctx.max_deletes {
             stats.skipped_cap = stats.skipped_cap.saturating_add(1);
@@ -324,7 +351,14 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
                 continue;
             }
         } else {
-            let meta = match ctx.op.stat(&path).await {
+            if stats.head_requests == 0 {
+                eprintln!("janitor phase=head started");
+            }
+            stats.head_requests = stats.head_requests.saturating_add(1);
+            let head_started = Instant::now();
+            let metadata = ctx.op.stat(&path).await;
+            stats.head_elapsed += head_started.elapsed();
+            let meta = match metadata {
                 Ok(m) => m,
                 Err(_) => {
                     stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
@@ -353,7 +387,14 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
 
         let mut delete_failed = false;
         for key in format_object_fragment_keys(ctx.prefix, object_id) {
-            if let Err(err) = ctx.op.delete(&key).await {
+            if stats.delete_requests == 0 {
+                eprintln!("janitor phase=delete started");
+            }
+            stats.delete_requests = stats.delete_requests.saturating_add(1);
+            let delete_started = Instant::now();
+            let result = ctx.op.delete(&key).await;
+            stats.delete_elapsed += delete_started.elapsed();
+            if let Err(err) = result {
                 if err.kind() == ErrorKind::NotFound {
                     continue;
                 }
@@ -371,6 +412,17 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
         stats.deleted = stats.deleted.saturating_add(1);
     }
 
+    stats.cycle_elapsed = cycle_started.elapsed();
+    eprintln!(
+        "janitor phase=head completed calls={} duration_ms={}",
+        stats.head_requests,
+        duration_ms(stats.head_elapsed)
+    );
+    eprintln!(
+        "janitor phase=delete completed calls={} duration_ms={}",
+        stats.delete_requests,
+        duration_ms(stats.delete_elapsed)
+    );
     Ok(stats)
 }
 
@@ -397,8 +449,15 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         ));
     }
 
+    eprintln!("janitor phase=metadata_open started");
+    let metadata_open_started = Instant::now();
     let engine = open_meta_engine(&db_path)?;
     let format_info = engine.get_format_info()?;
+    let metadata_open_elapsed = metadata_open_started.elapsed();
+    eprintln!(
+        "janitor phase=metadata_open completed duration_ms={}",
+        duration_ms(metadata_open_elapsed)
+    );
 
     let prefix = normalize_prefix(&format_info);
     let local_cache_report = if let Some(cache_dir) = cache_dir.as_deref() {
@@ -444,9 +503,21 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
     }
 
     loop {
+        let cycle_started = Instant::now();
+        let lock_started = Instant::now();
+        eprintln!("janitor phase=global_lock started");
         let lock_acquired = engine.try_acquire_global_janitor_lock()?;
+        let lock_wait_elapsed = lock_started.elapsed();
+        eprintln!(
+            "janitor phase=global_lock completed acquired={} duration_ms={}",
+            lock_acquired,
+            duration_ms(lock_wait_elapsed)
+        );
         if !lock_acquired {
-            println!("Janitor cycle skipped: PG janitor lock not acquired");
+            println!(
+                "Janitor cycle skipped: global janitor lock not acquired (wait_ms={})",
+                duration_ms(lock_wait_elapsed)
+            );
             if !loop_mode {
                 break;
             }
@@ -456,6 +527,9 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             continue;
         }
 
+        let protection_started = Instant::now();
+        eprintln!("janitor phase=protection started");
+        let mut protection_elapsed = Duration::ZERO;
         let cycle_result = (|| -> anyhow::Result<(JanitorStats, HashSet<u64>, HashSet<u64>)> {
             let global_snapshot_pins = engine.get_global_snapshot_pins()?;
             if !dry_run {
@@ -463,6 +537,14 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             }
             let referenced = engine.get_referenced_object_ids()?;
             let pending: HashMap<u64, i64> = engine.get_pending_deletions()?.into_iter().collect();
+            protection_elapsed = protection_started.elapsed();
+            eprintln!(
+                "janitor phase=protection completed duration_ms={} references={} snapshot_pins={} pending={}",
+                duration_ms(protection_elapsed),
+                referenced.len(),
+                global_snapshot_pins.len(),
+                pending.len()
+            );
 
             let stats = rt.block_on(run_one_cycle(JanitorCycleContext {
                 op: &op,
@@ -478,8 +560,9 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             Ok((stats, referenced, global_snapshot_pins))
         })();
         if let Err(e) = engine.release_global_janitor_lock() {
-            eprintln!("Warning: failed to release PG janitor lock: {}", e);
+            eprintln!("Warning: failed to release global janitor lock: {}", e);
         }
+        let cycle_elapsed = cycle_started.elapsed();
         let (stats, referenced, global_snapshot_pins) = cycle_result?;
 
         println!("Janitor cycle done:");
@@ -496,6 +579,30 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             stats.deleted
         );
         println!("  delete errors:        {}", stats.delete_errors);
+        println!(
+            "  janitor timings: metadata_open_ms={} global_lock_wait_ms={} protection_ms={} initial_listing_ms={} head_ms={} delete_ms={} object_work_ms={} cycle_ms={}",
+            duration_ms(metadata_open_elapsed),
+            duration_ms(lock_wait_elapsed),
+            duration_ms(protection_elapsed),
+            duration_ms(stats.initial_listing_elapsed),
+            duration_ms(stats.head_elapsed),
+            duration_ms(stats.delete_elapsed),
+            duration_ms(stats.cycle_elapsed),
+            duration_ms(cycle_elapsed),
+        );
+        println!(
+            "  janitor counts: listed_entries={} peak_listing_entries={} scanned={} first_candidate_ms={} opendal_head_calls={} opendal_delete_calls={} list_pages=unavailable claims=not_applicable claim_finish=not_applicable",
+            stats.initial_listing_entries,
+            stats.peak_listing_entries,
+            stats.scanned_files,
+            stats
+                .time_to_first_candidate
+                .map(duration_ms)
+                .map(|ms| ms.to_string())
+                .unwrap_or_else(|| "unavailable".to_string()),
+            stats.head_requests,
+            stats.delete_requests,
+        );
         println!(
             "  artifact-protected objects: {}",
             global_snapshot_pins.len()
@@ -515,7 +622,286 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use studiofs_cache::runtime::LocalPayloadLayout;
+    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+
+    struct FakeS3 {
+        list_requests: AtomicU64,
+        head_requests: AtomicU64,
+        delete_requests: AtomicU64,
+        list_requests_before_first_head: AtomicU64,
+        object_count: u64,
+    }
+
+    async fn fake_s3_request(listener: tokio::net::TcpListener, fake: std::sync::Arc<FakeS3>) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let fake = fake.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let request = String::from_utf8_lossy(&request);
+                let first_line = request.lines().next().unwrap_or_default();
+                let (status, body, extra_headers) = if first_line.starts_with("GET ") {
+                    fake.list_requests.fetch_add(1, Ordering::Relaxed);
+                    let page = if first_line.contains("continuation-token=page3") {
+                        2
+                    } else if first_line.contains("continuation-token=page2") {
+                        1
+                    } else {
+                        0
+                    };
+                    let start = page * 1000 + 1;
+                    let end = (start + 1000).min(fake.object_count + 1);
+                    let contents = (start..end)
+                        .map(|id| format!(
+                            "<Contents><Key>test/objects/{:04x}/{id:016x}/0</Key><LastModified>2020-01-01T00:00:00.000Z</LastModified><ETag>\"tag\"</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents>",
+                            id & 0xffff
+                        ))
+                        .collect::<String>();
+                    let truncated = end <= fake.object_count;
+                    let next = if truncated {
+                        format!(
+                            "<NextContinuationToken>page{}</NextContinuationToken>",
+                            page + 2
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let body = format!(
+                        "<ListBucketResult><Name>test</Name><Prefix>test/objects/</Prefix><KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>{truncated}</IsTruncated>{next}{contents}</ListBucketResult>",
+                        end - start
+                    );
+                    ("200 OK", body, "Content-Type: application/xml\r\n")
+                } else if first_line.starts_with("HEAD ") {
+                    if fake.head_requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                        fake.list_requests_before_first_head.store(
+                            fake.list_requests.load(Ordering::Relaxed),
+                            Ordering::Relaxed,
+                        );
+                    }
+                    (
+                        "200 OK",
+                        String::new(),
+                        "Last-Modified: Wed, 01 Jan 2020 00:00:00 GMT\r\n",
+                    )
+                } else if first_line.starts_with("DELETE ") {
+                    fake.delete_requests.fetch_add(1, Ordering::Relaxed);
+                    ("204 No Content", String::new(), "")
+                } else {
+                    ("501 Not Implemented", String::new(), "")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+
+    async fn fake_s3_operator(
+        object_count: u64,
+    ) -> (
+        Operator,
+        std::sync::Arc<FakeS3>,
+        String,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let fake = std::sync::Arc::new(FakeS3 {
+            list_requests: AtomicU64::new(0),
+            head_requests: AtomicU64::new(0),
+            delete_requests: AtomicU64::new(0),
+            list_requests_before_first_head: AtomicU64::new(0),
+            object_count,
+        });
+        let task = tokio::spawn(fake_s3_request(listener, fake.clone()));
+        let op = Operator::new(
+            S3::default()
+                .endpoint(&endpoint)
+                .bucket("test")
+                .access_key_id("test")
+                .secret_access_key("test")
+                .region("us-east-1")
+                .disable_config_load()
+                .disable_ec2_metadata(),
+        )
+        .unwrap()
+        .finish();
+        (op, fake, endpoint, task)
+    }
+
+    fn create_local_metadata_fixture(meta_dir: &std::path::Path, endpoint: &str) -> PathBuf {
+        use studiofs_meta::schema::{
+            CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, ENCRYPTION_KEY_LENGTH, EncryptionConfig,
+            FormatInfo, MetadataConfig,
+        };
+
+        std::fs::create_dir_all(meta_dir).unwrap();
+        let name = "janitor-fixture";
+        let db_path = meta_dir.join(format!("{name}.db"));
+        let engine = RedbMetaEngine::open(&db_path).unwrap();
+        engine
+            .set_format_info(&FormatInfo {
+                format_version: CURRENT_FORMAT_VERSION,
+                name: name.to_string(),
+                uuid: "janitor-fixture-uuid".to_string(),
+                endpoint: endpoint.to_string(),
+                bucket: "test".to_string(),
+                access_key: "fixture".to_string(),
+                secret_key: "fixture".to_string(),
+                region: "us-east-1".to_string(),
+                data_prefix: "test/objects/".to_string(),
+                metadata: MetadataConfig::default(),
+                encryption: EncryptionConfig::new([0; ENCRYPTION_KEY_LENGTH]),
+                block_size: DEFAULT_BLOCK_SIZE,
+            })
+            .unwrap();
+        engine.init_root(0, 0).unwrap();
+        drop(engine);
+        db_path
+    }
+
+    #[tokio::test]
+    async fn janitor_eager_listing_baseline_reads_all_pages_before_low_delete_cap() {
+        let (op, fake, _endpoint, server) = fake_s3_operator(2505).await;
+        let stats = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_one_cycle(JanitorCycleContext {
+                op: &op,
+                prefix: "test/objects/",
+                referenced: &HashSet::new(),
+                global_snapshot_pins: &HashSet::new(),
+                pending: &HashMap::new(),
+                dry_run: false,
+                skip_newer_than_secs: 60,
+                max_deletes: 2,
+            }),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        let stats = stats.unwrap();
+
+        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            fake.list_requests_before_first_head.load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(stats.scanned_files, 2505);
+        assert_eq!(stats.orphan_candidates, 2505);
+        assert_eq!(stats.deleted, 2);
+        assert_eq!(stats.skipped_cap, 2503);
+        assert_eq!(stats.initial_listing_entries, 2505);
+        assert_eq!(stats.peak_listing_entries, 2505);
+        assert!(stats.time_to_first_candidate.is_some());
+        assert_eq!(stats.head_requests, 2);
+        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            stats.delete_requests,
+            2 * studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64
+        );
+        assert_eq!(
+            fake.delete_requests.load(Ordering::Relaxed),
+            2 * studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64
+        );
+        println!(
+            "janitor baseline: pages={} listed={} peak={} first_candidate_ms={} head_calls={} delete_calls={} object_work_ms={}",
+            fake.list_requests.load(Ordering::Relaxed),
+            stats.initial_listing_entries,
+            stats.peak_listing_entries,
+            duration_ms(stats.time_to_first_candidate.unwrap()),
+            stats.head_requests,
+            stats.delete_requests,
+            duration_ms(stats.cycle_elapsed)
+        );
+    }
+
+    #[tokio::test]
+    async fn janitor_dry_run_never_sends_delete_requests() {
+        let (op, fake, _endpoint, server) = fake_s3_operator(1).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_one_cycle(JanitorCycleContext {
+                op: &op,
+                prefix: "test/objects/",
+                referenced: &HashSet::new(),
+                global_snapshot_pins: &HashSet::new(),
+                pending: &HashMap::new(),
+                dry_run: true,
+                skip_newer_than_secs: 60,
+                max_deletes: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        let stats = result.unwrap();
+
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.head_requests, 1);
+        assert_eq!(
+            stats.head_requests,
+            fake.head_requests.load(Ordering::Relaxed)
+        );
+        assert_eq!(stats.delete_requests, 0);
+        assert_eq!(fake.delete_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn janitor_run_uses_local_metadata_fixture_and_releases_global_lock() {
+        let (_op, fake, endpoint, server) = fake_s3_operator(1).await;
+        let temp = studiofs_test_support::workspace_target_tempdir("janitor-meta-");
+        let meta_dir = temp.path().join("meta");
+        let db_path = create_local_metadata_fixture(&meta_dir, &endpoint);
+        let result = tokio::task::spawn_blocking(move || {
+            run(JanitorRunRequest {
+                name: "janitor-fixture".to_string(),
+                meta_dir,
+                options: JanitorOptions {
+                    cache_dir: None,
+                    dry_run: false,
+                    loop_mode: false,
+                    interval_minutes: 30,
+                    skip_newer_minutes: 1,
+                    max_deletes: 1,
+                },
+            })
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        result.unwrap();
+
+        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            fake.delete_requests.load(Ordering::Relaxed),
+            studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64
+        );
+        let engine = open_meta_engine(&db_path).unwrap();
+        assert!(engine.try_acquire_global_janitor_lock().unwrap());
+        engine.release_global_janitor_lock().unwrap();
+    }
 
     #[test]
     fn janitor_parses_flags_and_defaults() {
