@@ -83,6 +83,159 @@ fn test_pg_uuid_mismatch_blocks_consistency_check() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn janitor_session_fences_object_deletion_claims() {
+    use crate::snapshot_ports::UploadedObjectDeletionOutcome::{Deleted, Retryable};
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-janitor-claims");
+    seed_local(&db_path, &volume.format_info());
+    let sql = |statement: &'static str| {
+        let dsn = dsn.clone();
+        let volume_id = volume.volume_id;
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            let rows = client
+                .query(statement, &[&volume_id])
+                .await
+                .expect("run fixture statement");
+            connection_task.abort();
+            Ok::<_, MetaError>(rows)
+        })
+        .expect("run fixture statement")
+    };
+    let ledger = |object_id: i64| -> Option<(String, Option<String>)> {
+        let dsn = dsn.clone();
+        let volume_id = volume.volume_id;
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            let row = client
+                .query_opt(
+                    "SELECT state, last_error FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2",
+                    &[&volume_id, &object_id],
+                )
+                .await
+                .expect("read ledger row");
+            connection_task.abort();
+            Ok::<_, MetaError>(row.map(|row| (row.get(0), row.get(1))))
+        })
+        .expect("read ledger row")
+    };
+    sql("INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, 0)");
+    sql("INSERT INTO snapshot_current_references (vol, ino, object_id) VALUES ($1, 7, 77)");
+    sql(
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 78, 'uploading'), ($1, 79, 'uploaded'), ($1, 80, 'published')",
+    );
+    sql(
+        "INSERT INTO snapshot_catalog (vol, id, origin, cut_version, captured_at, lifecycle) VALUES ($1, 'claim-ready', 'manual', 0, clock_timestamp(), 'ready')",
+    );
+    sql(
+        "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) VALUES ($1, 91, 0)",
+    );
+
+    let mut session = crate::JanitorMetadataSession::open(&db_path).expect("open janitor session");
+    assert!(session.try_acquire_global_janitor_lock().expect("lock"));
+    session.validate_protection().expect("validate protection");
+
+    // Referenced, unpublished-upload, and snapshot-pinned objects stay protected
+    // without ledger writes, matching batched eligibility.
+    for object_id in [77, 78, 79, 91] {
+        assert_eq!(
+            session.claim_deletion(object_id).expect("claim"),
+            None,
+            "{object_id}"
+        );
+    }
+    assert_eq!(
+        ledger(91),
+        None,
+        "a protected untracked object keeps no ledger row"
+    );
+    assert_eq!(ledger(78).expect("uploading row").0, "uploading");
+    assert_eq!(ledger(79).expect("uploaded row").0, "uploaded");
+
+    // An untracked object is fenced: publication and upload now observe delete_pending.
+    let token = session
+        .claim_deletion(90)
+        .expect("claim")
+        .expect("untracked claim");
+    assert_eq!(ledger(90).expect("fence row").0, "delete_pending");
+    assert!(matches!(
+        session.finish_deletion(90, token + 1, Deleted),
+        Err(crate::JanitorMetadataError::StaleClaim)
+    ));
+    session.finish_deletion(90, token, Deleted).expect("finish");
+    assert_eq!(ledger(90), Some(("delete_pending".to_owned(), None)));
+    // A late upload registration (same upsert as begin_fragment_uploads) keeps the fence.
+    sql(
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 90, 'uploading') ON CONFLICT (vol, object_id) DO UPDATE SET state = CASE WHEN snapshot_payload_upload_objects.state = 'deleted' THEN 'uploading' ELSE snapshot_payload_upload_objects.state END, closed_at = NULL",
+    );
+    assert_eq!(ledger(90).expect("fence row").0, "delete_pending");
+    assert!(
+        matches!(
+            session.finish_deletion(90, token, Deleted),
+            Err(crate::JanitorMetadataError::StaleClaim)
+        ),
+        "a completed claim cannot be finished twice"
+    );
+    // A duplicate retry after success re-claims and completes idempotently.
+    let retry = session
+        .claim_deletion(90)
+        .expect("claim")
+        .expect("re-claim");
+    assert!(retry > token);
+    session
+        .finish_deletion(90, retry, Deleted)
+        .expect("finish retry");
+
+    // A retryable outcome keeps the fence with its reason and is re-claimed next
+    // cycle; an active lease blocks a second claim, and an expired one is fenced out.
+    let first = session
+        .claim_deletion(80)
+        .expect("claim")
+        .expect("claim published, unreferenced 80");
+    session
+        .finish_deletion(80, first, Retryable)
+        .expect("retryable finish");
+    let (state, reason) = ledger(80).expect("retry row");
+    assert_eq!(state, "delete_pending");
+    assert!(reason.is_some());
+    let expired = session
+        .claim_deletion(80)
+        .expect("claim")
+        .expect("claim after retry");
+    assert_eq!(
+        session.claim_deletion(80).expect("claim"),
+        None,
+        "an active lease protects the object"
+    );
+    sql(
+        "UPDATE snapshot_payload_upload_objects SET reconcile_lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = $1 AND object_id = 80",
+    );
+    let current = session
+        .claim_deletion(80)
+        .expect("claim")
+        .expect("claim after expiry");
+    assert!(matches!(
+        session.finish_deletion(80, expired, Deleted),
+        Err(crate::JanitorMetadataError::StaleClaim)
+    ));
+    session
+        .finish_deletion(80, current, Deleted)
+        .expect("current finish");
+    session.release_global_janitor_lock().expect("release");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn janitor_read_only_session_validates_binding_and_lock() {
     let Some(dsn) = pg_dsn() else {
         return;

@@ -27,6 +27,10 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
 /// Lease duration used by uploaded-fragment reconciliation.
 pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 
+/// Completes an object deletion claim only while the owner and fence are current.
+/// Parameters: vol, object_id, owner, fence, state, retry delay secs, last_error.
+pub(super) const FINISH_UPLOADED_OBJECT_DELETION_SQL: &str = "UPDATE snapshot_payload_upload_objects SET state = $5, closed_at = CASE WHEN $5 = 'deleted' THEN clock_timestamp() ELSE closed_at END, next_retry_at = CASE WHEN $5 = 'retry_wait' THEN clock_timestamp() + ($6 * interval '1 second') ELSE NULL END, last_error = $7, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE vol = $1 AND object_id = $2 AND reconcile_owner = $3 AND reconcile_fence = $4 AND state = 'delete_pending'";
+
 const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
 const SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE: usize = 1_024;
 
@@ -1362,16 +1366,14 @@ impl PgMetaEngine {
                 move |client| {
                     Box::pin(async move {
                         let (state, message) = match outcome {
-                            UploadedObjectDeletionOutcome::Deleted => {
-                                ("deleted", None)
-                            }
+                            UploadedObjectDeletionOutcome::Deleted => ("deleted", None),
                             UploadedObjectDeletionOutcome::Retryable => {
                                 ("retry_wait", Some("remote deletion retry required"))
                             }
                         };
                         client
                             .execute(
-                                "UPDATE snapshot_payload_upload_objects SET state = $5, closed_at = CASE WHEN $5 = 'deleted' THEN clock_timestamp() ELSE closed_at END, next_retry_at = CASE WHEN $5 = 'retry_wait' THEN clock_timestamp() + ($6 * interval '1 second') ELSE NULL END, last_error = $7, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE vol = $1 AND object_id = $2 AND reconcile_owner = $3 AND reconcile_fence = $4 AND state = 'delete_pending'",
+                                FINISH_UPLOADED_OBJECT_DELETION_SQL,
                                 &[
                                     &volume_id,
                                     &object_id,
