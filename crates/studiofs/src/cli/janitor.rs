@@ -1214,8 +1214,8 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    include!("janitor/adversarial.rs");
-    include!("janitor/adversarial_live.rs");
+    mod adversarial;
+    mod adversarial_live;
 
     #[test]
     fn progress_jsonl_reports_versioned_fields_and_unknown_counts() {

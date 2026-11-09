@@ -1,13 +1,6 @@
-// Included inside adversarial_live so process tests share its disposable stack.
+//! Process termination, snapshot capture and resumption on the shared disposable stack.
 
-struct OwnedCli(std::process::Child);
-
-impl Drop for OwnedCli {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
+use super::*;
 
 async fn wait_for_claim_barrier(client: &tokio_postgres::Client, pid: u32) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -48,17 +41,9 @@ async fn live_cli_disposable_kill_restart_and_signal_drain() -> anyhow::Result<(
         let prefix = format!("sfs978-process/{id:016x}/objects/");
         seed_live_object(&stack, &prefix, id).await?;
         let client_root = stack.root.join(format!("process-{graceful}"));
-        let s3 = LiveS3Config {
-            endpoint: &stack.endpoint,
-            bucket: &stack.bucket,
-            access_key: ACCESS_KEY,
-            secret_key: SECRET_KEY,
-            region: REGION,
-            prefix: &prefix,
-        };
         let (volume_id, _, _) = create_live_postgres_janitor_fixture(
             &stack.postgres_url,
-            &s3,
+            &stack.s3(&prefix),
             &client_root.join("meta/janitor-live"),
             id,
         )
@@ -72,7 +57,6 @@ async fn live_cli_disposable_kill_restart_and_signal_drain() -> anyhow::Result<(
         .await?;
         let (observer, observer_task) = connection(&stack).await?;
         let args = cli_args(false, 10);
-        let args: Vec<_> = args.iter().map(String::as_str).collect();
         let stdout_path = stack
             .artifact_root
             .join(format!("process-{graceful}.stdout"));
@@ -90,11 +74,7 @@ async fn live_cli_disposable_kill_restart_and_signal_drain() -> anyhow::Result<(
             Some(3),
             "global lock must exclude a second CLI"
         );
-        let keys: Vec<_> = std::iter::once(studiofs_data::object::format_object_key(&prefix, id))
-            .chain(studiofs_data::object::format_object_fragment_keys(
-                &prefix, id,
-            ))
-            .collect();
+        let keys = object_keys(&prefix, id);
         for key in &keys {
             assert_eq!(
                 stack.writer()?.read(key).await?.to_vec(),
@@ -193,14 +173,7 @@ async fn live_cli_disposable_concurrent_snapshot_cuts_wait_for_janitor() -> anyh
     let client_root = stack.root.join("snapshot-cuts");
     let (volume_id, db_path, _) = create_live_postgres_janitor_fixture(
         &stack.postgres_url,
-        &LiveS3Config {
-            endpoint: &stack.endpoint,
-            bucket: &stack.bucket,
-            access_key: ACCESS_KEY,
-            secret_key: SECRET_KEY,
-            region: REGION,
-            prefix: &prefix,
-        },
+        &stack.s3(&prefix),
         &client_root.join("meta/janitor-live"),
         orphan,
     )
@@ -236,7 +209,6 @@ async fn live_cli_disposable_concurrent_snapshot_cuts_wait_for_janitor() -> anyh
     )
     .await?;
     let args = cli_args(false, 10);
-    let args: Vec<_> = args.iter().map(String::as_str).collect();
     let mut command = stack.command(&args, &client_root)?;
     command.stdout(std::fs::File::create(
         stack.artifact_root.join("snapshot-cli.stdout"),
@@ -294,9 +266,7 @@ async fn live_cli_disposable_concurrent_snapshot_cuts_wait_for_janitor() -> anyh
     );
     let writer = stack.writer()?;
     for id in [orphan, pinned] {
-        for key in std::iter::once(studiofs_data::object::format_object_key(&prefix, id)).chain(
-            studiofs_data::object::format_object_fragment_keys(&prefix, id),
-        ) {
+        for key in object_keys(&prefix, id) {
             if id == orphan {
                 assert!(!writer.exists(&key).await?);
             } else {
@@ -327,14 +297,7 @@ async fn live_cli_disposable_scan_budget_resumes_checkpoint_across_processes() -
     let client_root = stack.root.join("resume");
     let (volume_id, _, _) = create_live_postgres_janitor_fixture(
         &stack.postgres_url,
-        &LiveS3Config {
-            endpoint: &stack.endpoint,
-            bucket: &stack.bucket,
-            access_key: ACCESS_KEY,
-            secret_key: SECRET_KEY,
-            region: REGION,
-            prefix: &prefix,
-        },
+        &stack.s3(&prefix),
         &client_root.join("meta/janitor-live"),
         base,
     )
@@ -353,7 +316,6 @@ async fn live_cli_disposable_scan_budget_resumes_checkpoint_across_processes() -
     let mut args = cli_args(false, 10);
     args.retain(|arg| arg != "--full-scan");
     args.extend(["--max-scan-entries".to_string(), "1".to_string()]);
-    let args: Vec<_> = args.iter().map(String::as_str).collect();
     let mut complete = false;
     for run in 0..12 {
         let result = stack.cli(&args, &client_root)?;
@@ -398,9 +360,7 @@ async fn live_cli_disposable_scan_budget_resumes_checkpoint_across_processes() -
         "bounded invocations never completed the persisted sweep"
     );
     for id in base..base + 3 {
-        for key in std::iter::once(studiofs_data::object::format_object_key(&prefix, id)).chain(
-            studiofs_data::object::format_object_fragment_keys(&prefix, id),
-        ) {
+        for key in object_keys(&prefix, id) {
             assert!(!stack.writer()?.exists(&key).await?);
         }
     }

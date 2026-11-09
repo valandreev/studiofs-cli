@@ -226,8 +226,8 @@ cargo test -p studiofs --bin studiofs sfs978_ -- --nocapture
 ```
 
 The disposable acceptance tests start their own PostgreSQL 18/RustFS Compose
-project using `docker/compose.e2e.yml`, fresh named volumes and allocated loopback
-ports. They never select credentials or endpoints from `.env`. Build the actual
+project using `docker/compose.e2e.yml`, fresh named volumes and a loopback port
+window probed free for each run. They never select credentials or endpoints from `.env`. Build the actual
 CLI first, then run the focused selection serially (the same commands work in
 PowerShell):
 

@@ -79,8 +79,8 @@ studiofs-linux-fuse.workspace = true
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
 
 [dev-dependencies]
-studiofs-e2e.workspace = true
 dotenvy.workspace = true
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full"] }
+studiofs-e2e.workspace = true
 studiofs-test-support.workspace = true

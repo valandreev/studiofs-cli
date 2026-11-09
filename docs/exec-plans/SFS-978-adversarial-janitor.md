@@ -1,5 +1,7 @@
 # Prove standalone Janitor payload safety
 
+This ExecPlan is a living document and must remain aligned with `.agent/PLANS.md`.
+
 ## Purpose / Big Picture
 
 SFS-978 makes accidental deletion of a referenced, snapshot-pinned, or uploading
@@ -12,9 +14,14 @@ that the server did not delete anything.
 
 - [x] (2026-11-09) Recorded clean `main` baseline at `782e9c26`; created branch `test/sfs-978-adversarial-janitor`.
 - [x] (2026-11-09) Read Linear issue, canonical IO contract, architecture, coding guide, and existing Janitor tests. Verified graph coverage against current sources.
-- [x] Add deterministic writer/claim and ambiguous DELETE regressions with payload-presence assertions (2 passed).
-- [x] Add five disposable Docker PostgreSQL/RustFS process tests with payload bytes and authoritative ownership checks (5 passed).
-- [x] Run focused tests, Clippy, formatting and diff checks; record unavailable service/platform proof.
+- [x] (2026-11-09) Add deterministic writer/claim and ambiguous DELETE regressions with payload-presence assertions (2 passed).
+- [x] (2026-11-09) Add five disposable Docker PostgreSQL/RustFS process tests with payload bytes and authoritative ownership checks (5 passed).
+- [x] (2026-11-09) Run focused tests, Clippy, formatting and diff checks; record unavailable service/platform proof.
+- [x] (2026-11-10) Review fixes: probe a free loopback port window per stack, move the tests from `include!` into real modules under `cli/janitor/tests/` so `cargo fmt` checks them, stop blocking runtime workers while waiting on CLI children, check ownership after the PG restart, and remove duplicated harness code (2 + 5 passed again).
+- [ ] Run the disposable selection on Windows Docker.
+- [ ] Exercise Windows console Ctrl+C delivery (only Unix SIGINT and hard kill are covered).
+- [ ] Exercise CLI vs mounted background Janitor lock contention and a live mounted writer (only CLI vs CLI and seeded PG rows are covered).
+- [ ] Prove the SIGINT kill/drain barrier is tied to the owned CLI's backend; it currently matches any advisory-lock holder on the disposable cluster.
 
 ## Surprises & Discoveries
 
@@ -39,8 +46,10 @@ previously failing concurrent snapshot scenario passed.
 ## Decision Log
 
 Reuse `DockerComposeStack` from `studiofs-e2e` and `docker/compose.e2e.yml`.
-Its generated project name, allocated loopback ports, bounded readiness waits,
+Its generated project name, bounded readiness waits,
 logs and project-scoped volume teardown avoid another container harness.
+The harness probes a free 16-port loopback window per run, because a fixed
+`--port-range` always binds its first ports and concurrent stacks would collide.
 The new tests must construct credentials and endpoints from their own stack;
 they must never select resources through `.env` or inherited service settings.
 
@@ -53,12 +62,13 @@ is lost. The production Janitor pipeline remains the system under test.
 The new suite passed five real CLI/PostgreSQL/RustFS tests on macOS. The matrix
 checks current references, uploading/uploaded objects, active and expired
 reconciliation ownership, creating/ready/deleting snapshots, an active deleting
-snapshot mount lease, untracked payloads and legacy queue backfill. It verifies
-every canonical legacy/fragment key, the exact one-object delete cap, unchanged
+snapshot mount lease, untracked payloads and legacy upload-row queue backfill.
+It verifies every canonical object and fragment key (legacy key formats remain
+covered by the existing unit test), the exact one-object delete cap, unchanged
 durable dry-run state, final queue acknowledgements and released claim owners.
 
 The process cases check rejection of stale metadata, PG outage/restart/retry,
-hard kill before a claim, Unix SIGINT while a claim is admitted, competing CLI
+hard kill while the CLI waits at the claim fence, Unix SIGINT drain, competing CLI
 lock exclusion, and persisted discovery resumption with a one-entry scan budget.
 Two real snapshot captures queue on the held CLI lock, complete after the CLI is
 killed, and preserve pinned payload bytes after current references are removed.
@@ -89,12 +99,12 @@ contains complementary shared-metadata regressions.
 
 ## Plan of Work
 
-The first milestone adds `adversarial.rs` as a child of the current test module, exercising a
+The first milestone adds `tests/adversarial.rs` as a child of the current test module, exercising a
 writer activated between listing and claim and DELETE response loss followed
-by replay. The second milestone adds `adversarial_live.rs` with a uniquely named disposable
+by replay. The second milestone adds `tests/adversarial_live.rs` with a uniquely named disposable
 Compose stack, actual CLI subprocesses, shared PG protection rows and S3 byte
-checks. The third milestone adds `adversarial_process.rs` inside that live
-module for termination, concurrent snapshot cuts and resumable process runs.
+checks. The third milestone adds `tests/adversarial_live/process.rs` as a child of
+that live module for termination, concurrent snapshot cuts and resumable process runs.
 Wire the files into the existing test module and add only the existing
 workspace E2E crate as a dev dependency. Document exact commands and coverage
 limits in `docs/tests.md`.
@@ -111,7 +121,6 @@ From `/Volumes/Storage/dev/studiofs`, run focused selections:
     cargo test -p studiofs --bin studiofs legacy_keys_are_cleaned_and_non_canonical_keys_are_never_touched -- --nocapture
     cargo clippy -p studiofs --all-targets -- -D warnings
     cargo fmt --all -- --check
-    rustfmt --edition 2024 --check crates/studiofs/src/cli/janitor/adversarial.rs crates/studiofs/src/cli/janitor/adversarial_live.rs crates/studiofs/src/cli/janitor/adversarial_process.rs
     git diff --check
 
 The Docker selection requires Docker Compose and healthy disposable PostgreSQL
@@ -163,3 +172,5 @@ Plan created after reconciling the issue with existing focused coverage.
 Updated after live execution to include process barriers, concurrent snapshot
 capture, bounded checkpoint resumption, final payload/ownership checks, and
 the remaining Windows/mounted acceptance boundary.
+Updated 2026-11-10 after a two-axis review against `main`: harness and
+documentation corrections only; remaining acceptance gates are unchecked above.
