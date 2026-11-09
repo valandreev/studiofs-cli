@@ -18,7 +18,11 @@ const DELETE_KEY_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(20)
 };
 /// Bound for one fallback HEAD, issued only for keys listed without `LastModified`.
-const HEAD_KEY_TIMEOUT: Duration = DELETE_KEY_TIMEOUT;
+const HEAD_KEY_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(20)
+};
 /// Bound for one listing step; a stalled page fails the cycle. Finished
 /// deletions are already confirmed in PostgreSQL, so no completed work is lost.
 const LIST_PAGE_TIMEOUT: Duration = if cfg!(test) {
@@ -115,9 +119,8 @@ fn discover_object(
         stats.skipped_non_canonical = stats.skipped_non_canonical.saturating_add(1);
         return None;
     };
-    // ponytail: merge only adjacent keys of one object, relying on S3's lexicographic
-    // listing order; an unordered provider re-checks an object, which stays safe
-    // because claims and NotFound deletes are idempotent.
+    // Keys of one object are adjacent because `run_one_cycle` rejects a listing
+    // that is not in S3's lexicographic order.
     if let Some(candidate) = current
         .as_mut()
         .filter(|candidate| candidate.object_id == object_id)
@@ -175,7 +178,13 @@ async fn process_orphan<S: JanitorObjectStore>(
 
     let grace = Duration::from_secs(ctx.skip_newer_than_secs);
     let age = match pending_ts {
-        Some(pending_ts) => pending_deletion_age(now_unix, pending_ts, grace),
+        // A fresh or future-dated listed key still protects an object marked pending.
+        Some(pending_ts) => {
+            let pending = pending_deletion_age(now_unix, pending_ts, grace);
+            candidate.newest_listed.map_or(pending, |listed| {
+                pending.max(janitor_age(now, Some(listed), grace))
+            })
+        }
         None => janitor_age(
             now,
             observed_object_age(ctx.store, candidate, stats).await,
@@ -263,6 +272,7 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
     let mut stats = JanitorStats::default();
     let cycle_started = Instant::now();
     let mut current = None;
+    let mut last_file_key = String::new();
     let now = SystemTime::now();
     let now_unix = i64::try_from(
         now.duration_since(UNIX_EPOCH)
@@ -294,6 +304,17 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
             );
         }
         stats.initial_listing_entries = stats.initial_listing_entries.saturating_add(1);
+        // ponytail: object age merges adjacent keys only, so an unordered listing could
+        // judge an object from part of its keys. Fail the cycle on the first key out of
+        // order; candidates from batches already processed stay as they were.
+        if entry.is_file {
+            anyhow::ensure!(
+                entry.key >= last_file_key,
+                "janitor object listing is not in lexicographic order after {} entries; refusing to judge object age",
+                stats.initial_listing_entries
+            );
+            last_file_key.clone_from(&entry.key);
+        }
         let Some(candidate) = discover_object(entry, ctx.prefix, &mut current, &mut stats) else {
             continue;
         };

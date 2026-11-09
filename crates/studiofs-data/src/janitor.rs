@@ -109,8 +109,9 @@ pub struct JanitorEntry {
     pub last_modified: Option<SystemTime>,
 }
 
-/// Grace-period verdict for one orphan candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Grace-period verdict for one orphan candidate; a greater verdict is stricter,
+/// so `max` combines two observations conservatively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JanitorAge {
     /// Older than the grace period; deletion may proceed.
     Eligible,

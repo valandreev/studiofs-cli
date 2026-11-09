@@ -1011,7 +1011,10 @@ mod tests {
         let legacy = |id| studiofs_data::object::format_object_key("test/objects/", id);
         let fragment =
             |id| studiofs_data::object::format_object_fragment_keys("test/objects/", id)[0].clone();
+        // Entries follow S3's lexicographic listing order.
         let entries = vec![
+            // A foreign prefix is never parsed into an object.
+            entry(format!("other/{}", legacy(5)), ago(3600)),
             // Old legacy key plus a young fragment: the newest key decides, so it is young.
             entry(legacy(1), ago(3600)),
             entry(fragment(1), ago(30)),
@@ -1025,16 +1028,32 @@ mod tests {
             // Only the key listed without a timestamp is HEADed.
             entry(legacy(4), ago(3600)),
             entry(fragment(4), None),
-            // Malformed or foreign paths are never parsed into an object.
-            entry("test/objects/zzzz/not-an-object".to_owned(), ago(3600)),
-            entry(format!("other/{}", legacy(5)), ago(3600)),
+            // Malformed paths are never parsed into an object.
             entry(format!("{}x", legacy(6)), ago(3600)),
+            // An old pending-deletion mark does not override a young listed key.
+            entry(legacy(7), ago(30)),
+            entry("test/objects/zzzz/not-an-object".to_owned(), ago(3600)),
         ];
         let store = FakeJanitorStore {
             entries,
             ..FakeJanitorStore::default()
         };
-        let mut metadata = FakeJanitorMetadata::eligible();
+        let pending_long_ago = i64::try_from(
+            (SystemTime::now() - Duration::from_secs(3600))
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let mut metadata = FakeJanitorMetadata {
+            outcomes: HashMap::from([(
+                7,
+                JanitorEligibility::Eligible {
+                    pending_deletion: Some(pending_long_ago),
+                },
+            )]),
+            ..FakeJanitorMetadata::eligible()
+        };
         let stats = run_one_cycle(JanitorCycleContext {
             max_deletes: u64::MAX,
             ..fake_cycle_context(&store, &mut metadata)
@@ -1043,8 +1062,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(stats.skipped_non_canonical, 3);
-        assert_eq!(stats.orphan_candidates, 4);
-        assert_eq!(stats.skipped_young, 1);
+        assert_eq!(stats.orphan_candidates, 5);
+        assert_eq!(stats.skipped_young, 2);
         assert_eq!(stats.skipped_unknown_age, 1);
         assert_eq!(stats.head_requests, 1);
         assert_eq!(store.head_requests.load(Ordering::Relaxed), 1);
@@ -1055,6 +1074,29 @@ mod tests {
             .chain(canonical_keys(4))
             .collect();
         assert_eq!(*store.deleted.lock().unwrap(), expected);
+
+        // A key listed out of order fails the cycle before its object is judged.
+        let store = FakeJanitorStore {
+            entries: vec![
+                entry(legacy(8), ago(3600)),
+                entry(legacy(9), ago(3600)),
+                entry(fragment(8), ago(30)),
+            ],
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let error = run_one_cycle(JanitorCycleContext {
+            max_deletes: u64::MAX,
+            ..fake_cycle_context(&store, &mut metadata)
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not in lexicographic order after 3 entries"),
+            "{error:#}"
+        );
+        assert!(metadata.claims.is_empty());
+        assert!(store.deleted.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1062,8 +1104,8 @@ mod tests {
         let store = FakeJanitorStore {
             entries: [
                 studiofs_data::object::format_object_key("test/objects/", 5),
-                "test/objects/unrelated/0000000000000006".to_string(),
                 "test/objects/0007/0000000000000007/extra".to_string(),
+                "test/objects/unrelated/0000000000000006".to_string(),
             ]
             .into_iter()
             .map(|key| JanitorEntry {

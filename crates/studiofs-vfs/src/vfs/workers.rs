@@ -47,8 +47,8 @@ fn elapsed_ms(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Clock skew can date a pending deletion in the future; treat it as young
-/// instead of letting a negative age wrap to an arbitrarily old one.
+/// Clock skew can date a pending deletion in the future; such an age is unknown
+/// and never old enough, instead of wrapping to an arbitrarily old one.
 fn pending_deletion_is_old_enough(now_unix: i64, deleted_at_unix: i64, grace: Duration) -> bool {
     studiofs_data::janitor::pending_deletion_age(now_unix, deleted_at_unix, grace)
         == studiofs_data::janitor::JanitorAge::Eligible
@@ -3536,10 +3536,11 @@ impl StudioVfs {
             let is_old_enough = if let Some(ts) = pending_map.get(&object_id) {
                 pending_deletion_is_old_enough(now_unix, *ts, self.janitor_skip_newer_than)
             } else if let Some(last_modified_st) = entry.last_modified {
-                let age = now
-                    .duration_since(last_modified_st)
-                    .unwrap_or(Duration::ZERO);
-                age >= self.janitor_skip_newer_than
+                studiofs_data::janitor::janitor_age(
+                    now,
+                    Some(last_modified_st),
+                    self.janitor_skip_newer_than,
+                ) == studiofs_data::janitor::JanitorAge::Eligible
             } else {
                 skipped_unknown_age = skipped_unknown_age.saturating_add(1);
                 continue;

@@ -6,7 +6,7 @@ The public OpenDAL `Lister` does not expose how many S3 pages it fetched. Produc
 
 ## Streaming listing (SFS-969)
 
-The CLI consumes the remote listing through OpenDAL `lister_with(prefix).recursive(true)`. Entries are evaluated as pages arrive and grouped into eligibility batches of `MAX_JANITOR_ELIGIBILITY_BATCH` (64). Memory holds one provider page plus one batch, independent of the number of keys. Duplicate keys of one object are collapsed only when adjacent, which matches S3's lexicographic listing order; a provider that returns an object's keys apart re-checks that object, which stays safe because claims and `NotFound` deletes are idempotent.
+The CLI consumes the remote listing through OpenDAL `lister_with(prefix).recursive(true)`. Entries are evaluated as pages arrive and grouped into eligibility batches of `MAX_JANITOR_ELIGIBILITY_BATCH` (64). Memory holds one provider page plus one batch, independent of the number of keys. Keys of one object are merged only when adjacent, which matches S3's lexicographic listing order. A file key listed out of order fails the cycle, because merged object age depends on seeing every key of an object together; batches processed before that key keep their results.
 
 Each listing request, including the first, is bounded by a 60-second timeout. A failed or stalled page fails the cycle with the number of entries listed so far: batches processed earlier keep their confirmed deletions, and the partially buffered batch is not acted on. The listing is never treated as proof of deletion safety; PostgreSQL eligibility and claims decide that.
 
@@ -27,7 +27,7 @@ The fixture serves 20,005 old object keys in 21 1,000-key S3 pages through the r
 
 ## Object age (SFS-970)
 
-Keys are accepted only when `canonical_object_delete_keys` reformats the parsed object ID back to the exact listed key (legacy key or one fragment key under the configured prefix); any other key is counted as `skipped_non_canonical` and never touched. Adjacent keys of one object are merged into one candidate, and its age is the newest `LastModified` across those keys, so a young fragment protects an old legacy key. Only keys listed without `LastModified` get a HEAD, each bounded by a 20-second timeout. A missing, failed, or future-dated timestamp makes the age unknown and the object is skipped. A PostgreSQL pending-deletion timestamp, when present, decides age instead. CLI and mounted janitor share the grace rule in `studiofs_data::janitor` (`janitor_age`, `pending_deletion_age`).
+Keys are accepted only when `canonical_object_delete_keys` reformats the parsed object ID back to the exact listed key (legacy key or one fragment key under the configured prefix); any other key is counted as `skipped_non_canonical` and never touched. Adjacent keys of one object are merged into one candidate, and its age is the newest `LastModified` across those keys, so a young fragment protects an old legacy key. Only keys listed without `LastModified` get a HEAD, each bounded by a 20-second timeout. A missing, failed, or future-dated timestamp makes the age unknown and the object is skipped. When PostgreSQL has a pending-deletion timestamp, the stricter of that age and the listed age decides, and no HEAD is sent. CLI and mounted janitor share the grace rule in `studiofs_data::janitor` (`janitor_age`, `pending_deletion_age`).
 
 The earlier eager baseline (SFS-964, main commit `37c33f3f`) fetched all three pages of a 2,505-key fixture before the first HEAD and materialized all 2,505 entries.
 
