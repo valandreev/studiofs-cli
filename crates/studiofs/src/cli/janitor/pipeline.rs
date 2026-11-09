@@ -9,6 +9,18 @@ use studiofs_data::object::canonical_object_delete_keys;
 use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
 use studiofs_meta::{JanitorEligibility, MAX_JANITOR_ELIGIBILITY_BATCH};
 
+/// Bound for one remote DELETE. All canonical keys of an object must finish
+/// inside the 60-second deletion-claim lease, or the finish is fenced out.
+const DELETE_KEY_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(20)
+};
+const _: () = assert!(
+    (studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64 + 1) * 20 < 60,
+    "canonical key deletes must fit inside the deletion-claim lease"
+);
+
 #[derive(Debug, Default)]
 pub(super) struct JanitorStats {
     pub(super) scanned_files: u64,
@@ -154,7 +166,9 @@ async fn process_orphan<S: JanitorObjectStore>(
         }
         stats.delete_requests = stats.delete_requests.saturating_add(1);
         let delete_started = Instant::now();
-        let result = ctx.store.delete(key).await;
+        let result = tokio::time::timeout(DELETE_KEY_TIMEOUT, ctx.store.delete(key))
+            .await
+            .unwrap_or_else(|_| Err(JanitorDeleteError::Other("delete timed out".to_owned())));
         stats.delete_elapsed += delete_started.elapsed();
         if let Err(error) = result {
             match error {

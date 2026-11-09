@@ -638,15 +638,21 @@ Janitor policy:
   `snapshot_payload_upload_objects` (`delete_pending`, owner, lease, fence). The
   claim transaction first takes a share lock on the volume's `metadata_state`
   row, which event publication updates before recording references, then
-  re-checks current references, snapshot pins, and active leases. An untracked
-  object receives a fence row in that transaction, so a later upload or
-  publication of its ID observes `delete_pending`/`deleted` and fails. A
-  protected object rolls back without ledger changes.
+  re-checks current references, snapshot pins, and active leases. Like batched
+  eligibility, it never claims an upload awaiting publication (`uploading`,
+  `uploaded`, `retry_wait`). An untracked object receives a `delete_pending`
+  fence row in that transaction. A protected object rolls back without ledger
+  changes.
 - the CLI deletes only canonical keys (legacy plus every fragment) of a listed
-  canonical object key, treats `NotFound` as deleted, and counts an object as
-  deleted only after the fenced finish updates its row. A stale or expired claim
-  (`stale_claim`) or failed delete leaves a retryable row (`retry_wait` with a
-  reason, or an expiring `delete_pending` lease) for the next cycle.
+  canonical object key, bounds each DELETE inside the claim lease, treats
+  `NotFound` as deleted, and counts an object as deleted only after the fenced
+  finish updates its row.
+- every CLI finish releases the lease but leaves the row in `delete_pending`:
+  upload registration revives `deleted` rows to `uploading`, while it keeps
+  `delete_pending`, which publication rejects. A late upload or publication of
+  a deleted ID therefore fails instead of referencing missing payload. A failed
+  delete records its reason in `last_error`; it and a stale or expired claim
+  (`stale_claim`) are re-claimed by a later cycle.
 - every Snapshot v2 capture path (manual and policy) takes the matching
   exclusive transaction advisory lock in `capture_snapshot_in_transaction`
   before capturing the metadata cut or inserting its `creating` catalog row, so

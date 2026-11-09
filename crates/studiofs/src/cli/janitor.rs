@@ -526,6 +526,7 @@ mod tests {
         head_young: bool,
         fail_delete: bool,
         missing_delete: bool,
+        hang_delete: bool,
     }
 
     impl JanitorObjectStore for FakeJanitorStore {
@@ -551,6 +552,9 @@ mod tests {
 
         async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError> {
             self.deleted.lock().unwrap().push(key.to_string());
+            if self.hang_delete {
+                std::future::pending::<()>().await;
+            }
             if self.fail_delete {
                 Err(JanitorDeleteError::Other("delete failed".to_string()))
             } else if self.missing_delete {
@@ -895,21 +899,24 @@ mod tests {
         );
         assert_eq!(*store.deleted.lock().unwrap(), canonical_keys(2));
 
-        // A failed S3 delete records a retryable outcome under the same claim.
-        let store = FakeJanitorStore {
-            entries,
-            fail_delete: true,
-            ..FakeJanitorStore::default()
-        };
-        let mut metadata = FakeJanitorMetadata::eligible();
-        let stats = run_one_cycle(fake_cycle_context(&store, &mut metadata))
-            .await
-            .unwrap();
-        assert_eq!((stats.deleted, stats.delete_errors), (0, 1));
-        assert_eq!(
-            metadata.finishes,
-            [(2, fake_token(2), UploadedObjectDeletionOutcome::Retryable)]
-        );
+        // A failed or hung S3 delete records a retryable outcome under the same claim.
+        for (fail_delete, hang_delete) in [(true, false), (false, true)] {
+            let store = FakeJanitorStore {
+                entries: entries.clone(),
+                fail_delete,
+                hang_delete,
+                ..FakeJanitorStore::default()
+            };
+            let mut metadata = FakeJanitorMetadata::eligible();
+            let stats = run_one_cycle(fake_cycle_context(&store, &mut metadata))
+                .await
+                .unwrap();
+            assert_eq!((stats.deleted, stats.delete_errors), (0, 1));
+            assert_eq!(
+                metadata.finishes,
+                [(2, fake_token(2), UploadedObjectDeletionOutcome::Retryable)]
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

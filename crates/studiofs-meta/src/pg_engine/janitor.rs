@@ -364,8 +364,9 @@ impl PgJanitorSession {
     ///
     /// Event publication bumps `metadata_state` before it records references, so
     /// the share lock taken first makes the reference and pin checks authoritative.
-    /// An untracked object receives a ledger row in the same transaction; a later
-    /// upload or publication of that ID then observes the deletion fence and fails.
+    /// An untracked object receives a `delete_pending` ledger row in the same
+    /// transaction. Upload registration keeps that state and publication rejects
+    /// it, so a late upload or publication of the ID fails instead of reviving it.
     pub(crate) fn claim_object_deletion(
         &mut self,
         object_id: u64,
@@ -400,7 +401,7 @@ impl PgJanitorSession {
                 "PostgreSQL volume binding is missing",
             ))?;
             tx.execute(
-                "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at) VALUES ($1, $2, 'deleted', clock_timestamp()) ON CONFLICT (vol, object_id) DO NOTHING",
+                "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at) VALUES ($1, $2, 'delete_pending', clock_timestamp()) ON CONFLICT (vol, object_id) DO NOTHING",
                 &[&volume_id, &object_id],
             )
             .await
@@ -422,9 +423,10 @@ impl PgJanitorSession {
             let fencing_token = if protected {
                 None
             } else {
-                // 'uploading' stays protected; every other state is unreferenced here.
+                // Same protection as eligibility: an upload awaiting publication
+                // ('uploading', 'uploaded', 'retry_wait') is never claimed.
                 tx.query_opt(
-                    "UPDATE snapshot_payload_upload_objects SET state = 'delete_pending', reconcile_owner = $3, reconcile_lease_expires_at = clock_timestamp() + ($4 * interval '1 second'), reconcile_fence = reconcile_fence + 1, next_retry_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = $2 AND state IN ('uploaded', 'published', 'retry_wait', 'delete_pending', 'deleted') RETURNING reconcile_fence",
+                    "UPDATE snapshot_payload_upload_objects SET state = 'delete_pending', reconcile_owner = $3, reconcile_lease_expires_at = clock_timestamp() + ($4 * interval '1 second'), reconcile_fence = reconcile_fence + 1, next_retry_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = $2 AND state IN ('published', 'delete_pending', 'deleted') RETURNING reconcile_fence",
                     &[&volume_id, &object_id, &owner, &lease_secs],
                 )
                 .await
@@ -433,11 +435,14 @@ impl PgJanitorSession {
             };
             // Commit only a claim, so a protected object keeps its prior ledger state.
             if fencing_token.is_some() {
-                tx.commit().await
+                tx.commit()
+                    .await
+                    .map_err(|error| janitor_pg_error("janitor claim commit failed", error))?;
             } else {
-                tx.rollback().await
+                tx.rollback()
+                    .await
+                    .map_err(|error| janitor_pg_error("janitor claim rollback failed", error))?;
             }
-            .map_err(|error| janitor_pg_error("janitor claim commit failed", error))?;
             Ok(fencing_token)
         }).await });
         result.unwrap_or_else(|_| {
@@ -449,6 +454,11 @@ impl PgJanitorSession {
 
     /// Completes a deletion claim; returns `false` when the claim is no longer
     /// current (expired and re-claimed, or otherwise fenced out).
+    ///
+    /// Both outcomes release the lease but keep `delete_pending`: upload
+    /// registration revives `deleted` rows, so only `delete_pending` stays a fence
+    /// against a late publication. A retryable outcome records its reason in
+    /// `last_error`, and the next cycle re-claims the row.
     pub(crate) fn finish_object_deletion(
         &mut self,
         object_id: u64,
@@ -464,12 +474,12 @@ impl PgJanitorSession {
         };
         let object_id = i64::try_from(object_id)
             .map_err(|_| JanitorMetadataError::UnsafeToDelete("janitor object id is invalid"))?;
-        let (state, message) = match outcome {
-            UploadedObjectDeletionOutcome::Deleted => ("deleted", None),
-            UploadedObjectDeletionOutcome::Retryable => (
-                "retry_wait",
-                Some("cli janitor remote deletion retry required"),
-            ),
+        let state = "delete_pending";
+        let message = match outcome {
+            UploadedObjectDeletionOutcome::Deleted => None,
+            UploadedObjectDeletionOutcome::Retryable => {
+                Some("cli janitor remote deletion retry required")
+            }
         };
         let lease_secs = super::snapshot_reachability::SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64;
         let result = runtime.block_on(async {

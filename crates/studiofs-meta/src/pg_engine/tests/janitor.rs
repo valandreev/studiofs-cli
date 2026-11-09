@@ -132,7 +132,7 @@ fn janitor_session_fences_object_deletion_claims() {
     sql("INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, 0)");
     sql("INSERT INTO snapshot_current_references (vol, ino, object_id) VALUES ($1, 7, 77)");
     sql(
-        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 78, 'uploading'), ($1, 79, 'uploaded')",
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 78, 'uploading'), ($1, 79, 'uploaded'), ($1, 80, 'published')",
     );
     sql(
         "INSERT INTO snapshot_catalog (vol, id, origin, cut_version, captured_at, lifecycle) VALUES ($1, 'claim-ready', 'manual', 0, clock_timestamp(), 'ready')",
@@ -145,8 +145,9 @@ fn janitor_session_fences_object_deletion_claims() {
     assert!(session.try_acquire_global_janitor_lock().expect("lock"));
     session.validate_protection().expect("validate protection");
 
-    // Referenced, uploading, and snapshot-pinned objects stay protected without ledger writes.
-    for object_id in [77, 78, 91] {
+    // Referenced, unpublished-upload, and snapshot-pinned objects stay protected
+    // without ledger writes, matching batched eligibility.
+    for object_id in [77, 78, 79, 91] {
         assert_eq!(
             session.claim_deletion(object_id).expect("claim"),
             None,
@@ -159,6 +160,7 @@ fn janitor_session_fences_object_deletion_claims() {
         "a protected untracked object keeps no ledger row"
     );
     assert_eq!(ledger(78).expect("uploading row").0, "uploading");
+    assert_eq!(ledger(79).expect("uploaded row").0, "uploaded");
 
     // An untracked object is fenced: publication and upload now observe delete_pending.
     let token = session
@@ -171,7 +173,12 @@ fn janitor_session_fences_object_deletion_claims() {
         Err(crate::JanitorMetadataError::StaleClaim)
     ));
     session.finish_deletion(90, token, Deleted).expect("finish");
-    assert_eq!(ledger(90).expect("deleted row").0, "deleted");
+    assert_eq!(ledger(90), Some(("delete_pending".to_owned(), None)));
+    // A late upload registration (same upsert as begin_fragment_uploads) keeps the fence.
+    sql(
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 90, 'uploading') ON CONFLICT (vol, object_id) DO UPDATE SET state = CASE WHEN snapshot_payload_upload_objects.state = 'deleted' THEN 'uploading' ELSE snapshot_payload_upload_objects.state END, closed_at = NULL",
+    );
+    assert_eq!(ledger(90).expect("fence row").0, "delete_pending");
     assert!(
         matches!(
             session.finish_deletion(90, token, Deleted),
@@ -189,34 +196,40 @@ fn janitor_session_fences_object_deletion_claims() {
         .finish_deletion(90, retry, Deleted)
         .expect("finish retry");
 
-    // A retryable outcome persists its reason, and an expired claim is fenced out.
+    // A retryable outcome keeps the fence with its reason and is re-claimed next
+    // cycle; an active lease blocks a second claim, and an expired one is fenced out.
     let first = session
-        .claim_deletion(79)
+        .claim_deletion(80)
         .expect("claim")
-        .expect("claim 79");
+        .expect("claim published, unreferenced 80");
     session
-        .finish_deletion(79, first, Retryable)
+        .finish_deletion(80, first, Retryable)
         .expect("retryable finish");
-    let (state, reason) = ledger(79).expect("retry row");
-    assert_eq!(state, "retry_wait");
+    let (state, reason) = ledger(80).expect("retry row");
+    assert_eq!(state, "delete_pending");
     assert!(reason.is_some());
     let expired = session
-        .claim_deletion(79)
+        .claim_deletion(80)
         .expect("claim")
         .expect("claim after retry");
+    assert_eq!(
+        session.claim_deletion(80).expect("claim"),
+        None,
+        "an active lease protects the object"
+    );
     sql(
-        "UPDATE snapshot_payload_upload_objects SET reconcile_lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = $1 AND object_id = 79",
+        "UPDATE snapshot_payload_upload_objects SET reconcile_lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = $1 AND object_id = 80",
     );
     let current = session
-        .claim_deletion(79)
+        .claim_deletion(80)
         .expect("claim")
         .expect("claim after expiry");
     assert!(matches!(
-        session.finish_deletion(79, expired, Deleted),
+        session.finish_deletion(80, expired, Deleted),
         Err(crate::JanitorMetadataError::StaleClaim)
     ));
     session
-        .finish_deletion(79, current, Deleted)
+        .finish_deletion(80, current, Deleted)
         .expect("current finish");
     session.release_global_janitor_lock().expect("release");
 }
