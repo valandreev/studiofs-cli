@@ -6,7 +6,6 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use opendal::ErrorKind;
 use studiofs_cache::runtime::{
     LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
@@ -35,11 +34,10 @@ impl JanitorObjectStore for OpenDalJanitorStore {
     }
 
     async fn delete(&self, key: &str) -> Result<(), JanitorStoreError> {
-        self.0.delete(key).await.map_err(|error| {
-            if error.kind() == ErrorKind::NotFound {
-                JanitorStoreError::NotFound
-            } else {
-                JanitorStoreError::Other(error.to_string())
+        self.0.delete(key).await.map_err(|error| match error {
+            studiofs_data::janitor::JanitorDeleteError::NotFound => JanitorStoreError::NotFound,
+            studiofs_data::janitor::JanitorDeleteError::Other(message) => {
+                JanitorStoreError::Other(message)
             }
         })
     }
