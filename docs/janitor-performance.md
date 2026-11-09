@@ -8,7 +8,7 @@ The public OpenDAL `Lister` does not expose how many S3 pages it fetched. Produc
 
 The CLI consumes the remote listing through OpenDAL `lister_with(prefix).recursive(true)`. Entries are evaluated as pages arrive and grouped into eligibility batches of `MAX_JANITOR_ELIGIBILITY_BATCH` (64). Memory holds one provider page plus one batch, independent of the number of keys. Duplicate keys of one object are collapsed only when adjacent, which matches S3's lexicographic listing order; a provider that returns an object's keys apart re-checks that object, which stays safe because claims and `NotFound` deletes are idempotent.
 
-Each listing step is bounded by a 60-second timeout. A failed or stalled page fails the cycle: batches processed earlier keep their confirmed deletions, and the partially buffered batch is not acted on. The listing is never treated as proof of deletion safety; PostgreSQL eligibility and claims decide that.
+Each listing request, including the first, is bounded by a 60-second timeout. A failed or stalled page fails the cycle with the number of entries listed so far: batches processed earlier keep their confirmed deletions, and the partially buffered batch is not acted on. The listing is never treated as proof of deletion safety; PostgreSQL eligibility and claims decide that.
 
 `initial_listing_ms` is the time spent waiting on the listing, not wall time from start to the last page, because processing now overlaps listing.
 
@@ -22,6 +22,8 @@ The fixture serves 20,005 old object keys in 21 1,000-key S3 pages through the r
 - 20,005 entries are listed and scanned; peak buffered candidates are 64.
 - Two candidates receive HEAD requests and two objects are deleted (one request per canonical key).
 - The remaining 20,003 candidates are skipped by the cap. The cap does not yet stop the listing early.
+
+`janitor_stalled_opendal_page_times_out_after_first_page_was_processed` uses the same loopback S3 with a second page that never arrives. The first page's 15 full batches are evaluated before the timeout ends the cycle.
 
 The earlier eager baseline (SFS-964, main commit `37c33f3f`) fetched all three pages of a 2,505-key fixture before the first HEAD and materialized all 2,505 entries.
 

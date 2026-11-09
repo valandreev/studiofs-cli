@@ -18,7 +18,8 @@ const DELETE_KEY_TIMEOUT: Duration = if cfg!(test) {
 /// Bound for one listing step; a stalled page fails the cycle. Finished
 /// deletions are already confirmed in PostgreSQL, so no completed work is lost.
 const LIST_PAGE_TIMEOUT: Duration = if cfg!(test) {
-    Duration::from_millis(200)
+    // Long enough for a loaded CI host to serve a loopback page.
+    Duration::from_secs(2)
 } else {
     Duration::from_secs(60)
 };
@@ -242,21 +243,14 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
 
     eprintln!("janitor phase=initial_listing started");
     let listing_started = Instant::now();
-    let mut listing = ctx
-        .store
-        .list(ctx.prefix)
-        .await
-        .context("failed to list janitor objects")?;
+    let mut listing = bounded_list_step(ctx.store.list(ctx.prefix), 0).await?;
     stats.initial_listing_elapsed = listing_started.elapsed();
 
     // Entries are consumed as pages arrive; memory holds one page plus one batch.
     let mut candidates = Vec::with_capacity(MAX_JANITOR_ELIGIBILITY_BATCH);
     loop {
         let wait_started = Instant::now();
-        let entry = tokio::time::timeout(LIST_PAGE_TIMEOUT, listing.next_entry())
-            .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("listing page timed out")))
-            .context("failed to list janitor objects")?;
+        let entry = bounded_list_step(listing.next_entry(), stats.initial_listing_entries).await?;
         stats.initial_listing_elapsed += wait_started.elapsed();
         let Some(entry) = entry else {
             break;
@@ -319,6 +313,17 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
         super::duration_ms(stats.delete_elapsed)
     );
     Ok(stats)
+}
+
+/// Run one listing request under [`LIST_PAGE_TIMEOUT`], naming the entry offset on failure.
+async fn bounded_list_step<T>(
+    step: impl std::future::Future<Output = anyhow::Result<T>>,
+    listed_entries: u64,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(LIST_PAGE_TIMEOUT, step)
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("listing page timed out")))
+        .with_context(|| format!("failed to list janitor objects after {listed_entries} entries"))
 }
 
 async fn process_candidate_batch<S: JanitorObjectStore>(

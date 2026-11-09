@@ -1111,7 +1111,8 @@ mod tests {
         drop(metadata_runtime);
     }
 
-    fn one_fragment_per_object(count: u64) -> Vec<JanitorEntry> {
+    /// Every fragment key of objects `1..=count`, in listing order.
+    fn fragment_entries(count: u64) -> Vec<JanitorEntry> {
         (1..=count)
             .flat_map(|id| studiofs_data::object::format_object_fragment_keys("test/objects/", id))
             .map(|key| JanitorEntry { key, is_file: true })
@@ -1122,12 +1123,15 @@ mod tests {
     async fn failing_or_stalled_listing_page_stops_cycle_after_completed_batches() {
         let batch = MAX_JANITOR_ELIGIBILITY_BATCH as u64;
         let failing = FakeJanitorStore {
-            entries: one_fragment_per_object(batch + 6),
-            fail_list_after: Some(MAX_JANITOR_ELIGIBILITY_BATCH + 3),
+            entries: fragment_entries(batch + 6),
+            // Fail inside the second batch, after the first batch's entries.
+            fail_list_after: Some(
+                (MAX_JANITOR_ELIGIBILITY_BATCH + 3) * studiofs_data::object::CLOUD_FRAGMENT_COUNT,
+            ),
             ..FakeJanitorStore::default()
         };
         let stalled = FakeJanitorStore {
-            entries: one_fragment_per_object(batch + 6),
+            entries: fragment_entries(batch + 6),
             hang_list: true,
             ..FakeJanitorStore::default()
         };
@@ -1321,6 +1325,8 @@ mod tests {
         delete_requests: AtomicU64,
         list_requests_before_first_head: AtomicU64,
         object_count: u64,
+        /// Never answer this 0-based list page, simulating a stalled provider.
+        stall_page: Option<u64>,
     }
 
     async fn fake_s3_request(listener: tokio::net::TcpListener, fake: std::sync::Arc<FakeS3>) {
@@ -1358,6 +1364,9 @@ mod tests {
                                 .ok()
                         })
                         .map_or(0, |page| page - 1);
+                    if fake.stall_page == Some(page) {
+                        std::future::pending::<()>().await;
+                    }
                     let start = page * 1000 + 1;
                     let end = (start + 1000).min(fake.object_count + 1);
                     let contents = (start..end)
@@ -1415,6 +1424,18 @@ mod tests {
         String,
         tokio::task::JoinHandle<()>,
     ) {
+        fake_s3_operator_with_stall(object_count, None).await
+    }
+
+    async fn fake_s3_operator_with_stall(
+        object_count: u64,
+        stall_page: Option<u64>,
+    ) -> (
+        Operator,
+        std::sync::Arc<FakeS3>,
+        String,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let fake = std::sync::Arc::new(FakeS3 {
@@ -1423,6 +1444,7 @@ mod tests {
             delete_requests: AtomicU64::new(0),
             list_requests_before_first_head: AtomicU64::new(0),
             object_count,
+            stall_page,
         });
         let task = tokio::spawn(fake_s3_request(listener, fake.clone()));
         let op = Operator::new(
@@ -1561,6 +1583,48 @@ mod tests {
             stats.head_requests,
             stats.delete_requests,
             duration_ms(stats.cycle_elapsed)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn janitor_stalled_opendal_page_times_out_after_first_page_was_processed() {
+        // Page 2 never arrives; the first page's objects must already be processed.
+        let (op, fake, _endpoint, server) = fake_s3_operator_with_stall(2_000, Some(1)).await;
+        let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::new(op));
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_one_cycle(JanitorCycleContext {
+                store: &store,
+                prefix: "test/objects/",
+                dry_run: true,
+                skip_newer_than_secs: 60,
+                max_deletes: u64::MAX,
+                metadata: &mut metadata,
+            }),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains("failed to list janitor objects after 1000 entries"),
+            "{error}"
+        );
+        assert!(error.contains("listing page timed out"), "{error}");
+        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            fake.list_requests_before_first_head.load(Ordering::Relaxed),
+            1
+        );
+        // 1,000 listed objects fill 15 whole batches; the 40-object tail is never acted on.
+        let full_batches = 1000 / MAX_JANITOR_ELIGIBILITY_BATCH;
+        assert_eq!(metadata.eligibility_reads.len(), full_batches);
+        assert_eq!(
+            fake.head_requests.load(Ordering::Relaxed),
+            (full_batches * MAX_JANITOR_ELIGIBILITY_BATCH) as u64
         );
     }
 
