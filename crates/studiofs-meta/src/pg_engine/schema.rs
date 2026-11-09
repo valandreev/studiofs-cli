@@ -541,6 +541,16 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             PRIMARY KEY (vol, object_id)
         );
 
+        CREATE TABLE IF NOT EXISTS snapshot_payload_gc_candidates (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            object_id BIGINT NOT NULL CHECK (object_id >= 0),
+            eligible_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            next_attempt_at TIMESTAMPTZ,
+            last_error TEXT,
+            acknowledged_at TIMESTAMPTZ,
+            PRIMARY KEY (vol, object_id)
+        );
+
         -- Per payload namespace: the owning client never registers or publishes a
         -- new object ID whose counter is below acked_through, so fence rows there
         -- are redundant and the CLI Janitor may prune them.
@@ -839,6 +849,10 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         CREATE INDEX IF NOT EXISTS idx_snapshot_payload_upload_objects_fences
             ON snapshot_payload_upload_objects(vol, object_id)
             WHERE state IN ('delete_pending', 'deleted');
+        CREATE INDEX IF NOT EXISTS idx_snapshot_payload_gc_candidates_page
+            ON snapshot_payload_gc_candidates(vol, eligible_at, object_id)
+            INCLUDE (next_attempt_at)
+            WHERE acknowledged_at IS NULL;
     "#
 }
 

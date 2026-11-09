@@ -528,6 +528,82 @@ fn retry_and_final_reference_are_idempotent() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn final_reference_close_queues_published_payload_and_reopen_removes_stale_candidate() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-reachability-gc-candidate");
+
+    run_async(async {
+        let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 21, 'published')",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("seed published upload ledger row");
+
+        for (version, event) in [
+            (1, publish_event(7, 21)),
+            (2, MetaEvent::RemoveRegularFileGraph { ino: 7 }),
+        ] {
+            let tx = client.transaction().await.expect("start lifetime transaction");
+            apply_object_lifetime_changes(&tx, volume.volume_id, version, &[event])
+                .await
+                .expect("apply lifetime batch");
+            tx.commit().await.expect("commit lifetime batch");
+        }
+        let initial = client
+            .query_one(
+                "SELECT floor(extract(epoch FROM eligible_at))::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = 21",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("candidate created after final reference close")
+            .get::<_, i64>(0);
+
+        let tx = client.transaction().await.expect("start reopen transaction");
+        apply_object_lifetime_changes(&tx, volume.volume_id, 3, &[publish_event(8, 21)])
+            .await
+            .expect("reopen object reference");
+        tx.commit().await.expect("commit reopen transaction");
+        let stale_rows: i64 = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = 21",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("count stale candidates")
+            .get(0);
+        assert_eq!(stale_rows, 0);
+
+        let tx = client.transaction().await.expect("start second close transaction");
+        apply_object_lifetime_changes(&tx, volume.volume_id, 4, &[MetaEvent::RemoveRegularFileGraph { ino: 8 }])
+            .await
+            .expect("close reopened reference");
+        tx.commit().await.expect("commit second close transaction");
+        let renewed = client
+            .query_one(
+                "SELECT floor(extract(epoch FROM eligible_at))::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = 21",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("candidate recreated after final reference close")
+            .get::<_, i64>(0);
+        assert!(renewed >= initial);
+
+        connection_task.abort();
+        Ok::<(), MetaError>(())
+    })
+    .expect("GC candidate lifecycle");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn bootstrap_defers_while_a_snapshot_is_creating() {
     let Some(dsn) = pg_dsn() else {
         return;

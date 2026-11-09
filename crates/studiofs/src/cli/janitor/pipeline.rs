@@ -46,6 +46,8 @@ pub(super) struct JanitorStats {
     pub(super) deleted: u64,
     pub(super) delete_errors: u64,
     pub(super) skipped_non_canonical: u64,
+    pub(super) queued_candidates_scanned: u64,
+    pub(super) skipped_deferred: u64,
     pub(super) claims: u64,
     pub(super) claim_protected: u64,
     pub(super) claim_finishes: u64,
@@ -125,7 +127,12 @@ impl RunBudget {
     fn listing_stop(&self, stats: &JanitorStats, started: Instant) -> Option<CycleOutcome> {
         self.admission_stop(stats, started).or_else(|| {
             self.max_scan_entries
-                .filter(|max| stats.initial_listing_entries >= *max)
+                .filter(|max| {
+                    stats
+                        .initial_listing_entries
+                        .saturating_add(stats.queued_candidates_scanned)
+                        >= *max
+                })
                 .map(|_| CycleOutcome::ScanBudgetExhausted)
         })
     }
@@ -161,6 +168,26 @@ struct Candidate {
     newest_listed: Option<SystemTime>,
     /// Listed keys whose page carried no `LastModified`; they need a HEAD.
     untimed_keys: Vec<String>,
+    queued_eligible_at: Option<i64>,
+}
+
+impl Candidate {
+    fn from_queue(prefix: &str, object_id: u64, eligible_at: i64) -> anyhow::Result<Self> {
+        let key = studiofs_data::object::format_object_key(prefix, object_id);
+        let (found_id, delete_keys) = canonical_object_delete_keys(prefix, &key)
+            .ok_or_else(|| anyhow::anyhow!("invalid PostgreSQL GC candidate object id"))?;
+        anyhow::ensure!(
+            found_id == object_id,
+            "PostgreSQL GC candidate key does not match its object id"
+        );
+        Ok(Self {
+            object_id,
+            delete_keys,
+            newest_listed: None,
+            untimed_keys: Vec::new(),
+            queued_eligible_at: Some(eligible_at.div_euclid(1_000_000)),
+        })
+    }
 }
 
 impl Candidate {
@@ -202,6 +229,7 @@ fn discover_object(
         delete_keys,
         newest_listed: None,
         untimed_keys: Vec::new(),
+        queued_eligible_at: None,
     };
     candidate.record_key(entry.key, entry.last_modified);
     current.replace(candidate)
@@ -279,6 +307,7 @@ async fn process_orphan<S: JanitorObjectStore>(
     stats.claims = stats.claims.saturating_add(1);
     let Some(fencing_token) = claim else {
         stats.claim_protected = stats.claim_protected.saturating_add(1);
+        defer_queued_candidate(ctx, candidate);
         return Ok(());
     };
 
@@ -324,11 +353,37 @@ async fn process_orphan<S: JanitorObjectStore>(
         }
     }
     if delete_failed {
+        let retry = tokio::task::block_in_place(|| ctx.metadata.retry_gc_candidate(object_id));
+        if let Err(error) = retry {
+            eprintln!("janitor: failed to defer GC candidate object_id={object_id}: {error:#}");
+        }
         stats.delete_errors = stats.delete_errors.saturating_add(1);
     } else {
+        // The fenced finish already confirmed deletion; an unacked row is only re-claimed later.
+        let ack = tokio::task::block_in_place(|| ctx.metadata.ack_gc_candidate(object_id));
+        if let Err(error) = ack {
+            eprintln!(
+                "janitor: failed to acknowledge GC candidate object_id={object_id}: {error:#}"
+            );
+        }
         stats.deleted = stats.deleted.saturating_add(1);
     }
     Ok(())
+}
+
+/// Delays a protected queue row so it does not re-occupy the head of every later page.
+fn defer_queued_candidate<S: JanitorObjectStore>(
+    ctx: &mut JanitorCycleContext<'_, S>,
+    candidate: &Candidate,
+) {
+    if ctx.dry_run || candidate.queued_eligible_at.is_none() {
+        return;
+    }
+    let object_id = candidate.object_id;
+    let retry = tokio::task::block_in_place(|| ctx.metadata.retry_gc_candidate(object_id));
+    if let Err(error) = retry {
+        eprintln!("janitor: failed to defer GC candidate object_id={object_id}: {error:#}");
+    }
 }
 
 pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
@@ -345,6 +400,83 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
             .as_secs(),
     )
     .unwrap_or(i64::MAX);
+
+    let mut candidate_cursor: Option<(i64, u64)> = None;
+    loop {
+        if let Some(stop) = ctx.budget.admission_stop(&stats, cycle_started) {
+            stats.outcome = stop;
+            break;
+        }
+        let remaining_scan = ctx
+            .budget
+            .max_scan_entries
+            .map(|max| {
+                max.saturating_sub(
+                    stats
+                        .initial_listing_entries
+                        .saturating_add(stats.queued_candidates_scanned),
+                )
+            })
+            .unwrap_or(MAX_JANITOR_ELIGIBILITY_BATCH as u64);
+        if remaining_scan == 0 {
+            stats.outcome = CycleOutcome::ScanBudgetExhausted;
+            break;
+        }
+        let page_limit = usize::try_from(remaining_scan.min(MAX_JANITOR_ELIGIBILITY_BATCH as u64))
+            .unwrap_or(MAX_JANITOR_ELIGIBILITY_BATCH);
+        let page = tokio::task::block_in_place(|| {
+            ctx.metadata.gc_candidate_page(
+                candidate_cursor,
+                page_limit,
+                now_unix
+                    .saturating_sub(i64::try_from(ctx.skip_newer_than_secs).unwrap_or(i64::MAX)),
+                !ctx.dry_run,
+            )
+        })?;
+        if page.is_empty() {
+            break;
+        }
+        stats.queued_candidates_scanned = stats
+            .queued_candidates_scanned
+            .saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX));
+        stats.scanned_files = stats
+            .scanned_files
+            .saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX));
+        let candidates = page
+            .iter()
+            .map(|(object_id, eligible_at)| {
+                Candidate::from_queue(ctx.prefix, *object_id, *eligible_at)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        process_candidate_batch(
+            &mut ctx,
+            candidates,
+            now,
+            now_unix,
+            cycle_started,
+            &mut stats,
+        )
+        .await?;
+        if let Some(stop) = ctx.budget.admission_stop(&stats, cycle_started) {
+            stats.outcome = stop;
+        }
+        candidate_cursor = page.last().map(|(id, eligible_at)| (*eligible_at, *id));
+        if stats.outcome != CycleOutcome::Complete {
+            break;
+        }
+        if page.len() < page_limit {
+            break;
+        }
+    }
+    if stats.outcome != CycleOutcome::Complete {
+        stats.cycle_elapsed = cycle_started.elapsed();
+        return Ok(stats);
+    }
+    if let Some(stop) = ctx.budget.admission_stop(&stats, cycle_started) {
+        stats.outcome = stop;
+        stats.cycle_elapsed = cycle_started.elapsed();
+        return Ok(stats);
+    }
 
     eprintln!("janitor phase=initial_listing started");
     let listing_started = Instant::now();
@@ -473,31 +605,47 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
         .map(|candidate| candidate.object_id)
         .collect();
     // The metadata session owns a synchronous runtime; leave this worker before its block_on.
-    let protection = tokio::task::block_in_place(|| ctx.metadata.check_eligibility(&ids))?;
+    let eligible_before =
+        now_unix.saturating_sub(i64::try_from(ctx.skip_newer_than_secs).unwrap_or(i64::MAX));
+    let protection =
+        tokio::task::block_in_place(|| ctx.metadata.check_eligibility(&ids, eligible_before))?;
     // Resolve every decision before any delete so one unknown outcome retains the whole batch.
-    // `Some(pending_deletion)` marks an eligible orphan; `None` marks a protected object.
+    enum Decision {
+        Protected,
+        Deferred,
+        Eligible(Option<i64>),
+    }
     let decisions = candidates
         .into_iter()
         .map(|candidate| match protection.get(&candidate.object_id) {
-            Some(JanitorEligibility::Protected) => Ok((candidate, None)),
+            Some(JanitorEligibility::Protected) => Ok((candidate, Decision::Protected)),
+            Some(JanitorEligibility::Deferred) => Ok((candidate, Decision::Deferred)),
             Some(&JanitorEligibility::Eligible { pending_deletion }) => {
-                Ok((candidate, Some(pending_deletion)))
+                let oldest = candidate.queued_eligible_at;
+                Ok((
+                    candidate,
+                    Decision::Eligible(pending_deletion.into_iter().chain(oldest).max()),
+                ))
             }
             None | Some(JanitorEligibility::Unknown) => Err(anyhow::anyhow!(
                 "janitor eligibility is unknown; refusing to delete candidate batch"
             )),
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    for (candidate, orphan) in decisions {
+    for (candidate, decision) in decisions {
         if let Some(stop) = ctx.budget.admission_stop(stats, cycle_started) {
             stats.outcome = stop;
             return Ok(());
         }
-        match orphan {
-            None => {
+        match decision {
+            Decision::Protected => {
                 stats.referenced_files = stats.referenced_files.saturating_add(1);
+                defer_queued_candidate(ctx, &candidate);
             }
-            Some(pending_deletion) => {
+            Decision::Deferred => {
+                stats.skipped_deferred = stats.skipped_deferred.saturating_add(1);
+            }
+            Decision::Eligible(pending_deletion) => {
                 stats.orphan_candidates = stats.orphan_candidates.saturating_add(1);
                 if stats.time_to_first_candidate.is_none() {
                     stats.time_to_first_candidate = Some(cycle_started.elapsed());

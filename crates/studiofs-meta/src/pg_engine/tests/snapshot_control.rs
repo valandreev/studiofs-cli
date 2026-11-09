@@ -26,6 +26,8 @@ fn snapshot_schema_v2_replaces_legacy_snapshot_schema() {
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_reachability_batches"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_reachability_bootstrap"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_payload_upload_objects"));
+    assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_payload_gc_candidates"));
+    assert!(ddl.contains("idx_snapshot_payload_gc_candidates_page"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_payload_upload_fragments"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_payload_reconcile_cursors"));
     assert!(ddl.contains("CREATE TABLE IF NOT EXISTS snapshot_policy_slots"));
