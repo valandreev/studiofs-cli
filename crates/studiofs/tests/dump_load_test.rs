@@ -624,12 +624,13 @@ async fn dump_load_rejects_target_with_snapshot_v2_without_breaking_other_volume
 /// binary crate, so integration tests cannot import it. Keep both lists equal:
 /// a table dropped from the source list makes the per-table rejection test
 /// fail, but a table added there is untested until it is added here.
-const ACCOUNTING_TABLES: [&str; 5] = [
+const ACCOUNTING_TABLES: [&str; 6] = [
     "snapshot_current_references",
     "snapshot_object_reachability",
     "snapshot_reachability_batches",
     "snapshot_reachability_bootstrap",
     "snapshot_payload_upload_objects",
+    "snapshot_payload_upload_watermarks",
 ];
 
 const ACCOUNTING_REJECTION: &str =
@@ -991,6 +992,14 @@ async fn seed_accounting_row(
                 .execute(
                     "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, $2, 'published')",
                     &[&volume_id, &object_id],
+                )
+                .await
+        }
+        "snapshot_payload_upload_watermarks" => {
+            client
+                .execute(
+                    "INSERT INTO snapshot_payload_upload_watermarks (vol, payload_namespace, acked_through) VALUES ($1, 1, 1)",
+                    &[&volume_id],
                 )
                 .await
         }

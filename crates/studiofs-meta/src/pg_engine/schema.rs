@@ -552,6 +552,39 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             PRIMARY KEY (vol, payload_namespace)
         );
 
+        -- Lowering a watermark would unfence IDs whose fence rows were pruned.
+        CREATE OR REPLACE FUNCTION studiofs_reject_payload_watermark_regression()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NEW.vol <> OLD.vol
+                OR NEW.payload_namespace <> OLD.payload_namespace
+                OR NEW.acked_through < OLD.acked_through THEN
+                RAISE EXCEPTION 'payload upload watermark cannot move backwards'
+                    USING ERRCODE = 'restrict_violation';
+            END IF;
+            RETURN NEW;
+        END
+        $$;
+
+        -- Created once: re-creating it on every schema ensure takes a table lock
+        -- that deadlocks with concurrent volume setup.
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_trigger
+                WHERE tgname = 'studiofs_payload_watermark_regression_guard'
+                  AND tgrelid = 'snapshot_payload_upload_watermarks'::regclass
+            ) THEN
+                CREATE TRIGGER studiofs_payload_watermark_regression_guard
+                    BEFORE UPDATE ON snapshot_payload_upload_watermarks
+                    FOR EACH ROW
+                    EXECUTE FUNCTION studiofs_reject_payload_watermark_regression();
+            END IF;
+        END
+        $$;
+
         CREATE TABLE IF NOT EXISTS snapshot_payload_upload_fragments (
             vol BIGINT NOT NULL,
             object_id BIGINT NOT NULL,

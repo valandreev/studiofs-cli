@@ -139,12 +139,13 @@ const SNAPSHOT_V2_TABLES: [&str; 2] = ["snapshot_catalog", "snapshot_policies"];
 /// carries none of them, so rows retained for the target would describe a
 /// different history than the restored metadata and could let GC delete live
 /// payloads.
-const ACCOUNTING_TABLES: [&str; 5] = [
+const ACCOUNTING_TABLES: [&str; 6] = [
     "snapshot_current_references",
     "snapshot_object_reachability",
     "snapshot_reachability_batches",
     "snapshot_reachability_bootstrap",
     "snapshot_payload_upload_objects",
+    "snapshot_payload_upload_watermarks",
 ];
 
 type DumpLoadResult<T> = std::result::Result<T, DumpLoadError>;

@@ -661,9 +661,13 @@ Janitor policy:
   it unless a current reference already holds it. After each non-dry-run cycle,
   the CLI Janitor deletes finished fences below the watermark under its lock,
   at most 64 batches of 1,024 rows. A finished fence has no lease owner and no
-  `last_error`. Without a watermark row, nothing is pruned. Upload registration
-  takes a share lock on the volume's watermark rows, so a watermark advance
-  waits for in-flight registrations.
+  `last_error`. Without a watermark row, nothing is pruned. A trigger rejects
+  any update that lowers a watermark. Upload registration takes a share lock on
+  the volume's existing watermark rows, so an update that raises one waits for
+  in-flight registrations. That lock cannot cover a namespace's first insert,
+  so a client writes its first watermark only from a quiescent state.
+  Publication also exempts snapshot-pinned IDs, which a deletion claim never
+  deletes. `load` refuses a target that still has watermark rows.
 - every Snapshot v2 capture path (manual and policy) takes the matching
   exclusive transaction advisory lock in `capture_snapshot_in_transaction`
   before capturing the metadata cut or inserting its `creating` catalog row, so

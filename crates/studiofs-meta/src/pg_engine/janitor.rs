@@ -12,7 +12,7 @@ use tokio_postgres::Client;
 const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
 
 /// Objects retained by live or leased snapshots; shared by mounted and CLI janitors.
-const SNAPSHOT_PIN_QUERY: &str = "SELECT DISTINCT reachability.object_id
+pub(super) const SNAPSHOT_PIN_QUERY: &str = "SELECT DISTINCT reachability.object_id
     FROM snapshot_object_reachability AS reachability
     JOIN snapshot_catalog AS catalog
       ON catalog.vol = reachability.vol
@@ -472,7 +472,7 @@ impl PgJanitorSession {
         // A leased or failed fence (owner or last_error set) is still being deleted.
         let statement = concat!(
             "DELETE FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id IN (SELECT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND state IN ('delete_pending', 'deleted') AND reconcile_owner IS NULL AND last_error IS NULL AND ",
-            super::snapshot_reachability::below_payload_watermark!(),
+            super::snapshot_reachability::below_payload_watermark!("object_id"),
             " ORDER BY object_id LIMIT $2 FOR UPDATE SKIP LOCKED)"
         );
         let mut pruned = 0_u64;
@@ -533,7 +533,8 @@ pub(super) async fn claim_object_deletion_in(
     .map_err(|error| Postgres("janitor claim publication fence failed", error))?
     .ok_or(ObjectDeletionClaimError::VolumeBindingMissing)?;
     tx.execute(
-        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at) VALUES ($1, $2, 'delete_pending', clock_timestamp()) ON CONFLICT (vol, object_id) DO NOTHING",
+        // The no-op update locks an existing row, so a concurrent fence prune skips it.
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at) VALUES ($1, $2, 'delete_pending', clock_timestamp()) ON CONFLICT (vol, object_id) DO UPDATE SET state = snapshot_payload_upload_objects.state",
         &[&volume_id, &object_id],
     )
     .await

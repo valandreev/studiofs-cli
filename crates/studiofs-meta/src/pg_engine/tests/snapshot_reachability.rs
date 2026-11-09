@@ -352,6 +352,22 @@ fn pruned_deletion_fences_stay_fenced_below_the_payload_watermark() {
         "no fence is pruned before its namespace reports a watermark"
     );
     sql("INSERT INTO snapshot_payload_upload_watermarks (vol, payload_namespace, acked_through) VALUES ($1, 5, 25)".to_owned());
+    let regression = run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        let result = client
+            .execute(
+                "UPDATE snapshot_payload_upload_watermarks SET acked_through = 24 WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await;
+        connection_task.abort();
+        Ok::<_, MetaError>(result)
+    })
+    .expect("attempt watermark regression");
+    assert!(regression.is_err(), "a watermark must never move backwards");
     assert_eq!(janitor.prune_object_deletion_fences().expect("prune"), 2);
     assert_eq!(state(finished), None);
     assert_eq!(state(deleted), None);
