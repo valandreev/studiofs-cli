@@ -1,6 +1,6 @@
 //! Bounded metadata eligibility checks used by standalone object cleanup.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::{MetaGc, MetaInodes, RedbMetaEngine};
@@ -38,6 +38,10 @@ pub struct JanitorMetadataSession {
     format_info: crate::FormatInfo,
     postgres: crate::pg_engine::PgJanitorSession,
     validated_local_version: Option<u64>,
+    /// Local references read once per cycle; this process owns the redb file exclusively,
+    /// and `validated_local_version` rejects any batch checked after local state moved.
+    // ponytail: holds every locally referenced ID (8 B each); switch to an object-ID index if local graphs outgrow memory.
+    local_referenced: HashSet<u64>,
 }
 
 impl JanitorMetadataSession {
@@ -64,6 +68,7 @@ impl JanitorMetadataSession {
             format_info,
             postgres,
             validated_local_version: None,
+            local_referenced: HashSet::new(),
         })
     }
 
@@ -137,6 +142,10 @@ impl JanitorMetadataSession {
         }
         self.postgres
             .validate_protection(&self.format_info, local_version)?;
+        self.local_referenced = self
+            .local
+            .get_local_referenced_object_ids()
+            .map_err(backend_unavailable)?;
         self.validated_local_version = Some(local_version);
         Ok(())
     }
@@ -156,9 +165,9 @@ impl JanitorMetadataSession {
                 "PostgreSQL janitor lock is not held",
             ));
         }
-        let local = self
+        let pending_deletions = self
             .local
-            .get_local_janitor_protection(object_ids)
+            .get_pending_deletions_for(object_ids)
             .map_err(backend_unavailable)?;
         let local_version = self
             .local
@@ -179,7 +188,7 @@ impl JanitorMetadataSession {
                 .check_eligibility(&self.format_info, local_version, object_ids)?;
         let mut protection = HashMap::with_capacity(object_ids.len());
         for object_id in object_ids {
-            let is_protected = local.0.contains(object_id)
+            let is_protected = self.local_referenced.contains(object_id)
                 || remote.referenced.contains(object_id)
                 || remote.snapshot_pins.contains(object_id);
             protection.insert(
@@ -188,7 +197,7 @@ impl JanitorMetadataSession {
                     JanitorEligibility::Protected
                 } else {
                     JanitorEligibility::Eligible {
-                        pending_deletion: local.1.get(object_id).copied(),
+                        pending_deletion: pending_deletions.get(object_id).copied(),
                     }
                 },
             );

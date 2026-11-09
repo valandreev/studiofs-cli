@@ -508,18 +508,18 @@ fn snapshot_creation_waits_for_the_standalone_janitor_lock() {
             .expect("acquire janitor lock")
     );
 
-    let engine = std::sync::Arc::clone(&engine);
+    let snapshot_engine = std::sync::Arc::clone(&engine);
     let volume_id = volume.volume_id;
     let (started_tx, started_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
     let snapshot_thread = thread::spawn(move || {
         started_tx.send(()).expect("signal snapshot call start");
-        let result = engine
+        let result = snapshot_engine
             .create_snapshot_v2(
                 SnapshotOrigin::Manual,
                 SnapshotRetention::manual(None).expect("manual retention"),
             )
-            .map(|_| ())
+            .map(|entry| entry.snapshot_id)
             .map_err(|error| error.to_string());
         result_tx.send(result).expect("send snapshot result");
     });
@@ -540,7 +540,7 @@ fn snapshot_creation_waits_for_the_standalone_janitor_lock() {
             let connection_task = tokio::spawn(connection);
             let waiting = client
                 .query_one(
-                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 1 AND mode = 'ShareLock' AND NOT granted)",
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 1 AND mode = 'ExclusiveLock' AND NOT granted)",
                     &[&lock_classid, &lock_objid],
                 )
                 .await
@@ -568,7 +568,7 @@ fn snapshot_creation_waits_for_the_standalone_janitor_lock() {
         observed_waiter,
         "snapshot registration never waited for the janitor lock"
     );
-    result.expect("snapshot registration succeeds after janitor lock release");
+    let snapshot_id = result.expect("snapshot registration succeeds after janitor lock release");
     assert!(
         janitor
             .try_acquire_global_janitor_lock()
@@ -587,8 +587,136 @@ fn snapshot_creation_waits_for_the_standalone_janitor_lock() {
         Some(&crate::JanitorEligibility::Protected),
         "a committed creating snapshot must retain its reachable object"
     );
+
+    // Interleave a real snapshot deletion while the janitor still holds its lock.
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to insert active snapshot lease");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "INSERT INTO snapshot_mount_leases (vol, snapshot_id, owner, cache_volume_uuid, cache_sha256, lease_expires_at, heartbeat_at) VALUES ($1, $2, 'janitor-test', $3, $4, clock_timestamp() + interval '60 seconds', clock_timestamp())",
+                &[&volume_id, &snapshot_id.as_str(), &info.uuid, &vec![0u8; 32]],
+            )
+            .await
+            .expect("insert active snapshot mount lease");
+        connection_task.abort();
+        Ok::<(), MetaError>(())
+    })
+    .expect("seed live snapshot mount lease");
+    let deleting = engine
+        .delete_snapshot_v2(&snapshot_id)
+        .expect("snapshot deletion proceeds while the janitor lock is held");
+    assert_eq!(
+        deleting.lifecycle,
+        crate::snapshot::SnapshotLifecycle::Deleting
+    );
+    let protection = cli_runtime
+        .block_on(async { tokio::task::block_in_place(|| janitor.check_eligibility(&[90])) });
+    assert_eq!(
+        protection
+            .expect("run janitor eligibility after interleaved deletion")
+            .get(&90),
+        Some(&crate::JanitorEligibility::Protected),
+        "a deleting snapshot with a live mount lease must retain its reachable object"
+    );
     drop(cli_runtime);
     janitor
         .release_global_janitor_lock()
         .expect("release reacquired janitor lock");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn concurrent_snapshot_creations_released_by_the_janitor_do_not_deadlock() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let engine_dir = studiofs_test_support::workspace_target_tempdir("snapshot-pair-engine-");
+    let janitor_dir = studiofs_test_support::workspace_target_tempdir("snapshot-pair-lock-");
+    let engine_db = engine_dir.path().join("meta.redb");
+    let janitor_db = janitor_dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "snapshot-pair-lock");
+    let info = volume.format_info();
+    seed_local(&engine_db, &info);
+    seed_local(&janitor_db, &info);
+    let engine = PgMetaEngine::open_with_options(
+        &engine_db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open snapshot engine");
+    let mut janitor =
+        crate::JanitorMetadataSession::open(&janitor_db).expect("open janitor metadata session");
+    assert!(
+        janitor
+            .try_acquire_global_janitor_lock()
+            .expect("acquire janitor lock")
+    );
+
+    let (result_tx, result_rx) = mpsc::channel();
+    let creators: Vec<_> = (0..2)
+        .map(|_| {
+            let engine = std::sync::Arc::clone(&engine);
+            let result_tx = result_tx.clone();
+            thread::spawn(move || {
+                let result = engine
+                    .create_snapshot_v2(
+                        SnapshotOrigin::Manual,
+                        SnapshotRetention::manual(None).expect("manual retention"),
+                    )
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                result_tx.send(result).expect("send snapshot result");
+            })
+        })
+        .collect();
+
+    // Release only after both captures queue on the janitor key, so they contend on release.
+    let lock_key = crate::pg_engine::pg_janitor_lock_key(volume.volume_id) as u64;
+    let lock_classid = i64::from((lock_key >> 32) as u32);
+    let lock_objid = i64::from(lock_key as u32);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut waiters = 0_i64;
+    while Instant::now() < deadline && waiters < 2 {
+        waiters = run_async(async {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| MetaError::Storage(pg_err(error)))?;
+            let connection_task = tokio::spawn(connection);
+            let waiting: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND classid::bigint = $1 AND objid::bigint = $2 AND objsubid = 1 AND NOT granted",
+                    &[&lock_classid, &lock_objid],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(pg_err(error)))?
+                .get(0);
+            connection_task.abort();
+            Ok(waiting)
+        })
+        .expect("observe waiting snapshot captures");
+        thread::yield_now();
+    }
+    janitor
+        .release_global_janitor_lock()
+        .expect("release janitor lock");
+    assert_eq!(
+        waiters, 2,
+        "both snapshot captures must queue on the janitor lock"
+    );
+
+    for _ in 0..2 {
+        result_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("snapshot capture completes after janitor lock release")
+            .expect("concurrent snapshot capture succeeds without deadlock");
+    }
+    for creator in creators {
+        creator.join().expect("join snapshot creator");
+    }
 }

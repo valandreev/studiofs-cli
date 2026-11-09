@@ -27,7 +27,7 @@ The mounted background janitor keeps its current behavior. A user can observe th
 
 ## Decision Log
 
-- Decision: Reuse the existing per-volume advisory lock key. The CLI keeps its existing exclusive session lock for the destructive cycle; snapshot registration takes a shared transaction lock before it captures or inserts a creating snapshot.
+- Decision: Reuse the existing per-volume advisory lock key. The CLI keeps its existing exclusive session lock for the destructive cycle; snapshot capture relies on the exclusive transaction lock that `capture_snapshot_in_transaction` already takes on the same key (present on main since 97641c80).
   Rationale: The database arbitrates both processes across independent clients, and the existing exclusive session lock already spans eligibility through CLI deletion. This keeps snapshot creation and janitor locking in the shared PostgreSQL metadata layer without adding schema or a new lock registry.
   Date/Author: 2026-11-09 / Codex.
 - Decision: Keep an Unknown result as an error for the batch and stop the CLI cycle before its delete calls.
@@ -42,7 +42,7 @@ The mounted background janitor keeps its current behavior. A user can observe th
 
 ## Outcomes & Retrospective
 
-The standalone CLI now checks each candidate in a bounded batch and receives a typed `Protected`, `Eligible`, or `Unknown` result. Local redb scans preserve only candidate IDs, PostgreSQL queries only requested IDs, and missing outcomes or query errors stop the batch before deletion. Snapshot registration takes the shared advisory transaction lock before capture, and the exclusive CLI lock spans eligibility checks and deletion. Mounted janitor behavior is unchanged.
+The standalone CLI now checks each candidate in a bounded batch and receives a typed `Protected`, `Eligible`, or `Unknown` result. Local references are read once per cycle (the CLI owns the redb file and a version check rejects drift), pending markers and PostgreSQL rows are read only for requested IDs, and missing outcomes or query errors stop the batch before deletion. Snapshot capture takes the exclusive advisory transaction lock, and the exclusive CLI session lock spans eligibility checks and deletion. Mounted janitor behavior is unchanged.
 
 Focused Windows evidence so far:
 
@@ -67,11 +67,11 @@ Focused Windows evidence so far:
     git diff --check
     result: passed; Git emitted only line-ending conversion notices for Rust files.
 
-No workspace-wide or full ignored suite was run. SFS-968 per-object deletion claims, object-store key canonicalization, and claim/finish recovery remain follow-up work. The shared-lock guarantee requires snapshot writers to be upgraded to this protocol before running a new janitor against old snapshot-producing binaries.
+No workspace-wide or full ignored suite was run. SFS-968 per-object deletion claims, object-store key canonicalization, and claim/finish recovery remain follow-up work.
 
 ## Context and Orientation
 
-The workspace root is `E:\dev\studiofs-cli`, on branch `feature/sfs-967-add-authoritative-batched-gc-eligibility`. `crates/studiofs-meta/src/janitor.rs` owns the read-only metadata session used only by the standalone CLI. `crates/studiofs-meta/src/pg_engine/janitor.rs` owns the PostgreSQL advisory lock and metadata safety reads. `crates/studiofs-meta/src/engine.rs` and `crates/studiofs-meta/src/redb_engine/gc.rs` define and implement local GC queries. `crates/studiofs/src/cli/janitor.rs` runs the CLI cycle and owns the metadata session across it; `crates/studiofs/src/cli/janitor/pipeline.rs` evaluates listed storage entries. `crates/studiofs-meta/src/pg_engine/snapshot_control.rs` registers snapshots in a PostgreSQL transaction. A per-volume advisory lock is a PostgreSQL lock keyed by the volume; an exclusive janitor session lock blocks a shared lock requested by a snapshot registration transaction.
+The workspace root is `E:\dev\studiofs-cli`, on branch `feature/sfs-967-add-authoritative-batched-gc-eligibility`. `crates/studiofs-meta/src/janitor.rs` owns the read-only metadata session used only by the standalone CLI. `crates/studiofs-meta/src/pg_engine/janitor.rs` owns the PostgreSQL advisory lock and metadata safety reads. `crates/studiofs-meta/src/engine.rs` and `crates/studiofs-meta/src/redb_engine/gc.rs` define and implement local GC queries. `crates/studiofs/src/cli/janitor.rs` runs the CLI cycle and owns the metadata session across it; `crates/studiofs/src/cli/janitor/pipeline.rs` evaluates listed storage entries. `crates/studiofs-meta/src/pg_engine/snapshot_control.rs` registers snapshots in a PostgreSQL transaction. A per-volume advisory lock is a PostgreSQL lock keyed by the volume; an exclusive janitor session lock blocks the exclusive transaction lock requested by snapshot capture.
 
 The mounted background janitor uses a separate collector path and is not the target of this change. The SFS-968 follow-up adds per-object delete claims; this plan does not introduce that feature. SFS-967 must still prevent the known snapshot-registration race by excluding new snapshot registration for the lifetime of the existing CLI deletion lock.
 
@@ -81,7 +81,7 @@ First, add a bounded local query that classifies a supplied object-ID slice agai
 
 Expose the classification through `JanitorMetadataSession` while retaining the existing exclusive global lock lifecycle. Update the CLI pipeline to deduplicate IDs into bounded batches, request authoritative classification, and process only Eligible objects. A failed or incomplete classification aborts before any object-store delete in that batch. Preserve age checks, dry-run behavior, limits, and existing mounted janitor behavior.
 
-Add the shared transaction-level advisory lock at the beginning of snapshot registration, before reading the cut or inserting the `creating` row. Add tests for the three outcomes, failure-closed behavior, protection query coverage, and a live PostgreSQL concurrency scenario showing a snapshot registration transaction blocks while the CLI lock is held and can proceed after release. Update this ExecPlan with evidence and final validation.
+Rely on the existing exclusive transaction-level advisory lock in snapshot capture, before reading the cut or inserting the `creating` row. Add tests for the three outcomes, failure-closed behavior, protection query coverage, and a live PostgreSQL concurrency scenario showing a snapshot registration transaction blocks while the CLI lock is held and can proceed after release. Update this ExecPlan with evidence and final validation.
 
 ## Concrete Steps
 
@@ -113,3 +113,10 @@ No generated repository artifacts are expected. The focused test output and fina
 ## Interfaces and Dependencies
 
 Use existing workspace dependencies only. The metadata API should take a bounded slice of candidate `u64` object IDs and return a typed per-object eligibility representation with a pending deletion timestamp when applicable. Errors must remain typed or be converted into the existing janitor metadata error categories without rendering credentials. PostgreSQL classification must run under the existing command deadline and authoritative transaction, and snapshot registration must use the existing per-volume key from `pg_janitor_lock_key`.
+
+## Review follow-up (2026-11-09)
+
+- Removed the `pg_advisory_xact_lock_shared` call added to `create_snapshot_v2`: capture already takes the exclusive transaction lock on the same key, so the shared lock only added a shared-to-exclusive upgrade that deadlocks two concurrent captures.
+- Replaced the per-batch full scan of both regular-file chunk tables with one local reference read per cycle; per-batch work is now pending-marker point lookups plus bounded PostgreSQL queries. The janitor-only stub on the `MetaGc` port trait was removed.
+- Added a live PostgreSQL test in which a snapshot deletion runs while the CLI janitor checks a batch: the deleting snapshot with a live lease stays protected.
+- Added `concurrent_snapshot_creations_released_by_the_janitor_do_not_deadlock`: it failed with the shared lock restored (one capture aborted at the exclusive janitor lock) and passes with the fix. Validation: 5 live PostgreSQL janitor tests, the redb pending-marker test, 18 CLI janitor tests, clippy `-D warnings` and fmt for `studiofs-meta` and `studiofs`.

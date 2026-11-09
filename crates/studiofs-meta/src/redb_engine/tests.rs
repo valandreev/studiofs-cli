@@ -1599,34 +1599,21 @@ fn pending_deletions_limited_stops_at_limit() {
 }
 
 #[test]
-fn local_janitor_protection_reads_only_candidate_references_and_pending_markers() {
-    use crate::MetaGc;
-
+fn pending_deletions_for_reads_only_candidate_markers() {
     let engine = temp_engine();
-    let file = engine
-        .create_file(ROOT_INO, b"janitor-protected.bin", 1000, 1000, 0o644)
-        .expect("create file");
-    let mut attr = engine.get_attr(file.ino).expect("read file attributes");
-    attr.size = 4096;
-    attr.content_epoch = 1;
-    engine.set_attr(&attr).expect("set file attributes");
-    engine
-        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(90_001, 4096))
-        .expect("stage reachable payload");
     engine
         .add_pending_deletion(90_001, 100)
-        .expect("mark reachable object pending");
+        .expect("mark first candidate pending");
     engine
         .add_pending_deletion(90_002, 200)
-        .expect("mark candidate pending");
+        .expect("mark second candidate pending");
     engine
         .add_pending_deletion(90_003, 300)
         .expect("mark noncandidate pending");
 
-    let (referenced, pending) = engine
-        .get_local_janitor_protection(&[90_001, 90_002])
-        .expect("read bounded local protection");
-    assert_eq!(referenced, HashSet::from([90_001]));
+    let pending = engine
+        .get_pending_deletions_for(&[90_001, 90_002, 90_004])
+        .expect("read bounded pending markers");
     assert_eq!(pending, HashMap::from([(90_001, 100), (90_002, 200)]));
 }
 
