@@ -50,7 +50,8 @@ fn elapsed_ms(elapsed: Duration) -> u64 {
 /// Clock skew can date a pending deletion in the future; treat it as young
 /// instead of letting a negative age wrap to an arbitrarily old one.
 fn pending_deletion_is_old_enough(now_unix: i64, deleted_at_unix: i64, grace: Duration) -> bool {
-    u64::try_from(now_unix.saturating_sub(deleted_at_unix)).is_ok_and(|age| age >= grace.as_secs())
+    studiofs_data::janitor::pending_deletion_age(now_unix, deleted_at_unix, grace)
+        == studiofs_data::janitor::JanitorAge::Eligible
 }
 
 /// A `Retryable` finish releases the object-level reconciliation lease, so run
