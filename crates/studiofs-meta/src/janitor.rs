@@ -236,6 +236,14 @@ impl JanitorMetadataSession {
         }
     }
 
+    /// Prunes finished deletion fences below their payload namespace watermark.
+    ///
+    /// Runs under the held Janitor lock in bounded batches; returns the pruned row count.
+    pub fn prune_deletion_fences(&mut self) -> Result<u64, JanitorMetadataError> {
+        self.ensure_validated_cycle()?;
+        self.postgres.prune_object_deletion_fences()
+    }
+
     /// Requires the held lock and unchanged local state since `validate_protection`.
     fn ensure_validated_cycle(&self) -> Result<u64, JanitorMetadataError> {
         if !self.postgres.lock_is_held() {

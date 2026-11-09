@@ -12,7 +12,7 @@ use tokio_postgres::Client;
 const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
 
 /// Objects retained by live or leased snapshots; shared by mounted and CLI janitors.
-const SNAPSHOT_PIN_QUERY: &str = "SELECT DISTINCT reachability.object_id
+pub(super) const SNAPSHOT_PIN_QUERY: &str = "SELECT DISTINCT reachability.object_id
     FROM snapshot_object_reachability AS reachability
     JOIN snapshot_catalog AS catalog
       ON catalog.vol = reachability.vol
@@ -456,6 +456,47 @@ impl PgJanitorSession {
             )),
         }
     }
+
+    /// Deletes finished deletion fences below their payload namespace watermark,
+    /// in bounded batches, while this session holds the Janitor lock. Returns the
+    /// number of pruned rows. Registration and publication treat a row-less ID
+    /// below the watermark as fenced, so pruning keeps the deleted ID fenced.
+    pub(crate) fn prune_object_deletion_fences(&mut self) -> Result<u64, JanitorMetadataError> {
+        const BATCH_ROWS: i64 = 1_024;
+        const MAX_BATCHES: usize = 64;
+        let (Some(client), Some(runtime)) = (self.client.as_ref(), self.runtime.as_ref()) else {
+            return Err(JanitorMetadataError::UnsafeToDelete(
+                "PostgreSQL janitor lock is not held",
+            ));
+        };
+        // A leased or failed fence (owner or last_error set) is still being deleted.
+        let statement = format!(
+            "DELETE FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id IN (SELECT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND state IN ('delete_pending', 'deleted') AND reconcile_owner IS NULL AND last_error IS NULL AND {} ORDER BY object_id LIMIT $2 FOR UPDATE SKIP LOCKED)",
+            super::snapshot_reachability::below_payload_watermark("object_id"),
+        );
+        let mut pruned = 0_u64;
+        for _ in 0..MAX_BATCHES {
+            let rows = runtime
+                .block_on(async {
+                    tokio::time::timeout(
+                        self.command_timeout,
+                        client.execute(&statement, &[&self.volume_id, &BATCH_ROWS]),
+                    )
+                    .await
+                })
+                .map_err(|_| {
+                    JanitorMetadataError::BackendUnavailable(
+                        "PostgreSQL janitor fence prune timed out".to_owned(),
+                    )
+                })?
+                .map_err(|error| janitor_pg_error("janitor fence prune failed", error))?;
+            pruned += rows;
+            if rows < BATCH_ROWS as u64 {
+                break;
+            }
+        }
+        Ok(pruned)
+    }
 }
 
 pub(super) enum ObjectDeletionClaimError {
@@ -491,7 +532,8 @@ pub(super) async fn claim_object_deletion_in(
     .map_err(|error| Postgres("janitor claim publication fence failed", error))?
     .ok_or(ObjectDeletionClaimError::VolumeBindingMissing)?;
     tx.execute(
-        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at) VALUES ($1, $2, 'delete_pending', clock_timestamp()) ON CONFLICT (vol, object_id) DO NOTHING",
+        // The no-op update locks an existing row, so a concurrent fence prune skips it.
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at) VALUES ($1, $2, 'delete_pending', clock_timestamp()) ON CONFLICT (vol, object_id) DO UPDATE SET state = snapshot_payload_upload_objects.state",
         &[&volume_id, &object_id],
     )
     .await

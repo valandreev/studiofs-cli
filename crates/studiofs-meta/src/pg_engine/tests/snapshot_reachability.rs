@@ -239,6 +239,176 @@ fn mounted_deletion_claim_fences_untracked_objects_against_late_replay() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pruned_deletion_fences_stay_fenced_below_the_payload_watermark() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-reachability-fence-prune");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    seed_local(&db_path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open postgres engine");
+    let volume_id = volume.volume_id;
+    let sql = |statement: String| {
+        let dsn = dsn.clone();
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            client
+                .execute(&statement, &[&volume_id])
+                .await
+                .expect("run fixture statement");
+            connection_task.abort();
+            Ok::<_, MetaError>(())
+        })
+        .expect("run fixture statement");
+    };
+    let state = |object_id: u64| -> Option<String> {
+        let dsn = dsn.clone();
+        let object_id = object_id as i64;
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            let row = client
+                .query_opt(
+                    "SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2",
+                    &[&volume_id, &object_id],
+                )
+                .await
+                .expect("read ledger row");
+            connection_task.abort();
+            Ok::<_, MetaError>(row.map(|row| row.get(0)))
+        })
+        .expect("read ledger row")
+    };
+    let replay_upload = |object_id: u64| {
+        let entry = UploadedFragmentLedgerEntry {
+            volume_id,
+            object_id,
+            fragment_index: 0,
+            object_key: format!("objects/{object_id}/0"),
+            expected_byte_length: 1,
+            expected_sha256: [7; 32],
+        };
+        engine
+            .begin_fragment_uploads(std::slice::from_ref(&entry))
+            .expect("late upload registration");
+        engine.flush_metadata().expect("replay upload ledger");
+    };
+    let publication_rejected = |object_id: u64| {
+        run_async(async {
+            let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            let tx = client.transaction().await.expect("start publication");
+            let result =
+                apply_object_lifetime_changes(&tx, volume_id, 1, &[publish_event(7, object_id)])
+                    .await;
+            tx.rollback().await.expect("rollback publication");
+            connection_task.abort();
+            Ok::<_, MetaError>(result.is_err())
+        })
+        .expect("attempt publication")
+    };
+    // Payload namespace 5: object ID = 5 << 39 | counter.
+    let id = |counter: u64| (5_u64 << 39) | counter;
+    let (finished, deleted, failed, leased, uploading, referenced, above) =
+        (id(10), id(12), id(14), id(16), id(18), id(20), id(30));
+    let legacy = 77_u64;
+    sql(format!(
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at, last_error, reconcile_owner) VALUES \
+         ($1, {finished}, 'delete_pending', now(), NULL, NULL), ($1, {deleted}, 'deleted', now(), NULL, NULL), \
+         ($1, {failed}, 'delete_pending', now(), 'retry', NULL), ($1, {leased}, 'delete_pending', now(), NULL, 'janitor'), \
+         ($1, {uploading}, 'uploading', NULL, NULL, NULL), ($1, {above}, 'delete_pending', now(), NULL, NULL), \
+         ($1, {legacy}, 'delete_pending', now(), NULL, NULL)"
+    ));
+    sql(format!(
+        "INSERT INTO snapshot_current_references (vol, ino, object_id) VALUES ($1, 8, {referenced})"
+    ));
+
+    let mut janitor = crate::pg_engine::PgJanitorSession::new(dsn.clone(), volume_id);
+    assert!(
+        janitor
+            .try_acquire_global_janitor_lock()
+            .expect("janitor lock")
+    );
+    assert_eq!(
+        janitor
+            .prune_object_deletion_fences()
+            .expect("prune without watermark"),
+        0,
+        "no fence is pruned before its namespace reports a watermark"
+    );
+    sql("INSERT INTO snapshot_payload_upload_watermarks (vol, payload_namespace, acked_through) VALUES ($1, 5, 25)".to_owned());
+    // Lowering or deleting the watermark would unfence pruned IDs.
+    for statement in [
+        "UPDATE snapshot_payload_upload_watermarks SET acked_through = 24 WHERE vol = $1",
+        "DELETE FROM snapshot_payload_upload_watermarks WHERE vol = $1",
+    ] {
+        let error = run_async(async {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            let result = client.execute(statement, &[&volume_id]).await;
+            connection_task.abort();
+            Ok::<_, MetaError>(result)
+        })
+        .expect("attempt watermark regression")
+        .expect_err("a watermark must never move backwards");
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION),
+            "{statement}"
+        );
+    }
+    assert_eq!(janitor.prune_object_deletion_fences().expect("prune"), 2);
+    assert_eq!(state(finished), None);
+    assert_eq!(state(deleted), None);
+    // Unfinished, leased, live, above-watermark, and legacy rows stay.
+    assert_eq!(state(failed).as_deref(), Some("delete_pending"));
+    assert_eq!(state(leased).as_deref(), Some("delete_pending"));
+    assert_eq!(state(uploading).as_deref(), Some("uploading"));
+    assert_eq!(state(above).as_deref(), Some("delete_pending"));
+    assert_eq!(state(legacy).as_deref(), Some("delete_pending"));
+
+    // After pruning, publishing the deleted ID without a ledger row is rejected.
+    assert!(publication_rejected(finished));
+    // A late ledger replay re-creates the fence instead of reopening publication.
+    replay_upload(finished);
+    assert_eq!(state(finished).as_deref(), Some("delete_pending"));
+    assert!(publication_rejected(finished));
+    assert_eq!(janitor.prune_object_deletion_fences().expect("re-prune"), 1);
+    janitor
+        .release_global_janitor_lock()
+        .expect("release janitor lock");
+
+    // Live IDs are unaffected: a currently referenced row-less ID below the
+    // watermark and fresh IDs above it still publish and register normally.
+    assert!(!publication_rejected(referenced));
+    assert!(!publication_rejected(id(40)));
+    replay_upload(id(41));
+    assert_eq!(state(id(41)).as_deref(), Some("uploading"));
+
+    // The delete guard still lets the volume's own cascade remove its watermark.
+    drop(engine);
+    sql("DELETE FROM volumes WHERE vol = $1".to_owned());
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn published_batch_derives_exact_before_and_after_references() {
     let Some(dsn) = pg_dsn() else {
         return;
