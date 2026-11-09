@@ -9,6 +9,34 @@ use std::path::Path;
 /// Maximum number of candidates accepted by one authoritative janitor query.
 pub const MAX_JANITOR_ELIGIBILITY_BATCH: usize = 64;
 
+/// Durable provider-independent position for one CLI orphan scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JanitorSweepCheckpoint {
+    /// Last listed key; pending object state retains unfinished canonical groups.
+    pub after_key: Option<String>,
+    /// Object whose listed keys are still being collected across bounded runs.
+    pub pending_object_id: Option<u64>,
+    /// Last canonical key observed for the pending object.
+    pub pending_key: Option<String>,
+    /// Next deterministic hexadecimal prefix when start-after is unavailable.
+    pub next_prefix: String,
+}
+
+/// Storage identity the persisted orphan scan belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JanitorSweepScope<'a> {
+    /// Stable UUID from volume format metadata.
+    pub volume_uuid: &'a str,
+    /// Configured object storage endpoint.
+    pub endpoint: &'a str,
+    /// Configured bucket.
+    pub bucket: &'a str,
+    /// Normalized data key prefix.
+    pub data_prefix: &'a str,
+    /// Versioned provider-neutral listing strategy.
+    pub listing_strategy: &'a str,
+}
+
 /// A categorized error from the standalone janitor's read-only metadata gate.
 #[derive(Debug, thiserror::Error)]
 pub enum JanitorMetadataError {
@@ -89,6 +117,35 @@ impl JanitorMetadataSession {
     /// The locally persisted format information used to configure object access.
     pub fn format_info(&self) -> &crate::FormatInfo {
         &self.format_info
+    }
+
+    /// Loads the versioned scan state after validating volume protection.
+    pub fn load_sweep_checkpoint(
+        &mut self,
+        scope: JanitorSweepScope<'_>,
+        persist_initial: bool,
+    ) -> Result<JanitorSweepCheckpoint, JanitorMetadataError> {
+        self.ensure_validated_cycle()?;
+        self.postgres.load_sweep_checkpoint(scope, persist_initial)
+    }
+
+    /// Persists a completely processed scan boundary under the held volume lock.
+    pub fn save_sweep_checkpoint(
+        &mut self,
+        scope: JanitorSweepScope<'_>,
+        checkpoint: &JanitorSweepCheckpoint,
+    ) -> Result<(), JanitorMetadataError> {
+        self.ensure_validated_cycle()?;
+        self.postgres.save_sweep_checkpoint(scope, checkpoint)
+    }
+
+    /// Clears the saved scan position after validating its version under the held volume lock.
+    pub fn reset_sweep_checkpoint(
+        &mut self,
+        scope: JanitorSweepScope<'_>,
+    ) -> Result<(), JanitorMetadataError> {
+        self.ensure_validated_cycle()?;
+        self.postgres.reset_sweep_checkpoint(scope)
     }
 
     /// Acquires the per-volume PostgreSQL janitor lock when metadata is shared.

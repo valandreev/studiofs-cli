@@ -40,3 +40,15 @@ For a real volume, a non-deleting measurement can be started with `studiofs jani
 ## Reading a live run
 
 The command prints phase-start messages before blocking metadata, lock, protection, and listing operations, then completion durations when each phase returns. The listing also prints `first_entry` once the first page delivers an entry; OpenDAL exposes no per-page boundaries through this API. `cycle_ms` includes lock acquisition, protection metadata reads, object work, and lock release. `object_work_ms` and HEAD/DELETE durations are nested measurements and must not be added together as independent wall time.
+
+## Resuming bounded scans
+
+The CLI persists scan progress in PostgreSQL under its per-volume janitor lock. Repeated `studiofs janitor <volume> --max-scan-entries 10000` invocations continue the prior scan. Output includes the next scan position and whether coverage completed; reaching the end wraps to the beginning so newly inserted keys behind the cursor are revisited.
+
+S3 operators advertising `start_after` resume after the last listed key. An unfinished object group is retained in the checkpoint and all its canonical keys are statted again before deciding age. Other operators use deterministic hexadecimal prefix subdivision; a dense prefix is split down to one object ID, then its bounded canonical key set is statted before advancing. Entry budgets count listing entries, while age probes retain their separate bounded operation deadlines.
+
+`--full-scan` ignores the saved position for the first cycle and saves new progress if bounded. `--reset-scan` clears the saved position before that first cycle. These flags conflict; with `--loop` they apply once, and subsequent cycles resume. `--dry-run` reads progress and applies either flag only in memory: it never saves or resets checkpoints.
+
+Checkpoints bind the volume UUID, endpoint, bucket, normalized data prefix, and listing strategy. A supported scope change starts at the beginning. Missing tables, malformed state, and unknown checkpoint versions fail closed; an older binary cannot reset or overwrite a newer version.
+
+Schema deployment must include the repeatable canonical DDL in `studiofs-meta/src/pg_engine/schema.rs`, including `snapshot_payload_sweep_checkpoints`, before running the command. The CLI performs no runtime DDL. Coordinate this schema ensure step with the shared schema rollout; do not introduce a second migration runner. The checkpoint schema version is independent of the volume format version.
