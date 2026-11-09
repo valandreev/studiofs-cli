@@ -216,6 +216,40 @@ cargo test -p studiofs-vfs shutdown_result_reports_local_payload_sync_failure --
 cargo test -p studiofs-vfs shutdown_replay_preserves_typed_error_for_owner_and_waiter -- --nocapture
 ```
 
+### SFS-978 adversarial CLI Janitor safety
+
+Run the deterministic writer/claim and server-applied DELETE response-loss
+regressions without external services:
+
+```sh
+cargo test -p studiofs --bin studiofs sfs978_ -- --nocapture
+```
+
+The disposable acceptance tests start their own PostgreSQL 18/RustFS Compose
+project using `docker/compose.e2e.yml`, fresh named volumes and allocated loopback
+ports. They never select credentials or endpoints from `.env`. Build the actual
+CLI first, then run the focused selection serially (the same commands work in
+PowerShell):
+
+```sh
+cargo build -p studiofs --bin studiofs
+cargo test -p studiofs --bin studiofs live_cli_disposable_ -- --ignored --nocapture --test-threads=1
+```
+
+Docker Compose must be available and able to pull/start the repository's images.
+An unavailable Docker daemon is a failure, not a skipped pass. Per-run diagnostics
+are retained under `target/janitor-adversarial/`; teardown removes only that
+run's containers and named volumes. These tests mutate only their disposable
+stack. Existing opt-in provider verification remains separately selectable with
+`sfs973_live_s3_resumable_listing_covers_every_object`; it requires explicitly
+configured test resources and is not run by the disposable selection.
+
+The deterministic writer interleaving uses test metadata, and process acceptance
+seeds PostgreSQL ownership rows. Neither substitutes for a live mounted writer
+or Windows signal-delivery acceptance. See the living
+[SFS-978 plan](exec-plans/SFS-978-adversarial-janitor.md) for exact verified
+coverage and outstanding platform gates.
+
 ### SFS-971 CLI Janitor Budget Regressions
 
 Run these focused checks when changing CLI janitor admission, the delete cap,
