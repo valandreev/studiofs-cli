@@ -112,11 +112,26 @@ On Windows, use a free drive letter (for example `Z:`) instead of a folder path.
 
 ## 5. Clean Up Old Objects (Janitor)
 
+The standalone janitor requires PostgreSQL-backed metadata and a synchronized
+local metadata database. It validates the volume UUID and storage endpoint,
+bucket, and prefix against PostgreSQL's published format information, checks
+snapshot reachability and local sync/recovery state, and holds the per-volume
+janitor lock during each scan. A mount is not required.
+
+If the binding or protection state is missing or uncertain, the command stops
+with `unsafe_to_delete`; unavailable metadata reports `backend_unavailable`,
+and a competing janitor reports `lock_busy`. Resolve the reported prerequisite
+before retrying. The janitor does not bootstrap, replay, repair, or backfill
+metadata, and offers no safety bypass.
+
 See which objects are no longer used (dry-run):
 
 ```bash
 studiofs janitor myvolume --dry-run
 ```
+
+Dry-run performs the same validation and reports candidates without modifying
+metadata or deleting objects. It also requires complete protection state.
 
 Run actual cleanup (delete up to 500 old objects):
 

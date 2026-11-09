@@ -490,6 +490,7 @@ mod event_log_pruning;
 mod inode_allocator;
 #[path = "pg_engine/janitor.rs"]
 mod janitor;
+pub(crate) use janitor::PgJanitorSession;
 #[path = "pg_engine/lifecycle.rs"]
 mod lifecycle;
 #[path = "pg_engine/local_state.rs"]

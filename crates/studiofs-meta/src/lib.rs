@@ -58,6 +58,7 @@ pub use engine::{
     PgSyncPageDiagnostics, PgSyncStatus, PgSyncWriteAuthorityReason, RegularFileOverlayMutation,
 };
 pub use events::MetaEvent;
+pub use janitor::{JanitorMetadataError, JanitorMetadataSession, JanitorProtection};
 pub use pg_dsn::{
     STUDIOFS_METADATA_DB, StudioPgDsns, ensure_studiofs_database, resolve_studiofs_pg_dsns,
 };
