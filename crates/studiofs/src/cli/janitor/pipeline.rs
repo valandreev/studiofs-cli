@@ -1,6 +1,5 @@
 //! Provider-neutral standalone janitor cycle.
 
-use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -15,6 +14,13 @@ const DELETE_KEY_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_millis(200)
 } else {
     Duration::from_secs(20)
+};
+/// Bound for one listing step; a stalled page fails the cycle. Finished
+/// deletions are already confirmed in PostgreSQL, so no completed work is lost.
+const LIST_PAGE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(60)
 };
 const _: () = assert!(
     (studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64 + 1) * 20 < 60,
@@ -37,7 +43,8 @@ pub(super) struct JanitorStats {
     pub(super) claim_finishes: u64,
     pub(super) initial_listing_elapsed: Duration,
     pub(super) initial_listing_entries: u64,
-    pub(super) peak_listing_entries: u64,
+    pub(super) first_listing_entry: Option<Duration>,
+    pub(super) peak_buffered_candidates: u64,
     pub(super) time_to_first_candidate: Option<Duration>,
     pub(super) cycle_elapsed: Duration,
     pub(super) head_requests: u64,
@@ -55,8 +62,13 @@ pub(super) struct JanitorCycleContext<'a, S> {
     pub(super) metadata: &'a mut dyn super::JanitorMetadataSource,
 }
 
+pub(super) trait JanitorListing {
+    async fn next_entry(&mut self) -> anyhow::Result<Option<JanitorEntry>>;
+}
+
 pub(super) trait JanitorObjectStore {
-    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<JanitorEntry>>;
+    type Listing: JanitorListing;
+    async fn list(&self, prefix: &str) -> anyhow::Result<Self::Listing>;
     async fn last_modified(&self, key: &str) -> anyhow::Result<Option<SystemTime>>;
     async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError>;
 }
@@ -71,7 +83,7 @@ struct Candidate {
 fn discover_object(
     entry: JanitorEntry,
     prefix: &str,
-    seen_objects: &mut HashSet<u64>,
+    last_object: &mut Option<u64>,
     stats: &mut JanitorStats,
 ) -> Option<Candidate> {
     if !entry.is_file {
@@ -82,7 +94,13 @@ fn discover_object(
         stats.skipped_non_canonical = stats.skipped_non_canonical.saturating_add(1);
         return None;
     };
-    seen_objects.insert(object_id).then_some(Candidate {
+    // ponytail: dedupe only adjacent keys of one object, relying on S3's lexicographic
+    // listing order; an unordered provider re-checks an object, which stays safe
+    // because claims and NotFound deletes are idempotent.
+    if last_object.replace(object_id) == Some(object_id) {
+        return None;
+    }
+    Some(Candidate {
         object_id,
         path: entry.key,
         delete_keys,
@@ -213,7 +231,7 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
 ) -> anyhow::Result<JanitorStats> {
     let mut stats = JanitorStats::default();
     let cycle_started = Instant::now();
-    let mut seen_objects = HashSet::new();
+    let mut last_object = None;
     let now = SystemTime::now();
     let now_unix = i64::try_from(
         now.duration_since(UNIX_EPOCH)
@@ -224,27 +242,42 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
 
     eprintln!("janitor phase=initial_listing started");
     let listing_started = Instant::now();
-    let entries = ctx
+    let mut listing = ctx
         .store
         .list(ctx.prefix)
         .await
         .context("failed to list janitor objects")?;
     stats.initial_listing_elapsed = listing_started.elapsed();
-    stats.initial_listing_entries = u64::try_from(entries.len()).unwrap_or(u64::MAX);
-    stats.peak_listing_entries = stats.initial_listing_entries;
-    eprintln!(
-        "janitor phase=initial_listing completed duration_ms={} entries={}",
-        super::duration_ms(stats.initial_listing_elapsed),
-        stats.initial_listing_entries
-    );
 
+    // Entries are consumed as pages arrive; memory holds one page plus one batch.
     let mut candidates = Vec::with_capacity(MAX_JANITOR_ELIGIBILITY_BATCH);
-    for entry in entries {
-        let Some(candidate) = discover_object(entry, ctx.prefix, &mut seen_objects, &mut stats)
+    loop {
+        let wait_started = Instant::now();
+        let entry = tokio::time::timeout(LIST_PAGE_TIMEOUT, listing.next_entry())
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("listing page timed out")))
+            .context("failed to list janitor objects")?;
+        stats.initial_listing_elapsed += wait_started.elapsed();
+        let Some(entry) = entry else {
+            break;
+        };
+        if stats.first_listing_entry.is_none() {
+            let elapsed = cycle_started.elapsed();
+            stats.first_listing_entry = Some(elapsed);
+            eprintln!(
+                "janitor phase=initial_listing first_entry duration_ms={}",
+                super::duration_ms(elapsed)
+            );
+        }
+        stats.initial_listing_entries = stats.initial_listing_entries.saturating_add(1);
+        let Some(candidate) = discover_object(entry, ctx.prefix, &mut last_object, &mut stats)
         else {
             continue;
         };
         candidates.push(candidate);
+        stats.peak_buffered_candidates = stats
+            .peak_buffered_candidates
+            .max(u64::try_from(candidates.len()).unwrap_or(u64::MAX));
         if candidates.len() == MAX_JANITOR_ELIGIBILITY_BATCH {
             process_candidate_batch(
                 &mut ctx,
@@ -257,6 +290,11 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
             .await?;
         }
     }
+    eprintln!(
+        "janitor phase=initial_listing completed duration_ms={} entries={}",
+        super::duration_ms(stats.initial_listing_elapsed),
+        stats.initial_listing_entries
+    );
     if !candidates.is_empty() {
         process_candidate_batch(
             &mut ctx,

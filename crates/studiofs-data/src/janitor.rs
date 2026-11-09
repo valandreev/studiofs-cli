@@ -1,5 +1,6 @@
 //! OpenDAL operations used by the standalone janitor.
 
+use futures::TryStreamExt as _;
 use opendal::services::S3;
 use opendal::{EntryMode, ErrorKind, Operator, Result};
 
@@ -52,19 +53,11 @@ impl JanitorObjectStore {
         Ok(Self::new(operator))
     }
 
-    /// Eagerly list keys below `prefix`, preserving the CLI's current listing behavior.
-    pub async fn list(&self, prefix: &str) -> Result<Vec<JanitorEntry>> {
-        Ok(self
-            .operator
-            .list_with(prefix)
-            .recursive(true)
-            .await?
-            .into_iter()
-            .map(|entry| JanitorEntry {
-                key: entry.path().to_string(),
-                is_file: entry.metadata().mode() == EntryMode::FILE,
-            })
-            .collect())
+    /// Start a lazy recursive listing below `prefix`; pages are fetched on demand.
+    pub async fn list(&self, prefix: &str) -> Result<JanitorLister> {
+        Ok(JanitorLister(
+            self.operator.lister_with(prefix).recursive(true).await?,
+        ))
     }
 
     /// Return the remote object's last-modified time when the provider supplies one.
@@ -86,6 +79,19 @@ impl JanitorObjectStore {
                 JanitorDeleteError::Other(error.to_string())
             }
         })
+    }
+}
+
+/// Streaming listing that holds at most one provider page in memory.
+pub struct JanitorLister(opendal::Lister);
+
+impl JanitorLister {
+    /// Return the next listed entry, `None` once the listing is exhausted.
+    pub async fn next(&mut self) -> Result<Option<JanitorEntry>> {
+        Ok(self.0.try_next().await?.map(|entry| JanitorEntry {
+            key: entry.path().to_string(),
+            is_file: entry.metadata().mode() == EntryMode::FILE,
+        }))
     }
 }
 

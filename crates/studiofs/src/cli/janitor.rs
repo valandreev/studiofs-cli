@@ -12,13 +12,21 @@ use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
 use studiofs_meta::{JanitorMetadataSession, JanitorProtection};
 mod pipeline;
-use pipeline::{JanitorCycleContext, JanitorObjectStore, run_one_cycle};
-use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry};
+use pipeline::{JanitorCycleContext, JanitorListing, JanitorObjectStore, run_one_cycle};
+use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry, JanitorLister};
 
 struct OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore);
 
+impl JanitorListing for JanitorLister {
+    async fn next_entry(&mut self) -> anyhow::Result<Option<JanitorEntry>> {
+        Ok(self.next().await?)
+    }
+}
+
 impl JanitorObjectStore for OpenDalJanitorStore {
-    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<JanitorEntry>> {
+    type Listing = JanitorLister;
+
+    async fn list(&self, prefix: &str) -> anyhow::Result<JanitorLister> {
         Ok(self.0.list(prefix).await?)
     }
 
@@ -486,10 +494,15 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             duration_ms(cycle_elapsed),
         );
         println!(
-            "  janitor counts: listed_entries={} peak_listing_entries={} scanned={} first_candidate_ms={} opendal_head_calls={} opendal_delete_calls={} list_pages=unavailable claims={} claim_protected={} claim_finish={} skipped_non_canonical={}",
+            "  janitor counts: listed_entries={} peak_buffered_candidates={} scanned={} first_entry_ms={} first_candidate_ms={} opendal_head_calls={} opendal_delete_calls={} list_pages=unavailable claims={} claim_protected={} claim_finish={} skipped_non_canonical={}",
             stats.initial_listing_entries,
-            stats.peak_listing_entries,
+            stats.peak_buffered_candidates,
             stats.scanned_files,
+            stats
+                .first_listing_entry
+                .map(duration_ms)
+                .map(|ms| ms.to_string())
+                .unwrap_or_else(|| "unavailable".to_string()),
             stats
                 .time_to_first_candidate
                 .map(duration_ms)
@@ -532,6 +545,10 @@ mod tests {
         list_requests: AtomicU64,
         head_requests: AtomicU64,
         fail_list: bool,
+        /// Fail the listing after yielding this many entries.
+        fail_list_after: Option<usize>,
+        /// Stall the listing after yielding every entry.
+        hang_list: bool,
         fail_head: bool,
         head_missing: bool,
         head_young: bool,
@@ -540,13 +557,41 @@ mod tests {
         hang_delete: bool,
     }
 
+    struct FakeListing {
+        entries: std::vec::IntoIter<JanitorEntry>,
+        fail_after: Option<usize>,
+        hang: bool,
+        yielded: usize,
+    }
+
+    impl JanitorListing for FakeListing {
+        async fn next_entry(&mut self) -> anyhow::Result<Option<JanitorEntry>> {
+            if self.fail_after == Some(self.yielded) {
+                anyhow::bail!("list page failed")
+            }
+            let entry = self.entries.next();
+            if entry.is_none() && self.hang {
+                std::future::pending::<()>().await;
+            }
+            self.yielded += 1;
+            Ok(entry)
+        }
+    }
+
     impl JanitorObjectStore for FakeJanitorStore {
-        async fn list(&self, _prefix: &str) -> anyhow::Result<Vec<JanitorEntry>> {
+        type Listing = FakeListing;
+
+        async fn list(&self, _prefix: &str) -> anyhow::Result<FakeListing> {
             self.list_requests.fetch_add(1, Ordering::Relaxed);
             if self.fail_list {
                 anyhow::bail!("list failed")
             }
-            Ok(self.entries.clone())
+            Ok(FakeListing {
+                entries: self.entries.clone().into_iter(),
+                fail_after: self.fail_list_after,
+                hang: self.hang_list,
+                yielded: 0,
+            })
         }
 
         async fn last_modified(&self, _key: &str) -> anyhow::Result<Option<SystemTime>> {
@@ -1066,6 +1111,43 @@ mod tests {
         drop(metadata_runtime);
     }
 
+    fn one_fragment_per_object(count: u64) -> Vec<JanitorEntry> {
+        (1..=count)
+            .flat_map(|id| studiofs_data::object::format_object_fragment_keys("test/objects/", id))
+            .map(|key| JanitorEntry { key, is_file: true })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failing_or_stalled_listing_page_stops_cycle_after_completed_batches() {
+        let batch = MAX_JANITOR_ELIGIBILITY_BATCH as u64;
+        let failing = FakeJanitorStore {
+            entries: one_fragment_per_object(batch + 6),
+            fail_list_after: Some(MAX_JANITOR_ELIGIBILITY_BATCH + 3),
+            ..FakeJanitorStore::default()
+        };
+        let stalled = FakeJanitorStore {
+            entries: one_fragment_per_object(batch + 6),
+            hang_list: true,
+            ..FakeJanitorStore::default()
+        };
+        for store in [failing, stalled] {
+            let mut metadata = FakeJanitorMetadata::eligible();
+            let mut ctx = fake_cycle_context(&store, &mut metadata);
+            ctx.max_deletes = u64::MAX;
+            let error = run_one_cycle(ctx).await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("failed to list janitor objects"),
+                "{error:#}"
+            );
+            // The batch completed before the failing page stays deleted and finished;
+            // the partially buffered batch is never acted on.
+            let finished: Vec<u64> = metadata.finishes.iter().map(|(id, ..)| *id).collect();
+            assert_eq!(finished, (1..=batch).collect::<Vec<_>>());
+            assert_eq!(metadata.eligibility_reads.len(), 1);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fake_store_failures_skip_deletion_and_not_found_fragments_are_tolerated() {
         let entries = studiofs_data::object::format_object_fragment_keys("test/objects/", 4)
@@ -1265,13 +1347,17 @@ mod tests {
                 let first_line = request.lines().next().unwrap_or_default();
                 let (status, body, extra_headers) = if first_line.starts_with("GET ") {
                     fake.list_requests.fetch_add(1, Ordering::Relaxed);
-                    let page = if first_line.contains("continuation-token=page3") {
-                        2
-                    } else if first_line.contains("continuation-token=page2") {
-                        1
-                    } else {
-                        0
-                    };
+                    // Token `pageN` requests the N-th (1-based) page.
+                    let page = first_line
+                        .split("continuation-token=page")
+                        .nth(1)
+                        .and_then(|rest| {
+                            rest.split(|c: char| !c.is_ascii_digit())
+                                .next()?
+                                .parse::<u64>()
+                                .ok()
+                        })
+                        .map_or(0, |page| page - 1);
                     let start = page * 1000 + 1;
                     let end = (start + 1000).min(fake.object_count + 1);
                     let contents = (start..end)
@@ -1418,8 +1504,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn janitor_eager_listing_baseline_reads_all_pages_before_low_delete_cap() {
-        let (op, fake, _endpoint, server) = fake_s3_operator(2505).await;
+    async fn janitor_streaming_listing_processes_first_page_before_later_pages() {
+        let (op, fake, _endpoint, server) = fake_s3_operator(20_005).await;
         let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::new(op));
         let mut metadata = FakeJanitorMetadata::eligible();
         let stats = tokio::time::timeout(
@@ -1439,17 +1525,23 @@ mod tests {
         let _ = server.await;
         let stats = stats.unwrap();
 
-        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 3);
+        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 21);
+        // The first HEAD is issued while only the first of 21 pages has been fetched.
         assert_eq!(
             fake.list_requests_before_first_head.load(Ordering::Relaxed),
-            3
+            1
         );
-        assert_eq!(stats.scanned_files, 2505);
-        assert_eq!(stats.orphan_candidates, 2505);
+        assert_eq!(stats.scanned_files, 20_005);
+        assert_eq!(stats.orphan_candidates, 20_005);
         assert_eq!(stats.deleted, 2);
-        assert_eq!(stats.skipped_cap, 2503);
-        assert_eq!(stats.initial_listing_entries, 2505);
-        assert_eq!(stats.peak_listing_entries, 2505);
+        assert_eq!(stats.skipped_cap, 20_003);
+        assert_eq!(stats.initial_listing_entries, 20_005);
+        // Buffered candidates stay at one eligibility batch regardless of key count.
+        assert_eq!(
+            stats.peak_buffered_candidates,
+            MAX_JANITOR_ELIGIBILITY_BATCH as u64
+        );
+        assert!(stats.first_listing_entry.is_some());
         assert!(stats.time_to_first_candidate.is_some());
         assert_eq!(stats.head_requests, 2);
         assert_eq!(fake.head_requests.load(Ordering::Relaxed), 2);
@@ -1461,10 +1553,10 @@ mod tests {
             2 * keys_per_object
         );
         println!(
-            "janitor baseline: pages={} listed={} peak={} first_candidate_ms={} head_calls={} delete_calls={} object_work_ms={}",
+            "janitor streaming: pages={} listed={} peak_buffered={} first_candidate_ms={} head_calls={} delete_calls={} object_work_ms={}",
             fake.list_requests.load(Ordering::Relaxed),
             stats.initial_listing_entries,
-            stats.peak_listing_entries,
+            stats.peak_buffered_candidates,
             duration_ms(stats.time_to_first_candidate.unwrap()),
             stats.head_requests,
             stats.delete_requests,
