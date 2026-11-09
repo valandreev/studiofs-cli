@@ -12,7 +12,7 @@ use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
 use studiofs_meta::{JanitorMetadataSession, JanitorProtection};
 mod pipeline;
-use pipeline::{JanitorCycleContext, JanitorListing, JanitorObjectStore, run_one_cycle};
+use pipeline::{JanitorCycleContext, JanitorListing, JanitorObjectStore, RunBudget, run_one_cycle};
 use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry, JanitorLister};
 
 struct OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore);
@@ -46,6 +46,8 @@ struct JanitorOptions {
     interval_minutes: u64,
     skip_newer_minutes: u64,
     max_deletes: u64,
+    max_scan_entries: Option<u64>,
+    max_runtime_minutes: Option<u64>,
 }
 
 struct JanitorRunRequest {
@@ -136,6 +138,8 @@ impl JanitorRunRequest {
                 interval_minutes: args.interval_minutes,
                 skip_newer_minutes: args.skip_newer_minutes,
                 max_deletes: args.max_deletes,
+                max_scan_entries: args.max_scan_entries,
+                max_runtime_minutes: args.max_runtime_minutes,
             },
         })
     }
@@ -173,9 +177,17 @@ pub(crate) struct JanitorArgs {
     #[arg(long, default_value_t = 15)]
     skip_newer_minutes: u64,
 
-    /// Maximum objects to delete per cycle
-    #[arg(long, default_value_t = 500)]
+    /// Stop a cycle after this many successful deletions; the rest of the bucket is not listed
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(1..))]
     max_deletes: u64,
+
+    /// Stop listing a cycle after this many entries and report it as partial
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    max_scan_entries: Option<u64>,
+
+    /// Stop admitting new work after this many minutes per cycle and report it as partial
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    max_runtime_minutes: Option<u64>,
 }
 
 impl JanitorArgs {
@@ -356,6 +368,8 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         interval_minutes,
         skip_newer_minutes,
         max_deletes,
+        max_scan_entries,
+        max_runtime_minutes,
     } = options;
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
@@ -454,7 +468,12 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 prefix: &prefix,
                 dry_run,
                 skip_newer_than_secs: skip_secs,
-                max_deletes: max_deletes.max(1),
+                budget: RunBudget {
+                    max_deletes,
+                    max_listed_entries: max_scan_entries,
+                    max_runtime: max_runtime_minutes
+                        .map(|minutes| Duration::from_secs(minutes.saturating_mul(60))),
+                },
                 metadata,
             }))?;
             let fences_pruned = if dry_run {
@@ -474,7 +493,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         println!("  orphan candidates:    {}", stats.orphan_candidates);
         println!("  skipped young:        {}", stats.skipped_young);
         println!("  skipped unknown age:  {}", stats.skipped_unknown_age);
-        println!("  skipped by cap:       {}", stats.skipped_cap);
+        println!("  outcome:              {}", stats.outcome.label());
         println!(
             "  {}: {}",
             if dry_run { "would delete" } else { "deleted" },
@@ -762,7 +781,7 @@ mod tests {
                     prefix: "test/objects/",
                     dry_run: false,
                     skip_newer_than_secs: 0,
-                    max_deletes: 1,
+                    budget: RunBudget::deletes(1),
                     metadata,
                 }))
             });
@@ -796,7 +815,7 @@ mod tests {
                 prefix: "test/objects/",
                 dry_run: false,
                 skip_newer_than_secs: 0,
-                max_deletes: 1,
+                budget: RunBudget::deletes(1),
                 metadata,
             }))
         })
@@ -821,7 +840,7 @@ mod tests {
                 prefix: "test/objects/",
                 dry_run: true,
                 skip_newer_than_secs: 0,
-                max_deletes: 1,
+                budget: RunBudget::deletes(1),
                 metadata,
             }))
         })
@@ -844,7 +863,7 @@ mod tests {
             prefix: "test/objects/",
             dry_run: false,
             skip_newer_than_secs: 60,
-            max_deletes: 1,
+            budget: RunBudget::deletes(1),
             metadata,
         }
     }
@@ -877,7 +896,7 @@ mod tests {
             prefix: "test/objects/",
             dry_run: false,
             skip_newer_than_secs: 60,
-            max_deletes: 1,
+            budget: RunBudget::deletes(1),
             metadata: &mut metadata,
         })
         .await
@@ -1061,7 +1080,7 @@ mod tests {
             prefix: "test/objects/",
             dry_run: true,
             skip_newer_than_secs: 0,
-            max_deletes: 1,
+            budget: RunBudget::deletes(u64::MAX),
             metadata: &mut metadata,
         })
         .await
@@ -1138,7 +1157,7 @@ mod tests {
         for store in [failing, stalled] {
             let mut metadata = FakeJanitorMetadata::eligible();
             let mut ctx = fake_cycle_context(&store, &mut metadata);
-            ctx.max_deletes = u64::MAX;
+            ctx.budget.max_deletes = u64::MAX;
             let error = run_one_cycle(ctx).await.unwrap_err();
             assert!(
                 format!("{error:#}").contains("failed to list janitor objects"),
@@ -1314,9 +1333,104 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stats.deleted, 1);
-        assert_eq!(stats.skipped_cap, 2);
+        assert_eq!(stats.outcome, pipeline::CycleOutcome::DeleteCapReached);
         assert_eq!(stats.head_requests, 1);
         assert_eq!(*store.deleted.lock().unwrap(), canonical_keys(9));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_cap_counts_only_confirmed_successes_and_stops_listing() {
+        // Object 1 is claim-protected, 2 is referenced: neither consumes the cap.
+        let store = FakeJanitorStore {
+            entries: fragment_entries(MAX_JANITOR_ELIGIBILITY_BATCH as u64 * 3),
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata {
+            claim_protected: vec![1],
+            outcomes: HashMap::from([(2, JanitorEligibility::Protected)]),
+            ..FakeJanitorMetadata::eligible()
+        };
+        let mut ctx = fake_cycle_context(&store, &mut metadata);
+        ctx.budget.max_deletes = 2;
+        let stats = run_one_cycle(ctx).await.unwrap();
+
+        assert_eq!(stats.outcome, pipeline::CycleOutcome::DeleteCapReached);
+        assert_eq!(stats.deleted, 2);
+        assert_eq!(stats.claim_protected, 1);
+        assert_eq!(stats.referenced_files, 1);
+        assert_eq!(metadata.claims, vec![1, 3, 4]);
+        // The deletion that met the cap still ran through its PostgreSQL finish.
+        assert_eq!(
+            metadata.finishes,
+            vec![
+                (3, fake_token(3), UploadedObjectDeletionOutcome::Deleted),
+                (4, fake_token(4), UploadedObjectDeletionOutcome::Deleted),
+            ]
+        );
+        let mut expected = canonical_keys(3);
+        expected.extend(canonical_keys(4));
+        assert_eq!(*store.deleted.lock().unwrap(), expected);
+        // Only the first eligibility batch was listed; the tail is never scanned.
+        assert_eq!(metadata.eligibility_reads.len(), 1);
+        assert_eq!(
+            stats.initial_listing_entries,
+            (MAX_JANITOR_ELIGIBILITY_BATCH * studiofs_data::object::CLOUD_FRAGMENT_COUNT) as u64
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_deletes_never_consume_the_delete_cap() {
+        let store = FakeJanitorStore {
+            entries: fragment_entries(3),
+            fail_delete: true,
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let stats = run_one_cycle(fake_cycle_context(&store, &mut metadata))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.outcome, pipeline::CycleOutcome::Complete);
+        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.delete_errors, 3);
+        assert_eq!(metadata.claims, vec![1, 2, 3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_budget_stops_listing_and_finishes_already_listed_candidates() {
+        let fragments = studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64;
+        let store = FakeJanitorStore {
+            entries: fragment_entries(10),
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let mut ctx = fake_cycle_context(&store, &mut metadata);
+        ctx.budget.max_deletes = u64::MAX;
+        ctx.budget.max_listed_entries = Some(3 * fragments);
+        let stats = run_one_cycle(ctx).await.unwrap();
+
+        assert_eq!(stats.outcome, pipeline::CycleOutcome::ScanBudgetExhausted);
+        assert_eq!(stats.initial_listing_entries, 3 * fragments);
+        assert_eq!(stats.deleted, 3);
+        assert_eq!(metadata.claims, vec![1, 2, 3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exhausted_time_budget_admits_no_listing_or_candidate() {
+        let store = FakeJanitorStore {
+            entries: fragment_entries(3),
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let mut ctx = fake_cycle_context(&store, &mut metadata);
+        ctx.budget.max_runtime = Some(Duration::ZERO);
+        let stats = run_one_cycle(ctx).await.unwrap();
+
+        assert_eq!(stats.outcome, pipeline::CycleOutcome::TimeBudgetExhausted);
+        assert_eq!(stats.initial_listing_entries, 0);
+        assert_eq!(store.head_requests.load(Ordering::Relaxed), 0);
+        assert!(metadata.claims.is_empty());
+        assert!(metadata.eligibility_reads.is_empty());
     }
 
     struct FakeS3 {
@@ -1526,7 +1640,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn janitor_streaming_listing_processes_first_page_before_later_pages() {
+    async fn janitor_delete_cap_stops_opendal_listing_after_first_page() {
         let (op, fake, _endpoint, server) = fake_s3_operator(20_005).await;
         let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::new(op));
         let mut metadata = FakeJanitorMetadata::eligible();
@@ -1537,7 +1651,7 @@ mod tests {
                 prefix: "test/objects/",
                 dry_run: false,
                 skip_newer_than_secs: 60,
-                max_deletes: 2,
+                budget: RunBudget::deletes(2),
                 metadata: &mut metadata,
             }),
         )
@@ -1547,17 +1661,14 @@ mod tests {
         let _ = server.await;
         let stats = stats.unwrap();
 
-        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 21);
-        // The first HEAD is issued while only the first of 21 pages has been fetched.
-        assert_eq!(
-            fake.list_requests_before_first_head.load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(stats.scanned_files, 20_005);
-        assert_eq!(stats.orphan_candidates, 20_005);
+        // Meeting the cap in the first batch ends the cycle: 1 of 21 pages is ever requested.
+        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 1);
+        let batch = MAX_JANITOR_ELIGIBILITY_BATCH as u64;
+        assert_eq!(stats.outcome, pipeline::CycleOutcome::DeleteCapReached);
+        assert_eq!(stats.scanned_files, batch);
+        assert_eq!(stats.orphan_candidates, 2);
         assert_eq!(stats.deleted, 2);
-        assert_eq!(stats.skipped_cap, 20_003);
-        assert_eq!(stats.initial_listing_entries, 20_005);
+        assert_eq!(stats.initial_listing_entries, batch);
         // Buffered candidates stay at one eligibility batch regardless of key count.
         assert_eq!(
             stats.peak_buffered_candidates,
@@ -1599,7 +1710,7 @@ mod tests {
                 prefix: "test/objects/",
                 dry_run: true,
                 skip_newer_than_secs: 60,
-                max_deletes: u64::MAX,
+                budget: RunBudget::deletes(u64::MAX),
                 metadata: &mut metadata,
             }),
         )
@@ -1640,7 +1751,7 @@ mod tests {
                 prefix: "test/objects/",
                 dry_run: true,
                 skip_newer_than_secs: 60,
-                max_deletes: 1,
+                budget: RunBudget::deletes(1),
                 metadata: &mut metadata,
             }),
         )
@@ -1678,6 +1789,8 @@ mod tests {
                     interval_minutes: 30,
                     skip_newer_minutes: 1,
                     max_deletes: 1,
+                    max_scan_entries: None,
+                    max_runtime_minutes: None,
                 },
             })
         })
@@ -1724,6 +1837,8 @@ mod tests {
                     interval_minutes: 30,
                     skip_newer_minutes: 0,
                     max_deletes: 1,
+                    max_scan_entries: None,
+                    max_runtime_minutes: None,
                 },
             });
             if let Some(session) = holder.as_mut() {
@@ -1808,6 +1923,10 @@ mod tests {
             "20",
             "--max-deletes",
             "600",
+            "--max-scan-entries",
+            "10000",
+            "--max-runtime-minutes",
+            "30",
         ])
         .unwrap();
 
@@ -1820,6 +1939,8 @@ mod tests {
                 interval_minutes,
                 skip_newer_minutes,
                 max_deletes,
+                max_scan_entries,
+                max_runtime_minutes,
             }) => {
                 assert_eq!(name, "vol");
                 assert_eq!(cache_dir, Some(PathBuf::from("D:\\cache\\studiofs")));
@@ -1828,8 +1949,24 @@ mod tests {
                 assert_eq!(interval_minutes, 45);
                 assert_eq!(skip_newer_minutes, 20);
                 assert_eq!(max_deletes, 600);
+                assert_eq!(max_scan_entries, Some(10_000));
+                assert_eq!(max_runtime_minutes, Some(30));
             }
             other => panic!("expected Janitor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn janitor_rejects_zero_budgets() {
+        for flag in [
+            "--max-deletes",
+            "--max-scan-entries",
+            "--max-runtime-minutes",
+        ] {
+            assert!(
+                crate::cli::parse_for_test(&["janitor", "vol", flag, "0"]).is_err(),
+                "{flag} 0 must be rejected"
+            );
         }
     }
 

@@ -35,7 +35,6 @@ pub(super) struct JanitorStats {
     pub(super) orphan_candidates: u64,
     pub(super) skipped_young: u64,
     pub(super) skipped_unknown_age: u64,
-    pub(super) skipped_cap: u64,
     pub(super) deleted: u64,
     pub(super) delete_errors: u64,
     pub(super) skipped_non_canonical: u64,
@@ -52,6 +51,75 @@ pub(super) struct JanitorStats {
     pub(super) head_elapsed: Duration,
     pub(super) delete_requests: u64,
     pub(super) delete_elapsed: Duration,
+    pub(super) outcome: CycleOutcome,
+}
+
+/// Why a cycle stopped admitting work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum CycleOutcome {
+    /// The whole prefix was listed and every listed candidate was decided.
+    #[default]
+    Complete,
+    /// `max_deletes` successful deletions were confirmed; the unlisted tail was not scanned.
+    DeleteCapReached,
+    /// The listed-entry budget ran out before the listing ended.
+    ScanBudgetExhausted,
+    /// The wall-clock budget ran out before the listing ended.
+    TimeBudgetExhausted,
+}
+
+impl CycleOutcome {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::DeleteCapReached => "capped (max deletes reached)",
+            Self::ScanBudgetExhausted => "partial (scan budget exhausted)",
+            Self::TimeBudgetExhausted => "partial (time budget exhausted)",
+        }
+    }
+}
+
+/// Per-cycle work limits. They are checked only where new work is admitted, so a
+/// claimed deletion always runs through its PostgreSQL finish.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RunBudget {
+    /// Confirmed successful (dry-run: would-be) deletions; protected and failed
+    /// objects never consume it. Deletion is sequential, so it cannot overshoot.
+    pub(super) max_deletes: u64,
+    /// Listed entries after which no further entry is pulled from the listing.
+    pub(super) max_listed_entries: Option<u64>,
+    /// Wall-clock time after which no further entry or candidate is admitted.
+    pub(super) max_runtime: Option<Duration>,
+}
+
+impl RunBudget {
+    #[cfg(test)]
+    pub(super) fn deletes(max_deletes: u64) -> Self {
+        Self {
+            max_deletes,
+            max_listed_entries: None,
+            max_runtime: None,
+        }
+    }
+
+    /// The reason to stop admitting candidates, if the cap or the deadline is met.
+    fn admission_stop(&self, stats: &JanitorStats, started: Instant) -> Option<CycleOutcome> {
+        if stats.deleted >= self.max_deletes {
+            return Some(CycleOutcome::DeleteCapReached);
+        }
+        self.max_runtime
+            .filter(|max| started.elapsed() >= *max)
+            .map(|_| CycleOutcome::TimeBudgetExhausted)
+    }
+
+    /// [`Self::admission_stop`] plus the listed-entry budget, checked before each listing step.
+    fn listing_stop(&self, stats: &JanitorStats, started: Instant) -> Option<CycleOutcome> {
+        self.admission_stop(stats, started).or_else(|| {
+            self.max_listed_entries
+                .filter(|max| stats.initial_listing_entries >= *max)
+                .map(|_| CycleOutcome::ScanBudgetExhausted)
+        })
+    }
 }
 
 pub(super) struct JanitorCycleContext<'a, S> {
@@ -59,7 +127,7 @@ pub(super) struct JanitorCycleContext<'a, S> {
     pub(super) prefix: &'a str,
     pub(super) dry_run: bool,
     pub(super) skip_newer_than_secs: u64,
-    pub(super) max_deletes: u64,
+    pub(super) budget: RunBudget,
     pub(super) metadata: &'a mut dyn super::JanitorMetadataSource,
 }
 
@@ -122,10 +190,6 @@ async fn process_orphan<S: JanitorObjectStore>(
         delete_keys,
     } = candidate;
     let object_id = *object_id;
-    if stats.deleted >= ctx.max_deletes {
-        stats.skipped_cap = stats.skipped_cap.saturating_add(1);
-        return Ok(());
-    }
 
     if let Some(pending_ts) = pending_ts {
         match u64::try_from(now_unix.saturating_sub(pending_ts)) {
@@ -249,6 +313,10 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
     // Entries are consumed as pages arrive; memory holds one page plus one batch.
     let mut candidates = Vec::with_capacity(MAX_JANITOR_ELIGIBILITY_BATCH);
     loop {
+        if let Some(stop) = ctx.budget.listing_stop(&stats, cycle_started) {
+            stats.outcome = stop;
+            break;
+        }
         let wait_started = Instant::now();
         let entry = bounded_list_step(listing.next_entry(), stats.initial_listing_entries).await?;
         stats.initial_listing_elapsed += wait_started.elapsed();
@@ -282,14 +350,24 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
                 &mut stats,
             )
             .await?;
+            if stats.outcome != CycleOutcome::Complete {
+                break;
+            }
         }
     }
     eprintln!(
-        "janitor phase=initial_listing completed duration_ms={} entries={}",
+        "janitor phase=initial_listing completed duration_ms={} entries={} outcome={:?}",
         super::duration_ms(stats.initial_listing_elapsed),
-        stats.initial_listing_entries
+        stats.initial_listing_entries,
+        stats.outcome
     );
-    if !candidates.is_empty() {
+    // Already-listed candidates finish only while the cap and deadline still admit work.
+    if !candidates.is_empty()
+        && matches!(
+            stats.outcome,
+            CycleOutcome::Complete | CycleOutcome::ScanBudgetExhausted
+        )
+    {
         process_candidate_batch(
             &mut ctx,
             candidates,
@@ -355,6 +433,10 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     for (candidate, orphan) in decisions {
+        if let Some(stop) = ctx.budget.admission_stop(stats, cycle_started) {
+            stats.outcome = stop;
+            return Ok(());
+        }
         match orphan {
             None => {
                 stats.referenced_files = stats.referenced_files.saturating_add(1);
