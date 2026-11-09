@@ -1,0 +1,97 @@
+//! OpenDAL operations used by the standalone janitor.
+
+use opendal::services::S3;
+use opendal::{EntryMode, ErrorKind, Operator, Result};
+
+/// OpenDAL adapter for listing and mutating payload objects.
+#[derive(Clone)]
+pub struct JanitorObjectStore {
+    operator: Operator,
+}
+
+/// Result category for deleting one fragment.
+#[derive(Debug)]
+pub enum JanitorDeleteError {
+    /// The fragment was already absent.
+    NotFound,
+    /// The provider rejected the delete request.
+    Other(String),
+}
+
+impl JanitorObjectStore {
+    /// Wrap a configured object-storage operator.
+    pub fn new(operator: Operator) -> Self {
+        Self { operator }
+    }
+
+    /// Configure a provider-neutral S3-compatible endpoint without loading user credentials.
+    pub fn from_s3(
+        endpoint: &str,
+        bucket: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        region: &str,
+    ) -> Result<Self> {
+        let operator = Operator::new(
+            S3::default()
+                .endpoint(endpoint)
+                .bucket(bucket)
+                .access_key_id(access_key_id)
+                .secret_access_key(secret_access_key)
+                .region(if region.is_empty() {
+                    "us-east-1"
+                } else {
+                    region
+                })
+                .disable_config_load()
+                .disable_ec2_metadata(),
+        )?
+        .finish();
+        Ok(Self::new(operator))
+    }
+
+    /// Eagerly list keys below `prefix`, preserving the CLI's current listing behavior.
+    pub async fn list(&self, prefix: &str) -> Result<Vec<JanitorEntry>> {
+        Ok(self
+            .operator
+            .list_with(prefix)
+            .recursive(true)
+            .await?
+            .into_iter()
+            .map(|entry| JanitorEntry {
+                key: entry.path().to_string(),
+                is_file: entry.metadata().mode() == EntryMode::FILE,
+            })
+            .collect())
+    }
+
+    /// Return the remote object's last-modified time when the provider supplies one.
+    pub async fn last_modified(&self, key: &str) -> Result<Option<std::time::SystemTime>> {
+        Ok(self
+            .operator
+            .stat(key)
+            .await?
+            .last_modified()
+            .map(Into::into))
+    }
+
+    /// Delete one object fragment.
+    pub async fn delete(&self, key: &str) -> std::result::Result<(), JanitorDeleteError> {
+        self.operator.delete(key).await.map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                JanitorDeleteError::NotFound
+            } else {
+                JanitorDeleteError::Other(error.to_string())
+            }
+        })
+    }
+}
+
+/// One listed key and whether OpenDAL reports it as a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JanitorEntry {
+    /// Object key relative to the operator root.
+    pub key: String,
+    /// Whether this entry represents a file rather than a directory.
+    pub is_file: bool,
+}

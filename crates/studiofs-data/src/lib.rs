@@ -6,6 +6,8 @@
 
 pub mod crypto;
 pub mod envelope;
+/// OpenDAL-backed object listing and mutation used by the standalone janitor.
+pub mod janitor;
 pub mod object;
 pub mod snapshot_key;
 pub mod store;
