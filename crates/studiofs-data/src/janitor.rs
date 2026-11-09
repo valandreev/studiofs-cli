@@ -133,6 +133,10 @@ impl JanitorObjectStore {
         }
         let transport = Arc::<TransportCounters>::default();
         let base_interval = Duration::from_secs_f64(1.0 / f64::from(requests_per_second));
+        transport.interval_micros.store(
+            u64::try_from(base_interval.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         let request_rate = AdaptiveRateLimitedHttpClient {
             inner: HttpClient::new()?,
             base_interval,
@@ -366,6 +370,24 @@ pub fn pending_deletion_age(now_unix: i64, deleted_at_unix: i64, grace: Duration
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_transport_stats_start_at_the_configured_request_interval() {
+        let store = JanitorObjectStore::from_s3(
+            "http://127.0.0.1:9000",
+            "test",
+            "test",
+            "test",
+            "us-east-1",
+            2,
+            4,
+        )
+        .unwrap();
+
+        let stats = store.transport_stats();
+        assert_eq!(stats.request_interval, Duration::from_millis(250));
+        assert_eq!((stats.throttled, stats.retries), (0, 0));
+    }
 
     #[test]
     fn janitor_age_skips_missing_future_and_young_timestamps() {

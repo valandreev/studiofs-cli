@@ -709,6 +709,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 };
             }
 
+            let transport_before = store.0.transport_stats();
             let stats = rt.block_on(run_one_cycle_resumable(
                 JanitorCycleContext {
                     store: &store,
@@ -734,10 +735,10 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 JanitorMetadataSource::prune_deletion_fences(metadata)?
             };
 
-            Ok((stats, fences_pruned))
+            Ok((stats, fences_pruned, transport_before))
         });
         let cycle_elapsed = cycle_started.elapsed();
-        let (stats, fences_pruned) = match cycle_result {
+        let (stats, fences_pruned, transport_before) = match cycle_result {
             Ok(done) => done,
             Err(error) => {
                 match breaker.after_cycle(Err(error), loop_mode, interval)? {
@@ -806,8 +807,10 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             stats.claim_protected,
             stats.claim_finishes,
             stats.skipped_non_canonical,
-            transport.throttled,
-            transport.retries,
+            transport
+                .throttled
+                .saturating_sub(transport_before.throttled),
+            transport.retries.saturating_sub(transport_before.retries),
             duration_ms(transport.request_interval),
         );
         match breaker.after_cycle(Ok(stats.cycle_outcome()), loop_mode, interval)? {
@@ -1641,15 +1644,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unconfirmed_finish_and_failed_delete_are_not_reported_as_deleted() {
-        let entries: Vec<_> = canonical_keys(2)
-            .into_iter()
-            .map(|key| JanitorEntry {
-                key,
-                is_file: true,
-                last_modified: None,
-            })
-            .collect();
-        // A stale finish token after successful S3 deletes must not count as success.
+        let entries = fragment_entries(u64::from(pipeline::OVERLOAD_TRIP_OBJECTS + 1));
+        // Repeated PG finish failures after successful S3 deletes must not trip the S3 breaker.
         let store = FakeJanitorStore {
             entries: entries.clone(),
             ..FakeJanitorStore::default()
@@ -1663,14 +1659,27 @@ mod tests {
             .unwrap();
         assert_eq!(
             (stats.deleted, stats.delete_errors, stats.claim_finishes),
-            (0, 1, 0)
+            (0, u64::from(pipeline::OVERLOAD_TRIP_OBJECTS + 1), 0)
         );
-        assert_eq!(*store.deleted.lock().unwrap(), canonical_keys(2));
+        assert_eq!(stats.outcome, CycleOutcome::Complete);
+        assert_eq!(stats.cycle_outcome(), CycleOutcome::TransientErrors);
+        assert_eq!(store.deleted.lock().unwrap().len(), entries.len() * 2);
+        assert_eq!(
+            metadata.gc_candidate_retries.len(),
+            u64::from(pipeline::OVERLOAD_TRIP_OBJECTS + 1) as usize
+        );
 
         // A failed or hung S3 delete records a retryable outcome under the same claim.
         for (fail_delete, hang_delete) in [(true, false), (false, true)] {
             let store = FakeJanitorStore {
-                entries: entries.clone(),
+                entries: canonical_keys(2)
+                    .into_iter()
+                    .map(|key| JanitorEntry {
+                        key,
+                        is_file: true,
+                        last_modified: None,
+                    })
+                    .collect(),
                 fail_delete,
                 hang_delete,
                 ..FakeJanitorStore::default()
@@ -2737,6 +2746,18 @@ mod tests {
         assert!(
             starts[1].duration_since(starts[0]) >= Duration::from_secs(1),
             "Retry-After must hold back the next request"
+        );
+
+        let cycle_start = store.transport_stats();
+        assert!(store.stat_key(FAULT_KEY).await.is_ok());
+        let next_cycle = store.transport_stats();
+        assert_eq!((cycle_start.throttled, cycle_start.retries), (2, 2));
+        assert_eq!(
+            (
+                next_cycle.throttled.saturating_sub(cycle_start.throttled),
+                next_cycle.retries.saturating_sub(cycle_start.retries),
+            ),
+            (0, 0)
         );
         server.abort();
         let _ = server.await;

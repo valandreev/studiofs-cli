@@ -460,7 +460,7 @@ async fn process_orphan<S: JanitorObjectStore>(
         return Ok(());
     };
 
-    let mut delete_failed = false;
+    let mut s3_delete_failed = false;
     let mut terminal = None;
     for key in &candidate.delete_keys {
         if stats.delete_requests == 0 {
@@ -477,7 +477,7 @@ async fn process_orphan<S: JanitorObjectStore>(
             Err(JanitorDeleteError::Other(error)) => ("transient", error),
             Err(JanitorDeleteError::Terminal(error)) => ("terminal", error),
         };
-        delete_failed = true;
+        s3_delete_failed = true;
         eprintln!(
             "janitor: failed to delete object class={class} key={key} object_id={object_id}: {error}"
         );
@@ -487,7 +487,7 @@ async fn process_orphan<S: JanitorObjectStore>(
         // The whole object is retried later; more requests now only add load.
         break;
     }
-    let outcome = if delete_failed {
+    let outcome = if s3_delete_failed {
         UploadedObjectDeletionOutcome::Retryable
     } else {
         UploadedObjectDeletionOutcome::Deleted
@@ -497,24 +497,32 @@ async fn process_orphan<S: JanitorObjectStore>(
         ctx.metadata
             .finish_deletion(object_id, fencing_token, outcome)
     });
-    match finish {
-        Ok(()) => stats.claim_finishes = stats.claim_finishes.saturating_add(1),
-        Err(error) => {
-            delete_failed = true;
-            eprintln!("janitor: failed to finish deletion claim object_id={object_id}: {error:#}");
+    let finish_failed = match finish {
+        Ok(()) => {
+            stats.claim_finishes = stats.claim_finishes.saturating_add(1);
+            false
         }
-    }
+        Err(error) => {
+            eprintln!("janitor: failed to finish deletion claim object_id={object_id}: {error:#}");
+            true
+        }
+    };
+    let delete_failed = s3_delete_failed || finish_failed;
     if delete_failed {
         let retry = tokio::task::block_in_place(|| ctx.metadata.retry_gc_candidate(object_id));
         if let Err(error) = retry {
             eprintln!("janitor: failed to defer GC candidate object_id={object_id}: {error:#}");
         }
         stats.delete_errors = stats.delete_errors.saturating_add(1);
-        // The claim is already finished as retryable, so stopping leaves no live fence.
+        // A successful finish leaves no live fence; a failed finish expires for a later cycle.
         if let Some(error) = terminal {
             anyhow::bail!("terminal S3 delete failure for janitor object {object_id}: {error}");
         }
-        record_transient_failure(stats);
+        if s3_delete_failed {
+            record_transient_failure(stats);
+        } else {
+            stats.transient_streak = 0;
+        }
     } else {
         stats.transient_streak = 0;
         // The fenced finish already confirmed deletion; an unacked row is only re-claimed later.
