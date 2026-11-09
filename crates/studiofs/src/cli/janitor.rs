@@ -2908,9 +2908,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     async fn janitor_run_lock_busy_skips_cycle_without_s3_requests() {
-        let Ok(url) = std::env::var("STUDIOFS_TEST_PG_DSN") else {
-            panic!("STUDIOFS_TEST_PG_DSN must be set for this ignored test");
-        };
+        let url = test_env("STUDIOFS_TEST_PG_DSN")
+            .expect("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)");
         let run = run_postgres_fixture_once(url, true).await;
 
         run.result.unwrap();
@@ -3255,15 +3254,22 @@ mod tests {
 
     /// SFS-973 live check: S3 `start_after` resume, partial hex prefixes without a
     /// trailing `/`, and repeated one-entry runs of both listing strategies.
+    /// Reads an ignored-test setting from the process environment, then the workspace `.env`.
+    fn test_env(key: &str) -> Option<String> {
+        let non_empty = |value: &String| !value.trim().is_empty();
+        std::env::var(key).ok().filter(non_empty).or_else(|| {
+            dotenvy::from_path_iter(studiofs_test_support::workspace_root().join(".env"))
+                .ok()?
+                .filter_map(Result::ok)
+                .find_map(|(name, value)| (name == key).then_some(value))
+                .filter(non_empty)
+        })
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires live S3 backend with an existing bucket (set STUDIOFS_S3_*)"]
+    #[ignore = "requires live S3 backend with an existing bucket (STUDIOFS_S3_* in environment or .env)"]
     async fn sfs973_live_s3_resumable_listing_covers_every_object() {
-        let env = |key: &str, default: &str| {
-            std::env::var(key)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| default.to_string())
-        };
+        let env = |key: &str, default: &str| test_env(key).unwrap_or_else(|| default.to_string());
         let endpoint = env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
         let bucket = env("STUDIOFS_S3_BUCKET", "studiofs-test");
         let access_key = env("STUDIOFS_S3_ACCESS_KEY", "studiofs");
