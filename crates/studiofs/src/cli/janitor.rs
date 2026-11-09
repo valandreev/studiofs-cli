@@ -2,7 +2,6 @@
 
 use crate::cli::cache_layout::describe_cache_layout_state;
 use clap::Args;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -10,9 +9,9 @@ use studiofs_cache::runtime::{
     LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
-use studiofs_meta::open_meta_engine;
+use studiofs_meta::{JanitorMetadataSession, JanitorProtection};
 mod pipeline;
-use pipeline::{JanitorCycleContext, JanitorObjectStore, JanitorStats, run_one_cycle};
+use pipeline::{JanitorCycleContext, JanitorObjectStore, run_one_cycle};
 use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry};
 
 struct OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore);
@@ -44,6 +43,44 @@ struct JanitorRunRequest {
     name: String,
     meta_dir: PathBuf,
     options: JanitorOptions,
+}
+
+trait JanitorMetadataSource {
+    fn try_acquire_global_janitor_lock(&mut self) -> anyhow::Result<bool>;
+    fn collect_protection(&mut self) -> anyhow::Result<JanitorProtection>;
+    fn release_global_janitor_lock(&mut self) -> anyhow::Result<()>;
+}
+
+impl JanitorMetadataSource for JanitorMetadataSession {
+    fn try_acquire_global_janitor_lock(&mut self) -> anyhow::Result<bool> {
+        JanitorMetadataSession::try_acquire_global_janitor_lock(self).map_err(anyhow::Error::new)
+    }
+
+    fn collect_protection(&mut self) -> anyhow::Result<JanitorProtection> {
+        JanitorMetadataSession::collect_protection(self).map_err(anyhow::Error::new)
+    }
+
+    fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
+        JanitorMetadataSession::release_global_janitor_lock(self).map_err(anyhow::Error::new)
+    }
+}
+
+fn with_acquired_global_janitor_lock<M, T>(
+    metadata: &mut M,
+    work: impl FnOnce(&mut M) -> anyhow::Result<T>,
+) -> anyhow::Result<T>
+where
+    M: JanitorMetadataSource + ?Sized,
+{
+    let result = work(metadata);
+    match metadata.release_global_janitor_lock() {
+        Ok(()) => result,
+        Err(release_error) if result.is_err() => {
+            eprintln!("Warning: failed to release global janitor lock: {release_error}");
+            result
+        }
+        Err(release_error) => Err(release_error.context("failed to release global janitor lock")),
+    }
 }
 
 impl JanitorRunRequest {
@@ -291,8 +328,8 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 
     eprintln!("janitor phase=metadata_open started");
     let metadata_open_started = Instant::now();
-    let engine = open_meta_engine(&db_path)?;
-    let format_info = engine.get_format_info()?;
+    let mut metadata = JanitorMetadataSession::open(&db_path)?;
+    let format_info = metadata.format_info().clone();
     let metadata_open_elapsed = metadata_open_started.elapsed();
     eprintln!(
         "janitor phase=metadata_open completed duration_ms={}",
@@ -340,7 +377,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         let cycle_started = Instant::now();
         let lock_started = Instant::now();
         eprintln!("janitor phase=global_lock started");
-        let lock_acquired = engine.try_acquire_global_janitor_lock()?;
+        let lock_acquired = JanitorMetadataSource::try_acquire_global_janitor_lock(&mut metadata)?;
         let lock_wait_elapsed = lock_started.elapsed();
         eprintln!(
             "janitor phase=global_lock completed acquired={} duration_ms={}",
@@ -349,7 +386,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         );
         if !lock_acquired {
             println!(
-                "Janitor cycle skipped: global janitor lock not acquired (wait_ms={})",
+                "Janitor cycle skipped: lock_busy (wait_ms={})",
                 duration_ms(lock_wait_elapsed)
             );
             if !loop_mode {
@@ -364,8 +401,8 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         let protection_started = Instant::now();
         eprintln!("janitor phase=protection started");
         let mut protection_elapsed = Duration::ZERO;
-        let cycle_result = (|| -> anyhow::Result<(JanitorStats, HashSet<u64>, HashSet<u64>)> {
-            let protection = studiofs_meta::janitor::collect_janitor_protection(&*engine, dry_run)?;
+        let cycle_result = with_acquired_global_janitor_lock(&mut metadata, |metadata| {
+            let protection = JanitorMetadataSource::collect_protection(metadata)?;
             protection_elapsed = protection_started.elapsed();
             eprintln!(
                 "janitor phase=protection completed duration_ms={} references={} snapshot_pins={} pending={}",
@@ -387,10 +424,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             }))?;
 
             Ok((stats, protection.referenced, protection.snapshot_pins))
-        })();
-        if let Err(e) = engine.release_global_janitor_lock() {
-            eprintln!("Warning: failed to release global janitor lock: {}", e);
-        }
+        });
         let cycle_elapsed = cycle_started.elapsed();
         let (stats, referenced, global_snapshot_pins) = cycle_result?;
 
@@ -453,7 +487,7 @@ mod tests {
     use super::*;
     use opendal::Operator;
     use opendal::services::S3;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use studiofs_cache::runtime::LocalPayloadLayout;
@@ -463,6 +497,8 @@ mod tests {
     struct FakeJanitorStore {
         entries: Vec<studiofs_data::janitor::JanitorEntry>,
         deleted: Mutex<Vec<String>>,
+        list_requests: AtomicU64,
+        head_requests: AtomicU64,
         fail_list: bool,
         fail_head: bool,
         head_missing: bool,
@@ -473,6 +509,7 @@ mod tests {
 
     impl JanitorObjectStore for FakeJanitorStore {
         async fn list(&self, _prefix: &str) -> anyhow::Result<Vec<JanitorEntry>> {
+            self.list_requests.fetch_add(1, Ordering::Relaxed);
             if self.fail_list {
                 anyhow::bail!("list failed")
             }
@@ -480,6 +517,7 @@ mod tests {
         }
 
         async fn last_modified(&self, _key: &str) -> anyhow::Result<Option<SystemTime>> {
+            self.head_requests.fetch_add(1, Ordering::Relaxed);
             if self.fail_head {
                 anyhow::bail!("head failed")
             }
@@ -500,6 +538,156 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    struct FakeJanitorMetadata {
+        lock_acquired: bool,
+        protection: Option<JanitorProtection>,
+        protection_error: Option<&'static str>,
+        protection_reads: u64,
+        releases: u64,
+    }
+
+    impl JanitorMetadataSource for FakeJanitorMetadata {
+        fn try_acquire_global_janitor_lock(&mut self) -> anyhow::Result<bool> {
+            Ok(self.lock_acquired)
+        }
+
+        fn collect_protection(&mut self) -> anyhow::Result<JanitorProtection> {
+            self.protection_reads += 1;
+            if let Some(error) = self.protection_error {
+                anyhow::bail!(error);
+            }
+            self.protection
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("fake protection was already consumed"))
+        }
+
+        fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
+            self.releases += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn janitor_metadata_faults_release_lock_before_any_object_store_request() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for error in [
+            "unsafe_to_delete: identity mismatch",
+            "unsafe_to_delete: snapshot bootstrap incomplete",
+            "backend_unavailable: PostgreSQL timeout",
+        ] {
+            let mut metadata = FakeJanitorMetadata {
+                lock_acquired: true,
+                protection: None,
+                protection_error: Some(error),
+                protection_reads: 0,
+                releases: 0,
+            };
+            let store = FakeJanitorStore {
+                entries: studiofs_data::object::format_object_fragment_keys("test/objects/", 9)
+                    .into_iter()
+                    .map(|key| JanitorEntry { key, is_file: true })
+                    .collect(),
+                ..FakeJanitorStore::default()
+            };
+            assert!(
+                metadata.try_acquire_global_janitor_lock().unwrap(),
+                "{error}"
+            );
+            let result = with_acquired_global_janitor_lock(&mut metadata, |metadata| {
+                let protection = metadata.collect_protection()?;
+                rt.block_on(run_one_cycle(JanitorCycleContext {
+                    store: &store,
+                    prefix: "test/objects/",
+                    referenced: &protection.referenced,
+                    global_snapshot_pins: &protection.snapshot_pins,
+                    pending: &protection.pending_deletions,
+                    dry_run: false,
+                    skip_newer_than_secs: 0,
+                    max_deletes: 1,
+                }))
+            });
+            assert!(result.is_err(), "{error}");
+            assert_eq!(store.list_requests.load(Ordering::Relaxed), 0, "{error}");
+            assert_eq!(store.head_requests.load(Ordering::Relaxed), 0, "{error}");
+            assert!(store.deleted.lock().unwrap().is_empty(), "{error}");
+            assert_eq!(metadata.releases, 1, "{error}");
+            assert_eq!(metadata.protection_reads, 1, "{error}");
+        }
+    }
+
+    #[test]
+    fn janitor_healthy_metadata_progresses_and_dry_run_never_writes_or_deletes() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let entries = studiofs_data::object::format_object_fragment_keys("test/objects/", 42)
+            .into_iter()
+            .map(|key| JanitorEntry { key, is_file: true })
+            .collect();
+        let store = FakeJanitorStore {
+            entries,
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata {
+            lock_acquired: true,
+            protection: Some(JanitorProtection::default()),
+            protection_error: None,
+            protection_reads: 0,
+            releases: 0,
+        };
+        assert!(metadata.try_acquire_global_janitor_lock().unwrap());
+        let stats = with_acquired_global_janitor_lock(&mut metadata, |metadata| {
+            let protection = metadata.collect_protection()?;
+            rt.block_on(run_one_cycle(JanitorCycleContext {
+                store: &store,
+                prefix: "test/objects/",
+                referenced: &protection.referenced,
+                global_snapshot_pins: &protection.snapshot_pins,
+                pending: &protection.pending_deletions,
+                dry_run: false,
+                skip_newer_than_secs: 0,
+                max_deletes: 1,
+            }))
+        })
+        .unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(store.list_requests.load(Ordering::Relaxed), 1);
+        assert!(!store.deleted.lock().unwrap().is_empty());
+        assert_eq!(metadata.releases, 1);
+        assert_eq!(metadata.protection_reads, 1);
+
+        let dry_run_store = FakeJanitorStore {
+            entries: store.entries.clone(),
+            ..FakeJanitorStore::default()
+        };
+        let mut dry_run_metadata = FakeJanitorMetadata {
+            lock_acquired: true,
+            protection: Some(JanitorProtection::default()),
+            protection_error: None,
+            protection_reads: 0,
+            releases: 0,
+        };
+        assert!(dry_run_metadata.try_acquire_global_janitor_lock().unwrap());
+        let stats = with_acquired_global_janitor_lock(&mut dry_run_metadata, |metadata| {
+            let protection = metadata.collect_protection()?;
+            rt.block_on(run_one_cycle(JanitorCycleContext {
+                store: &dry_run_store,
+                prefix: "test/objects/",
+                referenced: &protection.referenced,
+                global_snapshot_pins: &protection.snapshot_pins,
+                pending: &protection.pending_deletions,
+                dry_run: true,
+                skip_newer_than_secs: 0,
+                max_deletes: 1,
+            }))
+        })
+        .unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(dry_run_store.list_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(dry_run_store.head_requests.load(Ordering::Relaxed), 1);
+        assert!(dry_run_store.deleted.lock().unwrap().is_empty());
+        assert_eq!(dry_run_metadata.releases, 1);
+        assert_eq!(dry_run_metadata.protection_reads, 1);
     }
 
     fn fake_cycle_context<'a>(
@@ -822,9 +1010,41 @@ mod tests {
     }
 
     fn create_local_metadata_fixture(meta_dir: &std::path::Path, endpoint: &str) -> PathBuf {
+        create_metadata_fixture(
+            meta_dir,
+            endpoint,
+            studiofs_meta::schema::MetadataConfig::default(),
+        )
+    }
+
+    fn create_postgres_metadata_fixture(
+        meta_dir: &std::path::Path,
+        endpoint: &str,
+        postgres_url: &str,
+    ) -> PathBuf {
+        use studiofs_meta::schema::{MetadataBackend, MetadataConfig, PostgresConfig};
+        create_metadata_fixture(
+            meta_dir,
+            endpoint,
+            MetadataConfig {
+                backend: MetadataBackend::Postgres,
+                postgres: Some(PostgresConfig {
+                    url: postgres_url.to_string(),
+                    volume_id: 966,
+                }),
+                ..MetadataConfig::default()
+            },
+        )
+    }
+
+    fn create_metadata_fixture(
+        meta_dir: &std::path::Path,
+        endpoint: &str,
+        metadata: studiofs_meta::schema::MetadataConfig,
+    ) -> PathBuf {
         use studiofs_meta::schema::{
             CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, ENCRYPTION_KEY_LENGTH, EncryptionConfig,
-            FormatInfo, MetadataConfig,
+            FormatInfo,
         };
 
         std::fs::create_dir_all(meta_dir).unwrap();
@@ -842,7 +1062,7 @@ mod tests {
                 secret_key: "fixture".to_string(),
                 region: "us-east-1".to_string(),
                 data_prefix: "test/objects/".to_string(),
-                metadata: MetadataConfig::default(),
+                metadata,
                 encryption: EncryptionConfig::new([0; ENCRYPTION_KEY_LENGTH]),
                 block_size: DEFAULT_BLOCK_SIZE,
             })
@@ -943,11 +1163,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn janitor_run_uses_local_metadata_fixture_and_releases_global_lock() {
+    async fn janitor_run_rejects_local_metadata_before_listing_objects() {
         let (_op, fake, endpoint, server) = fake_s3_operator(1).await;
         let temp = studiofs_test_support::workspace_target_tempdir("janitor-meta-");
         let meta_dir = temp.path().join("meta");
         let db_path = create_local_metadata_fixture(&meta_dir, &endpoint);
+        let before = std::fs::read(&db_path).unwrap();
         let result = tokio::task::spawn_blocking(move || {
             run(JanitorRunRequest {
                 name: "janitor-fixture".to_string(),
@@ -966,17 +1187,112 @@ mod tests {
         .unwrap();
         server.abort();
         let _ = server.await;
-        result.unwrap();
+        let error = result.unwrap_err();
 
-        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 1);
-        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            fake.delete_requests.load(Ordering::Relaxed),
-            studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64
+        assert!(error.to_string().contains("unsafe_to_delete"));
+        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.delete_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
+    }
+
+    struct FailClosedRun {
+        result: anyhow::Result<()>,
+        s3_requests: u64,
+        metadata_unchanged: bool,
+    }
+
+    /// Runs one real `run()` cycle against a PostgreSQL-backed fixture and a fake S3.
+    async fn run_postgres_fixture_once(postgres_url: String, hold_lock: bool) -> FailClosedRun {
+        let (_op, fake, endpoint, server) = fake_s3_operator(1).await;
+        let temp = studiofs_test_support::workspace_target_tempdir("janitor-pg-");
+        let meta_dir = temp.path().join("meta");
+        let db_path = create_postgres_metadata_fixture(&meta_dir, &endpoint, &postgres_url);
+        let before = std::fs::read(&db_path).unwrap();
+        let run_db_path = db_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut holder = hold_lock.then(|| {
+                let mut session = JanitorMetadataSession::open(&run_db_path).unwrap();
+                assert!(session.try_acquire_global_janitor_lock().unwrap());
+                session
+            });
+            let result = run(JanitorRunRequest {
+                name: "janitor-fixture".to_string(),
+                meta_dir,
+                options: JanitorOptions {
+                    cache_dir: None,
+                    dry_run: false,
+                    loop_mode: false,
+                    interval_minutes: 30,
+                    skip_newer_minutes: 0,
+                    max_deletes: 1,
+                },
+            });
+            if let Some(session) = holder.as_mut() {
+                session.release_global_janitor_lock().unwrap();
+            }
+            result
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        FailClosedRun {
+            result,
+            s3_requests: fake.list_requests.load(Ordering::Relaxed)
+                + fake.head_requests.load(Ordering::Relaxed)
+                + fake.delete_requests.load(Ordering::Relaxed),
+            metadata_unchanged: std::fs::read(&db_path).unwrap() == before,
+        }
+    }
+
+    #[tokio::test]
+    async fn janitor_run_unreachable_postgres_fails_closed_without_s3_requests() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("postgresql://janitor:leak-canary@127.0.0.1:{port}/studiofs");
+        let run = run_postgres_fixture_once(url, false).await;
+        let error = format!("{:#}", run.result.unwrap_err());
+
+        assert!(error.contains("backend_unavailable"), "{error}");
+        assert!(!error.contains("leak-canary"), "{error}");
+        assert_eq!(run.s3_requests, 0);
+        assert!(run.metadata_unchanged);
+    }
+
+    #[tokio::test]
+    async fn janitor_run_silent_postgres_times_out_without_s3_requests() {
+        // Accepts TCP but never speaks the protocol, so only the bounded connect timeout ends it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "postgresql://janitor@{}/studiofs",
+            listener.local_addr().unwrap()
         );
-        let engine = open_meta_engine(&db_path).unwrap();
-        assert!(engine.try_acquire_global_janitor_lock().unwrap());
-        engine.release_global_janitor_lock().unwrap();
+        let started = Instant::now();
+        let run = run_postgres_fixture_once(url, false).await;
+        drop(listener);
+        let error = format!("{:#}", run.result.unwrap_err());
+
+        assert!(error.contains("backend_unavailable"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(60));
+        assert_eq!(run.s3_requests, 0);
+        assert!(run.metadata_unchanged);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    async fn janitor_run_lock_busy_skips_cycle_without_s3_requests() {
+        let Ok(url) = std::env::var("STUDIOFS_TEST_PG_DSN") else {
+            panic!("STUDIOFS_TEST_PG_DSN must be set for this ignored test");
+        };
+        let run = run_postgres_fixture_once(url, true).await;
+
+        run.result.unwrap();
+        assert_eq!(run.s3_requests, 0);
+        assert!(run.metadata_unchanged);
     }
 
     #[test]
