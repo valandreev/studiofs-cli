@@ -168,6 +168,7 @@ impl JanitorMetadataSession {
     pub fn check_eligibility(
         &mut self,
         object_ids: &[u64],
+        eligible_before: i64,
     ) -> Result<JanitorProtection, JanitorMetadataError> {
         if object_ids.len() > MAX_JANITOR_ELIGIBILITY_BATCH {
             return Err(JanitorMetadataError::UnsafeToDelete(
@@ -179,22 +180,32 @@ impl JanitorMetadataSession {
             .local
             .get_pending_deletions_for(object_ids)
             .map_err(backend_unavailable)?;
-        let remote =
-            self.postgres
-                .check_eligibility(&self.format_info, local_version, object_ids)?;
+        let remote = self.postgres.check_eligibility(
+            &self.format_info,
+            local_version,
+            object_ids,
+            eligible_before,
+        )?;
         let mut protection = HashMap::with_capacity(object_ids.len());
         for object_id in object_ids {
             let is_protected = self.local_referenced.contains(object_id)
                 || remote.referenced.contains(object_id)
                 || remote.snapshot_pins.contains(object_id);
+            let gc_candidate = remote.gc_candidates.get(object_id).copied();
             protection.insert(
                 *object_id,
                 if is_protected {
                     JanitorEligibility::Protected
+                } else if gc_candidate.is_some_and(|(_, eligible)| !eligible) {
+                    JanitorEligibility::Deferred
                 } else {
-                    JanitorEligibility::Eligible {
-                        pending_deletion: pending_deletions.get(object_id).copied(),
-                    }
+                    let pending_deletion = pending_deletions.get(object_id).copied();
+                    let pending_deletion = gc_candidate
+                        .map(|(eligible_at, _)| {
+                            pending_deletion.map_or(eligible_at, |local| local.max(eligible_at))
+                        })
+                        .or(pending_deletion);
+                    JanitorEligibility::Eligible { pending_deletion }
                 },
             );
         }
@@ -234,6 +245,30 @@ impl JanitorMetadataSession {
         } else {
             Err(JanitorMetadataError::StaleClaim)
         }
+    }
+
+    /// Reads a bounded keyset page of durable PG GC candidates after `after_object_id`.
+    pub fn gc_candidate_page(
+        &mut self,
+        after: Option<(i64, u64)>,
+        limit: usize,
+        eligible_before: i64,
+    ) -> Result<Vec<(u64, i64)>, JanitorMetadataError> {
+        self.ensure_validated_cycle()?;
+        self.postgres
+            .gc_candidate_page(after, limit, eligible_before)
+    }
+
+    /// Defers a failed queue candidate so one broken object does not dominate later pages.
+    pub fn retry_gc_candidate(&mut self, object_id: u64) -> Result<(), JanitorMetadataError> {
+        self.ensure_validated_cycle()?;
+        self.postgres.retry_gc_candidate(object_id)
+    }
+
+    /// Acknowledges a candidate only after PostgreSQL confirmed its fenced deletion finish.
+    pub fn ack_gc_candidate(&mut self, object_id: u64) -> Result<(), JanitorMetadataError> {
+        self.ensure_validated_cycle()?;
+        self.postgres.ack_gc_candidate(object_id)
     }
 
     /// Prunes finished deletion fences below their payload namespace watermark.
@@ -280,6 +315,8 @@ impl Drop for JanitorMetadataSession {
 pub enum JanitorEligibility {
     /// Metadata still reaches or leases this object.
     Protected,
+    /// A durable PG GC candidate is too young or has a retry delay still active.
+    Deferred,
     /// Metadata proves the object is not reachable.
     Eligible {
         /// Timestamp of the local pending deletion marker, when one exists.

@@ -354,6 +354,18 @@ where
     if !opened_object_ids.is_empty() {
         client
             .execute(
+                "DELETE FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = ANY($2::BIGINT[])",
+                &[&volume_id, &opened_object_ids],
+            )
+            .await
+            .map_err(|error| {
+                PgMetaEngine::classify_pg_error(
+                    "postgres payload GC candidate reopen cleanup failed",
+                    error,
+                )
+            })?;
+        client
+            .execute(
                 "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) SELECT $1, objects.object_id, $3 FROM UNNEST($2::BIGINT[]) AS objects(object_id)",
                 &[&volume_id, &opened_object_ids, &batch_version],
             )
@@ -375,6 +387,18 @@ where
             .map_err(|error| {
                 PgMetaEngine::classify_pg_error(
                     "postgres snapshot reachability interval close failed",
+                    error,
+                )
+            })?;
+        client
+            .execute(
+                "INSERT INTO snapshot_payload_gc_candidates (vol, object_id) SELECT $1, candidates.object_id FROM UNNEST($2::BIGINT[]) AS candidates(object_id) JOIN snapshot_payload_upload_objects AS uploaded ON uploaded.vol = $1 AND uploaded.object_id = candidates.object_id AND uploaded.state = 'published' ON CONFLICT (vol, object_id) DO NOTHING",
+                &[&volume_id, &closed_object_ids],
+            )
+            .await
+            .map_err(|error| {
+                PgMetaEngine::classify_pg_error(
+                    "postgres payload GC candidate enqueue failed",
                     error,
                 )
             })?;
@@ -1163,6 +1187,17 @@ impl PgMetaEngine {
                                     })?;
                             }
                         }
+                        tx.execute(
+                            "INSERT INTO snapshot_payload_gc_candidates (vol, object_id) SELECT vol, object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2 AND state = 'delete_pending' ON CONFLICT (vol, object_id) DO NOTHING",
+                            &[&volume_id, &object_id],
+                        )
+                        .await
+                        .map_err(|error| {
+                            Self::classify_pg_error(
+                                "postgres abandoned payload GC candidate enqueue failed",
+                                error,
+                            )
+                        })?;
                         tx.commit().await.map_err(|error| {
                             Self::classify_pg_error(
                                 "postgres snapshot upload reconciliation completion commit failed",

@@ -48,6 +48,58 @@ fn test_pg_janitor_lock_is_exclusive() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_janitor_gc_candidate_pages_keyset_through_ten_thousand_rows() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "pg-janitor-gc-candidates");
+    let volume_id = volume.volume_id;
+    let insert_dsn = dsn.clone();
+    run_async(async move {
+        let (client, connection) = tokio_postgres::connect(&insert_dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "INSERT INTO snapshot_payload_gc_candidates (vol, object_id, eligible_at) SELECT $1, object_id, clock_timestamp() - interval '1 hour' FROM generate_series(1, 10000) AS object_id",
+                &[&volume_id],
+            )
+            .await
+            .expect("insert 10,000 GC candidates");
+        connection_task.abort();
+        Ok::<(), MetaError>(())
+    })
+    .expect("seed candidate queue");
+
+    let mut session = crate::pg_engine::janitor::PgJanitorSession::new(dsn, volume_id);
+    assert!(
+        session
+            .try_acquire_global_janitor_lock()
+            .expect("acquire lock")
+    );
+    let mut cursor = None;
+    let mut count = 0_usize;
+    let mut pages = 0_usize;
+    loop {
+        let page = session
+            .gc_candidate_page(cursor, 64, i64::MAX)
+            .expect("read bounded candidate page");
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 64);
+        count += page.len();
+        pages += 1;
+        cursor = page.last().map(|(id, eligible_at)| (*eligible_at, *id));
+    }
+    assert_eq!(count, 10_000);
+    assert_eq!(pages, 157);
+    session.release_global_janitor_lock().expect("release lock");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn test_pg_uuid_mismatch_blocks_consistency_check() {
     let Some(dsn) = pg_dsn() else {
         return;
@@ -403,7 +455,7 @@ fn janitor_read_only_session_validates_binding_and_lock() {
         .validate_protection()
         .expect("read-only janitor preflight");
     let protection = first
-        .check_eligibility(&[77, 78, 79, 80, 81, 82, 83])
+        .check_eligibility(&[77, 78, 79, 80, 81, 82, 83], i64::MAX)
         .expect("bounded janitor protection");
     for object_id in [77, 78, 79, 80, 82] {
         assert_eq!(
@@ -453,7 +505,7 @@ fn janitor_read_only_session_validates_binding_and_lock() {
 
         if lifecycle == "deleting" {
             let eligible = first
-                .check_eligibility(&[object_id])
+                .check_eligibility(&[object_id], i64::MAX)
                 .expect("unleased deleting snapshot does not pin objects");
             assert_eq!(
                 eligible.get(&object_id),
@@ -479,7 +531,7 @@ fn janitor_read_only_session_validates_binding_and_lock() {
             .expect("seed live snapshot mount lease");
         } else {
             let protected = first
-                .check_eligibility(&[object_id])
+                .check_eligibility(&[object_id], i64::MAX)
                 .expect("creating or ready snapshot pin query");
             assert_eq!(
                 protected.get(&object_id),
@@ -508,7 +560,7 @@ fn janitor_read_only_session_validates_binding_and_lock() {
     }
 
     let leased = first
-        .check_eligibility(&[86])
+        .check_eligibility(&[86], i64::MAX)
         .expect("live mount lease retains deleting snapshot reachability");
     assert_eq!(leased.get(&86), Some(&crate::JanitorEligibility::Protected));
     first
@@ -728,8 +780,9 @@ fn snapshot_creation_waits_for_the_standalone_janitor_lock() {
         .validate_protection()
         .expect("validate metadata after snapshot registration");
     let cli_runtime = tokio::runtime::Runtime::new().expect("build CLI-like runtime");
-    let protection = cli_runtime
-        .block_on(async { tokio::task::block_in_place(|| janitor.check_eligibility(&[90])) });
+    let protection = cli_runtime.block_on(async {
+        tokio::task::block_in_place(|| janitor.check_eligibility(&[90], i64::MAX))
+    });
     assert_eq!(
         protection
             .expect("run real janitor eligibility under CLI runtime")
@@ -762,8 +815,9 @@ fn snapshot_creation_waits_for_the_standalone_janitor_lock() {
         deleting.lifecycle,
         crate::snapshot::SnapshotLifecycle::Deleting
     );
-    let protection = cli_runtime
-        .block_on(async { tokio::task::block_in_place(|| janitor.check_eligibility(&[90])) });
+    let protection = cli_runtime.block_on(async {
+        tokio::task::block_in_place(|| janitor.check_eligibility(&[90], i64::MAX))
+    });
     assert_eq!(
         protection
             .expect("run janitor eligibility after interleaved deletion")

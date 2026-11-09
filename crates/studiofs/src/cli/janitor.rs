@@ -59,7 +59,17 @@ struct JanitorRunRequest {
 trait JanitorMetadataSource {
     fn try_acquire_global_janitor_lock(&mut self) -> anyhow::Result<bool>;
     fn validate_protection(&mut self) -> anyhow::Result<()>;
-    fn check_eligibility(&mut self, object_ids: &[u64]) -> anyhow::Result<JanitorProtection>;
+    fn check_eligibility(
+        &mut self,
+        object_ids: &[u64],
+        eligible_before: i64,
+    ) -> anyhow::Result<JanitorProtection>;
+    fn gc_candidate_page(
+        &mut self,
+        after: Option<(i64, u64)>,
+        limit: usize,
+        eligible_before: i64,
+    ) -> anyhow::Result<Vec<(u64, i64)>>;
     fn claim_deletion(&mut self, object_id: u64) -> anyhow::Result<Option<i64>>;
     fn finish_deletion(
         &mut self,
@@ -67,6 +77,8 @@ trait JanitorMetadataSource {
         fencing_token: i64,
         outcome: UploadedObjectDeletionOutcome,
     ) -> anyhow::Result<()>;
+    fn retry_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()>;
+    fn ack_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()>;
     fn prune_deletion_fences(&mut self) -> anyhow::Result<u64>;
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()>;
 }
@@ -80,8 +92,23 @@ impl JanitorMetadataSource for JanitorMetadataSession {
         JanitorMetadataSession::validate_protection(self).map_err(anyhow::Error::new)
     }
 
-    fn check_eligibility(&mut self, object_ids: &[u64]) -> anyhow::Result<JanitorProtection> {
-        JanitorMetadataSession::check_eligibility(self, object_ids).map_err(anyhow::Error::new)
+    fn check_eligibility(
+        &mut self,
+        object_ids: &[u64],
+        eligible_before: i64,
+    ) -> anyhow::Result<JanitorProtection> {
+        JanitorMetadataSession::check_eligibility(self, object_ids, eligible_before)
+            .map_err(anyhow::Error::new)
+    }
+
+    fn gc_candidate_page(
+        &mut self,
+        after: Option<(i64, u64)>,
+        limit: usize,
+        eligible_before: i64,
+    ) -> anyhow::Result<Vec<(u64, i64)>> {
+        JanitorMetadataSession::gc_candidate_page(self, after, limit, eligible_before)
+            .map_err(anyhow::Error::new)
     }
 
     fn claim_deletion(&mut self, object_id: u64) -> anyhow::Result<Option<i64>> {
@@ -96,6 +123,14 @@ impl JanitorMetadataSource for JanitorMetadataSession {
     ) -> anyhow::Result<()> {
         JanitorMetadataSession::finish_deletion(self, object_id, fencing_token, outcome)
             .map_err(anyhow::Error::new)
+    }
+
+    fn retry_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()> {
+        JanitorMetadataSession::retry_gc_candidate(self, object_id).map_err(anyhow::Error::new)
+    }
+
+    fn ack_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()> {
+        JanitorMetadataSession::ack_gc_candidate(self, object_id).map_err(anyhow::Error::new)
     }
 
     fn prune_deletion_fences(&mut self) -> anyhow::Result<u64> {
@@ -495,6 +530,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         println!("  orphan candidates:    {}", stats.orphan_candidates);
         println!("  skipped young:        {}", stats.skipped_young);
         println!("  skipped unknown age:  {}", stats.skipped_unknown_age);
+        println!("  deferred candidates: {}", stats.skipped_deferred);
         println!("  outcome:              {}", stats.outcome.label());
         println!(
             "  {}: {}",
@@ -655,6 +691,10 @@ mod tests {
         outcomes: JanitorProtection,
         validation_reads: u64,
         eligibility_reads: Vec<Vec<u64>>,
+        gc_candidates: Vec<(u64, i64)>,
+        gc_candidate_reads: Vec<(Option<u64>, usize)>,
+        gc_candidate_acks: Vec<u64>,
+        gc_candidate_retries: Vec<u64>,
         nested_runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
         releases: u64,
         claim_protected: Vec<u64>,
@@ -707,7 +747,11 @@ mod tests {
             Ok(())
         }
 
-        fn check_eligibility(&mut self, object_ids: &[u64]) -> anyhow::Result<JanitorProtection> {
+        fn check_eligibility(
+            &mut self,
+            object_ids: &[u64],
+            _eligible_before: i64,
+        ) -> anyhow::Result<JanitorProtection> {
             self.eligibility_reads.push(object_ids.to_vec());
             if let Some(error) = self.eligibility_error {
                 anyhow::bail!(error);
@@ -718,11 +762,46 @@ mod tests {
             Ok(object_ids
                 .iter()
                 .filter_map(|id| {
-                    self.outcomes
-                        .get(id)
-                        .or(self.default_eligibility.as_ref())
-                        .map(|eligibility| (*id, *eligibility))
+                    let eligibility = if self.gc_candidate_retries.contains(id) {
+                        Some(JanitorEligibility::Deferred)
+                    } else {
+                        self.outcomes
+                            .get(id)
+                            .or(self.default_eligibility.as_ref())
+                            .copied()
+                    };
+                    eligibility.map(|eligibility| (*id, eligibility))
                 })
+                .collect())
+        }
+
+        fn gc_candidate_page(
+            &mut self,
+            after: Option<(i64, u64)>,
+            limit: usize,
+            eligible_before: i64,
+        ) -> anyhow::Result<Vec<(u64, i64)>> {
+            self.gc_candidate_reads
+                .push((after.map(|(_, id)| id), limit));
+            let after_secs = after.map(|(micros, _)| micros.div_euclid(1_000_000));
+            let after_id = after.map(|(_, id)| id);
+            let mut candidates = self
+                .gc_candidates
+                .iter()
+                .copied()
+                .filter(|(id, eligible_at)| {
+                    *eligible_at <= eligible_before
+                        && after_secs.is_none_or(|after_secs| {
+                            *eligible_at > after_secs
+                                || (*eligible_at == after_secs && Some(*id) > after_id)
+                        })
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_unstable_by_key(|(id, eligible_at)| (*eligible_at, *id));
+            Ok(candidates
+                .into_iter()
+                .take(limit)
+                .map(|(id, eligible_at)| (id, eligible_at.saturating_mul(1_000_000)))
                 .collect())
         }
 
@@ -744,6 +823,16 @@ mod tests {
             if let Some(error) = self.finish_error {
                 anyhow::bail!(error);
             }
+            Ok(())
+        }
+
+        fn retry_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()> {
+            self.gc_candidate_retries.push(object_id);
+            Ok(())
+        }
+
+        fn ack_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()> {
+            self.gc_candidate_acks.push(object_id);
             Ok(())
         }
 
@@ -1309,6 +1398,106 @@ mod tests {
             assert_eq!(finished, (1..=batch).collect::<Vec<_>>());
             assert_eq!(metadata.eligibility_reads.len(), 1);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn janitor_drains_ten_thousand_gc_candidates_in_bounded_pages_before_listing() {
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let mut metadata = FakeJanitorMetadata {
+            gc_candidates: (1..=10_000).map(|id| (id, now - 3600)).collect(),
+            ..FakeJanitorMetadata::eligible()
+        };
+        let store = FakeJanitorStore::default();
+        let stats = run_one_cycle(JanitorCycleContext {
+            store: &store,
+            prefix: "test/objects/",
+            dry_run: true,
+            skip_newer_than_secs: 0,
+            budget: RunBudget::deletes(10_000),
+            metadata: &mut metadata,
+        })
+        .await
+        .expect("drain GC candidates");
+
+        assert_eq!(stats.deleted, 10_000);
+        assert_eq!(stats.queued_candidates_scanned, 10_000);
+        assert_eq!(metadata.gc_candidate_reads.len(), 157);
+        assert!(
+            metadata
+                .gc_candidate_reads
+                .iter()
+                .all(|(_, limit)| *limit <= MAX_JANITOR_ELIGIBILITY_BATCH)
+        );
+        assert_eq!(store.list_requests.load(Ordering::Relaxed), 0);
+        assert!(store.deleted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_candidate_acknowledges_only_confirmed_deletion_and_keeps_failures() {
+        let old = i64::try_from(
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+            - 3600;
+        let store = FakeJanitorStore {
+            entries: studiofs_data::object::format_object_fragment_keys("test/objects/", 5)
+                .into_iter()
+                .map(|key| JanitorEntry {
+                    key,
+                    is_file: true,
+                    last_modified: None,
+                })
+                .collect(),
+            fail_delete: true,
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata {
+            gc_candidates: vec![(5, old)],
+            ..FakeJanitorMetadata::eligible()
+        };
+        let stats = run_one_cycle(JanitorCycleContext {
+            store: &store,
+            prefix: "test/objects/",
+            dry_run: false,
+            skip_newer_than_secs: 0,
+            budget: RunBudget::deletes(2),
+            metadata: &mut metadata,
+        })
+        .await
+        .expect("record retryable deletion");
+        assert_eq!(stats.delete_errors, 1);
+        assert_eq!(stats.skipped_deferred, 1);
+        assert_eq!(metadata.claims, vec![5]);
+        assert_eq!(metadata.gc_candidate_retries, vec![5]);
+        assert!(metadata.gc_candidate_acks.is_empty());
+
+        let store = FakeJanitorStore::default();
+        let mut metadata = FakeJanitorMetadata {
+            gc_candidates: vec![(6, old)],
+            ..FakeJanitorMetadata::eligible()
+        };
+        let stats = run_one_cycle(JanitorCycleContext {
+            store: &store,
+            prefix: "test/objects/",
+            dry_run: false,
+            skip_newer_than_secs: 0,
+            budget: RunBudget::deletes(1),
+            metadata: &mut metadata,
+        })
+        .await
+        .expect("confirm deletion");
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(metadata.gc_candidate_acks, vec![6]);
+        assert_eq!(store.list_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
