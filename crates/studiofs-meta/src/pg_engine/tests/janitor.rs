@@ -83,7 +83,7 @@ fn pg_janitor_gc_candidate_pages_keyset_through_ten_thousand_rows() {
     let mut pages = 0_usize;
     loop {
         let page = session
-            .gc_candidate_page(cursor, 64, i64::MAX)
+            .gc_candidate_page(cursor, 64, i64::MAX, true)
             .expect("read bounded candidate page");
         if page.is_empty() {
             break;

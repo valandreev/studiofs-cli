@@ -69,6 +69,7 @@ trait JanitorMetadataSource {
         after: Option<(i64, u64)>,
         limit: usize,
         eligible_before: i64,
+        backfill: bool,
     ) -> anyhow::Result<Vec<(u64, i64)>>;
     fn claim_deletion(&mut self, object_id: u64) -> anyhow::Result<Option<i64>>;
     fn finish_deletion(
@@ -106,8 +107,9 @@ impl JanitorMetadataSource for JanitorMetadataSession {
         after: Option<(i64, u64)>,
         limit: usize,
         eligible_before: i64,
+        backfill: bool,
     ) -> anyhow::Result<Vec<(u64, i64)>> {
-        JanitorMetadataSession::gc_candidate_page(self, after, limit, eligible_before)
+        JanitorMetadataSession::gc_candidate_page(self, after, limit, eligible_before, backfill)
             .map_err(anyhow::Error::new)
     }
 
@@ -695,6 +697,8 @@ mod tests {
         gc_candidate_reads: Vec<(Option<u64>, usize)>,
         gc_candidate_acks: Vec<u64>,
         gc_candidate_retries: Vec<u64>,
+        gc_candidate_backfills: u64,
+        ack_error: Option<&'static str>,
         nested_runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
         releases: u64,
         claim_protected: Vec<u64>,
@@ -780,9 +784,11 @@ mod tests {
             after: Option<(i64, u64)>,
             limit: usize,
             eligible_before: i64,
+            backfill: bool,
         ) -> anyhow::Result<Vec<(u64, i64)>> {
             self.gc_candidate_reads
                 .push((after.map(|(_, id)| id), limit));
+            self.gc_candidate_backfills += u64::from(backfill);
             let after_secs = after.map(|(micros, _)| micros.div_euclid(1_000_000));
             let after_id = after.map(|(_, id)| id);
             let mut candidates = self
@@ -833,6 +839,9 @@ mod tests {
 
         fn ack_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()> {
             self.gc_candidate_acks.push(object_id);
+            if let Some(error) = self.ack_error {
+                anyhow::bail!(error);
+            }
             Ok(())
         }
 
@@ -1436,6 +1445,10 @@ mod tests {
         );
         assert_eq!(store.list_requests.load(Ordering::Relaxed), 0);
         assert!(store.deleted.lock().unwrap().is_empty());
+        assert_eq!(
+            metadata.gc_candidate_backfills, 0,
+            "dry run must not write the queue"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1497,7 +1510,41 @@ mod tests {
         .expect("confirm deletion");
         assert_eq!(stats.deleted, 1);
         assert_eq!(metadata.gc_candidate_acks, vec![6]);
+        assert!(metadata.gc_candidate_backfills > 0);
         assert_eq!(store.list_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_ack_failure_is_not_fatal_and_protected_rows_are_deferred() {
+        let old = i64::try_from(
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+            - 3600;
+        let store = FakeJanitorStore::default();
+        let mut metadata = FakeJanitorMetadata {
+            gc_candidates: vec![(7, old), (8, old)],
+            outcomes: [(7, JanitorEligibility::Protected)].into_iter().collect(),
+            ack_error: Some("acknowledgement updated no rows"),
+            ..FakeJanitorMetadata::eligible()
+        };
+        let stats = run_one_cycle(JanitorCycleContext {
+            store: &store,
+            prefix: "test/objects/",
+            dry_run: false,
+            skip_newer_than_secs: 0,
+            budget: RunBudget::deletes(1),
+            metadata: &mut metadata,
+        })
+        .await
+        .expect("an ack failure after a confirmed deletion must not abort the cycle");
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.referenced_files, 1);
+        assert_eq!(metadata.gc_candidate_acks, vec![8]);
+        assert_eq!(metadata.gc_candidate_retries, vec![7]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

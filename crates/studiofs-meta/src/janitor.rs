@@ -247,16 +247,19 @@ impl JanitorMetadataSession {
         }
     }
 
-    /// Reads a bounded keyset page of durable PG GC candidates after `after_object_id`.
+    /// Reads a bounded keyset page of durable PG GC candidates after the `(eligible_at_micros, object_id)` cursor.
+    ///
+    /// With `backfill`, it first enqueues legacy `delete_pending` ledger rows; dry runs pass `false`.
     pub fn gc_candidate_page(
         &mut self,
         after: Option<(i64, u64)>,
         limit: usize,
         eligible_before: i64,
+        backfill: bool,
     ) -> Result<Vec<(u64, i64)>, JanitorMetadataError> {
         self.ensure_validated_cycle()?;
         self.postgres
-            .gc_candidate_page(after, limit, eligible_before)
+            .gc_candidate_page(after, limit, eligible_before, backfill)
     }
 
     /// Defers a failed queue candidate so one broken object does not dominate later pages.

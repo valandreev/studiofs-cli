@@ -328,7 +328,7 @@ impl PgJanitorSession {
                 ).await.map_err(|error| janitor_pg_error("janitor upload lease query failed", error))?;
                 let active_uploads = decode_janitor_object_ids(lease_rows).map_err(|error| janitor_pg_error("janitor upload lease IDs are invalid", error))?;
                 let candidate_rows = transaction.query(
-                    "SELECT object_id, floor(extract(epoch FROM eligible_at))::BIGINT, (eligible_at <= to_timestamp($3::BIGINT::double precision) AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp())) FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) AND acknowledged_at IS NULL",
+                    "SELECT object_id, floor(extract(epoch FROM eligible_at))::BIGINT, (extract(epoch FROM eligible_at) <= $3::BIGINT AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp())) FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) AND acknowledged_at IS NULL",
                     &[&volume_id, &object_ids, &eligible_before],
                 ).await.map_err(|error| janitor_pg_error("janitor GC candidate state query failed", error))?;
                 let gc_candidates = candidate_rows.into_iter().map(|row| {
@@ -378,6 +378,7 @@ impl PgJanitorSession {
         after: Option<(i64, u64)>,
         requested_limit: usize,
         eligible_before: i64,
+        backfill: bool,
     ) -> Result<Vec<(u64, i64)>, JanitorMetadataError> {
         let (Some(client), Some(runtime)) = (self.client.as_mut(), self.runtime.as_ref()) else {
             return Err(JanitorMetadataError::UnsafeToDelete(
@@ -396,23 +397,26 @@ impl PgJanitorSession {
                 JanitorMetadataError::UnsafeToDelete("janitor candidate page limit is invalid")
             })?;
         let statement = if after.is_some() {
-            "SELECT object_id, floor(extract(epoch FROM eligible_at) * 1000000)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND acknowledged_at IS NULL AND (eligible_at, object_id) > (to_timestamp($2::BIGINT::double precision / 1000000.0), $3) AND eligible_at <= to_timestamp($4::BIGINT::double precision) AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()) ORDER BY eligible_at, object_id LIMIT $5"
+            "SELECT object_id, floor(extract(epoch FROM eligible_at) * 1000000)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND acknowledged_at IS NULL AND (eligible_at, object_id) > ('epoch'::timestamptz + $2::BIGINT * interval '1 microsecond', $3) AND extract(epoch FROM eligible_at) <= $4::BIGINT AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()) ORDER BY eligible_at, object_id LIMIT $5"
         } else {
-            "SELECT object_id, floor(extract(epoch FROM eligible_at) * 1000000)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND acknowledged_at IS NULL AND eligible_at <= to_timestamp($2::BIGINT::double precision) AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()) ORDER BY eligible_at, object_id LIMIT $3"
+            "SELECT object_id, floor(extract(epoch FROM eligible_at) * 1000000)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND acknowledged_at IS NULL AND extract(epoch FROM eligible_at) <= $2::BIGINT AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()) ORDER BY eligible_at, object_id LIMIT $3"
         };
         let result = runtime.block_on(async {
             tokio::time::timeout(self.command_timeout, async {
                 let tx = client.transaction().await?;
+                // Dry runs only read the queue; ledger conversion and backfill are writes.
+                if backfill {
                 tx.execute(
                     "WITH legacy AS (SELECT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND state = 'retry_wait' AND last_error IN ('remote deletion retry required', 'cli janitor remote deletion retry required') AND (reconcile_lease_expires_at IS NULL OR reconcile_lease_expires_at <= clock_timestamp()) ORDER BY object_id LIMIT $2 FOR UPDATE SKIP LOCKED) UPDATE snapshot_payload_upload_objects AS uploaded SET state = 'delete_pending', reconcile_owner = NULL, reconcile_lease_expires_at = NULL, next_retry_at = NULL WHERE uploaded.vol = $1 AND uploaded.object_id IN (SELECT object_id FROM legacy)",
                     &[&self.volume_id, &limit],
                 )
                 .await?;
                 tx.execute(
-                    "WITH pending AS (SELECT uploaded.object_id, COALESCE(uploaded.closed_at, uploaded.created_at) AS eligible_at, uploaded.next_retry_at FROM snapshot_payload_upload_objects AS uploaded LEFT JOIN snapshot_payload_gc_candidates AS candidate ON candidate.vol = uploaded.vol AND candidate.object_id = uploaded.object_id WHERE uploaded.vol = $1 AND uploaded.state = 'delete_pending' AND uploaded.reconcile_owner IS NULL AND candidate.object_id IS NULL AND COALESCE(uploaded.closed_at, uploaded.created_at) <= to_timestamp($2::BIGINT::double precision) AND (uploaded.next_retry_at IS NULL OR uploaded.next_retry_at <= clock_timestamp()) ORDER BY eligible_at, uploaded.object_id LIMIT $3 FOR UPDATE OF uploaded SKIP LOCKED) INSERT INTO snapshot_payload_gc_candidates (vol, object_id, eligible_at, next_attempt_at) SELECT $1, object_id, eligible_at, next_retry_at FROM pending ON CONFLICT (vol, object_id) DO NOTHING",
+                    "WITH pending AS (SELECT uploaded.object_id, COALESCE(uploaded.closed_at, uploaded.created_at) AS eligible_at, uploaded.next_retry_at FROM snapshot_payload_upload_objects AS uploaded LEFT JOIN snapshot_payload_gc_candidates AS candidate ON candidate.vol = uploaded.vol AND candidate.object_id = uploaded.object_id WHERE uploaded.vol = $1 AND uploaded.state = 'delete_pending' AND uploaded.reconcile_owner IS NULL AND candidate.object_id IS NULL AND extract(epoch FROM COALESCE(uploaded.closed_at, uploaded.created_at)) <= $2::BIGINT AND (uploaded.next_retry_at IS NULL OR uploaded.next_retry_at <= clock_timestamp()) ORDER BY eligible_at, uploaded.object_id LIMIT $3 FOR UPDATE OF uploaded SKIP LOCKED) INSERT INTO snapshot_payload_gc_candidates (vol, object_id, eligible_at, next_attempt_at) SELECT $1, object_id, eligible_at, next_retry_at FROM pending ON CONFLICT (vol, object_id) DO NOTHING",
                     &[&self.volume_id, &eligible_before, &limit],
                 )
                 .await?;
+                }
                 let rows = match after {
                     Some((eligible_at, object_id)) => tx.query(statement, &[&self.volume_id, &eligible_at, &object_id, &eligible_before, &limit]).await?,
                     None => tx.query(statement, &[&self.volume_id, &eligible_before, &limit]).await?,

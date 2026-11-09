@@ -307,6 +307,7 @@ async fn process_orphan<S: JanitorObjectStore>(
     stats.claims = stats.claims.saturating_add(1);
     let Some(fencing_token) = claim else {
         stats.claim_protected = stats.claim_protected.saturating_add(1);
+        defer_queued_candidate(ctx, candidate);
         return Ok(());
     };
 
@@ -358,11 +359,31 @@ async fn process_orphan<S: JanitorObjectStore>(
         }
         stats.delete_errors = stats.delete_errors.saturating_add(1);
     } else {
-        tokio::task::block_in_place(|| ctx.metadata.ack_gc_candidate(object_id))
-            .with_context(|| format!("failed to acknowledge deleted GC candidate {object_id}"))?;
+        // The fenced finish already confirmed deletion; an unacked row is only re-claimed later.
+        let ack = tokio::task::block_in_place(|| ctx.metadata.ack_gc_candidate(object_id));
+        if let Err(error) = ack {
+            eprintln!(
+                "janitor: failed to acknowledge GC candidate object_id={object_id}: {error:#}"
+            );
+        }
         stats.deleted = stats.deleted.saturating_add(1);
     }
     Ok(())
+}
+
+/// Delays a protected queue row so it does not re-occupy the head of every later page.
+fn defer_queued_candidate<S: JanitorObjectStore>(
+    ctx: &mut JanitorCycleContext<'_, S>,
+    candidate: &Candidate,
+) {
+    if ctx.dry_run || candidate.queued_eligible_at.is_none() {
+        return;
+    }
+    let object_id = candidate.object_id;
+    let retry = tokio::task::block_in_place(|| ctx.metadata.retry_gc_candidate(object_id));
+    if let Err(error) = retry {
+        eprintln!("janitor: failed to defer GC candidate object_id={object_id}: {error:#}");
+    }
 }
 
 pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
@@ -409,6 +430,7 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
                 page_limit,
                 now_unix
                     .saturating_sub(i64::try_from(ctx.skip_newer_than_secs).unwrap_or(i64::MAX)),
+                !ctx.dry_run,
             )
         })?;
         if page.is_empty() {
@@ -588,7 +610,6 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
     let protection =
         tokio::task::block_in_place(|| ctx.metadata.check_eligibility(&ids, eligible_before))?;
     // Resolve every decision before any delete so one unknown outcome retains the whole batch.
-    // `Some(pending_deletion)` marks an eligible orphan; `None` marks a protected object.
     enum Decision {
         Protected,
         Deferred,
@@ -619,6 +640,7 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
         match decision {
             Decision::Protected => {
                 stats.referenced_files = stats.referenced_files.saturating_add(1);
+                defer_queued_candidate(ctx, &candidate);
             }
             Decision::Deferred => {
                 stats.skipped_deferred = stats.skipped_deferred.saturating_add(1);
