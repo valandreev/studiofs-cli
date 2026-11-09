@@ -216,6 +216,23 @@ cargo test -p studiofs-vfs shutdown_result_reports_local_payload_sync_failure --
 cargo test -p studiofs-vfs shutdown_replay_preserves_typed_error_for_owner_and_waiter -- --nocapture
 ```
 
+### SFS-971 CLI Janitor Budget Regressions
+
+Run these focused checks when changing CLI janitor admission, the delete cap,
+or scan/time budgets:
+
+```bash
+cargo test -p studiofs --bin studiofs janitor -- --nocapture
+```
+
+They cover `delete_cap_counts_only_confirmed_successes_and_stops_listing`,
+`failed_deletes_never_consume_the_delete_cap`,
+`scan_budget_stops_listing_and_finishes_already_listed_candidates`,
+`exhausted_time_budget_admits_no_listing_or_candidate`,
+`stalled_head_probe_times_out_as_unknown_age`,
+`janitor_budget_flags_reject_zero_and_loop_mode`, and the OpenDAL
+fake-S3 check `janitor_delete_cap_stops_opendal_listing_after_first_page`.
+
 ### SFS-642 PostgreSQL Lifecycle and Schema Regressions
 
 Run these focused checks when changing PostgreSQL worker ownership, startup

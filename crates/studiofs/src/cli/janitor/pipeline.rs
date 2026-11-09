@@ -15,6 +15,9 @@ const DELETE_KEY_TIMEOUT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(20)
 };
+/// Bound for one HEAD age probe; a stalled probe leaves the object as unknown age,
+/// so one request cannot hold the cycle past its wall-clock budget.
+const HEAD_TIMEOUT: Duration = DELETE_KEY_TIMEOUT;
 /// Bound for one listing step; a stalled page fails the cycle. Finished
 /// deletions are already confirmed in PostgreSQL, so no completed work is lost.
 const LIST_PAGE_TIMEOUT: Duration = if cfg!(test) {
@@ -60,11 +63,12 @@ pub(super) enum CycleOutcome {
     /// The whole prefix was listed and every listed candidate was decided.
     #[default]
     Complete,
-    /// `max_deletes` successful deletions were confirmed; the unlisted tail was not scanned.
+    /// `max_deletes` successful deletions were confirmed and admission stopped. Listing
+    /// never looks ahead, so the cap met on the last entry also reports this.
     DeleteCapReached,
-    /// The listed-entry budget ran out before the listing ended.
+    /// The listed-entry budget was met before the listing was seen to end.
     ScanBudgetExhausted,
-    /// The wall-clock budget ran out before the listing ended.
+    /// The wall-clock budget ran out before all listed work was admitted.
     TimeBudgetExhausted,
 }
 
@@ -87,7 +91,7 @@ pub(super) struct RunBudget {
     /// objects never consume it. Deletion is sequential, so it cannot overshoot.
     pub(super) max_deletes: u64,
     /// Listed entries after which no further entry is pulled from the listing.
-    pub(super) max_listed_entries: Option<u64>,
+    pub(super) max_scan_entries: Option<u64>,
     /// Wall-clock time after which no further entry or candidate is admitted.
     pub(super) max_runtime: Option<Duration>,
 }
@@ -97,7 +101,7 @@ impl RunBudget {
     pub(super) fn deletes(max_deletes: u64) -> Self {
         Self {
             max_deletes,
-            max_listed_entries: None,
+            max_scan_entries: None,
             max_runtime: None,
         }
     }
@@ -115,7 +119,7 @@ impl RunBudget {
     /// [`Self::admission_stop`] plus the listed-entry budget, checked before each listing step.
     fn listing_stop(&self, stats: &JanitorStats, started: Instant) -> Option<CycleOutcome> {
         self.admission_stop(stats, started).or_else(|| {
-            self.max_listed_entries
+            self.max_scan_entries
                 .filter(|max| stats.initial_listing_entries >= *max)
                 .map(|_| CycleOutcome::ScanBudgetExhausted)
         })
@@ -209,7 +213,9 @@ async fn process_orphan<S: JanitorObjectStore>(
         }
         stats.head_requests = stats.head_requests.saturating_add(1);
         let head_started = Instant::now();
-        let last_modified = ctx.store.last_modified(path).await;
+        let last_modified = tokio::time::timeout(HEAD_TIMEOUT, ctx.store.last_modified(path))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("HEAD timed out")));
         stats.head_elapsed += head_started.elapsed();
         let last_modified = match last_modified {
             Ok(Some(value)) => value,

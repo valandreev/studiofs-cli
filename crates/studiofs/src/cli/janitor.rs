@@ -182,11 +182,13 @@ pub(crate) struct JanitorArgs {
     max_deletes: u64,
 
     /// Stop listing a cycle after this many entries and report it as partial
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    // ponytail: no continuation is persisted yet (SFS-973), so a looped partial cycle
+    // would rescan the same head forever; allow with --loop once checkpoints exist.
+    #[arg(long, conflicts_with = "loop", value_parser = clap::value_parser!(u64).range(1..))]
     max_scan_entries: Option<u64>,
 
     /// Stop admitting new work after this many minutes per cycle and report it as partial
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, conflicts_with = "loop", value_parser = clap::value_parser!(u64).range(1..))]
     max_runtime_minutes: Option<u64>,
 }
 
@@ -470,7 +472,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 skip_newer_than_secs: skip_secs,
                 budget: RunBudget {
                     max_deletes,
-                    max_listed_entries: max_scan_entries,
+                    max_scan_entries,
                     max_runtime: max_runtime_minutes
                         .map(|minutes| Duration::from_secs(minutes.saturating_mul(60))),
                 },
@@ -569,6 +571,7 @@ mod tests {
         /// Stall the listing after yielding every entry.
         hang_list: bool,
         fail_head: bool,
+        hang_head: bool,
         head_missing: bool,
         head_young: bool,
         fail_delete: bool,
@@ -617,6 +620,9 @@ mod tests {
             self.head_requests.fetch_add(1, Ordering::Relaxed);
             if self.fail_head {
                 anyhow::bail!("head failed")
+            }
+            if self.hang_head {
+                std::future::pending::<()>().await;
             }
             if self.head_missing {
                 return Ok(None);
@@ -1406,13 +1412,34 @@ mod tests {
         let mut metadata = FakeJanitorMetadata::eligible();
         let mut ctx = fake_cycle_context(&store, &mut metadata);
         ctx.budget.max_deletes = u64::MAX;
-        ctx.budget.max_listed_entries = Some(3 * fragments);
+        ctx.budget.max_scan_entries = Some(3 * fragments);
         let stats = run_one_cycle(ctx).await.unwrap();
 
         assert_eq!(stats.outcome, pipeline::CycleOutcome::ScanBudgetExhausted);
         assert_eq!(stats.initial_listing_entries, 3 * fragments);
         assert_eq!(stats.deleted, 3);
         assert_eq!(metadata.claims, vec![1, 2, 3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_head_probe_times_out_as_unknown_age() {
+        let store = FakeJanitorStore {
+            entries: fragment_entries(2),
+            hang_head: true,
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let stats = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_one_cycle(fake_cycle_context(&store, &mut metadata)),
+        )
+        .await
+        .expect("a stalled HEAD must not hold the cycle")
+        .unwrap();
+
+        assert_eq!(stats.outcome, pipeline::CycleOutcome::Complete);
+        assert_eq!(stats.skipped_unknown_age, 2);
+        assert!(metadata.claims.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1923,10 +1950,6 @@ mod tests {
             "20",
             "--max-deletes",
             "600",
-            "--max-scan-entries",
-            "10000",
-            "--max-runtime-minutes",
-            "30",
         ])
         .unwrap();
 
@@ -1949,15 +1972,30 @@ mod tests {
                 assert_eq!(interval_minutes, 45);
                 assert_eq!(skip_newer_minutes, 20);
                 assert_eq!(max_deletes, 600);
-                assert_eq!(max_scan_entries, Some(10_000));
-                assert_eq!(max_runtime_minutes, Some(30));
+                assert_eq!(max_scan_entries, None);
+                assert_eq!(max_runtime_minutes, None);
             }
             other => panic!("expected Janitor, got {other:?}"),
         }
     }
 
     #[test]
-    fn janitor_rejects_zero_budgets() {
+    fn janitor_budget_flags_reject_zero_and_loop_mode() {
+        let cli = crate::cli::parse_for_test(&[
+            "janitor",
+            "vol",
+            "--max-scan-entries",
+            "10000",
+            "--max-runtime-minutes",
+            "30",
+        ])
+        .unwrap();
+        let crate::cli::Commands::Janitor(args) = cli.command else {
+            panic!("expected Janitor");
+        };
+        assert_eq!(args.max_scan_entries, Some(10_000));
+        assert_eq!(args.max_runtime_minutes, Some(30));
+
         for flag in [
             "--max-deletes",
             "--max-scan-entries",
@@ -1966,6 +2004,13 @@ mod tests {
             assert!(
                 crate::cli::parse_for_test(&["janitor", "vol", flag, "0"]).is_err(),
                 "{flag} 0 must be rejected"
+            );
+        }
+        // Without a persisted continuation a looped partial cycle never reaches the tail.
+        for flag in ["--max-scan-entries", "--max-runtime-minutes"] {
+            assert!(
+                crate::cli::parse_for_test(&["janitor", "vol", "--loop", flag, "5"]).is_err(),
+                "{flag} must conflict with --loop"
             );
         }
     }
