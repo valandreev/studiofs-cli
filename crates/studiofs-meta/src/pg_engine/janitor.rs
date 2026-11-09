@@ -11,6 +11,30 @@ use tokio_postgres::Client;
 
 const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
 
+/// Objects retained by live or leased snapshots; shared by mounted and CLI janitors.
+const SNAPSHOT_PIN_QUERY: &str = "SELECT DISTINCT reachability.object_id
+    FROM snapshot_object_reachability AS reachability
+    JOIN snapshot_catalog AS catalog
+      ON catalog.vol = reachability.vol
+     AND catalog.cut_version >= reachability.start_version
+     AND (reachability.end_version IS NULL
+          OR catalog.cut_version < reachability.end_version)
+    WHERE reachability.vol = $1
+      AND (
+          catalog.lifecycle IN ('creating', 'ready')
+          OR (
+              catalog.lifecycle = 'deleting'
+              AND EXISTS (
+                  SELECT 1
+                  FROM snapshot_mount_leases AS mount_lease
+                  WHERE mount_lease.vol = catalog.vol
+                    AND mount_lease.snapshot_id = catalog.id
+                    AND mount_lease.released_at IS NULL
+                    AND mount_lease.lease_expires_at > clock_timestamp()
+              )
+          )
+      )";
+
 pub(crate) struct PgJanitorSession {
     postgres_url: String,
     volume_id: i64,
@@ -273,7 +297,7 @@ impl PgJanitorSession {
                     })?;
                 let pin_rows = transaction
                     .query(
-                        "SELECT DISTINCT reachability.object_id FROM snapshot_object_reachability AS reachability JOIN snapshot_catalog AS catalog ON catalog.vol = reachability.vol AND catalog.cut_version >= reachability.start_version AND (reachability.end_version IS NULL OR catalog.cut_version < reachability.end_version) WHERE reachability.vol = $1 AND (catalog.lifecycle IN ('creating', 'ready') OR (catalog.lifecycle = 'deleting' AND EXISTS (SELECT 1 FROM snapshot_mount_leases AS mount_lease WHERE mount_lease.vol = catalog.vol AND mount_lease.snapshot_id = catalog.id AND mount_lease.released_at IS NULL AND mount_lease.lease_expires_at > clock_timestamp())))",
+                        SNAPSHOT_PIN_QUERY,
                         &[&volume_id],
                     )
                     .await
@@ -282,9 +306,9 @@ impl PgJanitorSession {
                     })?;
 
                 let referenced = decode_janitor_object_ids(reference_rows)
-                    .map_err(|error| janitor_meta_error("janitor current references are invalid", error))?;
+                    .map_err(|error| janitor_pg_error("janitor current references are invalid", error))?;
                 let snapshot_pins = decode_janitor_object_ids(pin_rows)
-                    .map_err(|error| janitor_meta_error("janitor snapshot pins are invalid", error))?;
+                    .map_err(|error| janitor_pg_error("janitor snapshot pins are invalid", error))?;
                 transaction.commit().await.map_err(|error| {
                     janitor_pg_error("janitor metadata read commit failed", error)
                 })?;
@@ -304,14 +328,8 @@ impl PgJanitorSession {
     }
 }
 
-fn janitor_pg_error(context: &'static str, _error: tokio_postgres::Error) -> JanitorMetadataError {
-    JanitorMetadataError::BackendUnavailable(context.to_owned())
-}
-
-fn janitor_meta_error(
-    context: &'static str,
-    _error: impl std::fmt::Display,
-) -> JanitorMetadataError {
+/// Drops the source error so PostgreSQL details (possibly the DSN) never reach CLI output.
+fn janitor_pg_error(context: &'static str, _error: impl std::fmt::Display) -> JanitorMetadataError {
     JanitorMetadataError::BackendUnavailable(context.to_owned())
 }
 
@@ -441,28 +459,7 @@ impl PgMetaEngine {
                         }
                         client
                             .query(
-                                "SELECT DISTINCT reachability.object_id
-                                 FROM snapshot_object_reachability AS reachability
-                                 JOIN snapshot_catalog AS catalog
-                                   ON catalog.vol = reachability.vol
-                                  AND catalog.cut_version >= reachability.start_version
-                                  AND (reachability.end_version IS NULL
-                                       OR catalog.cut_version < reachability.end_version)
-                                 WHERE reachability.vol = $1
-                                   AND (
-                                       catalog.lifecycle IN ('creating', 'ready')
-                                       OR (
-                                           catalog.lifecycle = 'deleting'
-                                           AND EXISTS (
-                                               SELECT 1
-                                               FROM snapshot_mount_leases AS mount_lease
-                                               WHERE mount_lease.vol = catalog.vol
-                                                 AND mount_lease.snapshot_id = catalog.id
-                                                 AND mount_lease.released_at IS NULL
-                                                 AND mount_lease.lease_expires_at > clock_timestamp()
-                                           )
-                                       )
-                                   )",
+                                SNAPSHOT_PIN_QUERY,
                                 &[&volume_id],
                             )
                             .await
