@@ -602,7 +602,7 @@ mod tests {
             if self.head_missing {
                 return Ok(None);
             }
-            let age = if self.head_young { 0 } else { 3600 };
+            let age = if self.head_young { 30 } else { 3600 };
             Ok(Some(SystemTime::now() - Duration::from_secs(age)))
         }
 
@@ -747,7 +747,11 @@ mod tests {
             let store = FakeJanitorStore {
                 entries: studiofs_data::object::format_object_fragment_keys("test/objects/", 9)
                     .into_iter()
-                    .map(|key| JanitorEntry { key, is_file: true })
+                    .map(|key| JanitorEntry {
+                        key,
+                        is_file: true,
+                        last_modified: None,
+                    })
                     .collect(),
                 ..FakeJanitorStore::default()
             };
@@ -781,7 +785,11 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let entries = studiofs_data::object::format_object_fragment_keys("test/objects/", 42)
             .into_iter()
-            .map(|key| JanitorEntry { key, is_file: true })
+            .map(|key| JanitorEntry {
+                key,
+                is_file: true,
+                last_modified: None,
+            })
             .collect();
         let store = FakeJanitorStore {
             entries,
@@ -854,7 +862,11 @@ mod tests {
         let keys_for = |object_id| {
             studiofs_data::object::format_object_fragment_keys("test/objects/", object_id)
                 .into_iter()
-                .map(|key| studiofs_data::janitor::JanitorEntry { key, is_file: true })
+                .map(|key| studiofs_data::janitor::JanitorEntry {
+                    key,
+                    is_file: true,
+                    last_modified: None,
+                })
                 .collect::<Vec<_>>()
         };
         let mut entries = keys_for(1);
@@ -898,7 +910,11 @@ mod tests {
     async fn claim_protection_and_claim_failure_prevent_every_delete() {
         let entries: Vec<_> = canonical_keys(1)
             .into_iter()
-            .map(|key| JanitorEntry { key, is_file: true })
+            .map(|key| JanitorEntry {
+                key,
+                is_file: true,
+                last_modified: None,
+            })
             .collect();
         let store = FakeJanitorStore {
             entries: entries.clone(),
@@ -939,7 +955,11 @@ mod tests {
     async fn unconfirmed_finish_and_failed_delete_are_not_reported_as_deleted() {
         let entries: Vec<_> = canonical_keys(2)
             .into_iter()
-            .map(|key| JanitorEntry { key, is_file: true })
+            .map(|key| JanitorEntry {
+                key,
+                is_file: true,
+                last_modified: None,
+            })
             .collect();
         // A stale finish token after successful S3 deletes must not count as success.
         let store = FakeJanitorStore {
@@ -980,15 +1000,119 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listing_timestamps_decide_object_age_conservatively_without_head() {
+        let ago = |secs| Some(SystemTime::now() - Duration::from_secs(secs));
+        let ahead = Some(SystemTime::now() + Duration::from_secs(300));
+        let entry = |key: String, last_modified| JanitorEntry {
+            key,
+            is_file: true,
+            last_modified,
+        };
+        let legacy = |id| studiofs_data::object::format_object_key("test/objects/", id);
+        let fragment =
+            |id| studiofs_data::object::format_object_fragment_keys("test/objects/", id)[0].clone();
+        // Entries follow S3's lexicographic listing order.
+        let entries = vec![
+            // A foreign prefix is never parsed into an object.
+            entry(format!("other/{}", legacy(5)), ago(3600)),
+            // Old legacy key plus a young fragment: the newest key decides, so it is young.
+            entry(legacy(1), ago(3600)),
+            entry(fragment(1), ago(30)),
+            // A duplicated listing of one key is one object, claimed once.
+            entry(legacy(2), ago(3600)),
+            entry(legacy(2), ago(3600)),
+            entry(fragment(2), ago(3600)),
+            // Clock skew: a future-dated key makes the whole object's age unknown.
+            entry(legacy(3), ago(3600)),
+            entry(fragment(3), ahead),
+            // Only the key listed without a timestamp is HEADed.
+            entry(legacy(4), ago(3600)),
+            entry(fragment(4), None),
+            // Malformed paths are never parsed into an object.
+            entry(format!("{}x", legacy(6)), ago(3600)),
+            // An old pending-deletion mark does not override a young listed key.
+            entry(legacy(7), ago(30)),
+            entry("test/objects/zzzz/not-an-object".to_owned(), ago(3600)),
+        ];
+        let store = FakeJanitorStore {
+            entries,
+            ..FakeJanitorStore::default()
+        };
+        let pending_long_ago = i64::try_from(
+            (SystemTime::now() - Duration::from_secs(3600))
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let mut metadata = FakeJanitorMetadata {
+            outcomes: HashMap::from([(
+                7,
+                JanitorEligibility::Eligible {
+                    pending_deletion: Some(pending_long_ago),
+                },
+            )]),
+            ..FakeJanitorMetadata::eligible()
+        };
+        let stats = run_one_cycle(JanitorCycleContext {
+            max_deletes: u64::MAX,
+            ..fake_cycle_context(&store, &mut metadata)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(stats.skipped_non_canonical, 3);
+        assert_eq!(stats.orphan_candidates, 5);
+        assert_eq!(stats.skipped_young, 2);
+        assert_eq!(stats.skipped_unknown_age, 1);
+        assert_eq!(stats.head_requests, 1);
+        assert_eq!(store.head_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(metadata.claims, vec![2, 4]);
+        assert_eq!(stats.deleted, 2);
+        let expected: Vec<String> = canonical_keys(2)
+            .into_iter()
+            .chain(canonical_keys(4))
+            .collect();
+        assert_eq!(*store.deleted.lock().unwrap(), expected);
+
+        // A key listed out of order fails the cycle before its object is judged.
+        let store = FakeJanitorStore {
+            entries: vec![
+                entry(legacy(8), ago(3600)),
+                entry(legacy(9), ago(3600)),
+                entry(fragment(8), ago(30)),
+            ],
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let error = run_one_cycle(JanitorCycleContext {
+            max_deletes: u64::MAX,
+            ..fake_cycle_context(&store, &mut metadata)
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not in lexicographic order after 3 entries"),
+            "{error:#}"
+        );
+        assert!(metadata.claims.is_empty());
+        assert!(store.deleted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn legacy_keys_are_cleaned_and_non_canonical_keys_are_never_touched() {
         let store = FakeJanitorStore {
             entries: [
                 studiofs_data::object::format_object_key("test/objects/", 5),
-                "test/objects/unrelated/0000000000000006".to_string(),
                 "test/objects/0007/0000000000000007/extra".to_string(),
+                "test/objects/unrelated/0000000000000006".to_string(),
             ]
             .into_iter()
-            .map(|key| JanitorEntry { key, is_file: true })
+            .map(|key| JanitorEntry {
+                key,
+                is_file: true,
+                last_modified: None,
+            })
             .collect(),
             ..FakeJanitorStore::default()
         };
@@ -1009,7 +1133,11 @@ mod tests {
                 .flat_map(|id| {
                     studiofs_data::object::format_object_fragment_keys("test/objects/", id)
                 })
-                .map(|key| JanitorEntry { key, is_file: true })
+                .map(|key| JanitorEntry {
+                    key,
+                    is_file: true,
+                    last_modified: None,
+                })
                 .collect();
             let store = FakeJanitorStore {
                 entries,
@@ -1049,7 +1177,11 @@ mod tests {
     async fn eligibility_requests_are_split_into_bounded_batches() {
         let entries = (1..=129)
             .flat_map(|id| studiofs_data::object::format_object_fragment_keys("test/objects/", id))
-            .map(|key| JanitorEntry { key, is_file: true })
+            .map(|key| JanitorEntry {
+                key,
+                is_file: true,
+                last_modified: None,
+            })
             .collect();
         let store = FakeJanitorStore {
             entries,
@@ -1088,7 +1220,11 @@ mod tests {
     fn metadata_owned_runtime_works_inside_the_cli_runtime() {
         let entries = studiofs_data::object::format_object_fragment_keys("test/objects/", 1)
             .into_iter()
-            .map(|key| JanitorEntry { key, is_file: true })
+            .map(|key| JanitorEntry {
+                key,
+                is_file: true,
+                last_modified: None,
+            })
             .collect();
         let store = FakeJanitorStore {
             entries,
@@ -1115,7 +1251,11 @@ mod tests {
     fn fragment_entries(count: u64) -> Vec<JanitorEntry> {
         (1..=count)
             .flat_map(|id| studiofs_data::object::format_object_fragment_keys("test/objects/", id))
-            .map(|key| JanitorEntry { key, is_file: true })
+            .map(|key| JanitorEntry {
+                key,
+                is_file: true,
+                last_modified: None,
+            })
             .collect()
     }
 
@@ -1156,7 +1296,11 @@ mod tests {
     async fn fake_store_failures_skip_deletion_and_not_found_fragments_are_tolerated() {
         let entries = studiofs_data::object::format_object_fragment_keys("test/objects/", 4)
             .into_iter()
-            .map(|key| studiofs_data::janitor::JanitorEntry { key, is_file: true })
+            .map(|key| studiofs_data::janitor::JanitorEntry {
+                key,
+                is_file: true,
+                last_modified: None,
+            })
             .collect::<Vec<_>>();
         let listing_failure = FakeJanitorStore {
             fail_list: true,
@@ -1219,7 +1363,11 @@ mod tests {
                 .flat_map(|&id| {
                     studiofs_data::object::format_object_fragment_keys("test/objects/", id)
                 })
-                .map(|key| JanitorEntry { key, is_file: true })
+                .map(|key| JanitorEntry {
+                    key,
+                    is_file: true,
+                    last_modified: None,
+                })
                 .collect::<Vec<_>>()
         };
         // Unknown and young HEAD ages never delete.
@@ -1323,7 +1471,7 @@ mod tests {
         list_requests: AtomicU64,
         head_requests: AtomicU64,
         delete_requests: AtomicU64,
-        list_requests_before_first_head: AtomicU64,
+        list_requests_before_first_delete: AtomicU64,
         object_count: u64,
         /// Never answer this 0-based list page, simulating a stalled provider.
         stall_page: Option<u64>,
@@ -1390,19 +1538,19 @@ mod tests {
                     );
                     ("200 OK", body, "Content-Type: application/xml\r\n")
                 } else if first_line.starts_with("HEAD ") {
-                    if fake.head_requests.fetch_add(1, Ordering::Relaxed) == 0 {
-                        fake.list_requests_before_first_head.store(
-                            fake.list_requests.load(Ordering::Relaxed),
-                            Ordering::Relaxed,
-                        );
-                    }
+                    fake.head_requests.fetch_add(1, Ordering::Relaxed);
                     (
                         "200 OK",
                         String::new(),
                         "Last-Modified: Wed, 01 Jan 2020 00:00:00 GMT\r\n",
                     )
                 } else if first_line.starts_with("DELETE ") {
-                    fake.delete_requests.fetch_add(1, Ordering::Relaxed);
+                    if fake.delete_requests.fetch_add(1, Ordering::Relaxed) == 0 {
+                        fake.list_requests_before_first_delete.store(
+                            fake.list_requests.load(Ordering::Relaxed),
+                            Ordering::Relaxed,
+                        );
+                    }
                     ("204 No Content", String::new(), "")
                 } else {
                     ("501 Not Implemented", String::new(), "")
@@ -1442,7 +1590,7 @@ mod tests {
             list_requests: AtomicU64::new(0),
             head_requests: AtomicU64::new(0),
             delete_requests: AtomicU64::new(0),
-            list_requests_before_first_head: AtomicU64::new(0),
+            list_requests_before_first_delete: AtomicU64::new(0),
             object_count,
             stall_page,
         });
@@ -1548,9 +1696,10 @@ mod tests {
         let stats = stats.unwrap();
 
         assert_eq!(fake.list_requests.load(Ordering::Relaxed), 21);
-        // The first HEAD is issued while only the first of 21 pages has been fetched.
+        // The first DELETE is issued while only the first of 21 pages has been fetched.
         assert_eq!(
-            fake.list_requests_before_first_head.load(Ordering::Relaxed),
+            fake.list_requests_before_first_delete
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(stats.scanned_files, 20_005);
@@ -1565,8 +1714,9 @@ mod tests {
         );
         assert!(stats.first_listing_entry.is_some());
         assert!(stats.time_to_first_candidate.is_some());
-        assert_eq!(stats.head_requests, 2);
-        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 2);
+        // Listing pages carry LastModified, so age checks issue no HEAD.
+        assert_eq!(stats.head_requests, 0);
+        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 0);
         // Legacy key plus every fragment key per deleted object.
         let keys_per_object = studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64 + 1;
         assert_eq!(stats.delete_requests, 2 * keys_per_object);
@@ -1615,17 +1765,10 @@ mod tests {
         );
         assert!(error.contains("listing page timed out"), "{error}");
         assert_eq!(fake.list_requests.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            fake.list_requests_before_first_head.load(Ordering::Relaxed),
-            1
-        );
         // 1,000 listed objects fill 15 whole batches; the 40-object tail is never acted on.
         let full_batches = 1000 / MAX_JANITOR_ELIGIBILITY_BATCH;
         assert_eq!(metadata.eligibility_reads.len(), full_batches);
-        assert_eq!(
-            fake.head_requests.load(Ordering::Relaxed),
-            (full_batches * MAX_JANITOR_ELIGIBILITY_BATCH) as u64
-        );
+        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1651,7 +1794,7 @@ mod tests {
         let stats = result.unwrap();
 
         assert_eq!(stats.deleted, 1);
-        assert_eq!(stats.head_requests, 1);
+        assert_eq!(stats.head_requests, 0);
         assert_eq!(
             stats.head_requests,
             fake.head_requests.load(Ordering::Relaxed)

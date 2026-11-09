@@ -296,3 +296,132 @@ async fn https_endpoint_fixture_put_get_when_configured() {
     delete_res.expect("failed to delete object");
     assert_eq!(got, payload, "downloaded object must match uploaded data");
 }
+
+/// Live check of the janitor's listing assumptions: the provider returns a recursive
+/// listing in S3's UTF-8 byte order across pages, with `LastModified` on every entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires live S3 backend (set STUDIOFS_S3_* or .env)"]
+async fn janitor_listing_is_byte_ordered_with_last_modified_across_pages() {
+    use futures::StreamExt as _;
+    use studiofs_data::janitor::JanitorObjectStore;
+    use studiofs_data::object::{format_object_fragment_keys, format_object_key};
+
+    let cfg = test_config();
+    ensure_bucket_for(&cfg).await;
+    let op = opendal::Operator::new(
+        opendal::services::S3::default()
+            .endpoint(&cfg.endpoint)
+            .bucket(&cfg.bucket)
+            .access_key_id(&cfg.access_key)
+            .secret_access_key(&cfg.secret_key)
+            .region(&cfg.region),
+    )
+    .unwrap()
+    .finish();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let prefix = format!("janitor-order-probe/{}-{nanos}/", std::process::id());
+
+    // Keys that break naive or locale-aware sorting, plus enough canonical object
+    // keys (legacy + fragment) to span more than one 1,000-key listing page.
+    let mut keys: Vec<String> = [
+        "a",
+        "a b",
+        "a!",
+        "a-b",
+        "a.b",
+        "a/b",
+        "a/b/c",
+        "a0",
+        "A",
+        "Z",
+        "_",
+        "~",
+        "a\u{fc}",
+        "a\u{4e2d}",
+        "bar baz/foo",
+        "bar/baz",
+    ]
+    .iter()
+    .map(|suffix| format!("{prefix}{suffix}"))
+    .collect();
+    let objects = format!("{prefix}objects/");
+    for id in (1..=600u64).map(|n| n * 0x1_0001) {
+        keys.push(format_object_key(&objects, id));
+        keys.extend(format_object_fragment_keys(&objects, id));
+    }
+
+    let writes = futures::stream::iter(keys.iter().cloned())
+        .map(|key| {
+            let op = op.clone();
+            async move {
+                let result = op.write(&key, bytes::Bytes::from_static(b"x")).await;
+                result.map(|_| ()).map_err(|error| (key, error))
+            }
+        })
+        .buffer_unordered(32)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut listed = Vec::new();
+    let mut untimed = 0usize;
+    let list_result: opendal::Result<()> = async {
+        let mut lister = JanitorObjectStore::new(op.clone()).list(&prefix).await?;
+        while let Some(entry) = lister.next().await? {
+            if entry.is_file {
+                untimed += usize::from(entry.last_modified.is_none());
+                listed.push(entry.key);
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    // Clean up before asserting so a failure leaves no probe objects behind.
+    let _ = futures::stream::iter(keys.iter().cloned())
+        .map(|key| {
+            let op = op.clone();
+            async move { op.delete(&key).await }
+        })
+        .buffer_unordered(32)
+        .collect::<Vec<_>>()
+        .await;
+
+    let failed: Vec<_> = writes.iter().filter_map(|w| w.as_ref().err()).collect();
+    for (key, error) in failed.iter().take(5) {
+        println!(
+            "probe write failed key_suffix={:?} kind={:?} status_hint={}",
+            key.trim_start_matches(&prefix),
+            error.kind(),
+            error
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(160)
+                .collect::<String>()
+        );
+    }
+    assert!(
+        failed.is_empty(),
+        "{} of {} probe writes failed",
+        failed.len(),
+        keys.len()
+    );
+    list_result.expect("probe listing failed");
+    let mut expected = keys.clone();
+    expected.sort();
+    let first_disorder = listed.windows(2).position(|pair| pair[0] > pair[1]);
+    println!(
+        "janitor order probe: written={} listed={} untimed={} first_disorder={first_disorder:?}",
+        keys.len(),
+        listed.len(),
+        untimed
+    );
+    assert_eq!(first_disorder, None, "listing is not in byte order");
+    assert_eq!(listed, expected, "listing differs from the written key set");
+    assert_eq!(untimed, 0, "listing entries without LastModified");
+}

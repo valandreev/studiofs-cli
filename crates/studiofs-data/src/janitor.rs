@@ -1,5 +1,7 @@
 //! OpenDAL operations used by the standalone janitor.
 
+use std::time::{Duration, SystemTime};
+
 use futures::TryStreamExt as _;
 use opendal::services::S3;
 use opendal::{EntryMode, ErrorKind, Operator, Result};
@@ -61,7 +63,7 @@ impl JanitorObjectStore {
     }
 
     /// Return the remote object's last-modified time when the provider supplies one.
-    pub async fn last_modified(&self, key: &str) -> Result<Option<std::time::SystemTime>> {
+    pub async fn last_modified(&self, key: &str) -> Result<Option<SystemTime>> {
         Ok(self
             .operator
             .stat(key)
@@ -91,6 +93,7 @@ impl JanitorLister {
         Ok(self.0.try_next().await?.map(|entry| JanitorEntry {
             key: entry.path().to_string(),
             is_file: entry.metadata().mode() == EntryMode::FILE,
+            last_modified: entry.metadata().last_modified().map(Into::into),
         }))
     }
 }
@@ -102,4 +105,61 @@ pub struct JanitorEntry {
     pub key: String,
     /// Whether this entry represents a file rather than a directory.
     pub is_file: bool,
+    /// `LastModified` from the listing page, when the provider returned one.
+    pub last_modified: Option<SystemTime>,
+}
+
+/// Grace-period verdict for one orphan candidate; a greater verdict is stricter,
+/// so `max` combines two observations conservatively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JanitorAge {
+    /// Older than the grace period; deletion may proceed.
+    Eligible,
+    /// Inside the grace period.
+    Young,
+    /// Missing or future-dated; never infer an age from it.
+    Unknown,
+}
+
+/// Classify an object's age against `grace`; a timestamp after `now` is `Unknown`.
+pub fn janitor_age(now: SystemTime, observed: Option<SystemTime>, grace: Duration) -> JanitorAge {
+    match observed.map(|observed| now.duration_since(observed)) {
+        Some(Ok(age)) if age >= grace => JanitorAge::Eligible,
+        Some(Ok(_)) => JanitorAge::Young,
+        None | Some(Err(_)) => JanitorAge::Unknown,
+    }
+}
+
+/// [`janitor_age`] for a PostgreSQL pending-deletion timestamp in Unix seconds.
+pub fn pending_deletion_age(now_unix: i64, deleted_at_unix: i64, grace: Duration) -> JanitorAge {
+    match u64::try_from(now_unix.saturating_sub(deleted_at_unix)) {
+        Ok(age) if age >= grace.as_secs() => JanitorAge::Eligible,
+        Ok(_) => JanitorAge::Young,
+        Err(_) => JanitorAge::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn janitor_age_skips_missing_future_and_young_timestamps() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let grace = Duration::from_secs(100);
+        let at = |secs| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+        assert_eq!(janitor_age(now, None, grace), JanitorAge::Unknown);
+        assert_eq!(janitor_age(now, at(1_001), grace), JanitorAge::Unknown);
+        assert_eq!(janitor_age(now, at(950), grace), JanitorAge::Young);
+        assert_eq!(janitor_age(now, at(900), grace), JanitorAge::Eligible);
+        assert_eq!(
+            pending_deletion_age(1_000, 1_001, grace),
+            JanitorAge::Unknown
+        );
+        assert_eq!(pending_deletion_age(1_000, 950, grace), JanitorAge::Young);
+        assert_eq!(
+            pending_deletion_age(1_000, 900, grace),
+            JanitorAge::Eligible
+        );
+    }
 }
