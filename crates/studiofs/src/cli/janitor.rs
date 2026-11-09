@@ -47,6 +47,9 @@ impl LoopBreaker {
             Ok(CycleOutcome::Overloaded) => anyhow::anyhow!(
                 "janitor cycle stopped early: S3 overload circuit open; unfinished work stays queued or checkpointed"
             ),
+            Ok(CycleOutcome::TransientErrors) => {
+                anyhow::anyhow!("janitor cycle completed with transient errors")
+            }
             Ok(_) => {
                 self.consecutive_failures = 0;
                 return Ok(loop_mode.then_some(interval));
@@ -753,7 +756,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         println!("  skipped young:        {}", stats.skipped_young);
         println!("  skipped unknown age:  {}", stats.skipped_unknown_age);
         println!("  deferred candidates: {}", stats.skipped_deferred);
-        println!("  outcome:              {}", stats.outcome.label());
+        println!("  outcome:              {}", stats.cycle_outcome().label());
         println!(
             "  scan coverage:        {} (next={})",
             if stats.scan_complete {
@@ -807,7 +810,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             transport.retries,
             duration_ms(transport.request_interval),
         );
-        match breaker.after_cycle(Ok(stats.outcome), loop_mode, interval)? {
+        match breaker.after_cycle(Ok(stats.cycle_outcome()), loop_mode, interval)? {
             Some(delay) => std::thread::sleep(delay),
             None => break,
         }
@@ -2929,6 +2932,65 @@ mod tests {
             format!("{error:#}").contains("terminal failure"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn transient_object_errors_fail_cycles_and_healthy_cycles_reset_loop_breaker() {
+        use CycleOutcome::{Complete, DeleteCapReached, TransientErrors};
+
+        let interval = Duration::from_secs(10);
+        for (head_errors, delete_errors) in [(1, 0), (0, 1)] {
+            let mut stats = pipeline::JanitorStats::default();
+            stats.head_errors = head_errors;
+            stats.delete_errors = delete_errors;
+            assert_eq!(stats.cycle_outcome(), TransientErrors);
+            assert!(
+                LoopBreaker::default()
+                    .after_cycle(Ok(stats.cycle_outcome()), false, interval)
+                    .is_err()
+            );
+
+            let mut breaker = LoopBreaker::default();
+            for _ in 0..MAX_CONSECUTIVE_FAILED_CYCLES - 1 {
+                assert!(
+                    breaker
+                        .after_cycle(Ok(stats.cycle_outcome()), true, interval)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            assert!(
+                breaker
+                    .after_cycle(Ok(stats.cycle_outcome()), true, interval)
+                    .is_err()
+            );
+            assert_eq!(
+                breaker.after_cycle(Ok(Complete), true, interval).unwrap(),
+                Some(interval)
+            );
+            assert_eq!(
+                breaker
+                    .after_cycle(Ok(DeleteCapReached), true, interval)
+                    .unwrap(),
+                Some(interval)
+            );
+            assert!(
+                breaker
+                    .after_cycle(Ok(stats.cycle_outcome()), true, interval)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        let mut budget_limited = pipeline::JanitorStats::default();
+        budget_limited.outcome = DeleteCapReached;
+        budget_limited.delete_errors = 1;
+        assert_eq!(budget_limited.cycle_outcome(), TransientErrors);
+        budget_limited.delete_errors = 0;
+        assert_eq!(budget_limited.cycle_outcome(), DeleteCapReached);
+        budget_limited.delete_errors = 1;
+        budget_limited.outcome = CycleOutcome::Overloaded;
+        assert_eq!(budget_limited.cycle_outcome(), CycleOutcome::Overloaded);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

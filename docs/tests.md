@@ -252,6 +252,7 @@ claims retryable and its scan position unchanged:
 cargo test -p studiofs --bin studiofs cli::janitor::tests::s3_ -- --nocapture
 cargo test -p studiofs --bin studiofs cli::janitor::tests::failure_classes_follow_the_retry_policy
 cargo test -p studiofs --bin studiofs cli::janitor::tests::loop_breaker_backs_off_recovers_and_stops_after_bounded_failures
+cargo test -p studiofs --bin studiofs cli::janitor::tests::transient_object_errors_fail_cycles_and_healthy_cycles_reset_loop_breaker
 cargo test -p studiofs --bin studiofs cli::janitor::tests::transient_object_failures_open_the_overload_circuit_without_losing_work
 cargo test -p studiofs --bin studiofs cli::janitor::tests::terminal_delete_failure_releases_its_claim_and_stops_the_cycle
 ```

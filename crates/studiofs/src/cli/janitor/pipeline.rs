@@ -105,12 +105,26 @@ pub(super) struct JanitorStats {
     pub(super) scan_complete: bool,
 }
 
+impl JanitorStats {
+    pub(super) fn cycle_outcome(&self) -> CycleOutcome {
+        if self.outcome != CycleOutcome::Overloaded
+            && (self.head_errors > 0 || self.delete_errors > 0)
+        {
+            CycleOutcome::TransientErrors
+        } else {
+            self.outcome
+        }
+    }
+}
+
 /// Why a cycle stopped admitting work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum CycleOutcome {
     /// The whole prefix was listed and every listed candidate was decided.
     #[default]
     Complete,
+    /// A cycle had transient object-store or claim-confirmation errors.
+    TransientErrors,
     /// `max_deletes` successful deletions were confirmed and admission stopped. Listing
     /// never looks ahead, so the cap met on the last entry also reports this.
     DeleteCapReached,
@@ -131,6 +145,7 @@ impl CycleOutcome {
             Self::ScanBudgetExhausted => "partial (scan budget exhausted)",
             Self::TimeBudgetExhausted => "partial (time budget exhausted)",
             Self::Overloaded => "partial (S3 overload circuit open)",
+            Self::TransientErrors => "partial (transient errors)",
         }
     }
 }
