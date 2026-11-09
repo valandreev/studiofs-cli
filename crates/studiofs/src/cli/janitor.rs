@@ -1141,7 +1141,13 @@ mod tests {
     #[test]
     fn janitor_resumed_object_refreshes_age_and_dry_run_preserves_checkpoint() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        for (young, missing) in [(true, false), (false, true)] {
+        // A pending-deletion timestamp must not bypass the refreshed age of a resumed object.
+        for (young, missing, pending_deletion) in [
+            (true, false, None),
+            (false, true, None),
+            (true, false, Some(0)),
+            (false, true, Some(0)),
+        ] {
             let mut keys = canonical_keys(42);
             keys.sort();
             let checkpoint = JanitorSweepCheckpoint {
@@ -1165,6 +1171,7 @@ mod tests {
             };
             let mut metadata = FakeJanitorMetadata {
                 sweep_checkpoint: Some(checkpoint.clone()),
+                default_eligibility: Some(JanitorEligibility::Eligible { pending_deletion }),
                 ..FakeJanitorMetadata::eligible()
             };
             let stats = rt

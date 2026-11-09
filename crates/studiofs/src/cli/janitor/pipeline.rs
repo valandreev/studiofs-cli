@@ -332,9 +332,15 @@ async fn process_orphan<S: JanitorObjectStore>(
         // A fresh or future-dated listed key still protects an object marked pending.
         Some(pending_ts) => {
             let pending = pending_deletion_age(now_unix, pending_ts, grace);
-            candidate.newest_listed.map_or(pending, |listed| {
-                pending.max(janitor_age(now, Some(listed), grace))
-            })
+            if candidate.refresh_age {
+                // Keys listed by an earlier run are not in `newest_listed`; stat every key.
+                let observed = observed_object_age(ctx.store, candidate, stats).await;
+                pending.max(janitor_age(now, observed, grace))
+            } else {
+                candidate.newest_listed.map_or(pending, |listed| {
+                    pending.max(janitor_age(now, Some(listed), grace))
+                })
+            }
         }
         None => janitor_age(
             now,
@@ -477,7 +483,11 @@ async fn run_one_cycle_inner<S: JanitorObjectStore>(
     scope: Option<&JanitorSweepScope<'_>>,
     persist_checkpoint: bool,
 ) -> anyhow::Result<JanitorStats> {
-    let mut stats = JanitorStats::default();
+    let mut stats = JanitorStats {
+        // Early budget returns leave the sweep where it started.
+        scan_position: scan_position(&checkpoint),
+        ..JanitorStats::default()
+    };
     let cycle_started = Instant::now();
     let now = SystemTime::now();
     let now_unix = i64::try_from(
@@ -590,10 +600,7 @@ async fn run_one_cycle_inner<S: JanitorObjectStore>(
         let scope = scope.ok_or_else(|| anyhow::anyhow!("janitor checkpoint scope is missing"))?;
         tokio::task::block_in_place(|| ctx.metadata.save_sweep_checkpoint(*scope, &checkpoint))?;
     }
-    stats.scan_position = checkpoint
-        .after_key
-        .clone()
-        .unwrap_or_else(|| checkpoint.next_prefix.clone());
+    stats.scan_position = scan_position(&checkpoint);
 
     stats.cycle_elapsed = cycle_started.elapsed();
     eprintln!(
@@ -607,6 +614,13 @@ async fn run_one_cycle_inner<S: JanitorObjectStore>(
         super::duration_ms(stats.delete_elapsed)
     );
     Ok(stats)
+}
+
+fn scan_position(checkpoint: &JanitorSweepCheckpoint) -> String {
+    checkpoint
+        .after_key
+        .clone()
+        .unwrap_or_else(|| checkpoint.next_prefix.clone())
 }
 
 async fn run_start_after_listing<S: JanitorObjectStore>(
