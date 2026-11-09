@@ -82,7 +82,7 @@ The full binary test run passed 521 tests with 5 ignored before this new ignored
 
 ## Review fixes: dry-run accounting and progress lifecycle
 
-A separate review against `main` confirmed the duplicate dry-run count. Dry-run now remembers the object ids it has counted as would-delete in the cycle and drops them from later candidate batches, so the listing stage no longer revisits a queued object. The set grows only when `deleted` grows, so the delete cap bounds it. The focused unit regression `dry_run_counts_queued_object_once_when_listing_revisits_it` fails without the fix and passes with it. The live Docker regression `live_cli_dry_run_keeps_eligible_candidate_and_object` was not rerun in this pass.
+A separate review against `main` confirmed the duplicate dry-run count. Dry-run now remembers the object ids it has counted as would-delete in the cycle and drops them from later candidate batches, so the listing stage no longer revisits a queued object. The set grows only when `deleted` grows, so the delete cap bounds it. The focused unit regression `dry_run_counts_queued_object_once_when_listing_revisits_it` fails without the fix and passes with it. After a rebuild, the local PostgreSQL/RustFS fixtures passed all four ignored `cli::janitor::tests` live tests, including `live_cli_dry_run_keeps_eligible_candidate_and_object`. Loop mode now reports the exit status of the latest cycle, so a partial result from an earlier cycle no longer persists. The Kilo review's `std::sync::Mutex` warning was rejected: progress locks are held only for field copies, never across an `.await`, and the heartbeat runs on a std thread.
 
 The same review fixed these issues:
 

@@ -1169,12 +1169,11 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             ));
             break;
         }
-        if stats.cycle_outcome() != CycleOutcome::Complete {
-            command_exit = Some((
-                2,
-                "janitor completed with partial scan coverage or retryable work",
-            ));
-        }
+        // Loop mode reports the latest cycle, not a partial result from an earlier one.
+        command_exit = (stats.cycle_outcome() != CycleOutcome::Complete).then_some((
+            2,
+            "janitor completed with partial scan coverage or retryable work",
+        ));
         match breaker.after_cycle(Ok(stats.cycle_outcome()), loop_mode, interval)? {
             Some(delay) => {
                 progress.phase("waiting_for_cycle");
@@ -1288,7 +1287,6 @@ mod tests {
             },
         );
         let pending_operation = received.recv_timeout(Duration::from_secs(1)).unwrap();
-        let _operation_is_still_pending = true;
         assert_eq!(pending_operation["event"], "progress");
         assert_eq!(
             pending_operation["phase_elapsed_ms"].as_u64().unwrap() / 60_000,
