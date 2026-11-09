@@ -60,6 +60,26 @@ fn publication_rejects_deleted_payload_object() {
             .contains("after deletion has started"));
         tx.rollback().await.expect("rollback rejected publication");
 
+        // A failed deletion finished by an older mounted Janitor stays fenced, while
+        // an upload awaiting reconciliation retry remains publishable.
+        client
+            .execute(
+                "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, last_error) VALUES ($1, 12, 'retry_wait', 'remote deletion retry required'), ($1, 13, 'retry_wait', 'remote proof retry required')",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("insert retry_wait upload objects");
+        let tx = client.transaction().await.expect("start legacy retry publication");
+        apply_object_lifetime_changes(&tx, volume.volume_id, 1, &[publish_event(7, 12)])
+            .await
+            .expect_err("publication must reject a legacy deletion retry row");
+        tx.rollback().await.expect("rollback rejected legacy retry publication");
+        let tx = client.transaction().await.expect("start upload retry publication");
+        apply_object_lifetime_changes(&tx, volume.volume_id, 1, &[publish_event(8, 13)])
+            .await
+            .expect("an upload retry row stays publishable");
+        tx.rollback().await.expect("rollback upload retry publication");
+
         let references = client
             .query(
                 "SELECT object_id FROM snapshot_current_references WHERE vol = $1",

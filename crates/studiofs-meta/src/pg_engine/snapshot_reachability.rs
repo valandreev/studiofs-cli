@@ -28,8 +28,8 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
 pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 
 /// Completes an object deletion claim only while the owner and fence are current.
-/// Parameters: vol, object_id, owner, fence, state, retry delay secs, last_error.
-/// Releases a deletion claim but keeps `delete_pending`, the terminal fence that
+/// Parameters: vol, object_id, owner, fence, last_error.
+/// Releases the claim but keeps `delete_pending`, the terminal fence that
 /// upload registration never revives and publication rejects.
 pub(super) const FINISH_UPLOADED_OBJECT_DELETION_SQL: &str = "UPDATE snapshot_payload_upload_objects SET closed_at = COALESCE(closed_at, clock_timestamp()), next_retry_at = NULL, last_error = $5, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE vol = $1 AND object_id = $2 AND reconcile_owner = $3 AND reconcile_fence = $4 AND state = 'delete_pending'";
 
@@ -221,7 +221,9 @@ where
     if !published_object_ids.is_empty() {
         let states = client
             .query(
-                "SELECT object_id, state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) FOR UPDATE",
+                // Older mounted Janitors finished a failed deletion as 'retry_wait' with
+                // this marker; that payload may be partly deleted, so it stays fenced.
+                "SELECT object_id, CASE WHEN state = 'retry_wait' AND last_error = 'remote deletion retry required' THEN 'delete_pending' ELSE state END FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) FOR UPDATE",
                 &[&volume_id, &published_object_ids],
             )
             .await
