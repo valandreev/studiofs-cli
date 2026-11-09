@@ -19,7 +19,7 @@ use crate::snapshot_ports::{
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use tokio_postgres::GenericClient;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Maximum number of uploaded fragment rows one reconciliation cycle may claim.
 pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
@@ -464,7 +464,55 @@ impl PgMetaEngine {
             &self.local,
             |entries| self.begin_fragment_uploads_sync(entries),
             |entries| self.confirm_fragment_uploads_sync(entries),
-        )
+        )?;
+        // The watermark only bounds fence growth; never let it stall metadata replication.
+        if let Err(error) = self.publish_pending_payload_watermark() {
+            warn!(
+                error = %error,
+                volume_id = self.volume_id,
+                "payload upload watermark publication deferred"
+            );
+        }
+        Ok(())
+    }
+
+    /// Stores a captured quiescent watermark; it stays pending until PostgreSQL accepts it.
+    fn publish_pending_payload_watermark(&self) -> MetaResult<()> {
+        let Some((namespace, through)) = self.pending_payload_watermark()? else {
+            return Ok(());
+        };
+        let payload_namespace = i32::try_from(namespace)
+            .map_err(|_| MetaError::Storage("payload watermark namespace is invalid".to_owned()))?;
+        let acked_through = checked_i64(through, "payload watermark")?;
+        let command_pool = self.command_pool.clone();
+        let volume_id = self.volume_id;
+        let command_timeout = self.command_timeout;
+        self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                command_pool,
+                command_timeout,
+                "advance payload upload watermark",
+                move |client| {
+                    Box::pin(async move {
+                        // The row update waits for registrations holding FOR SHARE on it.
+                        client
+                            .execute(
+                                "INSERT INTO snapshot_payload_upload_watermarks (vol, payload_namespace, acked_through) VALUES ($1, $2, $3) ON CONFLICT (vol, payload_namespace) DO UPDATE SET acked_through = GREATEST(snapshot_payload_upload_watermarks.acked_through, EXCLUDED.acked_through), updated_at = now()",
+                                &[&volume_id, &payload_namespace, &acked_through],
+                            )
+                            .await
+                            .map_err(|error| {
+                                Self::classify_pg_error(
+                                    "postgres payload upload watermark advance failed",
+                                    error,
+                                )
+                            })
+                    })
+                },
+            )
+            .await
+        })?;
+        self.clear_published_payload_watermark((namespace, through))
     }
 
     pub(super) fn load_pg_current_reference_object_ids(&self) -> MetaResult<HashSet<u64>> {
@@ -1473,6 +1521,14 @@ impl UploadedFragmentLedger for PgMetaEngine {
         self.local.record_local_upload_ledger_confirm(entries)?;
         self.signal_poll_wakeup();
         Ok(())
+    }
+
+    fn report_quiescent_payload_upload_watermark(&self) -> MetaResult<Option<u64>> {
+        let captured = self.capture_quiescent_payload_watermark()?;
+        if captured.is_some() {
+            self.signal_poll_wakeup();
+        }
+        Ok(captured)
     }
 }
 

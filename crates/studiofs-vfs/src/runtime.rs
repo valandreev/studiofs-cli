@@ -288,6 +288,7 @@ impl<M: ?Sized + UploadedFragmentLedger> UploadedFragmentLedger for RuntimeMetaH
         &self,
         entries: &[studiofs_meta::snapshot_ports::UploadedFragmentLedgerEntry],
     ) -> MetaResult<()>);
+    forward_method!(fn report_quiescent_payload_upload_watermark(&self) -> MetaResult<Option<u64>>);
 }
 
 impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {

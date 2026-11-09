@@ -1021,3 +1021,242 @@ fn uploaded_fragment_ledger_batches_preserve_recovery_rows() {
     })
     .expect("verify confirmed upload fragment batch rows");
 }
+
+fn activate_payload_allocator(engine: &PgMetaEngine, namespace: u32, reserved_through: u64) {
+    use crate::allocator_state::{AllocatorRecord, AllocatorStateV1};
+    let state = AllocatorStateV1::new(
+        AllocatorRecord::new(namespace + 1, 0).expect("inode namespace"),
+        AllocatorRecord::new(namespace, reserved_through).expect("payload namespace"),
+    )
+    .expect("allocator state");
+    engine
+        .local
+        .replace_allocator_state(state)
+        .expect("persist allocator state");
+    engine
+        .bootstrap_allocator_state_local_only()
+        .expect("activate allocator state");
+}
+
+fn payload_counter(object_id: u64) -> u64 {
+    object_id & (crate::allocator_state::COUNTER_LIMIT - 1)
+}
+
+#[test]
+fn quiescent_payload_watermark_captures_reserved_through_below_later_handouts() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    activate_payload_allocator(&engine, 31, 8_192);
+
+    assert_eq!(
+        engine
+            .report_quiescent_payload_upload_watermark()
+            .expect("capture watermark"),
+        Some(8_192)
+    );
+    assert_eq!(
+        engine
+            .pending_payload_watermark()
+            .expect("pending watermark"),
+        Some((31, 8_192))
+    );
+    // One capture per engine: another caller's payload store was never checked.
+    assert_eq!(
+        engine
+            .report_quiescent_payload_upload_watermark()
+            .expect("second capture"),
+        None
+    );
+    // A handout after the capture comes from a fresh reservation at or above it.
+    let object_id = engine.allocate_object_ids(1).expect("allocate object id")[0];
+    assert!(payload_counter(object_id) >= 8_192);
+}
+
+#[test]
+fn reserved_unbegun_payload_id_blocks_the_watermark() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    activate_payload_allocator(&engine, 33, 8_192);
+    let reserved = engine.allocate_object_ids(1).expect("allocate object id")[0];
+    assert_eq!(payload_counter(reserved), 8_192);
+
+    assert_eq!(
+        engine
+            .report_quiescent_payload_upload_watermark()
+            .expect("capture watermark"),
+        None,
+        "a reserved ID without an upload begin must keep the watermark at or below its counter"
+    );
+    // Reactivation resets the batch but must not forget the outstanding handout.
+    engine
+        .bootstrap_allocator_state_local_only()
+        .expect("reactivate allocator state");
+    assert_eq!(
+        engine
+            .report_quiescent_payload_upload_watermark()
+            .expect("capture watermark after reactivation"),
+        None
+    );
+    assert_eq!(
+        engine
+            .pending_payload_watermark()
+            .expect("pending watermark"),
+        None
+    );
+}
+
+#[test]
+fn pending_local_upload_ledger_entry_blocks_the_watermark() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    activate_payload_allocator(&engine, 35, 8_192);
+    let entry = UploadedFragmentLedgerEntry {
+        volume_id: engine.volume_id,
+        object_id: (35_u64 << 39) | 17,
+        fragment_index: 0,
+        object_key: "objects/pending/0".to_string(),
+        expected_byte_length: 1,
+        expected_sha256: [7; 32],
+    };
+    engine
+        .begin_fragment_uploads(std::slice::from_ref(&entry))
+        .expect("record local upload begin");
+
+    assert_eq!(
+        engine
+            .report_quiescent_payload_upload_watermark()
+            .expect("capture watermark"),
+        None,
+        "an unreplicated begin below the counter must block the watermark"
+    );
+    assert_eq!(
+        engine
+            .pending_payload_watermark()
+            .expect("pending watermark"),
+        None
+    );
+}
+
+#[test]
+fn unpublished_payload_watermark_stays_pending_without_stalling_ledger_replay() {
+    let (_dir, engine) = temp_pg_engine_for_unit();
+    activate_payload_allocator(&engine, 37, 4_096);
+    engine
+        .report_quiescent_payload_upload_watermark()
+        .expect("capture watermark");
+
+    // The unit engine's PostgreSQL endpoint is unreachable.
+    engine
+        .replay_local_upload_ledger()
+        .expect("watermark publication failure must not fail ledger replay");
+    assert_eq!(
+        engine
+            .pending_payload_watermark()
+            .expect("pending watermark"),
+        Some((37, 4_096))
+    );
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn reported_payload_watermark_bounds_cli_janitor_fences() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-reachability-watermark-report");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    seed_local(&db_path, &volume.format_info());
+    // Each mount session opens its own engine, which captures at most once.
+    let mount = || {
+        PgMetaEngine::open_with_options(
+            &db_path,
+            PgOpenOptions {
+                background_poll: false,
+                ..Default::default()
+            },
+        )
+        .expect("open postgres engine")
+    };
+    let volume_id = volume.volume_id;
+    let query = |statement: String| -> i64 {
+        let dsn = dsn.clone();
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            let value = client
+                .query_one(&statement, &[&volume_id])
+                .await
+                .expect("run fixture query")
+                .get(0);
+            connection_task.abort();
+            Ok::<_, MetaError>(value)
+        })
+        .expect("run fixture query")
+    };
+    let namespace = 7_001_u32;
+    let watermark = || {
+        query(format!(
+            "SELECT acked_through FROM snapshot_payload_upload_watermarks WHERE vol = $1 AND payload_namespace = {namespace}"
+        ))
+    };
+    let mut janitor = crate::pg_engine::PgJanitorSession::new(dsn.clone(), volume_id);
+    assert!(
+        janitor
+            .try_acquire_global_janitor_lock()
+            .expect("janitor lock")
+    );
+
+    // Sustained deletion across mount sessions: each session leaves finished
+    // fences, then the next mount reports from a quiescent bootstrap.
+    for round in 0..3_u64 {
+        let first = round * 4_096;
+        let reserved_through = first + 4_096;
+        let engine = mount();
+        activate_payload_allocator(&engine, namespace, reserved_through);
+        assert_eq!(
+            query(format!(
+                "WITH fences AS (INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at) \
+                 SELECT $1, ({namespace}::BIGINT << 39) | counter, 'delete_pending', now() \
+                 FROM generate_series({first}::BIGINT, {}::BIGINT) AS counter RETURNING 1) \
+                 SELECT count(*) FROM fences",
+                first + 99
+            )),
+            100
+        );
+        assert_eq!(
+            engine
+                .report_quiescent_payload_upload_watermark()
+                .expect("capture watermark"),
+            Some(reserved_through)
+        );
+        engine.flush_metadata().expect("publish watermark");
+        assert_eq!(
+            watermark(),
+            i64::try_from(reserved_through).expect("counter fits")
+        );
+        assert_eq!(
+            engine
+                .pending_payload_watermark()
+                .expect("pending watermark"),
+            None
+        );
+        assert_eq!(janitor.prune_object_deletion_fences().expect("prune"), 100);
+        assert_eq!(
+            query("SELECT count(*) FROM snapshot_payload_upload_objects WHERE vol = $1".to_owned()),
+            0,
+            "fence rows stay bounded once the namespace reports"
+        );
+    }
+
+    // A stale lower capture never moves the watermark backwards.
+    let engine = mount();
+    activate_payload_allocator(&engine, namespace, 4_096);
+    engine
+        .report_quiescent_payload_upload_watermark()
+        .expect("capture stale watermark");
+    engine.flush_metadata().expect("publish stale watermark");
+    assert_eq!(watermark(), 3 * 4_096);
+    janitor
+        .release_global_janitor_lock()
+        .expect("release janitor lock");
+}

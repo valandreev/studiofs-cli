@@ -270,6 +270,15 @@ pub trait UploadedFragmentLedger: Send + Sync {
         }
         Ok(())
     }
+
+    /// Captures a payload upload watermark for asynchronous publication.
+    ///
+    /// The caller must have proven that no persisted local payload holds an
+    /// object ID without a replicated upload begin. Returns the captured counter,
+    /// or `None` when the engine cannot prove quiescence or has no watermarks.
+    fn report_quiescent_payload_upload_watermark(&self) -> MetaResult<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// Stable identity of one materializer worker.
