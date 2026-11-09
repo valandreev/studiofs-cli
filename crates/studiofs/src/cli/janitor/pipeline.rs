@@ -617,7 +617,8 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
     now_unix: i64,
     cycle_started: Instant,
 ) -> anyhow::Result<()> {
-    let initial_checkpoint = checkpoint.clone();
+    // Last position whose closed candidates were fully processed; a stop rolls back only to here.
+    let mut committed = checkpoint.clone();
     eprintln!("janitor phase=initial_listing started");
     let listing_started = Instant::now();
     let mut listing = bounded_list_step(
@@ -660,13 +661,16 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
             );
         }
         stats.initial_listing_entries = stats.initial_listing_entries.saturating_add(1);
-        anyhow::ensure!(
-            entry.key >= last_listing_key,
-            "janitor object listing is not in lexicographic order after {} entries; refusing to checkpoint",
-            stats.initial_listing_entries
-        );
-        last_listing_key.clone_from(&entry.key);
-        checkpoint.after_key = Some(entry.key.clone());
+        // Directory entries (e.g. the listed prefix itself) need not sort after `start_after`.
+        if entry.is_file {
+            anyhow::ensure!(
+                entry.key >= last_listing_key,
+                "janitor object listing is not in lexicographic order after {} entries; refusing to checkpoint",
+                stats.initial_listing_entries
+            );
+            last_listing_key.clone_from(&entry.key);
+            checkpoint.after_key = Some(entry.key.clone());
+        }
 
         let canonical =
             entry.is_file && canonical_object_delete_keys(ctx.prefix, &entry.key).is_some();
@@ -704,10 +708,11 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
             )
             .await?;
             if stats.outcome != CycleOutcome::Complete {
-                *checkpoint = initial_checkpoint.clone();
+                *checkpoint = committed.clone();
                 stats.scan_complete = false;
                 break;
             }
+            committed = checkpoint.clone();
         }
     }
     eprintln!(
@@ -729,7 +734,7 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
         stats.outcome = CycleOutcome::Complete;
         process_candidate_batch(ctx, candidates, now, now_unix, cycle_started, stats).await?;
         if stats.outcome != CycleOutcome::Complete {
-            *checkpoint = initial_checkpoint;
+            *checkpoint = committed;
             stats.scan_complete = false;
         } else {
             stats.outcome = listing_outcome;
@@ -835,12 +840,14 @@ async fn run_prefix_trie_listing<S: JanitorObjectStore>(
             }
             stats.initial_listing_entries = stats.initial_listing_entries.saturating_add(1);
             entries_in_prefix = entries_in_prefix.saturating_add(1);
-            anyhow::ensure!(
-                entry.key >= last_listing_key,
-                "janitor object listing is not in lexicographic order after {} entries; refusing to judge object age",
-                stats.initial_listing_entries
-            );
-            last_listing_key.clone_from(&entry.key);
+            if entry.is_file {
+                anyhow::ensure!(
+                    entry.key >= last_listing_key,
+                    "janitor object listing is not in lexicographic order after {} entries; refusing to judge object age",
+                    stats.initial_listing_entries
+                );
+                last_listing_key.clone_from(&entry.key);
+            }
             if let Some(candidate) = discover_object(entry, ctx.prefix, &mut current, stats) {
                 candidates.push(candidate);
             }
@@ -862,6 +869,11 @@ async fn run_prefix_trie_listing<S: JanitorObjectStore>(
         }
 
         if stats.outcome != CycleOutcome::Complete {
+            // A deadline/cap stop mid-prefix descends like the entry budget, so a dense
+            // prefix cannot stall a time-bounded loop; the children cover the same keys.
+            if !leaf && !reached_eof && entries_in_prefix > 0 {
+                checkpoint.next_prefix = format!("{cursor}0");
+            }
             break;
         }
         let capped = !reached_eof;

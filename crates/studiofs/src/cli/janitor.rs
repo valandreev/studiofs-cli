@@ -1095,6 +1095,50 @@ mod tests {
     }
 
     #[test]
+    fn janitor_stop_after_completed_batch_keeps_its_progress() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut keys: Vec<String> = (1..=70).flat_map(canonical_keys).collect();
+        keys.sort();
+        let store = FakeJanitorStore {
+            entries: keys
+                .into_iter()
+                .map(|key| JanitorEntry {
+                    key,
+                    is_file: true,
+                    last_modified: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        // The first batch of 64 completes; the cap then stops the trailing batch midway.
+        let stats = rt
+            .block_on(run_one_cycle_resumable(
+                JanitorCycleContext {
+                    store: &store,
+                    prefix: "test/objects/",
+                    dry_run: false,
+                    skip_newer_than_secs: 0,
+                    budget: RunBudget::deletes(65),
+                    metadata: &mut metadata,
+                },
+                sweep_checkpoint(),
+                &sweep_scope(),
+                true,
+            ))
+            .unwrap();
+        assert_eq!(stats.outcome, pipeline::CycleOutcome::DeleteCapReached);
+        assert!(!stats.scan_complete);
+        let saved = metadata.sweep_checkpoint.clone().unwrap();
+        assert_ne!(
+            saved,
+            sweep_checkpoint(),
+            "completed batch progress was discarded"
+        );
+        assert_eq!(saved.pending_object_id, Some(65));
+    }
+
+    #[test]
     fn janitor_resumed_object_refreshes_age_and_dry_run_preserves_checkpoint() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         for (young, missing) in [(true, false), (false, true)] {
