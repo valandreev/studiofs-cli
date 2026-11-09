@@ -28,8 +28,10 @@ pub const SNAPSHOT_UPLOADED_FRAGMENT_SCAN_LIMIT: i64 = 256;
 pub const SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS: i64 = 60;
 
 /// Completes an object deletion claim only while the owner and fence are current.
-/// Parameters: vol, object_id, owner, fence, state, retry delay secs, last_error.
-pub(super) const FINISH_UPLOADED_OBJECT_DELETION_SQL: &str = "UPDATE snapshot_payload_upload_objects SET state = $5, closed_at = CASE WHEN $5 = 'deleted' THEN clock_timestamp() ELSE closed_at END, next_retry_at = CASE WHEN $5 = 'retry_wait' THEN clock_timestamp() + ($6 * interval '1 second') ELSE NULL END, last_error = $7, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE vol = $1 AND object_id = $2 AND reconcile_owner = $3 AND reconcile_fence = $4 AND state = 'delete_pending'";
+/// Parameters: vol, object_id, owner, fence, last_error.
+/// Releases the claim but keeps `delete_pending`, the terminal fence that
+/// upload registration never revives and publication rejects.
+pub(super) const FINISH_UPLOADED_OBJECT_DELETION_SQL: &str = "UPDATE snapshot_payload_upload_objects SET closed_at = COALESCE(closed_at, clock_timestamp()), next_retry_at = NULL, last_error = $5, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE vol = $1 AND object_id = $2 AND reconcile_owner = $3 AND reconcile_fence = $4 AND state = 'delete_pending'";
 
 const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
 const SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE: usize = 1_024;
@@ -219,7 +221,9 @@ where
     if !published_object_ids.is_empty() {
         let states = client
             .query(
-                "SELECT object_id, state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) FOR UPDATE",
+                // Older mounted Janitors finished a failed deletion as 'retry_wait' with
+                // this marker; that payload may be partly deleted, so it stays fenced.
+                "SELECT object_id, CASE WHEN state = 'retry_wait' AND last_error = 'remote deletion retry required' THEN 'delete_pending' ELSE state END FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) FOR UPDATE",
                 &[&volume_id, &published_object_ids],
             )
             .await
@@ -1125,7 +1129,7 @@ impl PgMetaEngine {
                             )
                         })?;
                         tx.execute(
-                            "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) SELECT $1, object_id, 'uploading' FROM unnest($2::BIGINT[]) AS object_ids(object_id) GROUP BY object_id ON CONFLICT (vol, object_id) DO UPDATE SET state = CASE WHEN snapshot_payload_upload_objects.state = 'deleted' THEN 'uploading' ELSE snapshot_payload_upload_objects.state END, closed_at = NULL",
+                            "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) SELECT $1, object_id, 'uploading' FROM unnest($2::BIGINT[]) AS object_ids(object_id) GROUP BY object_id ON CONFLICT (vol, object_id) DO NOTHING",
                             &[&volume_id, &object_ids_for_objects],
                         )
                         .await
@@ -1266,79 +1270,26 @@ impl PgMetaEngine {
                                 error,
                             )
                         })?;
-                        let row = tx
-                            .query_opt(
-                                "SELECT state, (reconcile_lease_expires_at IS NOT NULL AND reconcile_lease_expires_at > clock_timestamp()) FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2 FOR UPDATE",
-                                &[&volume_id, &object_id],
-                            )
-                            .await
-                            .map_err(|error| {
-                                Self::classify_pg_error(
-                                    "postgres snapshot upload deletion claim row read failed",
-                                    error,
+                        // Same fenced claim as the CLI Janitor: an untracked object
+                        // gets a delete_pending row, so it is never deleted unfenced.
+                        let fencing_token = super::janitor::claim_object_deletion_in(
+                            tx, volume_id, object_id, &owner,
+                        )
+                        .await
+                        .map_err(|error| match error {
+                            super::janitor::ObjectDeletionClaimError::VolumeBindingMissing => {
+                                MetaError::Storage(
+                                    "PostgreSQL volume binding is missing".to_owned(),
                                 )
-                            })?;
-                        let claim = if let Some(row) = row {
-                            let state: String = row.get(0);
-                            let lease_active: bool = row.get(1);
-                            if lease_active {
-                                UploadedObjectDeletionClaim::Protected
-                            } else {
-                                let referenced = tx
-                                    .query_one(
-                                        "SELECT EXISTS (SELECT 1 FROM snapshot_current_references WHERE vol = $1 AND object_id = $2)",
-                                        &[&volume_id, &object_id],
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        Self::classify_pg_error(
-                                            "postgres snapshot upload deletion reference check failed",
-                                            error,
-                                        )
-                                    })?
-                                    .get::<_, bool>(0);
-                                if referenced {
-                                    UploadedObjectDeletionClaim::Protected
-                                } else if state == "deleted" {
-                                    UploadedObjectDeletionClaim::Untracked
-                                } else if !matches!(
-                                    state.as_str(),
-                                    "uploaded" | "published" | "retry_wait" | "delete_pending"
-                                ) {
-                                    UploadedObjectDeletionClaim::Protected
-                                } else {
-                                    tx.query_opt(
-                                        "UPDATE snapshot_payload_upload_objects SET state = 'delete_pending', reconcile_owner = $3, reconcile_lease_expires_at = clock_timestamp() + ($4 * interval '1 second'), reconcile_fence = reconcile_fence + 1, next_retry_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = $2 AND state IN ('uploaded', 'published', 'retry_wait', 'delete_pending') AND (reconcile_lease_expires_at IS NULL OR reconcile_lease_expires_at <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM snapshot_current_references WHERE vol = $1 AND object_id = $2) RETURNING reconcile_fence",
-                                        &[
-                                            &volume_id,
-                                            &object_id,
-                                            &owner,
-                                            &(SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64),
-                                        ],
-                                    )
-                                    .await
-                                    .map_err(|error| {
-                                        Self::classify_pg_error(
-                                            "postgres snapshot upload deletion lease failed",
-                                            error,
-                                        )
-                                    })?
-                                    .map(|row| UploadedObjectDeletionClaim::Claimed {
-                                        fencing_token: row.get(0),
-                                    })
-                                    .unwrap_or(UploadedObjectDeletionClaim::Protected)
-                                }
                             }
-                        } else {
-                            UploadedObjectDeletionClaim::Untracked
-                        };
-                        tx.commit().await.map_err(|error| {
-                            Self::classify_pg_error(
-                                "postgres snapshot upload deletion claim commit failed",
-                                error,
-                            )
+                            super::janitor::ObjectDeletionClaimError::Postgres(context, error) => {
+                                Self::classify_pg_error(context, error)
+                            }
                         })?;
-                        Ok(claim)
+                        Ok(fencing_token
+                            .map_or(UploadedObjectDeletionClaim::Protected, |fencing_token| {
+                                UploadedObjectDeletionClaim::Claimed { fencing_token }
+                            }))
                     })
                 },
             )
@@ -1365,24 +1316,16 @@ impl PgMetaEngine {
                 "finish snapshot upload object deletion",
                 move |client| {
                     Box::pin(async move {
-                        let (state, message) = match outcome {
-                            UploadedObjectDeletionOutcome::Deleted => ("deleted", None),
+                        let message = match outcome {
+                            UploadedObjectDeletionOutcome::Deleted => None,
                             UploadedObjectDeletionOutcome::Retryable => {
-                                ("retry_wait", Some("remote deletion retry required"))
+                                Some("remote deletion retry required")
                             }
                         };
                         client
                             .execute(
                                 FINISH_UPLOADED_OBJECT_DELETION_SQL,
-                                &[
-                                    &volume_id,
-                                    &object_id,
-                                    &owner,
-                                    &fencing_token,
-                                    &state,
-                                    &(SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64),
-                                    &message,
-                                ],
+                                &[&volume_id, &object_id, &owner, &fencing_token, &message],
                             )
                             .await
                             .map_err(|error| {

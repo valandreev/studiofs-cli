@@ -180,8 +180,8 @@ use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::upload_stage::UploadStageStoreError;
 use studiofs_cache::{CachedStore, CachedStoreConfig};
 use studiofs_data::object::{
-    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys, format_object_key,
-    parse_object_id_from_key,
+    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, canonical_object_delete_keys,
+    format_object_fragment_keys,
 };
 use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 
