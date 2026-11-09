@@ -3,7 +3,9 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
-use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry};
+use studiofs_data::janitor::{
+    JanitorAge, JanitorDeleteError, JanitorEntry, janitor_age, pending_deletion_age,
+};
 use studiofs_data::object::canonical_object_delete_keys;
 use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
 use studiofs_meta::{JanitorEligibility, MAX_JANITOR_ELIGIBILITY_BATCH};
@@ -15,9 +17,12 @@ const DELETE_KEY_TIMEOUT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(20)
 };
-/// Bound for one HEAD age probe; a stalled probe leaves the object as unknown age,
-/// so one request cannot hold the cycle past its wall-clock budget.
-const HEAD_TIMEOUT: Duration = DELETE_KEY_TIMEOUT;
+/// Bound for one fallback HEAD, issued only for keys listed without `LastModified`.
+const HEAD_KEY_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(20)
+};
 /// Bound for one listing step; a stalled page fails the cycle. Finished
 /// deletions are already confirmed in PostgreSQL, so no completed work is lost.
 const LIST_PAGE_TIMEOUT: Duration = if cfg!(test) {
@@ -146,17 +151,33 @@ pub(super) trait JanitorObjectStore {
     async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError>;
 }
 
-/// One discovered object: its ID, the listed key, and every canonical key to delete.
+/// One discovered object: its ID, every canonical key to delete, and the
+/// listing timestamps of all its adjacent listed keys.
+#[derive(Debug)]
 struct Candidate {
     object_id: u64,
-    path: String,
     delete_keys: Vec<String>,
+    /// Newest listed `LastModified` across the object's keys (conservative age).
+    newest_listed: Option<SystemTime>,
+    /// Listed keys whose page carried no `LastModified`; they need a HEAD.
+    untimed_keys: Vec<String>,
 }
 
+impl Candidate {
+    fn record_key(&mut self, key: String, last_modified: Option<SystemTime>) {
+        match last_modified {
+            Some(time) => self.newest_listed = self.newest_listed.max(Some(time)),
+            None if !self.untimed_keys.contains(&key) => self.untimed_keys.push(key),
+            None => {}
+        }
+    }
+}
+
+/// Fold one listed entry into `current`; return the previous object once a new one starts.
 fn discover_object(
     entry: JanitorEntry,
     prefix: &str,
-    last_object: &mut Option<u64>,
+    current: &mut Option<Candidate>,
     stats: &mut JanitorStats,
 ) -> Option<Candidate> {
     if !entry.is_file {
@@ -167,17 +188,47 @@ fn discover_object(
         stats.skipped_non_canonical = stats.skipped_non_canonical.saturating_add(1);
         return None;
     };
-    // ponytail: dedupe only adjacent keys of one object, relying on S3's lexicographic
-    // listing order; an unordered provider re-checks an object, which stays safe
-    // because claims and NotFound deletes are idempotent.
-    if last_object.replace(object_id) == Some(object_id) {
+    // Keys of one object are adjacent because `run_one_cycle` rejects a listing
+    // that is not in S3's lexicographic order.
+    if let Some(candidate) = current
+        .as_mut()
+        .filter(|candidate| candidate.object_id == object_id)
+    {
+        candidate.record_key(entry.key, entry.last_modified);
         return None;
     }
-    Some(Candidate {
+    let mut candidate = Candidate {
         object_id,
-        path: entry.key,
         delete_keys,
-    })
+        newest_listed: None,
+        untimed_keys: Vec::new(),
+    };
+    candidate.record_key(entry.key, entry.last_modified);
+    current.replace(candidate)
+}
+
+/// Object-level age: the newest timestamp over listed keys plus HEADs of untimed
+/// keys. Any HEAD failure, timeout or missing value leaves the age unknown.
+async fn observed_object_age<S: JanitorObjectStore>(
+    store: &S,
+    candidate: &Candidate,
+    stats: &mut JanitorStats,
+) -> Option<SystemTime> {
+    let mut newest = candidate.newest_listed;
+    for key in &candidate.untimed_keys {
+        if stats.head_requests == 0 {
+            eprintln!("janitor phase=head started");
+        }
+        stats.head_requests = stats.head_requests.saturating_add(1);
+        let head_started = Instant::now();
+        let last_modified = tokio::time::timeout(HEAD_KEY_TIMEOUT, store.last_modified(key)).await;
+        stats.head_elapsed += head_started.elapsed();
+        let Ok(Ok(Some(time))) = last_modified else {
+            return None;
+        };
+        newest = newest.max(Some(time));
+    }
+    newest
 }
 
 async fn process_orphan<S: JanitorObjectStore>(
@@ -188,48 +239,31 @@ async fn process_orphan<S: JanitorObjectStore>(
     stats: &mut JanitorStats,
     pending_ts: Option<i64>,
 ) -> anyhow::Result<()> {
-    let Candidate {
-        object_id,
-        path,
-        delete_keys,
-    } = candidate;
-    let object_id = *object_id;
+    let object_id = candidate.object_id;
 
-    if let Some(pending_ts) = pending_ts {
-        match u64::try_from(now_unix.saturating_sub(pending_ts)) {
-            Ok(age_secs) if age_secs >= ctx.skip_newer_than_secs => {}
-            Ok(_) => {
-                stats.skipped_young = stats.skipped_young.saturating_add(1);
-                return Ok(());
-            }
-            Err(_) => {
-                stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
-                return Ok(());
-            }
+    let grace = Duration::from_secs(ctx.skip_newer_than_secs);
+    let age = match pending_ts {
+        // A fresh or future-dated listed key still protects an object marked pending.
+        Some(pending_ts) => {
+            let pending = pending_deletion_age(now_unix, pending_ts, grace);
+            candidate.newest_listed.map_or(pending, |listed| {
+                pending.max(janitor_age(now, Some(listed), grace))
+            })
         }
-    } else {
-        if stats.head_requests == 0 {
-            eprintln!("janitor phase=head started");
-        }
-        stats.head_requests = stats.head_requests.saturating_add(1);
-        let head_started = Instant::now();
-        let last_modified = tokio::time::timeout(HEAD_TIMEOUT, ctx.store.last_modified(path))
-            .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("HEAD timed out")));
-        stats.head_elapsed += head_started.elapsed();
-        let last_modified = match last_modified {
-            Ok(Some(value)) => value,
-            Ok(None) | Err(_) => {
-                stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
-                return Ok(());
-            }
-        };
-        let age_secs = now
-            .duration_since(last_modified)
-            .unwrap_or_else(|_| Duration::from_secs(0))
-            .as_secs();
-        if age_secs < ctx.skip_newer_than_secs {
+        None => janitor_age(
+            now,
+            observed_object_age(ctx.store, candidate, stats).await,
+            grace,
+        ),
+    };
+    match age {
+        JanitorAge::Eligible => {}
+        JanitorAge::Young => {
             stats.skipped_young = stats.skipped_young.saturating_add(1);
+            return Ok(());
+        }
+        JanitorAge::Unknown => {
+            stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
             return Ok(());
         }
     }
@@ -249,7 +283,7 @@ async fn process_orphan<S: JanitorObjectStore>(
     };
 
     let mut delete_failed = false;
-    for key in delete_keys {
+    for key in &candidate.delete_keys {
         if stats.delete_requests == 0 {
             eprintln!("janitor phase=delete started");
         }
@@ -302,7 +336,8 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
 ) -> anyhow::Result<JanitorStats> {
     let mut stats = JanitorStats::default();
     let cycle_started = Instant::now();
-    let mut last_object = None;
+    let mut current = None;
+    let mut last_file_key = String::new();
     let now = SystemTime::now();
     let now_unix = i64::try_from(
         now.duration_since(UNIX_EPOCH)
@@ -338,8 +373,18 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
             );
         }
         stats.initial_listing_entries = stats.initial_listing_entries.saturating_add(1);
-        let Some(candidate) = discover_object(entry, ctx.prefix, &mut last_object, &mut stats)
-        else {
+        // ponytail: object age merges adjacent keys only, so an unordered listing could
+        // judge an object from part of its keys. Fail the cycle on the first key out of
+        // order; candidates from batches already processed stay as they were.
+        if entry.is_file {
+            anyhow::ensure!(
+                entry.key >= last_file_key,
+                "janitor object listing is not in lexicographic order after {} entries; refusing to judge object age",
+                stats.initial_listing_entries
+            );
+            last_file_key.clone_from(&entry.key);
+        }
+        let Some(candidate) = discover_object(entry, ctx.prefix, &mut current, &mut stats) else {
             continue;
         };
         candidates.push(candidate);
@@ -367,6 +412,11 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
         stats.initial_listing_entries,
         stats.outcome
     );
+    // The object still being listed is whole only when the listing ended. After a
+    // budget stop its remaining keys, and their ages, are unseen, so it waits for the next run.
+    if stats.outcome == CycleOutcome::Complete {
+        candidates.extend(current);
+    }
     // Already-listed candidates finish only while the cap and deadline still admit work.
     if !candidates.is_empty()
         && matches!(
