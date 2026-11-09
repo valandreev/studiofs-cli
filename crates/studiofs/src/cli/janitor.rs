@@ -2975,4 +2975,218 @@ mod tests {
             "janitor inspection should not create tmp directories as a side effect"
         );
     }
+
+    /// Forces the provider-neutral prefix fallback over a real OpenDAL listing.
+    struct NoStartAfterStore<'a>(&'a OpenDalJanitorStore);
+
+    impl JanitorObjectStore for NoStartAfterStore<'_> {
+        type Listing = JanitorLister;
+
+        fn supports_start_after(&self) -> bool {
+            false
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            after_key: Option<&str>,
+        ) -> anyhow::Result<JanitorLister> {
+            anyhow::ensure!(
+                after_key.is_none(),
+                "prefix fallback must not resume after a key"
+            );
+            self.0.list(prefix, None).await
+        }
+
+        async fn last_modified(&self, key: &str) -> anyhow::Result<Option<SystemTime>> {
+            self.0.last_modified(key).await
+        }
+
+        async fn stat_key(
+            &self,
+            key: &str,
+        ) -> anyhow::Result<studiofs_data::janitor::JanitorKeyStat> {
+            self.0.stat_key(key).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError> {
+            self.0.delete(key).await
+        }
+    }
+
+    async fn listed_files(
+        store: &OpenDalJanitorStore,
+        prefix: &str,
+        after: Option<&str>,
+    ) -> Vec<String> {
+        let mut listing = store.list(prefix, after).await.unwrap();
+        let mut files = Vec::new();
+        while let Some(entry) = listing.next_entry().await.unwrap() {
+            if entry.is_file {
+                files.push(entry.key);
+            } else {
+                eprintln!(
+                    "sfs973 live listing directory entry prefix={prefix} key={}",
+                    entry.key
+                );
+            }
+        }
+        files
+    }
+
+    /// SFS-973 live check: S3 `start_after` resume, partial hex prefixes without a
+    /// trailing `/`, and repeated one-entry runs of both listing strategies.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires live S3 backend with an existing bucket (set STUDIOFS_S3_*)"]
+    async fn sfs973_live_s3_resumable_listing_covers_every_object() {
+        let env = |key: &str, default: &str| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| default.to_string())
+        };
+        let endpoint = env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
+        let bucket = env("STUDIOFS_S3_BUCKET", "studiofs-test");
+        let access_key = env("STUDIOFS_S3_ACCESS_KEY", "studiofs");
+        let secret_key = env("STUDIOFS_S3_SECRET_KEY", "studiofs123");
+        let region = env("STUDIOFS_S3_REGION", "us-east-1");
+        let writer = Operator::new(
+            S3::default()
+                .endpoint(&endpoint)
+                .bucket(&bucket)
+                .access_key_id(&access_key)
+                .secret_access_key(&secret_key)
+                .region(&region),
+        )
+        .unwrap()
+        .finish();
+        let store = OpenDalJanitorStore(
+            studiofs_data::janitor::JanitorObjectStore::from_s3(
+                &endpoint,
+                &bucket,
+                &access_key,
+                &secret_key,
+                &region,
+            )
+            .unwrap(),
+        );
+        assert!(
+            store.supports_start_after(),
+            "S3 must advertise start_after"
+        );
+        let ids = [0x1_0000_u64, 0x2_0000, 0x1_0001, 0x5_abcd];
+        let run_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        for strategy in ["start_after", "prefix_trie"] {
+            let root = format!("sfs973-{run_id}-{strategy}/objects/");
+            let foreign = format!("{root}not-canonical");
+            let mut keys = vec![foreign.clone()];
+            for id in ids {
+                keys.push(studiofs_data::object::format_object_key(&root, id));
+                keys.push(studiofs_data::object::format_object_fragment_key(
+                    &root, id, 0,
+                ));
+            }
+            keys.sort();
+            for key in &keys {
+                writer.write(key, b"x".to_vec()).await.unwrap();
+            }
+
+            assert_eq!(listed_files(&store, &root, None).await, keys);
+            // Resume strictly after a key, even when directory entries are synthesized.
+            assert_eq!(listed_files(&store, &root, Some(&keys[1])).await, keys[2..]);
+            // Shard and object-ID cursors are key prefixes, not `/`-terminated directories.
+            let shard: Vec<_> = keys
+                .iter()
+                .filter(|key| key.starts_with(&format!("{root}0000/")))
+                .cloned()
+                .collect();
+            assert_eq!(shard.len(), 4);
+            assert_eq!(
+                listed_files(&store, &format!("{root}0000"), None).await,
+                shard
+            );
+            assert_eq!(
+                listed_files(&store, &format!("{root}0000/000000000001"), None).await,
+                shard[..2]
+            );
+            assert!(
+                listed_files(&store, &format!("{root}00000"), None)
+                    .await
+                    .is_empty()
+            );
+
+            let mut metadata = FakeJanitorMetadata::eligible();
+            let mut completed = false;
+            for _ in 0..2_000 {
+                let checkpoint = metadata
+                    .sweep_checkpoint
+                    .clone()
+                    .unwrap_or_else(sweep_checkpoint);
+                let budget = RunBudget {
+                    max_deletes: 100,
+                    max_scan_entries: Some(1),
+                    max_runtime: None,
+                };
+                let fallback = NoStartAfterStore(&store);
+                let stats = if strategy == "start_after" {
+                    run_one_cycle_resumable(
+                        JanitorCycleContext {
+                            store: &store,
+                            prefix: &root,
+                            dry_run: false,
+                            skip_newer_than_secs: 0,
+                            budget,
+                            metadata: &mut metadata,
+                        },
+                        checkpoint,
+                        &sweep_scope(),
+                        true,
+                    )
+                    .await
+                } else {
+                    run_one_cycle_resumable(
+                        JanitorCycleContext {
+                            store: &fallback,
+                            prefix: &root,
+                            dry_run: false,
+                            skip_newer_than_secs: 0,
+                            budget,
+                            metadata: &mut metadata,
+                        },
+                        checkpoint,
+                        &sweep_scope(),
+                        true,
+                    )
+                    .await
+                }
+                .unwrap();
+                assert!(stats.initial_listing_entries <= 1);
+                if stats.scan_complete {
+                    completed = true;
+                    break;
+                }
+            }
+            assert!(
+                completed,
+                "{strategy}: one-entry runs never completed the sweep"
+            );
+            let mut claims = metadata.claims.clone();
+            claims.sort_unstable();
+            let mut expected = ids.to_vec();
+            expected.sort_unstable();
+            assert_eq!(
+                claims, expected,
+                "{strategy}: every orphan must be claimed once"
+            );
+            assert_eq!(
+                listed_files(&store, &root, None).await,
+                vec![foreign.clone()]
+            );
+            writer.delete(&foreign).await.unwrap();
+        }
+    }
 }

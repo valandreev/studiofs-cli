@@ -233,6 +233,15 @@ They cover `delete_cap_counts_only_confirmed_successes_and_stops_listing`,
 `janitor_budget_flags_reject_zero_and_loop_mode`, and the OpenDAL
 fake-S3 check `janitor_delete_cap_stops_opendal_listing_after_first_page`.
 
+The SFS-973 live check runs the resumable janitor sweep against a real S3
+listing. It verifies `start_after` resume, partial hex prefixes without a trailing `/`,
+and repeated one-entry runs of both the `start_after` and the forced prefix-trie
+strategy. It needs the bucket created by the DataStore tests above:
+
+```bash
+cargo test -p studiofs --bin studiofs cli::janitor::tests::sfs973_live_s3_resumable_listing_covers_every_object -- --ignored --exact --nocapture
+```
+
 ### SFS-642 PostgreSQL Lifecycle and Schema Regressions
 
 Run these focused checks when changing PostgreSQL worker ownership, startup
