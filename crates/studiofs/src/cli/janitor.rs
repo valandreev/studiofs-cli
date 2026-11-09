@@ -4615,12 +4615,20 @@ mod tests {
         let access_key = env("STUDIOFS_S3_ACCESS_KEY", "studiofs");
         let secret_key = env("STUDIOFS_S3_SECRET_KEY", "studiofs123");
         let region = env("STUDIOFS_S3_REGION", "us-east-1");
-        let pg_url = url::Url::parse(&postgres_url)?;
+        // CI passes a libpq key-value DSN, so parse it as a PostgreSQL config, not a URL.
+        let pg_config: tokio_postgres::Config = postgres_url.parse()?;
         let s3_url = url::Url::parse(&endpoint)?;
         let is_loopback =
             |host: Option<&str>| matches!(host, Some("127.0.0.1" | "localhost" | "[::1]" | "::1"));
+        let pg_hosts = pg_config.get_hosts();
         anyhow::ensure!(
-            is_loopback(pg_url.host_str()) && is_loopback(s3_url.host_str()),
+            !pg_hosts.is_empty()
+                && pg_hosts.iter().all(|host| match host {
+                    tokio_postgres::config::Host::Tcp(host) => is_loopback(Some(host)),
+                    #[cfg(unix)]
+                    tokio_postgres::config::Host::Unix(_) => true,
+                })
+                && is_loopback(s3_url.host_str()),
             "live janitor test requires local PostgreSQL and S3 endpoints"
         );
         let object_id = u64::try_from(
