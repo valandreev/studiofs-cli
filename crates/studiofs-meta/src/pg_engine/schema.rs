@@ -551,6 +551,20 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             PRIMARY KEY (vol, object_id)
         );
 
+        CREATE TABLE IF NOT EXISTS snapshot_payload_sweep_checkpoints (
+            vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
+            schema_version SMALLINT NOT NULL,
+            volume_uuid TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            bucket TEXT NOT NULL,
+            data_prefix TEXT NOT NULL,
+            listing_strategy TEXT NOT NULL,
+            after_key TEXT,
+            pending_object_id BIGINT,
+            pending_key TEXT,
+            next_prefix TEXT NOT NULL DEFAULT '0'
+        );
+
         -- Per payload namespace: the owning client never registers or publishes a
         -- new object ID whose counter is below acked_through, so fence rows there
         -- are redundant and the CLI Janitor may prune them.

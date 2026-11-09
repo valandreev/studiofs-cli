@@ -10,9 +10,15 @@ use studiofs_cache::runtime::{
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
-use studiofs_meta::{JanitorMetadataSession, JanitorProtection};
+use studiofs_meta::{
+    JanitorMetadataSession, JanitorProtection, JanitorSweepCheckpoint, JanitorSweepScope,
+};
 mod pipeline;
-use pipeline::{JanitorCycleContext, JanitorListing, JanitorObjectStore, RunBudget, run_one_cycle};
+#[cfg(test)]
+use pipeline::run_one_cycle;
+use pipeline::{
+    JanitorCycleContext, JanitorListing, JanitorObjectStore, RunBudget, run_one_cycle_resumable,
+};
 use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry, JanitorLister};
 
 struct OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore);
@@ -26,12 +32,20 @@ impl JanitorListing for JanitorLister {
 impl JanitorObjectStore for OpenDalJanitorStore {
     type Listing = JanitorLister;
 
-    async fn list(&self, prefix: &str) -> anyhow::Result<JanitorLister> {
-        Ok(self.0.list(prefix).await?)
+    fn supports_start_after(&self) -> bool {
+        self.0.supports_start_after()
+    }
+
+    async fn list(&self, prefix: &str, after_key: Option<&str>) -> anyhow::Result<JanitorLister> {
+        Ok(self.0.list_after(prefix, after_key).await?)
     }
 
     async fn last_modified(&self, key: &str) -> anyhow::Result<Option<SystemTime>> {
         Ok(self.0.last_modified(key).await?)
+    }
+
+    async fn stat_key(&self, key: &str) -> anyhow::Result<studiofs_data::janitor::JanitorKeyStat> {
+        Ok(self.0.stat_key(key).await?)
     }
 
     async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError> {
@@ -48,6 +62,8 @@ struct JanitorOptions {
     max_deletes: u64,
     max_scan_entries: Option<u64>,
     max_runtime_minutes: Option<u64>,
+    full_scan: bool,
+    reset_scan: bool,
 }
 
 struct JanitorRunRequest {
@@ -81,6 +97,17 @@ trait JanitorMetadataSource {
     fn retry_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()>;
     fn ack_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()>;
     fn prune_deletion_fences(&mut self) -> anyhow::Result<u64>;
+    fn load_sweep_checkpoint(
+        &mut self,
+        scope: JanitorSweepScope<'_>,
+        persist_initial: bool,
+    ) -> anyhow::Result<JanitorSweepCheckpoint>;
+    fn save_sweep_checkpoint(
+        &mut self,
+        scope: JanitorSweepScope<'_>,
+        checkpoint: &JanitorSweepCheckpoint,
+    ) -> anyhow::Result<()>;
+    fn reset_sweep_checkpoint(&mut self, scope: JanitorSweepScope<'_>) -> anyhow::Result<()>;
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()>;
 }
 
@@ -139,6 +166,28 @@ impl JanitorMetadataSource for JanitorMetadataSession {
         JanitorMetadataSession::prune_deletion_fences(self).map_err(anyhow::Error::new)
     }
 
+    fn load_sweep_checkpoint(
+        &mut self,
+        scope: JanitorSweepScope<'_>,
+        persist_initial: bool,
+    ) -> anyhow::Result<JanitorSweepCheckpoint> {
+        JanitorMetadataSession::load_sweep_checkpoint(self, scope, persist_initial)
+            .map_err(anyhow::Error::new)
+    }
+
+    fn save_sweep_checkpoint(
+        &mut self,
+        scope: JanitorSweepScope<'_>,
+        checkpoint: &JanitorSweepCheckpoint,
+    ) -> anyhow::Result<()> {
+        JanitorMetadataSession::save_sweep_checkpoint(self, scope, checkpoint)
+            .map_err(anyhow::Error::new)
+    }
+
+    fn reset_sweep_checkpoint(&mut self, scope: JanitorSweepScope<'_>) -> anyhow::Result<()> {
+        JanitorMetadataSession::reset_sweep_checkpoint(self, scope).map_err(anyhow::Error::new)
+    }
+
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
         JanitorMetadataSession::release_global_janitor_lock(self).map_err(anyhow::Error::new)
     }
@@ -177,6 +226,8 @@ impl JanitorRunRequest {
                 max_deletes: args.max_deletes,
                 max_scan_entries: args.max_scan_entries,
                 max_runtime_minutes: args.max_runtime_minutes,
+                full_scan: args.full_scan,
+                reset_scan: args.reset_scan,
             },
         })
     }
@@ -219,14 +270,20 @@ pub(crate) struct JanitorArgs {
     max_deletes: u64,
 
     /// Stop listing a cycle after this many entries and report it as partial
-    // ponytail: no continuation is persisted yet (SFS-973), so a looped partial cycle
-    // would rescan the same head forever; allow with --loop once checkpoints exist.
-    #[arg(long, conflicts_with = "loop", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     max_scan_entries: Option<u64>,
 
     /// Stop admitting new work after this many minutes per cycle and report it as partial
-    #[arg(long, conflicts_with = "loop", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     max_runtime_minutes: Option<u64>,
+
+    /// Start this sweep at the beginning of the namespace
+    #[arg(long, conflicts_with = "reset_scan")]
+    full_scan: bool,
+
+    /// Clear saved scan progress before starting a new sweep
+    #[arg(long, conflicts_with = "full_scan")]
+    reset_scan: bool,
 }
 
 impl JanitorArgs {
@@ -409,6 +466,8 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         max_deletes,
         max_scan_entries,
         max_runtime_minutes,
+        full_scan,
+        reset_scan,
     } = options;
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
@@ -449,6 +508,18 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         &format_info.secret_key,
         &format_info.region,
     )?);
+    let listing_strategy = if store.supports_start_after() {
+        "opendal-start-after-v1"
+    } else {
+        "hex-prefix-trie-v1"
+    };
+    let sweep_scope = JanitorSweepScope {
+        volume_uuid: &format_info.uuid,
+        endpoint: &format_info.endpoint,
+        bucket: &format_info.bucket,
+        data_prefix: &prefix,
+        listing_strategy,
+    };
 
     let rt = tokio::runtime::Runtime::new()?;
     let skip_secs = skip_newer_minutes.saturating_mul(60);
@@ -466,6 +537,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         println!("{line}");
     }
 
+    let mut restart_pending = full_scan || reset_scan;
     loop {
         let cycle_started = Instant::now();
         let lock_started = Instant::now();
@@ -502,19 +574,49 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 duration_ms(protection_elapsed)
             );
 
-            let stats = rt.block_on(run_one_cycle(JanitorCycleContext {
-                store: &store,
-                prefix: &prefix,
-                dry_run,
-                skip_newer_than_secs: skip_secs,
-                budget: RunBudget {
-                    max_deletes,
-                    max_scan_entries,
-                    max_runtime: max_runtime_minutes
-                        .map(|minutes| Duration::from_secs(minutes.saturating_mul(60))),
-                },
+            let mut checkpoint = JanitorMetadataSource::load_sweep_checkpoint(
                 metadata,
-            }))?;
+                sweep_scope,
+                !dry_run && !restart_pending,
+            )?;
+            if restart_pending && reset_scan {
+                if !dry_run {
+                    JanitorMetadataSource::reset_sweep_checkpoint(metadata, sweep_scope)?;
+                }
+                checkpoint = JanitorSweepCheckpoint {
+                    after_key: None,
+                    pending_object_id: None,
+                    pending_key: None,
+                    next_prefix: "0".to_string(),
+                };
+            } else if restart_pending && full_scan {
+                checkpoint = JanitorSweepCheckpoint {
+                    after_key: None,
+                    pending_object_id: None,
+                    pending_key: None,
+                    next_prefix: "0".to_string(),
+                };
+            }
+
+            let stats = rt.block_on(run_one_cycle_resumable(
+                JanitorCycleContext {
+                    store: &store,
+                    prefix: &prefix,
+                    dry_run,
+                    skip_newer_than_secs: skip_secs,
+                    budget: RunBudget {
+                        max_deletes,
+                        max_scan_entries,
+                        max_runtime: max_runtime_minutes
+                            .map(|minutes| Duration::from_secs(minutes.saturating_mul(60))),
+                    },
+                    metadata,
+                },
+                checkpoint,
+                &sweep_scope,
+                !dry_run,
+            ))?;
+            restart_pending = false;
             let fences_pruned = if dry_run {
                 0
             } else {
@@ -534,6 +636,15 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         println!("  skipped unknown age:  {}", stats.skipped_unknown_age);
         println!("  deferred candidates: {}", stats.skipped_deferred);
         println!("  outcome:              {}", stats.outcome.label());
+        println!(
+            "  scan coverage:        {} (next={})",
+            if stats.scan_complete {
+                "complete"
+            } else {
+                "partial"
+            },
+            stats.scan_position
+        );
         println!(
             "  {}: {}",
             if dry_run { "would delete" } else { "deleted" },
@@ -600,6 +711,7 @@ mod tests {
     #[derive(Default)]
     struct FakeJanitorStore {
         entries: Vec<studiofs_data::janitor::JanitorEntry>,
+        start_after_capable: Option<bool>,
         deleted: Mutex<Vec<String>>,
         list_requests: AtomicU64,
         head_requests: AtomicU64,
@@ -641,13 +753,26 @@ mod tests {
     impl JanitorObjectStore for FakeJanitorStore {
         type Listing = FakeListing;
 
-        async fn list(&self, _prefix: &str) -> anyhow::Result<FakeListing> {
+        fn supports_start_after(&self) -> bool {
+            self.start_after_capable.unwrap_or(true)
+        }
+
+        async fn list(&self, prefix: &str, after_key: Option<&str>) -> anyhow::Result<FakeListing> {
             self.list_requests.fetch_add(1, Ordering::Relaxed);
             if self.fail_list {
                 anyhow::bail!("list failed")
             }
             Ok(FakeListing {
-                entries: self.entries.clone().into_iter(),
+                entries: self
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.key.starts_with(prefix))
+                    .filter(|entry| {
+                        after_key.is_none_or(|after_key| entry.key.as_str() > after_key)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter(),
                 fail_after: self.fail_list_after,
                 hang: self.hang_list,
                 yielded: 0,
@@ -706,6 +831,9 @@ mod tests {
         finish_error: Option<&'static str>,
         claims: Vec<u64>,
         finishes: Vec<(u64, i64, UploadedObjectDeletionOutcome)>,
+        sweep_checkpoint: Option<JanitorSweepCheckpoint>,
+        sweep_checkpoint_writes: u64,
+        sweep_checkpoint_resets: u64,
     }
 
     /// Fencing token the fake metadata hands out for `object_id`.
@@ -849,10 +977,265 @@ mod tests {
             Ok(0)
         }
 
+        fn load_sweep_checkpoint(
+            &mut self,
+            _scope: JanitorSweepScope<'_>,
+            persist_initial: bool,
+        ) -> anyhow::Result<JanitorSweepCheckpoint> {
+            let checkpoint = self
+                .sweep_checkpoint
+                .clone()
+                .unwrap_or(JanitorSweepCheckpoint {
+                    after_key: None,
+                    pending_object_id: None,
+                    pending_key: None,
+                    next_prefix: "0".to_string(),
+                });
+            if persist_initial && self.sweep_checkpoint.is_none() {
+                self.sweep_checkpoint = Some(checkpoint.clone());
+                self.sweep_checkpoint_writes += 1;
+            }
+            Ok(checkpoint)
+        }
+
+        fn save_sweep_checkpoint(
+            &mut self,
+            _scope: JanitorSweepScope<'_>,
+            checkpoint: &JanitorSweepCheckpoint,
+        ) -> anyhow::Result<()> {
+            self.sweep_checkpoint = Some(checkpoint.clone());
+            self.sweep_checkpoint_writes += 1;
+            Ok(())
+        }
+
+        fn reset_sweep_checkpoint(&mut self, _scope: JanitorSweepScope<'_>) -> anyhow::Result<()> {
+            self.sweep_checkpoint = None;
+            self.sweep_checkpoint_resets += 1;
+            Ok(())
+        }
+
         fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
             self.releases += 1;
             Ok(())
         }
+    }
+
+    fn sweep_scope() -> JanitorSweepScope<'static> {
+        JanitorSweepScope {
+            volume_uuid: "volume",
+            endpoint: "endpoint",
+            bucket: "bucket",
+            data_prefix: "test/objects/",
+            listing_strategy: "start_after",
+        }
+    }
+
+    fn sweep_checkpoint() -> JanitorSweepCheckpoint {
+        JanitorSweepCheckpoint {
+            after_key: None,
+            pending_object_id: None,
+            pending_key: None,
+            next_prefix: "0".into(),
+        }
+    }
+
+    #[test]
+    fn janitor_restart_with_single_entry_budget_drains_fragments_and_wraps() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut keys = canonical_keys(42);
+        keys.extend(canonical_keys(43));
+        keys.sort();
+        let store = FakeJanitorStore {
+            entries: keys
+                .into_iter()
+                .map(|key| JanitorEntry {
+                    key,
+                    is_file: true,
+                    last_modified: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let mut completed = false;
+        for _ in 0..10 {
+            // Recreate the in-memory state from the durable row on each invocation.
+            let checkpoint = metadata
+                .sweep_checkpoint
+                .clone()
+                .unwrap_or_else(sweep_checkpoint);
+            let stats = rt
+                .block_on(run_one_cycle_resumable(
+                    JanitorCycleContext {
+                        store: &store,
+                        prefix: "test/objects/",
+                        dry_run: false,
+                        skip_newer_than_secs: 0,
+                        budget: RunBudget {
+                            max_deletes: 100,
+                            max_scan_entries: Some(1),
+                            max_runtime: None,
+                        },
+                        metadata: &mut metadata,
+                    },
+                    checkpoint,
+                    &sweep_scope(),
+                    true,
+                ))
+                .unwrap();
+            assert!(stats.initial_listing_entries <= 1);
+            if stats.scan_complete {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        assert_eq!(metadata.claims, vec![42, 43]);
+        assert_eq!(metadata.sweep_checkpoint, Some(sweep_checkpoint()));
+    }
+
+    #[test]
+    fn janitor_resumed_object_refreshes_age_and_dry_run_preserves_checkpoint() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for (young, missing) in [(true, false), (false, true)] {
+            let mut keys = canonical_keys(42);
+            keys.sort();
+            let checkpoint = JanitorSweepCheckpoint {
+                after_key: Some(keys[0].clone()),
+                pending_object_id: Some(42),
+                pending_key: Some(keys[0].clone()),
+                next_prefix: "0".into(),
+            };
+            let store = FakeJanitorStore {
+                entries: keys
+                    .into_iter()
+                    .map(|key| JanitorEntry {
+                        key,
+                        is_file: true,
+                        last_modified: Some(SystemTime::now() - Duration::from_secs(3600)),
+                    })
+                    .collect(),
+                head_young: young,
+                head_missing: missing,
+                ..Default::default()
+            };
+            let mut metadata = FakeJanitorMetadata {
+                sweep_checkpoint: Some(checkpoint.clone()),
+                ..FakeJanitorMetadata::eligible()
+            };
+            let stats = rt
+                .block_on(run_one_cycle_resumable(
+                    JanitorCycleContext {
+                        store: &store,
+                        prefix: "test/objects/",
+                        dry_run: true,
+                        skip_newer_than_secs: 60,
+                        budget: RunBudget::deletes(100),
+                        metadata: &mut metadata,
+                    },
+                    checkpoint.clone(),
+                    &sweep_scope(),
+                    false,
+                ))
+                .unwrap();
+            assert_eq!(stats.deleted, 0);
+            assert!(metadata.claims.is_empty());
+            assert_eq!(metadata.sweep_checkpoint, Some(checkpoint));
+            assert_eq!(metadata.sweep_checkpoint_writes, 0);
+            assert!(store.head_requests.load(Ordering::Relaxed) > 0);
+            assert_eq!(stats.skipped_young + stats.skipped_unknown_age, 1);
+        }
+    }
+
+    #[test]
+    fn janitor_capped_eof_batch_replays_unprocessed_candidates() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut keys = canonical_keys(42);
+        keys.extend(canonical_keys(43));
+        keys.sort();
+        let store = FakeJanitorStore {
+            entries: keys
+                .into_iter()
+                .map(|key| JanitorEntry {
+                    key,
+                    is_file: true,
+                    last_modified: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let checkpoint = sweep_checkpoint();
+        let stats = rt
+            .block_on(run_one_cycle_resumable(
+                JanitorCycleContext {
+                    store: &store,
+                    prefix: "test/objects/",
+                    dry_run: false,
+                    skip_newer_than_secs: 0,
+                    budget: RunBudget::deletes(1),
+                    metadata: &mut metadata,
+                },
+                checkpoint.clone(),
+                &sweep_scope(),
+                true,
+            ))
+            .unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert!(!stats.scan_complete);
+        assert_eq!(metadata.sweep_checkpoint, Some(checkpoint));
+    }
+
+    #[test]
+    fn janitor_fallback_single_entry_budget_eventually_advances_past_dense_shard() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let store = FakeJanitorStore {
+            entries: canonical_keys(42)
+                .into_iter()
+                .map(|key| JanitorEntry {
+                    key,
+                    is_file: true,
+                    last_modified: None,
+                })
+                .collect(),
+            start_after_capable: Some(false),
+            ..Default::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        for _ in 0..24 {
+            let checkpoint = metadata
+                .sweep_checkpoint
+                .clone()
+                .unwrap_or_else(sweep_checkpoint);
+            let stats = rt
+                .block_on(run_one_cycle_resumable(
+                    JanitorCycleContext {
+                        store: &store,
+                        prefix: "test/objects/",
+                        dry_run: false,
+                        skip_newer_than_secs: 0,
+                        budget: RunBudget {
+                            max_deletes: 100,
+                            max_scan_entries: Some(1),
+                            max_runtime: None,
+                        },
+                        metadata: &mut metadata,
+                    },
+                    checkpoint,
+                    &sweep_scope(),
+                    true,
+                ))
+                .unwrap();
+            assert!(stats.initial_listing_entries <= 1);
+            if !metadata.claims.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(metadata.claims, vec![42]);
+        assert_ne!(
+            metadata.sweep_checkpoint.unwrap().next_prefix,
+            "002a000000000000002a"
+        );
     }
 
     #[test]
@@ -1136,8 +1519,6 @@ mod tests {
             |id| studiofs_data::object::format_object_fragment_keys("test/objects/", id)[0].clone();
         // Entries follow S3's lexicographic listing order.
         let entries = vec![
-            // A foreign prefix is never parsed into an object.
-            entry(format!("other/{}", legacy(5)), ago(3600)),
             // Old legacy key plus a young fragment: the newest key decides, so it is young.
             entry(legacy(1), ago(3600)),
             entry(fragment(1), ago(30)),
@@ -1181,7 +1562,7 @@ mod tests {
         ctx.budget.max_deletes = u64::MAX;
         let stats = run_one_cycle(ctx).await.unwrap();
 
-        assert_eq!(stats.skipped_non_canonical, 3);
+        assert_eq!(stats.skipped_non_canonical, 2);
         assert_eq!(stats.orphan_candidates, 5);
         assert_eq!(stats.skipped_young, 2);
         assert_eq!(stats.skipped_unknown_age, 1);
@@ -2195,6 +2576,8 @@ mod tests {
                     max_deletes: 1,
                     max_scan_entries: None,
                     max_runtime_minutes: None,
+                    full_scan: false,
+                    reset_scan: false,
                 },
             })
         })
@@ -2243,6 +2626,8 @@ mod tests {
                     max_deletes: 1,
                     max_scan_entries: None,
                     max_runtime_minutes: None,
+                    full_scan: false,
+                    reset_scan: false,
                 },
             });
             if let Some(session) = holder.as_mut() {
@@ -2341,6 +2726,8 @@ mod tests {
                 max_deletes,
                 max_scan_entries,
                 max_runtime_minutes,
+                full_scan,
+                reset_scan,
             }) => {
                 assert_eq!(name, "vol");
                 assert_eq!(cache_dir, Some(PathBuf::from("D:\\cache\\studiofs")));
@@ -2351,13 +2738,15 @@ mod tests {
                 assert_eq!(max_deletes, 600);
                 assert_eq!(max_scan_entries, None);
                 assert_eq!(max_runtime_minutes, None);
+                assert!(!full_scan);
+                assert!(!reset_scan);
             }
             other => panic!("expected Janitor, got {other:?}"),
         }
     }
 
     #[test]
-    fn janitor_budget_flags_reject_zero_and_loop_mode() {
+    fn janitor_budget_and_scan_flags_parse_and_reject_conflicts() {
         let cli = crate::cli::parse_for_test(&[
             "janitor",
             "vol",
@@ -2383,13 +2772,18 @@ mod tests {
                 "{flag} 0 must be rejected"
             );
         }
-        // Without a persisted continuation a looped partial cycle never reaches the tail.
         for flag in ["--max-scan-entries", "--max-runtime-minutes"] {
             assert!(
-                crate::cli::parse_for_test(&["janitor", "vol", "--loop", flag, "5"]).is_err(),
-                "{flag} must conflict with --loop"
+                crate::cli::parse_for_test(&["janitor", "vol", "--loop", flag, "5"]).is_ok(),
+                "{flag} should be resumable in loop mode"
             );
         }
+        assert!(crate::cli::parse_for_test(&["janitor", "vol", "--full-scan"]).is_ok());
+        assert!(crate::cli::parse_for_test(&["janitor", "vol", "--reset-scan"]).is_ok());
+        assert!(
+            crate::cli::parse_for_test(&["janitor", "vol", "--full-scan", "--reset-scan",])
+                .is_err()
+        );
     }
 
     #[test]

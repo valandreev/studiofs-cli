@@ -55,11 +55,29 @@ impl JanitorObjectStore {
         Ok(Self::new(operator))
     }
 
-    /// Start a lazy recursive listing below `prefix`; pages are fetched on demand.
+    /// Whether this provider can resume its listing after one key.
+    pub fn supports_start_after(&self) -> bool {
+        self.operator.info().full_capability().list_with_start_after
+    }
+
+    /// Start a lazy recursive listing below `prefix`.
     pub async fn list(&self, prefix: &str) -> Result<JanitorLister> {
-        Ok(JanitorLister(
-            self.operator.lister_with(prefix).recursive(true).await?,
-        ))
+        self.list_after(prefix, None).await
+    }
+
+    /// Start a lazy recursive listing below `prefix`, optionally after one key.
+    pub async fn list_after(&self, prefix: &str, after_key: Option<&str>) -> Result<JanitorLister> {
+        let mut lister = self.operator.lister_with(prefix);
+        if let Some(after_key) = after_key {
+            if !self.supports_start_after() {
+                return Err(opendal::Error::new(
+                    ErrorKind::Unsupported,
+                    "provider cannot resume listings after a key",
+                ));
+            }
+            lister = lister.start_after(after_key);
+        }
+        Ok(JanitorLister(lister.recursive(true).await?))
     }
 
     /// Return the remote object's last-modified time when the provider supplies one.
@@ -72,6 +90,17 @@ impl JanitorObjectStore {
             .map(Into::into))
     }
 
+    /// Return whether an exact canonical key exists and, when available, its age.
+    pub async fn stat_key(&self, key: &str) -> Result<JanitorKeyStat> {
+        match self.operator.stat(key).await {
+            Ok(metadata) => Ok(JanitorKeyStat::Found(
+                metadata.last_modified().map(Into::into),
+            )),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(JanitorKeyStat::Missing),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Delete one object fragment.
     pub async fn delete(&self, key: &str) -> std::result::Result<(), JanitorDeleteError> {
         self.operator.delete(key).await.map_err(|error| {
@@ -82,6 +111,15 @@ impl JanitorObjectStore {
             }
         })
     }
+}
+
+/// Result of statting one exact object key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JanitorKeyStat {
+    /// The object is absent.
+    Missing,
+    /// The object exists; its timestamp may be unavailable.
+    Found(Option<SystemTime>),
 }
 
 /// Streaming listing that holds at most one provider page in memory.

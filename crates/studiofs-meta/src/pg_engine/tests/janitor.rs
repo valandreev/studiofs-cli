@@ -924,3 +924,112 @@ fn concurrent_snapshot_creations_released_by_the_janitor_do_not_deadlock() {
         creator.join().expect("join snapshot creator");
     }
 }
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_janitor_sweep_checkpoint_restart_scope_dry_run_and_version() {
+    use crate::{JanitorSweepCheckpoint, JanitorSweepScope};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
+    let volume = PgTestVolume::new(&dsn, "pg-janitor-sweep");
+    let scope = JanitorSweepScope {
+        volume_uuid: &volume.uuid,
+        endpoint: "endpoint",
+        bucket: "bucket",
+        data_prefix: "objects/",
+        listing_strategy: "start-after-v1",
+    };
+    let initial = JanitorSweepCheckpoint {
+        after_key: None,
+        pending_object_id: None,
+        pending_key: None,
+        next_prefix: "0".into(),
+    };
+    let saved = JanitorSweepCheckpoint {
+        after_key: Some("objects/002a/000000000000002a/0".into()),
+        pending_object_id: Some(42),
+        pending_key: Some("objects/002a/000000000000002a/0".into()),
+        next_prefix: "0".into(),
+    };
+    let open = || {
+        let mut session = crate::pg_engine::PgJanitorSession::new(dsn.clone(), volume.volume_id);
+        assert!(session.try_acquire_global_janitor_lock().unwrap());
+        session
+    };
+    let mut session = open();
+    assert_eq!(
+        session.load_sweep_checkpoint(scope, false).unwrap(),
+        initial
+    );
+    session.save_sweep_checkpoint(scope, &saved).unwrap();
+    drop(session);
+    let mut session = open();
+    assert_eq!(session.load_sweep_checkpoint(scope, false).unwrap(), saved);
+    for changed in [
+        JanitorSweepScope {
+            volume_uuid: "other",
+            ..scope
+        },
+        JanitorSweepScope {
+            endpoint: "other",
+            ..scope
+        },
+        JanitorSweepScope {
+            bucket: "other",
+            ..scope
+        },
+        JanitorSweepScope {
+            data_prefix: "other/",
+            ..scope
+        },
+        JanitorSweepScope {
+            listing_strategy: "prefix-trie-v1",
+            ..scope
+        },
+    ] {
+        assert_eq!(
+            session.load_sweep_checkpoint(changed, false).unwrap(),
+            initial
+        );
+        assert_eq!(
+            session.load_sweep_checkpoint(scope, false).unwrap(),
+            saved,
+            "dry-run must not mutate mismatched scope"
+        );
+        assert_eq!(
+            session.load_sweep_checkpoint(changed, true).unwrap(),
+            initial
+        );
+        assert_eq!(
+            session.load_sweep_checkpoint(changed, false).unwrap(),
+            initial
+        );
+        session.save_sweep_checkpoint(scope, &saved).unwrap();
+    }
+    session.reset_sweep_checkpoint(scope).unwrap();
+    assert_eq!(
+        session.load_sweep_checkpoint(scope, false).unwrap(),
+        initial
+    );
+    session.save_sweep_checkpoint(scope, &saved).unwrap();
+    let execute = |sql: &'static str| {
+        run_async(async {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .unwrap();
+            let task = tokio::spawn(connection);
+            client.execute(sql, &[&volume.volume_id]).await.unwrap();
+            task.abort();
+            Ok::<_, MetaError>(())
+        })
+        .unwrap();
+    };
+    execute("UPDATE snapshot_payload_sweep_checkpoints SET next_prefix = 'invalid' WHERE vol = $1");
+    assert!(session.load_sweep_checkpoint(scope, false).is_err());
+    execute(
+        "UPDATE snapshot_payload_sweep_checkpoints SET next_prefix = '0', schema_version = 2 WHERE vol = $1",
+    );
+    assert!(session.load_sweep_checkpoint(scope, false).is_err());
+    assert!(session.load_sweep_checkpoint(scope, true).is_err());
+    assert!(session.save_sweep_checkpoint(scope, &saved).is_err());
+    assert!(session.reset_sweep_checkpoint(scope).is_err());
+}
