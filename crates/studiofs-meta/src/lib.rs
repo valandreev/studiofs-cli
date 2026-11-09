@@ -21,6 +21,8 @@ pub mod contract_harness;
 pub mod engine;
 /// Internal metadata event-log payloads used for replication and recovery.
 pub mod events;
+/// Metadata protection snapshots for standalone object cleanup.
+pub mod janitor;
 /// PostgreSQL DSN helpers for StudioFS metadata databases.
 pub mod pg_dsn;
 /// PostgreSQL-backed metadata engine implementation.

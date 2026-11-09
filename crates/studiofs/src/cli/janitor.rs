@@ -2,49 +2,33 @@
 
 use crate::cli::cache_layout::describe_cache_layout_state;
 use clap::Args;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
-use opendal::services::S3;
-use opendal::{EntryMode, ErrorKind, Operator};
 use studiofs_cache::runtime::{
     LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
-use studiofs_data::object::{format_object_fragment_keys, parse_object_id_from_key};
 use studiofs_meta::open_meta_engine;
+mod pipeline;
+use pipeline::{JanitorCycleContext, JanitorObjectStore, JanitorStats, run_one_cycle};
+use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry};
 
-#[derive(Debug, Default)]
-struct JanitorStats {
-    scanned_files: u64,
-    referenced_files: u64,
-    orphan_candidates: u64,
-    skipped_young: u64,
-    skipped_unknown_age: u64,
-    skipped_cap: u64,
-    deleted: u64,
-    delete_errors: u64,
-    initial_listing_elapsed: Duration,
-    initial_listing_entries: u64,
-    peak_listing_entries: u64,
-    time_to_first_candidate: Option<Duration>,
-    cycle_elapsed: Duration,
-    head_requests: u64,
-    head_elapsed: Duration,
-    delete_requests: u64,
-    delete_elapsed: Duration,
-}
+struct OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore);
 
-struct JanitorCycleContext<'a> {
-    op: &'a Operator,
-    prefix: &'a str,
-    referenced: &'a HashSet<u64>,
-    global_snapshot_pins: &'a HashSet<u64>,
-    pending: &'a HashMap<u64, i64>,
-    dry_run: bool,
-    skip_newer_than_secs: u64,
-    max_deletes: u64,
+impl JanitorObjectStore for OpenDalJanitorStore {
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<JanitorEntry>> {
+        Ok(self.0.list(prefix).await?)
+    }
+
+    async fn last_modified(&self, key: &str) -> anyhow::Result<Option<SystemTime>> {
+        Ok(self.0.last_modified(key).await?)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError> {
+        self.0.delete(key).await
+    }
 }
 
 struct JanitorOptions {
@@ -282,150 +266,6 @@ fn inspect_local_cache_runtime(
     ))
 }
 
-async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorStats> {
-    let mut stats = JanitorStats::default();
-    let cycle_started = Instant::now();
-    let mut seen_objects = HashSet::new();
-    let now = SystemTime::now();
-    let now_unix = i64::try_from(
-        now.duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| Duration::from_secs(0))
-            .as_secs(),
-    )
-    .unwrap_or(i64::MAX);
-
-    eprintln!("janitor phase=initial_listing started");
-    let listing_started = Instant::now();
-    let entries = ctx.op.list_with(ctx.prefix).recursive(true).await?;
-    stats.initial_listing_elapsed = listing_started.elapsed();
-    stats.initial_listing_entries = u64::try_from(entries.len()).unwrap_or(u64::MAX);
-    stats.peak_listing_entries = stats.initial_listing_entries;
-    eprintln!(
-        "janitor phase=initial_listing completed duration_ms={} entries={}",
-        duration_ms(stats.initial_listing_elapsed),
-        stats.initial_listing_entries
-    );
-    for entry in entries {
-        if entry.metadata().mode() != EntryMode::FILE {
-            continue;
-        }
-
-        stats.scanned_files = stats.scanned_files.saturating_add(1);
-        let path = entry.path().to_string();
-
-        let object_id = match parse_object_id_from_key(&path) {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-        if !seen_objects.insert(object_id) {
-            continue;
-        }
-
-        if ctx.referenced.contains(&object_id) {
-            stats.referenced_files = stats.referenced_files.saturating_add(1);
-            continue;
-        }
-        if ctx.global_snapshot_pins.contains(&object_id) {
-            stats.referenced_files = stats.referenced_files.saturating_add(1);
-            continue;
-        }
-        stats.orphan_candidates = stats.orphan_candidates.saturating_add(1);
-        if stats.time_to_first_candidate.is_none() {
-            stats.time_to_first_candidate = Some(cycle_started.elapsed());
-        }
-
-        if stats.deleted >= ctx.max_deletes {
-            stats.skipped_cap = stats.skipped_cap.saturating_add(1);
-            continue;
-        }
-
-        if let Some(pending_ts) = ctx.pending.get(&object_id) {
-            let age_secs = u64::try_from(now_unix.saturating_sub(*pending_ts));
-            if let Ok(age_secs) = age_secs {
-                if age_secs < ctx.skip_newer_than_secs {
-                    stats.skipped_young = stats.skipped_young.saturating_add(1);
-                    continue;
-                }
-            } else {
-                stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
-                continue;
-            }
-        } else {
-            if stats.head_requests == 0 {
-                eprintln!("janitor phase=head started");
-            }
-            stats.head_requests = stats.head_requests.saturating_add(1);
-            let head_started = Instant::now();
-            let metadata = ctx.op.stat(&path).await;
-            stats.head_elapsed += head_started.elapsed();
-            let meta = match metadata {
-                Ok(m) => m,
-                Err(_) => {
-                    stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
-                    continue;
-                }
-            };
-            let Some(last_modified) = meta.last_modified() else {
-                stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
-                continue;
-            };
-            let last_modified_st: SystemTime = last_modified.into();
-            let age_secs = now
-                .duration_since(last_modified_st)
-                .unwrap_or_else(|_| Duration::from_secs(0))
-                .as_secs();
-            if age_secs < ctx.skip_newer_than_secs {
-                stats.skipped_young = stats.skipped_young.saturating_add(1);
-                continue;
-            }
-        }
-
-        if ctx.dry_run {
-            stats.deleted = stats.deleted.saturating_add(1);
-            continue;
-        }
-
-        let mut delete_failed = false;
-        for key in format_object_fragment_keys(ctx.prefix, object_id) {
-            if stats.delete_requests == 0 {
-                eprintln!("janitor phase=delete started");
-            }
-            stats.delete_requests = stats.delete_requests.saturating_add(1);
-            let delete_started = Instant::now();
-            let result = ctx.op.delete(&key).await;
-            stats.delete_elapsed += delete_started.elapsed();
-            if let Err(err) = result {
-                if err.kind() == ErrorKind::NotFound {
-                    continue;
-                }
-                delete_failed = true;
-                eprintln!(
-                    "janitor: failed to delete fragment key={} object_id={}: {}",
-                    key, object_id, err
-                );
-            }
-        }
-        if delete_failed {
-            stats.delete_errors = stats.delete_errors.saturating_add(1);
-            continue;
-        }
-        stats.deleted = stats.deleted.saturating_add(1);
-    }
-
-    stats.cycle_elapsed = cycle_started.elapsed();
-    eprintln!(
-        "janitor phase=head completed calls={} duration_ms={}",
-        stats.head_requests,
-        duration_ms(stats.head_elapsed)
-    );
-    eprintln!(
-        "janitor phase=delete completed calls={} duration_ms={}",
-        stats.delete_requests,
-        duration_ms(stats.delete_elapsed)
-    );
-    Ok(stats)
-}
-
 fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
     let JanitorRunRequest {
         name,
@@ -472,19 +312,13 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         None
     };
 
-    let mut builder = S3::default()
-        .endpoint(&format_info.endpoint)
-        .bucket(&format_info.bucket)
-        .access_key_id(&format_info.access_key)
-        .secret_access_key(&format_info.secret_key)
-        .disable_config_load()
-        .disable_ec2_metadata();
-    if !format_info.region.is_empty() {
-        builder = builder.region(&format_info.region);
-    } else {
-        builder = builder.region("us-east-1");
-    }
-    let op = Operator::new(builder)?.finish();
+    let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::from_s3(
+        &format_info.endpoint,
+        &format_info.bucket,
+        &format_info.access_key,
+        &format_info.secret_key,
+        &format_info.region,
+    )?);
 
     let rt = tokio::runtime::Runtime::new()?;
     let skip_secs = skip_newer_minutes.saturating_mul(60);
@@ -531,33 +365,28 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         eprintln!("janitor phase=protection started");
         let mut protection_elapsed = Duration::ZERO;
         let cycle_result = (|| -> anyhow::Result<(JanitorStats, HashSet<u64>, HashSet<u64>)> {
-            let global_snapshot_pins = engine.get_global_snapshot_pins()?;
-            if !dry_run {
-                engine.reconcile_pending_regular_file_recoveries()?;
-            }
-            let referenced = engine.get_referenced_object_ids()?;
-            let pending: HashMap<u64, i64> = engine.get_pending_deletions()?.into_iter().collect();
+            let protection = studiofs_meta::janitor::collect_janitor_protection(&*engine, dry_run)?;
             protection_elapsed = protection_started.elapsed();
             eprintln!(
                 "janitor phase=protection completed duration_ms={} references={} snapshot_pins={} pending={}",
                 duration_ms(protection_elapsed),
-                referenced.len(),
-                global_snapshot_pins.len(),
-                pending.len()
+                protection.referenced.len(),
+                protection.snapshot_pins.len(),
+                protection.pending_deletions.len()
             );
 
             let stats = rt.block_on(run_one_cycle(JanitorCycleContext {
-                op: &op,
+                store: &store,
                 prefix: &prefix,
-                referenced: &referenced,
-                global_snapshot_pins: &global_snapshot_pins,
-                pending: &pending,
+                referenced: &protection.referenced,
+                global_snapshot_pins: &protection.snapshot_pins,
+                pending: &protection.pending_deletions,
                 dry_run,
                 skip_newer_than_secs: skip_secs,
                 max_deletes: max_deletes.max(1),
             }))?;
 
-            Ok((stats, referenced, global_snapshot_pins))
+            Ok((stats, protection.referenced, protection.snapshot_pins))
         })();
         if let Err(e) = engine.release_global_janitor_lock() {
             eprintln!("Warning: failed to release global janitor lock: {}", e);
@@ -622,9 +451,254 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opendal::Operator;
+    use opendal::services::S3;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use studiofs_cache::runtime::LocalPayloadLayout;
     use studiofs_meta::{MetaFormat, RedbMetaEngine};
+
+    #[derive(Default)]
+    struct FakeJanitorStore {
+        entries: Vec<studiofs_data::janitor::JanitorEntry>,
+        deleted: Mutex<Vec<String>>,
+        fail_list: bool,
+        fail_head: bool,
+        head_missing: bool,
+        head_young: bool,
+        fail_delete: bool,
+        missing_delete: bool,
+    }
+
+    impl JanitorObjectStore for FakeJanitorStore {
+        async fn list(&self, _prefix: &str) -> anyhow::Result<Vec<JanitorEntry>> {
+            if self.fail_list {
+                anyhow::bail!("list failed")
+            }
+            Ok(self.entries.clone())
+        }
+
+        async fn last_modified(&self, _key: &str) -> anyhow::Result<Option<SystemTime>> {
+            if self.fail_head {
+                anyhow::bail!("head failed")
+            }
+            if self.head_missing {
+                return Ok(None);
+            }
+            let age = if self.head_young { 0 } else { 3600 };
+            Ok(Some(SystemTime::now() - Duration::from_secs(age)))
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError> {
+            self.deleted.lock().unwrap().push(key.to_string());
+            if self.fail_delete {
+                Err(JanitorDeleteError::Other("delete failed".to_string()))
+            } else if self.missing_delete {
+                Err(JanitorDeleteError::NotFound)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn fake_cycle_context<'a>(
+        store: &'a FakeJanitorStore,
+        empty: &'a HashSet<u64>,
+        pending: &'a HashMap<u64, i64>,
+    ) -> JanitorCycleContext<'a, FakeJanitorStore> {
+        JanitorCycleContext {
+            store,
+            prefix: "test/objects/",
+            referenced: empty,
+            global_snapshot_pins: empty,
+            pending,
+            dry_run: false,
+            skip_newer_than_secs: 60,
+            max_deletes: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_store_deletes_only_discovered_unprotected_objects() {
+        let keys_for = |object_id| {
+            studiofs_data::object::format_object_fragment_keys("test/objects/", object_id)
+                .into_iter()
+                .map(|key| studiofs_data::janitor::JanitorEntry { key, is_file: true })
+                .collect::<Vec<_>>()
+        };
+        let mut entries = keys_for(1);
+        entries.extend(keys_for(2));
+        entries.extend(keys_for(3));
+        let store = FakeJanitorStore {
+            entries,
+            deleted: Mutex::new(Vec::new()),
+            ..FakeJanitorStore::default()
+        };
+        let stats = run_one_cycle(JanitorCycleContext {
+            store: &store,
+            prefix: "test/objects/",
+            referenced: &HashSet::from([1]),
+            global_snapshot_pins: &HashSet::from([2]),
+            pending: &HashMap::new(),
+            dry_run: false,
+            skip_newer_than_secs: 60,
+            max_deletes: 1,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(stats.referenced_files, 2);
+        assert_eq!(stats.orphan_candidates, 1);
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(
+            *store.deleted.lock().unwrap(),
+            studiofs_data::object::format_object_fragment_keys("test/objects/", 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_store_failures_skip_deletion_and_not_found_fragments_are_tolerated() {
+        let entries = studiofs_data::object::format_object_fragment_keys("test/objects/", 4)
+            .into_iter()
+            .map(|key| studiofs_data::janitor::JanitorEntry { key, is_file: true })
+            .collect::<Vec<_>>();
+        let empty = HashSet::new();
+        let pending = HashMap::new();
+        let listing_failure = FakeJanitorStore {
+            fail_list: true,
+            ..FakeJanitorStore::default()
+        };
+        assert!(
+            run_one_cycle(fake_cycle_context(&listing_failure, &empty, &pending))
+                .await
+                .is_err()
+        );
+        assert!(listing_failure.deleted.lock().unwrap().is_empty());
+
+        let head_failure = FakeJanitorStore {
+            entries: entries.clone(),
+            fail_head: true,
+            ..FakeJanitorStore::default()
+        };
+        let stats = run_one_cycle(fake_cycle_context(&head_failure, &empty, &pending))
+            .await
+            .unwrap();
+        assert_eq!(stats.skipped_unknown_age, 1);
+        assert_eq!(stats.deleted, 0);
+        assert!(head_failure.deleted.lock().unwrap().is_empty());
+
+        let delete_failure = FakeJanitorStore {
+            entries: entries.clone(),
+            fail_delete: true,
+            ..FakeJanitorStore::default()
+        };
+        let stats = run_one_cycle(fake_cycle_context(&delete_failure, &empty, &pending))
+            .await
+            .unwrap();
+        assert_eq!(stats.delete_errors, 1);
+        assert_eq!(stats.deleted, 0);
+
+        let missing_fragments = FakeJanitorStore {
+            entries,
+            missing_delete: true,
+            ..FakeJanitorStore::default()
+        };
+        let stats = run_one_cycle(fake_cycle_context(&missing_fragments, &empty, &pending))
+            .await
+            .unwrap();
+        assert_eq!(stats.delete_errors, 0);
+        assert_eq!(stats.deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn fake_store_age_and_cap_gates_skip_deletion() {
+        let entries_for = |object_ids: &[u64]| {
+            object_ids
+                .iter()
+                .flat_map(|&id| {
+                    studiofs_data::object::format_object_fragment_keys("test/objects/", id)
+                })
+                .map(|key| JanitorEntry { key, is_file: true })
+                .collect::<Vec<_>>()
+        };
+        let empty = HashSet::new();
+        let no_pending = HashMap::new();
+
+        // Unknown and young HEAD ages never delete.
+        for (store, young, unknown) in [
+            (
+                FakeJanitorStore {
+                    entries: entries_for(&[5]),
+                    head_missing: true,
+                    ..FakeJanitorStore::default()
+                },
+                0,
+                1,
+            ),
+            (
+                FakeJanitorStore {
+                    entries: entries_for(&[5]),
+                    head_young: true,
+                    ..FakeJanitorStore::default()
+                },
+                1,
+                0,
+            ),
+        ] {
+            let stats = run_one_cycle(fake_cycle_context(&store, &empty, &no_pending))
+                .await
+                .unwrap();
+            assert_eq!(
+                (stats.skipped_young, stats.skipped_unknown_age),
+                (young, unknown)
+            );
+            assert_eq!(stats.deleted, 0);
+            assert!(store.deleted.lock().unwrap().is_empty());
+        }
+
+        // Pending-deletion timestamps decide age without HEAD; future timestamps are unknown.
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let store = FakeJanitorStore {
+            entries: entries_for(&[6, 7, 8]),
+            fail_head: true,
+            ..FakeJanitorStore::default()
+        };
+        let pending = HashMap::from([(6, now), (7, now + 3600), (8, now - 3600)]);
+        let stats = run_one_cycle(fake_cycle_context(&store, &empty, &pending))
+            .await
+            .unwrap();
+        assert_eq!(stats.head_requests, 0);
+        assert_eq!(stats.skipped_young, 1);
+        assert_eq!(stats.skipped_unknown_age, 1);
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(
+            *store.deleted.lock().unwrap(),
+            studiofs_data::object::format_object_fragment_keys("test/objects/", 8)
+        );
+
+        // The delete cap stops further candidates before any HEAD or delete request.
+        let store = FakeJanitorStore {
+            entries: entries_for(&[9, 10, 11]),
+            ..FakeJanitorStore::default()
+        };
+        let stats = run_one_cycle(fake_cycle_context(&store, &empty, &no_pending))
+            .await
+            .unwrap();
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.skipped_cap, 2);
+        assert_eq!(stats.head_requests, 1);
+        assert_eq!(
+            *store.deleted.lock().unwrap(),
+            studiofs_data::object::format_object_fragment_keys("test/objects/", 9)
+        );
+    }
 
     struct FakeS3 {
         list_requests: AtomicU64,
@@ -781,10 +855,11 @@ mod tests {
     #[tokio::test]
     async fn janitor_eager_listing_baseline_reads_all_pages_before_low_delete_cap() {
         let (op, fake, _endpoint, server) = fake_s3_operator(2505).await;
+        let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::new(op));
         let stats = tokio::time::timeout(
             Duration::from_secs(30),
             run_one_cycle(JanitorCycleContext {
-                op: &op,
+                store: &store,
                 prefix: "test/objects/",
                 referenced: &HashSet::new(),
                 global_snapshot_pins: &HashSet::new(),
@@ -837,10 +912,11 @@ mod tests {
     #[tokio::test]
     async fn janitor_dry_run_never_sends_delete_requests() {
         let (op, fake, _endpoint, server) = fake_s3_operator(1).await;
+        let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::new(op));
         let result = tokio::time::timeout(
             Duration::from_secs(30),
             run_one_cycle(JanitorCycleContext {
-                op: &op,
+                store: &store,
                 prefix: "test/objects/",
                 referenced: &HashSet::new(),
                 global_snapshot_pins: &HashSet::new(),

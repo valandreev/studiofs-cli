@@ -22,6 +22,10 @@ The fixture provides 2,505 old object keys in three 1,000-key S3 pages and uses 
 
 This characterization records current behavior before any future listing or deletion algorithm change. It is not a live S3/PostgreSQL benchmark. The CLI uses PostgreSQL metadata only when the volume format selects that backend. Its standalone path does not use the mounted janitor's per-object claim/finish protocol, so claim and finish timings are not applicable. The mounted background janitor is unchanged.
 
+## Standalone janitor ownership
+
+The standalone command coordinates its phases in `crates/studiofs/src/cli/janitor.rs` and the provider-neutral cycle in `crates/studiofs/src/cli/janitor/pipeline.rs`. `studiofs-data` owns OpenDAL S3-compatible listing, last-modified reads, and fragment deletion; `studiofs-meta` owns the protected-reference snapshot and recovery reconciliation. This split keeps provider calls and metadata safety independently fakeable while preserving the eager listing order and existing protection policy. The mounted janitor remains in `crates/studiofs-vfs/src/vfs/workers.rs` and is not part of this CLI pipeline.
+
 For a real volume, a non-deleting measurement can be started with `studiofs janitor <volume> --dry-run --skip-newer-minutes 1 --max-deletes 1000`. Dry-run still reads metadata and lists/stat-checks remote objects; it suppresses DELETE calls. The recorded test does not run this command or connect to a live service.
 
 ## Reading a live run
