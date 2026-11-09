@@ -3,8 +3,12 @@
 use std::time::{Duration, SystemTime};
 
 use futures::TryStreamExt as _;
+use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer};
+use opendal::raw::{HttpBody, HttpClient, HttpFetch};
 use opendal::services::S3;
-use opendal::{EntryMode, ErrorKind, Operator, Result};
+use opendal::{Buffer, EntryMode, ErrorKind, Operator, Result};
+use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 /// OpenDAL adapter for listing and mutating payload objects.
 #[derive(Clone)]
@@ -36,7 +40,20 @@ impl JanitorObjectStore {
         access_key_id: &str,
         secret_access_key: &str,
         region: &str,
+        max_in_flight: usize,
+        requests_per_second: u32,
     ) -> Result<Self> {
+        if !(1..=32).contains(&max_in_flight) || !(1..=32).contains(&requests_per_second) {
+            return Err(opendal::Error::new(
+                ErrorKind::ConfigInvalid,
+                "janitor S3 request limits must be between 1 and 32",
+            ));
+        }
+        let request_rate = RateLimitedHttpClient {
+            inner: HttpClient::new()?,
+            interval: Duration::from_secs_f64(1.0 / f64::from(requests_per_second)),
+            next_request_at: Mutex::new(Instant::now()),
+        };
         let operator = Operator::new(
             S3::default()
                 .endpoint(endpoint)
@@ -51,6 +68,12 @@ impl JanitorObjectStore {
                 .disable_config_load()
                 .disable_ec2_metadata(),
         )?
+        .layer(HttpClientLayer::new(HttpClient::with(request_rate)))
+        .layer(
+            // A listing handle can stay open while candidate HEAD/DELETE work proceeds.
+            ConcurrentLimitLayer::new(studiofs_meta::MAX_JANITOR_ELIGIBILITY_BATCH + 1)
+                .with_http_concurrent_limit(max_in_flight),
+        )
         .finish();
         Ok(Self::new(operator))
     }
@@ -110,6 +133,27 @@ impl JanitorObjectStore {
                 JanitorDeleteError::Other(error.to_string())
             }
         })
+    }
+}
+
+/// Spreads actual provider HTTP request starts across the configured rate window.
+struct RateLimitedHttpClient {
+    inner: HttpClient,
+    interval: Duration,
+    next_request_at: Mutex<Instant>,
+}
+
+impl HttpFetch for RateLimitedHttpClient {
+    async fn fetch(&self, request: http::Request<Buffer>) -> Result<http::Response<HttpBody>> {
+        let mut next_request_at = self.next_request_at.lock().await;
+        let now = Instant::now();
+        if *next_request_at > now {
+            tokio::time::sleep_until(*next_request_at).await;
+        }
+        *next_request_at = Instant::now() + self.interval;
+        drop(next_request_at);
+
+        self.inner.fetch(request).await
     }
 }
 

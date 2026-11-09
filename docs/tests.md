@@ -233,6 +233,14 @@ They cover `delete_cap_counts_only_confirmed_successes_and_stops_listing`,
 `janitor_budget_flags_reject_zero_and_loop_mode`, and the OpenDAL
 fake-S3 check `janitor_delete_cap_stops_opendal_listing_after_first_page`.
 
+SFS-974's transport regression runs concurrent LIST, HEAD, and DELETE requests
+through the real OpenDAL S3 adapter with a loopback server. It checks the
+wire-request peak and request-start pacing, including serial mode:
+
+```powershell
+cargo test -p studiofs --bin studiofs s3_transport_budget_limits_live_http_requests_and_request_rate -- --nocapture
+```
+
 The SFS-973 live check runs the resumable janitor sweep against a real S3
 listing. It verifies `start_after` resume, partial hex prefixes without a trailing `/`,
 and repeated one-entry runs of both the `start_after` and the forced prefix-trie
