@@ -109,6 +109,8 @@ pub(super) struct JanitorStats {
     pub(super) delete_elapsed: Duration,
     /// HEAD probes that failed transiently; their objects were skipped as unknown age.
     pub(super) head_errors: u64,
+    /// Dry-run objects already counted as would-delete; bounded by the delete cap.
+    dry_run_counted: std::collections::HashSet<u64>,
     /// Objects in a row whose S3 work failed transiently.
     transient_streak: u32,
     pub(super) outcome: CycleOutcome,
@@ -488,6 +490,8 @@ async fn process_orphan<S: JanitorObjectStore>(
     }
 
     if ctx.dry_run {
+        // Dry-run neither deletes nor acks, so the listing can revisit a queued object.
+        stats.dry_run_counted.insert(object_id);
         stats.deleted = stats.deleted.saturating_add(1);
         super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
         return Ok(());
@@ -826,6 +830,7 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
             stats.outcome = stop;
             break;
         }
+        super::set_live_progress_phase(ctx.budget.progress.as_ref(), "listing");
         let wait_started = Instant::now();
         let entry = match bounded_list_step(
             listing.next_entry(),
@@ -1026,6 +1031,7 @@ async fn run_prefix_trie_listing<S: JanitorObjectStore>(
             if remaining != u64::MAX && entries_in_prefix >= remaining {
                 break;
             }
+            super::set_live_progress_phase(ctx.budget.progress.as_ref(), "listing");
             let wait_started = Instant::now();
             let entry = match bounded_list_step(
                 listing.next_entry(),
@@ -1162,12 +1168,18 @@ async fn bounded_list_step<T>(
 
 async fn process_candidate_batch<S: JanitorObjectStore>(
     ctx: &mut JanitorCycleContext<'_, S>,
-    candidates: Vec<Candidate>,
+    mut candidates: Vec<Candidate>,
     now: SystemTime,
     now_unix: i64,
     cycle_started: Instant,
     stats: &mut JanitorStats,
 ) -> anyhow::Result<()> {
+    if ctx.dry_run {
+        candidates.retain(|candidate| !stats.dry_run_counted.contains(&candidate.object_id));
+        if candidates.is_empty() {
+            return Ok(());
+        }
+    }
     let ids: Vec<u64> = candidates
         .iter()
         .map(|candidate| candidate.object_id)

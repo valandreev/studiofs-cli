@@ -79,3 +79,17 @@ The CLI output mode should be an enum accepted by clap, and JSON events should u
 The final repeated live process test `cargo test -p studiofs --bin studiofs live_cli_dry_run_keeps_eligible_candidate_and_object -- --ignored --nocapture --test-threads=1` failed: `would_delete` was 2 for one eligible queued object also present in the S3 listing (expected 1). Earlier runs passed, but they do not override this final failure. The queue stage and listing stage each reach the dry-run increment of `stats.deleted`; no deletion or queue acknowledgement removes the duplicate observation. The exact regression assertion is retained. No production correction or assertion weakening was made in this verification task. SFS-977 acceptance remains incomplete pending a bounded, correct accounting fix.
 
 The full binary test run passed 521 tests with 5 ignored before this new ignored regression was added. Clippy, formatting and diff checks passed after the final exact-loopback URL guard. Docker containers are stopped and their isolated named volumes remain for diagnosis. No external object storage was used.
+
+## Review fixes: dry-run accounting and progress lifecycle
+
+A separate review against `main` confirmed the duplicate dry-run count. Dry-run now remembers the object ids it has counted as would-delete in the cycle and drops them from later candidate batches, so the listing stage no longer revisits a queued object. The set grows only when `deleted` grows, so the delete cap bounds it. The focused unit regression `dry_run_counts_queued_object_once_when_listing_revisits_it` fails without the fix and passes with it. The live Docker regression `live_cli_dry_run_keeps_eligible_candidate_and_object` was not rerun in this pass.
+
+The same review fixed these issues:
+
+- The progress phase returns to `listing` before every listing wait, so a stalled LIST is no longer reported as the previous metadata or delete phase. The phase timer resets only when the phase actually changes.
+- The heartbeat thread is joined before the final summary, so no progress event can follow it.
+- A failed command prints its cause on stderr before showing the exit label.
+- Buffered tracing output is flushed before `process::exit`.
+- The heartbeat test no longer underflows `Instant` on hosts that have been up less than 30 minutes.
+
+The following review findings are still open: listing-call and in-flight fields in progress events, a schema file and its validation test, Windows terminal and redirect tests, a dedicated read-only estimate mode, and sign-off on dry-run taking the global lock.

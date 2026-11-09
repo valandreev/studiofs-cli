@@ -132,12 +132,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     let cli = cli::Cli::parse();
-    let _daemon_log_guard = init_tracing(cli.log_level())?;
+    let daemon_log_guard = init_tracing(cli.log_level())?;
     match cli.dispatch() {
         Ok(()) => Ok(()),
         Err(error) => {
             if let Some(exit) = error.downcast_ref::<cli::CommandExit>() {
                 eprintln!("studiofs: {}", exit.label);
+                // process::exit skips destructors; flush buffered logs first.
+                drop(daemon_log_guard);
                 std::process::exit(i32::from(exit.code));
             }
             Err(error)

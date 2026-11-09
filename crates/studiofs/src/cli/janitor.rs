@@ -189,6 +189,7 @@ fn publish_live_progress(
 fn set_live_progress_phase(progress: Option<&Arc<Mutex<ProgressSnapshot>>>, phase: &'static str) {
     if let Some(progress) = progress
         && let Ok(mut state) = progress.lock()
+        && state.phase != phase
     {
         state.phase = phase;
         state.phase_started = Instant::now();
@@ -230,10 +231,7 @@ impl ProgressReporter {
     }
 
     fn phase(&self, phase: &'static str) {
-        if let Ok(mut state) = self.state.lock() {
-            state.phase = phase;
-            state.phase_started = Instant::now();
-        }
+        set_live_progress_phase(Some(&self.state), phase);
     }
 
     fn begin_cycle(&self) {
@@ -586,6 +584,7 @@ impl JanitorArgs {
             Ok(()) => Ok(()),
             Err(error) if error.downcast_ref::<crate::cli::CommandExit>().is_some() => Err(error),
             Err(error) => {
+                eprintln!("janitor error: {error:#}");
                 let unsafe_metadata = error.chain().any(|cause| {
                     cause
                         .downcast_ref::<studiofs_meta::JanitorMetadataError>()
@@ -1185,6 +1184,8 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         }
     }
 
+    // Join the heartbeat so no progress event can follow the final summary.
+    drop(progress);
     if let Some((code, label)) = command_exit {
         if output == JanitorOutput::Jsonl {
             let outcome = match code {
@@ -1258,7 +1259,9 @@ mod tests {
     fn progress_heartbeat_runs_while_operation_is_pending_and_reports_long_elapsed_time() {
         let state = Arc::new(Mutex::new(ProgressSnapshot {
             phase: "metadata_open",
-            phase_started: Instant::now() - Duration::from_secs(30 * 60),
+            phase_started: Instant::now()
+                .checked_sub(Duration::from_secs(30 * 60))
+                .unwrap_or_else(Instant::now),
             scanned: None,
             listed_entries: None,
             candidates: None,
@@ -2635,6 +2638,49 @@ mod tests {
             metadata.gc_candidate_backfills, 0,
             "dry run must not write the queue"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dry_run_counts_queued_object_once_when_listing_revisits_it() {
+        let old = i64::try_from(
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+            - 3600;
+        let store = FakeJanitorStore {
+            entries: studiofs_data::object::format_object_fragment_keys("test/objects/", 5)
+                .into_iter()
+                .map(|key| JanitorEntry {
+                    key,
+                    is_file: true,
+                    last_modified: None,
+                })
+                .collect(),
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata {
+            gc_candidates: vec![(5, old)],
+            ..FakeJanitorMetadata::eligible()
+        };
+        let stats = run_one_cycle(JanitorCycleContext {
+            store: &store,
+            prefix: "test/objects/",
+            dry_run: true,
+            skip_newer_than_secs: 0,
+            budget: RunBudget::deletes(10),
+            metadata: &mut metadata,
+        })
+        .await
+        .expect("dry-run cycle");
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.orphan_candidates, 1);
+        assert_eq!(store.list_requests.load(Ordering::Relaxed), 1);
+        assert!(store.deleted.lock().unwrap().is_empty());
+        assert!(metadata.claims.is_empty());
+        assert!(metadata.gc_candidate_acks.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
