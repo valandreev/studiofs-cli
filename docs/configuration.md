@@ -330,8 +330,20 @@ path is not a mounted StudioFS volume. See
 ### `janitor`
 
 ```bash
-studiofs janitor <name> [--dry-run] [--loop] [--interval-minutes <u64>] [--skip-newer-minutes <u64>] [--max-deletes <u64>]
+studiofs janitor <name> [--dry-run] [--loop] [--interval-minutes <u64>] [--skip-newer-minutes <u64>] [--max-deletes <u64>] [--max-scan-entries <u64>] [--max-runtime-minutes <u64>]
 ```
+
+Each cycle stops admitting new work at the first limit it meets and reports an
+`outcome`:
+- `--max-deletes` (default 500, at least 1) counts only confirmed successful
+  deletions; protected objects and failed deletes do not consume it. In
+  `--dry-run` it counts would-be deletions, so a dry run also stops at the cap.
+  Once it is met, the rest of the bucket is not listed (`capped`).
+- `--max-scan-entries` and `--max-runtime-minutes` (optional, at least 1) stop
+  listing and report `partial`. A deletion that was already claimed always
+  finishes first. A partial cycle does not save its position yet, so the next
+  run starts again from the beginning of the prefix; these flags are therefore
+  rejected together with `--loop`.
 
 ### `fsck`
 
