@@ -133,7 +133,16 @@ fn main() -> anyhow::Result<()> {
 
     let cli = cli::Cli::parse();
     let _daemon_log_guard = init_tracing(cli.log_level())?;
-    cli.dispatch()
+    match cli.dispatch() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(exit) = error.downcast_ref::<cli::CommandExit>() {
+                eprintln!("studiofs: {}", exit.label);
+                std::process::exit(i32::from(exit.code));
+            }
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
