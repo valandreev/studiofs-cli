@@ -670,6 +670,16 @@ Janitor policy:
   registrations. That lock cannot cover a namespace's first insert, so a client
   writes its first watermark only from a quiescent state. `load` refuses a
   target that still has watermark rows.
+- a mounted client reports its payload namespace watermark at mount bootstrap.
+  After startup recovery, the VFS checks that the local payload store has no
+  dirty, uploading, or queued payload. The metadata engine then captures
+  `acked_through = reserved_through`, but only if this engine has handed out no
+  payload ID (reactivation does not reset this) and the local upload ledger is
+  empty. Later handouts come from fresh reservations at or above the captured
+  counter, so the capture stays valid until the replication worker stores it
+  with `GREATEST` after the next ledger replay. A failed store stays pending and
+  never fails metadata replication. Long-lived mounts do not advance the
+  watermark between remounts.
 - every Snapshot v2 capture path (manual and policy) takes the matching
   exclusive transaction advisory lock in `capture_snapshot_in_transaction`
   before capturing the metadata cut or inserting its `creating` catalog row, so

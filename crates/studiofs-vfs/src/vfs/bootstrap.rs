@@ -729,7 +729,32 @@ impl StudioVfs {
             recovered_after_unclean_shutdown,
             landing_recovery_inodes,
         );
+        self.report_quiescent_payload_upload_watermark();
         Ok(())
+    }
+
+    /// Reports the payload upload watermark when startup recovery left no local
+    /// payload that still holds an object ID awaiting upload.
+    fn report_quiescent_payload_upload_watermark(&self) {
+        // Dirty order covers dirty and uploading payloads; queued uploads cover recovery replay.
+        let quiescent = self.cached_store.pending_upload_count() == 0
+            && self.local_payload_backend.try_dirty_object_count() == Some(0);
+        if !quiescent {
+            debug!("payload upload watermark not reported: local payload uploads are pending");
+            return;
+        }
+        match self.sync_meta().report_quiescent_payload_upload_watermark() {
+            Ok(Some(acked_through)) => {
+                info!(
+                    acked_through,
+                    "payload upload watermark captured at mount bootstrap"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(error = %error, "payload upload watermark capture failed");
+            }
+        }
     }
 
     /// Create a new VFS instance using the current local payload backend contract.

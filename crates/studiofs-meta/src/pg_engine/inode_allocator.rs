@@ -16,9 +16,60 @@ pub(super) struct AllocatorRuntime {
     state: Option<AllocatorStateV1>,
     inode_batch: Range<u64>,
     payload_batch: Range<u64>,
+    /// Set by the first payload ID handout; reactivation never clears it.
+    payload_ids_handed_out: bool,
+    /// `(namespace, counter)` captured from a quiescent state, awaiting PostgreSQL.
+    pending_payload_watermark: Option<(u32, u64)>,
 }
 
 impl PgMetaEngine {
+    /// Captures `reserved_through` as the payload upload watermark when nothing
+    /// below it can still be registered: no payload ID was handed out by this
+    /// engine and the local upload ledger holds no unreplicated begin.
+    ///
+    /// The caller must have proven that no persisted local payload still holds a
+    /// payload ID. Every later handout comes from a fresh reservation at or above
+    /// the captured counter, so the capture stays valid until it is published.
+    pub(super) fn capture_quiescent_payload_watermark(&self) -> MetaResult<Option<u64>> {
+        if !self.local.pending_local_upload_ledger(1)?.is_empty() {
+            return Ok(None);
+        }
+        let mut runtime = self
+            .allocator_runtime
+            .lock()
+            .map_err(|_| MetaError::Storage("allocator runtime lock poisoned".to_string()))?;
+        let Some(state) = runtime.state else {
+            return Ok(None);
+        };
+        let through = state.payload.reserved_through();
+        if runtime.payload_ids_handed_out || through == 0 {
+            return Ok(None);
+        }
+        runtime.pending_payload_watermark = Some((state.payload.namespace(), through));
+        Ok(Some(through))
+    }
+
+    pub(super) fn pending_payload_watermark(&self) -> MetaResult<Option<(u32, u64)>> {
+        self.allocator_runtime
+            .lock()
+            .map(|runtime| runtime.pending_payload_watermark)
+            .map_err(|_| MetaError::Storage("allocator runtime lock poisoned".to_string()))
+    }
+
+    pub(super) fn clear_published_payload_watermark(
+        &self,
+        published: (u32, u64),
+    ) -> MetaResult<()> {
+        let mut runtime = self
+            .allocator_runtime
+            .lock()
+            .map_err(|_| MetaError::Storage("allocator runtime lock poisoned".to_string()))?;
+        if runtime.pending_payload_watermark == Some(published) {
+            runtime.pending_payload_watermark = None;
+        }
+        Ok(())
+    }
+
     pub(super) fn load_persisted_client_slot(local: &RedbMetaEngine) -> MetaResult<Option<u64>> {
         let stored = local.get_counter(LOCAL_PG_CLIENT_SLOT_COUNTER)?;
         Ok(if stored == 0 { None } else { Some(stored - 1) })
@@ -306,6 +357,7 @@ impl PgMetaEngine {
             runtime.inode_batch.start = end;
         } else {
             runtime.payload_batch.start = end;
+            runtime.payload_ids_handed_out = true;
         }
         Ok(Some(value))
     }
@@ -479,6 +531,7 @@ mod tests {
             inode_batch: crate::allocator_state::COUNTER_LIMIT
                 ..crate::allocator_state::COUNTER_LIMIT + 1,
             payload_batch: 0..0,
+            ..AllocatorRuntime::default()
         };
 
         let result = PgMetaEngine::take_ids_from_batch(&mut runtime, 1, true);
@@ -502,6 +555,7 @@ mod tests {
             state: Some(state),
             inode_batch: 0..1,
             payload_batch: 0..0,
+            ..AllocatorRuntime::default()
         };
 
         let result = PgMetaEngine::take_id_from_batch(&mut runtime, 1, true)
@@ -523,6 +577,7 @@ mod tests {
             state: Some(state),
             inode_batch: 0..2,
             payload_batch: 0..0,
+            ..AllocatorRuntime::default()
         };
 
         let result = PgMetaEngine::take_id_from_batch(&mut runtime, 2, true);
