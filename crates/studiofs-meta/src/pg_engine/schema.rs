@@ -552,12 +552,20 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             PRIMARY KEY (vol, payload_namespace)
         );
 
-        -- Lowering a watermark would unfence IDs whose fence rows were pruned.
+        -- Lowering or deleting a watermark would unfence IDs whose fence rows were
+        -- pruned; only the volume's own cascade delete may remove one.
         CREATE OR REPLACE FUNCTION studiofs_reject_payload_watermark_regression()
         RETURNS trigger
         LANGUAGE plpgsql
         AS $$
         BEGIN
+            IF TG_OP = 'DELETE' THEN
+                IF EXISTS (SELECT 1 FROM volumes WHERE vol = OLD.vol) THEN
+                    RAISE EXCEPTION 'payload upload watermark cannot be deleted'
+                        USING ERRCODE = 'restrict_violation';
+                END IF;
+                RETURN OLD;
+            END IF;
             IF NEW.vol <> OLD.vol
                 OR NEW.payload_namespace <> OLD.payload_namespace
                 OR NEW.acked_through < OLD.acked_through THEN
@@ -568,8 +576,8 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         END
         $$;
 
-        -- Created once: re-creating it on every schema ensure takes a table lock
-        -- that deadlocks with concurrent volume setup.
+        -- Created only when missing, so a schema ensure does not re-take the table
+        -- lock that DROP/CREATE TRIGGER needs; a concurrent first ensure may win.
         DO $$
         BEGIN
             IF NOT EXISTS (
@@ -582,6 +590,18 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
                     FOR EACH ROW
                     EXECUTE FUNCTION studiofs_reject_payload_watermark_regression();
             END IF;
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_trigger
+                WHERE tgname = 'studiofs_payload_watermark_delete_guard'
+                  AND tgrelid = 'snapshot_payload_upload_watermarks'::regclass
+            ) THEN
+                CREATE TRIGGER studiofs_payload_watermark_delete_guard
+                    BEFORE DELETE ON snapshot_payload_upload_watermarks
+                    FOR EACH ROW
+                    EXECUTE FUNCTION studiofs_reject_payload_watermark_regression();
+            END IF;
+        EXCEPTION WHEN duplicate_object THEN
+            NULL;
         END
         $$;
 

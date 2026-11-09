@@ -470,10 +470,9 @@ impl PgJanitorSession {
             ));
         };
         // A leased or failed fence (owner or last_error set) is still being deleted.
-        let statement = concat!(
-            "DELETE FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id IN (SELECT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND state IN ('delete_pending', 'deleted') AND reconcile_owner IS NULL AND last_error IS NULL AND ",
-            super::snapshot_reachability::below_payload_watermark!("object_id"),
-            " ORDER BY object_id LIMIT $2 FOR UPDATE SKIP LOCKED)"
+        let statement = format!(
+            "DELETE FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id IN (SELECT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND state IN ('delete_pending', 'deleted') AND reconcile_owner IS NULL AND last_error IS NULL AND {} ORDER BY object_id LIMIT $2 FOR UPDATE SKIP LOCKED)",
+            super::snapshot_reachability::below_payload_watermark("object_id"),
         );
         let mut pruned = 0_u64;
         for _ in 0..MAX_BATCHES {
@@ -481,7 +480,7 @@ impl PgJanitorSession {
                 .block_on(async {
                     tokio::time::timeout(
                         self.command_timeout,
-                        client.execute(statement, &[&self.volume_id, &BATCH_ROWS]),
+                        client.execute(&statement, &[&self.volume_id, &BATCH_ROWS]),
                     )
                     .await
                 })

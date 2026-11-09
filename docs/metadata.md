@@ -656,18 +656,20 @@ Janitor policy:
 - fence rows are bounded by `snapshot_payload_upload_watermarks`. Object IDs
   are `payload_namespace << 39 | counter`, and a namespace's `acked_through`
   promises that its owning client never registers or publishes a new ID with a
-  lower counter. Below the watermark a row-less ID therefore counts as fenced:
-  upload registration inserts it as `delete_pending`, and publication rejects
-  it unless a current reference already holds it. After each non-dry-run cycle,
-  the CLI Janitor deletes finished fences below the watermark under its lock,
-  at most 64 batches of 1,024 rows. A finished fence has no lease owner and no
-  `last_error`. Without a watermark row, nothing is pruned. A trigger rejects
-  any update that lowers a watermark. Upload registration takes a share lock on
-  the volume's existing watermark rows, so an update that raises one waits for
-  in-flight registrations. That lock cannot cover a namespace's first insert,
-  so a client writes its first watermark only from a quiescent state.
-  Publication also exempts snapshot-pinned IDs, which a deletion claim never
-  deletes. `load` refuses a target that still has watermark rows.
+  lower counter. Below the watermark a row-less ID therefore counts as fenced,
+  unless a current reference or snapshot pin holds it (the deletion claim never
+  deletes those): upload registration inserts it as `delete_pending`, and
+  publication rejects it. After each non-dry-run cycle, the CLI Janitor deletes
+  fences below the watermark under its lock, at most 64 batches of 1,024 rows.
+  A prunable fence has no lease owner and no `last_error`. An abandoned
+  upload's fence may still have payload; a later listing reclaims it as
+  untracked under a new fence. Without a watermark row, nothing is pruned. A
+  trigger rejects any update that lowers a watermark and any delete other than
+  the volume's cascade. Upload registration takes a share lock on the volume's
+  existing watermark rows, so an update that raises one waits for in-flight
+  registrations. That lock cannot cover a namespace's first insert, so a client
+  writes its first watermark only from a quiescent state. `load` refuses a
+  target that still has watermark rows.
 - every Snapshot v2 capture path (manual and policy) takes the matching
   exclusive transaction advisory lock in `capture_snapshot_in_transaction`
   before capturing the metadata cut or inserting its `creating` catalog row, so

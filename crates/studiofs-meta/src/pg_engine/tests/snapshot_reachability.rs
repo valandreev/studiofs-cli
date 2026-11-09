@@ -352,22 +352,28 @@ fn pruned_deletion_fences_stay_fenced_below_the_payload_watermark() {
         "no fence is pruned before its namespace reports a watermark"
     );
     sql("INSERT INTO snapshot_payload_upload_watermarks (vol, payload_namespace, acked_through) VALUES ($1, 5, 25)".to_owned());
-    let regression = run_async(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .expect("connect to test postgres");
-        let connection_task = tokio::spawn(connection);
-        let result = client
-            .execute(
-                "UPDATE snapshot_payload_upload_watermarks SET acked_through = 24 WHERE vol = $1",
-                &[&volume_id],
-            )
-            .await;
-        connection_task.abort();
-        Ok::<_, MetaError>(result)
-    })
-    .expect("attempt watermark regression");
-    assert!(regression.is_err(), "a watermark must never move backwards");
+    // Lowering or deleting the watermark would unfence pruned IDs.
+    for statement in [
+        "UPDATE snapshot_payload_upload_watermarks SET acked_through = 24 WHERE vol = $1",
+        "DELETE FROM snapshot_payload_upload_watermarks WHERE vol = $1",
+    ] {
+        let error = run_async(async {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            let result = client.execute(statement, &[&volume_id]).await;
+            connection_task.abort();
+            Ok::<_, MetaError>(result)
+        })
+        .expect("attempt watermark regression")
+        .expect_err("a watermark must never move backwards");
+        assert_eq!(
+            error.code(),
+            Some(&tokio_postgres::error::SqlState::RESTRICT_VIOLATION),
+            "{statement}"
+        );
+    }
     assert_eq!(janitor.prune_object_deletion_fences().expect("prune"), 2);
     assert_eq!(state(finished), None);
     assert_eq!(state(deleted), None);
@@ -395,6 +401,10 @@ fn pruned_deletion_fences_stay_fenced_below_the_payload_watermark() {
     assert!(!publication_rejected(id(40)));
     replay_upload(id(41));
     assert_eq!(state(id(41)).as_deref(), Some("uploading"));
+
+    // The delete guard still lets the volume's own cascade remove its watermark.
+    drop(engine);
+    sql("DELETE FROM volumes WHERE vol = $1".to_owned());
 }
 
 #[test]

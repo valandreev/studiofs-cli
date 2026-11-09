@@ -799,6 +799,14 @@ impl LoadGuardFixture {
 
     async fn clear_accounting(&self, volume_id: i64) {
         for table in ACCOUNTING_TABLES {
+            // The watermark delete guard needs an explicit operator bypass.
+            let bypass = table == "snapshot_payload_upload_watermarks";
+            if bypass {
+                self.client
+                    .batch_execute("SET session_replication_role = replica")
+                    .await
+                    .expect("bypass watermark delete guard");
+            }
             self.client
                 .execute(
                     &format!("DELETE FROM {table} WHERE vol = $1"),
@@ -806,6 +814,12 @@ impl LoadGuardFixture {
                 )
                 .await
                 .expect("clear volume accounting");
+            if bypass {
+                self.client
+                    .batch_execute("RESET session_replication_role")
+                    .await
+                    .expect("restore watermark delete guard");
+            }
         }
     }
 
