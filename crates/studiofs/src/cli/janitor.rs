@@ -4,6 +4,7 @@ use crate::cli::cache_layout::describe_cache_layout_state;
 use clap::Args;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
+use tokio_util::sync::CancellationToken;
 
 use studiofs_cache::runtime::{
     LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
@@ -494,6 +495,15 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn wait_or_cancel(rt: &tokio::runtime::Runtime, cancellation: &CancellationToken, delay: Duration) {
+    rt.block_on(async {
+        tokio::select! {
+            _ = cancellation.cancelled() => {},
+            _ = tokio::time::sleep(delay) => {},
+        }
+    });
+}
+
 fn inspect_local_cache_runtime(
     meta_dir: &std::path::Path,
     cache_dir: Option<&std::path::Path>,
@@ -619,6 +629,18 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
     };
 
     let rt = tokio::runtime::Runtime::new()?;
+    let cancellation = CancellationToken::new();
+    let signal_cancel = cancellation.clone();
+    rt.spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("janitor: draining admitted work; press Ctrl+C again to exit immediately");
+            signal_cancel.cancel();
+            // A hard exit is safe: an unfinished claim is fenced out when its lease expires.
+            if tokio::signal::ctrl_c().await.is_ok() {
+                std::process::exit(130);
+            }
+        }
+    });
     let skip_secs = skip_newer_minutes.saturating_mul(60);
 
     for line in build_start_banner_lines(JanitorStartBanner {
@@ -641,6 +663,10 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
     let interval = Duration::from_secs(interval_minutes.max(1).saturating_mul(60));
     let mut breaker = LoopBreaker::default();
     loop {
+        if cancellation.is_cancelled() {
+            println!("Janitor stopped: cancellation requested");
+            break;
+        }
         let cycle_started = Instant::now();
         let lock_started = Instant::now();
         eprintln!("janitor phase=global_lock started");
@@ -650,7 +676,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 Err(error) => {
                     let error = error.context("failed to acquire global janitor lock");
                     match breaker.after_cycle(Err(error), loop_mode, interval)? {
-                        Some(delay) => std::thread::sleep(delay),
+                        Some(delay) => wait_or_cancel(&rt, &cancellation, delay),
                         None => break,
                     }
                     continue;
@@ -670,9 +696,10 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             if !loop_mode {
                 break;
             }
-            std::thread::sleep(interval);
+            wait_or_cancel(&rt, &cancellation, interval);
             continue;
         }
+        let global_lock_acquired = Instant::now();
 
         let protection_started = Instant::now();
         eprintln!("janitor phase=protection started");
@@ -721,6 +748,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                         max_scan_entries,
                         max_runtime: max_runtime_minutes
                             .map(|minutes| Duration::from_secs(minutes.saturating_mul(60))),
+                        cancel: cancellation.clone(),
                     },
                     metadata,
                 },
@@ -738,11 +766,12 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             Ok((stats, fences_pruned, transport_before))
         });
         let cycle_elapsed = cycle_started.elapsed();
+        let global_lock_hold_elapsed = global_lock_acquired.elapsed();
         let (stats, fences_pruned, transport_before) = match cycle_result {
             Ok(done) => done,
             Err(error) => {
                 match breaker.after_cycle(Err(error), loop_mode, interval)? {
-                    Some(delay) => std::thread::sleep(delay),
+                    Some(delay) => wait_or_cancel(&rt, &cancellation, delay),
                     None => break,
                 }
                 continue;
@@ -776,9 +805,10 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         println!("  head errors:          {}", stats.head_errors);
         println!("  fences pruned:        {fences_pruned}");
         println!(
-            "  janitor timings: metadata_open_ms={} global_lock_wait_ms={} protection_ms={} initial_listing_ms={} head_ms={} delete_ms={} object_work_ms={} cycle_ms={}",
+            "  janitor timings: metadata_open_ms={} global_lock_wait_ms={} global_lock_hold_ms={} protection_ms={} initial_listing_ms={} head_ms={} delete_ms={} object_work_ms={} cycle_ms={}",
             duration_ms(metadata_open_elapsed),
             duration_ms(lock_wait_elapsed),
+            duration_ms(global_lock_hold_elapsed),
             duration_ms(protection_elapsed),
             duration_ms(stats.initial_listing_elapsed),
             duration_ms(stats.head_elapsed),
@@ -813,8 +843,12 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             transport.retries.saturating_sub(transport_before.retries),
             duration_ms(transport.request_interval),
         );
+        if cancellation.is_cancelled() || stats.cycle_outcome() == CycleOutcome::Cancelled {
+            println!("Janitor stopped: cancellation requested after admitted work drained");
+            break;
+        }
         match breaker.after_cycle(Ok(stats.cycle_outcome()), loop_mode, interval)? {
-            Some(delay) => std::thread::sleep(delay),
+            Some(delay) => wait_or_cancel(&rt, &cancellation, delay),
             None => break,
         }
     }
@@ -825,6 +859,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use opendal::Operator;
     use opendal::services::S3;
     use std::collections::HashMap;
@@ -832,7 +867,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use studiofs_cache::runtime::LocalPayloadLayout;
     use studiofs_meta::{JanitorEligibility, MAX_JANITOR_ELIGIBILITY_BATCH};
-    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use studiofs_meta::{MetaFormat, MetaInodes, RedbMetaEngine};
 
     #[derive(Default)]
     struct FakeJanitorStore {
@@ -855,12 +890,16 @@ mod tests {
         deny_delete: bool,
         missing_delete: bool,
         hang_delete: bool,
+        cancel_on_delete: Option<CancellationToken>,
+        /// Cancel this token when the listing stalls, so cancellation lands inside a list wait.
+        cancel_on_list_hang: Option<CancellationToken>,
     }
 
     struct FakeListing {
         entries: std::vec::IntoIter<JanitorEntry>,
         fail_after: Option<usize>,
         hang: bool,
+        cancel_on_hang: Option<CancellationToken>,
         yielded: usize,
     }
 
@@ -871,6 +910,9 @@ mod tests {
             }
             let entry = self.entries.next();
             if entry.is_none() && self.hang {
+                if let Some(cancel) = &self.cancel_on_hang {
+                    cancel.cancel();
+                }
                 std::future::pending::<()>().await;
             }
             self.yielded += 1;
@@ -903,6 +945,7 @@ mod tests {
                     .into_iter(),
                 fail_after: self.fail_list_after,
                 hang: self.hang_list,
+                cancel_on_hang: self.cancel_on_list_hang.clone(),
                 yielded: 0,
             })
         }
@@ -928,6 +971,10 @@ mod tests {
 
         async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError> {
             self.deleted.lock().unwrap().push(key.to_string());
+            if let Some(cancel) = &self.cancel_on_delete {
+                cancel.cancel();
+                tokio::task::yield_now().await;
+            }
             if self.hang_delete {
                 std::future::pending::<()>().await;
             }
@@ -1209,6 +1256,7 @@ mod tests {
                             max_deletes: 100,
                             max_scan_entries: Some(1),
                             max_runtime: None,
+                            cancel: CancellationToken::new(),
                         },
                         metadata: &mut metadata,
                     },
@@ -1270,6 +1318,132 @@ mod tests {
             "completed batch progress was discarded"
         );
         assert_eq!(saved.pending_object_id, Some(65));
+    }
+
+    #[test]
+    fn cancellation_during_list_wait_keeps_completed_batch_progress() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cancellation = CancellationToken::new();
+        let mut keys: Vec<String> = (1..=65).flat_map(canonical_keys).collect();
+        keys.sort();
+        let store = FakeJanitorStore {
+            entries: keys
+                .into_iter()
+                .map(|key| JanitorEntry {
+                    key,
+                    is_file: true,
+                    last_modified: None,
+                })
+                .collect(),
+            hang_list: true,
+            cancel_on_list_hang: Some(cancellation.clone()),
+            ..Default::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        // The first batch of 64 completes; the cancel then lands while the next page stalls.
+        let stats = rt
+            .block_on(run_one_cycle_resumable(
+                JanitorCycleContext {
+                    store: &store,
+                    prefix: "test/objects/",
+                    dry_run: false,
+                    skip_newer_than_secs: 0,
+                    budget: RunBudget {
+                        cancel: cancellation,
+                        ..RunBudget::deletes(100)
+                    },
+                    metadata: &mut metadata,
+                },
+                sweep_checkpoint(),
+                &sweep_scope(),
+                true,
+            ))
+            .unwrap();
+        assert_eq!(stats.outcome, CycleOutcome::Cancelled);
+        assert!(!stats.scan_complete);
+        assert_eq!(metadata.claims, (1..=64).collect::<Vec<_>>());
+        let saved = metadata
+            .sweep_checkpoint
+            .clone()
+            .expect("completed batch progress was not checkpointed");
+        assert_eq!(saved.pending_object_id, Some(65));
+        assert_eq!(stats.scan_position, saved.after_key.unwrap());
+    }
+
+    #[test]
+    fn cancellation_drains_admitted_delete_before_unlock_and_replays_checkpoint() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cancellation = CancellationToken::new();
+        let mut entries = [42, 43]
+            .into_iter()
+            .map(|id| JanitorEntry {
+                key: canonical_keys(id)[0].clone(),
+                is_file: true,
+                last_modified: Some(SystemTime::now() - Duration::from_secs(3600)),
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let store = FakeJanitorStore {
+            entries: entries.clone(),
+            cancel_on_delete: Some(cancellation.clone()),
+            ..Default::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        assert!(metadata.try_acquire_global_janitor_lock().unwrap());
+        let stats = with_acquired_global_janitor_lock(&mut metadata, |metadata| {
+            rt.block_on(run_one_cycle_resumable(
+                JanitorCycleContext {
+                    store: &store,
+                    prefix: "test/objects/",
+                    dry_run: false,
+                    skip_newer_than_secs: 0,
+                    budget: RunBudget {
+                        max_deletes: 10,
+                        max_scan_entries: None,
+                        max_runtime: None,
+                        cancel: cancellation.clone(),
+                    },
+                    metadata,
+                },
+                sweep_checkpoint(),
+                &sweep_scope(),
+                true,
+            ))
+        })
+        .unwrap();
+
+        assert_eq!(stats.outcome, CycleOutcome::Cancelled);
+        assert_eq!(metadata.claims, vec![42]);
+        assert_eq!(metadata.finishes.len(), 1);
+        assert_eq!(
+            metadata.finishes[0].2,
+            UploadedObjectDeletionOutcome::Deleted
+        );
+        assert_eq!(metadata.releases, 1);
+        let checkpoint = metadata.sweep_checkpoint.clone().unwrap();
+        assert_eq!(checkpoint, sweep_checkpoint());
+
+        let resumed = FakeJanitorStore {
+            entries,
+            ..Default::default()
+        };
+        let stats = rt
+            .block_on(run_one_cycle_resumable(
+                JanitorCycleContext {
+                    store: &resumed,
+                    prefix: "test/objects/",
+                    dry_run: false,
+                    skip_newer_than_secs: 0,
+                    budget: RunBudget::deletes(10),
+                    metadata: &mut metadata,
+                },
+                checkpoint,
+                &sweep_scope(),
+                true,
+            ))
+            .unwrap();
+        assert_eq!(stats.deleted, 2);
+        assert_eq!(metadata.claims, vec![42, 42, 43]);
     }
 
     #[test]
@@ -1403,6 +1577,7 @@ mod tests {
                             max_deletes: 100,
                             max_scan_entries: Some(1),
                             max_runtime: None,
+                            cancel: CancellationToken::new(),
                         },
                         metadata: &mut metadata,
                     },
@@ -3747,6 +3922,370 @@ mod tests {
         files
     }
 
+    struct GatedDeleteStore {
+        inner: OpenDalJanitorStore,
+        first_delete: tokio::sync::Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+    }
+
+    struct LiveS3Config<'a> {
+        endpoint: &'a str,
+        bucket: &'a str,
+        access_key: &'a str,
+        secret_key: &'a str,
+        region: &'a str,
+        prefix: &'a str,
+    }
+
+    impl JanitorObjectStore for GatedDeleteStore {
+        type Listing = JanitorLister;
+
+        fn supports_start_after(&self) -> bool {
+            self.inner.supports_start_after()
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            after_key: Option<&str>,
+        ) -> anyhow::Result<Self::Listing> {
+            self.inner.list(prefix, after_key).await
+        }
+
+        async fn last_modified(&self, key: &str) -> anyhow::Result<Option<SystemTime>> {
+            self.inner.last_modified(key).await
+        }
+
+        async fn stat_key(
+            &self,
+            key: &str,
+        ) -> anyhow::Result<studiofs_data::janitor::JanitorKeyStat> {
+            self.inner.stat_key(key).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError> {
+            if let Some((entered, release)) = self.first_delete.lock().await.take() {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            self.inner.delete(key).await
+        }
+    }
+
+    fn run_live_postgres_cycle<S: JanitorObjectStore + Send + 'static>(
+        db_path: PathBuf,
+        store: S,
+        volume_uuid: String,
+        endpoint: String,
+        bucket: String,
+        prefix: String,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<pipeline::JanitorStats> {
+        let mut metadata = JanitorMetadataSession::open(db_path)?;
+        anyhow::ensure!(
+            metadata.try_acquire_global_janitor_lock()?,
+            "PostgreSQL janitor lock was unexpectedly busy"
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
+        let scope = JanitorSweepScope {
+            volume_uuid: &volume_uuid,
+            endpoint: &endpoint,
+            bucket: &bucket,
+            data_prefix: &prefix,
+            listing_strategy: "start_after",
+        };
+
+        with_acquired_global_janitor_lock(&mut metadata, |metadata| {
+            metadata.validate_protection()?;
+            let checkpoint = metadata.load_sweep_checkpoint(scope, true)?;
+            runtime.block_on(run_one_cycle_resumable(
+                JanitorCycleContext {
+                    store: &store,
+                    prefix: &prefix,
+                    dry_run: false,
+                    skip_newer_than_secs: 0,
+                    budget: RunBudget {
+                        max_deletes: 1,
+                        max_scan_entries: None,
+                        max_runtime: None,
+                        cancel,
+                    },
+                    metadata,
+                },
+                checkpoint,
+                &scope,
+                true,
+            ))
+        })
+    }
+
+    async fn create_live_postgres_janitor_fixture(
+        postgres_url: &str,
+        s3: &LiveS3Config<'_>,
+        meta_dir: &std::path::Path,
+        object_id: u64,
+    ) -> anyhow::Result<(i64, PathBuf, studiofs_meta::schema::FormatInfo)> {
+        use studiofs_meta::schema::{
+            CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, ENCRYPTION_KEY_LENGTH, EncryptionConfig,
+            FormatInfo, MetadataBackend, MetadataConfig, PostgresConfig,
+        };
+
+        let (client, connection) =
+            tokio_postgres::connect(postgres_url, tokio_postgres::NoTls).await?;
+        let connection_task = tokio::spawn(connection);
+        studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema(&client).await?;
+
+        let run_id = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let name = format!("sfs976-{run_id}");
+        let uuid = format!("sfs976-{run_id}-volume");
+        let volume = client
+            .query_one(
+                "INSERT INTO volumes (name, uuid, block_size) VALUES ($1, $2, $3) RETURNING vol",
+                &[&name, &uuid, &(DEFAULT_BLOCK_SIZE as i32)],
+            )
+            .await?;
+        let volume_id: i64 = volume.get(0);
+        let metadata = MetadataConfig {
+            backend: MetadataBackend::Postgres,
+            postgres: Some(PostgresConfig {
+                url: postgres_url.to_string(),
+                volume_id,
+            }),
+            ..MetadataConfig::default()
+        };
+        let format_info = FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
+            name,
+            uuid,
+            endpoint: s3.endpoint.to_string(),
+            bucket: s3.bucket.to_string(),
+            access_key: s3.access_key.to_string(),
+            secret_key: s3.secret_key.to_string(),
+            region: s3.region.to_string(),
+            data_prefix: s3.prefix.to_string(),
+            metadata,
+            encryption: EncryptionConfig::new([0; ENCRYPTION_KEY_LENGTH]),
+            block_size: DEFAULT_BLOCK_SIZE,
+        };
+        let format_info_bytes = serde_json::to_vec(&format_info)?;
+        let checkpoint_sha256 = vec![0_u8; 32];
+        client
+            .execute(
+                "INSERT INTO metadata_state (vol, metadata_format_version, version, checkpoint_version, snapshot, checkpoint_sha256, format_info, checkpoint_publication_state, checkpoint_generation) VALUES ($1, $2, 0, 0, $3, $4, $5, 'published', 1)",
+                &[&volume_id, &(CURRENT_FORMAT_VERSION as i16), &Vec::<u8>::new(), &checkpoint_sha256, &format_info_bytes],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, 0)",
+                &[&volume_id],
+            )
+            .await?;
+        let object_id = i64::try_from(object_id)?;
+        client
+            .execute(
+                "INSERT INTO snapshot_payload_gc_candidates (vol, object_id, eligible_at) VALUES ($1, $2, clock_timestamp() - interval '1 hour')",
+                &[&volume_id, &object_id],
+            )
+            .await?;
+        connection_task.abort();
+
+        std::fs::create_dir_all(meta_dir)?;
+        let db_path = meta_dir.join("janitor-live.db");
+        let engine = RedbMetaEngine::open(&db_path)?;
+        engine.set_format_info(&format_info)?;
+        engine.init_root(0, 0)?;
+        let next_event_seq = engine.get_counter(studiofs_meta::schema::counters::NEXT_EVENT_SEQ)?;
+        engine.set_counter(
+            studiofs_meta::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ,
+            next_event_seq,
+        )?;
+        drop(engine);
+        Ok((volume_id, db_path, format_info))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires local STUDIOFS_TEST_PG_DSN and a live STUDIOFS_S3_* bucket"]
+    async fn cancellation_drains_live_postgres_claim_and_rustfs_delete_before_unlock()
+    -> anyhow::Result<()> {
+        let postgres_url = test_env("STUDIOFS_TEST_PG_DSN")
+            .expect("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)");
+        let env = |key: &str, default: &str| test_env(key).unwrap_or_else(|| default.to_string());
+        let endpoint = env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
+        let bucket = env("STUDIOFS_S3_BUCKET", "studiofs-test");
+        let access_key = env("STUDIOFS_S3_ACCESS_KEY", "studiofs");
+        let secret_key = env("STUDIOFS_S3_SECRET_KEY", "studiofs123");
+        let region = env("STUDIOFS_S3_REGION", "us-east-1");
+        let object_id = u64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_nanos()
+                % u128::try_from(i64::MAX)?,
+        )?;
+        let prefix = format!("sfs976-{object_id:016x}/objects/");
+        let s3 = LiveS3Config {
+            endpoint: &endpoint,
+            bucket: &bucket,
+            access_key: &access_key,
+            secret_key: &secret_key,
+            region: &region,
+            prefix: &prefix,
+        };
+        let writer = Operator::new(
+            S3::default()
+                .endpoint(&endpoint)
+                .bucket(&bucket)
+                .access_key_id(&access_key)
+                .secret_access_key(&secret_key)
+                .region(&region),
+        )?
+        .finish();
+        let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::from_s3(
+            &endpoint,
+            &bucket,
+            &access_key,
+            &secret_key,
+            &region,
+            2,
+            32,
+        )?);
+        let key = studiofs_data::object::format_object_key(&prefix, object_id);
+        writer.write(&key, b"sfs976-cancel".to_vec()).await?;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("janitor-sfs976-live-");
+        let (volume_id, db_path, format_info) = create_live_postgres_janitor_fixture(
+            &postgres_url,
+            &s3,
+            &temp.path().join("meta"),
+            object_id,
+        )
+        .await?;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let gated_store = GatedDeleteStore {
+            inner: store,
+            first_delete: tokio::sync::Mutex::new(Some((entered_tx, release_rx))),
+        };
+        // Connect and open the competing session before the gate: the held DELETE runs under
+        // the 1 s test DELETE timeout, so only the claim query and lock probe may run inside it.
+        let (client, connection) =
+            tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls).await?;
+        let connection_task = tokio::spawn(connection);
+        let mut competing = tokio::task::spawn_blocking({
+            let db_path = db_path.clone();
+            move || JanitorMetadataSession::open(db_path)
+        })
+        .await??;
+        let cancellation = CancellationToken::new();
+        let worker = tokio::task::spawn_blocking({
+            let db_path = db_path.clone();
+            let volume_uuid = format_info.uuid.clone();
+            let prefix = prefix.clone();
+            let endpoint = endpoint.clone();
+            let bucket = bucket.clone();
+            let cancellation = cancellation.clone();
+            move || {
+                run_live_postgres_cycle(
+                    db_path,
+                    gated_store,
+                    volume_uuid,
+                    endpoint,
+                    bucket,
+                    prefix,
+                    cancellation,
+                )
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(30), entered_rx)
+            .await
+            .context("timed out waiting for the live DELETE to be admitted")??;
+        let claim = client
+            .query_one(
+                "SELECT state, reconcile_owner IS NOT NULL, reconcile_lease_expires_at > clock_timestamp() FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2",
+                &[&volume_id, &(object_id as i64)],
+            )
+            .await?;
+        assert_eq!(claim.get::<_, String>(0), "delete_pending");
+        assert!(claim.get::<_, bool>(1));
+        assert!(claim.get::<_, bool>(2));
+        cancellation.cancel();
+        assert!(
+            !tokio::task::spawn_blocking(move || competing.try_acquire_global_janitor_lock())
+                .await??
+        );
+        release_tx
+            .send(())
+            .expect("release the admitted RustFS delete");
+        let stats = tokio::time::timeout(Duration::from_secs(60), worker)
+            .await
+            .context("timed out waiting for the admitted RustFS delete to drain")???;
+        connection_task.abort();
+        assert_eq!(stats.outcome, CycleOutcome::Cancelled);
+        assert_eq!(stats.claims, 1);
+        assert_eq!(stats.claim_finishes, 1);
+        assert_eq!(stats.deleted, 1);
+        let restart_store =
+            OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::from_s3(
+                &endpoint,
+                &bucket,
+                &access_key,
+                &secret_key,
+                &region,
+                2,
+                32,
+            )?);
+        assert!(listed_files(&restart_store, &prefix, None).await.is_empty());
+        let restarted = tokio::task::spawn_blocking({
+            let db_path = db_path.clone();
+            let volume_uuid = format_info.uuid.clone();
+            let prefix = prefix.clone();
+            let endpoint = endpoint.clone();
+            let bucket = bucket.clone();
+            move || {
+                run_live_postgres_cycle(
+                    db_path,
+                    restart_store,
+                    volume_uuid,
+                    endpoint,
+                    bucket,
+                    prefix,
+                    CancellationToken::new(),
+                )
+            }
+        })
+        .await??;
+        assert_eq!(restarted.claims, 0);
+        assert_eq!(restarted.queued_candidates_scanned, 0);
+
+        let (client, connection) =
+            tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls).await?;
+        let connection_task = tokio::spawn(connection);
+        let acknowledged: bool = client
+            .query_one(
+                "SELECT acknowledged_at IS NOT NULL FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = $2",
+                &[&volume_id, &(object_id as i64)],
+            )
+            .await?
+            .get(0);
+        assert!(acknowledged);
+        client
+            .execute("DELETE FROM volumes WHERE vol = $1", &[&volume_id])
+            .await?;
+        connection_task.abort();
+        drop(temp);
+        Ok(())
+    }
+
     /// SFS-973 live check: S3 `start_after` resume, partial hex prefixes without a
     /// trailing `/`, and repeated one-entry runs of both listing strategies.
     /// Reads an ignored-test setting from the process environment, then the workspace `.env`.
@@ -3853,6 +4392,7 @@ mod tests {
                     max_deletes: 100,
                     max_scan_entries: Some(1),
                     max_runtime: None,
+                    cancel: CancellationToken::new(),
                 };
                 let fallback = NoStartAfterStore(&store);
                 let stats = if strategy == "start_after" {
