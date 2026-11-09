@@ -317,6 +317,13 @@ async fn janitor_listing_is_byte_ordered_with_last_modified_across_pages() {
             .region(&cfg.region),
     )
     .unwrap()
+    // Providers such as B2 shed a few of 1,200 parallel writes with temporary 503s;
+    // like production stores, retry only errors OpenDAL marks temporary.
+    .layer(
+        opendal::layers::RetryLayer::new()
+            .with_max_times(4)
+            .with_jitter(),
+    )
     .finish();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

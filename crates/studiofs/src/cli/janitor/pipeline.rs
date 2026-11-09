@@ -13,6 +13,7 @@ use studiofs_meta::{
     JanitorEligibility, JanitorMetadataError, JanitorSweepCheckpoint, JanitorSweepScope,
     MAX_JANITOR_ELIGIBILITY_BATCH,
 };
+use tokio_util::sync::CancellationToken;
 
 /// Bound for one remote DELETE. All canonical keys of an object must finish
 /// inside the 60-second deletion-claim lease, or the finish is fenced out.
@@ -48,6 +49,14 @@ pub(super) const OVERLOAD_TRIP_OBJECTS: u32 = 5;
 #[derive(Debug, thiserror::Error)]
 #[error("{0} timed out")]
 pub(super) struct OperationTimedOut(pub(super) &'static str);
+
+#[derive(Debug, thiserror::Error)]
+#[error("janitor cancellation requested")]
+pub(super) struct OperationCancelled;
+
+pub(super) fn is_cancellation(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<OperationCancelled>())
+}
 
 /// Classify a cycle error by its typed causes. Unrecognized errors (malformed keys,
 /// unordered listings, invalid checkpoints) are terminal so they never loop.
@@ -133,6 +142,8 @@ pub(super) enum CycleOutcome {
     ScanBudgetExhausted,
     /// The wall-clock budget ran out before all listed work was admitted.
     TimeBudgetExhausted,
+    /// The operator requested a graceful stop.
+    Cancelled,
     /// [`OVERLOAD_TRIP_OBJECTS`] objects in a row failed transiently; admission stopped
     /// and the unfinished batch stays queued or before the saved checkpoint.
     Overloaded,
@@ -145,6 +156,7 @@ impl CycleOutcome {
             Self::DeleteCapReached => "capped (max deletes reached)",
             Self::ScanBudgetExhausted => "partial (scan budget exhausted)",
             Self::TimeBudgetExhausted => "partial (time budget exhausted)",
+            Self::Cancelled => "partial (cancelled)",
             Self::Overloaded => "partial (S3 overload circuit open)",
             Self::TransientErrors => "partial (transient errors)",
         }
@@ -153,7 +165,7 @@ impl CycleOutcome {
 
 /// Per-cycle work limits. They are checked only where new work is admitted, so a
 /// claimed deletion always runs through its PostgreSQL finish.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct RunBudget {
     /// Confirmed successful (dry-run: would-be) deletions; protected and failed
     /// objects never consume it. Deletion is sequential, so it cannot overshoot.
@@ -162,6 +174,8 @@ pub(super) struct RunBudget {
     pub(super) max_scan_entries: Option<u64>,
     /// Wall-clock time after which no further entry or candidate is admitted.
     pub(super) max_runtime: Option<Duration>,
+    /// Stops new listing/candidate admission while an admitted delete drains.
+    pub(super) cancel: CancellationToken,
 }
 
 impl RunBudget {
@@ -171,11 +185,15 @@ impl RunBudget {
             max_deletes,
             max_scan_entries: None,
             max_runtime: None,
+            cancel: CancellationToken::new(),
         }
     }
 
     /// The reason to stop admitting candidates, if the cap or the deadline is met.
     fn admission_stop(&self, stats: &JanitorStats, started: Instant) -> Option<CycleOutcome> {
+        if self.cancel.is_cancelled() {
+            return Some(CycleOutcome::Cancelled);
+        }
         if stats.deleted >= self.max_deletes {
             return Some(CycleOutcome::DeleteCapReached);
         }
@@ -679,7 +697,7 @@ async fn run_one_cycle_inner<S: JanitorObjectStore>(
         return Ok(stats);
     }
 
-    if ctx.store.supports_start_after() {
+    let listing_result = if ctx.store.supports_start_after() {
         run_start_after_listing(
             &mut ctx,
             &mut stats,
@@ -688,7 +706,7 @@ async fn run_one_cycle_inner<S: JanitorObjectStore>(
             now_unix,
             cycle_started,
         )
-        .await?;
+        .await
     } else {
         run_prefix_trie_listing(
             &mut ctx,
@@ -698,7 +716,19 @@ async fn run_one_cycle_inner<S: JanitorObjectStore>(
             now_unix,
             cycle_started,
         )
-        .await?;
+        .await
+    };
+    // Only the opening list request of a start-after sweep reaches here cancelled,
+    // before any checkpoint change; mid-listing cancels stop like other budgets.
+    if let Err(error) = listing_result {
+        if is_cancellation(&error) {
+            stats.outcome = CycleOutcome::Cancelled;
+            stats.scan_complete = false;
+            stats.scan_position = scan_position(&checkpoint);
+            stats.cycle_elapsed = cycle_started.elapsed();
+            return Ok(stats);
+        }
+        return Err(error);
     }
 
     if persist_checkpoint {
@@ -743,6 +773,7 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
     let mut listing = bounded_list_step(
         ctx.store.list(ctx.prefix, checkpoint.after_key.as_deref()),
         stats.initial_listing_entries,
+        &ctx.budget.cancel,
     )
     .await?;
     stats.initial_listing_elapsed = listing_started.elapsed();
@@ -765,7 +796,19 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
             break;
         }
         let wait_started = Instant::now();
-        let entry = bounded_list_step(listing.next_entry(), stats.initial_listing_entries).await?;
+        let entry = match bounded_list_step(
+            listing.next_entry(),
+            stats.initial_listing_entries,
+            &ctx.budget.cancel,
+        )
+        .await
+        {
+            Err(error) if is_cancellation(&error) => {
+                stats.outcome = CycleOutcome::Cancelled;
+                break;
+            }
+            result => result?,
+        };
         stats.initial_listing_elapsed += wait_started.elapsed();
         let Some(entry) = entry else {
             reached_eof = true;
@@ -920,11 +963,20 @@ async fn run_prefix_trie_listing<S: JanitorObjectStore>(
         }
         let listing_prefix = prefix_for_hex_cursor(ctx.prefix, &cursor);
         let listing_started = Instant::now();
-        let mut listing = bounded_list_step(
+        let mut listing = match bounded_list_step(
             ctx.store.list(&listing_prefix, None),
             stats.initial_listing_entries,
+            &ctx.budget.cancel,
         )
-        .await?;
+        .await
+        {
+            Err(error) if is_cancellation(&error) => {
+                stats.outcome = CycleOutcome::Cancelled;
+                checkpoint.next_prefix = cursor;
+                break;
+            }
+            result => result?,
+        };
         stats.initial_listing_elapsed += listing_started.elapsed();
         let mut current = None;
         let mut candidates = Vec::with_capacity(MAX_JANITOR_ELIGIBILITY_BATCH);
@@ -942,8 +994,20 @@ async fn run_prefix_trie_listing<S: JanitorObjectStore>(
                 break;
             }
             let wait_started = Instant::now();
-            let entry =
-                bounded_list_step(listing.next_entry(), stats.initial_listing_entries).await?;
+            let entry = match bounded_list_step(
+                listing.next_entry(),
+                stats.initial_listing_entries,
+                &ctx.budget.cancel,
+            )
+            .await
+            {
+                Err(error) if is_cancellation(&error) => {
+                    stats.outcome = CycleOutcome::Cancelled;
+                    checkpoint.next_prefix = cursor.clone();
+                    break;
+                }
+                result => result?,
+            };
             stats.initial_listing_elapsed += wait_started.elapsed();
             let Some(entry) = entry else {
                 reached_eof = true;
@@ -1051,11 +1115,15 @@ async fn run_prefix_trie_listing<S: JanitorObjectStore>(
 async fn bounded_list_step<T>(
     step: impl std::future::Future<Output = anyhow::Result<T>>,
     listed_entries: u64,
+    cancel: &CancellationToken,
 ) -> anyhow::Result<T> {
-    tokio::time::timeout(LIST_PAGE_TIMEOUT, step)
-        .await
-        .unwrap_or_else(|_| Err(OperationTimedOut("listing page").into()))
-        .with_context(|| format!("failed to list janitor objects after {listed_entries} entries"))
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(OperationCancelled.into()),
+        result = tokio::time::timeout(LIST_PAGE_TIMEOUT, step) => result
+            .unwrap_or_else(|_| Err(OperationTimedOut("listing page").into())),
+    }
+    .with_context(|| format!("failed to list janitor objects after {listed_entries} entries"))
 }
 
 async fn process_candidate_batch<S: JanitorObjectStore>(
