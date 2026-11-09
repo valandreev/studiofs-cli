@@ -229,22 +229,26 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
     let ids: Vec<u64> = candidates.iter().map(|(id, _)| *id).collect();
     // The metadata session owns a synchronous runtime; leave this worker before its block_on.
     let protection = tokio::task::block_in_place(|| ctx.metadata.check_eligibility(&ids))?;
-    if ids
-        .iter()
-        .any(|id| matches!(protection.get(id), None | Some(JanitorEligibility::Unknown)))
-    {
-        anyhow::bail!("janitor eligibility is unknown; refusing to delete candidate batch");
-    }
-    for (object_id, path) in candidates {
-        match protection
-            .get(&object_id)
-            .copied()
-            .unwrap_or(JanitorEligibility::Unknown)
-        {
-            JanitorEligibility::Protected => {
+    // Resolve every decision before any delete so one unknown outcome retains the whole batch.
+    // `Some(pending_deletion)` marks an eligible orphan; `None` marks a protected object.
+    let decisions = candidates
+        .into_iter()
+        .map(|(object_id, path)| match protection.get(&object_id) {
+            Some(JanitorEligibility::Protected) => Ok((object_id, path, None)),
+            Some(&JanitorEligibility::Eligible { pending_deletion }) => {
+                Ok((object_id, path, Some(pending_deletion)))
+            }
+            None | Some(JanitorEligibility::Unknown) => Err(anyhow::anyhow!(
+                "janitor eligibility is unknown; refusing to delete candidate batch"
+            )),
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    for (object_id, path, orphan) in decisions {
+        match orphan {
+            None => {
                 stats.referenced_files = stats.referenced_files.saturating_add(1);
             }
-            JanitorEligibility::Eligible { pending_deletion } => {
+            Some(pending_deletion) => {
                 stats.orphan_candidates = stats.orphan_candidates.saturating_add(1);
                 if stats.time_to_first_candidate.is_none() {
                     stats.time_to_first_candidate = Some(cycle_started.elapsed());
@@ -259,9 +263,6 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
                     pending_deletion,
                 )
                 .await;
-            }
-            JanitorEligibility::Unknown => {
-                anyhow::bail!("janitor eligibility is unknown; refusing to delete candidate")
             }
         }
     }
