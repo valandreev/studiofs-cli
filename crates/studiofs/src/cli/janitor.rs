@@ -4023,7 +4023,11 @@ mod tests {
             .expect("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)");
         let run = run_postgres_fixture_once(url, true).await;
 
-        run.result.unwrap();
+        let error = run.result.unwrap_err();
+        let exit = error
+            .downcast_ref::<crate::cli::CommandExit>()
+            .expect("busy global lock maps to a typed command exit");
+        assert_eq!(exit.code, 3);
         assert_eq!(run.s3_requests, 0);
         assert!(run.metadata_unchanged);
     }
@@ -4554,6 +4558,194 @@ mod tests {
         )?;
         drop(engine);
         Ok((volume_id, db_path, format_info))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires local STUDIOFS_TEST_PG_DSN and a live STUDIOFS_S3_* bucket"]
+    async fn live_cli_dry_run_keeps_eligible_candidate_and_object() -> anyhow::Result<()> {
+        let postgres_url = test_env("STUDIOFS_TEST_PG_DSN")
+            .expect("STUDIOFS_TEST_PG_DSN must be set (environment or workspace .env)");
+        let env = |key: &str, default: &str| test_env(key).unwrap_or_else(|| default.to_string());
+        let endpoint = env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:9000");
+        let bucket = env("STUDIOFS_S3_BUCKET", "studiofs-test");
+        let access_key = env("STUDIOFS_S3_ACCESS_KEY", "studiofs");
+        let secret_key = env("STUDIOFS_S3_SECRET_KEY", "studiofs123");
+        let region = env("STUDIOFS_S3_REGION", "us-east-1");
+        let pg_url = url::Url::parse(&postgres_url)?;
+        let s3_url = url::Url::parse(&endpoint)?;
+        let is_loopback =
+            |host: Option<&str>| matches!(host, Some("127.0.0.1" | "localhost" | "[::1]" | "::1"));
+        anyhow::ensure!(
+            is_loopback(pg_url.host_str()) && is_loopback(s3_url.host_str()),
+            "live janitor test requires local PostgreSQL and S3 endpoints"
+        );
+        let object_id = u64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)?
+                .as_nanos()
+                % u128::try_from(i64::MAX)?,
+        )?;
+        let prefix = format!("sfs977-dry-run-{object_id:016x}/objects/");
+        let s3 = LiveS3Config {
+            endpoint: &endpoint,
+            bucket: &bucket,
+            access_key: &access_key,
+            secret_key: &secret_key,
+            region: &region,
+            prefix: &prefix,
+        };
+        let writer = Operator::new(
+            S3::default()
+                .endpoint(&endpoint)
+                .bucket(&bucket)
+                .access_key_id(&access_key)
+                .secret_access_key(&secret_key)
+                .region(&region),
+        )?
+        .finish();
+        let key = studiofs_data::object::format_object_key(&prefix, object_id);
+        writer.write(&key, b"sfs977 dry-run".to_vec()).await?;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("janitor-sfs977-dry-run-");
+        let client_root = temp.path().join("client");
+        let meta_dir = client_root.join("meta/janitor-live");
+        let (volume_id, _db_path, _) =
+            create_live_postgres_janitor_fixture(&postgres_url, &s3, &meta_dir, object_id).await?;
+        let (client, connection) =
+            tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls).await?;
+        let connection_task = tokio::spawn(connection);
+        let object_id_sql = i64::try_from(object_id)?;
+        let candidate_before: String = client
+            .query_one(
+                "SELECT row_to_json(candidate)::text FROM snapshot_payload_gc_candidates AS candidate WHERE vol = $1 AND object_id = $2",
+                &[&volume_id, &object_id_sql],
+            )
+            .await?
+            .get(0);
+        let state_before: String = client
+            .query_one(
+                "SELECT concat_ws('|', (SELECT count(*) FROM snapshot_payload_sweep_checkpoints WHERE vol = $1), (SELECT count(*) FROM snapshot_payload_upload_objects WHERE vol = $1), (SELECT count(*) FROM snapshot_payload_upload_watermarks WHERE vol = $1))",
+                &[&volume_id],
+            )
+            .await?
+            .get(0);
+
+        let mut binary = std::env::current_exe()?;
+        binary.pop();
+        binary.pop();
+        binary.push(if cfg!(windows) {
+            "studiofs.exe"
+        } else {
+            "studiofs"
+        });
+        anyhow::ensure!(
+            binary.is_file(),
+            "build the studiofs CLI binary before this ignored test"
+        );
+        let output = std::process::Command::new(&binary)
+            .args([
+                "janitor",
+                "janitor-live",
+                "--dry-run",
+                "--output",
+                "jsonl",
+                "--full-scan",
+                "--skip-newer-minutes",
+                "0",
+                "--max-deletes",
+                "10",
+            ])
+            .env("STUDIOFS_CLIENT_ROOT", &client_root)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "live dry-run CLI exited with {}",
+            output.status
+        );
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        let cycle = events
+            .iter()
+            .find(|event| event["event"] == "cycle")
+            .expect("JSONL cycle event");
+        let summary = events
+            .iter()
+            .find(|event| event["event"] == "summary")
+            .expect("JSONL final summary");
+        assert_eq!(cycle["would_delete"], 1);
+        assert_eq!(cycle["delete_attempted"], 0);
+        assert_eq!(cycle["delete_confirmed"], 0);
+        assert_eq!(summary["outcome"], "complete");
+        assert_eq!(summary["exit_code"], 0);
+
+        let partial = std::process::Command::new(&binary)
+            .args([
+                "janitor",
+                "janitor-live",
+                "--dry-run",
+                "--output",
+                "jsonl",
+                "--full-scan",
+                "--skip-newer-minutes",
+                "0",
+                "--max-deletes",
+                "1",
+            ])
+            .env("STUDIOFS_CLIENT_ROOT", &client_root)
+            .output()?;
+        assert_eq!(partial.status.code(), Some(2));
+        let partial_events: Vec<serde_json::Value> = std::str::from_utf8(&partial.stdout)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        let partial_summary = partial_events
+            .iter()
+            .find(|event| event["event"] == "summary")
+            .expect("JSONL partial summary");
+        assert_eq!(partial_summary["outcome"], "partial");
+        assert_eq!(partial_summary["exit_code"], 2);
+
+        let candidate_after: String = client
+            .query_one(
+                "SELECT row_to_json(candidate)::text FROM snapshot_payload_gc_candidates AS candidate WHERE vol = $1 AND object_id = $2",
+                &[&volume_id, &object_id_sql],
+            )
+            .await?
+            .get(0);
+        let state_after: String = client
+            .query_one(
+                "SELECT concat_ws('|', (SELECT count(*) FROM snapshot_payload_sweep_checkpoints WHERE vol = $1), (SELECT count(*) FROM snapshot_payload_upload_objects WHERE vol = $1), (SELECT count(*) FROM snapshot_payload_upload_watermarks WHERE vol = $1))",
+                &[&volume_id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(candidate_after, candidate_before);
+        assert_eq!(state_after, state_before);
+        let object_store =
+            OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::from_s3(
+                &endpoint,
+                &bucket,
+                &access_key,
+                &secret_key,
+                &region,
+                2,
+                32,
+            )?);
+        assert!(
+            listed_files(&object_store, &prefix, None)
+                .await
+                .contains(&key)
+        );
+
+        client
+            .execute("DELETE FROM volumes WHERE vol = $1", &[&volume_id])
+            .await?;
+        connection_task.abort();
+        writer.delete(&key).await?;
+        drop(temp);
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

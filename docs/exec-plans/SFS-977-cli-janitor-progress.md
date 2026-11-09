@@ -11,6 +11,7 @@ Operators need to understand whether `studiofs janitor <volume>` is waiting on m
 - [x] (2026-11-09 20:00Z) Confirmed repository baseline, CLI pipeline, metadata session, dry-run checkpoint behavior, and existing logical transport counters.
 - [x] (2026-11-09 21:00Z) Implemented five-second progress events, live scanned/listed/candidate/protection/age/HEAD/DELETE counts, active operation phase, JSONL cycle/final events, and typed process outcomes.
 - [x] (2026-11-09 21:00Z) Documented JSONL schema, exit codes, dry-run limits, and provider observability boundaries; focused checks passed.
+- [x] (2026-11-09 21:30Z) Rechecked focused behavior and local live PostgreSQL/RustFS acceptance; corrected the ignored lock-busy test and added a local-only live CLI dry-run acceptance test.
 
 ## Surprises & Discoveries
 
@@ -35,7 +36,11 @@ Operators need to understand whether `studiofs janitor <volume>` is waiting on m
 
 The standalone CLI now emits five-second human-readable progress or versioned JSONL events. JSONL distinguishes per-cycle work from one final run summary and reports process codes 0, 2, 3, 4, and 5 for complete, partial/cancelled, lock-busy, unsafe metadata, and backend-failure outcomes. Dry-run continues to read metadata and coordinate with a session advisory lock but does not persist queue/checkpoint/fence changes or issue deletes; it reports would-delete separately from confirmed deletes.
 
-Focused progress, dry-run delete suppression, and resumed dry-run checkpoint-preservation tests passed. `cargo check`, package Clippy, formatting, and diff checks passed. Service-backed exit-code behavior was not exercised against live PostgreSQL/S3; CLI mapping is covered by the typed boundary and compile/test checks.
+Focused progress tests passed 4/4, and `janitor_dry_run_never_sends_delete_requests` passed. The ignored live PostgreSQL lock-busy test initially exposed an outdated success assertion; it now verifies typed exit code 3 and passed against an isolated local PostgreSQL service with zero S3 requests.
+
+Live acceptance used a new `sfs977-verify` Compose project with PostgreSQL 18 and RustFS on dedicated localhost ports and fresh named volumes. The legacy combined cancellation test passed against these services, exercising a PostgreSQL deletion claim, RustFS DELETE, claim finish, lock retention while DELETE was gated, restart behavior, and candidate acknowledgement. The new `live_cli_dry_run_keeps_eligible_candidate_and_object` ignored test uses a unique per-run prefix and a real child CLI process: with one eligible candidate and one canonical object it reports `would_delete=1`, `delete_attempted=0`, and `delete_confirmed=0`; the candidate row and checkpoint/upload/watermark state remain unchanged, and the object remains listed. The same fixture also verifies the process returns code 2 and a `partial` summary when the one-item delete budget is exhausted. The test rejects non-loopback PostgreSQL/S3 endpoints to avoid using `.env` remote services.
+
+The actual CLI process also returned JSONL `unsafe`/exit 4 when the isolated fixture lacked `snapshot_reachability_bootstrap`; after adding the readiness row to that disposable fixture, dry-run completed. Stopping only the isolated PostgreSQL container made the CLI emit `backend_failure`/exit 5; the service was restarted and returned healthy. The first sandboxed full binary run had nine Windows `Access is denied` failures in mount-session and snapshot fixture tests. An identical elevated rerun passed: `cargo test -p studiofs --bin studiofs -- --test-threads=1` reported 521 passed, 0 failed, 5 ignored. This run preceded adding the one ignored live acceptance test; that test was separately run and passed 1/1. This is the full `studiofs` binary unit-test suite only, not every package target or the workspace. `cargo clippy -p studiofs --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed after the final test change. Docker containers were stopped with their named volumes preserved.
 
 ## Context and Orientation
 
@@ -51,15 +56,15 @@ Document exact fields and limitations in `docs/janitor-performance.md`. Keep thi
 
 ## Concrete Steps
 
-From `E:\dev\studiofs-cli`, run `cargo test -p studiofs --bin studiofs progress_ -- --nocapture`, `cargo test -p studiofs --bin studiofs janitor_dry_run_never_sends_delete_requests -- --nocapture`, `cargo test -p studiofs --bin studiofs janitor_resumed_object_refreshes_age_and_dry_run_preserves_checkpoint -- --nocapture`, `cargo check -p studiofs --bin studiofs`, `cargo clippy -p studiofs --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check`. Do not run the full test suite.
+Focused checks: `cargo test -p studiofs --bin studiofs progress_ -- --nocapture`, `cargo test -p studiofs --bin studiofs janitor_dry_run_never_sends_delete_requests -- --nocapture`, and `cargo test -p studiofs --bin studiofs janitor_resumed_object_refreshes_age_and_dry_run_preserves_checkpoint -- --nocapture`. Local live checks use a disposable PostgreSQL/RustFS Compose project and explicit process environment overrides for `STUDIOFS_TEST_PG_DSN`, `STUDIOFS_S3_ENDPOINT`, `STUDIOFS_S3_BUCKET`, `STUDIOFS_S3_ACCESS_KEY`, `STUDIOFS_S3_SECRET_KEY`, and `STUDIOFS_S3_REGION`; do not load or reuse remote `.env` endpoints. Build with `cargo build -p studiofs`, then run the ignored janitor acceptance selections serially. The new dry-run process test additionally requires an isolated `STUDIOFS_CLIENT_ROOT` and fails closed for non-loopback services. The parent turn explicitly authorized `cargo test -p studiofs --bin studiofs -- --test-threads=1`; this binary suite was run, but workspace-wide suites were not.
 
 ## Validation and Acceptance
 
-Focused tests must show that a long pending metadata/object operation emits multiple progress events, dry-run performs zero checkpoint/queue/delete writes while allowing documented reads and advisory locking, JSONL output matches the documented versioned schema, and text output remains readable without a TTY. Run formatting and diff checks. Report any service-backed behavior that is not exercised.
+Focused tests must show that a long pending metadata/object operation emits multiple progress events, dry-run performs zero checkpoint/queue/delete writes while allowing documented reads and advisory locking, JSONL output matches the documented versioned schema, and text output remains readable without a TTY. The live acceptance test requires loopback-only PostgreSQL and S3 endpoints and uses a unique disposable object namespace. Run formatting and diff checks, and report behavior that remains environment-gated.
 
 ## Idempotence and Recovery
 
-The change is confined to CLI presentation and its dry-run boundary. It does not modify mounted cleanup behavior or persisted schema. Re-running tests uses isolated fakes and does not access a live volume.
+The change is confined to CLI presentation and its dry-run boundary. It does not modify mounted cleanup behavior or persisted schema. The live acceptance test writes one unique object and PG candidate into disposable loopback services, confirms dry-run leaves them unchanged, and removes only that test-owned object and volume row on success. Keep the Compose volumes for evidence; do not point the test at a user or remote volume.
 
 ## Artifacts and Notes
 
@@ -68,3 +73,9 @@ The existing pipeline's counters are logical provider operations. `list_pages` r
 ## Interfaces and Dependencies
 
 The CLI output mode should be an enum accepted by clap, and JSON events should use `serde_json` already present in the crate. No dependency is required.
+
+## Latest verification result: unresolved duplicate dry-run accounting
+
+The final repeated live process test `cargo test -p studiofs --bin studiofs live_cli_dry_run_keeps_eligible_candidate_and_object -- --ignored --nocapture --test-threads=1` failed: `would_delete` was 2 for one eligible queued object also present in the S3 listing (expected 1). Earlier runs passed, but they do not override this final failure. The queue stage and listing stage each reach the dry-run increment of `stats.deleted`; no deletion or queue acknowledgement removes the duplicate observation. The exact regression assertion is retained. No production correction or assertion weakening was made in this verification task. SFS-977 acceptance remains incomplete pending a bounded, correct accounting fix.
+
+The full binary test run passed 521 tests with 5 ignored before this new ignored regression was added. Clippy, formatting and diff checks passed after the final exact-loopback URL guard. Docker containers are stopped and their isolated named volumes remain for diagnosis. No external object storage was used.
