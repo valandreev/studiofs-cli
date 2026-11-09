@@ -629,6 +629,19 @@ Janitor policy:
   deletion.
 - a Creating source remains retained by its PostgreSQL control-plane row until
   the snapshot lifecycle can safely release it.
+- the standalone CLI janitor holds the exclusive per-volume advisory lock from
+  metadata validation through candidate checks and object deletion, and checks
+  bounded batches of at most 64 object IDs against local and PostgreSQL state.
+- missing or unknown eligibility and any metadata query error abort the current
+  candidate batch before the CLI sends deletes to object storage.
+- every Snapshot v2 capture path (manual and policy) takes the matching
+  exclusive transaction advisory lock in `capture_snapshot_in_transaction`
+  before capturing the metadata cut or inserting its `creating` catalog row, so
+  a capture waits while the CLI janitor holds its session lock. Capture must not
+  take a shared lock on the same key first: upgrading shared to exclusive inside
+  one transaction deadlocks two concurrent captures.
+  Creating and ready snapshots retain matching object IDs; deleting snapshots
+  retain them while an unreleased mount lease is still live.
 
 ACL metadata follows the same base+overlay split:
 - `base_acl_rules`

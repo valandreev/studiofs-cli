@@ -502,6 +502,20 @@ impl RedbMetaEngine {
             .collect()
     }
 
+    pub(crate) fn has_pending_uploaded_regular_file_recoveries(&self) -> MetaResult<bool> {
+        let txn = self.begin_read_txn()?;
+        let table = txn
+            .open_table(PENDING_REGULAR_FILE_RECOVERY_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        table
+            .iter()
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .next()
+            .transpose()
+            .map(|row| row.is_some())
+            .map_err(|error| MetaError::Storage(error.to_string()))
+    }
+
     pub(crate) fn pending_recovery_payloads_are_published(
         &self,
         recovery: &PendingRegularFileRecoveryRecord,

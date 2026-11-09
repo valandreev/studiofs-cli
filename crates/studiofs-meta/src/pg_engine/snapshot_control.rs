@@ -223,6 +223,8 @@ impl PgSnapshotBackend {
                         .transaction()
                         .await
                         .map_err(|_| snapshot_control_error("begin snapshot transaction"))?;
+                    // capture_snapshot_in_transaction takes the exclusive janitor xact lock,
+                    // which fences creation against a running janitor session.
                     let entry = capture_snapshot_in_transaction(&tx, &request).await?;
                     tx.commit()
                         .await

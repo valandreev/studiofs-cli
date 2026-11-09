@@ -389,6 +389,27 @@ impl RedbMetaEngine {
             cached.map(|cached| cached.stats)
         }
     }
+
+    /// Return pending deletion timestamps for a bounded candidate set.
+    pub(crate) fn get_pending_deletions_for(
+        &self,
+        object_ids: &[u64],
+    ) -> MetaResult<std::collections::HashMap<u64, i64>> {
+        let txn = self.begin_read_txn()?;
+        let table = txn
+            .open_table(PENDING_DELETIONS_TABLE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let mut pending = std::collections::HashMap::with_capacity(object_ids.len());
+        for object_id in object_ids {
+            if let Some(timestamp) = table
+                .get(object_id)
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+            {
+                pending.insert(*object_id, timestamp.value());
+            }
+        }
+        Ok(pending)
+    }
 }
 
 impl MetaGc for RedbMetaEngine {

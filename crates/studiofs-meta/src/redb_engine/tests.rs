@@ -1599,6 +1599,25 @@ fn pending_deletions_limited_stops_at_limit() {
 }
 
 #[test]
+fn pending_deletions_for_reads_only_candidate_markers() {
+    let engine = temp_engine();
+    engine
+        .add_pending_deletion(90_001, 100)
+        .expect("mark first candidate pending");
+    engine
+        .add_pending_deletion(90_002, 200)
+        .expect("mark second candidate pending");
+    engine
+        .add_pending_deletion(90_003, 300)
+        .expect("mark noncandidate pending");
+
+    let pending = engine
+        .get_pending_deletions_for(&[90_001, 90_002, 90_004])
+        .expect("read bounded pending markers");
+    assert_eq!(pending, HashMap::from([(90_001, 100), (90_002, 200)]));
+}
+
+#[test]
 fn pending_deletion_batch_commits_all_markers_in_one_transaction_with_one_event_each() {
     let engine = temp_engine();
     let markers = [(10, 100), (20, 200), (30, 300)];
