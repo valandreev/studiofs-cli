@@ -1010,9 +1010,41 @@ mod tests {
     }
 
     fn create_local_metadata_fixture(meta_dir: &std::path::Path, endpoint: &str) -> PathBuf {
+        create_metadata_fixture(
+            meta_dir,
+            endpoint,
+            studiofs_meta::schema::MetadataConfig::default(),
+        )
+    }
+
+    fn create_postgres_metadata_fixture(
+        meta_dir: &std::path::Path,
+        endpoint: &str,
+        postgres_url: &str,
+    ) -> PathBuf {
+        use studiofs_meta::schema::{MetadataBackend, MetadataConfig, PostgresConfig};
+        create_metadata_fixture(
+            meta_dir,
+            endpoint,
+            MetadataConfig {
+                backend: MetadataBackend::Postgres,
+                postgres: Some(PostgresConfig {
+                    url: postgres_url.to_string(),
+                    volume_id: 966,
+                }),
+                ..MetadataConfig::default()
+            },
+        )
+    }
+
+    fn create_metadata_fixture(
+        meta_dir: &std::path::Path,
+        endpoint: &str,
+        metadata: studiofs_meta::schema::MetadataConfig,
+    ) -> PathBuf {
         use studiofs_meta::schema::{
             CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, ENCRYPTION_KEY_LENGTH, EncryptionConfig,
-            FormatInfo, MetadataConfig,
+            FormatInfo,
         };
 
         std::fs::create_dir_all(meta_dir).unwrap();
@@ -1030,7 +1062,7 @@ mod tests {
                 secret_key: "fixture".to_string(),
                 region: "us-east-1".to_string(),
                 data_prefix: "test/objects/".to_string(),
-                metadata: MetadataConfig::default(),
+                metadata,
                 encryption: EncryptionConfig::new([0; ENCRYPTION_KEY_LENGTH]),
                 block_size: DEFAULT_BLOCK_SIZE,
             })
@@ -1162,6 +1194,105 @@ mod tests {
         assert_eq!(fake.head_requests.load(Ordering::Relaxed), 0);
         assert_eq!(fake.delete_requests.load(Ordering::Relaxed), 0);
         assert_eq!(std::fs::read(&db_path).unwrap(), before);
+    }
+
+    struct FailClosedRun {
+        result: anyhow::Result<()>,
+        s3_requests: u64,
+        metadata_unchanged: bool,
+    }
+
+    /// Runs one real `run()` cycle against a PostgreSQL-backed fixture and a fake S3.
+    async fn run_postgres_fixture_once(postgres_url: String, hold_lock: bool) -> FailClosedRun {
+        let (_op, fake, endpoint, server) = fake_s3_operator(1).await;
+        let temp = studiofs_test_support::workspace_target_tempdir("janitor-pg-");
+        let meta_dir = temp.path().join("meta");
+        let db_path = create_postgres_metadata_fixture(&meta_dir, &endpoint, &postgres_url);
+        let before = std::fs::read(&db_path).unwrap();
+        let run_db_path = db_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut holder = hold_lock.then(|| {
+                let mut session = JanitorMetadataSession::open(&run_db_path).unwrap();
+                assert!(session.try_acquire_global_janitor_lock().unwrap());
+                session
+            });
+            let result = run(JanitorRunRequest {
+                name: "janitor-fixture".to_string(),
+                meta_dir,
+                options: JanitorOptions {
+                    cache_dir: None,
+                    dry_run: false,
+                    loop_mode: false,
+                    interval_minutes: 30,
+                    skip_newer_minutes: 0,
+                    max_deletes: 1,
+                },
+            });
+            if let Some(session) = holder.as_mut() {
+                session.release_global_janitor_lock().unwrap();
+            }
+            result
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        FailClosedRun {
+            result,
+            s3_requests: fake.list_requests.load(Ordering::Relaxed)
+                + fake.head_requests.load(Ordering::Relaxed)
+                + fake.delete_requests.load(Ordering::Relaxed),
+            metadata_unchanged: std::fs::read(&db_path).unwrap() == before,
+        }
+    }
+
+    #[tokio::test]
+    async fn janitor_run_unreachable_postgres_fails_closed_without_s3_requests() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("postgresql://janitor:leak-canary@127.0.0.1:{port}/studiofs");
+        let run = run_postgres_fixture_once(url, false).await;
+        let error = format!("{:#}", run.result.unwrap_err());
+
+        assert!(error.contains("backend_unavailable"), "{error}");
+        assert!(!error.contains("leak-canary"), "{error}");
+        assert_eq!(run.s3_requests, 0);
+        assert!(run.metadata_unchanged);
+    }
+
+    #[tokio::test]
+    async fn janitor_run_silent_postgres_times_out_without_s3_requests() {
+        // Accepts TCP but never speaks the protocol, so only the bounded connect timeout ends it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "postgresql://janitor@{}/studiofs",
+            listener.local_addr().unwrap()
+        );
+        let started = Instant::now();
+        let run = run_postgres_fixture_once(url, false).await;
+        drop(listener);
+        let error = format!("{:#}", run.result.unwrap_err());
+
+        assert!(error.contains("backend_unavailable"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(60));
+        assert_eq!(run.s3_requests, 0);
+        assert!(run.metadata_unchanged);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    async fn janitor_run_lock_busy_skips_cycle_without_s3_requests() {
+        let Ok(url) = std::env::var("STUDIOFS_TEST_PG_DSN") else {
+            panic!("STUDIOFS_TEST_PG_DSN must be set for this ignored test");
+        };
+        let run = run_postgres_fixture_once(url, true).await;
+
+        run.result.unwrap();
+        assert_eq!(run.s3_requests, 0);
+        assert!(run.metadata_unchanged);
     }
 
     #[test]
