@@ -77,6 +77,148 @@ fn publication_rejects_deleted_payload_object() {
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn mounted_deletion_claim_fences_untracked_objects_against_late_replay() {
+    use crate::snapshot_ports::UploadedObjectDeletionClaim::{Claimed, Protected};
+    use crate::snapshot_ports::UploadedObjectDeletionOutcome::{Deleted, Retryable};
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-reachability-mounted-claim");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    seed_local(&db_path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open postgres engine");
+    let sql = |statement: &'static str| {
+        let dsn = dsn.clone();
+        let volume_id = volume.volume_id;
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            client
+                .execute(statement, &[&volume_id])
+                .await
+                .expect("run fixture statement");
+            connection_task.abort();
+            Ok::<_, MetaError>(())
+        })
+        .expect("run fixture statement");
+    };
+    let state = |object_id: i64| -> Option<String> {
+        let dsn = dsn.clone();
+        let volume_id = volume.volume_id;
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            let row = client
+                .query_opt(
+                    "SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2",
+                    &[&volume_id, &object_id],
+                )
+                .await
+                .expect("read ledger row");
+            connection_task.abort();
+            Ok::<_, MetaError>(row.map(|row| row.get(0)))
+        })
+        .expect("read ledger row")
+    };
+    let replay_upload = |object_id: u64| {
+        let entry = UploadedFragmentLedgerEntry {
+            volume_id: volume.volume_id,
+            object_id,
+            fragment_index: 0,
+            object_key: format!("objects/{object_id}/0"),
+            expected_byte_length: 1,
+            expected_sha256: [7; 32],
+        };
+        engine
+            .begin_fragment_uploads(std::slice::from_ref(&entry))
+            .expect("late upload registration");
+        engine
+            .confirm_fragment_uploads(std::slice::from_ref(&entry))
+            .expect("late upload confirmation");
+        engine.flush_metadata().expect("replay upload ledger");
+    };
+    let publication_rejected = |object_id: u64| {
+        run_async(async {
+            let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            let tx = client.transaction().await.expect("start publication");
+            let result = apply_object_lifetime_changes(
+                &tx,
+                volume.volume_id,
+                1,
+                &[publish_event(7, object_id)],
+            )
+            .await;
+            tx.rollback().await.expect("rollback publication");
+            connection_task.abort();
+            Ok::<_, MetaError>(result.is_err())
+        })
+        .expect("attempt publication")
+    };
+
+    sql(
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 61, 'uploaded'), ($1, 62, 'retry_wait'), ($1, 63, 'deleted')",
+    );
+    // Uploads awaiting publication are protected, as in batched eligibility.
+    for object_id in [61, 62] {
+        assert!(matches!(
+            engine
+                .claim_uploaded_object_deletion(object_id, "mounted-test")
+                .expect("claim"),
+            Protected
+        ));
+    }
+
+    // An untracked object is claimed only with a delete_pending fence row.
+    let Claimed { fencing_token } = engine
+        .claim_uploaded_object_deletion(60, "mounted-test")
+        .expect("claim untracked")
+    else {
+        panic!("an unreferenced untracked object must be claimed under a fence");
+    };
+    assert_eq!(state(60).as_deref(), Some("delete_pending"));
+    engine
+        .finish_uploaded_object_deletion(60, "mounted-test", fencing_token, Retryable)
+        .expect("retryable finish");
+    assert_eq!(state(60).as_deref(), Some("delete_pending"));
+    let Claimed { fencing_token } = engine
+        .claim_uploaded_object_deletion(60, "mounted-test")
+        .expect("re-claim after retry")
+    else {
+        panic!("a retryable fence row must be re-claimable");
+    };
+    engine
+        .finish_uploaded_object_deletion(60, "mounted-test", fencing_token, Deleted)
+        .expect("finish");
+    assert_eq!(state(60).as_deref(), Some("delete_pending"));
+
+    // A late ledger replay neither revives the fence nor a legacy 'deleted' row.
+    for (object_id, fence) in [(60, "delete_pending"), (63, "deleted")] {
+        replay_upload(object_id);
+        assert_eq!(state(object_id as i64).as_deref(), Some(fence));
+        assert!(
+            publication_rejected(object_id),
+            "a deleted object id must not be published"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn published_batch_derives_exact_before_and_after_references() {
     let Some(dsn) = pg_dsn() else {
         return;

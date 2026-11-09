@@ -174,11 +174,8 @@ fn janitor_session_fences_object_deletion_claims() {
     ));
     session.finish_deletion(90, token, Deleted).expect("finish");
     assert_eq!(ledger(90), Some(("delete_pending".to_owned(), None)));
-    // A late upload registration (same upsert as begin_fragment_uploads) keeps the fence.
-    sql(
-        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 90, 'uploading') ON CONFLICT (vol, object_id) DO UPDATE SET state = CASE WHEN snapshot_payload_upload_objects.state = 'deleted' THEN 'uploading' ELSE snapshot_payload_upload_objects.state END, closed_at = NULL",
-    );
-    assert_eq!(ledger(90).expect("fence row").0, "delete_pending");
+    // Late upload replay against this fence is covered by
+    // mounted_deletion_claim_fences_untracked_objects_against_late_replay.
     assert!(
         matches!(
             session.finish_deletion(90, token, Deleted),

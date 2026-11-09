@@ -147,19 +147,6 @@ async fn prove_reconciliation_claim(
     (claim, outcome)
 }
 
-fn janitor_object_delete_keys(
-    data_prefix: &str,
-    object_id: u64,
-    listed_key: &str,
-) -> Option<Vec<String>> {
-    let legacy_key = format_object_key(data_prefix, object_id);
-    let fragment_keys = format_object_fragment_keys(data_prefix, object_id);
-    if listed_key != legacy_key && !fragment_keys.iter().any(|key| key == listed_key) {
-        return None;
-    }
-    Some(std::iter::once(legacy_key).chain(fragment_keys).collect())
-}
-
 /// Finishes claims sequentially per key and concurrently across keys. Returns
 /// `(attempted, errors, unfinished)`; after shutdown no further finish starts,
 /// and unstarted claims keep their reconciliation lease for retry after expiry.
@@ -3529,14 +3516,8 @@ impl StudioVfs {
             };
             scanned = scanned.saturating_add(1);
             let path = entry.key.as_str();
-            let object_id = match parse_object_id_from_key(path) {
-                Ok(id) => id,
-                Err(_) => {
-                    skipped_non_object_key = skipped_non_object_key.saturating_add(1);
-                    continue;
-                }
-            };
-            let Some(delete_keys) = janitor_object_delete_keys(&self.data_prefix, object_id, path)
+            let Some((object_id, delete_keys)) =
+                canonical_object_delete_keys(&self.data_prefix, path)
             else {
                 skipped_non_object_key = skipped_non_object_key.saturating_add(1);
                 continue;
@@ -3824,30 +3805,6 @@ mod tests {
                 (8, 1, RemoteConfirmed),
                 (8, 0, Retryable),
             ]
-        );
-    }
-
-    #[test]
-    fn janitor_deletes_the_listed_legacy_key_and_current_fragment_keys() {
-        let legacy_key = "volume/objects/1234/0000000000001234";
-        let keys = janitor_object_delete_keys("volume/objects", 0x1234, legacy_key)
-            .expect("canonical legacy key");
-
-        assert!(keys.iter().any(|key| key == legacy_key));
-        assert!(keys.iter().any(|key| key.ends_with("/0000000000001234/0")));
-        assert_eq!(keys.len(), 2);
-
-        let fragment_key = "volume/objects/1234/0000000000001234/0";
-        let keys = janitor_object_delete_keys("volume/objects", 0x1234, fragment_key)
-            .expect("canonical fragment key");
-        assert_eq!(keys.len(), 2, "both legacy and fragment forms are deleted");
-        assert!(
-            janitor_object_delete_keys(
-                "volume/objects",
-                0x1234,
-                "volume/objects/unrelated/0000000000001234"
-            )
-            .is_none()
         );
     }
 

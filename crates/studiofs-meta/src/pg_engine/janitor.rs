@@ -361,12 +361,7 @@ impl PgJanitorSession {
 
     /// Claims one object for deletion under its object-level fence, immediately
     /// before remote I/O. Returns the fencing token, or `None` when protected.
-    ///
-    /// Event publication bumps `metadata_state` before it records references, so
-    /// the share lock taken first makes the reference and pin checks authoritative.
-    /// An untracked object receives a `delete_pending` ledger row in the same
-    /// transaction. Upload registration keeps that state and publication rejects
-    /// it, so a late upload or publication of the ID fails instead of reviving it.
+    /// See [`claim_object_deletion_in`].
     pub(crate) fn claim_object_deletion(
         &mut self,
         object_id: u64,
@@ -380,71 +375,29 @@ impl PgJanitorSession {
         let volume_id = self.volume_id;
         let object_id = i64::try_from(object_id)
             .map_err(|_| JanitorMetadataError::UnsafeToDelete("janitor object id is invalid"))?;
-        let lease_secs = super::snapshot_reachability::SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64;
-        let pin_query = format!(
-            "SELECT EXISTS ({SNAPSHOT_PIN_QUERY} AND reachability.object_id = $2) OR EXISTS (SELECT 1 FROM snapshot_current_references WHERE vol = $1 AND object_id = $2)"
-        );
         let command_timeout = self.command_timeout;
         // The timer must be created inside the runtime, so build the timeout within block_on.
-        let result = runtime.block_on(async move { tokio::time::timeout(command_timeout, async {
-            let tx = client
-                .transaction()
-                .await
-                .map_err(|error| janitor_pg_error("janitor claim transaction failed", error))?;
-            tx.query_opt(
-                "SELECT 1 FROM metadata_state WHERE vol = $1 FOR SHARE",
-                &[&volume_id],
-            )
+        let result = runtime.block_on(async move {
+            tokio::time::timeout(command_timeout, async {
+                let tx = client
+                    .transaction()
+                    .await
+                    .map_err(|error| janitor_pg_error("janitor claim transaction failed", error))?;
+                claim_object_deletion_in(tx, volume_id, object_id, owner)
+                    .await
+                    .map_err(|error| match error {
+                        ObjectDeletionClaimError::VolumeBindingMissing => {
+                            JanitorMetadataError::UnsafeToDelete(
+                                "PostgreSQL volume binding is missing",
+                            )
+                        }
+                        ObjectDeletionClaimError::Postgres(context, error) => {
+                            janitor_pg_error(context, error)
+                        }
+                    })
+            })
             .await
-            .map_err(|error| janitor_pg_error("janitor claim publication fence failed", error))?
-            .ok_or(JanitorMetadataError::UnsafeToDelete(
-                "PostgreSQL volume binding is missing",
-            ))?;
-            tx.execute(
-                "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at) VALUES ($1, $2, 'delete_pending', clock_timestamp()) ON CONFLICT (vol, object_id) DO NOTHING",
-                &[&volume_id, &object_id],
-            )
-            .await
-            .map_err(|error| janitor_pg_error("janitor claim ledger insert failed", error))?;
-            let lease_active: bool = tx
-                .query_one(
-                    "SELECT reconcile_lease_expires_at IS NOT NULL AND reconcile_lease_expires_at > clock_timestamp() FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2 FOR UPDATE",
-                    &[&volume_id, &object_id],
-                )
-                .await
-                .map_err(|error| janitor_pg_error("janitor claim ledger read failed", error))?
-                .get(0);
-            let protected = lease_active
-                || tx
-                    .query_one(&pin_query, &[&volume_id, &object_id])
-                    .await
-                    .map_err(|error| janitor_pg_error("janitor claim protection check failed", error))?
-                    .get::<_, bool>(0);
-            let fencing_token = if protected {
-                None
-            } else {
-                // Same protection as eligibility: an upload awaiting publication
-                // ('uploading', 'uploaded', 'retry_wait') is never claimed.
-                tx.query_opt(
-                    "UPDATE snapshot_payload_upload_objects SET state = 'delete_pending', reconcile_owner = $3, reconcile_lease_expires_at = clock_timestamp() + ($4 * interval '1 second'), reconcile_fence = reconcile_fence + 1, next_retry_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = $2 AND state IN ('published', 'delete_pending', 'deleted') RETURNING reconcile_fence",
-                    &[&volume_id, &object_id, &owner, &lease_secs],
-                )
-                .await
-                .map_err(|error| janitor_pg_error("janitor claim lease failed", error))?
-                .map(|row| row.get::<_, i64>(0))
-            };
-            // Commit only a claim, so a protected object keeps its prior ledger state.
-            if fencing_token.is_some() {
-                tx.commit()
-                    .await
-                    .map_err(|error| janitor_pg_error("janitor claim commit failed", error))?;
-            } else {
-                tx.rollback()
-                    .await
-                    .map_err(|error| janitor_pg_error("janitor claim rollback failed", error))?;
-            }
-            Ok(fencing_token)
-        }).await });
+        });
         result.unwrap_or_else(|_| {
             Err(JanitorMetadataError::BackendUnavailable(
                 "PostgreSQL janitor claim timed out".to_owned(),
@@ -455,8 +408,7 @@ impl PgJanitorSession {
     /// Completes a deletion claim; returns `false` when the claim is no longer
     /// current (expired and re-claimed, or otherwise fenced out).
     ///
-    /// Both outcomes release the lease but keep `delete_pending`: upload
-    /// registration revives `deleted` rows, so only `delete_pending` stays a fence
+    /// Both outcomes release the lease but keep `delete_pending`, the fence
     /// against a late publication. A retryable outcome records its reason in
     /// `last_error`, and the next cycle re-claims the row.
     pub(crate) fn finish_object_deletion(
@@ -474,14 +426,12 @@ impl PgJanitorSession {
         };
         let object_id = i64::try_from(object_id)
             .map_err(|_| JanitorMetadataError::UnsafeToDelete("janitor object id is invalid"))?;
-        let state = "delete_pending";
         let message = match outcome {
             UploadedObjectDeletionOutcome::Deleted => None,
             UploadedObjectDeletionOutcome::Retryable => {
                 Some("cli janitor remote deletion retry required")
             }
         };
-        let lease_secs = super::snapshot_reachability::SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64;
         let result = runtime.block_on(async {
             tokio::time::timeout(
                 self.command_timeout,
@@ -492,8 +442,6 @@ impl PgJanitorSession {
                         &object_id,
                         &owner,
                         &fencing_token,
-                        &state,
-                        &lease_secs,
                         &message,
                     ],
                 ),
@@ -508,6 +456,84 @@ impl PgJanitorSession {
             )),
         }
     }
+}
+
+pub(super) enum ObjectDeletionClaimError {
+    VolumeBindingMissing,
+    Postgres(&'static str, tokio_postgres::Error),
+}
+
+/// Claims one object for deletion in `tx` under its object-level fence, shared
+/// by the CLI and mounted Janitors. Returns the fencing token, or `None` when the
+/// object is protected; only a claim is committed.
+///
+/// Event publication bumps `metadata_state` before it records references, so
+/// the share lock taken first makes the reference and pin checks authoritative.
+/// An untracked object receives a `delete_pending` ledger row in the same
+/// transaction. Upload registration keeps that state and publication rejects
+/// it, so a late upload or publication of the ID fails instead of reviving it.
+pub(super) async fn claim_object_deletion_in(
+    tx: tokio_postgres::Transaction<'_>,
+    volume_id: i64,
+    object_id: i64,
+    owner: &str,
+) -> Result<Option<i64>, ObjectDeletionClaimError> {
+    use ObjectDeletionClaimError::Postgres;
+    let lease_secs = super::snapshot_reachability::SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64;
+    let pin_query = format!(
+        "SELECT EXISTS ({SNAPSHOT_PIN_QUERY} AND reachability.object_id = $2) OR EXISTS (SELECT 1 FROM snapshot_current_references WHERE vol = $1 AND object_id = $2)"
+    );
+    tx.query_opt(
+        "SELECT 1 FROM metadata_state WHERE vol = $1 FOR SHARE",
+        &[&volume_id],
+    )
+    .await
+    .map_err(|error| Postgres("janitor claim publication fence failed", error))?
+    .ok_or(ObjectDeletionClaimError::VolumeBindingMissing)?;
+    tx.execute(
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at) VALUES ($1, $2, 'delete_pending', clock_timestamp()) ON CONFLICT (vol, object_id) DO NOTHING",
+        &[&volume_id, &object_id],
+    )
+    .await
+    .map_err(|error| Postgres("janitor claim ledger insert failed", error))?;
+    let lease_active: bool = tx
+        .query_one(
+            "SELECT reconcile_lease_expires_at IS NOT NULL AND reconcile_lease_expires_at > clock_timestamp() FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2 FOR UPDATE",
+            &[&volume_id, &object_id],
+        )
+        .await
+        .map_err(|error| Postgres("janitor claim ledger read failed", error))?
+        .get(0);
+    let protected = lease_active
+        || tx
+            .query_one(&pin_query, &[&volume_id, &object_id])
+            .await
+            .map_err(|error| Postgres("janitor claim protection check failed", error))?
+            .get::<_, bool>(0);
+    let fencing_token = if protected {
+        None
+    } else {
+        // Same protection as eligibility: an upload awaiting publication
+        // ('uploading', 'uploaded', 'retry_wait') is never claimed.
+        tx.query_opt(
+            "UPDATE snapshot_payload_upload_objects SET state = 'delete_pending', reconcile_owner = $3, reconcile_lease_expires_at = clock_timestamp() + ($4 * interval '1 second'), reconcile_fence = reconcile_fence + 1, next_retry_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = $2 AND state IN ('published', 'delete_pending', 'deleted') RETURNING reconcile_fence",
+            &[&volume_id, &object_id, &owner, &lease_secs],
+        )
+        .await
+        .map_err(|error| Postgres("janitor claim lease failed", error))?
+        .map(|row| row.get::<_, i64>(0))
+    };
+    // Commit only a claim, so a protected object keeps its prior ledger state.
+    if fencing_token.is_some() {
+        tx.commit()
+            .await
+            .map_err(|error| Postgres("janitor claim commit failed", error))?;
+    } else {
+        tx.rollback()
+            .await
+            .map_err(|error| Postgres("janitor claim rollback failed", error))?;
+    }
+    Ok(fencing_token)
 }
 
 /// Drops the source error so PostgreSQL details (possibly the DSN) never reach CLI output.
