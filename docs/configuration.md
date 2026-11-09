@@ -330,7 +330,7 @@ path is not a mounted StudioFS volume. See
 ### `janitor`
 
 ```bash
-studiofs janitor <name> [--dry-run] [--loop] [--interval-minutes <u64>] [--skip-newer-minutes <u64>] [--max-deletes <u64>] [--max-scan-entries <u64>] [--max-runtime-minutes <u64>]
+studiofs janitor <name> [--dry-run] [--loop] [--interval-minutes <u64>] [--skip-newer-minutes <u64>] [--max-deletes <u64>] [--max-scan-entries <u64>] [--max-runtime-minutes <u64>] [--pg-concurrency <1..8>] [--s3-concurrency <1..32>] [--s3-requests-per-second <1..32>]
 ```
 
 Each cycle stops admitting new work at the first limit it meets and reports an
@@ -344,6 +344,18 @@ Each cycle stops admitting new work at the first limit it meets and reports an
   finishes first. A partial cycle does not save its position yet, so the next
   run starts again from the beginning of the prefix; these flags are therefore
   rejected together with `--loop`.
+- `--pg-concurrency` (default 1, range 1–8) is the maximum PostgreSQL command
+  budget. The current CLI claim/finish path is serial and uses at most one PG
+  command at a time; raising this limit does not parallelize that path.
+- `--s3-concurrency` (default 2, range 1–32) limits actual in-flight OpenDAL
+  HTTP requests, including listing pages, stat/HEAD, and every canonical
+  fragment DELETE. `--s3-requests-per-second` (default 4,
+  range 1–32) paces request starts at the same HTTP boundary.
+- Janitor work is admitted in batches of at most 64 candidates. S3 operations
+  have explicit per-request deadlines: 60 seconds for listing and 20 seconds
+  for stat/HEAD and DELETE; PostgreSQL commands use the metadata crate's
+  command timeout. These are per-process limits, not a cluster-wide capacity
+  guarantee.
 
 ### `fsck`
 

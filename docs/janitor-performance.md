@@ -2,6 +2,12 @@
 
 `studiofs janitor` logs the duration of metadata open, global lock acquisition, protection metadata reads, initial object listing, fallback HEAD requests, fragment DELETE requests, object work, and the full lock-held cycle. It also logs the listed entry count, peak buffered candidates, scanned count, time to the first listed entry, time to the first orphan candidate, and OpenDAL HEAD/DELETE call counts. These are logical OpenDAL calls; retries can create additional HTTP requests.
 
+## Independent request budgets (SFS-974)
+
+The command accepts `--pg-concurrency` (default 1, range 1–8), `--s3-concurrency` (default 2, range 1–32), and `--s3-requests-per-second` (default 4, range 1–32). The PG pipeline currently issues claim and finish commands serially, so its observed peak is one even when the configured upper bound is higher. S3 concurrency is enforced by OpenDAL's HTTP request layer and includes LIST pagination, stat/HEAD, and each canonical fragment DELETE. Request starts are paced at that same transport boundary.
+
+The provider-neutral pipeline admits no more than one candidate at a time for destructive claim/delete/finish and buffers at most one eligibility page (64 candidates); the rate and transport limits therefore remain effective if provider internals add parallel requests later. Existing deadlines bound listing to 60 seconds and stat/HEAD and DELETE to 20 seconds; PostgreSQL janitor commands use the metadata session's command timeout. These are per-process budgets, not cluster-wide coordination. The mounted VFS janitor is unchanged.
+
 The public OpenDAL `Lister` does not expose how many S3 pages it fetched. Production output therefore marks `list_pages=unavailable`. The test fixture below counts actual S3-compatible HTTP list requests. It uses the real OpenDAL S3 operator pointed at a loopback TCP server and never contacts external services.
 
 ## Streaming listing (SFS-969)

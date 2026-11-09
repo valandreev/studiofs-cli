@@ -62,6 +62,9 @@ struct JanitorOptions {
     max_deletes: u64,
     max_scan_entries: Option<u64>,
     max_runtime_minutes: Option<u64>,
+    pg_concurrency: u64,
+    s3_concurrency: u64,
+    s3_requests_per_second: u32,
     full_scan: bool,
     reset_scan: bool,
 }
@@ -226,6 +229,9 @@ impl JanitorRunRequest {
                 max_deletes: args.max_deletes,
                 max_scan_entries: args.max_scan_entries,
                 max_runtime_minutes: args.max_runtime_minutes,
+                pg_concurrency: args.pg_concurrency,
+                s3_concurrency: args.s3_concurrency,
+                s3_requests_per_second: args.s3_requests_per_second,
                 full_scan: args.full_scan,
                 reset_scan: args.reset_scan,
             },
@@ -240,6 +246,7 @@ EXAMPLES:
   studiofs janitor myvolume --dry-run
   studiofs janitor myvolume --max-deletes 500 --skip-newer-minutes 15
   studiofs janitor myvolume --loop --interval-minutes 30
+  studiofs janitor myvolume --s3-concurrency 2 --pg-concurrency 1
 ")]
 pub(crate) struct JanitorArgs {
     /// Volume name
@@ -276,6 +283,18 @@ pub(crate) struct JanitorArgs {
     /// Stop admitting new work after this many minutes per cycle and report it as partial
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     max_runtime_minutes: Option<u64>,
+
+    /// Maximum in-flight PostgreSQL janitor commands (the current CLI command path is serial)
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=8))]
+    pg_concurrency: u64,
+
+    /// Maximum in-flight S3 HTTP requests, including listing pages, HEAD, and DELETE
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=32))]
+    s3_concurrency: u64,
+
+    /// Maximum S3 HTTP request starts per second
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=32))]
+    s3_requests_per_second: u32,
 
     /// Start this sweep at the beginning of the namespace
     #[arg(long, conflicts_with = "reset_scan")]
@@ -347,6 +366,9 @@ struct JanitorStartBanner<'a> {
     local_cache_report: Option<&'a JanitorLocalCacheReport>,
     skip_newer_minutes: u64,
     max_deletes: u64,
+    pg_concurrency: u64,
+    s3_concurrency: u64,
+    s3_requests_per_second: u32,
 }
 
 impl JanitorLocalCacheReport {
@@ -389,6 +411,14 @@ fn build_start_banner_lines(banner: JanitorStartBanner<'_>) -> Vec<String> {
         format_minutes(banner.skip_newer_minutes)
     ));
     lines.push(format!("  Max delete: {}", banner.max_deletes));
+    lines.push(format!(
+        "  In-flight:  PG <= {} (serial), S3 HTTP <= {}",
+        banner.pg_concurrency, banner.s3_concurrency
+    ));
+    lines.push(format!(
+        "  S3 rate:    <= {} HTTP requests/second",
+        banner.s3_requests_per_second
+    ));
     lines
 }
 
@@ -466,6 +496,9 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         max_deletes,
         max_scan_entries,
         max_runtime_minutes,
+        pg_concurrency,
+        s3_concurrency,
+        s3_requests_per_second,
         full_scan,
         reset_scan,
     } = options;
@@ -507,6 +540,9 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         &format_info.access_key,
         &format_info.secret_key,
         &format_info.region,
+        usize::try_from(s3_concurrency)
+            .map_err(|_| anyhow::anyhow!("S3 concurrency is invalid"))?,
+        s3_requests_per_second,
     )?);
     let listing_strategy = if store.supports_start_after() {
         "opendal-start-after-v1"
@@ -533,6 +569,9 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         local_cache_report: local_cache_report.as_ref(),
         skip_newer_minutes,
         max_deletes,
+        pg_concurrency,
+        s3_concurrency,
+        s3_requests_per_second,
     }) {
         println!("{line}");
     }
@@ -2282,6 +2321,12 @@ mod tests {
         object_count: u64,
         /// Never answer this 0-based list page, simulating a stalled provider.
         stall_page: Option<u64>,
+        response_delay: Duration,
+        /// Hold each response until this many requests are active at once.
+        response_barrier: Option<tokio::sync::Barrier>,
+        active_requests: AtomicU64,
+        peak_active_requests: AtomicU64,
+        request_starts: std::sync::Mutex<Vec<Instant>>,
     }
 
     async fn fake_s3_request(listener: tokio::net::TcpListener, fake: std::sync::Arc<FakeS3>) {
@@ -2304,7 +2349,11 @@ mod tests {
                     }
                     request.extend_from_slice(&buffer[..read]);
                 }
+                let active = fake.active_requests.fetch_add(1, Ordering::Relaxed) + 1;
+                fake.peak_active_requests
+                    .fetch_max(active, Ordering::Relaxed);
                 let request = String::from_utf8_lossy(&request);
+                fake.request_starts.lock().unwrap().push(Instant::now());
                 let first_line = request.lines().next().unwrap_or_default();
                 let (status, body, extra_headers) = if first_line.starts_with("GET ") {
                     fake.list_requests.fetch_add(1, Ordering::Relaxed);
@@ -2366,7 +2415,15 @@ mod tests {
                     "HTTP/1.1 {status}\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
+                if !fake.response_delay.is_zero() {
+                    tokio::time::sleep(fake.response_delay).await;
+                }
+                if let Some(barrier) = &fake.response_barrier {
+                    // Bounded: a missing overlap fails the peak assertion instead of hanging.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), barrier.wait()).await;
+                }
                 let _ = stream.write_all(response.as_bytes()).await;
+                fake.active_requests.fetch_sub(1, Ordering::Relaxed);
             });
         }
     }
@@ -2391,6 +2448,20 @@ mod tests {
         String,
         tokio::task::JoinHandle<()>,
     ) {
+        fake_s3_operator_with_options(object_count, stall_page, Duration::ZERO, None).await
+    }
+
+    async fn fake_s3_operator_with_options(
+        object_count: u64,
+        stall_page: Option<u64>,
+        response_delay: Duration,
+        response_barrier: Option<tokio::sync::Barrier>,
+    ) -> (
+        Operator,
+        std::sync::Arc<FakeS3>,
+        String,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let fake = std::sync::Arc::new(FakeS3 {
@@ -2400,6 +2471,11 @@ mod tests {
             list_requests_before_first_delete: AtomicU64::new(0),
             object_count,
             stall_page,
+            response_delay,
+            response_barrier,
+            active_requests: AtomicU64::new(0),
+            peak_active_requests: AtomicU64::new(0),
+            request_starts: std::sync::Mutex::new(Vec::new()),
         });
         let task = tokio::spawn(fake_s3_request(listener, fake.clone()));
         let op = Operator::new(
@@ -2415,6 +2491,94 @@ mod tests {
         .unwrap()
         .finish();
         (op, fake, endpoint, task)
+    }
+
+    #[tokio::test]
+    async fn s3_transport_budget_limits_live_http_requests_and_request_rate() {
+        let (_op, fake, endpoint, server) =
+            fake_s3_operator_with_options(0, None, Duration::from_millis(40), None).await;
+        let store = studiofs_data::janitor::JanitorObjectStore::from_s3(
+            &endpoint,
+            "test",
+            "test",
+            "test",
+            "us-east-1",
+            1,
+            32,
+        )
+        .unwrap();
+
+        let (list, head, delete) = tokio::join!(
+            store.list("test/objects/"),
+            store.stat_key("test/objects/0000/0000000000000001/0"),
+            store.delete("test/objects/0000/0000000000000001/0"),
+        );
+        let mut listing = list.unwrap();
+        assert!(listing.next().await.unwrap().is_none());
+        assert!(matches!(
+            head,
+            Ok(studiofs_data::janitor::JanitorKeyStat::Found(_))
+        ));
+        assert!(delete.is_ok());
+        assert_eq!(fake.peak_active_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(fake.delete_requests.load(Ordering::Relaxed), 1);
+        server.abort();
+        let _ = server.await;
+
+        let (_op, fake, endpoint, server) = fake_s3_operator_with_options(
+            0,
+            None,
+            Duration::ZERO,
+            Some(tokio::sync::Barrier::new(2)),
+        )
+        .await;
+        let store = studiofs_data::janitor::JanitorObjectStore::from_s3(
+            &endpoint,
+            "test",
+            "test",
+            "test",
+            "us-east-1",
+            2,
+            32,
+        )
+        .unwrap();
+        let (first, second, third, fourth) = tokio::join!(
+            store.stat_key("test/objects/0000/0000000000000001/0"),
+            store.stat_key("test/objects/0000/0000000000000002/0"),
+            store.stat_key("test/objects/0000/0000000000000003/0"),
+            store.stat_key("test/objects/0000/0000000000000004/0"),
+        );
+        assert!(first.is_ok() && second.is_ok() && third.is_ok() && fourth.is_ok());
+        assert_eq!(fake.peak_active_requests.load(Ordering::Relaxed), 2);
+        server.abort();
+        let _ = server.await;
+
+        let (_op, fake, endpoint, server) =
+            fake_s3_operator_with_options(0, None, Duration::ZERO, None).await;
+        let store = studiofs_data::janitor::JanitorObjectStore::from_s3(
+            &endpoint,
+            "test",
+            "test",
+            "test",
+            "us-east-1",
+            2,
+            2,
+        )
+        .unwrap();
+        let (first, second) = tokio::join!(
+            store.stat_key("test/objects/0000/0000000000000001/0"),
+            store.stat_key("test/objects/0000/0000000000000002/0"),
+        );
+        assert!(first.is_ok() && second.is_ok());
+        let request_starts = fake.request_starts.lock().unwrap().clone();
+        assert_eq!(request_starts.len(), 2);
+        assert!(request_starts[1].duration_since(request_starts[0]) >= Duration::from_millis(400));
+        assert!(fake.peak_active_requests.load(Ordering::Relaxed) <= 2);
+        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 2);
+        server.abort();
+        let _ = server.await;
     }
 
     fn create_local_metadata_fixture(meta_dir: &std::path::Path, endpoint: &str) -> PathBuf {
@@ -2627,6 +2791,9 @@ mod tests {
                     max_deletes: 1,
                     max_scan_entries: None,
                     max_runtime_minutes: None,
+                    pg_concurrency: 1,
+                    s3_concurrency: 2,
+                    s3_requests_per_second: 4,
                     full_scan: false,
                     reset_scan: false,
                 },
@@ -2677,6 +2844,9 @@ mod tests {
                     max_deletes: 1,
                     max_scan_entries: None,
                     max_runtime_minutes: None,
+                    pg_concurrency: 1,
+                    s3_concurrency: 2,
+                    s3_requests_per_second: 4,
                     full_scan: false,
                     reset_scan: false,
                 },
@@ -2777,6 +2947,9 @@ mod tests {
                 max_deletes,
                 max_scan_entries,
                 max_runtime_minutes,
+                pg_concurrency,
+                s3_concurrency,
+                s3_requests_per_second,
                 full_scan,
                 reset_scan,
             }) => {
@@ -2789,6 +2962,9 @@ mod tests {
                 assert_eq!(max_deletes, 600);
                 assert_eq!(max_scan_entries, None);
                 assert_eq!(max_runtime_minutes, None);
+                assert_eq!(pg_concurrency, 1);
+                assert_eq!(s3_concurrency, 2);
+                assert_eq!(s3_requests_per_second, 4);
                 assert!(!full_scan);
                 assert!(!reset_scan);
             }
@@ -2813,14 +2989,45 @@ mod tests {
         assert_eq!(args.max_scan_entries, Some(10_000));
         assert_eq!(args.max_runtime_minutes, Some(30));
 
+        let serial = crate::cli::parse_for_test(&[
+            "janitor",
+            "vol",
+            "--s3-concurrency",
+            "1",
+            "--pg-concurrency",
+            "1",
+            "--s3-requests-per-second",
+            "1",
+        ])
+        .unwrap();
+        let crate::cli::Commands::Janitor(serial) = serial.command else {
+            panic!("expected Janitor");
+        };
+        assert_eq!(serial.s3_concurrency, 1);
+        assert_eq!(serial.pg_concurrency, 1);
+        assert_eq!(serial.s3_requests_per_second, 1);
+
         for flag in [
             "--max-deletes",
             "--max-scan-entries",
             "--max-runtime-minutes",
+            "--pg-concurrency",
+            "--s3-concurrency",
+            "--s3-requests-per-second",
         ] {
             assert!(
                 crate::cli::parse_for_test(&["janitor", "vol", flag, "0"]).is_err(),
                 "{flag} 0 must be rejected"
+            );
+        }
+        for (flag, value) in [
+            ("--pg-concurrency", "9"),
+            ("--s3-concurrency", "33"),
+            ("--s3-requests-per-second", "33"),
+        ] {
+            assert!(
+                crate::cli::parse_for_test(&["janitor", "vol", flag, value]).is_err(),
+                "{flag} above its supported maximum must be rejected"
             );
         }
         for flag in ["--max-scan-entries", "--max-runtime-minutes"] {
@@ -2848,6 +3055,9 @@ mod tests {
             local_cache_report: None,
             skip_newer_minutes: 1,
             max_deletes: 100_000,
+            pg_concurrency: 1,
+            s3_concurrency: 2,
+            s3_requests_per_second: 4,
         });
 
         assert_eq!(
@@ -2860,6 +3070,8 @@ mod tests {
                 "  Scope:      remote objects only".to_string(),
                 "  Grace:      1 minute".to_string(),
                 "  Max delete: 100000".to_string(),
+                "  In-flight:  PG <= 1 (serial), S3 HTTP <= 2".to_string(),
+                "  S3 rate:    <= 4 HTTP requests/second".to_string(),
             ]
         );
         assert!(
@@ -3074,6 +3286,9 @@ mod tests {
                 &access_key,
                 &secret_key,
                 &region,
+                2,
+                // Keep each gated HEAD below the cfg(test) 200 ms HEAD timeout.
+                32,
             )
             .unwrap(),
         );

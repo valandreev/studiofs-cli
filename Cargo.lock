@@ -4924,6 +4924,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "hkdf",
+ "http 1.4.0",
  "opendal",
  "sha2 0.10.9",
  "studiofs-meta",
