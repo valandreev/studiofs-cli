@@ -9,6 +9,7 @@ use studiofs_cache::runtime::{
     LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
+use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
 use studiofs_meta::{JanitorMetadataSession, JanitorProtection};
 mod pipeline;
 use pipeline::{JanitorCycleContext, JanitorObjectStore, run_one_cycle};
@@ -49,6 +50,13 @@ trait JanitorMetadataSource {
     fn try_acquire_global_janitor_lock(&mut self) -> anyhow::Result<bool>;
     fn validate_protection(&mut self) -> anyhow::Result<()>;
     fn check_eligibility(&mut self, object_ids: &[u64]) -> anyhow::Result<JanitorProtection>;
+    fn claim_deletion(&mut self, object_id: u64) -> anyhow::Result<Option<i64>>;
+    fn finish_deletion(
+        &mut self,
+        object_id: u64,
+        fencing_token: i64,
+        outcome: UploadedObjectDeletionOutcome,
+    ) -> anyhow::Result<()>;
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()>;
 }
 
@@ -63,6 +71,20 @@ impl JanitorMetadataSource for JanitorMetadataSession {
 
     fn check_eligibility(&mut self, object_ids: &[u64]) -> anyhow::Result<JanitorProtection> {
         JanitorMetadataSession::check_eligibility(self, object_ids).map_err(anyhow::Error::new)
+    }
+
+    fn claim_deletion(&mut self, object_id: u64) -> anyhow::Result<Option<i64>> {
+        JanitorMetadataSession::claim_deletion(self, object_id).map_err(anyhow::Error::new)
+    }
+
+    fn finish_deletion(
+        &mut self,
+        object_id: u64,
+        fencing_token: i64,
+        outcome: UploadedObjectDeletionOutcome,
+    ) -> anyhow::Result<()> {
+        JanitorMetadataSession::finish_deletion(self, object_id, fencing_token, outcome)
+            .map_err(anyhow::Error::new)
     }
 
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
@@ -453,7 +475,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             duration_ms(cycle_elapsed),
         );
         println!(
-            "  janitor counts: listed_entries={} peak_listing_entries={} scanned={} first_candidate_ms={} opendal_head_calls={} opendal_delete_calls={} list_pages=unavailable claims=not_applicable claim_finish=not_applicable",
+            "  janitor counts: listed_entries={} peak_listing_entries={} scanned={} first_candidate_ms={} opendal_head_calls={} opendal_delete_calls={} list_pages=unavailable claims={} claim_protected={} claim_finish={} skipped_non_canonical={}",
             stats.initial_listing_entries,
             stats.peak_listing_entries,
             stats.scanned_files,
@@ -464,6 +486,10 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 .unwrap_or_else(|| "unavailable".to_string()),
             stats.head_requests,
             stats.delete_requests,
+            stats.claims,
+            stats.claim_protected,
+            stats.claim_finishes,
+            stats.skipped_non_canonical,
         );
         if !loop_mode {
             break;
@@ -546,6 +572,29 @@ mod tests {
         eligibility_reads: Vec<Vec<u64>>,
         nested_runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
         releases: u64,
+        claim_protected: Vec<u64>,
+        claim_error: Option<&'static str>,
+        finish_error: Option<&'static str>,
+        claims: Vec<u64>,
+        finishes: Vec<(u64, i64, UploadedObjectDeletionOutcome)>,
+    }
+
+    /// Fencing token the fake metadata hands out for `object_id`.
+    fn fake_token(object_id: u64) -> i64 {
+        i64::try_from(object_id).unwrap() + 1000
+    }
+
+    /// Every canonical key the CLI must delete for `object_id`: legacy plus fragments.
+    fn canonical_keys(object_id: u64) -> Vec<String> {
+        std::iter::once(studiofs_data::object::format_object_key(
+            "test/objects/",
+            object_id,
+        ))
+        .chain(studiofs_data::object::format_object_fragment_keys(
+            "test/objects/",
+            object_id,
+        ))
+        .collect()
     }
 
     impl FakeJanitorMetadata {
@@ -590,6 +639,27 @@ mod tests {
                         .map(|eligibility| (*id, *eligibility))
                 })
                 .collect())
+        }
+
+        fn claim_deletion(&mut self, object_id: u64) -> anyhow::Result<Option<i64>> {
+            self.claims.push(object_id);
+            if let Some(error) = self.claim_error {
+                anyhow::bail!(error);
+            }
+            Ok((!self.claim_protected.contains(&object_id)).then(|| fake_token(object_id)))
+        }
+
+        fn finish_deletion(
+            &mut self,
+            object_id: u64,
+            fencing_token: i64,
+            outcome: UploadedObjectDeletionOutcome,
+        ) -> anyhow::Result<()> {
+            self.finishes.push((object_id, fencing_token, outcome));
+            if let Some(error) = self.finish_error {
+                anyhow::bail!(error);
+            }
+            Ok(())
         }
 
         fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
@@ -752,10 +822,116 @@ mod tests {
         assert_eq!(stats.referenced_files, 2);
         assert_eq!(stats.orphan_candidates, 1);
         assert_eq!(stats.deleted, 1);
+        assert_eq!(*store.deleted.lock().unwrap(), canonical_keys(3));
+        assert_eq!(metadata.claims, [3]);
         assert_eq!(
-            *store.deleted.lock().unwrap(),
-            studiofs_data::object::format_object_fragment_keys("test/objects/", 3)
+            metadata.finishes,
+            [(3, fake_token(3), UploadedObjectDeletionOutcome::Deleted)]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn claim_protection_and_claim_failure_prevent_every_delete() {
+        let entries: Vec<_> = canonical_keys(1)
+            .into_iter()
+            .map(|key| JanitorEntry { key, is_file: true })
+            .collect();
+        let store = FakeJanitorStore {
+            entries: entries.clone(),
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata {
+            claim_protected: vec![1],
+            ..FakeJanitorMetadata::eligible()
+        };
+        let stats = run_one_cycle(fake_cycle_context(&store, &mut metadata))
+            .await
+            .unwrap();
+        assert_eq!(
+            (stats.claims, stats.claim_protected, stats.deleted),
+            (1, 1, 0)
+        );
+        assert!(store.deleted.lock().unwrap().is_empty());
+        assert!(metadata.finishes.is_empty());
+
+        let store = FakeJanitorStore {
+            entries,
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata {
+            claim_error: Some("backend_unavailable: claim timed out"),
+            ..FakeJanitorMetadata::eligible()
+        };
+        assert!(
+            run_one_cycle(fake_cycle_context(&store, &mut metadata))
+                .await
+                .is_err()
+        );
+        assert!(store.deleted.lock().unwrap().is_empty());
+        assert!(metadata.finishes.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unconfirmed_finish_and_failed_delete_are_not_reported_as_deleted() {
+        let entries: Vec<_> = canonical_keys(2)
+            .into_iter()
+            .map(|key| JanitorEntry { key, is_file: true })
+            .collect();
+        // A stale finish token after successful S3 deletes must not count as success.
+        let store = FakeJanitorStore {
+            entries: entries.clone(),
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata {
+            finish_error: Some("stale_claim: deletion claim is no longer current"),
+            ..FakeJanitorMetadata::eligible()
+        };
+        let stats = run_one_cycle(fake_cycle_context(&store, &mut metadata))
+            .await
+            .unwrap();
+        assert_eq!(
+            (stats.deleted, stats.delete_errors, stats.claim_finishes),
+            (0, 1, 0)
+        );
+        assert_eq!(*store.deleted.lock().unwrap(), canonical_keys(2));
+
+        // A failed S3 delete records a retryable outcome under the same claim.
+        let store = FakeJanitorStore {
+            entries,
+            fail_delete: true,
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let stats = run_one_cycle(fake_cycle_context(&store, &mut metadata))
+            .await
+            .unwrap();
+        assert_eq!((stats.deleted, stats.delete_errors), (0, 1));
+        assert_eq!(
+            metadata.finishes,
+            [(2, fake_token(2), UploadedObjectDeletionOutcome::Retryable)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_keys_are_cleaned_and_non_canonical_keys_are_never_touched() {
+        let store = FakeJanitorStore {
+            entries: [
+                studiofs_data::object::format_object_key("test/objects/", 5),
+                "test/objects/unrelated/0000000000000006".to_string(),
+                "test/objects/0007/0000000000000007/extra".to_string(),
+            ]
+            .into_iter()
+            .map(|key| JanitorEntry { key, is_file: true })
+            .collect(),
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let stats = run_one_cycle(fake_cycle_context(&store, &mut metadata))
+            .await
+            .unwrap();
+        assert_eq!(stats.skipped_non_canonical, 2);
+        assert_eq!(metadata.eligibility_reads, [vec![5]]);
+        assert_eq!(*store.deleted.lock().unwrap(), canonical_keys(5));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1018,10 +1194,7 @@ mod tests {
         assert_eq!(stats.skipped_young, 1);
         assert_eq!(stats.skipped_unknown_age, 1);
         assert_eq!(stats.deleted, 1);
-        assert_eq!(
-            *store.deleted.lock().unwrap(),
-            studiofs_data::object::format_object_fragment_keys("test/objects/", 8)
-        );
+        assert_eq!(*store.deleted.lock().unwrap(), canonical_keys(8));
 
         // The delete cap stops further candidates before any HEAD or delete request.
         let store = FakeJanitorStore {
@@ -1035,10 +1208,7 @@ mod tests {
         assert_eq!(stats.deleted, 1);
         assert_eq!(stats.skipped_cap, 2);
         assert_eq!(stats.head_requests, 1);
-        assert_eq!(
-            *store.deleted.lock().unwrap(),
-            studiofs_data::object::format_object_fragment_keys("test/objects/", 9)
-        );
+        assert_eq!(*store.deleted.lock().unwrap(), canonical_keys(9));
     }
 
     struct FakeS3 {
@@ -1261,13 +1431,12 @@ mod tests {
         assert!(stats.time_to_first_candidate.is_some());
         assert_eq!(stats.head_requests, 2);
         assert_eq!(fake.head_requests.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            stats.delete_requests,
-            2 * studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64
-        );
+        // Legacy key plus every fragment key per deleted object.
+        let keys_per_object = studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64 + 1;
+        assert_eq!(stats.delete_requests, 2 * keys_per_object);
         assert_eq!(
             fake.delete_requests.load(Ordering::Relaxed),
-            2 * studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64
+            2 * keys_per_object
         );
         println!(
             "janitor baseline: pages={} listed={} peak={} first_candidate_ms={} head_calls={} delete_calls={} object_work_ms={}",

@@ -18,6 +18,9 @@ pub enum JanitorMetadataError {
     /// A metadata backend or bounded query was unavailable.
     #[error("backend_unavailable: {0}")]
     BackendUnavailable(String),
+    /// The deletion claim was fenced out before completion; the object is retried later.
+    #[error("stale_claim: deletion claim is no longer current")]
+    StaleClaim,
 }
 
 fn backend_unavailable(error: impl fmt::Display) -> JanitorMetadataError {
@@ -32,7 +35,8 @@ fn pg_backend_unavailable() -> JanitorMetadataError {
 ///
 /// Unlike the normal PostgreSQL metadata engine, opening this session does not
 /// repair, synchronize, or create local metadata. PostgreSQL operations are
-/// limited to the janitor advisory lock and read-only safety queries.
+/// limited to the janitor advisory lock, read-only safety queries, and fenced
+/// per-object deletion claims in the upload ledger.
 pub struct JanitorMetadataSession {
     local: RedbMetaEngine,
     format_info: crate::FormatInfo,
@@ -42,6 +46,8 @@ pub struct JanitorMetadataSession {
     /// and `validated_local_version` rejects any batch checked after local state moved.
     // ponytail: holds every locally referenced ID (8 B each); switch to an object-ID index if local graphs outgrow memory.
     local_referenced: HashSet<u64>,
+    /// Owner recorded on object-level deletion claims made by this session.
+    deletion_owner: String,
 }
 
 impl JanitorMetadataSession {
@@ -69,6 +75,14 @@ impl JanitorMetadataSession {
             postgres,
             validated_local_version: None,
             local_referenced: HashSet::new(),
+            deletion_owner: format!(
+                "studiofs-cli-janitor:{}:{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
         })
     }
 
@@ -160,29 +174,11 @@ impl JanitorMetadataSession {
                 "janitor eligibility batch exceeds the configured limit",
             ));
         }
-        if !self.postgres.lock_is_held() {
-            return Err(JanitorMetadataError::UnsafeToDelete(
-                "PostgreSQL janitor lock is not held",
-            ));
-        }
+        let local_version = self.ensure_validated_cycle()?;
         let pending_deletions = self
             .local
             .get_pending_deletions_for(object_ids)
             .map_err(backend_unavailable)?;
-        let local_version = self
-            .local
-            .get_counter(crate::pg_engine::LOCAL_PG_VERSION_COUNTER)
-            .map_err(backend_unavailable)?;
-        let Some(validated_local_version) = self.validated_local_version else {
-            return Err(JanitorMetadataError::UnsafeToDelete(
-                "janitor protection was not validated",
-            ));
-        };
-        if local_version != validated_local_version {
-            return Err(JanitorMetadataError::UnsafeToDelete(
-                "local metadata changed during janitor cycle",
-            ));
-        }
         let remote =
             self.postgres
                 .check_eligibility(&self.format_info, local_version, object_ids)?;
@@ -203,6 +199,65 @@ impl JanitorMetadataSession {
             );
         }
         Ok(protection)
+    }
+
+    /// Claims one eligible object immediately before its remote deletion.
+    ///
+    /// Returns the fencing token for [`Self::finish_deletion`], or `None` when
+    /// metadata now protects the object. Untracked objects are fenced too.
+    pub fn claim_deletion(&mut self, object_id: u64) -> Result<Option<i64>, JanitorMetadataError> {
+        self.ensure_validated_cycle()?;
+        if self.local_referenced.contains(&object_id) {
+            return Ok(None);
+        }
+        self.postgres
+            .claim_object_deletion(object_id, &self.deletion_owner)
+    }
+
+    /// Records the remote deletion outcome for a claim from [`Self::claim_deletion`].
+    ///
+    /// Fails with [`JanitorMetadataError::StaleClaim`] when the claim was fenced out,
+    /// so a caller never reports success that PostgreSQL did not confirm.
+    pub fn finish_deletion(
+        &mut self,
+        object_id: u64,
+        fencing_token: i64,
+        outcome: crate::snapshot_ports::UploadedObjectDeletionOutcome,
+    ) -> Result<(), JanitorMetadataError> {
+        if self.postgres.finish_object_deletion(
+            object_id,
+            &self.deletion_owner,
+            fencing_token,
+            outcome,
+        )? {
+            Ok(())
+        } else {
+            Err(JanitorMetadataError::StaleClaim)
+        }
+    }
+
+    /// Requires the held lock and unchanged local state since `validate_protection`.
+    fn ensure_validated_cycle(&self) -> Result<u64, JanitorMetadataError> {
+        if !self.postgres.lock_is_held() {
+            return Err(JanitorMetadataError::UnsafeToDelete(
+                "PostgreSQL janitor lock is not held",
+            ));
+        }
+        let Some(validated_local_version) = self.validated_local_version else {
+            return Err(JanitorMetadataError::UnsafeToDelete(
+                "janitor protection was not validated",
+            ));
+        };
+        let local_version = self
+            .local
+            .get_counter(crate::pg_engine::LOCAL_PG_VERSION_COUNTER)
+            .map_err(backend_unavailable)?;
+        if local_version != validated_local_version {
+            return Err(JanitorMetadataError::UnsafeToDelete(
+                "local metadata changed during janitor cycle",
+            ));
+        }
+        Ok(local_version)
     }
 }
 

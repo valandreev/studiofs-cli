@@ -500,6 +500,24 @@ pub fn format_fragment_keys(data_prefix: &str, object_id: u64) -> [String; CLOUD
 /// Alias for generating all fragment keys for an object.
 pub use format_fragment_keys as format_object_fragment_keys;
 
+/// Returns the object ID and every canonical key (legacy plus each fragment) for
+/// `listed_key`, or `None` when it is not a canonical object key under `data_prefix`.
+pub fn canonical_object_delete_keys(
+    data_prefix: &str,
+    listed_key: &str,
+) -> Option<(u64, Vec<String>)> {
+    let object_id = parse_object_id_from_key(listed_key).ok()?;
+    let legacy_key = format_object_key(data_prefix, object_id);
+    let fragment_keys = format_fragment_keys(data_prefix, object_id);
+    if listed_key != legacy_key && !fragment_keys.iter().any(|key| key == listed_key) {
+        return None;
+    }
+    Some((
+        object_id,
+        std::iter::once(legacy_key).chain(fragment_keys).collect(),
+    ))
+}
+
 /// Validate cloud fragment shape and return reconstructed payload size.
 ///
 /// Rules:
@@ -591,6 +609,27 @@ mod tests {
             .expect("create test object buffer")
             .to_bytes()
             .to_vec()
+    }
+
+    #[test]
+    fn canonical_delete_keys_cover_legacy_and_fragments_and_reject_foreign_keys() {
+        let expected: Vec<String> = std::iter::once(format_object_key("vol/objects/", 0x1234))
+            .chain(format_fragment_keys("vol/objects/", 0x1234))
+            .collect();
+        for listed in &expected {
+            assert_eq!(
+                canonical_object_delete_keys("vol/objects/", listed),
+                Some((0x1234, expected.clone()))
+            );
+        }
+        for foreign in [
+            "vol/objects/unrelated/0000000000001234",
+            "other/objects/1234/0000000000001234",
+            "vol/objects/1234/0000000000001234/extra",
+            "vol/objects/1234/1234",
+        ] {
+            assert_eq!(canonical_object_delete_keys("vol/objects/", foreign), None);
+        }
     }
 
     #[test]

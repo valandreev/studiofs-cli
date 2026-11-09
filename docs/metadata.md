@@ -634,6 +634,19 @@ Janitor policy:
   bounded batches of at most 64 object IDs against local and PostgreSQL state.
 - missing or unknown eligibility and any metadata query error abort the current
   candidate batch before the CLI sends deletes to object storage.
+- immediately before deleting an eligible object, the CLI claims it in
+  `snapshot_payload_upload_objects` (`delete_pending`, owner, lease, fence). The
+  claim transaction first takes a share lock on the volume's `metadata_state`
+  row, which event publication updates before recording references, then
+  re-checks current references, snapshot pins, and active leases. An untracked
+  object receives a fence row in that transaction, so a later upload or
+  publication of its ID observes `delete_pending`/`deleted` and fails. A
+  protected object rolls back without ledger changes.
+- the CLI deletes only canonical keys (legacy plus every fragment) of a listed
+  canonical object key, treats `NotFound` as deleted, and counts an object as
+  deleted only after the fenced finish updates its row. A stale or expired claim
+  (`stale_claim`) or failed delete leaves a retryable row (`retry_wait` with a
+  reason, or an expiring `delete_pending` lease) for the next cycle.
 - every Snapshot v2 capture path (manual and policy) takes the matching
   exclusive transaction advisory lock in `capture_snapshot_in_transaction`
   before capturing the metadata cut or inserting its `creating` catalog row, so

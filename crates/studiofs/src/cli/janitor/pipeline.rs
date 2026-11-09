@@ -5,7 +5,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use studiofs_data::janitor::{JanitorDeleteError, JanitorEntry};
-use studiofs_data::object::{format_object_fragment_keys, parse_object_id_from_key};
+use studiofs_data::object::canonical_object_delete_keys;
+use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
 use studiofs_meta::{JanitorEligibility, MAX_JANITOR_ELIGIBILITY_BATCH};
 
 #[derive(Debug, Default)]
@@ -18,6 +19,10 @@ pub(super) struct JanitorStats {
     pub(super) skipped_cap: u64,
     pub(super) deleted: u64,
     pub(super) delete_errors: u64,
+    pub(super) skipped_non_canonical: u64,
+    pub(super) claims: u64,
+    pub(super) claim_protected: u64,
+    pub(super) claim_finishes: u64,
     pub(super) initial_listing_elapsed: Duration,
     pub(super) initial_listing_entries: u64,
     pub(super) peak_listing_entries: u64,
@@ -44,33 +49,51 @@ pub(super) trait JanitorObjectStore {
     async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError>;
 }
 
+/// One discovered object: its ID, the listed key, and every canonical key to delete.
+struct Candidate {
+    object_id: u64,
+    path: String,
+    delete_keys: Vec<String>,
+}
+
 fn discover_object(
     entry: JanitorEntry,
+    prefix: &str,
     seen_objects: &mut HashSet<u64>,
     stats: &mut JanitorStats,
-) -> Option<(u64, String)> {
+) -> Option<Candidate> {
     if !entry.is_file {
         return None;
     }
     stats.scanned_files = stats.scanned_files.saturating_add(1);
-    let object_id = parse_object_id_from_key(&entry.key).ok()?;
-    seen_objects
-        .insert(object_id)
-        .then_some((object_id, entry.key))
+    let Some((object_id, delete_keys)) = canonical_object_delete_keys(prefix, &entry.key) else {
+        stats.skipped_non_canonical = stats.skipped_non_canonical.saturating_add(1);
+        return None;
+    };
+    seen_objects.insert(object_id).then_some(Candidate {
+        object_id,
+        path: entry.key,
+        delete_keys,
+    })
 }
 
 async fn process_orphan<S: JanitorObjectStore>(
-    ctx: &JanitorCycleContext<'_, S>,
-    object_id: u64,
-    path: &str,
+    ctx: &mut JanitorCycleContext<'_, S>,
+    candidate: &Candidate,
     now: SystemTime,
     now_unix: i64,
     stats: &mut JanitorStats,
     pending_ts: Option<i64>,
-) {
+) -> anyhow::Result<()> {
+    let Candidate {
+        object_id,
+        path,
+        delete_keys,
+    } = candidate;
+    let object_id = *object_id;
     if stats.deleted >= ctx.max_deletes {
         stats.skipped_cap = stats.skipped_cap.saturating_add(1);
-        return;
+        return Ok(());
     }
 
     if let Some(pending_ts) = pending_ts {
@@ -78,11 +101,11 @@ async fn process_orphan<S: JanitorObjectStore>(
             Ok(age_secs) if age_secs >= ctx.skip_newer_than_secs => {}
             Ok(_) => {
                 stats.skipped_young = stats.skipped_young.saturating_add(1);
-                return;
+                return Ok(());
             }
             Err(_) => {
                 stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
-                return;
+                return Ok(());
             }
         }
     } else {
@@ -97,7 +120,7 @@ async fn process_orphan<S: JanitorObjectStore>(
             Ok(Some(value)) => value,
             Ok(None) | Err(_) => {
                 stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
-                return;
+                return Ok(());
             }
         };
         let age_secs = now
@@ -106,23 +129,32 @@ async fn process_orphan<S: JanitorObjectStore>(
             .as_secs();
         if age_secs < ctx.skip_newer_than_secs {
             stats.skipped_young = stats.skipped_young.saturating_add(1);
-            return;
+            return Ok(());
         }
     }
 
     if ctx.dry_run {
         stats.deleted = stats.deleted.saturating_add(1);
-        return;
+        return Ok(());
     }
 
+    // A claim failure means safety cannot be proven; stop the cycle instead of guessing.
+    let claim = tokio::task::block_in_place(|| ctx.metadata.claim_deletion(object_id))
+        .with_context(|| format!("failed to claim janitor object {object_id} for deletion"))?;
+    stats.claims = stats.claims.saturating_add(1);
+    let Some(fencing_token) = claim else {
+        stats.claim_protected = stats.claim_protected.saturating_add(1);
+        return Ok(());
+    };
+
     let mut delete_failed = false;
-    for key in format_object_fragment_keys(ctx.prefix, object_id) {
+    for key in delete_keys {
         if stats.delete_requests == 0 {
             eprintln!("janitor phase=delete started");
         }
         stats.delete_requests = stats.delete_requests.saturating_add(1);
         let delete_started = Instant::now();
-        let result = ctx.store.delete(&key).await;
+        let result = ctx.store.delete(key).await;
         stats.delete_elapsed += delete_started.elapsed();
         if let Err(error) = result {
             match error {
@@ -130,11 +162,28 @@ async fn process_orphan<S: JanitorObjectStore>(
                 JanitorDeleteError::Other(error) => {
                     delete_failed = true;
                     eprintln!(
-                        "janitor: failed to delete fragment key={} object_id={}: {}",
+                        "janitor: failed to delete object key={} object_id={}: {}",
                         key, object_id, error
                     );
                 }
             }
+        }
+    }
+    let outcome = if delete_failed {
+        UploadedObjectDeletionOutcome::Retryable
+    } else {
+        UploadedObjectDeletionOutcome::Deleted
+    };
+    // Success needs PostgreSQL confirmation; an unfinished claim expires and is retried.
+    let finish = tokio::task::block_in_place(|| {
+        ctx.metadata
+            .finish_deletion(object_id, fencing_token, outcome)
+    });
+    match finish {
+        Ok(()) => stats.claim_finishes = stats.claim_finishes.saturating_add(1),
+        Err(error) => {
+            delete_failed = true;
+            eprintln!("janitor: failed to finish deletion claim object_id={object_id}: {error:#}");
         }
     }
     if delete_failed {
@@ -142,6 +191,7 @@ async fn process_orphan<S: JanitorObjectStore>(
     } else {
         stats.deleted = stats.deleted.saturating_add(1);
     }
+    Ok(())
 }
 
 pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
@@ -176,10 +226,11 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
 
     let mut candidates = Vec::with_capacity(MAX_JANITOR_ELIGIBILITY_BATCH);
     for entry in entries {
-        let Some((object_id, path)) = discover_object(entry, &mut seen_objects, &mut stats) else {
+        let Some(candidate) = discover_object(entry, ctx.prefix, &mut seen_objects, &mut stats)
+        else {
             continue;
         };
-        candidates.push((object_id, path));
+        candidates.push(candidate);
         if candidates.len() == MAX_JANITOR_ELIGIBILITY_BATCH {
             process_candidate_batch(
                 &mut ctx,
@@ -220,30 +271,33 @@ pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
 
 async fn process_candidate_batch<S: JanitorObjectStore>(
     ctx: &mut JanitorCycleContext<'_, S>,
-    candidates: Vec<(u64, String)>,
+    candidates: Vec<Candidate>,
     now: SystemTime,
     now_unix: i64,
     cycle_started: Instant,
     stats: &mut JanitorStats,
 ) -> anyhow::Result<()> {
-    let ids: Vec<u64> = candidates.iter().map(|(id, _)| *id).collect();
+    let ids: Vec<u64> = candidates
+        .iter()
+        .map(|candidate| candidate.object_id)
+        .collect();
     // The metadata session owns a synchronous runtime; leave this worker before its block_on.
     let protection = tokio::task::block_in_place(|| ctx.metadata.check_eligibility(&ids))?;
     // Resolve every decision before any delete so one unknown outcome retains the whole batch.
     // `Some(pending_deletion)` marks an eligible orphan; `None` marks a protected object.
     let decisions = candidates
         .into_iter()
-        .map(|(object_id, path)| match protection.get(&object_id) {
-            Some(JanitorEligibility::Protected) => Ok((object_id, path, None)),
+        .map(|candidate| match protection.get(&candidate.object_id) {
+            Some(JanitorEligibility::Protected) => Ok((candidate, None)),
             Some(&JanitorEligibility::Eligible { pending_deletion }) => {
-                Ok((object_id, path, Some(pending_deletion)))
+                Ok((candidate, Some(pending_deletion)))
             }
             None | Some(JanitorEligibility::Unknown) => Err(anyhow::anyhow!(
                 "janitor eligibility is unknown; refusing to delete candidate batch"
             )),
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    for (object_id, path, orphan) in decisions {
+    for (candidate, orphan) in decisions {
         match orphan {
             None => {
                 stats.referenced_files = stats.referenced_files.saturating_add(1);
@@ -253,16 +307,7 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
                 if stats.time_to_first_candidate.is_none() {
                     stats.time_to_first_candidate = Some(cycle_started.elapsed());
                 }
-                process_orphan(
-                    ctx,
-                    object_id,
-                    &path,
-                    now,
-                    now_unix,
-                    stats,
-                    pending_deletion,
-                )
-                .await;
+                process_orphan(ctx, &candidate, now, now_unix, stats, pending_deletion).await?;
             }
         }
     }
