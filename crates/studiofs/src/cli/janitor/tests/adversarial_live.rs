@@ -189,8 +189,12 @@ fn run_child_bounded(
             break false;
         }
         if started.elapsed() >= timeout {
-            child.0.kill()?;
-            break true;
+            match child.0.kill() {
+                Ok(()) => break true,
+                // The child exited between the poll and the kill: a normal exit, not a timeout.
+                Err(_) if child.0.try_wait()?.is_some() => break false,
+                Err(error) => return Err(error.into()),
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     };
