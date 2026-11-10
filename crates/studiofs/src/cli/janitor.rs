@@ -1214,6 +1214,9 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    mod adversarial;
+    mod adversarial_live;
+
     #[test]
     fn progress_jsonl_reports_versioned_fields_and_unknown_counts() {
         let state = ProgressSnapshot {
@@ -4537,7 +4540,7 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)?
             .as_nanos();
         let name = format!("sfs976-{run_id}");
-        let uuid = format!("sfs976-{run_id}-volume");
+        let uuid = uuid::Uuid::new_v4().to_string();
         let volume = client
             .query_one(
                 "INSERT INTO volumes (name, uuid, block_size) VALUES ($1, $2, $3) RETURNING vol",

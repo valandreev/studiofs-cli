@@ -4860,6 +4860,7 @@ dependencies = [
  "sha2 0.10.9",
  "studiofs-cache",
  "studiofs-data",
+ "studiofs-e2e",
  "studiofs-linux-fuse",
  "studiofs-macfuse",
  "studiofs-meta",
