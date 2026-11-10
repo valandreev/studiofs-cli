@@ -1023,6 +1023,13 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                     "s3_throttled": transport.throttled.saturating_sub(transport_before.throttled),
                     "s3_retries": transport.retries.saturating_sub(transport_before.retries),
                     "s3_rate_limit_per_second": s3_requests_per_second,
+                    "s3_request_interval_ms": duration_ms(transport.request_interval),
+                    "first_entry_ms": stats.first_listing_entry.map(duration_ms),
+                    "first_candidate_ms": stats.time_to_first_candidate.map(duration_ms),
+                    "peak_buffered_candidates": stats.peak_buffered_candidates,
+                    "head_attempted": stats.head_requests,
+                    "delete_errors": stats.delete_errors,
+                    "head_errors": stats.head_errors,
                 })
             );
         } else {
@@ -2974,6 +2981,13 @@ mod tests {
         /// headers (`"503 Service Unavailable|Retry-After: 1"`), or `"DROP"` to close the
         /// connection without an answer.
         faults: std::sync::Mutex<std::collections::VecDeque<&'static str>>,
+        /// When nonzero, every Nth request (after queued faults) receives `periodic_fault`.
+        fault_every: AtomicU64,
+        periodic_fault: std::sync::Mutex<&'static str>,
+        requests: AtomicU64,
+        /// Listed object IDs are `n * id_stride`; 65,536 keeps keys of more than 65,535
+        /// objects in S3's lexicographic order by pinning them to one shard.
+        id_stride: AtomicU64,
     }
 
     async fn fake_s3_request(listener: tokio::net::TcpListener, fake: std::sync::Arc<FakeS3>) {
@@ -3020,7 +3034,9 @@ mod tests {
                     }
                     let start = page * 1000 + 1;
                     let end = (start + 1000).min(fake.object_count + 1);
+                    let stride = fake.id_stride.load(Ordering::Relaxed);
                     let contents = (start..end)
+                        .map(|n| n * stride)
                         .map(|id| format!(
                             "<Contents><Key>test/objects/{:04x}/{id:016x}/0</Key><LastModified>2020-01-01T00:00:00.000Z</LastModified><ETag>\"tag\"</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents>",
                             id & 0xffff
@@ -3058,7 +3074,12 @@ mod tests {
                 } else {
                     ("501 Not Implemented", String::new(), "")
                 };
-                let fault = fake.faults.lock().unwrap().pop_front();
+                let request_number = fake.requests.fetch_add(1, Ordering::Relaxed) + 1;
+                let every = fake.fault_every.load(Ordering::Relaxed);
+                let fault = fake.faults.lock().unwrap().pop_front().or_else(|| {
+                    (every != 0 && request_number.is_multiple_of(every))
+                        .then(|| *fake.periodic_fault.lock().unwrap())
+                });
                 if fault == Some("DROP") {
                     fake.active_requests.fetch_sub(1, Ordering::Relaxed);
                     return;
@@ -3142,6 +3163,10 @@ mod tests {
             peak_active_requests: AtomicU64::new(0),
             request_starts: std::sync::Mutex::new(Vec::new()),
             faults: std::sync::Mutex::default(),
+            fault_every: AtomicU64::new(0),
+            periodic_fault: std::sync::Mutex::new("503 Service Unavailable"),
+            requests: AtomicU64::new(0),
+            id_stride: AtomicU64::new(1),
         });
         let task = tokio::spawn(fake_s3_request(listener, fake.clone()));
         let op = Operator::new(
@@ -3676,6 +3701,158 @@ mod tests {
             stats.delete_requests,
             duration_ms(stats.cycle_elapsed)
         );
+    }
+
+    /// Reads a numeric SFS-979 benchmark knob from the environment.
+    fn bench_knob(key: &str, default: u64) -> u64 {
+        std::env::var(key)
+            .ok()
+            .map(|value| {
+                value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("{key} must be a u64"))
+            })
+            .unwrap_or(default)
+    }
+
+    /// Samples this process's peak RSS until the returned flag is set.
+    fn sample_peak_rss() -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<u64>,
+    ) {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let sampler = std::thread::spawn(move || {
+            let pid = sysinfo::Pid::from_u32(std::process::id());
+            let mut system = sysinfo::System::new();
+            let mut peak = 0;
+            loop {
+                system.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    sysinfo::ProcessRefreshKind::nothing().with_memory(),
+                );
+                peak = peak.max(system.process(pid).map_or(0, sysinfo::Process::memory));
+                if flag.load(Ordering::Relaxed) {
+                    return peak;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        (stop, sampler)
+    }
+
+    /// SFS-979 synthetic listing benchmark: real OpenDAL S3 client and request gate against
+    /// a loopback S3 listing, with fake metadata protecting all but every Nth object.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "SFS-979 benchmark; tune with STUDIOFS_JANITOR_SYNTHETIC_* (see docs/perf/sfs-979-janitor-benchmark.md)"]
+    async fn janitor_synthetic_listing_benchmark() {
+        let keys = bench_knob("STUDIOFS_JANITOR_SYNTHETIC_KEYS", 1_000_000);
+        let orphan_every = bench_knob("STUDIOFS_JANITOR_SYNTHETIC_ORPHAN_EVERY", 1_000).max(1);
+        let fault_every = bench_knob("STUDIOFS_JANITOR_SYNTHETIC_FAULT_EVERY", 0);
+        let rps = u32::try_from(bench_knob("STUDIOFS_JANITOR_SYNTHETIC_RPS", 32)).unwrap();
+        let stride = 1 << 16;
+        let (_op, fake, endpoint, server) = fake_s3_operator(keys).await;
+        fake.id_stride.store(stride, Ordering::Relaxed);
+        fake.fault_every.store(fault_every, Ordering::Relaxed);
+        if std::env::var("STUDIOFS_JANITOR_SYNTHETIC_FAULT").as_deref() == Ok("429") {
+            *fake.periodic_fault.lock().unwrap() = "429 Too Many Requests";
+        }
+        let store = OpenDalJanitorStore(
+            studiofs_data::janitor::JanitorObjectStore::from_s3(
+                &endpoint,
+                "test",
+                "test",
+                "test",
+                "us-east-1",
+                rps,
+            )
+            .unwrap(),
+        );
+        let mut metadata = FakeJanitorMetadata {
+            lock_acquired: true,
+            default_eligibility: Some(JanitorEligibility::Protected),
+            outcomes: (orphan_every..=keys)
+                .step_by(usize::try_from(orphan_every).unwrap())
+                .map(|n| {
+                    (
+                        n * stride,
+                        JanitorEligibility::Eligible {
+                            pending_deletion: None,
+                        },
+                    )
+                })
+                .collect(),
+            ..FakeJanitorMetadata::default()
+        };
+        let orphans = keys / orphan_every;
+        let rss_before = {
+            let (stop, sampler) = sample_peak_rss();
+            stop.store(true, Ordering::Relaxed);
+            sampler.join().unwrap()
+        };
+        let (stop, sampler) = sample_peak_rss();
+        let started = Instant::now();
+        let stats = run_one_cycle(JanitorCycleContext {
+            store: &store,
+            prefix: "test/objects/",
+            dry_run: false,
+            skip_newer_than_secs: 60,
+            budget: RunBudget::deletes(u64::MAX),
+            metadata: &mut metadata,
+        })
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        let rss_peak = sampler.join().unwrap();
+        server.abort();
+        let _ = server.await;
+        let transport = store.0.transport_stats();
+        // The fake records every eligibility ID it is asked about; that is fixture memory.
+        let fixture_bytes: usize = metadata
+            .eligibility_reads
+            .iter()
+            .map(|ids| ids.capacity() * 8 + 24)
+            .sum();
+
+        let report = serde_json::json!({
+            "label": "synthetic",
+            "keys": keys,
+            "orphans": orphans,
+            "s3_requests_per_second": rps,
+            "fault_every": fault_every,
+            "outcome": stats.outcome.label(),
+            "scanned": stats.scanned_files,
+            "deleted": stats.deleted,
+            "elapsed_ms": duration_ms(elapsed),
+            "first_candidate_ms": stats.time_to_first_candidate.map(duration_ms),
+            "delete_rate_per_second": stats.deleted as f64 / elapsed.as_secs_f64(),
+            "list_requests": fake.list_requests.load(Ordering::Relaxed),
+            "delete_requests": fake.delete_requests.load(Ordering::Relaxed),
+            "head_requests": fake.head_requests.load(Ordering::Relaxed),
+            "peak_s3_in_flight": fake.peak_active_requests.load(Ordering::Relaxed),
+            "peak_buffered_candidates": stats.peak_buffered_candidates,
+            "s3_throttled": transport.throttled,
+            "s3_retries": transport.retries,
+            "rss_before_mib": rss_before / (1 << 20),
+            "rss_peak_mib": rss_peak / (1 << 20),
+            "fixture_retained_mib": fixture_bytes / (1 << 20),
+        });
+        let dir = studiofs_test_support::workspace_root().join("target/janitor-benchmark");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("synthetic-{keys}-fault{fault_every}.json")),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        println!("janitor synthetic benchmark: {report}");
+
+        assert_eq!(stats.outcome, pipeline::CycleOutcome::Complete);
+        assert_eq!(stats.scanned_files, keys);
+        assert_eq!(stats.deleted, orphans);
+        assert!(stats.peak_buffered_candidates <= MAX_JANITOR_ELIGIBILITY_BATCH as u64);
+        assert_eq!(fake.peak_active_requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -4,7 +4,7 @@
 
 The CLI emits a readable progress line every five seconds, beginning before the first local metadata open. It reports the active phase and its elapsed time. Counts are `unknown` until work updates them; while a blocking provider call is pending they represent completed work and attempted calls, not a fabricated completion. Phase values include `metadata_open`, `storage_setup`, `waiting_for_cycle`, `global_lock`, `protection`, `metadata_eligibility`, `listing`, `head`, `metadata_claim`, `delete`, `metadata_finish`, `object_scan`, and `cycle_summary`.
 
-Pass `--output jsonl` to emit newline-delimited JSON events (`--output text` is the default). Each event has `schema_version: 1` and an `event` field. `progress` events contain `phase`, `phase_elapsed_ms`, `scanned`, `listed_entries`, `orphan_candidates`, `protected`, `skipped_young`, `skipped_unknown`, `head_attempted`, `delete_attempted`, `delete_confirmed`, `would_delete`, `retryable_queue_depth`, `s3_rate_limit_per_second`, `s3_in_flight`, and `pg_in_flight`. `cycle` events report `outcome`, `partial`, `coverage`, `scanned`, `listed_entries`, `protected`, `orphan_candidates`, skip counts, delete attempted/confirmed/would-delete counts, nullable retryable queue depth, phase timings, S3 throttle/retry counts, and configured S3 rate limit. Exactly one final `summary` event reports `outcome`, `coverage`, and `exit_code`; backend/unsafe/partial/lock-busy summaries also include a safe `message`. Null means unobservable: in-flight requests, retryable queue depth, and actual request throughput are not exposed by current interfaces. `s3_rate_limit_per_second` is the configured cap, not measured throughput. S3 attempt counters are logical OpenDAL calls, not underlying HTTP retries. Listing page count is unavailable.
+Pass `--output jsonl` to emit newline-delimited JSON events (`--output text` is the default). Each event has `schema_version: 1` and an `event` field. `progress` events contain `phase`, `phase_elapsed_ms`, `scanned`, `listed_entries`, `orphan_candidates`, `protected`, `skipped_young`, `skipped_unknown`, `head_attempted`, `delete_attempted`, `delete_confirmed`, `would_delete`, `retryable_queue_depth`, `s3_rate_limit_per_second`, `s3_in_flight`, and `pg_in_flight`. `cycle` events report `outcome`, `partial`, `coverage`, `scanned`, `listed_entries`, `protected`, `orphan_candidates`, skip counts, delete attempted/confirmed/would-delete counts, nullable retryable queue depth, phase timings, S3 throttle/retry counts, configured S3 rate limit and current `s3_request_interval_ms`, nullable `first_entry_ms` and `first_candidate_ms`, `peak_buffered_candidates`, `head_attempted`, `delete_errors`, and `head_errors`. Exactly one final `summary` event reports `outcome`, `coverage`, and `exit_code`; backend/unsafe/partial/lock-busy summaries also include a safe `message`. Null means unobservable: in-flight requests, retryable queue depth, and actual request throughput are not exposed by current interfaces. `s3_rate_limit_per_second` is the configured cap, not measured throughput. S3 attempt counters are logical OpenDAL calls, not underlying HTTP retries. Listing page count is unavailable.
 
 The process exit codes are 0 for complete success, 2 for partial budget/cancellation/retryable work, 3 when the single cycle cannot acquire the global lock, 4 when metadata safety cannot be established, and 5 for backend failures. JSONL summaries include the matching `exit_code`.
 
@@ -36,14 +36,9 @@ Each listing request, including the first, is bounded by a 60-second timeout. A 
 
 From the repository root on Windows, run:
 
-    cargo test -p studiofs --bin studiofs janitor_streaming_listing_processes_first_page_before_later_pages -- --nocapture
+    cargo test -p studiofs --bin studiofs janitor_delete_cap_stops_opendal_listing_after_first_page -- --nocapture
 
-The fixture serves 20,005 old object keys in 21 1,000-key S3 pages through the real OpenDAL S3 operator on a loopback server, with `max_deletes=2`. Expected stable counts:
-
-- The first DELETE request is sent after only the first list page was fetched.
-- 20,005 entries are listed and scanned; peak buffered candidates are 64.
-- No HEAD requests are sent, because every listed key carries `LastModified`; two objects are deleted (one request per canonical key).
-- The remaining 20,003 candidates are skipped by the cap. The cap does not yet stop the listing early.
+The fixture serves 20,005 old object keys in 21 1,000-key S3 pages through the real OpenDAL S3 operator on a loopback server, with `max_deletes=2`. Reaching the cap in the first eligibility batch ends the cycle, so only the first page is requested; peak buffered candidates are 64, no HEAD is sent because every listed key carries `LastModified`, and two objects are deleted (one request per canonical key).
 
 `janitor_stalled_opendal_page_times_out_after_first_page_was_processed` uses the same loopback S3 with a second page that never arrives. The first page's 15 full batches are evaluated before the timeout ends the cycle.
 
@@ -74,3 +69,7 @@ S3 operators advertising `start_after` resume after the last listed key. An unfi
 Checkpoints bind the volume UUID, endpoint, bucket, normalized data prefix, and listing strategy. A supported scope change starts at the beginning. Missing tables, malformed state, and unknown checkpoint versions fail closed; an older binary cannot reset or overwrite a newer version.
 
 Schema deployment must include the repeatable canonical DDL in `studiofs-meta/src/pg_engine/schema.rs`, including `snapshot_payload_sweep_checkpoints`, before running the command. The CLI performs no runtime DDL. Coordinate this schema ensure step with the shared schema rollout; do not introduce a second migration runner. The checkpoint schema version is independent of the volume format version.
+
+## Large-volume benchmark (SFS-979)
+
+The measured 1K/100K live and 1M synthetic matrix, the reasons for keeping the current defaults, and the reproduction commands are in `docs/perf/sfs-979-janitor-benchmark.md`. In short, memory stays flat and S3 and PostgreSQL load stay bounded. Throughput is limited by PostgreSQL round-trip time (SFS-1064).
