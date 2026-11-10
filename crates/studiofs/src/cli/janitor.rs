@@ -3441,6 +3441,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s3_sustained_multi_delete_throttle_fails_the_batch_without_single_deletes() {
+        let (_op, fake, endpoint, server) = fake_s3_operator(0).await;
+        fake.faults.lock().unwrap().extend(
+            ["503 Service Unavailable"; studiofs_data::janitor::JANITOR_S3_MAX_RETRIES + 1],
+        );
+        let store = fault_store(&endpoint);
+        let keys = vec![FAULT_KEY.to_owned(), format!("{FAULT_KEY}-other")];
+
+        let results = store.delete_batch(&keys).await;
+        server.abort();
+        let _ = server.await;
+
+        // Every key stays retryable, and no per-key DELETE multiplies the overload.
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Err(JanitorDeleteError::Other(_)))),
+            "{results:?}"
+        );
+        assert_eq!(
+            fake.multi_delete_requests.load(Ordering::Relaxed),
+            studiofs_data::janitor::JANITOR_S3_MAX_RETRIES as u64 + 1
+        );
+        assert_eq!(fake.delete_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn s3_throttle_honors_retry_after_and_slows_the_request_gate() {
         let (_op, fake, endpoint, server) = fake_s3_operator(0).await;
         fake.faults.lock().unwrap().extend([

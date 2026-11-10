@@ -35,7 +35,7 @@ Implementation and focused regression validation are complete. The 1,000-key/500
 
 ## Plan of Work
 
-Add `delete_batch(&[String])` returning per-key results in input order. Use OpenDAL's capability limit, capped at 1,000 keys. Keep HTTP retries and adaptive pacing at the existing transport boundary. Bound adapter recovery to 35 seconds, leaving margin below the pipeline's 40-second batch timeout and 60-second claim lease. After batch failures use bounded single-key confirmation; on unsupported batch requests remember the paced single-DELETE fallback. Bound confirmations by the shared deadline and leave unconfirmed keys retryable.
+Add `delete_batch(&[String])` returning per-key results in input order. Use OpenDAL's capability limit, capped at 1,000 keys. Keep HTTP retries and adaptive pacing at the existing transport boundary. Bound adapter recovery to 35 seconds, leaving margin below the pipeline's 40-second batch timeout and 60-second claim lease. After non-throttle batch failures use bounded single-key confirmation; a throttled batch failure leaves every key retryable without single deletes; on unsupported batch requests remember the paced single-DELETE fallback. Bound confirmations by the shared deadline and leave unconfirmed keys retryable.
 
 Replace per-object remote calls with one call for the admitted claimed batch; map every key result back to its candidate. Preserve protected objects, terminal errors, overload accounting, queue deferral and PostgreSQL confirmation. Update loopback S3 to respond to DeleteObjects XML and verify the actual HTTP request count and key membership. Update cancellation expectations to drain the submitted batch.
 
@@ -75,3 +75,5 @@ Revision 2026-11-10: recorded passing focused regression results and user-select
 Revision 2026-11-10: user authorized the empty B2 bucket configured in `.env`; preparing the isolated smoke without PostgreSQL mutations.
 
 Revision 2026-11-10: recorded successful authorized Backblaze B2 smoke and exact-version cleanup; only Docker-dependent live acceptance remains pending.
+
+Revision 2026-11-10: separate review found that a batch exhausting its retries under 429/503 fell back to one DELETE per key, multiplying overload. A throttled batch failure now leaves every key retryable without single deletes; `s3_sustained_multi_delete_throttle_fails_the_batch_without_single_deletes` covers it (red before the fix). Per-key failure classes in the pipeline now use `JanitorFailureClass` instead of strings.

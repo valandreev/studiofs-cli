@@ -241,6 +241,7 @@ impl JanitorObjectStore {
         let mut outcomes = Vec::with_capacity(keys.len());
         for chunk in keys.chunks(capacity.clamp(1, 1000)) {
             if chunk.len() > 1 && !self.transport.batch_unsupported.load(Ordering::Relaxed) {
+                let throttled_before = self.transport.throttled.load(Ordering::Relaxed);
                 let attempt = async {
                     let mut deleter = self.operator.deleter().await?;
                     deleter.delete_iter(chunk.iter().cloned()).await?;
@@ -260,6 +261,21 @@ impl JanitorObjectStore {
                         self.transport
                             .batch_unsupported
                             .store(true, Ordering::Relaxed);
+                    }
+                    // A batch that exhausted its retries under 429/503 stays retryable as a whole:
+                    // confirming each key would multiply the load the overload breaker sheds.
+                    Ok(Err(error))
+                        if error.kind() == ErrorKind::RateLimited
+                            || self.transport.throttled.load(Ordering::Relaxed)
+                                != throttled_before =>
+                    {
+                        let message = error.to_string();
+                        outcomes.extend(
+                            chunk
+                                .iter()
+                                .map(|_| Err(JanitorDeleteError::Other(message.clone()))),
+                        );
+                        continue;
                     }
                     Err(_) => {
                         outcomes.extend(chunk.iter().map(|_| {

@@ -599,7 +599,7 @@ async fn delete_orphans<S: JanitorObjectStore>(
             let mut start = 0;
             for (candidate, token) in &attempted {
                 let end = start + candidate.delete_keys.len();
-                let mut failure: Option<(&str, &str, &str)> = None;
+                let mut failure: Option<(JanitorFailureClass, &str, &str)> = None;
                 for (key, result) in candidate
                     .delete_keys
                     .iter()
@@ -608,10 +608,14 @@ async fn delete_orphans<S: JanitorObjectStore>(
                     match result {
                         Ok(()) | Err(JanitorDeleteError::NotFound) => {}
                         Err(JanitorDeleteError::Other(error)) => {
-                            failure.get_or_insert(("transient", key, error.as_str()));
+                            failure.get_or_insert((
+                                JanitorFailureClass::Transient,
+                                key,
+                                error.as_str(),
+                            ));
                         }
                         Err(JanitorDeleteError::Terminal(error)) => {
-                            failure = Some(("terminal", key, error.as_str()));
+                            failure = Some((JanitorFailureClass::Terminal, key, error.as_str()));
                             break;
                         }
                     }
@@ -619,7 +623,7 @@ async fn delete_orphans<S: JanitorObjectStore>(
                 // A malformed adapter result must never turn an unreported key into success.
                 if failure.is_none() && results.len() < end {
                     failure = Some((
-                        "transient",
+                        JanitorFailureClass::Transient,
                         "<missing batch result>",
                         "batch result count mismatch",
                     ));
@@ -627,13 +631,18 @@ async fn delete_orphans<S: JanitorObjectStore>(
                 let s3_delete_failed = failure.is_some();
                 let terminal_failure = failure
                     .as_ref()
-                    .is_some_and(|(class, _, _)| *class == "terminal");
+                    .is_some_and(|(class, _, _)| *class == JanitorFailureClass::Terminal);
                 if let Some((class, key, error)) = failure {
+                    let label = if terminal_failure {
+                        "terminal"
+                    } else {
+                        "transient"
+                    };
                     eprintln!(
-                        "janitor: failed to delete object class={class} key={key} object_id={}: {error}",
+                        "janitor: failed to delete object class={label} key={key} object_id={}: {error}",
                         candidate.object_id
                     );
-                    if class == "terminal" && terminal.is_none() {
+                    if class == JanitorFailureClass::Terminal && terminal.is_none() {
                         terminal = Some((candidate.object_id, error.to_owned()));
                     }
                 }
