@@ -10,12 +10,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn knob<T: std::str::FromStr>(key: &str, default: T) -> anyhow::Result<T> {
+fn knob<T: std::str::FromStr>(key: &str, default: T) -> anyhow::Result<T>
+where
+    T::Err: std::fmt::Display,
+{
     match std::env::var(key) {
         Ok(value) if !value.trim().is_empty() => value
             .trim()
             .parse()
-            .map_err(|_| anyhow::anyhow!("{key} has an invalid value")),
+            .map_err(|error| anyhow::anyhow!("{key} has an invalid value: {error}")),
         _ => Ok(default),
     }
 }
@@ -145,16 +148,29 @@ struct Samples {
     peak_pg_memory_mib: f64,
 }
 
+/// Parses a `docker stats` memory figure, which uses binary units, into MiB.
 fn parse_mib(value: &str) -> Option<f64> {
     let value = value.trim();
     let split = value.find(|c: char| c.is_ascii_alphabetic())?;
     let number: f64 = value[..split].parse().ok()?;
-    Some(match &value[split..] {
-        "GiB" | "GB" => number * 1024.0,
-        "KiB" | "kB" => number / 1024.0,
-        "B" => number / (1024.0 * 1024.0),
-        _ => number,
-    })
+    let scale = match &value[split..] {
+        "B" => 1.0 / (1024.0 * 1024.0),
+        "KiB" => 1.0 / 1024.0,
+        "MiB" => 1.0,
+        "GiB" => 1024.0,
+        _ => return None,
+    };
+    Some(number * scale)
+}
+
+#[test]
+fn parse_mib_reads_docker_binary_units_and_rejects_others() {
+    assert_eq!(parse_mib("78.45MiB"), Some(78.45));
+    assert_eq!(parse_mib(" 2GiB "), Some(2048.0));
+    assert_eq!(parse_mib("512KiB"), Some(0.5));
+    assert_eq!(parse_mib("1048576B"), Some(1.0));
+    assert_eq!(parse_mib("12kB"), None);
+    assert_eq!(parse_mib("12"), None);
 }
 
 /// Runs a CLI child to completion while sampling its RSS and the PostgreSQL container.
@@ -307,6 +323,10 @@ fn percentile(values: &[u64], percent: usize) -> Option<u64> {
 #[ignore = "SFS-979 benchmark; requires Docker and a release CLI (see docs/perf/sfs-979-janitor-benchmark.md)"]
 async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
     let objects: u64 = knob("STUDIOFS_JANITOR_BENCH_OBJECTS", 1_000)?;
+    anyhow::ensure!(
+        objects > 0,
+        "STUDIOFS_JANITOR_BENCH_OBJECTS must be at least 1"
+    );
     let orphan_percent: u64 = knob("STUDIOFS_JANITOR_BENCH_ORPHAN_PERCENT", 50)?;
     let pg_latency_ms: u64 = knob("STUDIOFS_JANITOR_BENCH_PG_LATENCY_MS", 100)?;
     let s3_latency_ms: u64 = knob("STUDIOFS_JANITOR_BENCH_S3_LATENCY_MS", 20)?;
