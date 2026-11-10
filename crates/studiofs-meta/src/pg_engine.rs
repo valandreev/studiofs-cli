@@ -1207,6 +1207,8 @@ impl PgMetaEngine {
                                     ('snapshot_payload_upload_fragments'::TEXT),
                                     ('snapshot_payload_reconcile_cursors'::TEXT),
                                     ('snapshot_payload_upload_watermarks'::TEXT),
+                                    ('snapshot_payload_gc_candidates'::TEXT),
+                                    ('snapshot_payload_sweep_checkpoints'::TEXT),
                                     ('snapshot_artifacts'::TEXT),
                                     ('snapshot_artifact_payload_proofs'::TEXT),
                                     ('snapshot_artifact_attempts'::TEXT)

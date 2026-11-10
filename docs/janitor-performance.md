@@ -14,7 +14,7 @@ Text mode remains suitable for redirected output and terminals on Windows. JSONL
 
 ## Independent request budgets (SFS-974)
 
-The command accepts `--pg-concurrency` (default 1, range 1–8), `--s3-concurrency` (default 2, range 1–32), and `--s3-requests-per-second` (default 4, range 1–32). The PG pipeline currently issues claim and finish commands serially, so its observed peak is one even when the configured upper bound is higher. S3 concurrency is enforced by OpenDAL's HTTP request layer and includes LIST pagination, stat/HEAD, and each canonical fragment DELETE. Request starts are paced at that same transport boundary.
+The command accepts `--s3-requests-per-second` (default 4, range 1–32). The pipeline issues PostgreSQL commands and S3 requests one at a time, so the earlier `--pg-concurrency` and `--s3-concurrency` options had no effect and were removed. Request starts (LIST pagination, stat/HEAD, each canonical fragment DELETE) are paced at OpenDAL's HTTP request layer.
 
 The provider-neutral pipeline admits no more than one candidate at a time for destructive claim/delete/finish and buffers at most one eligibility page (64 candidates); the rate and transport limits therefore remain effective if provider internals add parallel requests later. Existing deadlines bound listing to 60 seconds and stat/HEAD and DELETE to 20 seconds; PostgreSQL janitor commands use the metadata session's command timeout. These are per-process budgets, not cluster-wide coordination. The mounted VFS janitor is unchanged.
 
@@ -67,9 +67,9 @@ The command prints phase-start messages before blocking metadata, lock, protecti
 
 The CLI persists scan progress in PostgreSQL under its per-volume janitor lock. Repeated `studiofs janitor <volume> --max-scan-entries 10000` invocations continue the prior scan. Output includes the next scan position and whether coverage completed; reaching the end wraps to the beginning so newly inserted keys behind the cursor are revisited.
 
-S3 operators advertising `start_after` resume after the last listed key. An unfinished object group is retained in the checkpoint and all its canonical keys are statted again before deciding age. Other operators use deterministic hexadecimal prefix subdivision; a dense prefix is split down to one object ID, then its bounded canonical key set is statted before advancing. Entry budgets count listing entries, while age probes retain their separate bounded operation deadlines.
+S3 operators advertising `start_after` resume after the last listed key. An unfinished object group is retained in the checkpoint and all its canonical keys are statted again before deciding age. The position is saved after every completed eligibility batch, so a failed cycle resumes there. A provider that ignores `start_after` is rejected by the listing order check; the earlier hexadecimal prefix fallback was unreachable with the S3 service and was removed. Entry budgets count listing entries, while age probes retain their separate bounded operation deadlines.
 
-`--full-scan` ignores the saved position for the first cycle and saves new progress if bounded. `--reset-scan` clears the saved position before that first cycle. These flags conflict; with `--loop` they apply once, and subsequent cycles resume. `--dry-run` reads progress and applies either flag only in memory: it never saves or resets checkpoints.
+`--full-scan` ignores the saved position for the first cycle and saves new progress; with `--loop` it applies once, and subsequent cycles resume. `--dry-run` reads progress and applies the flag only in memory: it never saves checkpoints.
 
 Checkpoints bind the volume UUID, endpoint, bucket, normalized data prefix, and listing strategy. A supported scope change starts at the beginning. Missing tables, malformed state, and unknown checkpoint versions fail closed; an older binary cannot reset or overwrite a newer version.
 

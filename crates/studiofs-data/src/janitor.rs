@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use futures::TryStreamExt as _;
-use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer, RetryInterceptor, RetryLayer};
+use opendal::layers::{HttpClientLayer, RetryInterceptor, RetryLayer};
 use opendal::raw::{HttpBody, HttpClient, HttpFetch};
 use opendal::services::S3;
 use opendal::{Buffer, EntryMode, ErrorKind, Operator, Result};
@@ -122,13 +122,12 @@ impl JanitorObjectStore {
         access_key_id: &str,
         secret_access_key: &str,
         region: &str,
-        max_in_flight: usize,
         requests_per_second: u32,
     ) -> Result<Self> {
-        if !(1..=32).contains(&max_in_flight) || !(1..=32).contains(&requests_per_second) {
+        if !(1..=32).contains(&requests_per_second) {
             return Err(opendal::Error::new(
                 ErrorKind::ConfigInvalid,
-                "janitor S3 request limits must be between 1 and 32",
+                "janitor S3 request rate must be between 1 and 32 per second",
             ));
         }
         let transport = Arc::<TransportCounters>::default();
@@ -161,12 +160,7 @@ impl JanitorObjectStore {
                 .disable_ec2_metadata(),
         )?
         .layer(HttpClientLayer::new(HttpClient::with(request_rate)))
-        .layer(
-            // A listing handle can stay open while candidate HEAD/DELETE work proceeds.
-            ConcurrentLimitLayer::new(studiofs_meta::MAX_JANITOR_ELIGIBILITY_BATCH + 1)
-                .with_http_concurrent_limit(max_in_flight),
-        )
-        // Outermost, so every retry attempt passes the request gate and in-flight limit again.
+        // Outermost, so every retry attempt passes the request gate again.
         // The janitor issues only idempotent requests: LIST pages, HEAD and DELETE.
         .layer(
             RetryLayer::new()
@@ -183,11 +177,6 @@ impl JanitorObjectStore {
         })
     }
 
-    /// Whether this provider can resume its listing after one key.
-    pub fn supports_start_after(&self) -> bool {
-        self.operator.info().full_capability().list_with_start_after
-    }
-
     /// Start a lazy recursive listing below `prefix`.
     pub async fn list(&self, prefix: &str) -> Result<JanitorLister> {
         self.list_after(prefix, None).await
@@ -197,12 +186,6 @@ impl JanitorObjectStore {
     pub async fn list_after(&self, prefix: &str, after_key: Option<&str>) -> Result<JanitorLister> {
         let mut lister = self.operator.lister_with(prefix);
         if let Some(after_key) = after_key {
-            if !self.supports_start_after() {
-                return Err(opendal::Error::new(
-                    ErrorKind::Unsupported,
-                    "provider cannot resume listings after a key",
-                ));
-            }
             lister = lister.start_after(after_key);
         }
         Ok(JanitorLister(lister.recursive(true).await?))
@@ -379,7 +362,6 @@ mod tests {
             "test",
             "test",
             "us-east-1",
-            2,
             4,
         )
         .unwrap();
