@@ -127,7 +127,11 @@ impl DisposableStack {
             binary.is_file(),
             "build the studiofs CLI binary before this ignored test"
         );
+        Ok(Self::command_for(&binary, args, client_root))
+    }
 
+    /// A sanitized CLI command for `binary` with its client root set to `client_root`.
+    fn command_for(binary: &Path, args: &[String], client_root: &Path) -> Command {
         let mut command = Command::new(binary);
         command.args(args).env_clear();
         for key in [
@@ -148,7 +152,7 @@ impl DisposableStack {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        Ok(command)
+        command
     }
 }
 
@@ -608,4 +612,5 @@ async fn janitor_ownership(
     Ok((acknowledged, owners))
 }
 
+mod benchmark;
 mod process;
