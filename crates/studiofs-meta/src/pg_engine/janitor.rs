@@ -1,13 +1,16 @@
 use super::{PgMetaEngine, PgTimeoutContext};
 use crate::engine::{MetaError, MetaResult};
-use crate::janitor::{JanitorMetadataError, JanitorSweepCheckpoint, JanitorSweepScope};
+use crate::janitor::{
+    JanitorDeletionSettlement, JanitorMetadataError, JanitorSweepCheckpoint, JanitorSweepScope,
+};
 use crate::pg_transport::connect_studiofs_postgres;
 use crate::schema::FormatInfo;
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
-use tokio_postgres::Client;
+use tokio_postgres::{Client, Statement};
 
 const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
 
@@ -35,6 +38,11 @@ pub(super) const SNAPSHOT_PIN_QUERY: &str = "SELECT DISTINCT reachability.object
           )
       )";
 
+/// [`SNAPSHOT_PIN_QUERY`] restricted to the object IDs in `$2`.
+static BATCH_PIN_QUERY: LazyLock<String> = LazyLock::new(|| {
+    format!("{SNAPSHOT_PIN_QUERY} AND reachability.object_id = ANY($2::BIGINT[])")
+});
+
 pub(crate) struct PgJanitorSession {
     postgres_url: String,
     volume_id: i64,
@@ -43,6 +51,28 @@ pub(crate) struct PgJanitorSession {
     runtime: Option<Runtime>,
     client: Option<Client>,
     connection_task: Option<JoinHandle<()>>,
+    /// Statements prepared on `client`, keyed by SQL; cleared with the connection.
+    statements: HashMap<String, Statement>,
+}
+
+/// Prepares the statements this connection has not prepared yet, all in one
+/// pipelined round trip. A prepared statement then costs one round trip per use,
+/// and statements sent together without awaiting share a single round trip.
+async fn prepare_statements<const N: usize>(
+    client: &Client,
+    cache: &mut HashMap<String, Statement>,
+    sql: [&str; N],
+) -> Result<[Statement; N], JanitorMetadataError> {
+    let missing: Vec<&str> = sql
+        .iter()
+        .copied()
+        .filter(|sql| !cache.contains_key(*sql))
+        .collect();
+    let prepared = futures::future::try_join_all(missing.iter().map(|sql| client.prepare(sql)))
+        .await
+        .map_err(|error| janitor_pg_error("janitor statement prepare failed", error))?;
+    cache.extend(missing.into_iter().map(str::to_owned).zip(prepared));
+    Ok(sql.map(|sql| cache[sql].clone()))
 }
 
 pub(crate) struct PgJanitorProtection {
@@ -51,7 +81,7 @@ pub(crate) struct PgJanitorProtection {
     pub(crate) gc_candidates: HashMap<u64, (i64, bool)>,
 }
 
-pub(crate) const PG_JANITOR_CANDIDATE_PAGE_SIZE: usize = 64;
+pub(crate) const PG_JANITOR_CANDIDATE_PAGE_SIZE: usize = crate::MAX_JANITOR_ELIGIBILITY_BATCH;
 
 fn canonical_sweep_object_id(prefix: &str, key: &str) -> Option<u64> {
     let suffix = key.strip_prefix(prefix)?;
@@ -130,6 +160,7 @@ fn validate_sweep_checkpoint(
 
 async fn persist_sweep_checkpoint(
     client: &Client,
+    statements: &mut HashMap<String, Statement>,
     volume_id: i64,
     scope: &JanitorSweepScope<'_>,
     checkpoint: &JanitorSweepCheckpoint,
@@ -142,9 +173,13 @@ async fn persist_sweep_checkpoint(
         .map_err(|_| {
             JanitorMetadataError::UnsafeToDelete("janitor sweep checkpoint object id is invalid")
         })?;
+    let [statement] = prepare_statements(client, statements, [
+            "INSERT INTO snapshot_payload_sweep_checkpoints (vol, schema_version, volume_uuid, endpoint, bucket, data_prefix, listing_strategy, after_key, pending_object_id, pending_key) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (vol) DO UPDATE SET schema_version = EXCLUDED.schema_version, volume_uuid = EXCLUDED.volume_uuid, endpoint = EXCLUDED.endpoint, bucket = EXCLUDED.bucket, data_prefix = EXCLUDED.data_prefix, listing_strategy = EXCLUDED.listing_strategy, after_key = EXCLUDED.after_key, pending_object_id = EXCLUDED.pending_object_id, pending_key = EXCLUDED.pending_key WHERE snapshot_payload_sweep_checkpoints.schema_version = 1",
+    ])
+    .await?;
     let affected = client
         .execute(
-            "INSERT INTO snapshot_payload_sweep_checkpoints (vol, schema_version, volume_uuid, endpoint, bucket, data_prefix, listing_strategy, after_key, pending_object_id, pending_key) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (vol) DO UPDATE SET schema_version = EXCLUDED.schema_version, volume_uuid = EXCLUDED.volume_uuid, endpoint = EXCLUDED.endpoint, bucket = EXCLUDED.bucket, data_prefix = EXCLUDED.data_prefix, listing_strategy = EXCLUDED.listing_strategy, after_key = EXCLUDED.after_key, pending_object_id = EXCLUDED.pending_object_id, pending_key = EXCLUDED.pending_key WHERE snapshot_payload_sweep_checkpoints.schema_version = 1",
+            &statement,
             &[
                 &volume_id,
                 &scope.volume_uuid,
@@ -177,6 +212,7 @@ impl PgJanitorSession {
             runtime: None,
             client: None,
             connection_task: None,
+            statements: HashMap::new(),
         }
     }
 
@@ -194,6 +230,7 @@ impl PgJanitorSession {
                 "PostgreSQL janitor lock is not held",
             ));
         };
+        let statements = &mut self.statements;
         let volume_id = self.volume_id;
         let timeout = self.command_timeout;
         let result = runtime.block_on(async {
@@ -245,7 +282,8 @@ impl PgJanitorSession {
                 // No row, or one saved for another storage scope: the sweep starts over.
                 let checkpoint = JanitorSweepCheckpoint::default();
                 if persist_initial {
-                    persist_sweep_checkpoint(client, volume_id, &scope, &checkpoint).await?;
+                    persist_sweep_checkpoint(client, statements, volume_id, &scope, &checkpoint)
+                        .await?;
                 }
                 Ok(checkpoint)
             })
@@ -264,13 +302,14 @@ impl PgJanitorSession {
                 "PostgreSQL janitor lock is not held",
             ));
         };
+        let statements = &mut self.statements;
         let timeout = self.command_timeout;
         let volume_id = self.volume_id;
         runtime
             .block_on(async {
                 tokio::time::timeout(
                     timeout,
-                    persist_sweep_checkpoint(client, volume_id, &scope, checkpoint),
+                    persist_sweep_checkpoint(client, statements, volume_id, &scope, checkpoint),
                 )
                 .await
             })
@@ -383,6 +422,7 @@ impl PgJanitorSession {
     }
 
     fn close_connection(&mut self) {
+        self.statements.clear();
         drop(self.client.take());
         if let Some(task) = self.connection_task.take() {
             task.abort();
@@ -416,24 +456,37 @@ impl PgJanitorSession {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let statements = &mut self.statements;
+        let client = &*client;
         let result = runtime.block_on(async {
             tokio::time::timeout(command_timeout, async {
-                let transaction = client.transaction().await.map_err(|error| {
-                    janitor_pg_error("janitor metadata transaction failed", error)
-                })?;
-                transaction
-                    .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-                    .await
-                    .map_err(|error| {
-                        janitor_pg_error("janitor read-only transaction failed", error)
-                    })?;
-
-                let row = transaction
-                    .query_opt(
+                let [identity, bootstrap, references, pins, leases, candidates] =
+                    prepare_statements(client, statements, [
                         "SELECT volumes.uuid, metadata_state.version, metadata_state.metadata_format_version, metadata_state.format_info, metadata_state.checkpoint_publication_state, metadata_state.checkpoint_generation FROM volumes INNER JOIN metadata_state ON metadata_state.vol = volumes.vol WHERE volumes.vol = $1",
-                        &[&volume_id],
-                    )
-                    .await
+                        "SELECT initialized_version FROM snapshot_reachability_bootstrap WHERE vol = $1",
+                        "SELECT DISTINCT object_id FROM snapshot_current_references WHERE vol = $1 AND object_id = ANY($2::BIGINT[])",
+                        &BATCH_PIN_QUERY,
+                        "SELECT DISTINCT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) AND (state IN ('uploading', 'uploaded', 'retry_wait') OR (reconcile_owner IS NOT NULL AND reconcile_lease_expires_at > clock_timestamp()))",
+                        "SELECT object_id, floor(extract(epoch FROM eligible_at))::BIGINT, (extract(epoch FROM eligible_at) <= $3::BIGINT AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp())) FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) AND acknowledged_at IS NULL",
+                    ])
+                    .await?;
+                // One pipelined round trip: PostgreSQL still runs the statements in
+                // order inside one read-only snapshot. A failed statement aborts the
+                // transaction, so the trailing COMMIT only rolls it back.
+                let (begin, row, bootstrap, reference_rows, pin_rows, lease_rows, candidate_rows, commit) = tokio::join!(
+                    client.batch_execute("START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"),
+                    async { client.query_opt(&identity, &[&volume_id]).await },
+                    async { client.query_opt(&bootstrap, &[&volume_id]).await },
+                    async { client.query(&references, &[&volume_id, &object_ids]).await },
+                    async { client.query(&pins, &[&volume_id, &object_ids]).await },
+                    async { client.query(&leases, &[&volume_id, &object_ids]).await },
+                    async { client.query(&candidates, &[&volume_id, &object_ids, &eligible_before]).await },
+                    client.batch_execute("COMMIT"),
+                );
+                begin.map_err(|error| {
+                    janitor_pg_error("janitor read-only transaction failed", error)
+                })?;
+                let row = row
                     .map_err(|error| {
                         janitor_pg_error("janitor volume identity query failed", error)
                     })?
@@ -486,15 +539,9 @@ impl PgJanitorSession {
                     ));
                 }
 
-                let bootstrap = transaction
-                    .query_opt(
-                        "SELECT initialized_version FROM snapshot_reachability_bootstrap WHERE vol = $1",
-                        &[&volume_id],
-                    )
-                    .await
-                    .map_err(|error| {
-                        janitor_pg_error("janitor snapshot bootstrap query failed", error)
-                    })?;
+                let bootstrap = bootstrap.map_err(|error| {
+                    janitor_pg_error("janitor snapshot bootstrap query failed", error)
+                })?;
                 let Some(bootstrap) = bootstrap else {
                     return Err(JanitorMetadataError::UnsafeToDelete(
                         "snapshot reachability bootstrap is incomplete",
@@ -506,24 +553,11 @@ impl PgJanitorSession {
                         "snapshot reachability bootstrap is incomplete",
                     ));
                 }
-                let reference_rows = transaction
-                    .query(
-                        "SELECT DISTINCT object_id FROM snapshot_current_references WHERE vol = $1 AND object_id = ANY($2::BIGINT[])",
-                        &[&volume_id, &object_ids],
-                    )
-                    .await
-                    .map_err(|error| {
-                        janitor_pg_error("janitor current-reference query failed", error)
-                    })?;
-                let pin_rows = transaction
-                    .query(
-                        &format!("{SNAPSHOT_PIN_QUERY} AND reachability.object_id = ANY($2::BIGINT[])"),
-                        &[&volume_id, &object_ids],
-                    )
-                    .await
-                    .map_err(|error| {
-                        janitor_pg_error("janitor snapshot pin query failed", error)
-                    })?;
+                let reference_rows = reference_rows.map_err(|error| {
+                    janitor_pg_error("janitor current-reference query failed", error)
+                })?;
+                let pin_rows = pin_rows
+                    .map_err(|error| janitor_pg_error("janitor snapshot pin query failed", error))?;
 
                 let invalid_ids = |context: &'static str| {
                     move |_| JanitorMetadataError::BackendUnavailable(context.to_owned())
@@ -532,20 +566,14 @@ impl PgJanitorSession {
                     .map_err(invalid_ids("janitor current references are invalid"))?;
                 let snapshot_pins = decode_janitor_object_ids(pin_rows)
                     .map_err(invalid_ids("janitor snapshot pins are invalid"))?;
-                let lease_rows = transaction.query(
-                    "SELECT DISTINCT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) AND (state IN ('uploading', 'uploaded', 'retry_wait') OR (reconcile_owner IS NOT NULL AND reconcile_lease_expires_at > clock_timestamp()))",
-                    &[&volume_id, &object_ids],
-                ).await.map_err(|error| janitor_pg_error("janitor upload lease query failed", error))?;
+                let lease_rows = lease_rows.map_err(|error| janitor_pg_error("janitor upload lease query failed", error))?;
                 let active_uploads = decode_janitor_object_ids(lease_rows).map_err(invalid_ids("janitor upload lease IDs are invalid"))?;
-                let candidate_rows = transaction.query(
-                    "SELECT object_id, floor(extract(epoch FROM eligible_at))::BIGINT, (extract(epoch FROM eligible_at) <= $3::BIGINT AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp())) FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) AND acknowledged_at IS NULL",
-                    &[&volume_id, &object_ids, &eligible_before],
-                ).await.map_err(|error| janitor_pg_error("janitor GC candidate state query failed", error))?;
+                let candidate_rows = candidate_rows.map_err(|error| janitor_pg_error("janitor GC candidate state query failed", error))?;
                 let gc_candidates = candidate_rows.into_iter().map(|row| {
                     let object_id = u64::try_from(row.get::<_, i64>(0)).map_err(|_| JanitorMetadataError::BackendUnavailable("janitor GC candidate IDs are invalid".to_owned()))?;
                     Ok((object_id, (row.get::<_, i64>(1), row.get::<_, bool>(2))))
                 }).collect::<Result<HashMap<_, _>, JanitorMetadataError>>()?;
-                transaction.commit().await.map_err(|error| {
+                commit.map_err(|error| {
                     janitor_pg_error("janitor metadata read commit failed", error)
                 })?;
                 Ok(PgJanitorProtection {
@@ -608,44 +636,73 @@ impl PgJanitorSession {
             })?;
         /// Legacy ledger rows enqueued by the first page of one cycle.
         const BACKFILL_ROWS: i64 = 4_096;
-        let statement = if after.is_some() {
-            "SELECT object_id, floor(extract(epoch FROM eligible_at) * 1000000)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND acknowledged_at IS NULL AND (eligible_at, object_id) > ('epoch'::timestamptz + $2::BIGINT * interval '1 microsecond', $3) AND extract(epoch FROM eligible_at) <= $4::BIGINT AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()) ORDER BY eligible_at, object_id LIMIT $5"
-        } else {
-            "SELECT object_id, floor(extract(epoch FROM eligible_at) * 1000000)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND acknowledged_at IS NULL AND extract(epoch FROM eligible_at) <= $2::BIGINT AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()) ORDER BY eligible_at, object_id LIMIT $3"
-        };
+        // Dry runs only read the queue; ledger conversion and backfill are writes.
+        // Later pages of a cycle only read: the first page already enqueued the backlog.
+        let backfill = backfill && after.is_none();
+        let statements = &mut self.statements;
+        let client = &*client;
+        let volume_id = self.volume_id;
         let result = runtime.block_on(async {
             tokio::time::timeout(self.command_timeout, async {
-                let tx = client.transaction().await?;
-                // Dry runs only read the queue; ledger conversion and backfill are writes.
-                // Later pages of a cycle only read: the first page already enqueued the backlog.
-                if backfill && after.is_none() {
-                tx.execute(
+                let [legacy, pending, first_page, next_page] = prepare_statements(client, statements, [
                     "WITH legacy AS (SELECT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND state = 'retry_wait' AND last_error IN ('remote deletion retry required', 'cli janitor remote deletion retry required') AND (reconcile_lease_expires_at IS NULL OR reconcile_lease_expires_at <= clock_timestamp()) ORDER BY object_id LIMIT $2 FOR UPDATE SKIP LOCKED) UPDATE snapshot_payload_upload_objects AS uploaded SET state = 'delete_pending', reconcile_owner = NULL, reconcile_lease_expires_at = NULL, next_retry_at = NULL WHERE uploaded.vol = $1 AND uploaded.object_id IN (SELECT object_id FROM legacy)",
-                    &[&self.volume_id, &BACKFILL_ROWS],
-                )
-                .await?;
-                tx.execute(
                     "WITH pending AS (SELECT uploaded.object_id, COALESCE(uploaded.closed_at, uploaded.created_at) AS eligible_at, uploaded.next_retry_at FROM snapshot_payload_upload_objects AS uploaded LEFT JOIN snapshot_payload_gc_candidates AS candidate ON candidate.vol = uploaded.vol AND candidate.object_id = uploaded.object_id WHERE uploaded.vol = $1 AND uploaded.state = 'delete_pending' AND uploaded.reconcile_owner IS NULL AND candidate.object_id IS NULL AND extract(epoch FROM COALESCE(uploaded.closed_at, uploaded.created_at)) <= $2::BIGINT AND (uploaded.next_retry_at IS NULL OR uploaded.next_retry_at <= clock_timestamp()) ORDER BY eligible_at, uploaded.object_id LIMIT $3 FOR UPDATE OF uploaded SKIP LOCKED) INSERT INTO snapshot_payload_gc_candidates (vol, object_id, eligible_at, next_attempt_at) SELECT $1, object_id, eligible_at, next_retry_at FROM pending ON CONFLICT (vol, object_id) DO NOTHING",
-                    &[&self.volume_id, &eligible_before, &BACKFILL_ROWS],
-                )
+                    "SELECT object_id, floor(extract(epoch FROM eligible_at) * 1000000)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND acknowledged_at IS NULL AND extract(epoch FROM eligible_at) <= $2::BIGINT AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()) ORDER BY eligible_at, object_id LIMIT $3",
+                    "SELECT object_id, floor(extract(epoch FROM eligible_at) * 1000000)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND acknowledged_at IS NULL AND (eligible_at, object_id) > ('epoch'::timestamptz + $2::BIGINT * interval '1 microsecond', $3) AND extract(epoch FROM eligible_at) <= $4::BIGINT AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()) ORDER BY eligible_at, object_id LIMIT $5",
+                ])
                 .await?;
-                }
-                let rows = match after {
-                    Some((eligible_at, object_id)) => tx.query(statement, &[&self.volume_id, &eligible_at, &object_id, &eligible_before, &limit]).await?,
-                    None => tx.query(statement, &[&self.volume_id, &eligible_before, &limit]).await?,
-                };
-                tx.commit().await?;
-                Ok::<_, tokio_postgres::Error>(rows)
+                // One pipelined round trip; a failed statement turns the COMMIT into a rollback.
+                let (begin, legacy, pending, rows, commit) = tokio::join!(
+                    client.batch_execute("BEGIN"),
+                    async {
+                        if backfill {
+                            client.execute(&legacy, &[&volume_id, &BACKFILL_ROWS]).await?;
+                        }
+                        Ok(())
+                    },
+                    async {
+                        if backfill {
+                            client
+                                .execute(&pending, &[&volume_id, &eligible_before, &BACKFILL_ROWS])
+                                .await?;
+                        }
+                        Ok::<_, tokio_postgres::Error>(())
+                    },
+                    async {
+                        match after {
+                            Some((eligible_at, object_id)) => {
+                                client
+                                    .query(
+                                        &next_page,
+                                        &[&volume_id, &eligible_at, &object_id, &eligible_before, &limit],
+                                    )
+                                    .await
+                            }
+                            None => {
+                                client
+                                    .query(&first_page, &[&volume_id, &eligible_before, &limit])
+                                    .await
+                            }
+                        }
+                    },
+                    client.batch_execute("COMMIT"),
+                );
+                let page_error =
+                    |error| janitor_pg_error("PostgreSQL GC candidate page failed", error);
+                begin.map_err(page_error)?;
+                legacy.map_err(page_error)?;
+                pending.map_err(page_error)?;
+                let rows = rows.map_err(page_error)?;
+                commit.map_err(page_error)?;
+                Ok(rows)
             })
             .await
         });
-        let rows = result
-            .map_err(|_| {
-                JanitorMetadataError::BackendUnavailable(
-                    "PostgreSQL GC candidate page timed out".to_owned(),
-                )
-            })?
-            .map_err(|error| janitor_pg_error("PostgreSQL GC candidate page failed", error))?;
+        let rows = result.map_err(|_| {
+            JanitorMetadataError::BackendUnavailable(
+                "PostgreSQL GC candidate page timed out".to_owned(),
+            )
+        })??;
         rows.into_iter()
             .map(|row| {
                 let object_id: i64 = row.get(0);
@@ -660,107 +717,68 @@ impl PgJanitorSession {
             .collect()
     }
 
-    pub(crate) fn retry_gc_candidate(
+    /// Claims the given objects for deletion under their object-level fences,
+    /// immediately before remote I/O, in one round trip. Returns the fencing token
+    /// of each claimed object; a missing object is protected. See
+    /// [`CLAIM_OBJECT_DELETIONS_SQL`].
+    pub(crate) fn claim_object_deletions(
         &mut self,
-        object_id: u64,
-    ) -> Result<(), JanitorMetadataError> {
-        let (Some(client), Some(runtime)) = (self.client.as_ref(), self.runtime.as_ref()) else {
-            return Err(JanitorMetadataError::UnsafeToDelete(
-                "PostgreSQL janitor lock is not held",
-            ));
-        };
-        let object_id = i64::try_from(object_id)
-            .map_err(|_| JanitorMetadataError::UnsafeToDelete("janitor object id is invalid"))?;
-        let result = runtime.block_on(async {
-            tokio::time::timeout(
-                self.command_timeout,
-                client.execute(
-                    "UPDATE snapshot_payload_gc_candidates SET next_attempt_at = clock_timestamp() + interval '60 seconds', last_error = 'cli janitor deletion retry required' WHERE vol = $1 AND object_id = $2 AND acknowledged_at IS NULL",
-                    &[&self.volume_id, &object_id],
-                ),
-            )
-            .await
-        });
-        match result {
-            Ok(Ok(1)) => Ok(()),
-            Ok(Ok(_)) => Err(JanitorMetadataError::StaleClaim),
-            Ok(Err(error)) => Err(janitor_pg_error(
-                "PostgreSQL GC candidate retry update failed",
-                error,
-            )),
-            Err(_) => Err(JanitorMetadataError::BackendUnavailable(
-                "PostgreSQL GC candidate retry update timed out".to_owned(),
-            )),
-        }
-    }
-
-    pub(crate) fn ack_gc_candidate(&mut self, object_id: u64) -> Result<(), JanitorMetadataError> {
-        let (Some(client), Some(runtime)) = (self.client.as_ref(), self.runtime.as_ref()) else {
-            return Err(JanitorMetadataError::UnsafeToDelete(
-                "PostgreSQL janitor lock is not held",
-            ));
-        };
-        let object_id = i64::try_from(object_id)
-            .map_err(|_| JanitorMetadataError::UnsafeToDelete("janitor object id is invalid"))?;
-        let result = runtime.block_on(async {
-            tokio::time::timeout(
-                self.command_timeout,
-                client.execute(
-                    "UPDATE snapshot_payload_gc_candidates AS candidate SET acknowledged_at = clock_timestamp(), next_attempt_at = NULL, last_error = NULL WHERE candidate.vol = $1 AND candidate.object_id = $2 AND candidate.acknowledged_at IS NULL AND EXISTS (SELECT 1 FROM snapshot_payload_upload_objects AS uploaded WHERE uploaded.vol = candidate.vol AND uploaded.object_id = candidate.object_id AND uploaded.state = 'delete_pending' AND uploaded.reconcile_owner IS NULL AND uploaded.last_error IS NULL)",
-                    &[&self.volume_id, &object_id],
-                ),
-            )
-            .await
-        });
-        match result {
-            Ok(Ok(1)) => Ok(()),
-            Ok(Ok(_)) => Err(JanitorMetadataError::StaleClaim),
-            Ok(Err(error)) => Err(janitor_pg_error(
-                "PostgreSQL GC candidate acknowledgement failed",
-                error,
-            )),
-            Err(_) => Err(JanitorMetadataError::BackendUnavailable(
-                "PostgreSQL GC candidate acknowledgement timed out".to_owned(),
-            )),
-        }
-    }
-
-    /// Claims one object for deletion under its object-level fence, immediately
-    /// before remote I/O. Returns the fencing token, or `None` when protected.
-    /// See [`claim_object_deletion_in`].
-    pub(crate) fn claim_object_deletion(
-        &mut self,
-        object_id: u64,
+        object_ids: &[u64],
         owner: &str,
-    ) -> Result<Option<i64>, JanitorMetadataError> {
-        let (Some(client), Some(runtime)) = (self.client.as_mut(), self.runtime.as_ref()) else {
+    ) -> Result<HashMap<u64, i64>, JanitorMetadataError> {
+        let (Some(client), Some(runtime)) = (self.client.as_ref(), self.runtime.as_ref()) else {
             return Err(JanitorMetadataError::UnsafeToDelete(
                 "PostgreSQL janitor lock is not held",
             ));
         };
+        let object_ids = janitor_object_ids(object_ids)?;
+        let statements = &mut self.statements;
         let volume_id = self.volume_id;
-        let object_id = i64::try_from(object_id)
-            .map_err(|_| JanitorMetadataError::UnsafeToDelete("janitor object id is invalid"))?;
-        let command_timeout = self.command_timeout;
-        // The timer must be created inside the runtime, so build the timeout within block_on.
-        let result = runtime.block_on(async move {
-            tokio::time::timeout(command_timeout, async {
-                let tx = client
-                    .transaction()
-                    .await
+        let lease_secs = super::snapshot_reachability::SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64;
+        let result = runtime.block_on(async {
+            tokio::time::timeout(self.command_timeout, async {
+                let [fence, claim] = prepare_statements(
+                    client,
+                    statements,
+                    [CLAIM_PUBLICATION_FENCE_SQL, &CLAIM_OBJECT_DELETIONS_SQL],
+                )
+                .await?;
+                // One pipelined round trip. PostgreSQL finishes the share lock before the
+                // claim statement takes its snapshot, as with separate round trips.
+                let (begin, fence, claimed, commit) = tokio::join!(
+                    client.batch_execute("BEGIN"),
+                    async { client.query_opt(&fence, &[&volume_id]).await },
+                    async {
+                        client
+                            .query(&claim, &[&volume_id, &object_ids, &owner, &lease_secs])
+                            .await
+                    },
+                    client.batch_execute("COMMIT"),
+                );
+                begin
                     .map_err(|error| janitor_pg_error("janitor claim transaction failed", error))?;
-                claim_object_deletion_in(tx, volume_id, object_id, owner)
-                    .await
-                    .map_err(|error| match error {
-                        ObjectDeletionClaimError::VolumeBindingMissing => {
-                            JanitorMetadataError::UnsafeToDelete(
-                                "PostgreSQL volume binding is missing",
+                // Without the volume row the claim statement claims nothing.
+                fence
+                    .map_err(|error| {
+                        janitor_pg_error("janitor claim publication fence failed", error)
+                    })?
+                    .ok_or(JanitorMetadataError::UnsafeToDelete(
+                        "PostgreSQL volume binding is missing",
+                    ))?;
+                let claimed = claimed
+                    .map_err(|error| janitor_pg_error("janitor claim lease failed", error))?;
+                commit.map_err(|error| janitor_pg_error("janitor claim commit failed", error))?;
+                claimed
+                    .into_iter()
+                    .map(|row| {
+                        let object_id = u64::try_from(row.get::<_, i64>(0)).map_err(|_| {
+                            JanitorMetadataError::BackendUnavailable(
+                                "janitor claimed object id is invalid".to_owned(),
                             )
-                        }
-                        ObjectDeletionClaimError::Postgres(context, error) => {
-                            janitor_pg_error(context, error)
-                        }
+                        })?;
+                        Ok((object_id, row.get::<_, i64>(1)))
                     })
+                    .collect()
             })
             .await
         });
@@ -771,56 +789,78 @@ impl PgJanitorSession {
         })
     }
 
-    /// Completes a deletion claim; returns `false` when the claim is no longer
-    /// current (expired and re-claimed, or otherwise fenced out).
+    /// Settles a batch in one statement; see [`JanitorDeletionSettlement`]. Returns
+    /// the objects whose claim was still current; any other claim was fenced out.
     ///
-    /// Both outcomes release the lease but keep `delete_pending`, the fence
-    /// against a late publication. A retryable outcome records its reason in
-    /// `last_error`, and the next cycle re-claims the row.
-    pub(crate) fn finish_object_deletion(
+    /// A settled claim releases the lease but keeps `delete_pending`, the fence
+    /// against a late publication. A claim without a confirmed deletion records its
+    /// reason in `last_error`, and a later cycle re-claims the row.
+    pub(crate) fn settle_object_deletions(
         &mut self,
-        object_id: u64,
+        settlements: &[JanitorDeletionSettlement],
         owner: &str,
-        fencing_token: i64,
-        outcome: crate::snapshot_ports::UploadedObjectDeletionOutcome,
-    ) -> Result<bool, JanitorMetadataError> {
-        use crate::snapshot_ports::UploadedObjectDeletionOutcome;
+    ) -> Result<HashSet<u64>, JanitorMetadataError> {
+        use crate::snapshot_ports::UploadedObjectDeletionOutcome::Deleted;
+        use JanitorDeletionSettlement::{Deferred, Finished, Released};
         let (Some(client), Some(runtime)) = (self.client.as_ref(), self.runtime.as_ref()) else {
             return Err(JanitorMetadataError::UnsafeToDelete(
                 "PostgreSQL janitor lock is not held",
             ));
         };
-        let object_id = i64::try_from(object_id)
-            .map_err(|_| JanitorMetadataError::UnsafeToDelete("janitor object id is invalid"))?;
-        let message = match outcome {
-            UploadedObjectDeletionOutcome::Deleted => None,
-            UploadedObjectDeletionOutcome::Retryable => {
-                Some("cli janitor remote deletion retry required")
-            }
-        };
+        let object_ids =
+            janitor_object_ids(settlements.iter().map(|settlement| match settlement {
+                Finished { object_id, .. }
+                | Released { object_id, .. }
+                | Deferred { object_id } => object_id,
+            }))?;
+        let fences: Vec<Option<i64>> = settlements
+            .iter()
+            .map(|settlement| match settlement {
+                Finished { fencing_token, .. } | Released { fencing_token, .. } => {
+                    Some(*fencing_token)
+                }
+                Deferred { .. } => None,
+            })
+            .collect();
+        let errors: Vec<Option<&str>> = settlements
+            .iter()
+            .map(|settlement| match settlement {
+                Finished {
+                    outcome: Deleted, ..
+                } => None,
+                _ => Some("cli janitor remote deletion retry required"),
+            })
+            .collect();
+        let defers: Vec<bool> = settlements
+            .iter()
+            .map(|settlement| !matches!(settlement, Released { .. }))
+            .collect();
+        let statements = &mut self.statements;
+        let volume_id = self.volume_id;
         let result = runtime.block_on(async {
-            tokio::time::timeout(
-                self.command_timeout,
-                client.execute(
-                    super::snapshot_reachability::FINISH_UPLOADED_OBJECT_DELETION_SQL,
-                    &[
-                        &self.volume_id,
-                        &object_id,
-                        &owner,
-                        &fencing_token,
-                        &message,
-                    ],
-                ),
-            )
+            tokio::time::timeout(self.command_timeout, async {
+                let [settle] =
+                    prepare_statements(client, statements, [SETTLE_OBJECT_DELETIONS_SQL]).await?;
+                let rows = client
+                    .query(
+                        &settle,
+                        &[&volume_id, &object_ids, &owner, &fences, &errors, &defers],
+                    )
+                    .await
+                    .map_err(|error| janitor_pg_error("janitor claim finish failed", error))?;
+                decode_janitor_object_ids(rows).map_err(|_| {
+                    JanitorMetadataError::BackendUnavailable(
+                        "janitor finished object id is invalid".to_owned(),
+                    )
+                })
+            })
             .await
         });
-        match result {
-            Ok(Ok(rows)) => Ok(rows == 1),
-            Ok(Err(error)) => Err(janitor_pg_error("janitor claim finish failed", error)),
-            Err(_) => Err(JanitorMetadataError::BackendUnavailable(
+        result.unwrap_or_else(|_| {
+            Err(JanitorMetadataError::BackendUnavailable(
                 "PostgreSQL janitor claim finish timed out".to_owned(),
-            )),
-        }
+            ))
+        })
     }
 
     /// Deletes finished deletion fences below their payload namespace watermark,
@@ -836,68 +876,101 @@ impl PgJanitorSession {
             ));
         };
         // A leased or failed fence (owner or last_error set) is still being deleted.
-        let statement = format!(
+        let fence_prune = format!(
             "DELETE FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id IN (SELECT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND state IN ('delete_pending', 'deleted') AND reconcile_owner IS NULL AND last_error IS NULL AND {} ORDER BY object_id LIMIT $2 FOR UPDATE SKIP LOCKED)",
             super::snapshot_reachability::below_payload_watermark("object_id"),
         );
-        let mut pruned = 0_u64;
-        for _ in 0..MAX_BATCHES {
-            let rows = runtime
-                .block_on(async {
-                    tokio::time::timeout(
-                        self.command_timeout,
-                        client.execute(&statement, &[&self.volume_id, &BATCH_ROWS]),
-                    )
+        let statements = &mut self.statements;
+        let volume_id = self.volume_id;
+        let timeout = self.command_timeout;
+        let result = runtime.block_on(async {
+            tokio::time::timeout(timeout, async {
+                let [fence_prune, queue_prune] = prepare_statements(client, statements, [
+                    &fence_prune,
+                    // An acknowledged queue row only stops the backfill from re-enqueueing its
+                    // fence; once the fence row is pruned it has no purpose left.
+                    "DELETE FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id IN (SELECT candidate.object_id FROM snapshot_payload_gc_candidates AS candidate WHERE candidate.vol = $1 AND candidate.acknowledged_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM snapshot_payload_upload_objects AS uploaded WHERE uploaded.vol = candidate.vol AND uploaded.object_id = candidate.object_id) LIMIT $2)",
+                ])
+                .await?;
+                let mut pruned = 0_u64;
+                for _ in 0..MAX_BATCHES {
+                    let rows = client
+                        .execute(&fence_prune, &[&volume_id, &BATCH_ROWS])
+                        .await
+                        .map_err(|error| janitor_pg_error("janitor fence prune failed", error))?;
+                    pruned += rows;
+                    if rows < BATCH_ROWS as u64 {
+                        break;
+                    }
+                }
+                client
+                    .execute(&queue_prune, &[&volume_id, &(BATCH_ROWS * MAX_BATCHES as i64)])
                     .await
-                })
-                .map_err(|_| {
-                    JanitorMetadataError::BackendUnavailable(
-                        "PostgreSQL janitor fence prune timed out".to_owned(),
-                    )
-                })?
-                .map_err(|error| janitor_pg_error("janitor fence prune failed", error))?;
-            pruned += rows;
-            if rows < BATCH_ROWS as u64 {
-                break;
-            }
-        }
-        // An acknowledged queue row only stops the backfill from re-enqueueing its
-        // fence; once the fence row is pruned it has no purpose left.
-        runtime
-            .block_on(async {
-                tokio::time::timeout(
-                    self.command_timeout,
-                    client.execute(
-                        "DELETE FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id IN (SELECT candidate.object_id FROM snapshot_payload_gc_candidates AS candidate WHERE candidate.vol = $1 AND candidate.acknowledged_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM snapshot_payload_upload_objects AS uploaded WHERE uploaded.vol = candidate.vol AND uploaded.object_id = candidate.object_id) LIMIT $2)",
-                        &[&self.volume_id, &(BATCH_ROWS * MAX_BATCHES as i64)],
-                    ),
-                )
-                .await
+                    .map_err(|error| janitor_pg_error("janitor queue prune failed", error))?;
+                Ok(pruned)
             })
-            .map_err(|_| {
-                JanitorMetadataError::BackendUnavailable(
-                    "PostgreSQL janitor queue prune timed out".to_owned(),
-                )
-            })?
-            .map_err(|error| janitor_pg_error("janitor queue prune failed", error))?;
-        Ok(pruned)
+            .await
+        });
+        result.unwrap_or_else(|_| {
+            Err(JanitorMetadataError::BackendUnavailable(
+                "PostgreSQL janitor fence prune timed out".to_owned(),
+            ))
+        })
     }
 }
+
+fn janitor_object_ids<'a>(
+    object_ids: impl IntoIterator<Item = &'a u64>,
+) -> Result<Vec<i64>, JanitorMetadataError> {
+    object_ids
+        .into_iter()
+        .map(|id| {
+            i64::try_from(*id)
+                .map_err(|_| JanitorMetadataError::UnsafeToDelete("janitor object id is invalid"))
+        })
+        .collect()
+}
+
+/// Publication bumps `metadata_state` before it records references, so this share
+/// lock, taken before the claim statement starts, makes the claim's reference and pin
+/// checks authoritative.
+pub(super) const CLAIM_PUBLICATION_FENCE_SQL: &str =
+    "SELECT 1 FROM metadata_state WHERE vol = $1 FOR SHARE";
+
+/// Claims every object in `$2` that is neither referenced nor snapshot-pinned, under
+/// its object-level fence, and returns `(object_id, fencing_token)` per claim
+/// (`$3` owner, `$4` lease seconds). Shared by the CLI and mounted Janitors; run it
+/// after [`CLAIM_PUBLICATION_FENCE_SQL`] in the same transaction.
+///
+/// A protected object keeps its prior ledger state. An untracked object receives a
+/// `delete_pending` ledger row. Upload registration keeps that state and publication
+/// rejects it, so a late upload or publication of the ID fails instead of reviving
+/// it. An existing row is claimed only from `published`, `delete_pending` or
+/// `deleted` with no active lease: an upload awaiting publication ('uploading',
+/// 'uploaded', 'retry_wait') is never claimed, as in eligibility. Rows are locked in
+/// object ID order.
+pub(super) static CLAIM_OBJECT_DELETIONS_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "WITH requested AS (SELECT DISTINCT object_id FROM unnest($2::BIGINT[]) AS requested(object_id)), protected AS (SELECT object_id FROM snapshot_current_references WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) UNION {pins}), claimed AS (INSERT INTO snapshot_payload_upload_objects AS uploaded (vol, object_id, state, closed_at, reconcile_owner, reconcile_lease_expires_at, reconcile_fence) SELECT $1, requested.object_id, 'delete_pending', clock_timestamp(), $3::TEXT, clock_timestamp() + ($4::FLOAT8 * interval '1 second'), 1 FROM requested WHERE requested.object_id NOT IN (SELECT object_id FROM protected) AND EXISTS (SELECT 1 FROM metadata_state WHERE vol = $1) ORDER BY requested.object_id ON CONFLICT (vol, object_id) DO UPDATE SET state = 'delete_pending', reconcile_owner = EXCLUDED.reconcile_owner, reconcile_lease_expires_at = EXCLUDED.reconcile_lease_expires_at, reconcile_fence = uploaded.reconcile_fence + 1, next_retry_at = NULL, last_error = NULL WHERE uploaded.state IN ('published', 'delete_pending', 'deleted') AND (uploaded.reconcile_lease_expires_at IS NULL OR uploaded.reconcile_lease_expires_at <= clock_timestamp()) RETURNING uploaded.object_id, uploaded.reconcile_fence), enqueued AS (INSERT INTO snapshot_payload_gc_candidates (vol, object_id) SELECT $1, object_id FROM claimed ON CONFLICT (vol, object_id) DO NOTHING) SELECT object_id, reconcile_fence FROM claimed",
+        pins = *BATCH_PIN_QUERY,
+    )
+});
+
+/// Settles a batch (`$2` object IDs, `$4` fencing tokens, `$5` retry reasons, `$6`
+/// defer flags; `$3` owner): finishes each current claim as
+/// [`super::snapshot_reachability::FINISH_UPLOADED_OBJECT_DELETION_SQL`] does,
+/// acknowledges the queue rows of confirmed deletions, and defers every other
+/// flagged queue row by 60 seconds. Returns the finished object IDs.
+const SETTLE_OBJECT_DELETIONS_SQL: &str = "WITH settled AS (SELECT * FROM unnest($2::BIGINT[], $4::BIGINT[], $5::TEXT[], $6::BOOLEAN[]) AS settled(object_id, fence, error, defer)), finished AS (UPDATE snapshot_payload_upload_objects AS uploaded SET closed_at = COALESCE(uploaded.closed_at, clock_timestamp()), next_retry_at = NULL, last_error = settled.error, reconcile_owner = NULL, reconcile_lease_expires_at = NULL FROM settled WHERE uploaded.vol = $1 AND uploaded.object_id = settled.object_id AND uploaded.reconcile_owner = $3::TEXT AND uploaded.reconcile_fence = settled.fence AND uploaded.state = 'delete_pending' RETURNING uploaded.object_id, settled.error IS NULL AS deleted), acknowledged AS (UPDATE snapshot_payload_gc_candidates AS candidate SET acknowledged_at = clock_timestamp(), next_attempt_at = NULL, last_error = NULL FROM finished WHERE candidate.vol = $1 AND candidate.object_id = finished.object_id AND finished.deleted AND candidate.acknowledged_at IS NULL), deferred AS (UPDATE snapshot_payload_gc_candidates AS candidate SET next_attempt_at = clock_timestamp() + interval '60 seconds', last_error = 'cli janitor deletion retry required' FROM settled WHERE candidate.vol = $1 AND candidate.object_id = settled.object_id AND settled.defer AND candidate.acknowledged_at IS NULL AND NOT EXISTS (SELECT 1 FROM finished WHERE finished.object_id = settled.object_id AND finished.deleted)) SELECT object_id FROM finished";
 
 pub(super) enum ObjectDeletionClaimError {
     VolumeBindingMissing,
     Postgres(&'static str, tokio_postgres::Error),
 }
 
-/// Claims one object for deletion in `tx` under its object-level fence, shared
-/// by the CLI and mounted Janitors. Returns the fencing token, or `None` when the
-/// object is protected; only a claim is committed.
-///
-/// Event publication bumps `metadata_state` before it records references, so
-/// the share lock taken first makes the reference and pin checks authoritative.
-/// An untracked object receives a `delete_pending` ledger row in the same
-/// transaction. Upload registration keeps that state and publication rejects
-/// it, so a late upload or publication of the ID fails instead of reviving it.
+/// Claims one object for deletion in `tx` with [`CLAIM_OBJECT_DELETIONS_SQL`] for
+/// the mounted Janitor. Returns the fencing token, or `None` when the object is
+/// protected.
 pub(super) async fn claim_object_deletion_in(
     tx: tokio_postgres::Transaction<'_>,
     volume_id: i64,
@@ -906,67 +979,21 @@ pub(super) async fn claim_object_deletion_in(
 ) -> Result<Option<i64>, ObjectDeletionClaimError> {
     use ObjectDeletionClaimError::Postgres;
     let lease_secs = super::snapshot_reachability::SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS as f64;
-    let pin_query = format!(
-        "SELECT EXISTS ({SNAPSHOT_PIN_QUERY} AND reachability.object_id = $2) OR EXISTS (SELECT 1 FROM snapshot_current_references WHERE vol = $1 AND object_id = $2)"
-    );
-    tx.query_opt(
-        "SELECT 1 FROM metadata_state WHERE vol = $1 FOR SHARE",
-        &[&volume_id],
-    )
-    .await
-    .map_err(|error| Postgres("janitor claim publication fence failed", error))?
-    .ok_or(ObjectDeletionClaimError::VolumeBindingMissing)?;
-    tx.execute(
-        // The no-op update locks an existing row, so a concurrent fence prune skips it.
-        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, closed_at) VALUES ($1, $2, 'delete_pending', clock_timestamp()) ON CONFLICT (vol, object_id) DO UPDATE SET state = snapshot_payload_upload_objects.state",
-        &[&volume_id, &object_id],
-    )
-    .await
-    .map_err(|error| Postgres("janitor claim ledger insert failed", error))?;
-    let lease_active: bool = tx
-        .query_one(
-            "SELECT reconcile_lease_expires_at IS NOT NULL AND reconcile_lease_expires_at > clock_timestamp() FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2 FOR UPDATE",
-            &[&volume_id, &object_id],
+    tx.query_opt(CLAIM_PUBLICATION_FENCE_SQL, &[&volume_id])
+        .await
+        .map_err(|error| Postgres("janitor claim publication fence failed", error))?
+        .ok_or(ObjectDeletionClaimError::VolumeBindingMissing)?;
+    let claimed = tx
+        .query_opt(
+            CLAIM_OBJECT_DELETIONS_SQL.as_str(),
+            &[&volume_id, &vec![object_id], &owner, &lease_secs],
         )
         .await
-        .map_err(|error| Postgres("janitor claim ledger read failed", error))?
-        .get(0);
-    let protected = lease_active
-        || tx
-            .query_one(&pin_query, &[&volume_id, &object_id])
-            .await
-            .map_err(|error| Postgres("janitor claim protection check failed", error))?
-            .get::<_, bool>(0);
-    let fencing_token = if protected {
-        None
-    } else {
-        // Same protection as eligibility: an upload awaiting publication
-        // ('uploading', 'uploaded', 'retry_wait') is never claimed.
-        tx.query_opt(
-            "UPDATE snapshot_payload_upload_objects SET state = 'delete_pending', reconcile_owner = $3, reconcile_lease_expires_at = clock_timestamp() + ($4 * interval '1 second'), reconcile_fence = reconcile_fence + 1, next_retry_at = NULL, last_error = NULL WHERE vol = $1 AND object_id = $2 AND state IN ('published', 'delete_pending', 'deleted') RETURNING reconcile_fence",
-            &[&volume_id, &object_id, &owner, &lease_secs],
-        )
+        .map_err(|error| Postgres("janitor claim lease failed", error))?;
+    tx.commit()
         .await
-        .map_err(|error| Postgres("janitor claim lease failed", error))?
-        .map(|row| row.get::<_, i64>(0))
-    };
-    // Commit only a claim, so a protected object keeps its prior ledger state.
-    if fencing_token.is_some() {
-        tx.execute(
-            "INSERT INTO snapshot_payload_gc_candidates (vol, object_id) VALUES ($1, $2) ON CONFLICT (vol, object_id) DO NOTHING",
-            &[&volume_id, &object_id],
-        )
-        .await
-        .map_err(|error| Postgres("janitor GC candidate enqueue failed", error))?;
-        tx.commit()
-            .await
-            .map_err(|error| Postgres("janitor claim commit failed", error))?;
-    } else {
-        tx.rollback()
-            .await
-            .map_err(|error| Postgres("janitor claim rollback failed", error))?;
-    }
-    Ok(fencing_token)
+        .map_err(|error| Postgres("janitor claim commit failed", error))?;
+    Ok(claimed.map(|row| row.get::<_, i64>(1)))
 }
 
 /// Keeps only the SQLSTATE code: the error text may carry connection details, the

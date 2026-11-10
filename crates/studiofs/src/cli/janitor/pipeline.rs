@@ -11,8 +11,8 @@ use studiofs_data::janitor::{
 use studiofs_data::object::canonical_object_delete_keys;
 use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
 use studiofs_meta::{
-    JanitorEligibility, JanitorMetadataError, JanitorSweepCheckpoint, JanitorSweepScope,
-    MAX_JANITOR_ELIGIBILITY_BATCH,
+    JanitorDeletionSettlement, JanitorEligibility, JanitorMetadataError, JanitorSweepCheckpoint,
+    JanitorSweepScope, MAX_JANITOR_ELIGIBILITY_BATCH,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -38,10 +38,17 @@ const LIST_PAGE_TIMEOUT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(60)
 };
+/// PostgreSQL deletion-claim lease (`SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS`).
+const CLAIM_LEASE: Duration = Duration::from_secs(60);
+/// Longest S3 work for one object: each canonical key (legacy plus fragments) at its timeout.
+const OBJECT_DELETE_BOUND: Duration =
+    DELETE_KEY_TIMEOUT.saturating_mul(studiofs_data::object::CLOUD_FRAGMENT_COUNT as u32 + 1);
 const _: () = assert!(
-    (studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64 + 1) * 20 < 60,
+    OBJECT_DELETE_BOUND.as_secs() < CLAIM_LEASE.as_secs(),
     "canonical key deletes must fit inside the deletion-claim lease"
 );
+/// Most objects claimed, and settled, per PostgreSQL round trip.
+const DELETION_CLAIM_BATCH: usize = 64;
 /// Consecutive objects whose S3 work failed transiently (after the transport's own
 /// bounded retries) before the cycle stops admitting work as overloaded.
 pub(super) const OVERLOAD_TRIP_OBJECTS: u32 = 5;
@@ -428,16 +435,15 @@ fn record_transient_failure(stats: &mut JanitorStats) {
     }
 }
 
-async fn process_orphan<S: JanitorObjectStore>(
+/// Age and dry-run gate for one eligible object; `true` admits it for deletion.
+async fn admit_orphan<S: JanitorObjectStore>(
     ctx: &mut JanitorCycleContext<'_, S>,
     candidate: &Candidate,
     now: SystemTime,
     now_unix: i64,
     stats: &mut JanitorStats,
     pending_ts: Option<i64>,
-) -> anyhow::Result<()> {
-    let object_id = candidate.object_id;
-
+) -> anyhow::Result<bool> {
     let grace = Duration::from_secs(ctx.skip_newer_than_secs);
     let age = match pending_ts {
         // A fresh or future-dated listed key still protects an object marked pending.
@@ -478,36 +484,161 @@ async fn process_orphan<S: JanitorObjectStore>(
         JanitorAge::Young => {
             stats.skipped_young = stats.skipped_young.saturating_add(1);
             super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
-            return Ok(());
+            return Ok(false);
         }
         JanitorAge::Unknown => {
             stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
             super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
-            return Ok(());
+            return Ok(false);
         }
     }
 
     if ctx.dry_run {
         // Dry-run neither deletes nor acks, so the listing can revisit a queued object.
-        stats.dry_run_counted.insert(object_id);
+        stats.dry_run_counted.insert(candidate.object_id);
         stats.deleted = stats.deleted.saturating_add(1);
         super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
-        return Ok(());
+        return Ok(false);
     }
+    Ok(true)
+}
 
-    // A claim failure means safety cannot be proven; stop the cycle instead of guessing.
-    super::set_live_progress_phase(ctx.budget.progress.as_ref(), "metadata_claim");
-    let claim = tokio::task::block_in_place(|| ctx.metadata.claim_deletion(object_id))
-        .with_context(|| format!("failed to claim janitor object {object_id} for deletion"))?;
-    stats.claims = stats.claims.saturating_add(1);
-    let Some(fencing_token) = claim else {
-        stats.claim_protected = stats.claim_protected.saturating_add(1);
-        defer_queued_candidate(ctx, candidate);
-        return Ok(());
-    };
+/// Deletes admitted orphans in claim batches. One PostgreSQL round trip claims the
+/// batch, each claimed object's S3 deletes follow, and one round trip settles the
+/// outcomes together with the queued `defers`. An object starts its deletes only
+/// while the claim lease still covers [`OBJECT_DELETE_BOUND`]; later objects are
+/// released and claimed again. A stop releases every unattempted claim.
+async fn delete_orphans<S: JanitorObjectStore>(
+    ctx: &mut JanitorCycleContext<'_, S>,
+    mut orphans: Vec<Candidate>,
+    defers: &mut Vec<u64>,
+    cycle_started: Instant,
+    stats: &mut JanitorStats,
+) -> anyhow::Result<()> {
+    while !orphans.is_empty() {
+        let ids: Vec<u64> = orphans
+            .iter()
+            .map(|candidate| candidate.object_id)
+            .collect();
+        // A claim failure means safety cannot be proven; stop the cycle instead of guessing.
+        super::set_live_progress_phase(ctx.budget.progress.as_ref(), "metadata_claim");
+        let claimed_at = Instant::now();
+        let tokens = tokio::task::block_in_place(|| ctx.metadata.claim_deletions(&ids))
+            .with_context(|| {
+                format!("failed to claim {} janitor objects for deletion", ids.len())
+            })?;
+        stats.claims = stats
+            .claims
+            .saturating_add(u64::try_from(ids.len()).unwrap_or(u64::MAX));
+        let mut settlements: Vec<JanitorDeletionSettlement> = defers
+            .drain(..)
+            .map(|object_id| JanitorDeletionSettlement::Deferred { object_id })
+            .collect();
+        let mut attempted = Vec::new();
+        let mut reclaim = Vec::new();
+        let mut terminal = None;
+        for candidate in orphans {
+            let object_id = candidate.object_id;
+            let Some(&token) = tokens.get(&object_id) else {
+                stats.claim_protected = stats.claim_protected.saturating_add(1);
+                // Delays a protected queue row so it does not re-occupy the head of every later page.
+                if candidate.queued_eligible_at.is_some() {
+                    settlements.push(JanitorDeletionSettlement::Deferred { object_id });
+                }
+                continue;
+            };
+            let release = JanitorDeletionSettlement::Released {
+                object_id,
+                fencing_token: token,
+            };
+            if terminal.is_none()
+                && stats.outcome == CycleOutcome::Complete
+                && let Some(stop) = ctx.budget.admission_stop(stats, cycle_started)
+            {
+                stats.outcome = stop;
+            }
+            if terminal.is_some() || stats.outcome != CycleOutcome::Complete {
+                settlements.push(release);
+                continue;
+            }
+            if !reclaim.is_empty() || claimed_at.elapsed() + OBJECT_DELETE_BOUND > CLAIM_LEASE {
+                settlements.push(release);
+                reclaim.push(candidate);
+                continue;
+            }
+            let (s3_delete_failed, terminal_error) =
+                delete_object_keys(ctx, &candidate, stats).await;
+            if !s3_delete_failed {
+                stats.transient_streak = 0;
+            } else if terminal_error.is_none() {
+                record_transient_failure(stats);
+            }
+            let outcome = if s3_delete_failed {
+                UploadedObjectDeletionOutcome::Retryable
+            } else {
+                UploadedObjectDeletionOutcome::Deleted
+            };
+            settlements.push(JanitorDeletionSettlement::Finished {
+                object_id,
+                fencing_token: token,
+                outcome,
+            });
+            attempted.push((object_id, s3_delete_failed));
+            terminal = terminal_error.map(|error| (object_id, error));
+        }
+        // Success needs PostgreSQL confirmation; an unfinished claim expires and is retried.
+        super::set_live_progress_phase(ctx.budget.progress.as_ref(), "metadata_finish");
+        let finished = settle(ctx, &settlements);
+        for (object_id, s3_delete_failed) in attempted {
+            let finish_failed = !finished.contains(&object_id);
+            if finish_failed {
+                eprintln!("janitor: failed to finish deletion claim object_id={object_id}");
+            } else {
+                stats.claim_finishes = stats.claim_finishes.saturating_add(1);
+            }
+            if s3_delete_failed || finish_failed {
+                stats.delete_errors = stats.delete_errors.saturating_add(1);
+            } else {
+                stats.deleted = stats.deleted.saturating_add(1);
+            }
+        }
+        super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
+        if let Some((object_id, error)) = terminal {
+            anyhow::bail!("terminal S3 delete failure for janitor object {object_id}: {error}");
+        }
+        orphans = reclaim;
+    }
+    Ok(())
+}
 
-    let mut s3_delete_failed = false;
-    let mut terminal = None;
+/// Settles deletion outcomes and queue deferrals; returns the confirmed claims. A
+/// failure confirms none, so their claims expire and a later cycle retries them.
+fn settle<S: JanitorObjectStore>(
+    ctx: &mut JanitorCycleContext<'_, S>,
+    settlements: &[JanitorDeletionSettlement],
+) -> std::collections::HashSet<u64> {
+    if settlements.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    tokio::task::block_in_place(|| ctx.metadata.settle_deletions(settlements)).unwrap_or_else(
+        |error| {
+            eprintln!(
+                "janitor: failed to settle {} deletion claims or GC candidates: {error:#}",
+                settlements.len()
+            );
+            std::collections::HashSet::new()
+        },
+    )
+}
+
+/// Deletes every canonical key of one claimed object. Returns whether its S3 work
+/// failed, and the error of a terminal failure. The whole object is retried later
+/// after any failure, so the first one stops further requests.
+async fn delete_object_keys<S: JanitorObjectStore>(
+    ctx: &mut JanitorCycleContext<'_, S>,
+    candidate: &Candidate,
+    stats: &mut JanitorStats,
+) -> (bool, Option<String>) {
     for key in &candidate.delete_keys {
         super::set_live_progress_phase(ctx.budget.progress.as_ref(), "delete");
         if stats.delete_requests == 0 {
@@ -525,81 +656,13 @@ async fn process_orphan<S: JanitorObjectStore>(
             Err(JanitorDeleteError::Other(error)) => ("transient", error),
             Err(JanitorDeleteError::Terminal(error)) => ("terminal", error),
         };
-        s3_delete_failed = true;
         eprintln!(
-            "janitor: failed to delete object class={class} key={key} object_id={object_id}: {error}"
+            "janitor: failed to delete object class={class} key={key} object_id={}: {error}",
+            candidate.object_id
         );
-        if class == "terminal" {
-            terminal = Some(error);
-        }
-        // The whole object is retried later; more requests now only add load.
-        break;
+        return (true, (class == "terminal").then_some(error));
     }
-    let outcome = if s3_delete_failed {
-        UploadedObjectDeletionOutcome::Retryable
-    } else {
-        UploadedObjectDeletionOutcome::Deleted
-    };
-    // Success needs PostgreSQL confirmation; an unfinished claim expires and is retried.
-    super::set_live_progress_phase(ctx.budget.progress.as_ref(), "metadata_finish");
-    let finish = tokio::task::block_in_place(|| {
-        ctx.metadata
-            .finish_deletion(object_id, fencing_token, outcome)
-    });
-    let finish_failed = match finish {
-        Ok(()) => {
-            stats.claim_finishes = stats.claim_finishes.saturating_add(1);
-            false
-        }
-        Err(error) => {
-            eprintln!("janitor: failed to finish deletion claim object_id={object_id}: {error:#}");
-            true
-        }
-    };
-    let delete_failed = s3_delete_failed || finish_failed;
-    if delete_failed {
-        let retry = tokio::task::block_in_place(|| ctx.metadata.retry_gc_candidate(object_id));
-        if let Err(error) = retry {
-            eprintln!("janitor: failed to defer GC candidate object_id={object_id}: {error:#}");
-        }
-        stats.delete_errors = stats.delete_errors.saturating_add(1);
-        // A successful finish leaves no live fence; a failed finish expires for a later cycle.
-        if let Some(error) = terminal {
-            anyhow::bail!("terminal S3 delete failure for janitor object {object_id}: {error}");
-        }
-        if s3_delete_failed {
-            record_transient_failure(stats);
-        } else {
-            stats.transient_streak = 0;
-        }
-    } else {
-        stats.transient_streak = 0;
-        // The fenced finish already confirmed deletion; an unacked row is only re-claimed later.
-        let ack = tokio::task::block_in_place(|| ctx.metadata.ack_gc_candidate(object_id));
-        if let Err(error) = ack {
-            eprintln!(
-                "janitor: failed to acknowledge GC candidate object_id={object_id}: {error:#}"
-            );
-        }
-        stats.deleted = stats.deleted.saturating_add(1);
-        super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
-    }
-    Ok(())
-}
-
-/// Delays a protected queue row so it does not re-occupy the head of every later page.
-fn defer_queued_candidate<S: JanitorObjectStore>(
-    ctx: &mut JanitorCycleContext<'_, S>,
-    candidate: &Candidate,
-) {
-    if ctx.dry_run || candidate.queued_eligible_at.is_none() {
-        return;
-    }
-    let object_id = candidate.object_id;
-    let retry = tokio::task::block_in_place(|| ctx.metadata.retry_gc_candidate(object_id));
-    if let Err(error) = retry {
-        eprintln!("janitor: failed to defer GC candidate object_id={object_id}: {error:#}");
-    }
+    (false, None)
 }
 
 #[cfg(test)]
@@ -993,19 +1056,24 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
             )),
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut orphans = Vec::new();
+    let mut defers = Vec::new();
     for (candidate, decision) in decisions {
         if stats.outcome != CycleOutcome::Complete {
-            return Ok(());
+            break;
         }
         if let Some(stop) = ctx.budget.admission_stop(stats, cycle_started) {
             stats.outcome = stop;
-            return Ok(());
+            break;
         }
         match decision {
             Decision::Protected => {
                 stats.referenced_files = stats.referenced_files.saturating_add(1);
                 super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
-                defer_queued_candidate(ctx, &candidate);
+                // Delays a protected queue row so it does not re-occupy the head of every later page.
+                if !ctx.dry_run && candidate.queued_eligible_at.is_some() {
+                    defers.push(candidate.object_id);
+                }
             }
             Decision::Deferred => {
                 stats.skipped_deferred = stats.skipped_deferred.saturating_add(1);
@@ -1015,9 +1083,27 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
                 if stats.time_to_first_candidate.is_none() {
                     stats.time_to_first_candidate = Some(cycle_started.elapsed());
                 }
-                process_orphan(ctx, &candidate, now, now_unix, stats, pending_deletion).await?;
+                if admit_orphan(ctx, &candidate, now, now_unix, stats, pending_deletion).await? {
+                    orphans.push(candidate);
+                }
+                // Claim no more objects than the delete cap still admits.
+                let remaining_deletes =
+                    usize::try_from(ctx.budget.max_deletes.saturating_sub(stats.deleted))
+                        .unwrap_or(usize::MAX);
+                if orphans.len() >= DELETION_CLAIM_BATCH.min(remaining_deletes) {
+                    let batch = std::mem::take(&mut orphans);
+                    delete_orphans(ctx, batch, &mut defers, cycle_started, stats).await?;
+                }
             }
         }
     }
+    if stats.outcome == CycleOutcome::Complete && !orphans.is_empty() {
+        delete_orphans(ctx, orphans, &mut defers, cycle_started, stats).await?;
+    }
+    let defers: Vec<JanitorDeletionSettlement> = defers
+        .into_iter()
+        .map(|object_id| JanitorDeletionSettlement::Deferred { object_id })
+        .collect();
+    settle(ctx, &defers);
     Ok(())
 }

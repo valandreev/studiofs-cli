@@ -16,7 +16,7 @@ Text mode remains suitable for redirected output and terminals on Windows. JSONL
 
 The command accepts `--s3-requests-per-second` (default 4, range 1–32). The pipeline issues PostgreSQL commands and S3 requests one at a time, so the earlier `--pg-concurrency` and `--s3-concurrency` options had no effect and were removed. Request starts (LIST pagination, stat/HEAD, each canonical fragment DELETE) are paced at OpenDAL's HTTP request layer.
 
-The provider-neutral pipeline admits no more than one candidate at a time for destructive claim/delete/finish and buffers at most one eligibility page (64 candidates); the rate and transport limits therefore remain effective if provider internals add parallel requests later. Existing deadlines bound listing to 60 seconds and stat/HEAD and DELETE to 20 seconds; PostgreSQL janitor commands use the metadata session's command timeout. These are per-process budgets, not cluster-wide coordination. The mounted VFS janitor is unchanged.
+The provider-neutral pipeline deletes one object at a time and buffers at most one eligibility batch (1,000 candidates); the rate and transport limits therefore remain effective if provider internals add parallel requests later. Existing deadlines bound listing to 60 seconds and stat/HEAD and DELETE to 20 seconds; PostgreSQL janitor commands use the metadata session's command timeout. These are per-process budgets, not cluster-wide coordination. The mounted VFS janitor is unchanged.
 
 ## Retries, backoff and overload (SFS-975)
 
@@ -28,7 +28,7 @@ The public OpenDAL `Lister` does not expose how many S3 pages it fetched. Produc
 
 ## Streaming listing (SFS-969)
 
-The CLI consumes the remote listing through OpenDAL `lister_with(prefix).recursive(true)`. Entries are evaluated as pages arrive and grouped into eligibility batches of `MAX_JANITOR_ELIGIBILITY_BATCH` (64). Memory holds one provider page plus one batch, independent of the number of keys. Keys of one object are merged only when adjacent, which matches S3's lexicographic listing order. A file key listed out of order fails the cycle, because merged object age depends on seeing every key of an object together; batches processed before that key keep their results.
+The CLI consumes the remote listing through OpenDAL `lister_with(prefix).recursive(true)`. Entries are evaluated as pages arrive and grouped into eligibility batches of `MAX_JANITOR_ELIGIBILITY_BATCH` (1,000). Memory holds one provider page plus one batch, independent of the number of keys. Keys of one object are merged only when adjacent, which matches S3's lexicographic listing order. A file key listed out of order fails the cycle, because merged object age depends on seeing every key of an object together; batches processed before that key keep their results.
 
 Each listing request, including the first, is bounded by a 60-second timeout. A failed or stalled page fails the cycle with the number of entries listed so far: batches processed earlier keep their confirmed deletions, and the partially buffered batch is not acted on. The listing is never treated as proof of deletion safety; PostgreSQL eligibility and claims decide that.
 
@@ -72,4 +72,8 @@ Schema deployment must include the repeatable canonical DDL in `studiofs-meta/sr
 
 ## Large-volume benchmark (SFS-979)
 
-The measured 1K/100K live and 1M synthetic matrix, the reasons for keeping the current defaults, and the reproduction commands are in `docs/perf/sfs-979-janitor-benchmark.md`. In short, memory stays flat and S3 and PostgreSQL load stay bounded. Throughput is limited by PostgreSQL round-trip time (SFS-1064).
+The measured 1K/100K live and 1M synthetic matrix, the reasons for keeping the current defaults, and the reproduction commands are in `docs/perf/sfs-979-janitor-benchmark.md`. In short, memory stays flat and S3 and PostgreSQL load stay bounded. SFS-1064 cut the PostgreSQL round trips that limited throughput.
+
+## PostgreSQL round trips (SFS-1064)
+
+The janitor session prepares its statements once per connection and sends the statements of one call together; PostgreSQL still runs them in order. An eligibility batch of up to 1,000 candidates costs one round trip, plus one for the checkpoint save. Deletions are claimed in batches of up to 64 objects with one set-based statement, after the `metadata_state` share lock in the same transaction, and settled with one statement that finishes each claim under its fencing token and acknowledges or defers its GC queue row. An object starts its deletes only while its 60-second claim lease still covers the worst-case S3 work for it; later objects are released without deferring their queue rows and claimed again. A stop releases every unattempted claim the same way. Measurements are in `docs/perf/sfs-979-janitor-benchmark.md`.

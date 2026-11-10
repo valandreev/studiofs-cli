@@ -357,7 +357,9 @@ Each cycle stops admitting new work at the first limit it meets and reports an
   cancellation); 3 another janitor holds the lock; 4 unsafe metadata state;
   5 backend, schema or other failure. `--output jsonl` prints the same outcome
   in a final `summary` event.
-- Janitor work is admitted in batches of at most 64 candidates. S3 operations
+- Janitor work is admitted in eligibility batches of at most 1,000 candidates,
+  and deletions are claimed and settled in PostgreSQL in batches of at most 64
+  objects. S3 operations
   have explicit per-request deadlines: 60 seconds for listing and 20 seconds
   for stat/HEAD and DELETE; PostgreSQL commands use the metadata crate's
   command timeout. These are per-process limits, not a cluster-wide capacity

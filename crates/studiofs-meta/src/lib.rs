@@ -59,8 +59,8 @@ pub use engine::{
 };
 pub use events::MetaEvent;
 pub use janitor::{
-    JanitorEligibility, JanitorMetadataError, JanitorMetadataSession, JanitorProtection,
-    JanitorSweepCheckpoint, JanitorSweepScope, MAX_JANITOR_ELIGIBILITY_BATCH,
+    JanitorDeletionSettlement, JanitorEligibility, JanitorMetadataError, JanitorMetadataSession,
+    JanitorProtection, JanitorSweepCheckpoint, JanitorSweepScope, MAX_JANITOR_ELIGIBILITY_BATCH,
 };
 pub use pg_dsn::{
     STUDIOFS_METADATA_DB, StudioPgDsns, ensure_studiofs_database, resolve_studiofs_pg_dsns,

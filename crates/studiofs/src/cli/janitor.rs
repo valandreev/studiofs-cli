@@ -12,9 +12,9 @@ use studiofs_cache::runtime::{
     LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
-use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
 use studiofs_meta::{
-    JanitorMetadataSession, JanitorProtection, JanitorSweepCheckpoint, JanitorSweepScope,
+    JanitorDeletionSettlement, JanitorMetadataSession, JanitorProtection, JanitorSweepCheckpoint,
+    JanitorSweepScope,
 };
 mod pipeline;
 #[cfg(test)]
@@ -342,15 +342,16 @@ trait JanitorMetadataSource {
         eligible_before: i64,
         backfill: bool,
     ) -> anyhow::Result<Vec<(u64, i64)>>;
-    fn claim_deletion(&mut self, object_id: u64) -> anyhow::Result<Option<i64>>;
-    fn finish_deletion(
+    /// Fencing tokens of the claimed objects; a missing object is protected.
+    fn claim_deletions(
         &mut self,
-        object_id: u64,
-        fencing_token: i64,
-        outcome: UploadedObjectDeletionOutcome,
-    ) -> anyhow::Result<()>;
-    fn retry_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()>;
-    fn ack_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()>;
+        object_ids: &[u64],
+    ) -> anyhow::Result<std::collections::HashMap<u64, i64>>;
+    /// Objects whose claim PostgreSQL confirmed; see `JanitorMetadataSession::settle_deletions`.
+    fn settle_deletions(
+        &mut self,
+        settlements: &[JanitorDeletionSettlement],
+    ) -> anyhow::Result<std::collections::HashSet<u64>>;
     fn prune_deletion_fences(&mut self) -> anyhow::Result<u64>;
     fn load_sweep_checkpoint(
         &mut self,
@@ -394,26 +395,18 @@ impl JanitorMetadataSource for JanitorMetadataSession {
             .map_err(anyhow::Error::new)
     }
 
-    fn claim_deletion(&mut self, object_id: u64) -> anyhow::Result<Option<i64>> {
-        JanitorMetadataSession::claim_deletion(self, object_id).map_err(anyhow::Error::new)
-    }
-
-    fn finish_deletion(
+    fn claim_deletions(
         &mut self,
-        object_id: u64,
-        fencing_token: i64,
-        outcome: UploadedObjectDeletionOutcome,
-    ) -> anyhow::Result<()> {
-        JanitorMetadataSession::finish_deletion(self, object_id, fencing_token, outcome)
-            .map_err(anyhow::Error::new)
+        object_ids: &[u64],
+    ) -> anyhow::Result<std::collections::HashMap<u64, i64>> {
+        JanitorMetadataSession::claim_deletions(self, object_ids).map_err(anyhow::Error::new)
     }
 
-    fn retry_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()> {
-        JanitorMetadataSession::retry_gc_candidate(self, object_id).map_err(anyhow::Error::new)
-    }
-
-    fn ack_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()> {
-        JanitorMetadataSession::ack_gc_candidate(self, object_id).map_err(anyhow::Error::new)
+    fn settle_deletions(
+        &mut self,
+        settlements: &[JanitorDeletionSettlement],
+    ) -> anyhow::Result<std::collections::HashSet<u64>> {
+        JanitorMetadataSession::settle_deletions(self, settlements).map_err(anyhow::Error::new)
     }
 
     fn prune_deletion_fences(&mut self) -> anyhow::Result<u64> {
@@ -1152,6 +1145,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_meta::snapshot_ports::UploadedObjectDeletionOutcome;
 
     mod adversarial;
     mod adversarial_live;
@@ -1373,11 +1367,14 @@ mod tests {
         gc_candidate_acks: Vec<u64>,
         gc_candidate_retries: Vec<u64>,
         gc_candidate_backfills: u64,
-        ack_error: Option<&'static str>,
         nested_runtime: Option<std::sync::Arc<tokio::runtime::Runtime>>,
         releases: u64,
         claim_protected: Vec<u64>,
         claim_error: Option<&'static str>,
+        /// Object IDs of each `claim_deletions` call.
+        claim_batches: Vec<Vec<u64>>,
+        /// Fails a whole settle call, as a lost PostgreSQL connection would.
+        settle_error: Option<&'static str>,
         finish_error: Option<&'static str>,
         claims: Vec<u64>,
         finishes: Vec<(u64, i64, UploadedObjectDeletionOutcome)>,
@@ -1488,38 +1485,68 @@ mod tests {
                 .collect())
         }
 
-        fn claim_deletion(&mut self, object_id: u64) -> anyhow::Result<Option<i64>> {
-            self.claims.push(object_id);
+        fn claim_deletions(
+            &mut self,
+            object_ids: &[u64],
+        ) -> anyhow::Result<std::collections::HashMap<u64, i64>> {
+            self.claim_batches.push(object_ids.to_vec());
+            self.claims.extend_from_slice(object_ids);
             if let Some(error) = self.claim_error {
                 anyhow::bail!(error);
             }
-            Ok((!self.claim_protected.contains(&object_id)).then(|| fake_token(object_id)))
+            Ok(object_ids
+                .iter()
+                .filter(|id| !self.claim_protected.contains(id))
+                .map(|id| (*id, fake_token(*id)))
+                .collect())
         }
 
-        fn finish_deletion(
+        fn settle_deletions(
             &mut self,
-            object_id: u64,
-            fencing_token: i64,
-            outcome: UploadedObjectDeletionOutcome,
-        ) -> anyhow::Result<()> {
-            self.finishes.push((object_id, fencing_token, outcome));
-            if let Some(error) = self.finish_error {
+            settlements: &[JanitorDeletionSettlement],
+        ) -> anyhow::Result<std::collections::HashSet<u64>> {
+            if let Some(error) = self.settle_error {
                 anyhow::bail!(error);
             }
-            Ok(())
-        }
-
-        fn retry_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()> {
-            self.gc_candidate_retries.push(object_id);
-            Ok(())
-        }
-
-        fn ack_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()> {
-            self.gc_candidate_acks.push(object_id);
-            if let Some(error) = self.ack_error {
-                anyhow::bail!(error);
+            let mut finished = std::collections::HashSet::new();
+            for settlement in settlements {
+                let (object_id, token, outcome, defer) = match *settlement {
+                    JanitorDeletionSettlement::Finished {
+                        object_id,
+                        fencing_token,
+                        outcome,
+                    } => (object_id, Some(fencing_token), outcome, true),
+                    // The ledger records a released claim as retryable.
+                    JanitorDeletionSettlement::Released {
+                        object_id,
+                        fencing_token,
+                    } => (
+                        object_id,
+                        Some(fencing_token),
+                        UploadedObjectDeletionOutcome::Retryable,
+                        false,
+                    ),
+                    JanitorDeletionSettlement::Deferred { object_id } => (
+                        object_id,
+                        None,
+                        UploadedObjectDeletionOutcome::Retryable,
+                        true,
+                    ),
+                };
+                let confirmed = token.is_some() && self.finish_error.is_none();
+                if let Some(token) = token {
+                    self.finishes.push((object_id, token, outcome));
+                }
+                if confirmed {
+                    finished.insert(object_id);
+                }
+                if confirmed && defer && outcome == UploadedObjectDeletionOutcome::Deleted {
+                    self.gc_candidate_acks.push(object_id);
+                } else if defer {
+                    self.gc_candidate_retries.push(object_id);
+                }
             }
-            Ok(())
+            Ok(finished)
         }
 
         fn prune_deletion_fences(&mut self) -> anyhow::Result<u64> {
@@ -1640,7 +1667,8 @@ mod tests {
     #[test]
     fn janitor_stop_after_completed_batch_keeps_its_progress() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut keys: Vec<String> = (1..=70).flat_map(canonical_keys).collect();
+        let batch = MAX_JANITOR_ELIGIBILITY_BATCH as u64;
+        let mut keys: Vec<String> = (1..=batch + 6).flat_map(canonical_keys).collect();
         keys.sort();
         let store = FakeJanitorStore {
             entries: keys
@@ -1654,7 +1682,7 @@ mod tests {
             ..Default::default()
         };
         let mut metadata = FakeJanitorMetadata::eligible();
-        // The first batch of 64 completes; the cap then stops the trailing batch midway.
+        // The first batch completes; the cap then stops the trailing batch midway.
         let stats = rt
             .block_on(run_one_cycle_resumable(
                 JanitorCycleContext {
@@ -1662,7 +1690,7 @@ mod tests {
                     prefix: "test/objects/",
                     dry_run: false,
                     skip_newer_than_secs: 0,
-                    budget: RunBudget::deletes(65),
+                    budget: RunBudget::deletes(batch + 1),
                     metadata: &mut metadata,
                 },
                 sweep_checkpoint(),
@@ -1678,14 +1706,15 @@ mod tests {
             sweep_checkpoint(),
             "completed batch progress was discarded"
         );
-        assert_eq!(saved.pending_object_id, Some(65));
+        assert_eq!(saved.pending_object_id, Some(batch + 1));
     }
 
     #[test]
     fn cancellation_during_list_wait_keeps_completed_batch_progress() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let cancellation = CancellationToken::new();
-        let mut keys: Vec<String> = (1..=65).flat_map(canonical_keys).collect();
+        let batch = MAX_JANITOR_ELIGIBILITY_BATCH as u64;
+        let mut keys: Vec<String> = (1..=batch + 1).flat_map(canonical_keys).collect();
         keys.sort();
         let store = FakeJanitorStore {
             entries: keys
@@ -1701,7 +1730,7 @@ mod tests {
             ..Default::default()
         };
         let mut metadata = FakeJanitorMetadata::eligible();
-        // The first batch of 64 completes; the cancel then lands while the next page stalls.
+        // The first batch completes; the cancel then lands while the next page stalls.
         let stats = rt
             .block_on(run_one_cycle_resumable(
                 JanitorCycleContext {
@@ -1711,7 +1740,7 @@ mod tests {
                     skip_newer_than_secs: 0,
                     budget: RunBudget {
                         cancel: cancellation,
-                        ..RunBudget::deletes(100)
+                        ..RunBudget::deletes(batch + 36)
                     },
                     metadata: &mut metadata,
                 },
@@ -1722,12 +1751,12 @@ mod tests {
             .unwrap();
         assert_eq!(stats.outcome, CycleOutcome::Cancelled);
         assert!(!stats.scan_complete);
-        assert_eq!(metadata.claims, (1..=64).collect::<Vec<_>>());
+        assert_eq!(metadata.claims, (1..=batch).collect::<Vec<_>>());
         let saved = metadata
             .sweep_checkpoint
             .clone()
             .expect("completed batch progress was not checkpointed");
-        assert_eq!(saved.pending_object_id, Some(65));
+        assert_eq!(saved.pending_object_id, Some(batch + 1));
         assert_eq!(stats.scan_position, saved.after_key.unwrap());
     }
 
@@ -1775,11 +1804,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(stats.outcome, CycleOutcome::Cancelled);
-        assert_eq!(metadata.claims, vec![42]);
-        assert_eq!(metadata.finishes.len(), 1);
+        // One claim batch; the cancelled, unattempted object is released as retryable.
+        assert_eq!(metadata.claim_batches, [vec![42, 43]]);
         assert_eq!(
-            metadata.finishes[0].2,
-            UploadedObjectDeletionOutcome::Deleted
+            metadata.finishes,
+            [
+                (42, fake_token(42), UploadedObjectDeletionOutcome::Deleted),
+                (43, fake_token(43), UploadedObjectDeletionOutcome::Retryable),
+            ]
         );
         assert_eq!(metadata.releases, 1);
         let checkpoint = metadata.sweep_checkpoint.clone().unwrap();
@@ -1805,7 +1837,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(stats.deleted, 2);
-        assert_eq!(metadata.claims, vec![42, 42, 43]);
+        assert_eq!(metadata.claims, vec![42, 43, 42, 43]);
     }
 
     #[test]
@@ -2347,7 +2379,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn eligibility_requests_are_split_into_bounded_batches() {
-        let entries = (1..=129)
+        let batch = MAX_JANITOR_ELIGIBILITY_BATCH;
+        let entries = (1..=2 * batch as u64 + 1)
             .flat_map(|id| studiofs_data::object::format_object_fragment_keys("test/objects/", id))
             .map(|key| JanitorEntry {
                 key,
@@ -2377,7 +2410,7 @@ mod tests {
                 .iter()
                 .map(Vec::len)
                 .collect::<Vec<_>>(),
-            [64, 64, 1]
+            [batch, batch, 1]
         );
         assert!(
             metadata
@@ -2385,7 +2418,7 @@ mod tests {
                 .iter()
                 .all(|batch| batch.len() <= MAX_JANITOR_ELIGIBILITY_BATCH)
         );
-        assert_eq!(stats.orphan_candidates, 129);
+        assert_eq!(stats.orphan_candidates, 2 * batch as u64 + 1);
     }
 
     #[test]
@@ -2513,7 +2546,10 @@ mod tests {
 
         assert_eq!(stats.deleted, 10_000);
         assert_eq!(stats.queued_candidates_scanned, 10_000);
-        assert_eq!(metadata.gc_candidate_reads.len(), 157);
+        assert_eq!(
+            metadata.gc_candidate_reads.len(),
+            10_000_usize.div_ceil(MAX_JANITOR_ELIGIBILITY_BATCH)
+        );
         assert!(
             metadata
                 .gc_candidate_reads
@@ -2635,7 +2671,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn queued_ack_failure_is_not_fatal_and_protected_rows_are_deferred() {
+    async fn queued_protected_rows_are_deferred_and_a_settle_failure_is_not_fatal() {
         let old = i64::try_from(
             SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2644,27 +2680,36 @@ mod tests {
         )
         .unwrap()
             - 3600;
-        let store = FakeJanitorStore::default();
-        let mut metadata = FakeJanitorMetadata {
-            gc_candidates: vec![(7, old), (8, old)],
-            outcomes: [(7, JanitorEligibility::Protected)].into_iter().collect(),
-            ack_error: Some("acknowledgement updated no rows"),
-            ..FakeJanitorMetadata::eligible()
-        };
-        let stats = run_one_cycle(JanitorCycleContext {
-            store: &store,
-            prefix: "test/objects/",
-            dry_run: false,
-            skip_newer_than_secs: 0,
-            budget: RunBudget::deletes(1),
-            metadata: &mut metadata,
-        })
-        .await
-        .expect("an ack failure after a confirmed deletion must not abort the cycle");
-        assert_eq!(stats.deleted, 1);
-        assert_eq!(stats.referenced_files, 1);
-        assert_eq!(metadata.gc_candidate_acks, vec![8]);
-        assert_eq!(metadata.gc_candidate_retries, vec![7]);
+        for settle_error in [None, Some("backend_unavailable: settle timed out")] {
+            let store = FakeJanitorStore::default();
+            let mut metadata = FakeJanitorMetadata {
+                gc_candidates: vec![(7, old), (8, old)],
+                outcomes: [(7, JanitorEligibility::Protected)].into_iter().collect(),
+                settle_error,
+                ..FakeJanitorMetadata::eligible()
+            };
+            let stats = run_one_cycle(JanitorCycleContext {
+                store: &store,
+                prefix: "test/objects/",
+                dry_run: false,
+                skip_newer_than_secs: 0,
+                budget: RunBudget::deletes(1),
+                metadata: &mut metadata,
+            })
+            .await
+            .expect("a settle failure after the S3 deletes must not abort the cycle");
+            assert_eq!(stats.referenced_files, 1);
+            assert_eq!(metadata.claims, vec![8]);
+            if settle_error.is_none() {
+                assert_eq!((stats.deleted, stats.delete_errors), (1, 0));
+                assert_eq!(metadata.gc_candidate_acks, vec![8]);
+                assert_eq!(metadata.gc_candidate_retries, vec![7]);
+            } else {
+                // PostgreSQL never confirmed the deletion: the claim expires and is retried.
+                assert_eq!((stats.deleted, stats.delete_errors), (0, 1));
+                assert!(metadata.finishes.is_empty());
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3538,17 +3583,23 @@ mod tests {
 
         let trip = u64::from(pipeline::OVERLOAD_TRIP_OBJECTS);
         assert_eq!(stats.outcome, pipeline::CycleOutcome::Overloaded);
-        assert_eq!(metadata.claims, (1..=trip).collect::<Vec<_>>());
+        // The whole listed batch is claimed at once; S3 work stops at the trip.
+        assert_eq!(metadata.claim_batches, [(1..=8).collect::<Vec<_>>()]);
         // One DELETE per failed object; its other keys wait for the object's retry.
         assert_eq!(store.deleted.lock().unwrap().len() as u64, trip);
-        // Every claim was released as retryable and its queue row deferred.
+        // Every claim, attempted or not, was released as retryable; only attempted
+        // objects defer their queue rows.
+        assert_eq!(metadata.finishes.len(), metadata.claims.len());
         assert!(
             metadata
                 .finishes
                 .iter()
                 .all(|(_, _, outcome)| *outcome == UploadedObjectDeletionOutcome::Retryable)
         );
-        assert_eq!(metadata.gc_candidate_retries, metadata.claims);
+        assert_eq!(
+            metadata.gc_candidate_retries,
+            (1..=trip).collect::<Vec<_>>()
+        );
         // The listed batch replays next cycle: the saved scan position did not move.
         assert!(!stats.scan_complete);
         assert_eq!(metadata.sweep_checkpoint, Some(start));
@@ -3571,10 +3622,11 @@ mod tests {
             JanitorFailureClass::Terminal,
             "{error:#}"
         );
-        assert_eq!(metadata.claims, [1]);
+        // The batch was claimed together; the unattempted claims are released too.
+        assert_eq!(metadata.claims, [1, 2, 3]);
         assert_eq!(
             metadata.finishes,
-            [(1, fake_token(1), UploadedObjectDeletionOutcome::Retryable)]
+            [1, 2, 3].map(|id| (id, fake_token(id), UploadedObjectDeletionOutcome::Retryable))
         );
         assert_eq!(metadata.gc_candidate_retries, [1]);
         assert_eq!(store.deleted.lock().unwrap().len(), 1);
@@ -3665,10 +3717,14 @@ mod tests {
         let _ = server.await;
         let stats = stats.unwrap();
 
-        // Meeting the cap in the first batch ends the cycle: 1 of 21 pages is ever requested.
-        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 1);
         // A batch closes on the first key of the next object.
         let batch = MAX_JANITOR_ELIGIBILITY_BATCH as u64 + 1;
+        // Meeting the cap in the first batch ends the cycle: only the 1,000-key pages
+        // that list that batch, of 21, are ever requested.
+        assert_eq!(
+            fake.list_requests.load(Ordering::Relaxed),
+            batch.div_ceil(1_000)
+        );
         assert_eq!(stats.outcome, pipeline::CycleOutcome::DeleteCapReached);
         assert_eq!(stats.scanned_files, batch);
         assert_eq!(stats.orphan_candidates, 2);
@@ -3857,8 +3913,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn janitor_stalled_opendal_page_times_out_after_first_page_was_processed() {
-        // Page 2 never arrives; the first page's objects must already be processed.
-        let (op, fake, _endpoint, server) = fake_s3_operator_with_stall(2_000, Some(1)).await;
+        // Page 3 never arrives; the objects of the first two pages must already be processed.
+        let (op, fake, _endpoint, server) = fake_s3_operator_with_stall(3_000, Some(2)).await;
         let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::new(op));
         let mut metadata = FakeJanitorMetadata::eligible();
         let result = tokio::time::timeout(
@@ -3879,13 +3935,14 @@ mod tests {
 
         let error = format!("{:#}", result.unwrap_err());
         assert!(
-            error.contains("failed to list janitor objects after 1000 entries"),
+            error.contains("failed to list janitor objects after 2000 entries"),
             "{error}"
         );
         assert!(error.contains("listing page timed out"), "{error}");
-        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 2);
-        // 1,000 listed objects fill 15 whole batches; the 40-object tail is never acted on.
-        let full_batches = 1000 / MAX_JANITOR_ELIGIBILITY_BATCH;
+        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 3);
+        // A batch closes on the next object's key, so 2,000 listed objects close
+        // (2,000 - 1) / batch whole batches; the tail is never acted on.
+        let full_batches = (2_000 - 1) / MAX_JANITOR_ELIGIBILITY_BATCH;
         assert_eq!(metadata.eligibility_reads.len(), full_batches);
         assert_eq!(fake.head_requests.load(Ordering::Relaxed), 0);
     }

@@ -8,7 +8,38 @@ Recorded 2026-11-10 on Windows 11 with Docker Desktop. The candidate is this bra
 - **Memory is flat.** Candidate peak RSS was 16–17 MiB for 1K and 100K live keys. Synthetic peak RSS was 17 MiB at 100K keys and 25–29 MiB at 1M keys, of which about 7 MiB is fixture bookkeeping. The pipeline buffered at most 64 candidates. The baseline buffers the whole listing: 82 MiB at 100K keys.
 - **Small PostgreSQL servers are not saturated.** With PostgreSQL limited to 1 vCPU and 512 MiB, the candidate used one connection. Peak CPU was 12% and peak memory 56–81 MiB. Foreground PostgreSQL inserts stayed at p99 ≤ 9 ms and foreground S3 PUTs at p99 ≤ 94 ms during every run.
 - **S3 load is bounded.** The candidate never had more than one S3 request or connection in flight. With 503 or 429 on every 20th request over 1M keys, it retried 157 requests, deleted every orphan, and took 28% longer.
-- **Throughput is bound by PostgreSQL round-trip time (RTT), not by S3 or server CPU.** A 500-deletion cycle took 443 s at about 0 ms RTT and 1,323 s at 100 ms RTT. S3 DELETE time was 170–194 s in both. That is about 18 extra round trips per deleted object and about 20 per 64-key eligibility batch. At 100 ms RTT, scanning runs at about 29 keys/s, so 1M keys take about 9.6 hours. The baseline is 5–14× faster in wall time because it reads metadata once and does not fence deletions. No speedup is claimed. SFS-1064 tracks cutting the round trips: prepared statements, batched claim/finish/acknowledge, and a larger eligibility batch. After that, one DELETE per key (at most 2 objects/s at the default 4 requests/s) becomes the ceiling. SFS-1065 tracks S3 multi-object delete.
+- **Throughput is bound by PostgreSQL round-trip time (RTT), not by S3 or server CPU.** A 500-deletion cycle took 443 s at about 0 ms RTT and 1,323 s at 100 ms RTT. S3 DELETE time was 170–194 s in both. That is about 18 extra round trips per deleted object and about 20 per 64-key eligibility batch. At 100 ms RTT, scanning runs at about 29 keys/s, so 1M keys take about 9.6 hours. The baseline is 5–14× faster in wall time because it reads metadata once and does not fence deletions. No speedup is claimed. SFS-1064 cut the round trips (see below): deletion now runs at about 1.85 objects/s, close to the 2 objects/s that one DELETE per key allows at the default 4 requests/s. SFS-1065 tracks S3 multi-object delete.
+
+## SFS-1064: PostgreSQL round trips
+
+Recorded 2026-11-10 with the live benchmark at 100 ms PostgreSQL RTT, 20 ms S3 RTT, PostgreSQL at 1 vCPU / 512 MiB, 4 S3 requests/s, `--max-deletes 500`, and the usual foreground load. "Before" is main commit `560db2ca`. The PostgreSQL proxy now counts round trips (`pg_round_trips`, total and per run): a server reply after client bytes ends one round trip, so a pipelined burst counts once. Scan-only runs use `ORPHAN_PERCENT=0`, so they measure eligibility batches without claims.
+
+The changes, in order:
+
+1. **Prepared and pipelined statements.** The janitor session prepares each statement once per connection. The statements of one call are sent together and PostgreSQL runs them in order, so the read-only eligibility transaction is one round trip, and the checkpoint save is another.
+2. **Batched claim and settle.** One set-based statement claims up to 64 objects and returns one fencing token per object; one statement settles them (fenced finish, queue acknowledgement or 60-second deferral). A stale token still cannot finish a newer claim, and one object's failure still defers only that object. An object starts its deletes only while the 60-second claim lease still covers its worst-case S3 work; later objects are released and claimed again.
+3. **Eligibility batch 64 → 1,000**, one S3 listing page. Claims stay at 64 objects.
+
+Round trips (fitted from the 2K and 10K scan runs; each run also pays about 22–25 fixed round trips for connect, lock, validation, queue page and fence pruning):
+
+    step                     per eligibility batch   per 1,000 keys scanned   per deleted object
+    before                   ~17 (64 keys)           ~270                     ~18
+    1+2, batch 64            2 (64 keys)             ~31                      ~0.1
+    3, batch 1,000           2 (1,000 keys)          ~2                       ~0.07
+
+Throughput and load (all candidate runs kept every referenced and foreground object and finished the sweep):
+
+    run                      keys    orphans  runs  time      PG round trips  scan keys/s  delete obj/s  PG CPU  fg PG p99
+    before, scan             10,000  0        1     394.7 s   3,126           29           –             4.8%    4 ms
+    1+2 batch 64, scan       10,000  0        1     50.2 s    341             203          –             4.2%    6 ms
+    3 batch 1,000, scan      10,000  0        1     12.4 s    43              809          –             1.4%    4 ms
+    before, delete           1,000   500      2     1,523.4 s 10,966          –            0.33          9.4%    13 ms
+    1+2 batch 64, delete     1,000   500      2     279.2 s   142             –            1.79          7.2%    4 ms
+    3 batch 1,000, delete    1,000   500      2     270.8 s   81              –            1.85          14.2%   6 ms
+
+The 500-deletion cycle now holds the global janitor lock for 266 s instead of 1,315 s. S3 DELETE time was about 160 s in every deleting run, so deletion now runs at the S3 gate: two DELETE requests per object at 4 requests/s allow at most 2 objects/s. SFS-1065 (S3 multi-object delete) is the next ceiling. PostgreSQL stayed unsaturated: at most 14% of one vCPU and about 50 MiB. Each claim batch locks at most 64 ledger rows for one pipelined transaction; the eligibility transaction is read-only. The "before" scan runs list more keys than their seeded objects because the foreground load keeps adding objects for as long as a run lasts.
+
+The rows that follow this section predate SFS-1064.
 
 ## Parameter choices
 

@@ -39,11 +39,14 @@ fn bench_key(prefix: &str, id: u64, index: u64) -> String {
     }
 }
 
-/// Loopback TCP proxy that delays each direction by `one_way` and counts open connections.
+/// Loopback TCP proxy that delays each direction by `one_way` and counts open connections
+/// and round trips: a server reply after client bytes ends one round trip, so a pipelined
+/// burst counts once.
 struct DelayProxy {
     port: u16,
     peak_open: Arc<AtomicU64>,
     accepted: Arc<AtomicU64>,
+    round_trips: Arc<AtomicU64>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -57,6 +60,7 @@ async fn delayed_pipe(
     mut from: tokio::net::tcp::OwnedReadHalf,
     mut to: tokio::net::tcp::OwnedWriteHalf,
     one_way: Duration,
+    on_read: impl Fn(),
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
     let writer = tokio::spawn(async move {
@@ -70,6 +74,7 @@ async fn delayed_pipe(
     });
     let mut buffer = vec![0_u8; 64 * 1024];
     while let Ok(read @ 1..) = from.read(&mut buffer).await {
+        on_read();
         if tx
             .send((
                 tokio::time::Instant::now() + one_way,
@@ -90,11 +95,21 @@ async fn start_proxy(upstream_port: u16, one_way: Duration) -> anyhow::Result<De
     let open = Arc::new(AtomicU64::new(0));
     let peak_open = Arc::new(AtomicU64::new(0));
     let accepted = Arc::new(AtomicU64::new(0));
-    let (task_open, task_peak, task_accepted) = (open, peak_open.clone(), accepted.clone());
+    let round_trips = Arc::new(AtomicU64::new(0));
+    let (task_open, task_peak, task_accepted, task_round_trips) = (
+        open,
+        peak_open.clone(),
+        accepted.clone(),
+        round_trips.clone(),
+    );
     let task = tokio::spawn(async move {
         while let Ok((client, _)) = listener.accept().await {
-            let (open, peak, accepted) =
-                (task_open.clone(), task_peak.clone(), task_accepted.clone());
+            let (open, peak, accepted, round_trips) = (
+                task_open.clone(),
+                task_peak.clone(),
+                task_accepted.clone(),
+                task_round_trips.clone(),
+            );
             tokio::spawn(async move {
                 let Ok(server) = tokio::net::TcpStream::connect(("127.0.0.1", upstream_port)).await
                 else {
@@ -105,9 +120,16 @@ async fn start_proxy(upstream_port: u16, one_way: Duration) -> anyhow::Result<De
                 peak.fetch_max(open.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
                 let (client_read, client_write) = client.into_split();
                 let (server_read, server_write) = server.into_split();
+                let awaiting_reply = AtomicBool::new(false);
                 tokio::join!(
-                    delayed_pipe(client_read, server_write, one_way),
-                    delayed_pipe(server_read, client_write, one_way),
+                    delayed_pipe(client_read, server_write, one_way, || {
+                        awaiting_reply.store(true, Ordering::Relaxed);
+                    }),
+                    delayed_pipe(server_read, client_write, one_way, || {
+                        if awaiting_reply.swap(false, Ordering::Relaxed) {
+                            round_trips.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }),
                 );
                 open.fetch_sub(1, Ordering::Relaxed);
             });
@@ -117,6 +139,7 @@ async fn start_proxy(upstream_port: u16, one_way: Duration) -> anyhow::Result<De
         port,
         peak_open,
         accepted,
+        round_trips,
         task,
     })
 }
@@ -468,6 +491,8 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
         ))
     });
 
+    // Fixture setup also went through the proxy; count only the janitor runs.
+    let pg_round_trips_before = pg_proxy.round_trips.load(Ordering::Relaxed);
     let mut runs = Vec::new();
     let mut complete = false;
     let (mut total_ms, mut peak_rss, mut peak_cpu, mut peak_memory) =
@@ -499,6 +524,7 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
         };
         let stdout = stack.artifact_root.join(format!("bench-{run}.stdout"));
         let stderr = stack.artifact_root.join(format!("bench-{run}.stderr"));
+        let run_round_trips = pg_proxy.round_trips.load(Ordering::Relaxed);
         let (output, elapsed, samples) = tokio::task::block_in_place(|| {
             run_measured(command, timeout, &stdout, &stderr, &pg_container)
         })?;
@@ -523,6 +549,7 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
             "run": run,
             "exit_code": output.status.code(),
             "wall_ms": elapsed.as_millis(),
+            "pg_round_trips": pg_proxy.round_trips.load(Ordering::Relaxed) - run_round_trips,
             "peak_rss_mib": samples.peak_rss / (1 << 20),
             "peak_pg_cpu_percent": samples.peak_pg_cpu_percent,
             "peak_pg_memory_mib": samples.peak_pg_memory_mib,
@@ -609,6 +636,7 @@ async fn live_cli_janitor_benchmark() -> anyhow::Result<()> {
         "peak_pg_memory_mib": peak_memory,
         "peak_pg_connections": pg_proxy.peak_open.load(Ordering::Relaxed),
         "pg_connections_opened": pg_proxy.accepted.load(Ordering::Relaxed),
+        "pg_round_trips": pg_proxy.round_trips.load(Ordering::Relaxed) - pg_round_trips_before,
         "peak_s3_connections": s3_proxy.peak_open.load(Ordering::Relaxed),
         "s3_connections_opened": s3_proxy.accepted.load(Ordering::Relaxed),
         "run_details": runs,

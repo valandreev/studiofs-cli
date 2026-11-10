@@ -5013,6 +5013,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "dotenvy",
+ "futures",
  "postcard",
  "rand 0.9.3",
  "redb",
