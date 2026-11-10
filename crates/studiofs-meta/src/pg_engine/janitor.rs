@@ -474,6 +474,8 @@ impl PgJanitorSession {
                 // order inside one read-only snapshot. A failed statement aborts the
                 // transaction, so the trailing COMMIT only rolls it back.
                 let (begin, row, bootstrap, reference_rows, pin_rows, lease_rows, candidate_rows, commit) = tokio::join!(
+                    // Each request is sent on its first poll; `biased` keeps that in order.
+                    biased;
                     client.batch_execute("START TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"),
                     async { client.query_opt(&identity, &[&volume_id]).await },
                     async { client.query_opt(&bootstrap, &[&volume_id]).await },
@@ -653,6 +655,7 @@ impl PgJanitorSession {
                 .await?;
                 // One pipelined round trip; a failed statement turns the COMMIT into a rollback.
                 let (begin, legacy, pending, rows, commit) = tokio::join!(
+                    biased;
                     client.batch_execute("BEGIN"),
                     async {
                         if backfill {
@@ -718,7 +721,7 @@ impl PgJanitorSession {
     }
 
     /// Claims the given objects for deletion under their object-level fences,
-    /// immediately before remote I/O, in one round trip. Returns the fencing token
+    /// immediately before remote I/O, in two round trips. Returns the fencing token
     /// of each claimed object; a missing object is protected. See
     /// [`CLAIM_OBJECT_DELETIONS_SQL`].
     pub(crate) fn claim_object_deletions(
@@ -743,11 +746,35 @@ impl PgJanitorSession {
                     [CLAIM_PUBLICATION_FENCE_SQL, &CLAIM_OBJECT_DELETIONS_SQL],
                 )
                 .await?;
-                // One pipelined round trip. PostgreSQL finishes the share lock before the
-                // claim statement takes its snapshot, as with separate round trips.
-                let (begin, fence, claimed, commit) = tokio::join!(
+                // Two round trips. The claim is sent only after the share lock is granted:
+                // a claim pipelined behind a waiting lock would still commit, and keep its
+                // lease, after this process died.
+                let (begin, fence) = tokio::join!(
+                    // Each request is sent on its first poll; `biased` keeps that in order.
+                    biased;
                     client.batch_execute("BEGIN"),
                     async { client.query_opt(&fence, &[&volume_id]).await },
+                );
+                let fenced = begin
+                    .map_err(|error| janitor_pg_error("janitor claim transaction failed", error))
+                    .and_then(|()| {
+                        fence.map_err(|error| {
+                            janitor_pg_error("janitor claim publication fence failed", error)
+                        })
+                    })
+                    .and_then(|row| {
+                        row.map(drop).ok_or(JanitorMetadataError::UnsafeToDelete(
+                            "PostgreSQL volume binding is missing",
+                        ))
+                    });
+                if let Err(error) = fenced {
+                    // Leave the connection outside a transaction; the fence error wins.
+                    let _ = client.batch_execute("ROLLBACK").await;
+                    return Err(error);
+                }
+                // A failed claim aborts the transaction, so this COMMIT only rolls it back.
+                let (claimed, commit) = tokio::join!(
+                    biased;
                     async {
                         client
                             .query(&claim, &[&volume_id, &object_ids, &owner, &lease_secs])
@@ -755,16 +782,6 @@ impl PgJanitorSession {
                     },
                     client.batch_execute("COMMIT"),
                 );
-                begin
-                    .map_err(|error| janitor_pg_error("janitor claim transaction failed", error))?;
-                // Without the volume row the claim statement claims nothing.
-                fence
-                    .map_err(|error| {
-                        janitor_pg_error("janitor claim publication fence failed", error)
-                    })?
-                    .ok_or(JanitorMetadataError::UnsafeToDelete(
-                        "PostgreSQL volume binding is missing",
-                    ))?;
                 let claimed = claimed
                     .map_err(|error| janitor_pg_error("janitor claim lease failed", error))?;
                 commit.map_err(|error| janitor_pg_error("janitor claim commit failed", error))?;
@@ -801,26 +818,17 @@ impl PgJanitorSession {
         owner: &str,
     ) -> Result<HashSet<u64>, JanitorMetadataError> {
         use crate::snapshot_ports::UploadedObjectDeletionOutcome::Deleted;
-        use JanitorDeletionSettlement::{Deferred, Finished, Released};
+        use JanitorDeletionSettlement::{Finished, Released};
         let (Some(client), Some(runtime)) = (self.client.as_ref(), self.runtime.as_ref()) else {
             return Err(JanitorMetadataError::UnsafeToDelete(
                 "PostgreSQL janitor lock is not held",
             ));
         };
         let object_ids =
-            janitor_object_ids(settlements.iter().map(|settlement| match settlement {
-                Finished { object_id, .. }
-                | Released { object_id, .. }
-                | Deferred { object_id } => object_id,
-            }))?;
+            janitor_object_ids(settlements.iter().map(JanitorDeletionSettlement::object_id))?;
         let fences: Vec<Option<i64>> = settlements
             .iter()
-            .map(|settlement| match settlement {
-                Finished { fencing_token, .. } | Released { fencing_token, .. } => {
-                    Some(*fencing_token)
-                }
-                Deferred { .. } => None,
-            })
+            .map(JanitorDeletionSettlement::fencing_token)
             .collect();
         let errors: Vec<Option<&str>> = settlements
             .iter()

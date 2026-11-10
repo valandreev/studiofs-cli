@@ -268,6 +268,44 @@ fn janitor_session_fences_object_deletion_claims() {
     let current = session.claim_deletions(&[80]).expect("claim")[&80];
     assert!(!finish(&mut session, 80, expired, Deleted));
     assert!(finish(&mut session, 80, current, Deleted), "current finish");
+
+    // A released claim (deletes never started) is re-claimable at once and does not
+    // defer its queue row; a queue-only deferral touches no ledger row.
+    sql(
+        "UPDATE snapshot_payload_gc_candidates SET acknowledged_at = NULL, next_attempt_at = NULL WHERE vol = $1 AND object_id = 80",
+    );
+    sql("INSERT INTO snapshot_payload_gc_candidates (vol, object_id) VALUES ($1, 77)");
+    let released = session.claim_deletions(&[80]).expect("claim")[&80];
+    let settled = session
+        .settle_deletions(&[
+            crate::JanitorDeletionSettlement::Released {
+                object_id: 80,
+                fencing_token: released,
+            },
+            crate::JanitorDeletionSettlement::Deferred { object_id: 77 },
+        ])
+        .expect("settle release and deferral");
+    assert_eq!(settled, [80].into_iter().collect());
+    let (state, reason) = ledger(80).expect("released row");
+    assert_eq!(state, "delete_pending");
+    assert!(reason.is_some(), "a released object is not deleted yet");
+    assert!(
+        sql("SELECT 1 FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = 80 AND next_attempt_at > clock_timestamp()").is_empty(),
+        "a release must not defer the queue row"
+    );
+    assert_eq!(
+        sql("SELECT 1 FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = 77 AND next_attempt_at > clock_timestamp()").len(),
+        1,
+        "a deferral delays the protected queue row"
+    );
+    assert_eq!(ledger(77), None, "a deferral writes no ledger row");
+    assert!(
+        session
+            .claim_deletions(&[80])
+            .expect("claim")
+            .contains_key(&80),
+        "a released claim is re-claimable at once"
+    );
     session.release_global_janitor_lock().expect("release");
 }
 

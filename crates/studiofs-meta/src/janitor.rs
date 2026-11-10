@@ -10,6 +10,10 @@ use std::path::Path;
 /// S3 listing page, so a scan pays one eligibility round trip per page.
 pub const MAX_JANITOR_ELIGIBILITY_BATCH: usize = 1_000;
 
+/// Seconds a deletion claim stays leased; an object's deletes must finish inside it.
+pub const JANITOR_DELETION_CLAIM_LEASE_SECS: i64 =
+    crate::pg_engine::snapshot_reachability::SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS;
+
 /// One object's entry for [`JanitorMetadataSession::settle_deletions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JanitorDeletionSettlement {
@@ -37,6 +41,27 @@ pub enum JanitorDeletionSettlement {
         /// Protected object.
         object_id: u64,
     },
+}
+
+impl JanitorDeletionSettlement {
+    /// The settled object.
+    pub fn object_id(&self) -> &u64 {
+        match self {
+            Self::Finished { object_id, .. }
+            | Self::Released { object_id, .. }
+            | Self::Deferred { object_id } => object_id,
+        }
+    }
+
+    /// The claim's fencing token; `None` for a queue-only deferral.
+    pub fn fencing_token(&self) -> Option<i64> {
+        match self {
+            Self::Finished { fencing_token, .. } | Self::Released { fencing_token, .. } => {
+                Some(*fencing_token)
+            }
+            Self::Deferred { .. } => None,
+        }
+    }
 }
 
 /// Durable provider-independent position for one CLI orphan scan.
@@ -291,8 +316,8 @@ impl JanitorMetadataSession {
         Ok(protection)
     }
 
-    /// Claims eligible objects immediately before their remote deletion, in one
-    /// PostgreSQL round trip.
+    /// Claims eligible objects immediately before their remote deletion, in two
+    /// PostgreSQL round trips.
     ///
     /// Returns the fencing token of each claimed object for [`Self::settle_deletions`];
     /// an object missing from the result is now protected by metadata. Untracked

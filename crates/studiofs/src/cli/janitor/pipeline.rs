@@ -38,8 +38,9 @@ const LIST_PAGE_TIMEOUT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(60)
 };
-/// PostgreSQL deletion-claim lease (`SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS`).
-const CLAIM_LEASE: Duration = Duration::from_secs(60);
+/// PostgreSQL deletion-claim lease.
+const CLAIM_LEASE: Duration =
+    Duration::from_secs(studiofs_meta::JANITOR_DELETION_CLAIM_LEASE_SECS as u64);
 /// Longest S3 work for one object: each canonical key (legacy plus fragments) at its timeout.
 const OBJECT_DELETE_BOUND: Duration =
     DELETE_KEY_TIMEOUT.saturating_mul(studiofs_data::object::CLOUD_FRAGMENT_COUNT as u32 + 1);
@@ -47,7 +48,7 @@ const _: () = assert!(
     OBJECT_DELETE_BOUND.as_secs() < CLAIM_LEASE.as_secs(),
     "canonical key deletes must fit inside the deletion-claim lease"
 );
-/// Most objects claimed, and settled, per PostgreSQL round trip.
+/// Most objects claimed, and settled, per PostgreSQL call.
 const DELETION_CLAIM_BATCH: usize = 64;
 /// Consecutive objects whose S3 work failed transiently (after the transport's own
 /// bounded retries) before the cycle stops admitting work as overloaded.
@@ -503,7 +504,7 @@ async fn admit_orphan<S: JanitorObjectStore>(
     Ok(true)
 }
 
-/// Deletes admitted orphans in claim batches. One PostgreSQL round trip claims the
+/// Deletes admitted orphans in claim batches. Two PostgreSQL round trips claim the
 /// batch, each claimed object's S3 deletes follow, and one round trip settles the
 /// outcomes together with the queued `defers`. An object starts its deletes only
 /// while the claim lease still covers [`OBJECT_DELETE_BOUND`]; later objects are
@@ -541,7 +542,6 @@ async fn delete_orphans<S: JanitorObjectStore>(
             let object_id = candidate.object_id;
             let Some(&token) = tokens.get(&object_id) else {
                 stats.claim_protected = stats.claim_protected.saturating_add(1);
-                // Delays a protected queue row so it does not re-occupy the head of every later page.
                 if candidate.queued_eligible_at.is_some() {
                     settlements.push(JanitorDeletionSettlement::Deferred { object_id });
                 }
@@ -588,7 +588,7 @@ async fn delete_orphans<S: JanitorObjectStore>(
         }
         // Success needs PostgreSQL confirmation; an unfinished claim expires and is retried.
         super::set_live_progress_phase(ctx.budget.progress.as_ref(), "metadata_finish");
-        let finished = settle(ctx, &settlements);
+        let finished = settle_or_log(ctx, &settlements);
         for (object_id, s3_delete_failed) in attempted {
             let finish_failed = !finished.contains(&object_id);
             if finish_failed {
@@ -613,7 +613,7 @@ async fn delete_orphans<S: JanitorObjectStore>(
 
 /// Settles deletion outcomes and queue deferrals; returns the confirmed claims. A
 /// failure confirms none, so their claims expire and a later cycle retries them.
-fn settle<S: JanitorObjectStore>(
+fn settle_or_log<S: JanitorObjectStore>(
     ctx: &mut JanitorCycleContext<'_, S>,
     settlements: &[JanitorDeletionSettlement],
 ) -> std::collections::HashSet<u64> {
@@ -1104,6 +1104,6 @@ async fn process_candidate_batch<S: JanitorObjectStore>(
         .into_iter()
         .map(|object_id| JanitorDeletionSettlement::Deferred { object_id })
         .collect();
-    settle(ctx, &defers);
+    settle_or_log(ctx, &defers);
     Ok(())
 }
