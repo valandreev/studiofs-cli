@@ -21,7 +21,7 @@ that the server did not delete anything.
 - [ ] Run the disposable selection on Windows Docker.
 - [ ] Exercise Windows console Ctrl+C delivery (only Unix SIGINT and hard kill are covered).
 - [ ] Exercise CLI vs mounted background Janitor lock contention and a live mounted writer (only CLI vs CLI and seeded PG rows are covered).
-- [ ] Prove the SIGINT kill/drain barrier is tied to the owned CLI's backend; it currently matches any advisory-lock holder on the disposable cluster.
+- [x] (2026-11-10) PR #974 review: tie the claim-fence barrier to the advisory-lock holder blocked by the fixture's own `FOR UPDATE` backend, and re-check that fence after SIGINT instead of relying on one exit poll (3 process tests passed). `Child::kill` already returns `Ok` for an exited child on the pinned Rust 1.95.
 
 ## Surprises & Discoveries
 

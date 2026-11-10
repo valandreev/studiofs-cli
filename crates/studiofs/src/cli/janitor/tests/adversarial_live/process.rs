@@ -2,19 +2,45 @@
 
 use super::*;
 
-async fn wait_for_claim_barrier(client: &tokio_postgres::Client, pid: u32) -> anyhow::Result<()> {
+/// Backend pid of a fixture session, used to identify which lock a CLI waits on.
+async fn backend_pid(client: &tokio_postgres::Client) -> anyhow::Result<i32> {
+    Ok(client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await?
+        .get(0))
+}
+
+/// Whether a session holding the janitor advisory lock is blocked at the claim
+/// publication fence by the fixture's `FOR UPDATE` session `blocker_pid`.
+///
+/// An OS pid cannot be mapped to a PostgreSQL backend, so the CLI is identified
+/// by holding the advisory lock while `blocker_pid` blocks its fence query.
+async fn cli_waits_at_claim_fence(
+    client: &tokio_postgres::Client,
+    blocker_pid: i32,
+) -> anyhow::Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity AS activity WHERE activity.wait_event_type = 'Lock' AND activity.query LIKE 'SELECT 1 FROM metadata_state%FOR SHARE' AND $1 = ANY(pg_blocking_pids(activity.pid)) AND activity.pid IN (SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted))",
+            &[&blocker_pid],
+        )
+        .await?
+        .get(0))
+}
+
+async fn wait_for_claim_barrier(
+    client: &tokio_postgres::Client,
+    blocker_pid: i32,
+    cli_pid: u32,
+) -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            let waiting: bool = client.query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT 1 FROM metadata_state%FOR SHARE' AND pid IN (SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted))",
-                &[],
-            ).await?.get(0);
-            if waiting {
-                return Ok::<_, anyhow::Error>(());
-            }
+        while !cli_waits_at_claim_fence(client, blocker_pid).await? {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    }).await.with_context(|| format!("CLI {pid} never reached the claim publication fence"))?
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .with_context(|| format!("CLI {cli_pid} never reached the claim publication fence"))?
 }
 
 async fn wait_for_cli(child: &mut OwnedCli) -> anyhow::Result<std::process::ExitStatus> {
@@ -49,6 +75,7 @@ async fn live_cli_disposable_kill_restart_and_signal_drain() -> anyhow::Result<(
         )
         .await?;
         let (mut blocker, blocker_task) = connection(&stack).await?;
+        let blocker_pid = backend_pid(&blocker).await?;
         let tx = blocker.transaction().await?;
         tx.query_one(
             "SELECT 1 FROM metadata_state WHERE vol = $1 FOR UPDATE",
@@ -67,7 +94,7 @@ async fn live_cli_disposable_kill_restart_and_signal_drain() -> anyhow::Result<(
         command.stdout(std::fs::File::create(&stdout_path)?);
         command.stderr(std::fs::File::create(&stderr_path)?);
         let mut child = OwnedCli(command.spawn()?);
-        wait_for_claim_barrier(&observer, child.0.id()).await?;
+        wait_for_claim_barrier(&observer, blocker_pid, child.0.id()).await?;
         let competing = stack.cli(&args, &client_root)?;
         assert_eq!(
             competing.status.code(),
@@ -100,6 +127,12 @@ async fn live_cli_disposable_kill_restart_and_signal_drain() -> anyhow::Result<(
                 })
                 .await
                 .context("CLI did not acknowledge SIGINT")??;
+                // The fence is still held, so the drain cannot finish yet: prove the
+                // CLI is blocked on it rather than relying on a single exit poll.
+                assert!(
+                    cli_waits_at_claim_fence(&observer, blocker_pid).await?,
+                    "draining CLI must still wait at the claim fence"
+                );
                 assert!(
                     child.0.try_wait()?.is_none(),
                     "admitted claim must drain before exit"
@@ -202,6 +235,7 @@ async fn live_cli_disposable_concurrent_snapshot_cuts_wait_for_janitor() -> anyh
         "INSERT INTO snapshot_object_reachability (vol, object_id, start_version) VALUES ($1, $2, 0)",
         &[&volume_id, &i64::try_from(pinned)?],
     ).await?;
+    let blocker_pid = backend_pid(&client).await?;
     let tx = client.transaction().await?;
     tx.query_one(
         "SELECT 1 FROM metadata_state WHERE vol = $1 FOR UPDATE",
@@ -218,7 +252,7 @@ async fn live_cli_disposable_concurrent_snapshot_cuts_wait_for_janitor() -> anyh
     )?);
     let mut child = OwnedCli(command.spawn()?);
     let (observer, observer_task) = connection(&stack).await?;
-    wait_for_claim_barrier(&observer, child.0.id()).await?;
+    wait_for_claim_barrier(&observer, blocker_pid, child.0.id()).await?;
     let creators: Vec<_> = (0..2)
         .map(|_| {
             let dsn = stack.postgres_url.clone();
