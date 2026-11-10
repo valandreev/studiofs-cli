@@ -39,7 +39,7 @@ pub(super) const SNAPSHOT_PIN_QUERY: &str = "SELECT DISTINCT reachability.object
       )";
 
 /// [`SNAPSHOT_PIN_QUERY`] restricted to the object IDs in `$2`.
-static BATCH_PIN_QUERY: LazyLock<String> = LazyLock::new(|| {
+pub(super) static BATCH_PIN_QUERY: LazyLock<String> = LazyLock::new(|| {
     format!("{SNAPSHOT_PIN_QUERY} AND reachability.object_id = ANY($2::BIGINT[])")
 });
 

@@ -244,6 +244,14 @@ stack. Existing opt-in provider verification remains separately selectable with
 `sfs973_live_s3_resumable_listing_covers_every_object`; it requires explicitly
 configured test resources and is not run by the disposable selection.
 
+For SFS-1066, select
+`live_cli_disposable_retires_abandoned_upload_but_protects_delayed_publication`
+to verify actual S3 removal of a retired upload and protection through delayed
+metadata publication. Its focused metadata counterpart is
+`abandoned_uploaded_objects_retire_only_after_local_publication_is_settled`
+in `studiofs-meta`; it requires an explicitly configured disposable
+`STUDIOFS_TEST_PG_DSN` and `-- --ignored`.
+
 The deterministic writer interleaving uses test metadata, and process acceptance
 seeds PostgreSQL ownership rows. Neither substitutes for a live mounted writer
 or Windows signal-delivery acceptance. See the living

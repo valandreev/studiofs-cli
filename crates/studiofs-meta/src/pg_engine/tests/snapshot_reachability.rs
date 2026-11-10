@@ -1098,6 +1098,165 @@ fn uploaded_fragment_ledger_batches_preserve_recovery_rows() {
     .expect("verify confirmed upload fragment batch rows");
 }
 
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn abandoned_uploaded_objects_retire_only_after_local_publication_is_settled() {
+    use crate::snapshot_ports::UploadedObjectDeletionClaim::{Claimed, Protected};
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let volume = PgTestVolume::new(&dsn, "snapshot-reachability-abandoned-upload");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    seed_local(&db_path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open postgres engine");
+
+    let upload = |object_id| {
+        let entry = UploadedFragmentLedgerEntry {
+            volume_id: volume.volume_id,
+            object_id,
+            fragment_index: 0,
+            object_key: format!("objects/{object_id}/0"),
+            expected_byte_length: 1,
+            expected_sha256: [object_id as u8; 32],
+        };
+        engine
+            .begin_fragment_uploads(std::slice::from_ref(&entry))
+            .expect("begin upload fragment");
+        engine
+            .confirm_fragment_uploads(std::slice::from_ref(&entry))
+            .expect("confirm upload fragment");
+        engine
+            .flush_metadata()
+            .expect("replicate uploaded fragment");
+    };
+    let state = |object_id: i64| -> Option<String> {
+        let dsn = dsn.clone();
+        let volume_id = volume.volume_id;
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            let row = client
+                .query_opt(
+                    "SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2",
+                    &[&volume_id, &object_id],
+                )
+                .await
+                .expect("read upload object state");
+            connection_task.abort();
+            Ok::<_, MetaError>(row.map(|row| row.get(0)))
+        })
+        .expect("read upload object state")
+    };
+
+    // A completed upload with an acknowledged local deletion marker is abandoned
+    // and becomes claimable for remote cleanup.
+    upload(71);
+    assert_eq!(state(71).as_deref(), Some("uploaded"));
+    engine
+        .add_pending_deletion(71, 1)
+        .expect("record abandoned upload deletion");
+    create_published_small_file(&engine, ROOT_INO, b"outbound-tail-barrier", 74);
+    {
+        let _replication = engine.replication_lock.lock().expect("lock replication");
+        engine
+            .retire_abandoned_uploads()
+            .expect("defer retirement until the outbound tail is acknowledged");
+    }
+    assert_eq!(state(71).as_deref(), Some("uploaded"));
+    engine
+        .flush_metadata()
+        .expect("retire settled abandoned upload");
+    assert_eq!(state(71).as_deref(), Some("delete_pending"));
+    assert!(matches!(
+        engine
+            .claim_uploaded_object_deletion(71, "test-janitor")
+            .expect("claim abandoned upload"),
+        Claimed { .. }
+    ));
+
+    // A local publication queued behind the deletion marker must reach PostgreSQL
+    // before cleanup can fence the uploaded ID.
+    upload(72);
+    engine
+        .add_pending_deletion(72, 2)
+        .expect("record deletion before delayed publication");
+    create_published_small_file(&engine, ROOT_INO, b"delayed-publication", 72);
+    {
+        let _replication = engine.replication_lock.lock().expect("lock replication");
+        engine
+            .retire_abandoned_uploads()
+            .expect("skip retirement while local publication is pending");
+    }
+    assert_eq!(state(72).as_deref(), Some("uploaded"));
+    engine
+        .flush_due_pending()
+        .expect("publish due delayed metadata");
+    engine
+        .flush_metadata()
+        .expect("publish delayed upload before retirement");
+    assert_eq!(state(72).as_deref(), Some("published"));
+    assert!(matches!(
+        engine
+            .claim_uploaded_object_deletion(72, "test-janitor")
+            .expect("claim referenced upload"),
+        Protected
+    ));
+
+    // A periodic mounted Janitor cycle also retires a settled marker without an
+    // explicit metadata flush from its caller.
+    upload(75);
+    engine
+        .add_pending_deletion(75, 4)
+        .expect("record upload abandoned between Janitor cycles");
+    assert_eq!(state(75).as_deref(), Some("uploaded"));
+    assert!(
+        engine
+            .try_acquire_global_janitor_lock()
+            .expect("admit mounted Janitor cycle")
+    );
+    assert_eq!(state(75).as_deref(), Some("delete_pending"));
+    engine
+        .release_global_janitor_lock()
+        .expect("release mounted Janitor lock");
+
+    // An unpublished local overlay can retain an upload even after its metadata
+    // sequence is settled in PostgreSQL.
+    upload(73);
+    let file = engine
+        .create_file(ROOT_INO, b"retained-local-overlay", 0, 0, 0o644)
+        .expect("create local overlay file");
+    set_file_state(&engine, file.ino, 64, 1);
+    engine
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(73, 64))
+        .expect("stage retained local payload");
+    mark_overlay_objects_uploaded(&engine, file.ino, 1, &[73]);
+    engine
+        .flush_metadata()
+        .expect("settle local overlay metadata sequence");
+    assert!(
+        engine
+            .get_referenced_object_ids()
+            .expect("read local and remote references")
+            .contains(&73)
+    );
+    engine
+        .add_pending_deletion(73, 3)
+        .expect("record deletion for locally retained upload");
+    engine
+        .flush_metadata()
+        .expect("preserve locally referenced upload");
+    assert_eq!(state(73).as_deref(), Some("uploaded"));
+}
+
 fn activate_payload_allocator(engine: &PgMetaEngine, namespace: u32, reserved_through: u64) {
     use crate::allocator_state::{AllocatorRecord, AllocatorStateV1};
     let state = AllocatorStateV1::new(

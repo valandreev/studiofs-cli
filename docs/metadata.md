@@ -643,6 +643,20 @@ Janitor policy:
   `uploaded`, `retry_wait`). An untracked object receives a `delete_pending`
   fence row in that transaction. A protected object rolls back without ledger
   changes.
+- after an explicit metadata flush or before a mounted Janitor cycle, the
+  owning client retires a
+  completed `uploaded` object if it has a durable local pending-deletion marker,
+  no local base/overlay/recovery reference, and its entire local metadata journal
+  is acknowledged. This acknowledgement barrier preserves a slow publication
+  that is still queued locally. Under the same PostgreSQL publication fence,
+  retirement rechecks shared references, snapshot pins and reconciliation leases,
+  then moves the object to terminal `delete_pending` and enqueues it for normal
+  Janitor deletion. It does not relax the Janitor's protection of uploads still
+  awaiting publication. A failed or deferred retirement is logged, does not fail
+  the flush or Janitor admission, and retains the local marker for retry,
+  including after restart. Only the owning client can prove an upload abandoned,
+  so after an unmount its objects are retired once that client mounts again; the
+  CLI Janitor never retires uploads itself.
 - the CLI deletes only canonical keys (legacy plus every fragment) of a listed
   canonical object key, bounds each DELETE inside the claim lease, treats
   `NotFound` as deleted, and counts an object as deleted only after the fenced
