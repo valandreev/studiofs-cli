@@ -88,11 +88,44 @@ fn safe_sweep_key(prefix: &str, key: &str) -> bool {
         && !suffix.split('/').any(|part| matches!(part, "." | ".."))
 }
 
+/// PostgreSQL is the reference authority, so a local replica behind it is safe;
+/// one ahead means PostgreSQL lost history (e.g. a restored backup).
+fn local_is_ahead(local_version: u64, remote_head: i64) -> bool {
+    i64::try_from(local_version).map_or(true, |local| local > remote_head)
+}
+
 fn pg_sweep_timeout(timeout: Duration) -> JanitorMetadataError {
     JanitorMetadataError::BackendUnavailable(format!(
         "PostgreSQL janitor sweep checkpoint timed out after {} seconds",
         timeout.as_secs()
     ))
+}
+
+/// Rejects a scan position that is not a safe key under the scope's prefix or
+/// whose pending object does not match its pending key.
+fn validate_sweep_checkpoint(
+    scope: &JanitorSweepScope<'_>,
+    checkpoint: &JanitorSweepCheckpoint,
+) -> Result<(), JanitorMetadataError> {
+    let prefix = scope.data_prefix;
+    let after_key = checkpoint.after_key.as_deref();
+    let pending_key = checkpoint.pending_key.as_deref();
+    let valid = checkpoint.pending_object_id.is_some() == pending_key.is_some()
+        && (pending_key.is_none() || after_key.is_some())
+        && after_key.is_none_or(|key| {
+            safe_sweep_key(prefix, key) && pending_key.is_none_or(|pending| key >= pending)
+        })
+        && pending_key.is_none_or(|key| {
+            safe_sweep_key(prefix, key)
+                && canonical_sweep_object_id(prefix, key) == checkpoint.pending_object_id
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(JanitorMetadataError::UnsafeToDelete(
+            "janitor sweep checkpoint position is invalid",
+        ))
+    }
 }
 
 async fn persist_sweep_checkpoint(
@@ -101,31 +134,7 @@ async fn persist_sweep_checkpoint(
     scope: &JanitorSweepScope<'_>,
     checkpoint: &JanitorSweepCheckpoint,
 ) -> Result<(), JanitorMetadataError> {
-    if !(1..=20).contains(&checkpoint.next_prefix.len())
-        || !checkpoint
-            .next_prefix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || checkpoint.pending_object_id.is_some() != checkpoint.pending_key.is_some()
-        || (checkpoint.pending_key.is_some() && checkpoint.after_key.is_none())
-        || checkpoint.after_key.as_deref().is_some_and(|key| {
-            !safe_sweep_key(scope.data_prefix, key)
-                || checkpoint
-                    .pending_key
-                    .as_deref()
-                    .is_some_and(|pending_key| key < pending_key)
-        })
-        || checkpoint.pending_key.as_deref().is_some_and(|key| {
-            !safe_sweep_key(scope.data_prefix, key)
-                || checkpoint.pending_object_id.is_some_and(|object_id| {
-                    canonical_sweep_object_id(scope.data_prefix, key) != Some(object_id)
-                })
-        })
-    {
-        return Err(JanitorMetadataError::UnsafeToDelete(
-            "janitor sweep checkpoint position is invalid",
-        ));
-    }
+    validate_sweep_checkpoint(scope, checkpoint)?;
     let pending_object_id = checkpoint
         .pending_object_id
         .map(i64::try_from)
@@ -135,7 +144,7 @@ async fn persist_sweep_checkpoint(
         })?;
     let affected = client
         .execute(
-            "INSERT INTO snapshot_payload_sweep_checkpoints (vol, schema_version, volume_uuid, endpoint, bucket, data_prefix, listing_strategy, after_key, pending_object_id, pending_key, next_prefix) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (vol) DO UPDATE SET schema_version = EXCLUDED.schema_version, volume_uuid = EXCLUDED.volume_uuid, endpoint = EXCLUDED.endpoint, bucket = EXCLUDED.bucket, data_prefix = EXCLUDED.data_prefix, listing_strategy = EXCLUDED.listing_strategy, after_key = EXCLUDED.after_key, pending_object_id = EXCLUDED.pending_object_id, pending_key = EXCLUDED.pending_key, next_prefix = EXCLUDED.next_prefix WHERE snapshot_payload_sweep_checkpoints.schema_version = 1",
+            "INSERT INTO snapshot_payload_sweep_checkpoints (vol, schema_version, volume_uuid, endpoint, bucket, data_prefix, listing_strategy, after_key, pending_object_id, pending_key) VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (vol) DO UPDATE SET schema_version = EXCLUDED.schema_version, volume_uuid = EXCLUDED.volume_uuid, endpoint = EXCLUDED.endpoint, bucket = EXCLUDED.bucket, data_prefix = EXCLUDED.data_prefix, listing_strategy = EXCLUDED.listing_strategy, after_key = EXCLUDED.after_key, pending_object_id = EXCLUDED.pending_object_id, pending_key = EXCLUDED.pending_key WHERE snapshot_payload_sweep_checkpoints.schema_version = 1",
             &[
                 &volume_id,
                 &scope.volume_uuid,
@@ -146,7 +155,6 @@ async fn persist_sweep_checkpoint(
                 &checkpoint.after_key,
                 &pending_object_id,
                 &checkpoint.pending_key,
-                &checkpoint.next_prefix,
             ],
         )
         .await
@@ -190,61 +198,58 @@ impl PgJanitorSession {
         let timeout = self.command_timeout;
         let result = runtime.block_on(async {
             tokio::time::timeout(timeout, async {
-                let row = client.query_opt(
-                    "SELECT schema_version, volume_uuid, endpoint, bucket, data_prefix, listing_strategy, after_key, pending_object_id, pending_key, next_prefix FROM snapshot_payload_sweep_checkpoints WHERE vol = $1",
-                    &[&volume_id],
-                ).await.map_err(|error| janitor_pg_error("janitor sweep checkpoint read failed", error))?;
-                let Some(row) = row else {
-                    let checkpoint = JanitorSweepCheckpoint { after_key: None, pending_object_id: None, pending_key: None, next_prefix: "0".into() };
-                    if persist_initial { persist_sweep_checkpoint(client, volume_id, &scope, &checkpoint).await?; }
-                    return Ok(checkpoint);
-                };
-                let version: i16 = row.get(0);
-                if version != 1 {
-                    return Err(JanitorMetadataError::UnsafeToDelete("janitor sweep checkpoint schema is unsupported"));
-                }
-                let stored_scope = (
-                    row.get::<usize, String>(1), row.get::<usize, String>(2),
-                    row.get::<usize, String>(3), row.get::<usize, String>(4),
-                    row.get::<usize, String>(5),
-                );
-                if stored_scope.0 == scope.volume_uuid && stored_scope.1 == scope.endpoint
-                    && stored_scope.2 == scope.bucket && stored_scope.3 == scope.data_prefix
-                    && stored_scope.4 == scope.listing_strategy
-                {
-                    let after_key: Option<String> = row.get(6);
-                    let pending_object_id: Option<i64> = row.get(7);
-                    let pending_object_id = pending_object_id
-                        .map(u64::try_from)
-                        .transpose()
-                        .map_err(|_| JanitorMetadataError::UnsafeToDelete("janitor sweep checkpoint object id is invalid"))?;
-                    let pending_key: Option<String> = row.get(8);
-                    let next_prefix: String = row.get(9);
-                    if !next_prefix.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                        || !(1..=20).contains(&next_prefix.len())
-                        || pending_object_id.is_some() != pending_key.is_some()
-                        || (pending_key.is_some() && after_key.is_none())
-                        || after_key.as_deref().is_some_and(|key| {
-                            !safe_sweep_key(scope.data_prefix, key)
-                                || pending_key.as_deref().is_some_and(|pending_key| key < pending_key)
-                        })
-                        || pending_key.as_deref().is_some_and(|key| {
-                            !safe_sweep_key(scope.data_prefix, key)
-                                || pending_object_id.is_some_and(|object_id| {
-                                    canonical_sweep_object_id(scope.data_prefix, key) != Some(object_id)
-                                })
-                        })
-                    {
-                        return Err(JanitorMetadataError::UnsafeToDelete("janitor sweep checkpoint position is invalid"));
+                let row = client
+                    .query_opt(
+                        "SELECT schema_version, volume_uuid, endpoint, bucket, data_prefix, listing_strategy, after_key, pending_object_id, pending_key FROM snapshot_payload_sweep_checkpoints WHERE vol = $1",
+                        &[&volume_id],
+                    )
+                    .await
+                    .map_err(|error| {
+                        janitor_pg_error("janitor sweep checkpoint read failed", error)
+                    })?;
+                if let Some(row) = row {
+                    if row.get::<_, i16>(0) != 1 {
+                        return Err(JanitorMetadataError::UnsafeToDelete(
+                            "janitor sweep checkpoint schema is unsupported",
+                        ));
                     }
-                    return Ok(JanitorSweepCheckpoint { after_key, pending_object_id, pending_key, next_prefix });
+                    let stored_scope: [String; 5] =
+                        [row.get(1), row.get(2), row.get(3), row.get(4), row.get(5)];
+                    if stored_scope
+                        == [
+                            scope.volume_uuid,
+                            scope.endpoint,
+                            scope.bucket,
+                            scope.data_prefix,
+                            scope.listing_strategy,
+                        ]
+                    {
+                        let pending_object_id = row
+                            .get::<_, Option<i64>>(7)
+                            .map(u64::try_from)
+                            .transpose()
+                            .map_err(|_| {
+                                JanitorMetadataError::UnsafeToDelete(
+                                    "janitor sweep checkpoint object id is invalid",
+                                )
+                            })?;
+                        let checkpoint = JanitorSweepCheckpoint {
+                            after_key: row.get(6),
+                            pending_object_id,
+                            pending_key: row.get(8),
+                        };
+                        validate_sweep_checkpoint(&scope, &checkpoint)?;
+                        return Ok(checkpoint);
+                    }
                 }
-                let checkpoint = JanitorSweepCheckpoint { after_key: None, pending_object_id: None, pending_key: None, next_prefix: "0".into() };
+                // No row, or one saved for another storage scope: the sweep starts over.
+                let checkpoint = JanitorSweepCheckpoint::default();
                 if persist_initial {
                     persist_sweep_checkpoint(client, volume_id, &scope, &checkpoint).await?;
                 }
                 Ok(checkpoint)
-            }).await
+            })
+            .await
         });
         result.map_err(|_| pg_sweep_timeout(timeout))?
     }
@@ -270,48 +275,6 @@ impl PgJanitorSession {
                 .await
             })
             .map_err(|_| pg_sweep_timeout(timeout))?
-    }
-
-    pub(crate) fn reset_sweep_checkpoint(
-        &mut self,
-        _scope: JanitorSweepScope<'_>,
-    ) -> Result<(), JanitorMetadataError> {
-        let (Some(client), Some(runtime)) = (self.client.as_mut(), self.runtime.as_ref()) else {
-            return Err(JanitorMetadataError::UnsafeToDelete(
-                "PostgreSQL janitor lock is not held",
-            ));
-        };
-        let timeout = self.command_timeout;
-        let volume_id = self.volume_id;
-        runtime.block_on(async {
-            tokio::time::timeout(timeout, async {
-                if let Some(row) = client
-                    .query_opt(
-                        "SELECT schema_version FROM snapshot_payload_sweep_checkpoints WHERE vol = $1",
-                        &[&volume_id],
-                    )
-                    .await
-                    .map_err(|error| janitor_pg_error("janitor sweep checkpoint read failed", error))?
-                {
-                    let version: i16 = row.get(0);
-                    if version != 1 {
-                        return Err(JanitorMetadataError::UnsafeToDelete(
-                            "janitor sweep checkpoint schema is unsupported",
-                        ));
-                    }
-                    client
-                        .execute(
-                            "DELETE FROM snapshot_payload_sweep_checkpoints WHERE vol = $1 AND schema_version = 1",
-                            &[&volume_id],
-                        )
-                        .await
-                        .map_err(|error| janitor_pg_error("janitor sweep checkpoint reset failed", error))?;
-                }
-                Ok(())
-            })
-            .await
-        })
-        .map_err(|_| pg_sweep_timeout(timeout))?
     }
 
     pub(crate) fn try_acquire_global_janitor_lock(&mut self) -> MetaResult<bool> {
@@ -517,9 +480,9 @@ impl PgJanitorSession {
                         "PostgreSQL volume identity or storage binding does not match",
                     ));
                 }
-                if i64::try_from(local_version).ok() != Some(remote_head) {
+                if local_is_ahead(local_version, remote_head) {
                     return Err(JanitorMetadataError::UnsafeToDelete(
-                        "local metadata is not synchronized with PostgreSQL",
+                        "local metadata is ahead of PostgreSQL",
                     ));
                 }
 
@@ -562,21 +525,24 @@ impl PgJanitorSession {
                         janitor_pg_error("janitor snapshot pin query failed", error)
                     })?;
 
+                let invalid_ids = |context: &'static str| {
+                    move |_| JanitorMetadataError::BackendUnavailable(context.to_owned())
+                };
                 let referenced = decode_janitor_object_ids(reference_rows)
-                    .map_err(|error| janitor_pg_error("janitor current references are invalid", error))?;
+                    .map_err(invalid_ids("janitor current references are invalid"))?;
                 let snapshot_pins = decode_janitor_object_ids(pin_rows)
-                    .map_err(|error| janitor_pg_error("janitor snapshot pins are invalid", error))?;
+                    .map_err(invalid_ids("janitor snapshot pins are invalid"))?;
                 let lease_rows = transaction.query(
                     "SELECT DISTINCT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) AND (state IN ('uploading', 'uploaded', 'retry_wait') OR (reconcile_owner IS NOT NULL AND reconcile_lease_expires_at > clock_timestamp()))",
                     &[&volume_id, &object_ids],
                 ).await.map_err(|error| janitor_pg_error("janitor upload lease query failed", error))?;
-                let active_uploads = decode_janitor_object_ids(lease_rows).map_err(|error| janitor_pg_error("janitor upload lease IDs are invalid", error))?;
+                let active_uploads = decode_janitor_object_ids(lease_rows).map_err(invalid_ids("janitor upload lease IDs are invalid"))?;
                 let candidate_rows = transaction.query(
                     "SELECT object_id, floor(extract(epoch FROM eligible_at))::BIGINT, (extract(epoch FROM eligible_at) <= $3::BIGINT AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp())) FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = ANY($2::BIGINT[]) AND acknowledged_at IS NULL",
                     &[&volume_id, &object_ids, &eligible_before],
                 ).await.map_err(|error| janitor_pg_error("janitor GC candidate state query failed", error))?;
                 let gc_candidates = candidate_rows.into_iter().map(|row| {
-                    let object_id = u64::try_from(row.get::<_, i64>(0)).map_err(|_| janitor_pg_error("janitor GC candidate IDs are invalid", "invalid object ID"))?;
+                    let object_id = u64::try_from(row.get::<_, i64>(0)).map_err(|_| JanitorMetadataError::BackendUnavailable("janitor GC candidate IDs are invalid".to_owned()))?;
                     Ok((object_id, (row.get::<_, i64>(1), row.get::<_, bool>(2))))
                 }).collect::<Result<HashMap<_, _>, JanitorMetadataError>>()?;
                 transaction.commit().await.map_err(|error| {
@@ -640,6 +606,8 @@ impl PgJanitorSession {
             i64::try_from(requested_limit.min(PG_JANITOR_CANDIDATE_PAGE_SIZE)).map_err(|_| {
                 JanitorMetadataError::UnsafeToDelete("janitor candidate page limit is invalid")
             })?;
+        /// Legacy ledger rows enqueued by the first page of one cycle.
+        const BACKFILL_ROWS: i64 = 4_096;
         let statement = if after.is_some() {
             "SELECT object_id, floor(extract(epoch FROM eligible_at) * 1000000)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND acknowledged_at IS NULL AND (eligible_at, object_id) > ('epoch'::timestamptz + $2::BIGINT * interval '1 microsecond', $3) AND extract(epoch FROM eligible_at) <= $4::BIGINT AND (next_attempt_at IS NULL OR next_attempt_at <= clock_timestamp()) ORDER BY eligible_at, object_id LIMIT $5"
         } else {
@@ -649,15 +617,16 @@ impl PgJanitorSession {
             tokio::time::timeout(self.command_timeout, async {
                 let tx = client.transaction().await?;
                 // Dry runs only read the queue; ledger conversion and backfill are writes.
-                if backfill {
+                // Later pages of a cycle only read: the first page already enqueued the backlog.
+                if backfill && after.is_none() {
                 tx.execute(
                     "WITH legacy AS (SELECT object_id FROM snapshot_payload_upload_objects WHERE vol = $1 AND state = 'retry_wait' AND last_error IN ('remote deletion retry required', 'cli janitor remote deletion retry required') AND (reconcile_lease_expires_at IS NULL OR reconcile_lease_expires_at <= clock_timestamp()) ORDER BY object_id LIMIT $2 FOR UPDATE SKIP LOCKED) UPDATE snapshot_payload_upload_objects AS uploaded SET state = 'delete_pending', reconcile_owner = NULL, reconcile_lease_expires_at = NULL, next_retry_at = NULL WHERE uploaded.vol = $1 AND uploaded.object_id IN (SELECT object_id FROM legacy)",
-                    &[&self.volume_id, &limit],
+                    &[&self.volume_id, &BACKFILL_ROWS],
                 )
                 .await?;
                 tx.execute(
                     "WITH pending AS (SELECT uploaded.object_id, COALESCE(uploaded.closed_at, uploaded.created_at) AS eligible_at, uploaded.next_retry_at FROM snapshot_payload_upload_objects AS uploaded LEFT JOIN snapshot_payload_gc_candidates AS candidate ON candidate.vol = uploaded.vol AND candidate.object_id = uploaded.object_id WHERE uploaded.vol = $1 AND uploaded.state = 'delete_pending' AND uploaded.reconcile_owner IS NULL AND candidate.object_id IS NULL AND extract(epoch FROM COALESCE(uploaded.closed_at, uploaded.created_at)) <= $2::BIGINT AND (uploaded.next_retry_at IS NULL OR uploaded.next_retry_at <= clock_timestamp()) ORDER BY eligible_at, uploaded.object_id LIMIT $3 FOR UPDATE OF uploaded SKIP LOCKED) INSERT INTO snapshot_payload_gc_candidates (vol, object_id, eligible_at, next_attempt_at) SELECT $1, object_id, eligible_at, next_retry_at FROM pending ON CONFLICT (vol, object_id) DO NOTHING",
-                    &[&self.volume_id, &eligible_before, &limit],
+                    &[&self.volume_id, &eligible_before, &BACKFILL_ROWS],
                 )
                 .await?;
                 }
@@ -676,11 +645,7 @@ impl PgJanitorSession {
                     "PostgreSQL GC candidate page timed out".to_owned(),
                 )
             })?
-            .map_err(|_| {
-                JanitorMetadataError::BackendUnavailable(
-                    "PostgreSQL GC candidate page failed".to_owned(),
-                )
-            })?;
+            .map_err(|error| janitor_pg_error("PostgreSQL GC candidate page failed", error))?;
         rows.into_iter()
             .map(|row| {
                 let object_id: i64 = row.get(0);
@@ -719,8 +684,9 @@ impl PgJanitorSession {
         match result {
             Ok(Ok(1)) => Ok(()),
             Ok(Ok(_)) => Err(JanitorMetadataError::StaleClaim),
-            Ok(Err(_)) => Err(JanitorMetadataError::BackendUnavailable(
-                "PostgreSQL GC candidate retry update failed".to_owned(),
+            Ok(Err(error)) => Err(janitor_pg_error(
+                "PostgreSQL GC candidate retry update failed",
+                error,
             )),
             Err(_) => Err(JanitorMetadataError::BackendUnavailable(
                 "PostgreSQL GC candidate retry update timed out".to_owned(),
@@ -749,8 +715,9 @@ impl PgJanitorSession {
         match result {
             Ok(Ok(1)) => Ok(()),
             Ok(Ok(_)) => Err(JanitorMetadataError::StaleClaim),
-            Ok(Err(_)) => Err(JanitorMetadataError::BackendUnavailable(
-                "PostgreSQL GC candidate acknowledgement failed".to_owned(),
+            Ok(Err(error)) => Err(janitor_pg_error(
+                "PostgreSQL GC candidate acknowledgement failed",
+                error,
             )),
             Err(_) => Err(JanitorMetadataError::BackendUnavailable(
                 "PostgreSQL GC candidate acknowledgement timed out".to_owned(),
@@ -894,6 +861,25 @@ impl PgJanitorSession {
                 break;
             }
         }
+        // An acknowledged queue row only stops the backfill from re-enqueueing its
+        // fence; once the fence row is pruned it has no purpose left.
+        runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    self.command_timeout,
+                    client.execute(
+                        "DELETE FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id IN (SELECT candidate.object_id FROM snapshot_payload_gc_candidates AS candidate WHERE candidate.vol = $1 AND candidate.acknowledged_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM snapshot_payload_upload_objects AS uploaded WHERE uploaded.vol = candidate.vol AND uploaded.object_id = candidate.object_id) LIMIT $2)",
+                        &[&self.volume_id, &(BATCH_ROWS * MAX_BATCHES as i64)],
+                    ),
+                )
+                .await
+            })
+            .map_err(|_| {
+                JanitorMetadataError::BackendUnavailable(
+                    "PostgreSQL janitor queue prune timed out".to_owned(),
+                )
+            })?
+            .map_err(|error| janitor_pg_error("janitor queue prune failed", error))?;
         Ok(pruned)
     }
 }
@@ -983,9 +969,19 @@ pub(super) async fn claim_object_deletion_in(
     Ok(fencing_token)
 }
 
-/// Drops the source error so PostgreSQL details (possibly the DSN) never reach CLI output.
-fn janitor_pg_error(context: &'static str, _error: impl std::fmt::Display) -> JanitorMetadataError {
-    JanitorMetadataError::BackendUnavailable(context.to_owned())
+/// Keeps only the SQLSTATE code: the error text may carry connection details, the
+/// code cannot. Class 42 (undefined table or column, insufficient privilege) means
+/// the schema does not fit this binary, which no retry fixes.
+fn janitor_pg_error(context: &'static str, error: tokio_postgres::Error) -> JanitorMetadataError {
+    match error.code().map(tokio_postgres::error::SqlState::code) {
+        Some(code) if code.starts_with("42") => {
+            JanitorMetadataError::SchemaUnavailable(format!("{context} (SQLSTATE {code})"))
+        }
+        Some(code) => {
+            JanitorMetadataError::BackendUnavailable(format!("{context} (SQLSTATE {code})"))
+        }
+        None => JanitorMetadataError::BackendUnavailable(context.to_owned()),
+    }
 }
 
 impl Drop for PgJanitorSession {
@@ -1152,4 +1148,18 @@ const PG_EVENT_LOG_PRUNE_LOCK_SALT: i64 = 0x5f53_4653_5f50_5255;
 
 pub(super) fn pg_event_log_prune_lock_key(volume_id: i64) -> i64 {
     volume_id.wrapping_mul(1_000_003) ^ PG_EVENT_LOG_PRUNE_LOCK_SALT
+}
+
+#[cfg(test)]
+mod version_gate_tests {
+    #[test]
+    fn only_a_local_replica_ahead_of_postgres_is_unsafe() {
+        assert!(!super::local_is_ahead(5, 5));
+        assert!(
+            !super::local_is_ahead(5, 9),
+            "peers may publish during a cycle"
+        );
+        assert!(super::local_is_ahead(6, 5));
+        assert!(super::local_is_ahead(u64::MAX, i64::MAX));
+    }
 }

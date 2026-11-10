@@ -68,7 +68,8 @@ pub(super) fn classify_error(error: &anyhow::Error) -> JanitorFailureClass {
         }
         if let Some(error) = cause.downcast_ref::<JanitorMetadataError>() {
             return match error {
-                JanitorMetadataError::UnsafeToDelete(_) => JanitorFailureClass::Terminal,
+                JanitorMetadataError::UnsafeToDelete(_)
+                | JanitorMetadataError::SchemaUnavailable(_) => JanitorFailureClass::Terminal,
                 // A lost connection or fenced-out claim leaves durable state to a later cycle.
                 JanitorMetadataError::BackendUnavailable(_) | JanitorMetadataError::StaleClaim => {
                     JanitorFailureClass::Transient
@@ -237,9 +238,6 @@ pub(super) trait JanitorListing {
 
 pub(super) trait JanitorObjectStore {
     type Listing: JanitorListing;
-    fn supports_start_after(&self) -> bool {
-        true
-    }
     async fn list(&self, prefix: &str, after_key: Option<&str>) -> anyhow::Result<Self::Listing>;
     async fn last_modified(&self, key: &str) -> anyhow::Result<Option<SystemTime>>;
     async fn stat_key(&self, key: &str) -> anyhow::Result<JanitorKeyStat> {
@@ -608,18 +606,7 @@ fn defer_queued_candidate<S: JanitorObjectStore>(
 pub(super) async fn run_one_cycle<S: JanitorObjectStore>(
     ctx: JanitorCycleContext<'_, S>,
 ) -> anyhow::Result<JanitorStats> {
-    run_one_cycle_inner(
-        ctx,
-        JanitorSweepCheckpoint {
-            after_key: None,
-            pending_object_id: None,
-            pending_key: None,
-            next_prefix: "0".to_string(),
-        },
-        None,
-        false,
-    )
-    .await
+    run_one_cycle_inner(ctx, JanitorSweepCheckpoint::default(), None, false).await
 }
 
 pub(super) async fn run_one_cycle_resumable<S: JanitorObjectStore>(
@@ -731,28 +718,22 @@ async fn run_one_cycle_inner<S: JanitorObjectStore>(
         return Ok(stats);
     }
 
-    let listing_result = if ctx.store.supports_start_after() {
-        run_start_after_listing(
-            &mut ctx,
-            &mut stats,
-            &mut checkpoint,
-            now,
-            now_unix,
-            cycle_started,
-        )
-        .await
+    let persist_scope = if persist_checkpoint {
+        Some(scope.ok_or_else(|| anyhow::anyhow!("janitor checkpoint scope is missing"))?)
     } else {
-        run_prefix_trie_listing(
-            &mut ctx,
-            &mut stats,
-            &mut checkpoint,
-            now,
-            now_unix,
-            cycle_started,
-        )
-        .await
+        None
     };
-    // Only the opening list request of a start-after sweep reaches here cancelled,
+    let listing_result = run_start_after_listing(
+        &mut ctx,
+        &mut stats,
+        &mut checkpoint,
+        persist_scope,
+        now,
+        now_unix,
+        cycle_started,
+    )
+    .await;
+    // Only the opening list request of a sweep reaches here cancelled,
     // before any checkpoint change; mid-listing cancels stop like other budgets.
     if let Err(error) = listing_result {
         if is_cancellation(&error) {
@@ -765,8 +746,7 @@ async fn run_one_cycle_inner<S: JanitorObjectStore>(
         return Err(error);
     }
 
-    if persist_checkpoint {
-        let scope = scope.ok_or_else(|| anyhow::anyhow!("janitor checkpoint scope is missing"))?;
+    if let Some(scope) = persist_scope {
         tokio::task::block_in_place(|| ctx.metadata.save_sweep_checkpoint(*scope, &checkpoint))?;
     }
     stats.scan_position = scan_position(&checkpoint);
@@ -789,13 +769,14 @@ fn scan_position(checkpoint: &JanitorSweepCheckpoint) -> String {
     checkpoint
         .after_key
         .clone()
-        .unwrap_or_else(|| checkpoint.next_prefix.clone())
+        .unwrap_or_else(|| "start".to_string())
 }
 
 async fn run_start_after_listing<S: JanitorObjectStore>(
     ctx: &mut JanitorCycleContext<'_, S>,
     stats: &mut JanitorStats,
     checkpoint: &mut JanitorSweepCheckpoint,
+    persist_scope: Option<&JanitorSweepScope<'_>>,
     now: SystemTime,
     now_unix: i64,
     cycle_started: Instant,
@@ -912,6 +893,12 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
                 break;
             }
             committed = checkpoint.clone();
+            // Saved per batch, so a later listing or metadata failure keeps this progress.
+            if let Some(scope) = persist_scope {
+                tokio::task::block_in_place(|| {
+                    ctx.metadata.save_sweep_checkpoint(*scope, &committed)
+                })?;
+            }
         }
     }
     eprintln!(
@@ -925,7 +912,6 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
         checkpoint.after_key = None;
         checkpoint.pending_object_id = None;
         checkpoint.pending_key = None;
-        checkpoint.next_prefix = "0".to_string();
         stats.scan_complete = true;
     }
     if !candidates.is_empty() {
@@ -942,212 +928,6 @@ async fn run_start_after_listing<S: JanitorObjectStore>(
     if stats.outcome == CycleOutcome::Complete && !reached_eof {
         stats.outcome = CycleOutcome::ScanBudgetExhausted;
     }
-    Ok(())
-}
-
-fn prefix_for_hex_cursor(prefix: &str, cursor: &str) -> String {
-    if cursor.len() <= 4 {
-        format!("{prefix}{cursor}")
-    } else {
-        format!("{}{}/{}", prefix, &cursor[..4], &cursor[4..])
-    }
-}
-
-fn next_hex_prefix(cursor: &str) -> Option<String> {
-    let mut bytes = cursor.as_bytes().to_vec();
-    while bytes.last() == Some(&b'f') {
-        bytes.pop();
-    }
-    let last = *bytes.last()?;
-    *bytes.last_mut()? = match last {
-        b'0'..=b'8' | b'a'..=b'e' => last + 1,
-        b'9' => b'a',
-        _ => return None,
-    };
-    String::from_utf8(bytes).ok()
-}
-
-async fn run_prefix_trie_listing<S: JanitorObjectStore>(
-    ctx: &mut JanitorCycleContext<'_, S>,
-    stats: &mut JanitorStats,
-    checkpoint: &mut JanitorSweepCheckpoint,
-    now: SystemTime,
-    now_unix: i64,
-    cycle_started: Instant,
-) -> anyhow::Result<()> {
-    super::set_live_progress_phase(ctx.budget.progress.as_ref(), "listing");
-    let mut cursor = checkpoint.next_prefix.clone();
-    loop {
-        if let Some(stop) = ctx.budget.admission_stop(stats, cycle_started) {
-            stats.outcome = stop;
-            checkpoint.next_prefix = cursor;
-            break;
-        }
-        let remaining = ctx
-            .budget
-            .max_scan_entries
-            .map(|max| {
-                max.saturating_sub(
-                    stats
-                        .initial_listing_entries
-                        .saturating_add(stats.queued_candidates_scanned),
-                )
-            })
-            .unwrap_or(u64::MAX);
-        if remaining == 0 {
-            stats.outcome = CycleOutcome::ScanBudgetExhausted;
-            checkpoint.next_prefix = cursor;
-            break;
-        }
-        let listing_prefix = prefix_for_hex_cursor(ctx.prefix, &cursor);
-        let listing_started = Instant::now();
-        let mut listing = match bounded_list_step(
-            ctx.store.list(&listing_prefix, None),
-            stats.initial_listing_entries,
-            &ctx.budget.cancel,
-        )
-        .await
-        {
-            Err(error) if is_cancellation(&error) => {
-                stats.outcome = CycleOutcome::Cancelled;
-                checkpoint.next_prefix = cursor;
-                break;
-            }
-            result => result?,
-        };
-        stats.initial_listing_elapsed += listing_started.elapsed();
-        let mut current = None;
-        let mut candidates = Vec::with_capacity(MAX_JANITOR_ELIGIBILITY_BATCH);
-        let mut last_listing_key = String::new();
-        let mut reached_eof = false;
-        let mut entries_in_prefix = 0_u64;
-        let leaf = cursor.len() == 20;
-        loop {
-            if let Some(stop) = ctx.budget.admission_stop(stats, cycle_started) {
-                stats.outcome = stop;
-                checkpoint.next_prefix = cursor.clone();
-                break;
-            }
-            if remaining != u64::MAX && entries_in_prefix >= remaining {
-                break;
-            }
-            super::set_live_progress_phase(ctx.budget.progress.as_ref(), "listing");
-            let wait_started = Instant::now();
-            let entry = match bounded_list_step(
-                listing.next_entry(),
-                stats.initial_listing_entries,
-                &ctx.budget.cancel,
-            )
-            .await
-            {
-                Err(error) if is_cancellation(&error) => {
-                    stats.outcome = CycleOutcome::Cancelled;
-                    checkpoint.next_prefix = cursor.clone();
-                    break;
-                }
-                result => result?,
-            };
-            stats.initial_listing_elapsed += wait_started.elapsed();
-            let Some(entry) = entry else {
-                reached_eof = true;
-                break;
-            };
-            if stats.first_listing_entry.is_none() {
-                let elapsed = cycle_started.elapsed();
-                stats.first_listing_entry = Some(elapsed);
-                eprintln!(
-                    "janitor phase=initial_listing first_entry duration_ms={}",
-                    super::duration_ms(elapsed)
-                );
-            }
-            stats.initial_listing_entries = stats.initial_listing_entries.saturating_add(1);
-            entries_in_prefix = entries_in_prefix.saturating_add(1);
-            if entry.is_file {
-                anyhow::ensure!(
-                    entry.key >= last_listing_key,
-                    "janitor object listing is not in lexicographic order after {} entries; refusing to judge object age",
-                    stats.initial_listing_entries
-                );
-                last_listing_key.clone_from(&entry.key);
-            }
-            if let Some(candidate) = discover_object(entry, ctx.prefix, &mut current, stats) {
-                candidates.push(candidate);
-            }
-            super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
-            if candidates.len() == MAX_JANITOR_ELIGIBILITY_BATCH && !leaf {
-                process_candidate_batch(
-                    ctx,
-                    std::mem::take(&mut candidates),
-                    now,
-                    now_unix,
-                    cycle_started,
-                    stats,
-                )
-                .await?;
-                if stats.outcome != CycleOutcome::Complete {
-                    checkpoint.next_prefix = cursor.clone();
-                    break;
-                }
-            }
-        }
-
-        if stats.outcome != CycleOutcome::Complete {
-            // A deadline/cap stop mid-prefix descends like the entry budget, so a dense
-            // prefix cannot stall a time-bounded loop; the children cover the same keys.
-            if !leaf && !reached_eof && entries_in_prefix > 0 {
-                checkpoint.next_prefix = format!("{cursor}0");
-            }
-            break;
-        }
-        let capped = !reached_eof;
-        if capped && !leaf {
-            checkpoint.next_prefix = format!("{cursor}0");
-            stats.outcome = CycleOutcome::ScanBudgetExhausted;
-            break;
-        }
-        if let Some(candidate) = current.take() {
-            candidates.push(candidate);
-        }
-        if leaf && capped {
-            for candidate in &mut candidates {
-                candidate.refresh_age = true;
-            }
-        }
-        if !candidates.is_empty() {
-            process_candidate_batch(ctx, candidates, now, now_unix, cycle_started, stats).await?;
-        }
-        if stats.outcome != CycleOutcome::Complete {
-            checkpoint.next_prefix = cursor.clone();
-            break;
-        }
-
-        match next_hex_prefix(&cursor) {
-            Some(next) => {
-                cursor = next;
-                checkpoint.next_prefix = cursor.clone();
-            }
-            None => {
-                checkpoint.next_prefix = "0".to_string();
-                stats.scan_complete = true;
-                break;
-            }
-        }
-        if ctx.budget.max_scan_entries.is_some_and(|max| {
-            stats
-                .initial_listing_entries
-                .saturating_add(stats.queued_candidates_scanned)
-                >= max
-        }) {
-            stats.outcome = CycleOutcome::ScanBudgetExhausted;
-            break;
-        }
-    }
-    eprintln!(
-        "janitor phase=initial_listing completed duration_ms={} entries={} outcome={:?}",
-        super::duration_ms(stats.initial_listing_elapsed),
-        stats.initial_listing_entries,
-        stats.outcome
-    );
     Ok(())
 }
 

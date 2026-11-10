@@ -96,10 +96,6 @@ impl JanitorListing for JanitorLister {
 impl JanitorObjectStore for OpenDalJanitorStore {
     type Listing = JanitorLister;
 
-    fn supports_start_after(&self) -> bool {
-        self.0.supports_start_after()
-    }
-
     async fn list(&self, prefix: &str, after_key: Option<&str>) -> anyhow::Result<JanitorLister> {
         Ok(self.0.list_after(prefix, after_key).await?)
     }
@@ -126,11 +122,8 @@ struct JanitorOptions {
     max_deletes: u64,
     max_scan_entries: Option<u64>,
     max_runtime_minutes: Option<u64>,
-    pg_concurrency: u64,
-    s3_concurrency: u64,
     s3_requests_per_second: u32,
     full_scan: bool,
-    reset_scan: bool,
     output: JanitorOutput,
 }
 
@@ -154,7 +147,6 @@ pub(super) struct ProgressSnapshot {
     delete_attempted: Option<u64>,
     delete_confirmed: Option<u64>,
     would_delete: Option<u64>,
-    queue_depth: Option<u64>,
     s3_rate_limit_per_second: u32,
 }
 
@@ -211,7 +203,6 @@ impl ProgressReporter {
             delete_attempted: None,
             delete_confirmed: None,
             would_delete: None,
-            queue_depth: None,
             s3_rate_limit_per_second,
         }));
         let (stop, stopped) = std::sync::mpsc::channel();
@@ -246,7 +237,6 @@ impl ProgressReporter {
             state.delete_attempted = Some(0);
             state.delete_confirmed = Some(0);
             state.would_delete = Some(0);
-            state.queue_depth = None;
         }
     }
 }
@@ -290,7 +280,7 @@ fn emit_progress(output: JanitorOutput, state: &ProgressSnapshot, elapsed_ms: u6
 
 fn progress_text_line(state: &ProgressSnapshot, elapsed_ms: u64) -> String {
     format!(
-        "Janitor progress: phase={} phase_elapsed={}s scanned={} listed_entries={} candidates={} protected={} young={} unknown={} HEAD={} DELETE_attempted={} DELETE_confirmed={} DELETE_would={} queue_depth={} s3_rate_limit_per_second={}",
+        "Janitor progress: phase={} phase_elapsed={}s scanned={} listed_entries={} candidates={} protected={} young={} unknown={} HEAD={} DELETE_attempted={} DELETE_confirmed={} DELETE_would={} s3_rate_limit_per_second={}",
         state.phase,
         elapsed_ms / 1000,
         optional_count(state.scanned),
@@ -303,7 +293,6 @@ fn progress_text_line(state: &ProgressSnapshot, elapsed_ms: u64) -> String {
         optional_count(state.delete_attempted),
         optional_count(state.delete_confirmed),
         optional_count(state.would_delete),
-        optional_count(state.queue_depth),
         state.s3_rate_limit_per_second,
     )
 }
@@ -325,9 +314,6 @@ fn progress_json_event(state: &ProgressSnapshot, elapsed_ms: u64) -> serde_json:
         "delete_confirmed": state.delete_confirmed,
         "would_delete": state.would_delete,
         "s3_rate_limit_per_second": state.s3_rate_limit_per_second,
-        "retryable_queue_depth": state.queue_depth,
-        "s3_in_flight": null,
-        "pg_in_flight": null,
     })
 }
 
@@ -376,7 +362,6 @@ trait JanitorMetadataSource {
         scope: JanitorSweepScope<'_>,
         checkpoint: &JanitorSweepCheckpoint,
     ) -> anyhow::Result<()>;
-    fn reset_sweep_checkpoint(&mut self, scope: JanitorSweepScope<'_>) -> anyhow::Result<()>;
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()>;
 }
 
@@ -453,10 +438,6 @@ impl JanitorMetadataSource for JanitorMetadataSession {
             .map_err(anyhow::Error::new)
     }
 
-    fn reset_sweep_checkpoint(&mut self, scope: JanitorSweepScope<'_>) -> anyhow::Result<()> {
-        JanitorMetadataSession::reset_sweep_checkpoint(self, scope).map_err(anyhow::Error::new)
-    }
-
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
         JanitorMetadataSession::release_global_janitor_lock(self).map_err(anyhow::Error::new)
     }
@@ -495,11 +476,8 @@ impl JanitorRunRequest {
                 max_deletes: args.max_deletes,
                 max_scan_entries: args.max_scan_entries,
                 max_runtime_minutes: args.max_runtime_minutes,
-                pg_concurrency: args.pg_concurrency,
-                s3_concurrency: args.s3_concurrency,
                 s3_requests_per_second: args.s3_requests_per_second,
                 full_scan: args.full_scan,
-                reset_scan: args.reset_scan,
                 output: args.output,
             },
         })
@@ -507,13 +485,13 @@ impl JanitorRunRequest {
 }
 
 #[derive(Debug, Args)]
-#[command(about = "Scan data objects and remove orphaned ones (Phase 6 prototype)")]
+#[command(about = "Delete remote data objects that no metadata references")]
 #[command(after_help = "\
 EXAMPLES:
   studiofs janitor myvolume --dry-run
   studiofs janitor myvolume --max-deletes 500 --skip-newer-minutes 15
   studiofs janitor myvolume --loop --interval-minutes 30
-  studiofs janitor myvolume --s3-concurrency 2 --pg-concurrency 1
+  studiofs janitor myvolume --full-scan --s3-requests-per-second 8
 ")]
 pub(crate) struct JanitorArgs {
     /// Volume name
@@ -551,25 +529,13 @@ pub(crate) struct JanitorArgs {
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     max_runtime_minutes: Option<u64>,
 
-    /// Maximum in-flight PostgreSQL janitor commands (the current CLI command path is serial)
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=8))]
-    pg_concurrency: u64,
-
-    /// Maximum in-flight S3 HTTP requests, including listing pages, HEAD, and DELETE
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=32))]
-    s3_concurrency: u64,
-
-    /// Maximum S3 HTTP request starts per second
+    /// Maximum S3 HTTP request starts per second (requests are issued one at a time)
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=32))]
     s3_requests_per_second: u32,
 
-    /// Start this sweep at the beginning of the namespace
-    #[arg(long, conflicts_with = "reset_scan")]
+    /// Ignore saved scan progress and start this sweep at the beginning of the namespace
+    #[arg(long)]
     full_scan: bool,
-
-    /// Clear saved scan progress before starting a new sweep
-    #[arg(long, conflicts_with = "full_scan")]
-    reset_scan: bool,
 
     /// Output readable text or versioned JSON Lines events
     #[arg(long, value_enum, default_value = "text")]
@@ -585,28 +551,30 @@ impl JanitorArgs {
             Err(error) if error.downcast_ref::<crate::cli::CommandExit>().is_some() => Err(error),
             Err(error) => {
                 eprintln!("janitor error: {error:#}");
-                let unsafe_metadata = error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<studiofs_meta::JanitorMetadataError>()
-                        .is_some_and(|metadata_error| {
-                            matches!(
-                                metadata_error,
-                                studiofs_meta::JanitorMetadataError::UnsafeToDelete(_)
-                            )
-                        })
-                });
-                let (code, label, outcome) = if unsafe_metadata {
-                    (
+                use studiofs_meta::JanitorMetadataError as MetadataError;
+                let metadata_error = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<MetadataError>());
+                let (code, label, outcome) = match metadata_error {
+                    Some(MetadataError::UnsafeToDelete(_)) => (
                         4,
                         "janitor stopped: unsafe metadata state; verify volume protection and format binding",
                         "unsafe",
-                    )
-                } else {
-                    (
+                    ),
+                    Some(MetadataError::SchemaUnavailable(_)) => (
+                        5,
+                        "janitor stopped: the PostgreSQL schema or privileges do not fit this version",
+                        "schema_unavailable",
+                    ),
+                    // Only a failure that a retry can fix is reported as a connectivity problem.
+                    None if classify_error(&error) == JanitorFailureClass::Terminal => {
+                        (5, "janitor failed; see the error above", "failed")
+                    }
+                    _ => (
                         5,
                         "janitor stopped: backend unavailable; verify PostgreSQL/S3 connectivity and retry",
                         "backend_failure",
-                    )
+                    ),
                 };
                 if output == JanitorOutput::Jsonl {
                     println!(
@@ -682,8 +650,6 @@ struct JanitorStartBanner<'a> {
     local_cache_report: Option<&'a JanitorLocalCacheReport>,
     skip_newer_minutes: u64,
     max_deletes: u64,
-    pg_concurrency: u64,
-    s3_concurrency: u64,
     s3_requests_per_second: u32,
 }
 
@@ -727,10 +693,6 @@ fn build_start_banner_lines(banner: JanitorStartBanner<'_>) -> Vec<String> {
         format_minutes(banner.skip_newer_minutes)
     ));
     lines.push(format!("  Max delete: {}", banner.max_deletes));
-    lines.push(format!(
-        "  In-flight:  PG <= {} (serial), S3 HTTP <= {}",
-        banner.pg_concurrency, banner.s3_concurrency
-    ));
     lines.push(format!(
         "  S3 rate:    <= {} HTTP requests/second",
         banner.s3_requests_per_second
@@ -821,11 +783,8 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         max_deletes,
         max_scan_entries,
         max_runtime_minutes,
-        pg_concurrency,
-        s3_concurrency,
         s3_requests_per_second,
         full_scan,
-        reset_scan,
         output,
     } = options;
     let db_path = meta_dir.join(format!("{name}.db"));
@@ -868,22 +827,15 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         &format_info.access_key,
         &format_info.secret_key,
         &format_info.region,
-        usize::try_from(s3_concurrency)
-            .map_err(|_| anyhow::anyhow!("S3 concurrency is invalid"))?,
         s3_requests_per_second,
     )?);
-    let listing_strategy = if store.supports_start_after() {
-        "opendal-start-after-v1"
-    } else {
-        "hex-prefix-trie-v1"
-    };
     progress.phase("waiting_for_cycle");
     let sweep_scope = JanitorSweepScope {
         volume_uuid: &format_info.uuid,
         endpoint: &format_info.endpoint,
         bucket: &format_info.bucket,
         data_prefix: &prefix,
-        listing_strategy,
+        listing_strategy: "opendal-start-after-v1",
     };
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -910,8 +862,6 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         local_cache_report: local_cache_report.as_ref(),
         skip_newer_minutes,
         max_deletes,
-        pg_concurrency,
-        s3_concurrency,
         s3_requests_per_second,
     }) {
         if output == JanitorOutput::Text {
@@ -919,7 +869,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         }
     }
 
-    let mut restart_pending = full_scan || reset_scan;
+    let mut restart_pending = full_scan;
     let interval = Duration::from_secs(interval_minutes.max(1).saturating_mul(60));
     let mut breaker = LoopBreaker::default();
     let mut command_exit: Option<(u8, &'static str)> = None;
@@ -991,23 +941,8 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 sweep_scope,
                 !dry_run && !restart_pending,
             )?;
-            if restart_pending && reset_scan {
-                if !dry_run {
-                    JanitorMetadataSource::reset_sweep_checkpoint(metadata, sweep_scope)?;
-                }
-                checkpoint = JanitorSweepCheckpoint {
-                    after_key: None,
-                    pending_object_id: None,
-                    pending_key: None,
-                    next_prefix: "0".to_string(),
-                };
-            } else if restart_pending && full_scan {
-                checkpoint = JanitorSweepCheckpoint {
-                    after_key: None,
-                    pending_object_id: None,
-                    pending_key: None,
-                    next_prefix: "0".to_string(),
-                };
+            if restart_pending {
+                checkpoint = JanitorSweepCheckpoint::default();
             }
 
             let transport_before = store.0.transport_stats();
@@ -1077,7 +1012,6 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                     "delete_attempted": stats.delete_requests,
                     "delete_confirmed": if dry_run { 0 } else { stats.deleted },
                     "would_delete": if dry_run { stats.deleted } else { 0 },
-                    "retryable_queue_depth": null,
                     "metadata_open_ms": duration_ms(metadata_open_elapsed),
                     "global_lock_wait_ms": duration_ms(lock_wait_elapsed),
                     "global_lock_hold_ms": duration_ms(global_lock_hold_elapsed),
@@ -1089,8 +1023,6 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                     "s3_throttled": transport.throttled.saturating_sub(transport_before.throttled),
                     "s3_retries": transport.retries.saturating_sub(transport_before.retries),
                     "s3_rate_limit_per_second": s3_requests_per_second,
-                    "s3_in_flight": null,
-                    "pg_in_flight": null,
                 })
             );
         } else {
@@ -1232,7 +1164,6 @@ mod tests {
             delete_attempted: None,
             delete_confirmed: None,
             would_delete: None,
-            queue_depth: None,
             s3_rate_limit_per_second: 4,
         };
         let event = progress_json_event(&state, 1_800_000);
@@ -1241,9 +1172,6 @@ mod tests {
         assert_eq!(event["phase_elapsed_ms"], 1_800_000);
         assert_eq!(event["scanned"], 12);
         assert!(event["delete_attempted"].is_null());
-        assert!(event["retryable_queue_depth"].is_null());
-        assert!(event["s3_in_flight"].is_null());
-        assert!(event["pg_in_flight"].is_null());
         let text = progress_text_line(&state, 1_800_000);
         assert!(text.contains("phase=object_scan phase_elapsed=1800s"));
         assert!(text.contains("DELETE_attempted=unknown"));
@@ -1274,7 +1202,6 @@ mod tests {
             delete_attempted: None,
             delete_confirmed: None,
             would_delete: None,
-            queue_depth: None,
             s3_rate_limit_per_second: 4,
         }));
         let (stop, stopped) = std::sync::mpsc::channel();
@@ -1312,7 +1239,6 @@ mod tests {
     #[derive(Default)]
     struct FakeJanitorStore {
         entries: Vec<studiofs_data::janitor::JanitorEntry>,
-        start_after_capable: Option<bool>,
         deleted: Mutex<Vec<String>>,
         list_requests: AtomicU64,
         head_requests: AtomicU64,
@@ -1362,10 +1288,6 @@ mod tests {
 
     impl JanitorObjectStore for FakeJanitorStore {
         type Listing = FakeListing;
-
-        fn supports_start_after(&self) -> bool {
-            self.start_after_capable.unwrap_or(true)
-        }
 
         async fn list(&self, prefix: &str, after_key: Option<&str>) -> anyhow::Result<FakeListing> {
             self.list_requests.fetch_add(1, Ordering::Relaxed);
@@ -1454,7 +1376,6 @@ mod tests {
         finishes: Vec<(u64, i64, UploadedObjectDeletionOutcome)>,
         sweep_checkpoint: Option<JanitorSweepCheckpoint>,
         sweep_checkpoint_writes: u64,
-        sweep_checkpoint_resets: u64,
     }
 
     /// Fencing token the fake metadata hands out for `object_id`.
@@ -1610,7 +1531,6 @@ mod tests {
                     after_key: None,
                     pending_object_id: None,
                     pending_key: None,
-                    next_prefix: "0".to_string(),
                 });
             if persist_initial && self.sweep_checkpoint.is_none() {
                 self.sweep_checkpoint = Some(checkpoint.clone());
@@ -1626,12 +1546,6 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.sweep_checkpoint = Some(checkpoint.clone());
             self.sweep_checkpoint_writes += 1;
-            Ok(())
-        }
-
-        fn reset_sweep_checkpoint(&mut self, _scope: JanitorSweepScope<'_>) -> anyhow::Result<()> {
-            self.sweep_checkpoint = None;
-            self.sweep_checkpoint_resets += 1;
             Ok(())
         }
 
@@ -1656,7 +1570,6 @@ mod tests {
             after_key: None,
             pending_object_id: None,
             pending_key: None,
-            next_prefix: "0".into(),
         }
     }
 
@@ -1904,7 +1817,6 @@ mod tests {
                 after_key: Some(keys[0].clone()),
                 pending_object_id: Some(42),
                 pending_key: Some(keys[0].clone()),
-                next_prefix: "0".into(),
             };
             let store = FakeJanitorStore {
                 entries: keys
@@ -1985,60 +1897,6 @@ mod tests {
         assert_eq!(stats.deleted, 1);
         assert!(!stats.scan_complete);
         assert_eq!(metadata.sweep_checkpoint, Some(checkpoint));
-    }
-
-    #[test]
-    fn janitor_fallback_single_entry_budget_eventually_advances_past_dense_shard() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let store = FakeJanitorStore {
-            entries: canonical_keys(42)
-                .into_iter()
-                .map(|key| JanitorEntry {
-                    key,
-                    is_file: true,
-                    last_modified: None,
-                })
-                .collect(),
-            start_after_capable: Some(false),
-            ..Default::default()
-        };
-        let mut metadata = FakeJanitorMetadata::eligible();
-        for _ in 0..24 {
-            let checkpoint = metadata
-                .sweep_checkpoint
-                .clone()
-                .unwrap_or_else(sweep_checkpoint);
-            let stats = rt
-                .block_on(run_one_cycle_resumable(
-                    JanitorCycleContext {
-                        store: &store,
-                        prefix: "test/objects/",
-                        dry_run: false,
-                        skip_newer_than_secs: 0,
-                        budget: RunBudget {
-                            max_deletes: 100,
-                            max_scan_entries: Some(1),
-                            max_runtime: None,
-                            cancel: CancellationToken::new(),
-                            progress: None,
-                        },
-                        metadata: &mut metadata,
-                    },
-                    checkpoint,
-                    &sweep_scope(),
-                    true,
-                ))
-                .unwrap();
-            assert!(stats.initial_listing_entries <= 1);
-            if !metadata.claims.is_empty() {
-                break;
-            }
-        }
-        assert_eq!(metadata.claims, vec![42]);
-        assert_ne!(
-            metadata.sweep_checkpoint.unwrap().next_prefix,
-            "002a000000000000002a"
-        );
     }
 
     #[test]
@@ -2597,6 +2455,28 @@ mod tests {
             assert_eq!(finished, (1..=batch).collect::<Vec<_>>());
             assert_eq!(metadata.eligibility_reads.len(), 1);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn listing_failure_keeps_the_checkpoint_of_completed_batches() {
+        let batch = MAX_JANITOR_ELIGIBILITY_BATCH as u64;
+        let store = FakeJanitorStore {
+            entries: fragment_entries(batch + 6),
+            fail_list_after: Some(
+                (MAX_JANITOR_ELIGIBILITY_BATCH + 3) * studiofs_data::object::CLOUD_FRAGMENT_COUNT,
+            ),
+            ..FakeJanitorStore::default()
+        };
+        let mut metadata = FakeJanitorMetadata::eligible();
+        let mut ctx = fake_cycle_context(&store, &mut metadata);
+        ctx.budget.max_deletes = u64::MAX;
+        run_one_cycle_resumable(ctx, sweep_checkpoint(), &sweep_scope(), true)
+            .await
+            .unwrap_err();
+        // The failed cycle still resumes behind the batch it finished, not at the start.
+        let saved = metadata.sweep_checkpoint.expect("checkpoint saved");
+        assert_eq!(saved.pending_object_id, Some(batch + 1));
+        assert!(saved.after_key.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3280,67 +3160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s3_transport_budget_limits_live_http_requests_and_request_rate() {
-        let (_op, fake, endpoint, server) =
-            fake_s3_operator_with_options(0, None, Duration::from_millis(40), None).await;
-        let store = studiofs_data::janitor::JanitorObjectStore::from_s3(
-            &endpoint,
-            "test",
-            "test",
-            "test",
-            "us-east-1",
-            1,
-            32,
-        )
-        .unwrap();
-
-        let (list, head, delete) = tokio::join!(
-            store.list("test/objects/"),
-            store.stat_key("test/objects/0000/0000000000000001/0"),
-            store.delete("test/objects/0000/0000000000000001/0"),
-        );
-        let mut listing = list.unwrap();
-        assert!(listing.next().await.unwrap().is_none());
-        assert!(matches!(
-            head,
-            Ok(studiofs_data::janitor::JanitorKeyStat::Found(_))
-        ));
-        assert!(delete.is_ok());
-        assert_eq!(fake.peak_active_requests.load(Ordering::Relaxed), 1);
-        assert_eq!(fake.list_requests.load(Ordering::Relaxed), 1);
-        assert_eq!(fake.head_requests.load(Ordering::Relaxed), 1);
-        assert_eq!(fake.delete_requests.load(Ordering::Relaxed), 1);
-        server.abort();
-        let _ = server.await;
-
-        let (_op, fake, endpoint, server) = fake_s3_operator_with_options(
-            0,
-            None,
-            Duration::ZERO,
-            Some(tokio::sync::Barrier::new(2)),
-        )
-        .await;
-        let store = studiofs_data::janitor::JanitorObjectStore::from_s3(
-            &endpoint,
-            "test",
-            "test",
-            "test",
-            "us-east-1",
-            2,
-            32,
-        )
-        .unwrap();
-        let (first, second, third, fourth) = tokio::join!(
-            store.stat_key("test/objects/0000/0000000000000001/0"),
-            store.stat_key("test/objects/0000/0000000000000002/0"),
-            store.stat_key("test/objects/0000/0000000000000003/0"),
-            store.stat_key("test/objects/0000/0000000000000004/0"),
-        );
-        assert!(first.is_ok() && second.is_ok() && third.is_ok() && fourth.is_ok());
-        assert_eq!(fake.peak_active_requests.load(Ordering::Relaxed), 2);
-        server.abort();
-        let _ = server.await;
-
+    async fn s3_transport_paces_request_starts() {
         let (_op, fake, endpoint, server) =
             fake_s3_operator_with_options(0, None, Duration::ZERO, None).await;
         let store = studiofs_data::janitor::JanitorObjectStore::from_s3(
@@ -3349,7 +3169,6 @@ mod tests {
             "test",
             "test",
             "us-east-1",
-            2,
             2,
         )
         .unwrap();
@@ -3376,7 +3195,6 @@ mod tests {
             "test",
             "test",
             "us-east-1",
-            2,
             32,
         )
         .unwrap()
@@ -3947,11 +3765,8 @@ mod tests {
                     max_deletes: 1,
                     max_scan_entries: None,
                     max_runtime_minutes: None,
-                    pg_concurrency: 1,
-                    s3_concurrency: 2,
                     s3_requests_per_second: 4,
                     full_scan: false,
-                    reset_scan: false,
                     output: JanitorOutput::Text,
                 },
             })
@@ -4001,11 +3816,8 @@ mod tests {
                     max_deletes: 1,
                     max_scan_entries: None,
                     max_runtime_minutes: None,
-                    pg_concurrency: 1,
-                    s3_concurrency: 2,
                     s3_requests_per_second: 4,
                     full_scan: false,
-                    reset_scan: false,
                     output: JanitorOutput::Text,
                 },
             });
@@ -4108,11 +3920,8 @@ mod tests {
                 max_deletes,
                 max_scan_entries,
                 max_runtime_minutes,
-                pg_concurrency,
-                s3_concurrency,
                 s3_requests_per_second,
                 full_scan,
-                reset_scan,
                 ..
             }) => {
                 assert_eq!(name, "vol");
@@ -4124,11 +3933,8 @@ mod tests {
                 assert_eq!(max_deletes, 600);
                 assert_eq!(max_scan_entries, None);
                 assert_eq!(max_runtime_minutes, None);
-                assert_eq!(pg_concurrency, 1);
-                assert_eq!(s3_concurrency, 2);
                 assert_eq!(s3_requests_per_second, 4);
                 assert!(!full_scan);
-                assert!(!reset_scan);
             }
             other => panic!("expected Janitor, got {other:?}"),
         }
@@ -4151,30 +3957,18 @@ mod tests {
         assert_eq!(args.max_scan_entries, Some(10_000));
         assert_eq!(args.max_runtime_minutes, Some(30));
 
-        let serial = crate::cli::parse_for_test(&[
-            "janitor",
-            "vol",
-            "--s3-concurrency",
-            "1",
-            "--pg-concurrency",
-            "1",
-            "--s3-requests-per-second",
-            "1",
-        ])
-        .unwrap();
+        let serial =
+            crate::cli::parse_for_test(&["janitor", "vol", "--s3-requests-per-second", "1"])
+                .unwrap();
         let crate::cli::Commands::Janitor(serial) = serial.command else {
             panic!("expected Janitor");
         };
-        assert_eq!(serial.s3_concurrency, 1);
-        assert_eq!(serial.pg_concurrency, 1);
         assert_eq!(serial.s3_requests_per_second, 1);
 
         for flag in [
             "--max-deletes",
             "--max-scan-entries",
             "--max-runtime-minutes",
-            "--pg-concurrency",
-            "--s3-concurrency",
             "--s3-requests-per-second",
         ] {
             assert!(
@@ -4182,14 +3976,15 @@ mod tests {
                 "{flag} 0 must be rejected"
             );
         }
-        for (flag, value) in [
-            ("--pg-concurrency", "9"),
-            ("--s3-concurrency", "33"),
-            ("--s3-requests-per-second", "33"),
-        ] {
+        assert!(
+            crate::cli::parse_for_test(&["janitor", "vol", "--s3-requests-per-second", "33"])
+                .is_err(),
+            "a request rate above the supported maximum must be rejected"
+        );
+        for removed in ["--pg-concurrency", "--s3-concurrency", "--reset-scan"] {
             assert!(
-                crate::cli::parse_for_test(&["janitor", "vol", flag, value]).is_err(),
-                "{flag} above its supported maximum must be rejected"
+                crate::cli::parse_for_test(&["janitor", "vol", removed, "1"]).is_err(),
+                "{removed} no longer exists"
             );
         }
         for flag in ["--max-scan-entries", "--max-runtime-minutes"] {
@@ -4199,11 +3994,6 @@ mod tests {
             );
         }
         assert!(crate::cli::parse_for_test(&["janitor", "vol", "--full-scan"]).is_ok());
-        assert!(crate::cli::parse_for_test(&["janitor", "vol", "--reset-scan"]).is_ok());
-        assert!(
-            crate::cli::parse_for_test(&["janitor", "vol", "--full-scan", "--reset-scan",])
-                .is_err()
-        );
     }
 
     #[test]
@@ -4217,8 +4007,6 @@ mod tests {
             local_cache_report: None,
             skip_newer_minutes: 1,
             max_deletes: 100_000,
-            pg_concurrency: 1,
-            s3_concurrency: 2,
             s3_requests_per_second: 4,
         });
 
@@ -4232,7 +4020,6 @@ mod tests {
                 "  Scope:      remote objects only".to_string(),
                 "  Grace:      1 minute".to_string(),
                 "  Max delete: 100000".to_string(),
-                "  In-flight:  PG <= 1 (serial), S3 HTTP <= 2".to_string(),
                 "  S3 rate:    <= 4 HTTP requests/second".to_string(),
             ]
         );
@@ -4357,44 +4144,6 @@ mod tests {
         );
     }
 
-    /// Forces the provider-neutral prefix fallback over a real OpenDAL listing.
-    struct NoStartAfterStore<'a>(&'a OpenDalJanitorStore);
-
-    impl JanitorObjectStore for NoStartAfterStore<'_> {
-        type Listing = JanitorLister;
-
-        fn supports_start_after(&self) -> bool {
-            false
-        }
-
-        async fn list(
-            &self,
-            prefix: &str,
-            after_key: Option<&str>,
-        ) -> anyhow::Result<JanitorLister> {
-            anyhow::ensure!(
-                after_key.is_none(),
-                "prefix fallback must not resume after a key"
-            );
-            self.0.list(prefix, None).await
-        }
-
-        async fn last_modified(&self, key: &str) -> anyhow::Result<Option<SystemTime>> {
-            self.0.last_modified(key).await
-        }
-
-        async fn stat_key(
-            &self,
-            key: &str,
-        ) -> anyhow::Result<studiofs_data::janitor::JanitorKeyStat> {
-            self.0.stat_key(key).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError> {
-            self.0.delete(key).await
-        }
-    }
-
     async fn listed_files(
         store: &OpenDalJanitorStore,
         prefix: &str,
@@ -4436,10 +4185,6 @@ mod tests {
 
     impl JanitorObjectStore for GatedDeleteStore {
         type Listing = JanitorLister;
-
-        fn supports_start_after(&self) -> bool {
-            self.inner.supports_start_after()
-        }
 
         async fn list(
             &self,
@@ -4785,7 +4530,6 @@ mod tests {
                 &access_key,
                 &secret_key,
                 &region,
-                2,
                 32,
             )?);
         assert!(
@@ -4845,7 +4589,6 @@ mod tests {
             &access_key,
             &secret_key,
             &region,
-            2,
             32,
         )?);
         let key = studiofs_data::object::format_object_key(&prefix, object_id);
@@ -4931,7 +4674,6 @@ mod tests {
                 &access_key,
                 &secret_key,
                 &region,
-                2,
                 32,
             )?);
         assert!(listed_files(&restart_store, &prefix, None).await.is_empty());
@@ -4977,7 +4719,7 @@ mod tests {
     }
 
     /// SFS-973 live check: S3 `start_after` resume, partial hex prefixes without a
-    /// trailing `/`, and repeated one-entry runs of both listing strategies.
+    /// trailing `/`, and repeated one-entry runs of the resumable listing.
     /// Reads an ignored-test setting from the process environment, then the workspace `.env`.
     fn test_env(key: &str) -> Option<String> {
         let non_empty = |value: &String| !value.trim().is_empty();
@@ -5016,15 +4758,10 @@ mod tests {
                 &access_key,
                 &secret_key,
                 &region,
-                2,
                 // Keep each gated HEAD well below the cfg(test) 1 s HEAD timeout.
                 32,
             )
             .unwrap(),
-        );
-        assert!(
-            store.supports_start_after(),
-            "S3 must advertise start_after"
         );
         let ids = [0x1_0000_u64, 0x2_0000, 0x1_0001, 0x5_abcd];
         let run_id = SystemTime::now()
@@ -5032,7 +4769,7 @@ mod tests {
             .unwrap()
             .as_nanos();
 
-        for strategy in ["start_after", "prefix_trie"] {
+        for strategy in ["start_after"] {
             let root = format!("sfs973-{run_id}-{strategy}/objects/");
             let foreign = format!("{root}not-canonical");
             let mut keys = vec![foreign.clone()];
@@ -5085,38 +4822,20 @@ mod tests {
                     cancel: CancellationToken::new(),
                     progress: None,
                 };
-                let fallback = NoStartAfterStore(&store);
-                let stats = if strategy == "start_after" {
-                    run_one_cycle_resumable(
-                        JanitorCycleContext {
-                            store: &store,
-                            prefix: &root,
-                            dry_run: false,
-                            skip_newer_than_secs: 0,
-                            budget,
-                            metadata: &mut metadata,
-                        },
-                        checkpoint,
-                        &sweep_scope(),
-                        true,
-                    )
-                    .await
-                } else {
-                    run_one_cycle_resumable(
-                        JanitorCycleContext {
-                            store: &fallback,
-                            prefix: &root,
-                            dry_run: false,
-                            skip_newer_than_secs: 0,
-                            budget,
-                            metadata: &mut metadata,
-                        },
-                        checkpoint,
-                        &sweep_scope(),
-                        true,
-                    )
-                    .await
-                }
+                let stats = run_one_cycle_resumable(
+                    JanitorCycleContext {
+                        store: &store,
+                        prefix: &root,
+                        dry_run: false,
+                        skip_newer_than_secs: 0,
+                        budget,
+                        metadata: &mut metadata,
+                    },
+                    checkpoint,
+                    &sweep_scope(),
+                    true,
+                )
+                .await
                 .unwrap();
                 assert!(stats.initial_listing_entries <= 1);
                 if stats.scan_complete {

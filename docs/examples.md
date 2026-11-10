@@ -112,8 +112,9 @@ On Windows, use a free drive letter (for example `Z:`) instead of a folder path.
 
 ## 5. Clean Up Old Objects (Janitor)
 
-The standalone janitor requires PostgreSQL-backed metadata and a synchronized
-local metadata database. It validates the volume UUID and storage endpoint,
+The standalone janitor requires PostgreSQL-backed metadata and a local metadata
+database with nothing unpublished; it may be behind PostgreSQL, so other clients
+can keep writing. It validates the volume UUID and storage endpoint,
 bucket, and prefix against PostgreSQL's published format information, checks
 snapshot reachability and local sync/recovery state, and holds the per-volume
 janitor lock during each scan. A mount is not required.

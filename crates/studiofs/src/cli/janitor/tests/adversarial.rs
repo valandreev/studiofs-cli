@@ -112,10 +112,6 @@ impl JanitorMetadataSource for WriterAwareMetadata {
         self.inner.save_sweep_checkpoint(scope, checkpoint)
     }
 
-    fn reset_sweep_checkpoint(&mut self, scope: JanitorSweepScope<'_>) -> anyhow::Result<()> {
-        self.inner.reset_sweep_checkpoint(scope)
-    }
-
     fn release_global_janitor_lock(&mut self) -> anyhow::Result<()> {
         self.inner.release_global_janitor_lock()
     }

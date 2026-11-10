@@ -10,7 +10,7 @@ use std::path::Path;
 pub const MAX_JANITOR_ELIGIBILITY_BATCH: usize = 64;
 
 /// Durable provider-independent position for one CLI orphan scan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JanitorSweepCheckpoint {
     /// Last listed key; pending object state retains unfinished canonical groups.
     pub after_key: Option<String>,
@@ -18,8 +18,6 @@ pub struct JanitorSweepCheckpoint {
     pub pending_object_id: Option<u64>,
     /// Last canonical key observed for the pending object.
     pub pending_key: Option<String>,
-    /// Next deterministic hexadecimal prefix when start-after is unavailable.
-    pub next_prefix: String,
 }
 
 /// Storage identity the persisted orphan scan belongs to.
@@ -46,6 +44,9 @@ pub enum JanitorMetadataError {
     /// A metadata backend or bounded query was unavailable.
     #[error("backend_unavailable: {0}")]
     BackendUnavailable(String),
+    /// PostgreSQL rejected a janitor statement for a missing table, column or privilege.
+    #[error("schema_unavailable: {0}")]
+    SchemaUnavailable(String),
     /// The deletion claim was fenced out before completion; the object is retried later.
     #[error("stale_claim: deletion claim is no longer current")]
     StaleClaim,
@@ -137,15 +138,6 @@ impl JanitorMetadataSession {
     ) -> Result<(), JanitorMetadataError> {
         self.ensure_validated_cycle()?;
         self.postgres.save_sweep_checkpoint(scope, checkpoint)
-    }
-
-    /// Clears the saved scan position after validating its version under the held volume lock.
-    pub fn reset_sweep_checkpoint(
-        &mut self,
-        scope: JanitorSweepScope<'_>,
-    ) -> Result<(), JanitorMetadataError> {
-        self.ensure_validated_cycle()?;
-        self.postgres.reset_sweep_checkpoint(scope)
     }
 
     /// Acquires the per-volume PostgreSQL janitor lock when metadata is shared.

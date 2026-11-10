@@ -330,7 +330,7 @@ path is not a mounted StudioFS volume. See
 ### `janitor`
 
 ```bash
-studiofs janitor <name> [--dry-run] [--loop] [--interval-minutes <u64>] [--skip-newer-minutes <u64>] [--max-deletes <u64>] [--max-scan-entries <u64>] [--max-runtime-minutes <u64>] [--pg-concurrency <1..8>] [--s3-concurrency <1..32>] [--s3-requests-per-second <1..32>]
+studiofs janitor <name> [--dry-run] [--loop] [--interval-minutes <u64>] [--skip-newer-minutes <u64>] [--max-deletes <u64>] [--max-scan-entries <u64>] [--max-runtime-minutes <u64>] [--s3-requests-per-second <1..32>] [--full-scan] [--output <text|jsonl>]
 ```
 
 Each cycle stops admitting new work at the first limit it meets and reports an
@@ -341,16 +341,22 @@ Each cycle stops admitting new work at the first limit it meets and reports an
   Once it is met, the rest of the bucket is not listed (`capped`).
 - `--max-scan-entries` and `--max-runtime-minutes` (optional, at least 1) stop
   listing and report `partial`. A deletion that was already claimed always
-  finishes first. A partial cycle does not save its position yet, so the next
-  run starts again from the beginning of the prefix; these flags are therefore
-  rejected together with `--loop`.
-- `--pg-concurrency` (default 1, range 1–8) is the maximum PostgreSQL command
-  budget. The current CLI claim/finish path is serial and uses at most one PG
-  command at a time; raising this limit does not parallelize that path.
-- `--s3-concurrency` (default 2, range 1–32) limits actual in-flight OpenDAL
-  HTTP requests, including listing pages, stat/HEAD, and every canonical
-  fragment DELETE. `--s3-requests-per-second` (default 4,
-  range 1–32) paces request starts at the same HTTP boundary.
+  finishes first. The scan position is saved in PostgreSQL after every
+  completed batch, so the next run or `--loop` cycle resumes there, also after
+  a failed cycle. `--full-scan` ignores the saved position for the first cycle.
+  `--dry-run` starts at the saved position too and never saves one; add
+  `--full-scan` to preview the whole prefix.
+- `--s3-requests-per-second` (default 4, range 1–32) paces S3 HTTP request
+  starts: listing pages, stat/HEAD, and every canonical fragment DELETE. The
+  janitor issues S3 and PostgreSQL requests one at a time, so this rate is the
+  only throughput setting; an object costs two DELETE requests.
+- The local metadata database must have nothing unpublished and must not be
+  ahead of PostgreSQL. It may be behind: other clients can keep writing while
+  the janitor runs, because every deletion is re-checked in PostgreSQL.
+- Exit status: 0 complete; 2 partial (delete cap, scan or time budget,
+  cancellation); 3 another janitor holds the lock; 4 unsafe metadata state;
+  5 backend, schema or other failure. `--output jsonl` prints the same outcome
+  in a final `summary` event.
 - Janitor work is admitted in batches of at most 64 candidates. S3 operations
   have explicit per-request deadlines: 60 seconds for listing and 20 seconds
   for stat/HEAD and DELETE; PostgreSQL commands use the metadata crate's

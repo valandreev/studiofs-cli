@@ -584,8 +584,16 @@ fn janitor_read_only_session_validates_binding_and_lock() {
     assert_unsafe(&db_a);
     set_snapshot_bootstrap(true);
 
+    // A PostgreSQL head past the local replica is safe: peers may keep publishing.
     update_remote_head(1);
-    assert_unsafe(&db_a);
+    let mut behind =
+        crate::JanitorMetadataSession::open(&db_a).expect("open lagging local replica");
+    assert!(behind.try_acquire_global_janitor_lock().unwrap());
+    behind
+        .validate_protection()
+        .expect("a local replica behind PostgreSQL stays valid");
+    behind.release_global_janitor_lock().unwrap();
+    drop(behind);
     update_remote_head(0);
 
     update_remote_format(Vec::new());
@@ -942,13 +950,11 @@ fn pg_janitor_sweep_checkpoint_restart_scope_dry_run_and_version() {
         after_key: None,
         pending_object_id: None,
         pending_key: None,
-        next_prefix: "0".into(),
     };
     let saved = JanitorSweepCheckpoint {
         after_key: Some("objects/002a/000000000000002a/0".into()),
         pending_object_id: Some(42),
         pending_key: Some("objects/002a/000000000000002a/0".into()),
-        next_prefix: "0".into(),
     };
     let open = || {
         let mut session = crate::pg_engine::PgJanitorSession::new(dsn.clone(), volume.volume_id);
@@ -1005,12 +1011,6 @@ fn pg_janitor_sweep_checkpoint_restart_scope_dry_run_and_version() {
         );
         session.save_sweep_checkpoint(scope, &saved).unwrap();
     }
-    session.reset_sweep_checkpoint(scope).unwrap();
-    assert_eq!(
-        session.load_sweep_checkpoint(scope, false).unwrap(),
-        initial
-    );
-    session.save_sweep_checkpoint(scope, &saved).unwrap();
     let execute = |sql: &'static str| {
         run_async(async {
             let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
@@ -1023,13 +1023,14 @@ fn pg_janitor_sweep_checkpoint_restart_scope_dry_run_and_version() {
         })
         .unwrap();
     };
-    execute("UPDATE snapshot_payload_sweep_checkpoints SET next_prefix = 'invalid' WHERE vol = $1");
+    execute(
+        "UPDATE snapshot_payload_sweep_checkpoints SET pending_key = 'objects/invalid' WHERE vol = $1",
+    );
     assert!(session.load_sweep_checkpoint(scope, false).is_err());
     execute(
-        "UPDATE snapshot_payload_sweep_checkpoints SET next_prefix = '0', schema_version = 2 WHERE vol = $1",
+        "UPDATE snapshot_payload_sweep_checkpoints SET pending_key = 'objects/002a/000000000000002a/0', schema_version = 2 WHERE vol = $1",
     );
     assert!(session.load_sweep_checkpoint(scope, false).is_err());
     assert!(session.load_sweep_checkpoint(scope, true).is_err());
     assert!(session.save_sweep_checkpoint(scope, &saved).is_err());
-    assert!(session.reset_sweep_checkpoint(scope).is_err());
 }
