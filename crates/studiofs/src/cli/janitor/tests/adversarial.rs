@@ -64,32 +64,21 @@ impl JanitorMetadataSource for WriterAwareMetadata {
             .gc_candidate_page(after, limit, eligible_before, backfill)
     }
 
-    fn claim_deletion(&mut self, object_id: u64) -> anyhow::Result<Option<i64>> {
-        self.inner.claims.push(object_id);
-        if self.writer_active.load(Ordering::SeqCst) {
-            self.inner.claim_protected.push(object_id);
-            Ok(None)
-        } else {
-            Ok(Some(fake_token(object_id)))
-        }
-    }
-
-    fn finish_deletion(
+    fn claim_deletions(
         &mut self,
-        object_id: u64,
-        fencing_token: i64,
-        outcome: UploadedObjectDeletionOutcome,
-    ) -> anyhow::Result<()> {
-        self.inner
-            .finish_deletion(object_id, fencing_token, outcome)
+        object_ids: &[u64],
+    ) -> anyhow::Result<std::collections::HashMap<u64, i64>> {
+        if self.writer_active.load(Ordering::SeqCst) {
+            self.inner.claim_protected.extend_from_slice(object_ids);
+        }
+        self.inner.claim_deletions(object_ids)
     }
 
-    fn retry_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()> {
-        self.inner.retry_gc_candidate(object_id)
-    }
-
-    fn ack_gc_candidate(&mut self, object_id: u64) -> anyhow::Result<()> {
-        self.inner.ack_gc_candidate(object_id)
+    fn settle_deletions(
+        &mut self,
+        settlements: &[JanitorDeletionSettlement],
+    ) -> anyhow::Result<std::collections::HashSet<u64>> {
+        self.inner.settle_deletions(settlements)
     }
 
     fn prune_deletion_fences(&mut self) -> anyhow::Result<u64> {

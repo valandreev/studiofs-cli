@@ -198,14 +198,14 @@ fn janitor_session_fences_object_deletion_claims() {
     session.validate_protection().expect("validate protection");
 
     // Referenced, unpublished-upload, and snapshot-pinned objects stay protected
-    // without ledger writes, matching batched eligibility.
-    for object_id in [77, 78, 79, 91] {
-        assert_eq!(
-            session.claim_deletion(object_id).expect("claim"),
-            None,
-            "{object_id}"
-        );
-    }
+    // without ledger writes, matching batched eligibility; one batch claims only
+    // the untracked and the published, unreferenced object.
+    let claimed = session
+        .claim_deletions(&[77, 78, 79, 91, 90, 80])
+        .expect("claim batch");
+    let mut claimed_ids: Vec<u64> = claimed.keys().copied().collect();
+    claimed_ids.sort_unstable();
+    assert_eq!(claimed_ids, [80, 90]);
     assert_eq!(
         ledger(91),
         None,
@@ -213,73 +213,99 @@ fn janitor_session_fences_object_deletion_claims() {
     );
     assert_eq!(ledger(78).expect("uploading row").0, "uploading");
     assert_eq!(ledger(79).expect("uploaded row").0, "uploaded");
+    assert!(
+        session.claim_deletions(&[80]).expect("claim").is_empty(),
+        "an active lease protects the object"
+    );
+    let finish = |session: &mut crate::JanitorMetadataSession, object_id, token, outcome| {
+        session
+            .settle_deletions(&[crate::JanitorDeletionSettlement::Finished {
+                object_id,
+                fencing_token: token,
+                outcome,
+            }])
+            .expect("settle")
+            .contains(&object_id)
+    };
 
     // An untracked object is fenced: publication and upload now observe delete_pending.
-    let token = session
-        .claim_deletion(90)
-        .expect("claim")
-        .expect("untracked claim");
+    let token = claimed[&90];
     assert_eq!(ledger(90).expect("fence row").0, "delete_pending");
-    assert!(matches!(
-        session.finish_deletion(90, token + 1, Deleted),
-        Err(crate::JanitorMetadataError::StaleClaim)
-    ));
-    session.finish_deletion(90, token, Deleted).expect("finish");
+    assert!(!finish(&mut session, 90, token + 1, Deleted), "stale token");
+    assert!(finish(&mut session, 90, token, Deleted));
     assert_eq!(ledger(90), Some(("delete_pending".to_owned(), None)));
+    assert_eq!(
+        sql("SELECT 1 FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = 90 AND acknowledged_at IS NOT NULL").len(),
+        1,
+        "a confirmed deletion acknowledges its queue row"
+    );
     // Late upload replay against this fence is covered by
     // mounted_deletion_claim_fences_untracked_objects_against_late_replay.
     assert!(
-        matches!(
-            session.finish_deletion(90, token, Deleted),
-            Err(crate::JanitorMetadataError::StaleClaim)
-        ),
+        !finish(&mut session, 90, token, Deleted),
         "a completed claim cannot be finished twice"
     );
     // A duplicate retry after success re-claims and completes idempotently.
-    let retry = session
-        .claim_deletion(90)
-        .expect("claim")
-        .expect("re-claim");
+    let retry = session.claim_deletions(&[90]).expect("claim")[&90];
     assert!(retry > token);
-    session
-        .finish_deletion(90, retry, Deleted)
-        .expect("finish retry");
+    assert!(finish(&mut session, 90, retry, Deleted), "finish retry");
 
-    // A retryable outcome keeps the fence with its reason and is re-claimed next
-    // cycle; an active lease blocks a second claim, and an expired one is fenced out.
-    let first = session
-        .claim_deletion(80)
-        .expect("claim")
-        .expect("claim published, unreferenced 80");
-    session
-        .finish_deletion(80, first, Retryable)
-        .expect("retryable finish");
+    // A retryable outcome keeps the fence with its reason and defers the queue row;
+    // the row is re-claimed next cycle, and an expired claim is fenced out.
+    assert!(finish(&mut session, 80, claimed[&80], Retryable));
     let (state, reason) = ledger(80).expect("retry row");
     assert_eq!(state, "delete_pending");
     assert!(reason.is_some());
-    let expired = session
-        .claim_deletion(80)
-        .expect("claim")
-        .expect("claim after retry");
     assert_eq!(
-        session.claim_deletion(80).expect("claim"),
-        None,
-        "an active lease protects the object"
+        sql("SELECT 1 FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = 80 AND acknowledged_at IS NULL AND next_attempt_at > clock_timestamp()").len(),
+        1,
+        "a retryable outcome defers its queue row"
     );
+    let expired = session.claim_deletions(&[80]).expect("claim")[&80];
     sql(
         "UPDATE snapshot_payload_upload_objects SET reconcile_lease_expires_at = clock_timestamp() - interval '1 second' WHERE vol = $1 AND object_id = 80",
     );
-    let current = session
-        .claim_deletion(80)
-        .expect("claim")
-        .expect("claim after expiry");
-    assert!(matches!(
-        session.finish_deletion(80, expired, Deleted),
-        Err(crate::JanitorMetadataError::StaleClaim)
-    ));
-    session
-        .finish_deletion(80, current, Deleted)
-        .expect("current finish");
+    let current = session.claim_deletions(&[80]).expect("claim")[&80];
+    assert!(!finish(&mut session, 80, expired, Deleted));
+    assert!(finish(&mut session, 80, current, Deleted), "current finish");
+
+    // A released claim (deletes never started) is re-claimable at once and does not
+    // defer its queue row; a queue-only deferral touches no ledger row.
+    sql(
+        "UPDATE snapshot_payload_gc_candidates SET acknowledged_at = NULL, next_attempt_at = NULL WHERE vol = $1 AND object_id = 80",
+    );
+    sql("INSERT INTO snapshot_payload_gc_candidates (vol, object_id) VALUES ($1, 77)");
+    let released = session.claim_deletions(&[80]).expect("claim")[&80];
+    let settled = session
+        .settle_deletions(&[
+            crate::JanitorDeletionSettlement::Released {
+                object_id: 80,
+                fencing_token: released,
+            },
+            crate::JanitorDeletionSettlement::Deferred { object_id: 77 },
+        ])
+        .expect("settle release and deferral");
+    assert_eq!(settled, [80].into_iter().collect());
+    let (state, reason) = ledger(80).expect("released row");
+    assert_eq!(state, "delete_pending");
+    assert!(reason.is_some(), "a released object is not deleted yet");
+    assert!(
+        sql("SELECT 1 FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = 80 AND next_attempt_at > clock_timestamp()").is_empty(),
+        "a release must not defer the queue row"
+    );
+    assert_eq!(
+        sql("SELECT 1 FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = 77 AND next_attempt_at > clock_timestamp()").len(),
+        1,
+        "a deferral delays the protected queue row"
+    );
+    assert_eq!(ledger(77), None, "a deferral writes no ledger row");
+    assert!(
+        session
+            .claim_deletions(&[80])
+            .expect("claim")
+            .contains_key(&80),
+        "a released claim is re-claimable at once"
+    );
     session.release_global_janitor_lock().expect("release");
 }
 

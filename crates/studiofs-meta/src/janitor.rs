@@ -6,8 +6,63 @@ use std::fmt;
 use crate::{MetaGc, MetaInodes, RedbMetaEngine};
 use std::path::Path;
 
-/// Maximum number of candidates accepted by one authoritative janitor query.
-pub const MAX_JANITOR_ELIGIBILITY_BATCH: usize = 64;
+/// Maximum number of candidates accepted by one authoritative janitor query: one
+/// S3 listing page, so a scan pays one eligibility round trip per page.
+pub const MAX_JANITOR_ELIGIBILITY_BATCH: usize = 1_000;
+
+/// Seconds a deletion claim stays leased; an object's deletes must finish inside it.
+pub const JANITOR_DELETION_CLAIM_LEASE_SECS: i64 =
+    crate::pg_engine::snapshot_reachability::SNAPSHOT_UPLOADED_FRAGMENT_LEASE_SECS;
+
+/// One object's entry for [`JanitorMetadataSession::settle_deletions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JanitorDeletionSettlement {
+    /// Records the remote deletion outcome of a claim. A confirmed deletion
+    /// acknowledges the GC queue row; any other outcome defers it.
+    Finished {
+        /// Claimed object.
+        object_id: u64,
+        /// Token from [`JanitorMetadataSession::claim_deletions`].
+        fencing_token: i64,
+        /// Remote deletion outcome.
+        outcome: crate::snapshot_ports::UploadedObjectDeletionOutcome,
+    },
+    /// Releases a claim whose deletes never started, as retryable, without
+    /// deferring the GC queue row.
+    Released {
+        /// Claimed object.
+        object_id: u64,
+        /// Token from [`JanitorMetadataSession::claim_deletions`].
+        fencing_token: i64,
+    },
+    /// Defers a protected object's GC queue row so it does not re-occupy the head
+    /// of every later page.
+    Deferred {
+        /// Protected object.
+        object_id: u64,
+    },
+}
+
+impl JanitorDeletionSettlement {
+    /// The settled object.
+    pub fn object_id(&self) -> &u64 {
+        match self {
+            Self::Finished { object_id, .. }
+            | Self::Released { object_id, .. }
+            | Self::Deferred { object_id } => object_id,
+        }
+    }
+
+    /// The claim's fencing token; `None` for a queue-only deferral.
+    pub fn fencing_token(&self) -> Option<i64> {
+        match self {
+            Self::Finished { fencing_token, .. } | Self::Released { fencing_token, .. } => {
+                Some(*fencing_token)
+            }
+            Self::Deferred { .. } => None,
+        }
+    }
+}
 
 /// Durable provider-independent position for one CLI orphan scan.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -65,7 +120,7 @@ fn pg_backend_unavailable() -> JanitorMetadataError {
 /// Unlike the normal PostgreSQL metadata engine, opening this session does not
 /// repair, synchronize, or create local metadata. PostgreSQL operations are
 /// limited to the janitor advisory lock, read-only safety queries, and fenced
-/// per-object deletion claims in the upload ledger.
+/// object-level deletion claims in the upload ledger.
 pub struct JanitorMetadataSession {
     local: RedbMetaEngine,
     format_info: crate::FormatInfo,
@@ -261,39 +316,44 @@ impl JanitorMetadataSession {
         Ok(protection)
     }
 
-    /// Claims one eligible object immediately before its remote deletion.
+    /// Claims eligible objects immediately before their remote deletion, in two
+    /// PostgreSQL round trips.
     ///
-    /// Returns the fencing token for [`Self::finish_deletion`], or `None` when
-    /// metadata now protects the object. Untracked objects are fenced too.
-    pub fn claim_deletion(&mut self, object_id: u64) -> Result<Option<i64>, JanitorMetadataError> {
+    /// Returns the fencing token of each claimed object for [`Self::settle_deletions`];
+    /// an object missing from the result is now protected by metadata. Untracked
+    /// objects are fenced too.
+    pub fn claim_deletions(
+        &mut self,
+        object_ids: &[u64],
+    ) -> Result<HashMap<u64, i64>, JanitorMetadataError> {
         self.ensure_validated_cycle()?;
-        if self.local_referenced.contains(&object_id) {
-            return Ok(None);
+        let unreferenced: Vec<u64> = object_ids
+            .iter()
+            .copied()
+            .filter(|object_id| !self.local_referenced.contains(object_id))
+            .collect();
+        if unreferenced.is_empty() {
+            return Ok(HashMap::new());
         }
         self.postgres
-            .claim_object_deletion(object_id, &self.deletion_owner)
+            .claim_object_deletions(&unreferenced, &self.deletion_owner)
     }
 
-    /// Records the remote deletion outcome for a claim from [`Self::claim_deletion`].
+    /// Records remote deletion outcomes and updates the PG GC queue in one
+    /// PostgreSQL round trip.
     ///
-    /// Fails with [`JanitorMetadataError::StaleClaim`] when the claim was fenced out,
-    /// so a caller never reports success that PostgreSQL did not confirm.
-    pub fn finish_deletion(
+    /// Returns the objects whose claim PostgreSQL confirmed. A claim missing from
+    /// the result was fenced out, so a caller never reports success that PostgreSQL
+    /// did not confirm.
+    pub fn settle_deletions(
         &mut self,
-        object_id: u64,
-        fencing_token: i64,
-        outcome: crate::snapshot_ports::UploadedObjectDeletionOutcome,
-    ) -> Result<(), JanitorMetadataError> {
-        if self.postgres.finish_object_deletion(
-            object_id,
-            &self.deletion_owner,
-            fencing_token,
-            outcome,
-        )? {
-            Ok(())
-        } else {
-            Err(JanitorMetadataError::StaleClaim)
+        settlements: &[JanitorDeletionSettlement],
+    ) -> Result<HashSet<u64>, JanitorMetadataError> {
+        if settlements.is_empty() {
+            return Ok(HashSet::new());
         }
+        self.postgres
+            .settle_object_deletions(settlements, &self.deletion_owner)
     }
 
     /// Reads a bounded keyset page of durable PG GC candidates after the `(eligible_at_micros, object_id)` cursor.
@@ -309,18 +369,6 @@ impl JanitorMetadataSession {
         self.ensure_validated_cycle()?;
         self.postgres
             .gc_candidate_page(after, limit, eligible_before, backfill)
-    }
-
-    /// Defers a failed queue candidate so one broken object does not dominate later pages.
-    pub fn retry_gc_candidate(&mut self, object_id: u64) -> Result<(), JanitorMetadataError> {
-        self.ensure_validated_cycle()?;
-        self.postgres.retry_gc_candidate(object_id)
-    }
-
-    /// Acknowledges a candidate only after PostgreSQL confirmed its fenced deletion finish.
-    pub fn ack_gc_candidate(&mut self, object_id: u64) -> Result<(), JanitorMetadataError> {
-        self.ensure_validated_cycle()?;
-        self.postgres.ack_gc_candidate(object_id)
     }
 
     /// Prunes finished deletion fences below their payload namespace watermark.

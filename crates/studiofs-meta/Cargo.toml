@@ -19,6 +19,7 @@ thiserror.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+futures.workspace = true
 tokio-util.workspace = true
 tokio-postgres.workspace = true
 rustls.workspace = true
