@@ -1,7 +1,7 @@
 //! OpenDAL operations used by the standalone janitor.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use futures::TryStreamExt as _;
@@ -84,6 +84,7 @@ struct TransportCounters {
     throttled: AtomicU64,
     retries: AtomicU64,
     interval_micros: AtomicU64,
+    batch_unsupported: AtomicBool,
 }
 
 struct RetryCounter(Arc<TransportCounters>);
@@ -223,6 +224,94 @@ impl JanitorObjectStore {
                 JanitorFailureClass::Transient => JanitorDeleteError::Other(error.to_string()),
             })
     }
+
+    /// Delete keys in input order, confirming ambiguous batch outcomes with single deletes.
+    /// The bounded recovery leaves time to settle the PostgreSQL claims before their lease ends.
+    pub async fn delete_batch(
+        &self,
+        keys: &[String],
+    ) -> Vec<std::result::Result<(), JanitorDeleteError>> {
+        let deadline = Instant::now() + Duration::from_secs(35);
+        let capacity = self
+            .operator
+            .info()
+            .full_capability()
+            .delete_max_size
+            .unwrap_or(1);
+        let mut outcomes = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(capacity.clamp(1, 1000)) {
+            if chunk.len() > 1 && !self.transport.batch_unsupported.load(Ordering::Relaxed) {
+                let throttled_before = self.transport.throttled.load(Ordering::Relaxed);
+                let attempt = async {
+                    let mut deleter = self.operator.deleter().await?;
+                    deleter.delete_iter(chunk.iter().cloned()).await?;
+                    deleter.flush().await
+                };
+                match tokio::time::timeout_at(
+                    deadline.min(Instant::now() + Duration::from_secs(20)),
+                    attempt,
+                )
+                .await
+                {
+                    Ok(Ok(deleted)) if deleted == chunk.len() => {
+                        outcomes.extend(chunk.iter().map(|_| Ok(())));
+                        continue;
+                    }
+                    Ok(Err(error)) if error.kind() == ErrorKind::Unsupported => {
+                        self.transport
+                            .batch_unsupported
+                            .store(true, Ordering::Relaxed);
+                    }
+                    // A batch that exhausted its retries under 429/503 stays retryable as a whole:
+                    // confirming each key would multiply the load the overload breaker sheds.
+                    Ok(Err(error))
+                        if error.kind() == ErrorKind::RateLimited
+                            || self.transport.throttled.load(Ordering::Relaxed)
+                                != throttled_before =>
+                    {
+                        let message = error.to_string();
+                        outcomes.extend(
+                            chunk
+                                .iter()
+                                .map(|_| Err(JanitorDeleteError::Other(message.clone()))),
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        outcomes.extend(chunk.iter().map(|_| {
+                            Err(JanitorDeleteError::Other(
+                                "batch delete timed out".to_owned(),
+                            ))
+                        }));
+                        continue;
+                    }
+                    // OpenDAL exposes only a success count, not the keys in a partial result.
+                    // Repeating an idempotent DELETE independently confirms each key.
+                    _ => {}
+                }
+            }
+            for key in chunk {
+                if Instant::now() >= deadline {
+                    outcomes.push(Err(JanitorDeleteError::Other(
+                        "delete confirmation timed out".to_owned(),
+                    )));
+                    continue;
+                }
+                let result = tokio::time::timeout_at(
+                    deadline.min(Instant::now() + Duration::from_secs(20)),
+                    self.delete(key),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(JanitorDeleteError::Other(
+                        "delete confirmation timed out".to_owned(),
+                    ))
+                });
+                outcomes.push(result);
+            }
+        }
+        outcomes
+    }
 }
 
 /// Spreads provider HTTP request starts across an adaptive rate window.
@@ -245,12 +334,27 @@ struct Pace {
 
 impl HttpFetch for AdaptiveRateLimitedHttpClient {
     async fn fetch(&self, request: http::Request<Buffer>) -> Result<http::Response<HttpBody>> {
+        let batch_delete = request.method() == http::Method::POST
+            && request.uri().query().is_some_and(|query| {
+                query
+                    .split('&')
+                    .any(|part| part == "delete" || part == "delete=")
+            });
         let mut pace = self.pace.lock().await;
         tokio::time::sleep_until(pace.next_request_at).await;
         pace.next_request_at = Instant::now() + pace.interval;
         drop(pace);
 
         let result = self.inner.fetch(request).await;
+        if batch_delete
+            && result
+                .as_ref()
+                .is_ok_and(|response| matches!(response.status().as_u16(), 405 | 501))
+        {
+            self.counters
+                .batch_unsupported
+                .store(true, Ordering::Relaxed);
+        }
         let throttle = match &result {
             Ok(response) => matches!(response.status().as_u16(), 429 | 503)
                 .then(|| retry_after(response.headers())),

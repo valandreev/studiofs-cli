@@ -16,13 +16,11 @@ use studiofs_meta::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// Bound for one remote DELETE. All canonical keys of an object must finish
-/// inside the 60-second deletion-claim lease, or the finish is fenced out.
-const DELETE_KEY_TIMEOUT: Duration = if cfg!(test) {
-    // Short for stalled fakes, yet above live RustFS latency spikes seen on CI (>200 ms).
-    Duration::from_secs(1)
+/// Bound for an admitted delete batch, including single-key recovery.
+const DELETE_BATCH_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
 } else {
-    Duration::from_secs(20)
+    Duration::from_secs(40)
 };
 /// Bound for one fallback HEAD, issued only for keys listed without `LastModified`.
 const HEAD_KEY_TIMEOUT: Duration = if cfg!(test) {
@@ -41,12 +39,9 @@ const LIST_PAGE_TIMEOUT: Duration = if cfg!(test) {
 /// PostgreSQL deletion-claim lease.
 const CLAIM_LEASE: Duration =
     Duration::from_secs(studiofs_meta::JANITOR_DELETION_CLAIM_LEASE_SECS as u64);
-/// Longest S3 work for one object: each canonical key (legacy plus fragments) at its timeout.
-const OBJECT_DELETE_BOUND: Duration =
-    DELETE_KEY_TIMEOUT.saturating_mul(studiofs_data::object::CLOUD_FRAGMENT_COUNT as u32 + 1);
 const _: () = assert!(
-    OBJECT_DELETE_BOUND.as_secs() < CLAIM_LEASE.as_secs(),
-    "canonical key deletes must fit inside the deletion-claim lease"
+    DELETE_BATCH_TIMEOUT.as_secs() < CLAIM_LEASE.as_secs(),
+    "batch deletion must fit inside the deletion-claim lease"
 );
 /// Most objects claimed, and settled, per PostgreSQL call.
 const DELETION_CLAIM_BATCH: usize = 64;
@@ -156,8 +151,8 @@ pub(super) enum CycleOutcome {
     TimeBudgetExhausted,
     /// The operator requested a graceful stop.
     Cancelled,
-    /// [`OVERLOAD_TRIP_OBJECTS`] objects in a row failed transiently; admission stopped
-    /// and the unfinished batch stays queued or before the saved checkpoint.
+    /// [`OVERLOAD_TRIP_OBJECTS`] objects in a row failed transiently; later work stops
+    /// while the already admitted delete batch drains.
     Overloaded,
 }
 
@@ -180,7 +175,7 @@ impl CycleOutcome {
 #[derive(Debug, Clone)]
 pub(super) struct RunBudget {
     /// Confirmed successful (dry-run: would-be) deletions; protected and failed
-    /// objects never consume it. Deletion is sequential, so it cannot overshoot.
+    /// objects never consume it. Admission reserves no more slots than remain.
     pub(super) max_deletes: u64,
     /// Listed entries after which no further entry is pulled from the listing.
     pub(super) max_scan_entries: Option<u64>,
@@ -252,6 +247,13 @@ pub(super) trait JanitorObjectStore {
         self.last_modified(key).await.map(JanitorKeyStat::Found)
     }
     async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError>;
+    async fn delete_batch(&self, keys: &[String]) -> Vec<Result<(), JanitorDeleteError>> {
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.delete(key).await);
+        }
+        results
+    }
 }
 
 /// One discovered object: its ID, every canonical key to delete, and the
@@ -504,11 +506,10 @@ async fn admit_orphan<S: JanitorObjectStore>(
     Ok(true)
 }
 
-/// Deletes admitted orphans in claim batches. Two PostgreSQL round trips claim the
-/// batch, each claimed object's S3 deletes follow, and one round trip settles the
-/// outcomes together with the queued `defers`. An object starts its deletes only
-/// while the claim lease still covers [`OBJECT_DELETE_BOUND`]; later objects are
-/// released and claimed again. A stop releases every unattempted claim.
+/// Claims and settles bounded batches of admitted orphans. The S3 batch is the
+/// cancellation drain unit. An object is included only while the claim lease still
+/// covers [`DELETE_BATCH_TIMEOUT`]; later objects are released and claimed again.
+/// A stop before batch admission releases every unattempted claim.
 async fn delete_orphans<S: JanitorObjectStore>(
     ctx: &mut JanitorCycleContext<'_, S>,
     mut orphans: Vec<Candidate>,
@@ -537,7 +538,6 @@ async fn delete_orphans<S: JanitorObjectStore>(
             .collect();
         let mut attempted = Vec::new();
         let mut reclaim = Vec::new();
-        let mut terminal = None;
         for candidate in orphans {
             let object_id = candidate.object_id;
             let Some(&token) = tokens.get(&object_id) else {
@@ -547,49 +547,127 @@ async fn delete_orphans<S: JanitorObjectStore>(
                 }
                 continue;
             };
-            let release = JanitorDeletionSettlement::Released {
-                object_id,
-                fencing_token: token,
-            };
-            if terminal.is_none()
-                && stats.outcome == CycleOutcome::Complete
+            attempted.push((candidate, token));
+        }
+        if !attempted.is_empty() {
+            if stats.outcome == CycleOutcome::Complete
                 && let Some(stop) = ctx.budget.admission_stop(stats, cycle_started)
             {
                 stats.outcome = stop;
             }
-            if terminal.is_some() || stats.outcome != CycleOutcome::Complete {
-                settlements.push(release);
-                continue;
+            if stats.outcome != CycleOutcome::Complete {
+                settlements.extend(attempted.drain(..).map(|(candidate, fencing_token)| {
+                    JanitorDeletionSettlement::Released {
+                        object_id: candidate.object_id,
+                        fencing_token,
+                    }
+                }));
+            } else if claimed_at.elapsed() + DELETE_BATCH_TIMEOUT > CLAIM_LEASE {
+                reclaim.extend(attempted.drain(..).map(|(candidate, fencing_token)| {
+                    settlements.push(JanitorDeletionSettlement::Released {
+                        object_id: candidate.object_id,
+                        fencing_token,
+                    });
+                    candidate
+                }));
             }
-            if !reclaim.is_empty() || claimed_at.elapsed() + OBJECT_DELETE_BOUND > CLAIM_LEASE {
-                settlements.push(release);
-                reclaim.push(candidate);
-                continue;
+        }
+        let mut outcomes = Vec::with_capacity(attempted.len());
+        let mut terminal = None;
+        if !attempted.is_empty() {
+            let keys: Vec<String> = attempted
+                .iter()
+                .flat_map(|(candidate, _)| candidate.delete_keys.iter().cloned())
+                .collect();
+            super::set_live_progress_phase(ctx.budget.progress.as_ref(), "delete");
+            if stats.delete_requests == 0 {
+                eprintln!("janitor phase=delete started");
             }
-            let (s3_delete_failed, terminal_error) =
-                delete_object_keys(ctx, &candidate, stats).await;
-            if !s3_delete_failed {
-                stats.transient_streak = 0;
-            } else if terminal_error.is_none() {
-                record_transient_failure(stats);
+            stats.delete_requests = stats
+                .delete_requests
+                .saturating_add(u64::try_from(keys.len()).unwrap_or(u64::MAX));
+            super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
+            let delete_started = Instant::now();
+            let results = tokio::time::timeout(DELETE_BATCH_TIMEOUT, ctx.store.delete_batch(&keys))
+                .await
+                .unwrap_or_else(|_| {
+                    (0..keys.len())
+                        .map(|_| Err(JanitorDeleteError::Other("delete timed out".to_owned())))
+                        .collect()
+                });
+            stats.delete_elapsed += delete_started.elapsed();
+            let mut start = 0;
+            for (candidate, token) in &attempted {
+                let end = start + candidate.delete_keys.len();
+                let mut failure: Option<(JanitorFailureClass, &str, &str)> = None;
+                for (key, result) in candidate
+                    .delete_keys
+                    .iter()
+                    .zip(results.get(start..end).unwrap_or(&[]).iter())
+                {
+                    match result {
+                        Ok(()) | Err(JanitorDeleteError::NotFound) => {}
+                        Err(JanitorDeleteError::Other(error)) => {
+                            failure.get_or_insert((
+                                JanitorFailureClass::Transient,
+                                key,
+                                error.as_str(),
+                            ));
+                        }
+                        Err(JanitorDeleteError::Terminal(error)) => {
+                            failure = Some((JanitorFailureClass::Terminal, key, error.as_str()));
+                            break;
+                        }
+                    }
+                }
+                // A malformed adapter result must never turn an unreported key into success.
+                if failure.is_none() && results.len() < end {
+                    failure = Some((
+                        JanitorFailureClass::Transient,
+                        "<missing batch result>",
+                        "batch result count mismatch",
+                    ));
+                }
+                let s3_delete_failed = failure.is_some();
+                let terminal_failure = failure
+                    .as_ref()
+                    .is_some_and(|(class, _, _)| *class == JanitorFailureClass::Terminal);
+                if let Some((class, key, error)) = failure {
+                    let label = if terminal_failure {
+                        "terminal"
+                    } else {
+                        "transient"
+                    };
+                    eprintln!(
+                        "janitor: failed to delete object class={label} key={key} object_id={}: {error}",
+                        candidate.object_id
+                    );
+                    if class == JanitorFailureClass::Terminal && terminal.is_none() {
+                        terminal = Some((candidate.object_id, error.to_owned()));
+                    }
+                }
+                if !s3_delete_failed {
+                    stats.transient_streak = 0;
+                } else if !terminal_failure {
+                    record_transient_failure(stats);
+                }
+                outcomes.push((candidate.object_id, s3_delete_failed));
+                settlements.push(JanitorDeletionSettlement::Finished {
+                    object_id: candidate.object_id,
+                    fencing_token: *token,
+                    outcome: if s3_delete_failed {
+                        UploadedObjectDeletionOutcome::Retryable
+                    } else {
+                        UploadedObjectDeletionOutcome::Deleted
+                    },
+                });
+                start = end;
             }
-            let outcome = if s3_delete_failed {
-                UploadedObjectDeletionOutcome::Retryable
-            } else {
-                UploadedObjectDeletionOutcome::Deleted
-            };
-            settlements.push(JanitorDeletionSettlement::Finished {
-                object_id,
-                fencing_token: token,
-                outcome,
-            });
-            attempted.push((object_id, s3_delete_failed));
-            terminal = terminal_error.map(|error| (object_id, error));
         }
         // Success needs PostgreSQL confirmation; an unfinished claim expires and is retried.
         super::set_live_progress_phase(ctx.budget.progress.as_ref(), "metadata_finish");
         let finished = settle_or_log(ctx, &settlements);
-        for (object_id, s3_delete_failed) in attempted {
+        for (object_id, s3_delete_failed) in outcomes {
             let finish_failed = !finished.contains(&object_id);
             if finish_failed {
                 eprintln!("janitor: failed to finish deletion claim object_id={object_id}");
@@ -602,11 +680,20 @@ async fn delete_orphans<S: JanitorObjectStore>(
                 stats.deleted = stats.deleted.saturating_add(1);
             }
         }
+        if stats.outcome == CycleOutcome::Complete
+            && let Some(stop) = ctx.budget.admission_stop(stats, cycle_started)
+        {
+            stats.outcome = stop;
+        }
         super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
         if let Some((object_id, error)) = terminal {
             anyhow::bail!("terminal S3 delete failure for janitor object {object_id}: {error}");
         }
-        orphans = reclaim;
+        orphans = if stats.outcome == CycleOutcome::Complete {
+            reclaim
+        } else {
+            Vec::new()
+        };
     }
     Ok(())
 }
@@ -629,40 +716,6 @@ fn settle_or_log<S: JanitorObjectStore>(
             std::collections::HashSet::new()
         },
     )
-}
-
-/// Deletes every canonical key of one claimed object. Returns whether its S3 work
-/// failed, and the error of a terminal failure. The whole object is retried later
-/// after any failure, so the first one stops further requests.
-async fn delete_object_keys<S: JanitorObjectStore>(
-    ctx: &mut JanitorCycleContext<'_, S>,
-    candidate: &Candidate,
-    stats: &mut JanitorStats,
-) -> (bool, Option<String>) {
-    for key in &candidate.delete_keys {
-        super::set_live_progress_phase(ctx.budget.progress.as_ref(), "delete");
-        if stats.delete_requests == 0 {
-            eprintln!("janitor phase=delete started");
-        }
-        stats.delete_requests = stats.delete_requests.saturating_add(1);
-        super::publish_live_progress(ctx.budget.progress.as_ref(), stats, ctx.dry_run);
-        let delete_started = Instant::now();
-        let result = tokio::time::timeout(DELETE_KEY_TIMEOUT, ctx.store.delete(key))
-            .await
-            .unwrap_or_else(|_| Err(JanitorDeleteError::Other("delete timed out".to_owned())));
-        stats.delete_elapsed += delete_started.elapsed();
-        let (class, error) = match result {
-            Ok(()) | Err(JanitorDeleteError::NotFound) => continue,
-            Err(JanitorDeleteError::Other(error)) => ("transient", error),
-            Err(JanitorDeleteError::Terminal(error)) => ("terminal", error),
-        };
-        eprintln!(
-            "janitor: failed to delete object class={class} key={key} object_id={}: {error}",
-            candidate.object_id
-        );
-        return (true, (class == "terminal").then_some(error));
-    }
-    (false, None)
 }
 
 #[cfg(test)]

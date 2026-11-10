@@ -111,6 +111,10 @@ impl JanitorObjectStore for OpenDalJanitorStore {
     async fn delete(&self, key: &str) -> Result<(), JanitorDeleteError> {
         self.0.delete(key).await
     }
+
+    async fn delete_batch(&self, keys: &[String]) -> Vec<Result<(), JanitorDeleteError>> {
+        self.0.delete_batch(keys).await
+    }
 }
 
 struct JanitorOptions {
@@ -1804,13 +1808,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(stats.outcome, CycleOutcome::Cancelled);
-        // One claim batch; the cancelled, unattempted object is released as retryable.
+        // The admitted batch drains after cancellation; both claimed objects finish.
         assert_eq!(metadata.claim_batches, [vec![42, 43]]);
         assert_eq!(
             metadata.finishes,
             [
                 (42, fake_token(42), UploadedObjectDeletionOutcome::Deleted),
-                (43, fake_token(43), UploadedObjectDeletionOutcome::Retryable),
+                (43, fake_token(43), UploadedObjectDeletionOutcome::Deleted),
             ]
         );
         assert_eq!(metadata.releases, 1);
@@ -3012,6 +3016,11 @@ mod tests {
         list_requests: AtomicU64,
         head_requests: AtomicU64,
         delete_requests: AtomicU64,
+        multi_delete_requests: AtomicU64,
+        multi_delete_status: std::sync::Mutex<Option<&'static str>>,
+        multi_delete_error_key: std::sync::Mutex<Option<String>>,
+        delete_error_key: std::sync::Mutex<Option<String>>,
+        delete_error_status: std::sync::Mutex<Option<&'static str>>,
         list_requests_before_first_delete: AtomicU64,
         object_count: u64,
         /// Never answer this 0-based list page, simulating a stalled provider.
@@ -3055,6 +3064,33 @@ mod tests {
                     }
                     request.extend_from_slice(&buffer[..read]);
                 }
+                let header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .unwrap()
+                    + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let body =
+                    String::from_utf8_lossy(&request[header_end..header_end + content_length])
+                        .into_owned();
                 let active = fake.active_requests.fetch_add(1, Ordering::Relaxed) + 1;
                 fake.peak_active_requests
                     .fetch_max(active, Ordering::Relaxed);
@@ -3115,7 +3151,42 @@ mod tests {
                             Ordering::Relaxed,
                         );
                     }
-                    ("204 No Content", String::new(), "")
+                    let error_key = fake.delete_error_key.lock().unwrap().clone();
+                    if error_key.is_some_and(|key| first_line.contains(&key)) {
+                        let status =
+                            (*fake.delete_error_status.lock().unwrap()).unwrap_or("403 Forbidden");
+                        (status, String::new(), "")
+                    } else {
+                        ("204 No Content", String::new(), "")
+                    }
+                } else if first_line.starts_with("POST ") && first_line.contains("?delete") {
+                    if fake.multi_delete_requests.fetch_add(1, Ordering::Relaxed) == 0
+                        && fake.delete_requests.load(Ordering::Relaxed) == 0
+                    {
+                        fake.list_requests_before_first_delete.store(
+                            fake.list_requests.load(Ordering::Relaxed),
+                            Ordering::Relaxed,
+                        );
+                    }
+                    if let Some(status) = *fake.multi_delete_status.lock().unwrap() {
+                        (status, String::new(), "")
+                    } else {
+                        let error_key = fake.multi_delete_error_key.lock().unwrap().clone();
+                        let keys = body
+                            .split("<Key>")
+                            .skip(1)
+                            .filter_map(|part| part.split_once("</Key>").map(|(key, _)| key));
+                        let mut response = String::from("<DeleteResult>");
+                        for key in keys {
+                            if error_key.as_deref() == Some(key) {
+                                response.push_str(&format!("<Error><Key>{key}</Key><Code>AccessDenied</Code><Message>denied</Message></Error>"));
+                            } else {
+                                response.push_str(&format!("<Deleted><Key>{key}</Key></Deleted>"));
+                            }
+                        }
+                        response.push_str("</DeleteResult>");
+                        ("200 OK", response, "Content-Type: application/xml\r\n")
+                    }
                 } else {
                     ("501 Not Implemented", String::new(), "")
                 };
@@ -3199,6 +3270,11 @@ mod tests {
             list_requests: AtomicU64::new(0),
             head_requests: AtomicU64::new(0),
             delete_requests: AtomicU64::new(0),
+            multi_delete_requests: AtomicU64::new(0),
+            multi_delete_status: std::sync::Mutex::new(None),
+            multi_delete_error_key: std::sync::Mutex::new(None),
+            delete_error_key: std::sync::Mutex::new(None),
+            delete_error_status: std::sync::Mutex::new(None),
             list_requests_before_first_delete: AtomicU64::new(0),
             object_count,
             stall_page,
@@ -3268,6 +3344,128 @@ mod tests {
             32,
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s3_multi_delete_partial_failure_settles_each_claim_independently() {
+        let (op, fake, _endpoint, server) = fake_s3_operator(2).await;
+        let failed = canonical_keys(1)[1].clone();
+        *fake.multi_delete_error_key.lock().unwrap() = Some(failed.clone());
+        *fake.delete_error_key.lock().unwrap() = Some(failed.clone());
+        *fake.delete_error_status.lock().unwrap() = Some("500 Internal Server Error");
+        let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::new(op));
+        let mut metadata = FakeJanitorMetadata::eligible();
+
+        let stats = run_one_cycle(JanitorCycleContext {
+            store: &store,
+            prefix: "test/objects/",
+            dry_run: false,
+            skip_newer_than_secs: 0,
+            budget: RunBudget::deletes(u64::MAX),
+            metadata: &mut metadata,
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(fake.multi_delete_requests.load(Ordering::Relaxed), 1);
+        let keys_per_object = studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64 + 1;
+        assert_eq!(
+            fake.delete_requests.load(Ordering::Relaxed),
+            2 * keys_per_object
+        );
+        assert_eq!(stats.deleted, 1);
+        assert_eq!(stats.delete_errors, 1);
+        assert_eq!(stats.delete_requests, 2 * keys_per_object);
+        assert_eq!(stats.cycle_outcome(), CycleOutcome::TransientErrors);
+        assert_eq!(metadata.finishes.len(), 2);
+        assert_eq!(
+            metadata.finishes[0].2,
+            UploadedObjectDeletionOutcome::Retryable
+        );
+        assert_eq!(
+            metadata.finishes[1].2,
+            UploadedObjectDeletionOutcome::Deleted
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_unsupported_multi_delete_falls_back_and_is_remembered() {
+        let (_op, fake, endpoint, server) = fake_s3_operator(0).await;
+        *fake.multi_delete_status.lock().unwrap() = Some("501 Not Implemented");
+        let store = fault_store(&endpoint);
+        let keys = vec![FAULT_KEY.to_owned(), format!("{FAULT_KEY}-other")];
+
+        assert!(
+            store
+                .delete_batch(&keys)
+                .await
+                .into_iter()
+                .all(|result| result.is_ok())
+        );
+        assert!(
+            store
+                .delete_batch(&keys)
+                .await
+                .into_iter()
+                .all(|result| result.is_ok())
+        );
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(fake.multi_delete_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(fake.delete_requests.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn s3_multi_delete_retries_throttle_at_the_shared_request_gate() {
+        let (_op, fake, endpoint, server) = fake_s3_operator(0).await;
+        fake.faults
+            .lock()
+            .unwrap()
+            .push_back("503 Service Unavailable");
+        let store = fault_store(&endpoint);
+        let keys = vec![FAULT_KEY.to_owned(), format!("{FAULT_KEY}-other")];
+
+        let results = store.delete_batch(&keys).await;
+        let starts = fake.request_starts.lock().unwrap().clone();
+        let transport = store.transport_stats();
+        server.abort();
+        let _ = server.await;
+
+        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert_eq!(fake.multi_delete_requests.load(Ordering::Relaxed), 2);
+        assert_eq!((transport.throttled, transport.retries), (1, 1));
+        assert!(starts[1].duration_since(starts[0]) >= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn s3_sustained_multi_delete_throttle_fails_the_batch_without_single_deletes() {
+        let (_op, fake, endpoint, server) = fake_s3_operator(0).await;
+        fake.faults.lock().unwrap().extend(
+            ["503 Service Unavailable"; studiofs_data::janitor::JANITOR_S3_MAX_RETRIES + 1],
+        );
+        let store = fault_store(&endpoint);
+        let keys = vec![FAULT_KEY.to_owned(), format!("{FAULT_KEY}-other")];
+
+        let results = store.delete_batch(&keys).await;
+        server.abort();
+        let _ = server.await;
+
+        // Every key stays retryable, and no per-key DELETE multiplies the overload.
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|result| matches!(result, Err(JanitorDeleteError::Other(_)))),
+            "{results:?}"
+        );
+        assert_eq!(
+            fake.multi_delete_requests.load(Ordering::Relaxed),
+            studiofs_data::janitor::JANITOR_S3_MAX_RETRIES as u64 + 1
+        );
+        assert_eq!(fake.delete_requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -3581,14 +3779,13 @@ mod tests {
             .await
             .unwrap();
 
-        let trip = u64::from(pipeline::OVERLOAD_TRIP_OBJECTS);
         assert_eq!(stats.outcome, pipeline::CycleOutcome::Overloaded);
-        // The whole listed batch is claimed at once; S3 work stops at the trip.
+        // The whole listed batch is claimed at once; the admitted batch drains.
         assert_eq!(metadata.claim_batches, [(1..=8).collect::<Vec<_>>()]);
-        // One DELETE per failed object; its other keys wait for the object's retry.
-        assert_eq!(store.deleted.lock().unwrap().len() as u64, trip);
-        // Every claim, attempted or not, was released as retryable; only attempted
-        // objects defer their queue rows.
+        // The batch admits all keys for the claimed objects before draining failures.
+        assert_eq!(stats.delete_requests, 16);
+        assert_eq!(store.deleted.lock().unwrap().len(), 16);
+        // Every claim is finished retryable because every delete failed.
         assert_eq!(metadata.finishes.len(), metadata.claims.len());
         assert!(
             metadata
@@ -3596,10 +3793,7 @@ mod tests {
                 .iter()
                 .all(|(_, _, outcome)| *outcome == UploadedObjectDeletionOutcome::Retryable)
         );
-        assert_eq!(
-            metadata.gc_candidate_retries,
-            (1..=trip).collect::<Vec<_>>()
-        );
+        assert_eq!(metadata.gc_candidate_retries, (1..=8).collect::<Vec<_>>());
         // The listed batch replays next cycle: the saved scan position did not move.
         assert!(!stats.scan_complete);
         assert_eq!(metadata.sweep_checkpoint, Some(start));
@@ -3622,14 +3816,14 @@ mod tests {
             JanitorFailureClass::Terminal,
             "{error:#}"
         );
-        // The batch was claimed together; the unattempted claims are released too.
+        // Every admitted claim is settled before the terminal failure returns.
         assert_eq!(metadata.claims, [1, 2, 3]);
         assert_eq!(
             metadata.finishes,
             [1, 2, 3].map(|id| (id, fake_token(id), UploadedObjectDeletionOutcome::Retryable))
         );
-        assert_eq!(metadata.gc_candidate_retries, [1]);
-        assert_eq!(store.deleted.lock().unwrap().len(), 1);
+        assert_eq!(metadata.gc_candidate_retries, [1, 2, 3]);
+        assert_eq!(store.deleted.lock().unwrap().len(), 6);
     }
 
     fn create_local_metadata_fixture(meta_dir: &std::path::Path, endpoint: &str) -> PathBuf {
@@ -3743,10 +3937,8 @@ mod tests {
         // Legacy key plus every fragment key per deleted object.
         let keys_per_object = studiofs_data::object::CLOUD_FRAGMENT_COUNT as u64 + 1;
         assert_eq!(stats.delete_requests, 2 * keys_per_object);
-        assert_eq!(
-            fake.delete_requests.load(Ordering::Relaxed),
-            2 * keys_per_object
-        );
+        assert_eq!(fake.delete_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.multi_delete_requests.load(Ordering::Relaxed), 1);
         println!(
             "janitor streaming: pages={} listed={} peak_buffered={} first_candidate_ms={} head_calls={} delete_calls={} object_work_ms={}",
             fake.list_requests.load(Ordering::Relaxed),
@@ -3886,6 +4078,7 @@ mod tests {
             "delete_rate_per_second": stats.deleted as f64 / elapsed.as_secs_f64(),
             "list_requests": fake.list_requests.load(Ordering::Relaxed),
             "delete_requests": fake.delete_requests.load(Ordering::Relaxed),
+            "batch_delete_requests": fake.multi_delete_requests.load(Ordering::Relaxed),
             "head_requests": fake.head_requests.load(Ordering::Relaxed),
             "peak_s3_in_flight": fake.peak_active_requests.load(Ordering::Relaxed),
             "peak_buffered_candidates": stats.peak_buffered_candidates,
@@ -4068,7 +4261,8 @@ mod tests {
             result,
             s3_requests: fake.list_requests.load(Ordering::Relaxed)
                 + fake.head_requests.load(Ordering::Relaxed)
-                + fake.delete_requests.load(Ordering::Relaxed),
+                + fake.delete_requests.load(Ordering::Relaxed)
+                + fake.multi_delete_requests.load(Ordering::Relaxed),
             metadata_unchanged: std::fs::read(&db_path).unwrap() == before,
         }
     }

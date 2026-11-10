@@ -41,6 +41,24 @@ The 500-deletion cycle now holds the global janitor lock (`global_lock_hold_ms`)
 
 The rows that follow this section predate SFS-1064.
 
+## SFS-1065: local multi-delete smoke (live acceptance pending)
+
+Recorded 2026-11-10 on macOS, using the debug-profile focused synthetic fixture with real OpenDAL 0.55 and fake metadata: 1,000 listed keys, 500 eligible orphans, 4 HTTP request starts/s, no faults. The final run completed 500 deletions in 2,018 ms (248 objects/s), with one LIST, eight multi-object POSTs, no single DELETEs, and peak S3 requests in flight of one. This is a functional batching smoke, not a release-profile performance measurement or a matched PostgreSQL/RustFS comparison. The fixture does not store referenced payloads, so it cannot establish the live zero-missing-reference acceptance criterion.
+
+    STUDIOFS_JANITOR_SYNTHETIC_KEYS=1000 STUDIOFS_JANITOR_SYNTHETIC_ORPHAN_EVERY=2 STUDIOFS_JANITOR_SYNTHETIC_RPS=4 cargo test -p studiofs --bin studiofs janitor_synthetic_listing_benchmark -- --ignored --nocapture
+
+Artifact: `target/janitor-benchmark/synthetic-1000-fault0.json`. Docker's configured OrbStack socket was unavailable. Matched live throughput and the disposable PostgreSQL/RustFS adversarial tests remain unverified. The Backblaze B2 adapter smoke is recorded below. Historical measurements below describe earlier implementations.
+
+## SFS-1065: Backblaze B2 live adapter smoke
+
+Recorded 2026-11-10 using the empty B2 bucket explicitly authorized by the user, with credentials read from `.env` without modification or disclosure. All mutations stayed inside one new UUID scratch prefix. No PostgreSQL state or bucket settings were changed.
+
+The real `JanitorObjectStore::delete_batch` confirmed four seeded keys using exactly **one DeleteObjects POST and zero scalar DELETEs**; a fifth protected sentinel remained readable with unchanged bytes. Exact-version cleanup then removed all **nine version/marker entries**, and a second ListObjectVersions including delete markers returned **zero entries** in the prefix. The HTTP counts describe batch execution before cleanup, which uses version-scoped single deletes.
+
+    cargo test -p studiofs-data --test janitor_live janitor_live_s3_uses_multi_delete_and_cleans_exact_versions -- --ignored --nocapture
+
+Result: 1 passed in 4.35 seconds. Artifact: `target/janitor-benchmark/sfs1065-live-smoke.json`. The ignored test is retained in `crates/studiofs-data/tests/janitor_live.rs`. It uses an instrumented OpenDAL operator to establish the provider's batch behavior; adaptive pacing/retries are covered by the local transport tests. This is an adapter smoke, not a matched throughput or live PostgreSQL protection test. RustFS and the full disposable PG/S3 adversarial acceptance remain unrun while Docker is unavailable.
+
 ## Parameter choices
 
 The defaults stay as they are. Each change considered was rejected against the evidence:

@@ -227,10 +227,7 @@ async fn sfs978_applied_delete_with_lost_response_replays_idempotently_after_res
         metadata.finishes[0].2,
         UploadedObjectDeletionOutcome::Retryable
     );
-    assert_eq!(
-        store.payload_keys.lock().unwrap().len(),
-        studiofs_data::object::CLOUD_FRAGMENT_COUNT
-    );
+    assert!(store.payload_keys.lock().unwrap().is_empty());
 
     // A fresh metadata handle models restart after the retry becomes eligible again.
     let mut restarted_metadata = FakeJanitorMetadata::eligible();
