@@ -12,6 +12,13 @@ impl MetaEngineCore for PgMetaEngine {
     }
 
     fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {
+        {
+            let _replication = self
+                .replication_lock
+                .lock()
+                .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_owned()))?;
+            self.retire_abandoned_uploads_or_warn();
+        }
         self.try_acquire_pg_janitor_lock()
     }
 

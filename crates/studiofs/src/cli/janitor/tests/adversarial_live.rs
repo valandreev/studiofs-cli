@@ -539,6 +539,223 @@ async fn live_cli_disposable_adversarial_protection_cleanup_dry_run_and_budget()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker; creates isolated PostgreSQL and RustFS containers"]
+async fn live_cli_disposable_retires_abandoned_upload_but_protects_delayed_publication()
+-> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    use studiofs_meta::engine::{
+        MetaFsOps, MetaGc, MetaInodes, MetaPayloadObjects, MetaReplication,
+    };
+    use studiofs_meta::snapshot_ports::{UploadedFragmentLedger, UploadedFragmentLedgerEntry};
+    use studiofs_meta::{PgMetaEngine, PgOpenOptions};
+
+    let stack = DisposableStack::start().await?;
+    let base = object_id(0)?;
+    let abandoned = base;
+    let waiting_publication = base + 1;
+    let prefix = format!("sfsjanitor-abandoned/{base:016x}/objects/");
+    let s3 = stack.s3(&prefix);
+    seed_live_object(&stack, &prefix, abandoned).await?;
+    seed_live_object(&stack, &prefix, waiting_publication).await?;
+    let writer_root = stack.root.join("abandoned-upload-writer");
+    let janitor_root = stack.root.join("abandoned-upload-janitor");
+    let meta_dir = writer_root.join("meta/janitor-live");
+    let (volume_id, db_path, _) =
+        create_live_postgres_janitor_fixture(&stack.postgres_url, &s3, &meta_dir, abandoned)
+            .await?;
+    let (client, task) = connection(&stack).await?;
+    client
+        .execute(
+            "DELETE FROM snapshot_payload_gc_candidates WHERE vol = $1",
+            &[&volume_id],
+        )
+        .await?;
+    task.abort();
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )?;
+
+    let payload = b"janitor fixture";
+    let digest: [u8; 32] = Sha256::digest(payload).into();
+    let entries_for = |id: u64| -> anyhow::Result<Vec<UploadedFragmentLedgerEntry>> {
+        Ok(object_keys(&prefix, id)
+            .into_iter()
+            .enumerate()
+            .map(|(fragment_index, object_key)| UploadedFragmentLedgerEntry {
+                volume_id,
+                object_id: id,
+                fragment_index: u32::try_from(fragment_index).expect("two fixture keys"),
+                object_key,
+                expected_byte_length: u64::try_from(payload.len()).expect("payload length fits"),
+                expected_sha256: digest,
+            })
+            .collect())
+    };
+    for id in [abandoned, waiting_publication] {
+        let entries = entries_for(id)?;
+        engine.begin_fragment_uploads(&entries)?;
+        engine.confirm_fragment_uploads(&entries)?;
+    }
+    engine.flush_metadata()?;
+
+    engine.add_pending_deletion(abandoned, 1)?;
+    engine.flush_metadata()?;
+    let (client, task) = connection(&stack).await?;
+    let retired = client
+        .query_one(
+            "SELECT state, EXISTS (SELECT 1 FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = $2) FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2",
+            &[&volume_id, &i64::try_from(abandoned)?],
+        )
+        .await?;
+    anyhow::ensure!(
+        retired.get::<_, String>(0) == "delete_pending" && retired.get::<_, bool>(1),
+        "settled unreferenced upload was not queued for deletion"
+    );
+    // The CLI uses a whole-second cutoff; age the new candidate past that boundary.
+    client
+        .execute(
+            "UPDATE snapshot_payload_gc_candidates SET eligible_at = clock_timestamp() - interval '1 second' WHERE vol = $1 AND object_id = $2",
+            &[&volume_id, &i64::try_from(abandoned)?],
+        )
+        .await?;
+    task.abort();
+    engine.flush_local_metadata()?;
+    drop(engine);
+
+    // The janitor client stays caught up while the writer has a local event tail.
+    let janitor_db_path = janitor_root.join("meta/janitor-live/janitor-live.db");
+    std::fs::create_dir_all(
+        janitor_db_path
+            .parent()
+            .expect("janitor metadata directory"),
+    )?;
+    std::fs::copy(&db_path, &janitor_db_path)?;
+    let engine = PgMetaEngine::open_with_options(
+        &db_path,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )?;
+
+    // Keep a real local publication behind the pending deletion marker while the
+    // standalone janitor runs against PostgreSQL's older, uploaded-only view.
+    engine.add_pending_deletion(waiting_publication, 2)?;
+    let file = engine.create_file(1, b"delayed-publication", 0, 0, 0o644)?;
+    let mut attr = engine.get_attr(file.ino)?;
+    attr.size = u64::try_from(payload.len())?;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr)?;
+    let slice = studiofs_meta::schema::SliceRecord::new(
+        studiofs_meta::schema::SliceId(0),
+        studiofs_meta::schema::SliceOrder(0),
+        studiofs_meta::schema::SliceRange::new(0, u32::try_from(payload.len())?)
+            .expect("nonempty fixture payload range"),
+        studiofs_meta::schema::PayloadRef::new_partial(
+            waiting_publication,
+            u32::try_from(payload.len())?,
+        ),
+    );
+    engine.flush_regular_file_overlay_slices(
+        file.ino,
+        &[(studiofs_meta::schema::ChunkId(0), vec![slice])],
+    )?;
+    engine.mark_regular_file_overlay_object_uploaded_if_matches(
+        file.ino,
+        1,
+        waiting_publication,
+    )?;
+    anyhow::ensure!(
+        engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)?,
+        "delayed publication fixture was not publishable"
+    );
+
+    let first_sweep = stack.cli(&cli_args(false, 10), &janitor_root)?;
+    anyhow::ensure!(
+        first_sweep.status.success(),
+        "janitor should finish after retiring the abandoned upload"
+    );
+    let writer = stack.writer()?;
+    for key in object_keys(&prefix, abandoned) {
+        anyhow::ensure!(
+            !writer.exists(&key).await?,
+            "abandoned payload key survived: {key}"
+        );
+    }
+    for key in object_keys(&prefix, waiting_publication) {
+        anyhow::ensure!(
+            writer.exists(&key).await?,
+            "delayed publication payload was deleted: {key}"
+        );
+    }
+
+    let (client, task) = connection(&stack).await?;
+    let abandoned_row = client
+        .query_one(
+            "SELECT uploaded.state, candidate.acknowledged_at IS NOT NULL FROM snapshot_payload_upload_objects AS uploaded JOIN snapshot_payload_gc_candidates AS candidate USING (vol, object_id) WHERE uploaded.vol = $1 AND uploaded.object_id = $2",
+            &[&volume_id, &i64::try_from(abandoned)?],
+        )
+        .await?;
+    anyhow::ensure!(
+        abandoned_row.get::<_, String>(0) == "delete_pending" && abandoned_row.get::<_, bool>(1),
+        "deleted upload must retain its terminal fence and acknowledge its candidate"
+    );
+    let waiting_state: String = client
+        .query_one(
+            "SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2",
+            &[&volume_id, &i64::try_from(waiting_publication)?],
+        )
+        .await?
+        .get(0);
+    anyhow::ensure!(
+        waiting_state == "uploaded",
+        "janitor must leave the delayed upload eligible for publication"
+    );
+    task.abort();
+
+    engine.flush_metadata()?;
+    let (client, task) = connection(&stack).await?;
+    let published_state: String = client
+        .query_one(
+            "SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = $2",
+            &[&volume_id, &i64::try_from(waiting_publication)?],
+        )
+        .await?
+        .get(0);
+    let reference_count: i64 = client
+        .query_one(
+            "SELECT count(*) FROM snapshot_current_references WHERE vol = $1 AND object_id = $2",
+            &[&volume_id, &i64::try_from(waiting_publication)?],
+        )
+        .await?
+        .get(0);
+    anyhow::ensure!(
+        published_state == "published" && reference_count == 1,
+        "delayed publication did not commit its object reference"
+    );
+    task.abort();
+    engine.flush_local_metadata()?;
+    drop(engine);
+    std::fs::copy(&db_path, &janitor_db_path)?;
+    let second_sweep = stack.cli(&cli_args(false, 10), &janitor_root)?;
+    anyhow::ensure!(
+        second_sweep.status.success(),
+        "janitor should complete with the published object protected"
+    );
+    for key in object_keys(&prefix, waiting_publication) {
+        anyhow::ensure!(
+            writer.exists(&key).await?,
+            "published payload key was deleted: {key}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; creates isolated PostgreSQL and RustFS containers"]
 async fn live_cli_disposable_fixture_recovers_after_postgres_restart() -> anyhow::Result<()> {
     let stack = DisposableStack::start().await?;
     let base = object_id(20)?;

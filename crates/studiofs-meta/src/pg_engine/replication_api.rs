@@ -29,6 +29,7 @@ impl MetaReplication for PgMetaEngine {
                 None
             };
             let _ = self.pull_and_reconcile_foreign_events_locked(recent_flush.as_ref())?;
+            self.retire_abandoned_uploads_or_warn();
         }
         self.write_checkpoint_with_lease()?;
         self.local.flush_local_metadata()
