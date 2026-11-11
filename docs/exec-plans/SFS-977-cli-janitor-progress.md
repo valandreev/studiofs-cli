@@ -19,6 +19,8 @@ Operators need to understand whether `studiofs janitor <volume>` is waiting on m
   Evidence: `JanitorMetadataSession::open`, `load_sweep_checkpoint(..., false)`, and the CLI's `!dry_run` guards.
 - Observation: OpenDAL provides logical HEAD/DELETE and transport retry/throttle counters, while list page count is not exposed.
   Evidence: `docs/janitor-performance.md` documents `list_pages=unavailable` and clarifies counters can exclude retries.
+- Observation: the console tracing layer wrote to stdout, so `--output jsonl` mixed log lines into the JSONL stream. Loopback PostgreSQL never emitted the INFO line about falling back from TLS, so the loopback guard hid this.
+  Evidence: against a remote DSN, `live_cli_dry_run_keeps_eligible_candidate_and_object` failed with `expected value at line 1 column 1` until `init_tracing` was changed to write to stderr.
 
 ## Decision Log
 
@@ -31,6 +33,9 @@ Operators need to understand whether `studiofs janitor <volume>` is waiting on m
 - Decision: expose configured S3 request rate and mark actual in-flight requests, queue depth, and measured throughput null because the existing transport/metadata interfaces do not expose them.
   Rationale: no false precision in operator output.
   Date/Author: 2026-11-09 / Codex.
+- Decision: drop the loopback-only guard from `live_cli_dry_run_keeps_eligible_candidate_and_object`, so it reads the same `STUDIOFS_TEST_PG_DSN`/`STUDIOFS_S3_*` sources as the other live janitor tests.
+  Rationale: the guard made the test fail against the remote `.env` services that the sibling live tests use. The test writes only a unique object prefix and its own volume row, and it removes both on success.
+  Date/Author: 2026-11-11 / Claude.
 
 ## Outcomes & Retrospective
 
@@ -56,15 +61,15 @@ Document exact fields and limitations in `docs/janitor-performance.md`. Keep thi
 
 ## Concrete Steps
 
-Focused checks: `cargo test -p studiofs --bin studiofs progress_ -- --nocapture`, `cargo test -p studiofs --bin studiofs janitor_dry_run_never_sends_delete_requests -- --nocapture`, and `cargo test -p studiofs --bin studiofs janitor_resumed_object_refreshes_age_and_dry_run_preserves_checkpoint -- --nocapture`. Local live checks use a disposable PostgreSQL/RustFS Compose project and explicit process environment overrides for `STUDIOFS_TEST_PG_DSN`, `STUDIOFS_S3_ENDPOINT`, `STUDIOFS_S3_BUCKET`, `STUDIOFS_S3_ACCESS_KEY`, `STUDIOFS_S3_SECRET_KEY`, and `STUDIOFS_S3_REGION`; do not load or reuse remote `.env` endpoints. Build with `cargo build -p studiofs`, then run the ignored janitor acceptance selections serially. The new dry-run process test additionally requires an isolated `STUDIOFS_CLIENT_ROOT` and fails closed for non-loopback services. The parent turn explicitly authorized `cargo test -p studiofs --bin studiofs -- --test-threads=1`; this binary suite was run, but workspace-wide suites were not.
+Focused checks: `cargo test -p studiofs --bin studiofs progress_ -- --nocapture`, `cargo test -p studiofs --bin studiofs janitor_dry_run_never_sends_delete_requests -- --nocapture`, and `cargo test -p studiofs --bin studiofs janitor_resumed_object_refreshes_age_and_dry_run_preserves_checkpoint -- --nocapture`. Local live checks use a disposable PostgreSQL/RustFS Compose project and explicit process environment overrides for `STUDIOFS_TEST_PG_DSN`, `STUDIOFS_S3_ENDPOINT`, `STUDIOFS_S3_BUCKET`, `STUDIOFS_S3_ACCESS_KEY`, `STUDIOFS_S3_SECRET_KEY`, and `STUDIOFS_S3_REGION`; do not load or reuse remote `.env` endpoints. Build with `cargo build -p studiofs`, then run the ignored janitor acceptance selections serially. The new dry-run process test additionally requires an isolated `STUDIOFS_CLIENT_ROOT`. The parent turn explicitly authorized `cargo test -p studiofs --bin studiofs -- --test-threads=1`; this binary suite was run, but workspace-wide suites were not.
 
 ## Validation and Acceptance
 
-Focused tests must show that a long pending metadata/object operation emits multiple progress events, dry-run performs zero checkpoint/queue/delete writes while allowing documented reads and advisory locking, JSONL output matches the documented versioned schema, and text output remains readable without a TTY. The live acceptance test requires loopback-only PostgreSQL and S3 endpoints and uses a unique disposable object namespace. Run formatting and diff checks, and report behavior that remains environment-gated.
+Focused tests must show that a long pending metadata/object operation emits multiple progress events, dry-run performs zero checkpoint/queue/delete writes while allowing documented reads and advisory locking, JSONL output matches the documented versioned schema, and text output remains readable without a TTY. The live acceptance test uses the configured live PostgreSQL and S3 endpoints and a unique disposable object namespace. Run formatting and diff checks, and report behavior that remains environment-gated.
 
 ## Idempotence and Recovery
 
-The change is confined to CLI presentation and its dry-run boundary. It does not modify mounted cleanup behavior or persisted schema. The live acceptance test writes one unique object and PG candidate into disposable loopback services, confirms dry-run leaves them unchanged, and removes only that test-owned object and volume row on success. Keep the Compose volumes for evidence; do not point the test at a user or remote volume.
+The change is confined to CLI presentation and its dry-run boundary. It does not modify mounted cleanup behavior or persisted schema. The live acceptance test writes one unique object and PG candidate under a unique prefix and volume row, confirms dry-run leaves them unchanged, and removes only that test-owned object and volume row on success. Keep the Compose volumes for evidence; never point the test at an existing user volume.
 
 ## Artifacts and Notes
 

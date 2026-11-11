@@ -94,9 +94,14 @@ fn init_tracing(log_level: &str) -> anyhow::Result<Option<WorkerGuard>> {
 
         Ok(Some(guard))
     } else {
+        // Logs go to stderr so stdout carries only command output, such as JSONL.
         tracing_subscriber::registry()
             .with(filter_layer)
-            .with(tracing_subscriber::fmt::layer().with_target(false))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_writer(std::io::stderr),
+            )
             .init();
         Ok(None)
     }
