@@ -44,7 +44,9 @@ pub(super) static BATCH_PIN_QUERY: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// Triggers whose silent loss would let GC or event pruning remove protected
-/// state; every other schema gap makes a janitor statement fail closed.
+/// state; every other schema gap makes a janitor statement fail closed. Only
+/// `O` (origin) and `A` (always) triggers fire in a normal session: `D` is
+/// disabled and `R` fires only under `session_replication_role = replica`.
 const PAYLOAD_GC_GUARD_TRIGGERS: [&str; 6] = [
     "event_log.studiofs_snapshot_source_event_prune_guard",
     "event_log.studiofs_snapshot_source_event_truncate_guard",
@@ -54,7 +56,7 @@ const PAYLOAD_GC_GUARD_TRIGGERS: [&str; 6] = [
     "snapshot_payload_upload_watermarks.studiofs_payload_watermark_delete_guard",
 ];
 
-const PAYLOAD_GC_SCHEMA_PROBE_SQL: &str = "SELECT (SELECT version FROM studiofs_schema_components WHERE component = 'payload_gc'), (SELECT count(DISTINCT tgrelid::regclass::text || '.' || tgname) FROM pg_trigger WHERE tgenabled <> 'D' AND tgrelid::regclass::text || '.' || tgname = ANY($1::TEXT[]))";
+const PAYLOAD_GC_SCHEMA_PROBE_SQL: &str = "SELECT (SELECT version FROM studiofs_schema_components WHERE component = 'payload_gc'), (SELECT count(DISTINCT tgrelid::regclass::text || '.' || tgname) FROM pg_trigger WHERE tgenabled IN ('O', 'A') AND tgrelid::regclass::text || '.' || tgname = ANY($1::TEXT[]))";
 
 pub(crate) struct PgJanitorSession {
     postgres_url: String,
@@ -415,7 +417,12 @@ impl PgJanitorSession {
                 )
                 .await
             })
-            .map_err(|_| pg_sweep_timeout(timeout))?
+            .map_err(|_| {
+                JanitorMetadataError::BackendUnavailable(format!(
+                    "PostgreSQL payload GC schema probe timed out after {} seconds",
+                    timeout.as_secs()
+                ))
+            })?
             .map_err(|error| janitor_pg_error("payload GC schema probe failed", error))?;
         let version: Option<i32> = row.get(0);
         let guards: i64 = row.get(1);

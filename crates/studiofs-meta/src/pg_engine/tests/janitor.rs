@@ -1164,9 +1164,8 @@ fn pg_janitor_sweep_checkpoint_restart_scope_dry_run_and_version() {
 fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
     use crate::pg_engine::schema::{PAYLOAD_GC_SCHEMA_VERSION, studiofs_pg_schema_sql};
     let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
-    let schema = format!("sfs980_{}", Uuid::new_v4().simple());
-    let separator = if dsn.contains('?') { '&' } else { '?' };
-    let isolated_dsn = format!("{dsn}{separator}options=-csearch_path%3D{schema}");
+    let schema = IsolatedPgSchema::new(&dsn);
+    let isolated_dsn = schema.dsn.clone();
     // A volume row is not needed: only the advisory lock and schema probe run.
     let volume_id = i64::from(rand::random::<u32>()) + 1_000_000_000;
 
@@ -1219,8 +1218,7 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
         other => panic!("expected schema refusal containing {reason:?}, got {other:?}"),
     };
 
-    sql(format!("CREATE SCHEMA {schema}")).expect("create isolated schema");
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    {
         // Empty database: nothing deployed.
         refused("SQLSTATE 42P01");
 
@@ -1281,6 +1279,15 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
         refused("incomplete");
         sql(studiofs_pg_schema_sql().to_owned()).expect("re-enabling application");
         verdict().expect("re-created guard is accepted");
+        // A replica-only trigger does not fire in a normal session.
+        sql(
+            "ALTER TABLE event_log ENABLE REPLICA TRIGGER studiofs_snapshot_source_event_prune_guard"
+                .to_owned(),
+        )
+        .expect("make a guard replica-only");
+        refused("incomplete");
+        sql(studiofs_pg_schema_sql().to_owned()).expect("restoring application");
+        verdict().expect("restored guard is accepted");
 
         // A newer schema is unsupported, and re-application never downgrades it.
         sql(format!(
@@ -1291,9 +1298,5 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
         refused("version is unsupported");
         sql(studiofs_pg_schema_sql().to_owned()).expect("older application");
         refused("version is unsupported");
-    }));
-    sql(format!("DROP SCHEMA {schema} CASCADE")).expect("drop isolated schema");
-    if let Err(panic) = outcome {
-        std::panic::resume_unwind(panic);
     }
 }

@@ -644,26 +644,104 @@ fn apply_decoded_foreign_batches_locked(
 
 const SETUP_PG_VOLUME_ADVISORY_LOCK_ID: i64 = 902_202_603;
 
-/// Applies the shared schema once per test process, before any test writes
-/// fixtures. Reapplying it per volume took table locks (`ALTER TABLE`, trigger
+/// Applies the schema once per DSN, before the first volume of that DSN is
+/// created. Reapplying it per volume took table locks (`ALTER TABLE`, trigger
 /// and index DDL) while parallel tests held row locks, and PostgreSQL aborted
-/// one side with `deadlock detected`.
+/// one side with `deadlock detected`. A test that drops or disables shared
+/// schema objects must use [`IsolatedPgSchema`] so this one-time setup holds.
 fn ensure_test_schema_once(dsn: &str) {
-    static SCHEMA_READY: OnceLock<()> = OnceLock::new();
-    SCHEMA_READY.get_or_init(|| {
-        run_async(async {
-            let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| {
-                    MetaError::Storage(format!("postgres connect failed: {}", pg_err(e)))
-                })?;
-            let conn_task = tokio::spawn(connection);
-            let result = crate::pg_engine::schema::ensure_studiofs_pg_schema(&client).await;
-            conn_task.abort();
-            result
-        })
-        .expect("apply the shared PostgreSQL test schema");
-    });
+    static READY: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let mut ready = READY
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if ready.contains(dsn) {
+        return;
+    }
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| MetaError::Storage(format!("postgres connect failed: {}", pg_err(e))))?;
+        let conn_task = tokio::spawn(connection);
+        let result = crate::pg_engine::schema::ensure_studiofs_pg_schema(&client).await;
+        conn_task.abort();
+        result
+    })
+    .expect("apply the PostgreSQL test schema");
+    ready.insert(dsn.to_owned());
+}
+
+/// Returns `dsn` with its sessions confined to `schema`, for both URL and
+/// `key=value` DSNs.
+fn search_path_dsn(dsn: &str, schema: &str) -> String {
+    if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
+        let separator = if dsn.contains('?') { '&' } else { '?' };
+        format!("{dsn}{separator}options=-csearch_path%3D{schema}")
+    } else {
+        format!("{dsn} options='-csearch_path={schema}'")
+    }
+}
+
+/// A private, initially empty PostgreSQL schema for a test that drops or
+/// disables schema objects, so parallel tests keep an intact shared schema.
+/// Dropping the guard removes the schema and everything in it.
+struct IsolatedPgSchema {
+    base_dsn: String,
+    name: String,
+    dsn: String,
+}
+
+impl IsolatedPgSchema {
+    fn new(base_dsn: &str) -> Self {
+        let name = format!("sfs_test_{}", Uuid::new_v4().simple());
+        execute_test_sql(base_dsn, format!("CREATE SCHEMA {name}"));
+        Self {
+            base_dsn: base_dsn.to_owned(),
+            dsn: search_path_dsn(base_dsn, &name),
+            name,
+        }
+    }
+}
+
+impl Drop for IsolatedPgSchema {
+    fn drop(&mut self) {
+        execute_test_sql(&self.base_dsn, format!("DROP SCHEMA {} CASCADE", self.name));
+    }
+}
+
+fn execute_test_sql(dsn: &str, statement: String) {
+    run_async(async move {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| MetaError::Storage(format!("postgres connect failed: {}", pg_err(e))))?;
+        let conn_task = tokio::spawn(connection);
+        let result = client
+            .batch_execute(&statement)
+            .await
+            .map_err(|e| MetaError::Storage(pg_err(e)));
+        conn_task.abort();
+        result
+    })
+    .expect("run test SQL");
+}
+
+#[test]
+fn search_path_dsn_confines_url_and_key_value_dsns() {
+    for dsn in [
+        "postgres://user@127.0.0.1:5432/db",
+        "postgres://user@127.0.0.1:5432/db?sslmode=disable",
+        "host=127.0.0.1 port=5432 user=postgres dbname=db sslmode=disable",
+    ] {
+        let config: tokio_postgres::Config = search_path_dsn(dsn, "sfs_test_x")
+            .parse()
+            .unwrap_or_else(|error| panic!("{dsn}: {error}"));
+        assert_eq!(
+            config.get_options(),
+            Some("-csearch_path=sfs_test_x"),
+            "{dsn}"
+        );
+        assert_eq!(config.get_dbname(), Some("db"), "{dsn}");
+    }
 }
 
 fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaResult<i64> {
