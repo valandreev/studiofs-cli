@@ -89,6 +89,8 @@ impl DisposableStack {
                 .disable_config_load()
                 .disable_ec2_metadata(),
         )?
+        // Fixture writes retry temporary S3 errors, as the janitor store does.
+        .layer(opendal::layers::RetryLayer::new())
         .finish())
     }
 
@@ -260,32 +262,12 @@ fn object_id(offset: u64) -> anyhow::Result<u64> {
 }
 
 async fn seed_live_object(stack: &DisposableStack, prefix: &str, id: u64) -> anyhow::Result<()> {
-    for key in object_keys(prefix, id) {
-        stack
-            .writer()?
-            .write(&key, b"janitor fixture".to_vec())
-            .await?;
-        // The container clock can run ahead of this host; the janitor skips a
-        // future-dated object as unknown age, so wait until its timestamp has passed.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let modified: Option<std::time::SystemTime> = stack
-                .writer()?
-                .stat(&key)
-                .await?
-                .last_modified()
-                .map(Into::into);
-            if modified.is_some_and(|modified| modified <= std::time::SystemTime::now()) {
-                break;
-            }
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "seeded object {key} stayed future-dated"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+    let writer = stack.writer()?;
+    let keys = object_keys(prefix, id);
+    for key in &keys {
+        writer.write(key, b"janitor fixture".to_vec()).await?;
     }
-    Ok(())
+    super::wait_until_s3_keys_are_past(&writer, &keys).await
 }
 
 fn parse_events(output: &Output) -> anyhow::Result<Vec<serde_json::Value>> {

@@ -644,7 +644,30 @@ fn apply_decoded_foreign_batches_locked(
 
 const SETUP_PG_VOLUME_ADVISORY_LOCK_ID: i64 = 902_202_603;
 
+/// Applies the shared schema once per test process, before any test writes
+/// fixtures. Reapplying it per volume took table locks (`ALTER TABLE`, trigger
+/// and index DDL) while parallel tests held row locks, and PostgreSQL aborted
+/// one side with `deadlock detected`.
+fn ensure_test_schema_once(dsn: &str) {
+    static SCHEMA_READY: OnceLock<()> = OnceLock::new();
+    SCHEMA_READY.get_or_init(|| {
+        run_async(async {
+            let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| {
+                    MetaError::Storage(format!("postgres connect failed: {}", pg_err(e)))
+                })?;
+            let conn_task = tokio::spawn(connection);
+            let result = crate::pg_engine::schema::ensure_studiofs_pg_schema(&client).await;
+            conn_task.abort();
+            result
+        })
+        .expect("apply the shared PostgreSQL test schema");
+    });
+}
+
 fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaResult<i64> {
+    ensure_test_schema_once(dsn);
     run_async(async move {
         let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
@@ -664,8 +687,6 @@ fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaRe
         )
         .await
         .map_err(|e| MetaError::Storage(format!("postgres advisory lock failed: {}", pg_err(e))))?;
-
-        crate::pg_engine::schema::ensure_studiofs_pg_schema(&tx).await?;
 
         let row = tx
             .query_one(

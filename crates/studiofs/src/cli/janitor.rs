@@ -1167,6 +1167,31 @@ mod tests {
     mod adversarial;
     mod adversarial_live;
 
+    /// Returns once S3 dates every key in the past by this host's clock. With a
+    /// zero grace window the janitor skips a future-dated object as unknown age,
+    /// and the S3 server clock may run ahead of this host. HEAD dates have second
+    /// precision while listings carry milliseconds, hence the 1 s margin.
+    async fn wait_until_s3_keys_are_past(writer: &Operator, keys: &[String]) -> anyhow::Result<()> {
+        let mut newest = SystemTime::UNIX_EPOCH;
+        for key in keys {
+            let modified = writer
+                .stat(key)
+                .await?
+                .last_modified()
+                .with_context(|| format!("S3 returned no Last-Modified for {key}"))?;
+            newest = newest.max(modified.into());
+        }
+        let ahead = (newest + Duration::from_secs(1))
+            .duration_since(SystemTime::now())
+            .unwrap_or_default();
+        anyhow::ensure!(
+            ahead < Duration::from_secs(10),
+            "S3 server clock runs {ahead:?} ahead of this host"
+        );
+        tokio::time::sleep(ahead).await;
+        Ok(())
+    }
+
     #[test]
     fn progress_jsonl_reports_versioned_fields_and_unknown_counts() {
         let state = ProgressSnapshot {
@@ -4847,9 +4872,12 @@ mod tests {
                 .secret_access_key(&secret_key)
                 .region(&region),
         )?
+        // Fixture writes retry temporary S3 errors, as the janitor store does.
+        .layer(opendal::layers::RetryLayer::new())
         .finish();
         let key = studiofs_data::object::format_object_key(&prefix, object_id);
         writer.write(&key, b"sfs977 dry-run".to_vec()).await?;
+        wait_until_s3_keys_are_past(&writer, std::slice::from_ref(&key)).await?;
 
         let temp = studiofs_test_support::workspace_target_tempdir("janitor-sfs977-dry-run-");
         let client_root = temp.path().join("client");
@@ -5027,6 +5055,8 @@ mod tests {
                 .secret_access_key(&secret_key)
                 .region(&region),
         )?
+        // Fixture writes retry temporary S3 errors, as the janitor store does.
+        .layer(opendal::layers::RetryLayer::new())
         .finish();
         let store = OpenDalJanitorStore(studiofs_data::janitor::JanitorObjectStore::from_s3(
             &endpoint,
@@ -5038,6 +5068,7 @@ mod tests {
         )?);
         let key = studiofs_data::object::format_object_key(&prefix, object_id);
         writer.write(&key, b"sfs976-cancel".to_vec()).await?;
+        wait_until_s3_keys_are_past(&writer, std::slice::from_ref(&key)).await?;
 
         let temp = studiofs_test_support::workspace_target_tempdir("janitor-sfs976-live-");
         let (volume_id, db_path, format_info) = create_live_postgres_janitor_fixture(
@@ -5195,6 +5226,8 @@ mod tests {
                 .region(&region),
         )
         .unwrap()
+        // Fixture writes retry temporary S3 errors, as the janitor store does.
+        .layer(opendal::layers::RetryLayer::new())
         .finish();
         let store = OpenDalJanitorStore(
             studiofs_data::janitor::JanitorObjectStore::from_s3(
@@ -5228,6 +5261,7 @@ mod tests {
             for key in &keys {
                 writer.write(key, b"x".to_vec()).await.unwrap();
             }
+            wait_until_s3_keys_are_past(&writer, &keys).await.unwrap();
 
             assert_eq!(listed_files(&store, &root, None).await, keys);
             // Resume strictly after a key, even when directory entries are synthesized.
@@ -5255,6 +5289,7 @@ mod tests {
 
             let mut metadata = FakeJanitorMetadata::eligible();
             let mut completed = false;
+            let mut skipped = (0_u64, 0_u64, 0_u64);
             for _ in 0..2_000 {
                 let checkpoint = metadata
                     .sweep_checkpoint
@@ -5283,6 +5318,9 @@ mod tests {
                 .await
                 .unwrap();
                 assert!(stats.initial_listing_entries <= 1);
+                skipped.0 += stats.skipped_young;
+                skipped.1 += stats.skipped_unknown_age;
+                skipped.2 += stats.delete_errors;
                 if stats.scan_complete {
                     completed = true;
                     break;
@@ -5298,7 +5336,7 @@ mod tests {
             expected.sort_unstable();
             assert_eq!(
                 claims, expected,
-                "{strategy}: every orphan must be claimed once"
+                "{strategy}: every orphan must be claimed once (young, unknown_age, delete_errors) = {skipped:?}"
             );
             assert_eq!(
                 listed_files(&store, &root, None).await,
