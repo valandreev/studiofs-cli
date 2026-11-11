@@ -4847,7 +4847,10 @@ mod tests {
                     tokio_postgres::config::Host::Unix(_) => true,
                 })
                 && is_loopback(s3_url.host_str()),
-            "live janitor test requires local PostgreSQL and S3 endpoints"
+            "live janitor test requires loopback PostgreSQL and S3 endpoints (S3 host: {:?}); \
+             override STUDIOFS_TEST_PG_DSN and STUDIOFS_S3_* with disposable local services, \
+             e.g. postgres and rustfs from docker/compose.e2e.yml",
+            s3_url.host_str()
         );
         let object_id = u64::try_from(
             SystemTime::now()
