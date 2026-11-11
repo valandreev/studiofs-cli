@@ -150,7 +150,8 @@ studiofs janitor myvolume --loop --interval-minutes 30
 ```
 
 Exit codes: 0 complete, 2 partial (limit reached or Ctrl+C), 3 lock busy,
-4 unsafe metadata state, 5 backend/schema failure. In PowerShell read
+4 unsafe metadata state, 5 backend/schema failure or any object that failed
+its HEAD or DELETE. In PowerShell read
 `$LASTEXITCODE`. For automation, `--output jsonl` emits `progress`, `cycle` and
 a final `summary` event. See the
 [user guide](user-guide/en/27-maintenance-and-removing-a-volume.md) for recovery steps.

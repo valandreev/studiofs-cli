@@ -344,6 +344,8 @@ volume on this computer must be stopped first.
 - `--loop` repeats cycles every `--interval-minutes` (default 30); a busy lock
   waits for the next interval instead of exiting.
 - `--cache-dir` only adds local pending-upload diagnostics to the banner.
+- There is no `--reset-scan` (use `--full-scan`) and no PostgreSQL or S3
+  concurrency option: both are used one request at a time.
 
 Each cycle stops admitting new work at the first limit it meets and reports an
 `outcome`:
@@ -368,8 +370,9 @@ Each cycle stops admitting new work at the first limit it meets and reports an
   the janitor runs, because every deletion is re-checked in PostgreSQL.
 - Exit status: 0 complete; 2 partial (delete cap, scan or time budget,
   cancellation); 3 another janitor holds the lock; 4 unsafe metadata state;
-  5 backend, schema or other failure, including a single cycle that ended with
-  transient S3 errors or an open overload circuit. A second Ctrl+C exits at once
+  5 backend, schema or other failure, including a single cycle in which any
+  object's HEAD or DELETE failed (even if a limit was also reached) or the
+  overload circuit opened. A second Ctrl+C exits at once
   with 130. `--output jsonl` prints the same outcome in a final `summary` event.
 - Janitor work is admitted in eligibility batches of at most 1,000 candidates,
   and deletions are claimed and settled in PostgreSQL in batches of at most 64

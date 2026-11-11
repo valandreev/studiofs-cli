@@ -100,7 +100,9 @@ Every 5 seconds it prints a `Janitor progress:` line with the current phase and 
 | `outcome` | `complete`, or why the cycle stopped early (see the table below) |
 | `scan coverage` | `complete` if the sweep reached the end of the prefix, otherwise `partial`, with the next position |
 | `would delete` / `deleted` | Objects that would be deleted (dry run) or were deleted and confirmed |
-| `delete errors`, `head errors` | Objects that failed and stay queued for a later run |
+| `deferred candidates` | Queued objects postponed to a later cycle |
+| `delete errors`, `head errors` | Objects whose deletion or age check failed; a later run tries them again |
+| `fences pruned` | Old internal deletion records removed from PostgreSQL |
 
 **`scan coverage: partial` means part of the bucket has not been checked in this sweep. It is not a full cleanup.** Run the command again to continue.
 
@@ -144,6 +146,8 @@ Press **Ctrl+C** once. The janitor stops taking new work, finishes the deletions
 
 Press Ctrl+C a second time only if the command does not finish. It then exits immediately (code 130). This is also safe: an unfinished claim expires after about one minute, and the object is processed again by a later run.
 
+This graceful stop is tested on Linux and macOS. On Windows, stopping and restarting the process was tested, but the Ctrl+C drain in a console was not yet. Check the exit code after you stop a run.
+
 ### Load on S3 and PostgreSQL
 
 The janitor sends S3 requests one at a time, by default at most 4 per second (`--s3-requests-per-second`, from 1 to 32). If the provider answers "too many requests" (HTTP 429 or 503), the janitor slows down by itself and recovers gradually. PostgreSQL commands are also sent one at a time, and objects are processed in batches. The janitor needs no extra settings for a small PostgreSQL server.
@@ -157,10 +161,10 @@ The exit code tells a script what happened:
 | Code | Meaning | What to do |
 | --- | --- | --- |
 | 0 | The cycle finished completely | Nothing |
-| 2 | Partial: a delete, scan or time limit was reached, or you pressed Ctrl+C | Run the command again to continue |
+| 2 | Partial: a delete, scan or time limit was reached, or you pressed Ctrl+C, and no object failed | Run the command again to continue |
 | 3 | Another janitor is working on this volume (single run only) | Try again later, or use `--loop` |
 | 4 | Unsafe metadata state: nothing was deleted | See [Troubleshooting](#when-the-janitor-stops) |
-| 5 | PostgreSQL or S3 is unavailable, S3 kept failing, the schema does not match, or another failure | Read the error message; work already confirmed is kept, and unfinished work stays for the next run |
+| 5 | PostgreSQL or S3 is unavailable, at least one object could not be checked or deleted, the schema does not match, or another failure | Read the error message; work already confirmed is kept, and unfinished work stays for the next run |
 
 In PowerShell, read the code with `$LASTEXITCODE`; in bash, with `$?`:
 
@@ -175,18 +179,20 @@ For automation, `--output jsonl` prints one JSON object per line: `progress` eve
 studiofs janitor myvolume --dry-run --output jsonl > janitor.jsonl
 ```
 
+Use PowerShell 7 (`pwsh`) for this: Windows PowerShell 5.1 writes the file as UTF-16, which most JSON tools cannot read.
+
 ### When the janitor stops
 
 | Message | Cause | What to do |
 | --- | --- | --- |
 | `Volume '…' not found` | The volume is not set up on this computer | Run the command on a computer where the volume exists, or connect it with `studiofs discover` |
-| Exit code 5 with an error opening the local database | The volume is mounted on this computer | Unmount it and try again |
+| Exit code 5 with an error opening the local database | The volume is mounted on this computer | Unmount it and try again. The last line still suggests checking PostgreSQL/S3 connectivity; the error line above it names the real cause |
 | `unsafe metadata state` … `pending sync or recovery state` (code 4) | This computer has unpublished changes or unfinished recovery | Mount, wait for synchronization, unmount, retry |
 | `unsafe metadata state` for the volume identity or storage binding (code 4) | Local and PostgreSQL information about the volume do not match | Do not try to bypass it; check that this is the right volume and storage, and ask for help with the logs |
 | `global lock is busy` (code 3) | Another janitor, possibly a mounted client's, is working | Wait and retry, or use `--loop` |
 | `PostgreSQL schema or privileges do not fit this version` (code 5) | The schema is missing, damaged, or from another StudioFS version | See [After an upgrade](#after-an-upgrade) |
 | `backend unavailable` (code 5) | PostgreSQL or S3 cannot be reached | Check the network and credentials; work already confirmed is kept |
-| `S3 overload circuit open` or `completed with transient errors` (code 5) | S3 failed for several objects | Wait, or lower `--s3-requests-per-second`; unfinished work stays queued |
+| `S3 overload circuit open` or `completed with transient errors` (code 5) | At least one object could not be checked or deleted in S3 | Run again later, or lower `--s3-requests-per-second`; failed objects are tried again |
 
 None of these cases has a "force" option. If the janitor is not sure an object is unused, it keeps the object.
 
@@ -196,8 +202,10 @@ The janitor stores its queue and saved position in PostgreSQL tables with a vers
 
 ```powershell
 studiofs init myvolume --endpoint https://s3.example.com --bucket my-bucket `
-  --access-key <key> --secret-key <secret> --meta "<postgresql-dsn>"
+  --access-key "<key>" --secret-key "<secret>" --meta "<postgresql-dsn>"
 ```
+
+Use exactly the same endpoint and bucket: `init` creates a bucket that does not exist, so a typo creates a new, empty bucket.
 
 For an existing volume, the command applies the update first and then stops with `Volume 'myvolume' already exists in PostgreSQL metadata`. **That message is expected here. Do not follow its suggestion to run `destroy`: that would delete the volume.** The update does not change your files, and repeating it is safe.
 

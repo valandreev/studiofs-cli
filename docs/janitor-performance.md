@@ -6,7 +6,7 @@ The CLI emits a readable progress line every five seconds, beginning before the 
 
 Pass `--output jsonl` to emit newline-delimited JSON events (`--output text` is the default). Each event has `schema_version: 1` and an `event` field. `progress` events contain `phase`, `phase_elapsed_ms`, `scanned`, `listed_entries`, `orphan_candidates`, `protected`, `skipped_young`, `skipped_unknown`, `head_attempted`, `delete_attempted`, `delete_confirmed`, `would_delete`, and `s3_rate_limit_per_second`. `cycle` events report `outcome`, `partial`, `coverage`, `scanned`, `listed_entries`, `protected`, `abandoned_uploads`, `orphan_candidates`, skip counts, delete attempted/confirmed/would-delete counts, phase timings, S3 throttle/retry counts, configured S3 rate limit and current `s3_request_interval_ms`, nullable `first_entry_ms` and `first_candidate_ms`, `peak_buffered_candidates`, `head_attempted`, `delete_errors`, and `head_errors`. Exactly one final `summary` event reports `outcome`, `coverage`, and `exit_code`; backend/unsafe/partial/lock-busy summaries also include a safe `message`. Null means not yet observed. In-flight requests, retryable queue depth and actual request throughput are not exposed by current interfaces, so no event reports them. `s3_rate_limit_per_second` is the configured cap, not measured throughput. S3 attempt counters are logical OpenDAL calls, not underlying HTTP retries. Listing page count is unavailable.
 
-The process exit codes are 0 for complete success, 2 for a partial budget or cancellation, 3 when the single cycle cannot acquire the global lock, 4 when metadata safety cannot be established, and 5 for backend, schema and other failures, including a single cycle that ended with transient S3 errors or an open overload circuit. A second Ctrl+C exits immediately with 130. JSONL summaries include the matching `exit_code`.
+The process exit codes are 0 for complete success, 2 for a partial budget or cancellation, 3 when the single cycle cannot acquire the global lock, 4 when metadata safety cannot be established, and 5 for backend, schema and other failures, including a single cycle in which any object's HEAD or DELETE failed (`CycleOutcome::TransientErrors`, even when a limit was also reached) or the overload circuit opened. A second Ctrl+C exits immediately with 130. JSONL summaries include the matching `exit_code`.
 
 Text mode remains suitable for redirected output and terminals on Windows. JSONL mode writes progress, cycle, and final-summary objects to stdout; phase diagnostics and safe error labels stay on stderr. A clean cycle can still have limited coverage when a scan, runtime, or delete budget stops admission. Dry-run opens local metadata read-only, reads remote protection/checkpoint/GC-candidate state, and takes a session-scoped PostgreSQL advisory lock to avoid racing a destructive sweep. It does not persist the lock, write the GC queue, reset/save a scan checkpoint, prune deletion fences, or send DELETE; it can list objects and HEAD untimed entries.
 
@@ -102,16 +102,20 @@ Backblaze B2 was selected as the production-provider class. B2 buckets are alway
 ## Release gate (SFS-981)
 
 The CLI janitor deletes by default, without `--dry-run`. Do not tag a release
-that contains it until all three gates below pass on the release commit. Run
-them from the repository root; every command works in PowerShell. The Docker
-gates start their own disposable Compose project and never read `.env`. The
-schema gate needs `STUDIOFS_TEST_PG_DSN` pointing at a disposable PostgreSQL.
+that contains it until all three gates below pass on the release commit. This
+gate is a release procedure: CI and the binary do not enforce it. Run the
+commands from the repository root; they work in PowerShell. The Docker gates
+start their own disposable Compose project and never read `.env`. The schema
+gate needs a disposable PostgreSQL, for example
+`$env:STUDIOFS_TEST_PG_DSN = "postgres://postgres:<password>@127.0.0.1:<port>/postgres"`.
+The dump/load test additionally needs the `STUDIOFS_S3_*` test settings and
+falls back to `.env`, so set every variable explicitly to disposable resources.
 
 | Gate | Proves | Command |
 | --- | --- | --- |
 | Safety (SFS-978) | Referenced, snapshot-pinned, uploading and delayed-publication payloads survive; dry run changes nothing; budgets, checkpoints, PG restart, kill/restart and lock exclusion recover | `cargo test -p studiofs --bin studiofs sfs978_ -- --nocapture`, then `cargo build -p studiofs --bin studiofs` and `cargo test -p studiofs --bin studiofs live_cli_disposable_ -- --ignored --nocapture --test-threads=1` |
-| Scale (SFS-979) | Flat memory, bounded S3/PG load, completed sweeps without losing referenced objects | `cargo build --release -p studiofs --bin studiofs --tests`, then `cargo test -p studiofs --bin studiofs --release janitor_synthetic_listing_benchmark -- --ignored --nocapture` and `... live_cli_janitor_benchmark -- --ignored --nocapture` |
-| Migration (SFS-980) | Atomic, repeatable schema deployment; janitor refuses missing, interrupted, drifted or newer schema | `cargo test -p studiofs-meta --lib payload_gc_version_marker_is_the_last_statement_and_never_downgrades` and `cargo test -p studiofs-meta --lib janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema -- --ignored --nocapture` |
+| Scale (SFS-979) | Flat memory, bounded S3/PG load, completed sweeps without losing referenced objects | `cargo build --release -p studiofs --bin studiofs --tests`, then `cargo test -p studiofs --bin studiofs --release janitor_synthetic_listing_benchmark -- --ignored --nocapture` and `cargo test -p studiofs --bin studiofs --release live_cli_janitor_benchmark -- --ignored --nocapture` |
+| Migration (SFS-980) | Atomic, repeatable schema deployment; janitor refuses missing, interrupted, drifted or newer schema; `load` refuses targets holding GC rows | `cargo test -p studiofs-meta --lib payload_gc_version_marker_is_the_last_statement_and_never_downgrades`, `cargo test -p studiofs-meta --lib janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema -- --ignored --nocapture` and `cargo test -p studiofs --test dump_load_test dump_load_rejects_replacing_uuid_with_reachability_or_upload_state -- --ignored --nocapture` |
 
 Deployment: build and publish the release, apply the schema once with
 `studiofs init` (expected `already exists` exit, never followed by `destroy`),
@@ -123,7 +127,8 @@ There is no schema downgrade, and an older binary refuses the newer schema.
 
 - Safety: 2 deterministic and 6 disposable PostgreSQL 18/RustFS tests passed
   (92 s). This closes the SFS-978 Windows Docker gap.
-- Migration: both schema tests passed against a disposable PostgreSQL 18.
+- Migration: both schema tests passed against a disposable PostgreSQL 18. The
+  dump/load test was not run, so this gate is still incomplete.
 - Scale, synthetic: 1M keys with 1,000 orphans completed in 90 s, peak RSS
   32 MiB, 1,000 list and 1,000 batch delete requests, no HEAD.
 - Scale, live (1,000 objects, 50% orphans, 100 ms PostgreSQL RTT, 1 PG vCPU,
