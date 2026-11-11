@@ -250,7 +250,10 @@ to verify actual S3 removal of a retired upload and protection through delayed
 metadata publication. Its focused metadata counterpart is
 `abandoned_uploaded_objects_retire_only_after_local_publication_is_settled`
 in `studiofs-meta`; it requires an explicitly configured disposable
-`STUDIOFS_TEST_PG_DSN` and `-- --ignored`.
+`STUDIOFS_TEST_PG_DSN` and `-- --ignored`. The write, delete, unmount, CLI
+Janitor path is covered by
+`janitor_session_retires_uploads_its_client_abandoned_before_publication` under
+the same prerequisites.
 
 The deterministic writer interleaving uses test metadata, and process acceptance
 seeds PostgreSQL ownership rows. Neither substitutes for a live mounted writer

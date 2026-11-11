@@ -268,6 +268,30 @@ impl JanitorMetadataSession {
         Ok(())
     }
 
+    /// Retires the uploads this client abandoned before publication (written and
+    /// deleted before their metadata reached PostgreSQL), so this cycle can delete
+    /// them. Returns the retired count; a dry run only counts.
+    ///
+    /// Only the owning client can prove an upload abandoned: `validate_protection`
+    /// showed its whole local journal acknowledged, and its pending-deletion
+    /// markers are local-only. Uploads of other clients stay protected.
+    // ponytail: resends every unreferenced local marker each cycle (1,000 per round trip);
+    // the read-only redb cannot drop them. Track retired IDs if marker sets grow large.
+    pub fn retire_abandoned_uploads(&mut self, dry_run: bool) -> Result<u64, JanitorMetadataError> {
+        self.ensure_validated_cycle()?;
+        let marked: Vec<(u64, i64)> = self
+            .local
+            .get_pending_deletions()
+            .map_err(backend_unavailable)?
+            .into_iter()
+            .filter(|(object_id, _)| !self.local_referenced.contains(object_id))
+            .collect();
+        if marked.is_empty() {
+            return Ok(0);
+        }
+        self.postgres.retire_abandoned_uploads(&marked, dry_run)
+    }
+
     /// Checks only the supplied object IDs against authoritative local and shared metadata.
     pub fn check_eligibility(
         &mut self,
