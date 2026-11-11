@@ -45,6 +45,7 @@
 | Переглянути знімки | `studiofs snapshot projectfs list` | Та сама глава |
 | Перевірити розклад знімків | `studiofs snapshot projectfs policy show` | Та сама глава |
 | Попередньо оцінити прибирання | `studiofs janitor projectfs --dry-run` | [Обслуговування](27-maintenance-and-removing-a-volume.md) |
+| Прибирати невеликими кроками | `studiofs janitor projectfs --max-deletes 100` | Та сама глава |
 
 Для знімка скопіюйте справжній ідентифікатор зі списку. Наприклад, якщо він `projectfs.2026-08-12T14-07-09.482Z`:
 

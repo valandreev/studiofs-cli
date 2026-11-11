@@ -132,13 +132,29 @@ studiofs janitor myvolume --dry-run
 ```
 
 Dry-run performs the same validation and reports candidates without modifying
-metadata or deleting objects. It also requires complete protection state.
+metadata or deleting objects. It also requires complete protection state. It
+starts at the saved sweep position; add `--full-scan` to preview the whole prefix.
 
-Run actual cleanup (delete up to 500 old objects):
+Run a capped cleanup (at most 100 confirmed deletions, 60-minute grace):
 
 ```bash
-studiofs janitor myvolume --max-deletes 500
+studiofs janitor myvolume --max-deletes 100 --skip-newer-minutes 60
 ```
+
+A large bucket takes several runs. Each run resumes from the position saved in
+PostgreSQL and prints `scan coverage: partial` until a sweep reaches the end:
+
+```bash
+studiofs janitor myvolume --max-scan-entries 100000
+studiofs janitor myvolume --loop --interval-minutes 30
+```
+
+Exit codes: 0 complete, 2 partial (limit reached or Ctrl+C), 3 lock busy,
+4 unsafe metadata state, 5 backend/schema failure or any object that failed
+its HEAD or DELETE. In PowerShell read
+`$LASTEXITCODE`. For automation, `--output jsonl` emits `progress`, `cycle` and
+a final `summary` event. See the
+[user guide](user-guide/en/27-maintenance-and-removing-a-volume.md) for recovery steps.
 
 ## 6. Snapshot v2 source capture
 

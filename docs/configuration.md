@@ -330,8 +330,22 @@ path is not a mounted StudioFS volume. See
 ### `janitor`
 
 ```bash
-studiofs janitor <name> [--dry-run] [--loop] [--interval-minutes <u64>] [--skip-newer-minutes <u64>] [--max-deletes <u64>] [--max-scan-entries <u64>] [--max-runtime-minutes <u64>] [--s3-requests-per-second <1..32>] [--full-scan] [--output <text|jsonl>]
+studiofs janitor <name> [--dry-run] [--loop] [--interval-minutes <u64>] [--skip-newer-minutes <u64>] [--max-deletes <u64>] [--max-scan-entries <u64>] [--max-runtime-minutes <u64>] [--s3-requests-per-second <1..32>] [--full-scan] [--output <text|jsonl>] [--cache-dir <path>]
 ```
+
+Operator walkthrough: [user guide chapter 27](user-guide/en/27-maintenance-and-removing-a-volume.md).
+Each cycle first drains the PostgreSQL GC candidate queue, then continues the
+S3 orphan sweep from the volume's saved position. It requires local metadata
+for the volume on this computer, opened read-only, so a mount of the same
+volume on this computer must be stopped first.
+
+- `--skip-newer-minutes` (default 15) is the grace period; younger or
+  unknown-age objects are kept.
+- `--loop` repeats cycles every `--interval-minutes` (default 30); a busy lock
+  waits for the next interval instead of exiting.
+- `--cache-dir` only adds local pending-upload diagnostics to the banner.
+- There is no `--reset-scan` (use `--full-scan`) and no PostgreSQL or S3
+  concurrency option: both are used one request at a time.
 
 Each cycle stops admitting new work at the first limit it meets and reports an
 `outcome`:
@@ -347,21 +361,25 @@ Each cycle stops admitting new work at the first limit it meets and reports an
   `--dry-run` starts at the saved position too and never saves one; add
   `--full-scan` to preview the whole prefix.
 - `--s3-requests-per-second` (default 4, range 1–32) paces S3 HTTP request
-  starts: listing pages, stat/HEAD, and every canonical fragment DELETE. The
-  janitor issues S3 and PostgreSQL requests one at a time, so this rate is the
-  only throughput setting; an object costs two DELETE requests.
+  starts: listing pages, stat/HEAD, and every DELETE request, including
+  retries. The janitor issues S3 and PostgreSQL requests one at a time, so this
+  rate is the only throughput setting. Where the provider supports it, the
+  canonical keys of up to 64 claimed objects go in one multi-object DELETE.
 - The local metadata database must have nothing unpublished and must not be
   ahead of PostgreSQL. It may be behind: other clients can keep writing while
   the janitor runs, because every deletion is re-checked in PostgreSQL.
 - Exit status: 0 complete; 2 partial (delete cap, scan or time budget,
   cancellation); 3 another janitor holds the lock; 4 unsafe metadata state;
-  5 backend, schema or other failure. `--output jsonl` prints the same outcome
-  in a final `summary` event.
+  5 backend, schema or other failure, including a single cycle in which any
+  object's HEAD or DELETE failed (even if a limit was also reached) or the
+  overload circuit opened. A second Ctrl+C exits at once
+  with 130. `--output jsonl` prints the same outcome in a final `summary` event.
 - Janitor work is admitted in eligibility batches of at most 1,000 candidates,
   and deletions are claimed and settled in PostgreSQL in batches of at most 64
   objects. S3 operations
-  have explicit per-request deadlines: 60 seconds for listing and 20 seconds
-  for stat/HEAD and DELETE; PostgreSQL commands use the metadata crate's
+  have explicit deadlines: 60 seconds per listing step, 20 seconds per
+  stat/HEAD, and 40 seconds per claimed delete batch, inside the 60-second
+  claim lease; PostgreSQL commands use the metadata crate's
   command timeout. These are per-process limits, not a cluster-wide capacity
   guarantee.
 - Failures are classified. S3 throttling (429, `SlowDown`, 503), other 5xx,

@@ -229,7 +229,7 @@ studiofs mount myvolume Y:
 | `status` | Show volume status, PostgreSQL binding, and local/runtime counters |
 | `settings` | Show or update persistent client settings and runtime tuning |
 | `snapshot` | Create, list, inspect, delete, and schedule whole-volume snapshots |
-| `janitor` | Scan and delete orphaned remote objects; `--dry-run` only reports candidates |
+| `janitor` | Delete unreferenced remote objects in bounded, resumable cycles; `--dry-run` only reports candidates |
 | `fsck` | Check and optionally repair dangling entries, orphan inodes, link counts, and pending/deferred state |
 | `dump` | Sync local metadata to PostgreSQL, then export a metadata dump |
 | `load` | Import a metadata dump into PostgreSQL |

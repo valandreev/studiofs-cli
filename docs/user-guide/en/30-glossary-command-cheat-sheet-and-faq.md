@@ -45,6 +45,7 @@ In the examples, `projectfs` is your volume name and `Z:` is an available Window
 | List snapshots | `studiofs snapshot projectfs list` | The same chapter |
 | Check the snapshot schedule | `studiofs snapshot projectfs policy show` | The same chapter |
 | Preview cleanup | `studiofs janitor projectfs --dry-run` | [Maintenance](27-maintenance-and-removing-a-volume.md) |
+| Clean up in small steps | `studiofs janitor projectfs --max-deletes 100` | The same chapter |
 
 For a snapshot, copy its actual identifier from the list. For example, if it is `projectfs.2026-08-12T14-07-09.482Z`:
 
