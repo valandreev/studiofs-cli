@@ -1300,3 +1300,22 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
         refused("version is unsupported");
     }
 }
+
+#[test]
+fn search_path_dsn_confines_url_and_key_value_dsns() {
+    for dsn in [
+        "postgres://user@127.0.0.1:5432/db",
+        "postgres://user@127.0.0.1:5432/db?sslmode=disable",
+        "host=127.0.0.1 port=5432 user=postgres dbname=db sslmode=disable",
+    ] {
+        let config: tokio_postgres::Config = search_path_dsn(dsn, "sfs_test_x")
+            .parse()
+            .unwrap_or_else(|error| panic!("{dsn}: {error}"));
+        assert_eq!(
+            config.get_options(),
+            Some("-csearch_path=sfs_test_x"),
+            "{dsn}"
+        );
+        assert_eq!(config.get_dbname(), Some("db"), "{dsn}");
+    }
+}

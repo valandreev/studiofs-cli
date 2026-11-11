@@ -694,7 +694,8 @@ struct IsolatedPgSchema {
 impl IsolatedPgSchema {
     fn new(base_dsn: &str) -> Self {
         let name = format!("sfs_test_{}", Uuid::new_v4().simple());
-        execute_test_sql(base_dsn, format!("CREATE SCHEMA {name}"));
+        execute_test_sql(base_dsn, format!("CREATE SCHEMA {name}"))
+            .expect("create isolated PostgreSQL schema");
         Self {
             base_dsn: base_dsn.to_owned(),
             dsn: search_path_dsn(base_dsn, &name),
@@ -705,11 +706,17 @@ impl IsolatedPgSchema {
 
 impl Drop for IsolatedPgSchema {
     fn drop(&mut self) {
-        execute_test_sql(&self.base_dsn, format!("DROP SCHEMA {} CASCADE", self.name));
+        // A panic here while a failed test unwinds would abort the process and
+        // hide that failure, so a cleanup error is only reported.
+        if let Err(error) =
+            execute_test_sql(&self.base_dsn, format!("DROP SCHEMA {} CASCADE", self.name))
+        {
+            eprintln!("failed to drop isolated schema {}: {error}", self.name);
+        }
     }
 }
 
-fn execute_test_sql(dsn: &str, statement: String) {
+fn execute_test_sql(dsn: &str, statement: String) -> MetaResult<()> {
     run_async(async move {
         let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
@@ -722,26 +729,6 @@ fn execute_test_sql(dsn: &str, statement: String) {
         conn_task.abort();
         result
     })
-    .expect("run test SQL");
-}
-
-#[test]
-fn search_path_dsn_confines_url_and_key_value_dsns() {
-    for dsn in [
-        "postgres://user@127.0.0.1:5432/db",
-        "postgres://user@127.0.0.1:5432/db?sslmode=disable",
-        "host=127.0.0.1 port=5432 user=postgres dbname=db sslmode=disable",
-    ] {
-        let config: tokio_postgres::Config = search_path_dsn(dsn, "sfs_test_x")
-            .parse()
-            .unwrap_or_else(|error| panic!("{dsn}: {error}"));
-        assert_eq!(
-            config.get_options(),
-            Some("-csearch_path=sfs_test_x"),
-            "{dsn}"
-        );
-        assert_eq!(config.get_dbname(), Some("db"), "{dsn}");
-    }
 }
 
 fn setup_pg_volume(dsn: &str, name: &str, uuid: &str, block_size: u32) -> MetaResult<i64> {
