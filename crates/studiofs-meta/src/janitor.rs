@@ -119,8 +119,9 @@ fn pg_backend_unavailable() -> JanitorMetadataError {
 ///
 /// Unlike the normal PostgreSQL metadata engine, opening this session does not
 /// repair, synchronize, or create local metadata. PostgreSQL operations are
-/// limited to the janitor advisory lock, read-only safety queries, and fenced
-/// object-level deletion claims in the upload ledger.
+/// limited to the janitor advisory lock, read-only safety queries, retirement of
+/// this client's abandoned uploads, and fenced object-level deletion claims in
+/// the upload ledger.
 pub struct JanitorMetadataSession {
     local: RedbMetaEngine,
     format_info: crate::FormatInfo,
@@ -266,6 +267,31 @@ impl JanitorMetadataSession {
             .map_err(backend_unavailable)?;
         self.validated_local_version = Some(local_version);
         Ok(())
+    }
+
+    /// Retires the uploads this client abandoned before publication (written and
+    /// deleted before their metadata reached PostgreSQL), so this cycle can delete
+    /// them. Returns the retired count; a dry run only counts.
+    ///
+    /// Only the owning client can prove an upload abandoned: `validate_protection`
+    /// showed its whole local journal acknowledged, and its pending-deletion
+    /// markers are local-only. Unpublished uploads of other clients have no marker
+    /// here and stay protected. A failure fails the cycle before any deletion.
+    // ponytail: resends every unreferenced local marker each cycle (1,000 per transaction);
+    // the read-only redb cannot drop them. Track retired IDs if marker sets grow large.
+    pub fn retire_abandoned_uploads(&mut self, dry_run: bool) -> Result<u64, JanitorMetadataError> {
+        self.ensure_validated_cycle()?;
+        let marked: Vec<(u64, i64)> = self
+            .local
+            .get_pending_deletions()
+            .map_err(backend_unavailable)?
+            .into_iter()
+            .filter(|(object_id, _)| !self.local_referenced.contains(object_id))
+            .collect();
+        if marked.is_empty() {
+            return Ok(0);
+        }
+        self.postgres.retire_abandoned_uploads(&marked, dry_run)
     }
 
     /// Checks only the supplied object IDs against authoritative local and shared metadata.

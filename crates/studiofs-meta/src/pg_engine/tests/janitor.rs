@@ -309,6 +309,101 @@ fn janitor_session_fences_object_deletion_claims() {
     session.release_global_janitor_lock().expect("release");
 }
 
+/// Write, delete and unmount before publication leaves `uploaded` ledger rows that
+/// only the owning client can prove abandoned; its CLI Janitor must retire them.
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn janitor_session_retires_uploads_its_client_abandoned_before_publication() {
+    use crate::JanitorEligibility::{Eligible, Protected};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this ignored test");
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db_path = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-janitor-abandoned-uploads");
+    seed_local(&db_path, &volume.format_info());
+    let sql = |statement: &'static str| {
+        let dsn = dsn.clone();
+        let volume_id = volume.volume_id;
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect to test postgres");
+            let connection_task = tokio::spawn(connection);
+            let rows = client
+                .query(statement, &[&volume_id])
+                .await
+                .expect("run fixture statement");
+            connection_task.abort();
+            Ok::<_, MetaError>(rows)
+        })
+        .expect("run fixture statement")
+    };
+    let states = || -> Vec<String> {
+        sql("SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id IN (79, 81, 82) ORDER BY object_id")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    };
+
+    // The mount marks object 79 deleted locally, acknowledges its journal and unmounts.
+    {
+        let engine = PgMetaEngine::open_with_options(
+            &db_path,
+            PgOpenOptions {
+                background_poll: false,
+                ..Default::default()
+            },
+        )
+        .expect("open postgres engine");
+        engine
+            .add_pending_deletions(&[(79, 1), (82, 1)])
+            .expect("record local deletion markers");
+        engine.flush_metadata().expect("acknowledge local journal");
+        engine.prepare_for_close().expect("close postgres engine");
+    }
+    // 79 is this client's abandoned upload; 81 has no local marker (another client's);
+    // 82 is this client's upload cancelled mid-PUT, which nothing ever confirms.
+    sql(
+        "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, 0) ON CONFLICT DO NOTHING",
+    );
+    sql(
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 79, 'uploaded'), ($1, 81, 'uploaded'), ($1, 82, 'uploading')",
+    );
+
+    let mut session = crate::JanitorMetadataSession::open(&db_path).expect("open janitor session");
+    assert!(session.try_acquire_global_janitor_lock().expect("lock"));
+    session.validate_protection().expect("validate protection");
+    let eligibility = session
+        .check_eligibility(&[79, 81], i64::MAX)
+        .expect("eligibility before retirement");
+    assert_eq!((eligibility[&79], eligibility[&81]), (Protected, Protected));
+
+    assert_eq!(session.retire_abandoned_uploads(true).expect("dry run"), 2);
+    assert_eq!(
+        states(),
+        ["uploaded", "uploaded", "uploading"],
+        "a dry run only counts"
+    );
+
+    assert_eq!(session.retire_abandoned_uploads(false).expect("retire"), 2);
+    assert_eq!(states(), ["delete_pending", "uploaded", "delete_pending"]);
+    let eligibility = session
+        .check_eligibility(&[79, 81], i64::MAX)
+        .expect("eligibility after retirement");
+    assert!(
+        matches!(eligibility[&79], Eligible { .. }),
+        "the retired upload is deletable in the same cycle: {:?}",
+        eligibility[&79]
+    );
+    assert_eq!(eligibility[&81], Protected);
+    assert_eq!(
+        sql("SELECT 1 FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = 79 AND eligible_at = to_timestamp(1)").len(),
+        1,
+        "the grace window counts from the local deletion, not from retirement"
+    );
+    assert_eq!(session.retire_abandoned_uploads(false).expect("repeat"), 0);
+    session.release_global_janitor_lock().expect("release");
+}
+
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn janitor_read_only_session_validates_binding_and_lock() {

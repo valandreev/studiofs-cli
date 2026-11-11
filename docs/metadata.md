@@ -654,9 +654,23 @@ Janitor policy:
   Janitor deletion. It does not relax the Janitor's protection of uploads still
   awaiting publication. A failed or deferred retirement is logged, does not fail
   the flush or Janitor admission, and retains the local marker for retry,
-  including after restart. Only the owning client can prove an upload abandoned,
-  so after an unmount its objects are retired once that client mounts again; the
-  CLI Janitor never retires uploads itself.
+  including after restart. Only the owning client can prove an upload abandoned.
+  The mount does not retire at unmount, so the CLI Janitor retires abandoned
+  uploads at the start of each cycle when it runs on the owning client: it holds that client's
+  local metadata open, which no mount of that client can do at the same time,
+  has checked that the whole local journal is
+  acknowledged, and applies the same marker, local-reference and PostgreSQL
+  rechecks. Unlike the mount's best-effort retirement, a failed CLI retirement
+  fails the cycle before any deletion. It also retires that client's `uploading` rows: an upload cancelled
+  because its file was deleted is never confirmed, although its PUT may have
+  reached the object store, and while the Janitor holds the local metadata
+  no mount of that client has a PUT in flight. The mount itself retires only
+  `uploaded` rows and leaves `uploading` rows to fragment reconciliation. A dry
+  run only counts them (`abandoned uploads`). Uploads of other
+  clients, which have no local marker here, stay protected. An object the
+  CLI retires gets a GC queue row eligible at its local deletion time, so the
+  Janitor grace window counts from the deletion; an object the mount retires
+  still counts it from the retirement.
 - the CLI deletes only canonical keys (legacy plus every fragment) of a listed
   canonical object key, bounds each DELETE inside the claim lease, treats
   `NotFound` as deleted, and counts an object as deleted only after the fenced

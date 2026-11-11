@@ -58,14 +58,35 @@ fn pruned_fence(id: &str) -> String {
 
 const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
 
-/// Moves unreferenced, unpinned and unleased completed uploads in `$2` to the
-/// terminal `delete_pending` state and enqueues them for Janitor deletion. It
-/// runs after [`super::janitor::CLAIM_PUBLICATION_FENCE_SQL`] in the same
-/// transaction.
-static RETIRE_ABANDONED_UPLOADS_SQL: LazyLock<String> = LazyLock::new(|| {
+/// Matches the unreferenced, unpinned and unleased uploads in `$2` whose state is
+/// in `$3`.
+static ABANDONED_UPLOADS_PREDICATE: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "WITH retired AS (UPDATE snapshot_payload_upload_objects AS object SET state = 'delete_pending', closed_at = clock_timestamp(), next_retry_at = NULL, last_error = NULL, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE object.vol = $1 AND object.object_id = ANY($2::BIGINT[]) AND object.state = 'uploaded' AND (object.reconcile_lease_expires_at IS NULL OR object.reconcile_lease_expires_at <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM snapshot_current_references AS reference WHERE reference.vol = $1 AND reference.object_id = object.object_id) AND object.object_id NOT IN ({pins}) RETURNING object_id) INSERT INTO snapshot_payload_gc_candidates (vol, object_id) SELECT $1, object_id FROM retired ON CONFLICT (vol, object_id) DO NOTHING",
+        "object.vol = $1 AND object.object_id = ANY($2::BIGINT[]) AND object.state = ANY($3::TEXT[]) AND (object.reconcile_lease_expires_at IS NULL OR object.reconcile_lease_expires_at <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM snapshot_current_references AS reference WHERE reference.vol = $1 AND reference.object_id = object.object_id) AND object.object_id NOT IN ({pins})",
         pins = super::janitor::BATCH_PIN_QUERY.as_str(),
+    )
+});
+
+/// Moves unreferenced, unpinned and unleased uploads in `$2` to the terminal
+/// `delete_pending` state, enqueues them for Janitor deletion and returns their
+/// count. `$3` lists the retirable states: the mount passes only `uploaded`,
+/// because an `uploading` object may still have a PUT in flight in that process.
+/// `$4` holds each object's local deletion time in epoch seconds, from which the
+/// Janitor grace window then counts; a NULL counts it from the retirement, as
+/// the mount does. It runs after [`super::janitor::CLAIM_PUBLICATION_FENCE_SQL`] in
+/// the same transaction.
+pub(super) static RETIRE_ABANDONED_UPLOADS_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "WITH retired AS (UPDATE snapshot_payload_upload_objects AS object SET state = 'delete_pending', closed_at = clock_timestamp(), next_retry_at = NULL, last_error = NULL, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE {abandoned} RETURNING object_id), enqueued AS (INSERT INTO snapshot_payload_gc_candidates (vol, object_id, eligible_at) SELECT $1, retired.object_id, LEAST(clock_timestamp(), COALESCE(to_timestamp(marked.deleted_at), clock_timestamp())) FROM retired JOIN unnest($2::BIGINT[], $4::BIGINT[]) AS marked(object_id, deleted_at) USING (object_id) ON CONFLICT (vol, object_id) DO NOTHING) SELECT count(*) FROM retired",
+        abandoned = *ABANDONED_UPLOADS_PREDICATE,
+    )
+});
+
+/// Counts what [`RETIRE_ABANDONED_UPLOADS_SQL`] would retire, without writing.
+pub(super) static COUNT_ABANDONED_UPLOADS_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT count(*) FROM snapshot_payload_upload_objects AS object WHERE {abandoned}",
+        abandoned = *ABANDONED_UPLOADS_PREDICATE,
     )
 });
 const SNAPSHOT_REACHABILITY_BOOTSTRAP_BATCH_SIZE: usize = 1_024;
@@ -505,8 +526,9 @@ impl PgMetaEngine {
     }
 
     /// Retires completed uploads only after this client's entire local metadata
-    /// tail has settled. Pending-deletion markers are local-only, so every marked
-    /// object was allocated and uploaded by this client. The caller holds
+    /// tail has settled. Pending-deletion markers are local-only. A marked object
+    /// of another client is already `published`, so only this client's own
+    /// unpublished uploads can match the retired state. The caller holds
     /// `replication_lock` through this operation.
     pub(super) fn retire_abandoned_uploads(&self) -> MetaResult<()> {
         let object_ids = {
@@ -542,6 +564,8 @@ impl PgMetaEngine {
                 move |client| {
                     Box::pin(async move {
                         for object_ids in object_ids.chunks(UPLOAD_LEDGER_REPLAY_BATCH_SIZE) {
+                            // No deletion times: the mount keeps a grace window from retirement.
+                            let deleted_at = vec![None::<i64>; object_ids.len()];
                             let tx = client.transaction().await.map_err(|error| {
                                 Self::classify_pg_error(
                                     "postgres abandoned upload transaction failed",
@@ -566,7 +590,7 @@ impl PgMetaEngine {
                             })?;
                             tx.execute(
                                 RETIRE_ABANDONED_UPLOADS_SQL.as_str(),
-                                &[&volume_id, &object_ids],
+                                &[&volume_id, &object_ids, &vec!["uploaded"], &deleted_at],
                             )
                             .await
                             .map_err(|error| {

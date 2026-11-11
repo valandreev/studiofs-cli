@@ -45,6 +45,10 @@ impl JanitorMetadataSource for WriterAwareMetadata {
         self.inner.validate_protection()
     }
 
+    fn retire_abandoned_uploads(&mut self, dry_run: bool) -> anyhow::Result<u64> {
+        self.inner.retire_abandoned_uploads(dry_run)
+    }
+
     fn check_eligibility(
         &mut self,
         object_ids: &[u64],

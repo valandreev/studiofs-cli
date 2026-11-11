@@ -871,6 +871,93 @@ impl PgJanitorSession {
         })
     }
 
+    /// Retires the abandoned uploads among `marked` (object ID, local deletion epoch
+    /// seconds) as the owning mount does, under the publication fence, and returns
+    /// their count. A dry run only counts them.
+    ///
+    /// Unlike the mount it also retires `uploading` rows: an upload cancelled when
+    /// its file was deleted is never confirmed, although its PUT may have reached
+    /// the object store. The caller holds the client's redb file open, which no
+    /// mount of that client can do at the same time, so no PUT is in flight.
+    pub(crate) fn retire_abandoned_uploads(
+        &mut self,
+        marked: &[(u64, i64)],
+        dry_run: bool,
+    ) -> Result<u64, JanitorMetadataError> {
+        use super::snapshot_reachability::{
+            COUNT_ABANDONED_UPLOADS_SQL, RETIRE_ABANDONED_UPLOADS_SQL,
+        };
+        let (Some(client), Some(runtime)) = (self.client.as_ref(), self.runtime.as_ref()) else {
+            return Err(JanitorMetadataError::UnsafeToDelete(
+                "PostgreSQL janitor lock is not held",
+            ));
+        };
+        let statements = &mut self.statements;
+        let volume_id = self.volume_id;
+        let timeout = self.command_timeout;
+        let retire_error =
+            |error| janitor_pg_error("janitor abandoned upload retirement failed", error);
+        let states = vec!["uploaded", "uploading"];
+        let mut retired = 0_i64;
+        for marked in marked.chunks(crate::MAX_JANITOR_ELIGIBILITY_BATCH) {
+            let object_ids = janitor_object_ids(marked.iter().map(|(object_id, _)| object_id))?;
+            let deleted_at: Vec<Option<i64>> = marked
+                .iter()
+                .map(|(_, deleted_at)| Some(*deleted_at))
+                .collect();
+            let chunk = runtime.block_on(async {
+                tokio::time::timeout(timeout, async {
+                    let [fence, retire, count] = prepare_statements(
+                        client,
+                        statements,
+                        [
+                            CLAIM_PUBLICATION_FENCE_SQL,
+                            &RETIRE_ABANDONED_UPLOADS_SQL,
+                            &COUNT_ABANDONED_UPLOADS_SQL,
+                        ],
+                    )
+                    .await?;
+                    if dry_run {
+                        let row = client
+                            .query_one(&count, &[&volume_id, &object_ids, &states])
+                            .await
+                            .map_err(retire_error)?;
+                        return Ok(row.get::<_, i64>(0));
+                    }
+                    client.batch_execute("BEGIN").await.map_err(retire_error)?;
+                    let retired = async {
+                        client
+                            .query_opt(&fence, &[&volume_id])
+                            .await
+                            .map_err(retire_error)?
+                            .ok_or(JanitorMetadataError::UnsafeToDelete(
+                                "PostgreSQL volume binding is missing",
+                            ))?;
+                        let row = client
+                            .query_one(&retire, &[&volume_id, &object_ids, &states, &deleted_at])
+                            .await
+                            .map_err(retire_error)?;
+                        client.batch_execute("COMMIT").await.map_err(retire_error)?;
+                        Ok(row.get::<_, i64>(0))
+                    }
+                    .await;
+                    if retired.is_err() {
+                        // Leave the connection outside a transaction; the retirement error wins.
+                        let _ = client.batch_execute("ROLLBACK").await;
+                    }
+                    retired
+                })
+                .await
+            });
+            retired += chunk.unwrap_or_else(|_| {
+                Err(JanitorMetadataError::BackendUnavailable(
+                    "PostgreSQL janitor abandoned upload retirement timed out".to_owned(),
+                ))
+            })?;
+        }
+        Ok(u64::try_from(retired).unwrap_or(0))
+    }
+
     /// Deletes finished deletion fences below their payload namespace watermark,
     /// in bounded batches, while this session holds the Janitor lock. Returns the
     /// number of pruned rows. Registration and publication treat a row-less ID

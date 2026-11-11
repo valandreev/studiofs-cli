@@ -334,6 +334,7 @@ struct JanitorRunRequest {
 trait JanitorMetadataSource {
     fn try_acquire_global_janitor_lock(&mut self) -> anyhow::Result<bool>;
     fn validate_protection(&mut self) -> anyhow::Result<()>;
+    fn retire_abandoned_uploads(&mut self, dry_run: bool) -> anyhow::Result<u64>;
     fn check_eligibility(
         &mut self,
         object_ids: &[u64],
@@ -373,6 +374,10 @@ trait JanitorMetadataSource {
 impl JanitorMetadataSource for JanitorMetadataSession {
     fn try_acquire_global_janitor_lock(&mut self) -> anyhow::Result<bool> {
         JanitorMetadataSession::try_acquire_global_janitor_lock(self).map_err(anyhow::Error::new)
+    }
+
+    fn retire_abandoned_uploads(&mut self, dry_run: bool) -> anyhow::Result<u64> {
+        JanitorMetadataSession::retire_abandoned_uploads(self, dry_run).map_err(anyhow::Error::new)
     }
 
     fn validate_protection(&mut self) -> anyhow::Result<()> {
@@ -932,6 +937,9 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 "janitor phase=protection completed duration_ms={}",
                 duration_ms(protection_elapsed)
             );
+            // The owning client proves its abandoned uploads; this cycle then deletes them.
+            let abandoned_uploads =
+                JanitorMetadataSource::retire_abandoned_uploads(metadata, dry_run)?;
 
             let mut checkpoint = JanitorMetadataSource::load_sweep_checkpoint(
                 metadata,
@@ -971,11 +979,11 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                 JanitorMetadataSource::prune_deletion_fences(metadata)?
             };
 
-            Ok((stats, fences_pruned, transport_before))
+            Ok((stats, fences_pruned, transport_before, abandoned_uploads))
         });
         let cycle_elapsed = cycle_started.elapsed();
         let global_lock_hold_elapsed = global_lock_acquired.elapsed();
-        let (stats, fences_pruned, transport_before) = match cycle_result {
+        let (stats, fences_pruned, transport_before, abandoned_uploads) = match cycle_result {
             Ok(done) => done,
             Err(error) => {
                 match breaker.after_cycle(Err(error), loop_mode, interval)? {
@@ -1003,6 +1011,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
                     "scanned": stats.scanned_files,
                     "listed_entries": stats.initial_listing_entries,
                     "protected": stats.referenced_files,
+                    "abandoned_uploads": abandoned_uploads,
                     "orphan_candidates": stats.orphan_candidates,
                     "skipped_young": stats.skipped_young,
                     "skipped_unknown": stats.skipped_unknown_age,
@@ -1033,6 +1042,10 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
             println!("Janitor cycle done:");
             println!("  scanned:              {}", stats.scanned_files);
             println!("  referenced:           {}", stats.referenced_files);
+            println!(
+                "  abandoned uploads:    {abandoned_uploads} ({})",
+                if dry_run { "would retire" } else { "retired" }
+            );
             println!("  orphan candidates:    {}", stats.orphan_candidates);
             println!("  skipped young:        {}", stats.skipped_young);
             println!("  skipped unknown age:  {}", stats.skipped_unknown_age);
@@ -1419,6 +1432,10 @@ mod tests {
     impl JanitorMetadataSource for FakeJanitorMetadata {
         fn try_acquire_global_janitor_lock(&mut self) -> anyhow::Result<bool> {
             Ok(self.lock_acquired)
+        }
+
+        fn retire_abandoned_uploads(&mut self, _dry_run: bool) -> anyhow::Result<u64> {
+            Ok(0)
         }
 
         fn validate_protection(&mut self) -> anyhow::Result<()> {
