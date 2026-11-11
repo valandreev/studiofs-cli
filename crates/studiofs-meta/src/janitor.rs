@@ -119,8 +119,9 @@ fn pg_backend_unavailable() -> JanitorMetadataError {
 ///
 /// Unlike the normal PostgreSQL metadata engine, opening this session does not
 /// repair, synchronize, or create local metadata. PostgreSQL operations are
-/// limited to the janitor advisory lock, read-only safety queries, and fenced
-/// object-level deletion claims in the upload ledger.
+/// limited to the janitor advisory lock, read-only safety queries, retirement of
+/// this client's abandoned uploads, and fenced object-level deletion claims in
+/// the upload ledger.
 pub struct JanitorMetadataSession {
     local: RedbMetaEngine,
     format_info: crate::FormatInfo,
@@ -274,8 +275,9 @@ impl JanitorMetadataSession {
     ///
     /// Only the owning client can prove an upload abandoned: `validate_protection`
     /// showed its whole local journal acknowledged, and its pending-deletion
-    /// markers are local-only. Uploads of other clients stay protected.
-    // ponytail: resends every unreferenced local marker each cycle (1,000 per round trip);
+    /// markers are local-only. Unpublished uploads of other clients have no marker
+    /// here and stay protected. A failure fails the cycle before any deletion.
+    // ponytail: resends every unreferenced local marker each cycle (1,000 per transaction);
     // the read-only redb cannot drop them. Track retired IDs if marker sets grow large.
     pub fn retire_abandoned_uploads(&mut self, dry_run: bool) -> Result<u64, JanitorMetadataError> {
         self.ensure_validated_cycle()?;

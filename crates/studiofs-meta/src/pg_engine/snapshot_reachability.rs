@@ -71,13 +71,13 @@ static ABANDONED_UPLOADS_PREDICATE: LazyLock<String> = LazyLock::new(|| {
 /// `delete_pending` state, enqueues them for Janitor deletion and returns their
 /// count. `$3` lists the retirable states: the mount passes only `uploaded`,
 /// because an `uploading` object may still have a PUT in flight in that process.
-/// `$4` holds each object's local deletion time in epoch
-/// seconds: the Janitor grace window counts from the deletion, not from the
-/// retirement. It runs after [`super::janitor::CLAIM_PUBLICATION_FENCE_SQL`] in
+/// `$4` holds each object's local deletion time in epoch seconds, from which the
+/// Janitor grace window then counts; a NULL counts it from the retirement, as
+/// the mount does. It runs after [`super::janitor::CLAIM_PUBLICATION_FENCE_SQL`] in
 /// the same transaction.
 pub(super) static RETIRE_ABANDONED_UPLOADS_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "WITH retired AS (UPDATE snapshot_payload_upload_objects AS object SET state = 'delete_pending', closed_at = clock_timestamp(), next_retry_at = NULL, last_error = NULL, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE {abandoned} RETURNING object_id), enqueued AS (INSERT INTO snapshot_payload_gc_candidates (vol, object_id, eligible_at) SELECT $1, retired.object_id, LEAST(clock_timestamp(), to_timestamp(marked.deleted_at)) FROM retired JOIN unnest($2::BIGINT[], $4::BIGINT[]) AS marked(object_id, deleted_at) USING (object_id) ON CONFLICT (vol, object_id) DO NOTHING) SELECT count(*) FROM retired",
+        "WITH retired AS (UPDATE snapshot_payload_upload_objects AS object SET state = 'delete_pending', closed_at = clock_timestamp(), next_retry_at = NULL, last_error = NULL, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE {abandoned} RETURNING object_id), enqueued AS (INSERT INTO snapshot_payload_gc_candidates (vol, object_id, eligible_at) SELECT $1, retired.object_id, LEAST(clock_timestamp(), COALESCE(to_timestamp(marked.deleted_at), clock_timestamp())) FROM retired JOIN unnest($2::BIGINT[], $4::BIGINT[]) AS marked(object_id, deleted_at) USING (object_id) ON CONFLICT (vol, object_id) DO NOTHING) SELECT count(*) FROM retired",
         abandoned = *ABANDONED_UPLOADS_PREDICATE,
     )
 });
@@ -526,11 +526,12 @@ impl PgMetaEngine {
     }
 
     /// Retires completed uploads only after this client's entire local metadata
-    /// tail has settled. Pending-deletion markers are local-only, so every marked
-    /// object was allocated and uploaded by this client. The caller holds
+    /// tail has settled. Pending-deletion markers are local-only. A marked object
+    /// of another client is already `published`, so only this client's own
+    /// unpublished uploads can match the retired state. The caller holds
     /// `replication_lock` through this operation.
     pub(super) fn retire_abandoned_uploads(&self) -> MetaResult<()> {
-        let marked = {
+        let object_ids = {
             let (_position, _pending) = self.lock_local_position_and_pending_state()?;
             let tail = self
                 .local
@@ -546,12 +547,10 @@ impl PgMetaEngine {
             pending
                 .into_iter()
                 .filter(|(object_id, _)| !referenced.contains(object_id))
-                .map(|(object_id, deleted_at)| {
-                    Ok((checked_i64(object_id, "object id")?, deleted_at))
-                })
-                .collect::<MetaResult<Vec<(i64, i64)>>>()?
+                .map(|(object_id, _)| checked_i64(object_id, "object id"))
+                .collect::<MetaResult<Vec<_>>>()?
         };
-        if marked.is_empty() {
+        if object_ids.is_empty() {
             return Ok(());
         }
         let command_pool = self.command_pool.clone();
@@ -564,9 +563,9 @@ impl PgMetaEngine {
                 "retire abandoned payload uploads",
                 move |client| {
                     Box::pin(async move {
-                        for marked in marked.chunks(UPLOAD_LEDGER_REPLAY_BATCH_SIZE) {
-                            let (object_ids, deleted_at): (Vec<i64>, Vec<i64>) =
-                                marked.iter().copied().unzip();
+                        for object_ids in object_ids.chunks(UPLOAD_LEDGER_REPLAY_BATCH_SIZE) {
+                            // No deletion times: the mount keeps a grace window from retirement.
+                            let deleted_at = vec![None::<i64>; object_ids.len()];
                             let tx = client.transaction().await.map_err(|error| {
                                 Self::classify_pg_error(
                                     "postgres abandoned upload transaction failed",

@@ -877,8 +877,8 @@ impl PgJanitorSession {
     ///
     /// Unlike the mount it also retires `uploading` rows: an upload cancelled when
     /// its file was deleted is never confirmed, although its PUT may have reached
-    /// the object store. The caller owns the client's redb file exclusively, so no
-    /// mount of that client has a PUT in flight.
+    /// the object store. The caller holds the client's redb file open, which no
+    /// mount of that client can do at the same time, so no PUT is in flight.
     pub(crate) fn retire_abandoned_uploads(
         &mut self,
         marked: &[(u64, i64)],
@@ -901,7 +901,10 @@ impl PgJanitorSession {
         let mut retired = 0_i64;
         for marked in marked.chunks(crate::MAX_JANITOR_ELIGIBILITY_BATCH) {
             let object_ids = janitor_object_ids(marked.iter().map(|(object_id, _)| object_id))?;
-            let deleted_at: Vec<i64> = marked.iter().map(|(_, deleted_at)| *deleted_at).collect();
+            let deleted_at: Vec<Option<i64>> = marked
+                .iter()
+                .map(|(_, deleted_at)| Some(*deleted_at))
+                .collect();
             let chunk = runtime.block_on(async {
                 tokio::time::timeout(timeout, async {
                     let [fence, retire, count] = prepare_statements(
@@ -921,22 +924,28 @@ impl PgJanitorSession {
                             .map_err(retire_error)?;
                         return Ok(row.get::<_, i64>(0));
                     }
-                    // A failure leaves the transaction open; the cycle then fails and
-                    // releasing the Janitor lock closes this connection.
                     client.batch_execute("BEGIN").await.map_err(retire_error)?;
-                    client
-                        .query_opt(&fence, &[&volume_id])
-                        .await
-                        .map_err(retire_error)?
-                        .ok_or(JanitorMetadataError::UnsafeToDelete(
-                            "PostgreSQL volume binding is missing",
-                        ))?;
-                    let row = client
-                        .query_one(&retire, &[&volume_id, &object_ids, &states, &deleted_at])
-                        .await
-                        .map_err(retire_error)?;
-                    client.batch_execute("COMMIT").await.map_err(retire_error)?;
-                    Ok(row.get::<_, i64>(0))
+                    let retired = async {
+                        client
+                            .query_opt(&fence, &[&volume_id])
+                            .await
+                            .map_err(retire_error)?
+                            .ok_or(JanitorMetadataError::UnsafeToDelete(
+                                "PostgreSQL volume binding is missing",
+                            ))?;
+                        let row = client
+                            .query_one(&retire, &[&volume_id, &object_ids, &states, &deleted_at])
+                            .await
+                            .map_err(retire_error)?;
+                        client.batch_execute("COMMIT").await.map_err(retire_error)?;
+                        Ok(row.get::<_, i64>(0))
+                    }
+                    .await;
+                    if retired.is_err() {
+                        // Leave the connection outside a transaction; the retirement error wins.
+                        let _ = client.batch_execute("ROLLBACK").await;
+                    }
+                    retired
                 })
                 .await
             });
