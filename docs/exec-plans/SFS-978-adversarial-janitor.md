@@ -18,7 +18,7 @@ that the server did not delete anything.
 - [x] (2026-11-09) Add five disposable Docker PostgreSQL/RustFS process tests with payload bytes and authoritative ownership checks (5 passed).
 - [x] (2026-11-09) Run focused tests, Clippy, formatting and diff checks; record unavailable service/platform proof.
 - [x] (2026-11-10) Review fixes: probe a free loopback port window per stack, move the tests from `include!` into real modules under `cli/janitor/tests/` so `cargo fmt` checks them, stop blocking runtime workers while waiting on CLI children, check ownership after the PG restart, and remove duplicated harness code (2 + 5 passed again).
-- [ ] Run the disposable selection on Windows Docker.
+- [x] (2026-11-11) Run the disposable selection on Windows Docker: 6 passed in 92 s (Windows 11, Docker 29.9.3; SFS-981 release gate).
 - [ ] Exercise Windows console Ctrl+C delivery (only Unix SIGINT and hard kill are covered).
 - [ ] Exercise CLI vs mounted background Janitor lock contention and a live mounted writer (only CLI vs CLI and seeded PG rows are covered).
 - [x] (2026-11-10) PR #974 review: tie the claim-fence barrier to the advisory-lock holder blocked by the fixture's own `FOR UPDATE` backend, and re-check that fence after SIGINT instead of relying on one exit poll (3 process tests passed). `Child::kill` already returns `Ok` for an exited child on the pinned Rust 1.95.
