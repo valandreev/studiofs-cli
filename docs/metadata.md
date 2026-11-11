@@ -659,7 +659,12 @@ Janitor policy:
   uploads at the start of each cycle when it runs on the owning client: it holds that client's
   local metadata exclusively, has checked that the whole local journal is
   acknowledged, and applies the same marker, local-reference and PostgreSQL
-  rechecks. A dry run only counts them (`abandoned uploads`). Uploads of other
+  rechecks. It also retires that client's `uploading` rows: an upload cancelled
+  because its file was deleted is never confirmed, although its PUT may have
+  reached the object store, and with the local metadata held exclusively no
+  mount of that client has a PUT in flight. The mount itself retires only
+  `uploaded` rows and leaves `uploading` rows to fragment reconciliation. A dry
+  run only counts them (`abandoned uploads`). Uploads of other
   clients, which have no local marker here, stay protected. The retired
   object's GC queue row becomes eligible at its local deletion time, so the
   Janitor grace window counts from the deletion and not from the retirement.

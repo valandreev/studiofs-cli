@@ -338,7 +338,7 @@ fn janitor_session_retires_uploads_its_client_abandoned_before_publication() {
         .expect("run fixture statement")
     };
     let states = || -> Vec<String> {
-        sql("SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id IN (79, 81) ORDER BY object_id")
+        sql("SELECT state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id IN (79, 81, 82) ORDER BY object_id")
             .iter()
             .map(|row| row.get(0))
             .collect()
@@ -355,17 +355,18 @@ fn janitor_session_retires_uploads_its_client_abandoned_before_publication() {
         )
         .expect("open postgres engine");
         engine
-            .add_pending_deletion(79, 1)
-            .expect("record local deletion marker");
+            .add_pending_deletions(&[(79, 1), (82, 1)])
+            .expect("record local deletion markers");
         engine.flush_metadata().expect("acknowledge local journal");
         engine.prepare_for_close().expect("close postgres engine");
     }
-    // 79 is this client's abandoned upload; 81 has no local marker (another client's).
+    // 79 is this client's abandoned upload; 81 has no local marker (another client's);
+    // 82 is this client's upload cancelled mid-PUT, which nothing ever confirms.
     sql(
         "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, 0) ON CONFLICT DO NOTHING",
     );
     sql(
-        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 79, 'uploaded'), ($1, 81, 'uploaded')",
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 79, 'uploaded'), ($1, 81, 'uploaded'), ($1, 82, 'uploading')",
     );
 
     let mut session = crate::JanitorMetadataSession::open(&db_path).expect("open janitor session");
@@ -376,11 +377,15 @@ fn janitor_session_retires_uploads_its_client_abandoned_before_publication() {
         .expect("eligibility before retirement");
     assert_eq!((eligibility[&79], eligibility[&81]), (Protected, Protected));
 
-    assert_eq!(session.retire_abandoned_uploads(true).expect("dry run"), 1);
-    assert_eq!(states(), ["uploaded", "uploaded"], "a dry run only counts");
+    assert_eq!(session.retire_abandoned_uploads(true).expect("dry run"), 2);
+    assert_eq!(
+        states(),
+        ["uploaded", "uploaded", "uploading"],
+        "a dry run only counts"
+    );
 
-    assert_eq!(session.retire_abandoned_uploads(false).expect("retire"), 1);
-    assert_eq!(states(), ["delete_pending", "uploaded"]);
+    assert_eq!(session.retire_abandoned_uploads(false).expect("retire"), 2);
+    assert_eq!(states(), ["delete_pending", "uploaded", "delete_pending"]);
     let eligibility = session
         .check_eligibility(&[79, 81], i64::MAX)
         .expect("eligibility after retirement");

@@ -58,23 +58,26 @@ fn pruned_fence(id: &str) -> String {
 
 const UPLOAD_LEDGER_REPLAY_BATCH_SIZE: usize = 256;
 
-/// Matches the unreferenced, unpinned and unleased completed uploads in `$2`.
+/// Matches the unreferenced, unpinned and unleased uploads in `$2` whose state is
+/// in `$3`.
 static ABANDONED_UPLOADS_PREDICATE: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "object.vol = $1 AND object.object_id = ANY($2::BIGINT[]) AND object.state = 'uploaded' AND (object.reconcile_lease_expires_at IS NULL OR object.reconcile_lease_expires_at <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM snapshot_current_references AS reference WHERE reference.vol = $1 AND reference.object_id = object.object_id) AND object.object_id NOT IN ({pins})",
+        "object.vol = $1 AND object.object_id = ANY($2::BIGINT[]) AND object.state = ANY($3::TEXT[]) AND (object.reconcile_lease_expires_at IS NULL OR object.reconcile_lease_expires_at <= clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM snapshot_current_references AS reference WHERE reference.vol = $1 AND reference.object_id = object.object_id) AND object.object_id NOT IN ({pins})",
         pins = super::janitor::BATCH_PIN_QUERY.as_str(),
     )
 });
 
-/// Moves unreferenced, unpinned and unleased completed uploads in `$2` to the
-/// terminal `delete_pending` state, enqueues them for Janitor deletion and
-/// returns their count. `$3` holds each object's local deletion time in epoch
+/// Moves unreferenced, unpinned and unleased uploads in `$2` to the terminal
+/// `delete_pending` state, enqueues them for Janitor deletion and returns their
+/// count. `$3` lists the retirable states: the mount passes only `uploaded`,
+/// because an `uploading` object may still have a PUT in flight in that process.
+/// `$4` holds each object's local deletion time in epoch
 /// seconds: the Janitor grace window counts from the deletion, not from the
 /// retirement. It runs after [`super::janitor::CLAIM_PUBLICATION_FENCE_SQL`] in
 /// the same transaction.
 pub(super) static RETIRE_ABANDONED_UPLOADS_SQL: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "WITH retired AS (UPDATE snapshot_payload_upload_objects AS object SET state = 'delete_pending', closed_at = clock_timestamp(), next_retry_at = NULL, last_error = NULL, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE {abandoned} RETURNING object_id), enqueued AS (INSERT INTO snapshot_payload_gc_candidates (vol, object_id, eligible_at) SELECT $1, retired.object_id, LEAST(clock_timestamp(), to_timestamp(marked.deleted_at)) FROM retired JOIN unnest($2::BIGINT[], $3::BIGINT[]) AS marked(object_id, deleted_at) USING (object_id) ON CONFLICT (vol, object_id) DO NOTHING) SELECT count(*) FROM retired",
+        "WITH retired AS (UPDATE snapshot_payload_upload_objects AS object SET state = 'delete_pending', closed_at = clock_timestamp(), next_retry_at = NULL, last_error = NULL, reconcile_owner = NULL, reconcile_lease_expires_at = NULL WHERE {abandoned} RETURNING object_id), enqueued AS (INSERT INTO snapshot_payload_gc_candidates (vol, object_id, eligible_at) SELECT $1, retired.object_id, LEAST(clock_timestamp(), to_timestamp(marked.deleted_at)) FROM retired JOIN unnest($2::BIGINT[], $4::BIGINT[]) AS marked(object_id, deleted_at) USING (object_id) ON CONFLICT (vol, object_id) DO NOTHING) SELECT count(*) FROM retired",
         abandoned = *ABANDONED_UPLOADS_PREDICATE,
     )
 });
@@ -588,7 +591,7 @@ impl PgMetaEngine {
                             })?;
                             tx.execute(
                                 RETIRE_ABANDONED_UPLOADS_SQL.as_str(),
-                                &[&volume_id, &object_ids, &deleted_at],
+                                &[&volume_id, &object_ids, &vec!["uploaded"], &deleted_at],
                             )
                             .await
                             .map_err(|error| {
