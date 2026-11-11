@@ -867,8 +867,27 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             ON snapshot_payload_gc_candidates(vol, eligible_at, object_id)
             INCLUDE (next_attempt_at)
             WHERE acknowledged_at IS NULL;
+
+        CREATE TABLE IF NOT EXISTS studiofs_schema_components (
+            component TEXT PRIMARY KEY,
+            version INTEGER NOT NULL CHECK (version > 0),
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
+        -- Kept last: the whole ensure batch is one transaction, so this marker
+        -- commits only together with every statement above. It never moves
+        -- backwards, so an older binary cannot relabel a newer schema.
+        INSERT INTO studiofs_schema_components (component, version)
+            VALUES ('payload_gc', 1)
+            ON CONFLICT (component) DO UPDATE
+                SET version = EXCLUDED.version, applied_at = now()
+                WHERE studiofs_schema_components.version < EXCLUDED.version;
     "#
 }
+
+/// Version of the payload GC queue, sweep-checkpoint and upload-fence schema
+/// that this binary creates and that the CLI Janitor requires before deleting.
+pub const PAYLOAD_GC_SCHEMA_VERSION: i32 = 1;
 
 /// Ensures the canonical Snapshot v2 schema exists for a client or transaction.
 ///
@@ -894,6 +913,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_gc_version_marker_is_the_last_statement_and_never_downgrades() {
+        let sql = studiofs_pg_schema_sql();
+        let marker = format!("VALUES ('payload_gc', {PAYLOAD_GC_SCHEMA_VERSION})");
+        let marker_at = sql
+            .find(&marker)
+            .expect("schema records the payload GC version");
+        let tail = &sql[marker_at..];
+        assert!(
+            !tail.contains("CREATE ") && !tail.contains("ALTER "),
+            "no DDL may follow the version marker"
+        );
+        assert!(tail.contains("WHERE studiofs_schema_components.version < EXCLUDED.version"));
+    }
 
     #[test]
     fn schema_declares_incompatible_sync_boundary_and_checkpoint_descriptor() {

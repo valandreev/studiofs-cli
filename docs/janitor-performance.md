@@ -68,7 +68,16 @@ S3 operators advertising `start_after` resume after the last listed key. An unfi
 
 Checkpoints bind the volume UUID, endpoint, bucket, normalized data prefix, and listing strategy. A supported scope change starts at the beginning. Missing tables, malformed state, and unknown checkpoint versions fail closed; an older binary cannot reset or overwrite a newer version.
 
-Schema deployment must include the repeatable canonical DDL in `studiofs-meta/src/pg_engine/schema.rs`, including `snapshot_payload_sweep_checkpoints`, before running the command. The CLI performs no runtime DDL. Coordinate this schema ensure step with the shared schema rollout; do not introduce a second migration runner. The checkpoint schema version is independent of the volume format version.
+## Schema version, deployment and recovery (SFS-980)
+
+The payload GC queue (`snapshot_payload_gc_candidates`), sweep checkpoint (`snapshot_payload_sweep_checkpoints`) and upload fences share one schema version, recorded as `studiofs_schema_components(component = 'payload_gc')`. The current version is `PAYLOAD_GC_SCHEMA_VERSION = 1` in `crates/studiofs-meta/src/pg_engine/schema.rs`. Volumes created before this version are not supported and are not converted.
+
+- **Deploy.** `studiofs init` and `studiofs load` apply the canonical, repeatable DDL in one PostgreSQL transaction, and the version marker is its last statement. An interrupted or failed application therefore leaves either the previous schema or the complete new one, never a marker without its tables. To deploy onto an existing metadata database, rerun `studiofs init` with the new binary: it applies the schema before it reports that the volume already exists. The CLI janitor performs no runtime DDL and there is no second migration runner.
+- **Retry.** Reapplying the DDL is idempotent. It keeps existing queue, checkpoint and fence rows, recreates dropped guard triggers, and never lowers the recorded version.
+- **Refusal.** After taking its lock, `studiofs janitor` checks that the recorded version equals the version it was built for and that the six deletion guard triggers on `event_log`, `snapshot_source_checkpoints` and `snapshot_payload_upload_watermarks` exist and are enabled. A missing table, missing marker, other version, or missing or disabled guard releases the lock and stops with exit code 5 (`schema_unavailable`) before any listing or deletion. Dry runs are refused the same way.
+- **Rollback limit.** There is no down-migration. A binary built for an older version refuses a newer schema rather than relabelling it; roll back by redeploying the matching binary, not by editing the marker. Do not lower the marker by hand: an older janitor would then run against tables it does not understand.
+- **Recovery.** Rerun `studiofs init` to repair a dropped guard or an incomplete schema. A disabled watermark guard is not re-enabled by the DDL, because that would take a table lock on every ensure; re-enable it with `ALTER TABLE snapshot_payload_upload_watermarks ENABLE TRIGGER USER`.
+- **Dump and load.** A dump carries no GC queue, checkpoint or upload ledger. `studiofs load` refuses a target volume that still holds rows in any of those tables, and a loaded volume starts with an empty queue and a fresh scan, so every object is again judged by the normal protections and grace window.
 
 ## Large-volume benchmark (SFS-979)
 

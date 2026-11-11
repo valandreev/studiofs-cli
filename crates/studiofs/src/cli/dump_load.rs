@@ -135,17 +135,20 @@ pub enum DumpLoadError {
 /// Snapshot v2 tables whose rows describe snapshots of the load target.
 const SNAPSHOT_V2_TABLES: [&str; 2] = ["snapshot_catalog", "snapshot_policies"];
 
-/// Version-keyed reachability accounting and the payload upload ledger. A dump
+/// Version-keyed reachability accounting, the payload upload ledger and the
+/// payload GC queue and sweep checkpoint. A dump
 /// carries none of them, so rows retained for the target would describe a
 /// different history than the restored metadata and could let GC delete live
 /// payloads.
-const ACCOUNTING_TABLES: [&str; 6] = [
+const ACCOUNTING_TABLES: [&str; 8] = [
     "snapshot_current_references",
     "snapshot_object_reachability",
     "snapshot_reachability_batches",
     "snapshot_reachability_bootstrap",
     "snapshot_payload_upload_objects",
     "snapshot_payload_upload_watermarks",
+    "snapshot_payload_gc_candidates",
+    "snapshot_payload_sweep_checkpoints",
 ];
 
 type DumpLoadResult<T> = std::result::Result<T, DumpLoadError>;

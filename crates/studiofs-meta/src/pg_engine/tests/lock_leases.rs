@@ -252,6 +252,9 @@ fn test_pg_open_rejects_missing_file_lock_lease_table() {
 
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
+    // Dropping the table must not break parallel tests on the shared schema.
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn.clone();
     let volume = PgTestVolume::new(&dsn, "pg-open-rejects-missing-file-lock-lease-table");
     let info = volume.format_info();
     seed_local(&db, &info);
@@ -283,6 +286,9 @@ fn test_pg_foreground_file_lock_does_not_repair_missing_schema() {
 
     let dir = studiofs_test_support::workspace_target_tempdir("test-");
     let db = dir.path().join("meta.redb");
+    // Dropping the table must not break parallel tests on the shared schema.
+    let schema = IsolatedPgSchema::new(&dsn);
+    let dsn = schema.dsn.clone();
     let volume = PgTestVolume::new(&dsn, "pg-foreground-file-lock-no-schema-repair");
     seed_local(&db, &volume.format_info());
     let engine = PgMetaEngine::open_with_options(

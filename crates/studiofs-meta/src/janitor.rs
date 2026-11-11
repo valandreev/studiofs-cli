@@ -197,10 +197,21 @@ impl JanitorMetadataSession {
     }
 
     /// Acquires the per-volume PostgreSQL janitor lock when metadata is shared.
+    ///
+    /// The lock is released again when the deployed payload GC schema is
+    /// missing, incomplete or of another version, so no cycle runs against it.
     pub fn try_acquire_global_janitor_lock(&mut self) -> Result<bool, JanitorMetadataError> {
-        self.postgres
+        let acquired = self
+            .postgres
             .try_acquire_global_janitor_lock()
-            .map_err(|_| pg_backend_unavailable())
+            .map_err(|_| pg_backend_unavailable())?;
+        if acquired && let Err(error) = self.postgres.verify_payload_gc_schema() {
+            // The schema verdict matters more than a failed unlock; closing the
+            // session drops the advisory lock either way.
+            let _ = self.postgres.release_global_janitor_lock();
+            return Err(error);
+        }
+        Ok(acquired)
     }
 
     /// Releases the lock and closes its PostgreSQL session.
