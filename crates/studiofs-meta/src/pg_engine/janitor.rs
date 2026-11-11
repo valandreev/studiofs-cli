@@ -43,6 +43,19 @@ pub(super) static BATCH_PIN_QUERY: LazyLock<String> = LazyLock::new(|| {
     format!("{SNAPSHOT_PIN_QUERY} AND reachability.object_id = ANY($2::BIGINT[])")
 });
 
+/// Triggers whose silent loss would let GC or event pruning remove protected
+/// state; every other schema gap makes a janitor statement fail closed.
+const PAYLOAD_GC_GUARD_TRIGGERS: [&str; 6] = [
+    "event_log.studiofs_snapshot_source_event_prune_guard",
+    "event_log.studiofs_snapshot_source_event_truncate_guard",
+    "snapshot_source_checkpoints.studiofs_snapshot_source_prune_guard",
+    "snapshot_source_checkpoints.studiofs_snapshot_source_truncate_guard",
+    "snapshot_payload_upload_watermarks.studiofs_payload_watermark_regression_guard",
+    "snapshot_payload_upload_watermarks.studiofs_payload_watermark_delete_guard",
+];
+
+const PAYLOAD_GC_SCHEMA_PROBE_SQL: &str = "SELECT (SELECT version FROM studiofs_schema_components WHERE component = 'payload_gc'), (SELECT count(DISTINCT tgrelid::regclass::text || '.' || tgname) FROM pg_trigger WHERE tgenabled <> 'D' AND tgrelid::regclass::text || '.' || tgname = ANY($1::TEXT[]))";
+
 pub(crate) struct PgJanitorSession {
     postgres_url: String,
     volume_id: i64,
@@ -382,6 +395,42 @@ impl PgJanitorSession {
                 ))
             }
         }
+    }
+
+    /// Refuses destructive work unless the deployed payload GC schema is the
+    /// exact version this binary understands and its deletion guards are intact.
+    pub(crate) fn verify_payload_gc_schema(&mut self) -> Result<(), JanitorMetadataError> {
+        let (Some(client), Some(runtime)) = (self.client.as_ref(), self.runtime.as_ref()) else {
+            return Err(JanitorMetadataError::UnsafeToDelete(
+                "PostgreSQL janitor lock is not held",
+            ));
+        };
+        let timeout = self.command_timeout;
+        let guard_names: &[&str] = &PAYLOAD_GC_GUARD_TRIGGERS;
+        let row = runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    timeout,
+                    client.query_one(PAYLOAD_GC_SCHEMA_PROBE_SQL, &[&guard_names]),
+                )
+                .await
+            })
+            .map_err(|_| pg_sweep_timeout(timeout))?
+            .map_err(|error| janitor_pg_error("payload GC schema probe failed", error))?;
+        let version: Option<i32> = row.get(0);
+        let guards: i64 = row.get(1);
+        let expected = crate::pg_engine::schema::PAYLOAD_GC_SCHEMA_VERSION;
+        let problem = match version {
+            None => "payload GC schema version is not recorded",
+            Some(version) if version != expected => "payload GC schema version is unsupported",
+            Some(_) if usize::try_from(guards) != Ok(PAYLOAD_GC_GUARD_TRIGGERS.len()) => {
+                "payload GC schema is incomplete: a deletion guard trigger is missing or disabled"
+            }
+            Some(_) => return Ok(()),
+        };
+        Err(JanitorMetadataError::SchemaUnavailable(format!(
+            "{problem} (expected version {expected}); rerun `studiofs init` with this binary to deploy the schema"
+        )))
     }
 
     pub(crate) fn release_global_janitor_lock(&mut self) -> MetaResult<()> {

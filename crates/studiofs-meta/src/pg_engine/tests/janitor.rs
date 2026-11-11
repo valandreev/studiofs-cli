@@ -1155,3 +1155,145 @@ fn pg_janitor_sweep_checkpoint_restart_scope_dry_run_and_version() {
     assert!(session.load_sweep_checkpoint(scope, true).is_err());
     assert!(session.save_sweep_checkpoint(scope, &saved).is_err());
 }
+
+/// SFS-980: the payload GC schema deploys atomically and repeatably, and the CLI
+/// Janitor refuses any missing, interrupted, drifted or unsupported schema.
+/// Runs in a private PostgreSQL schema so dropping guards cannot affect other tests.
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
+    use crate::pg_engine::schema::{PAYLOAD_GC_SCHEMA_VERSION, studiofs_pg_schema_sql};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required for this explicit test");
+    let schema = format!("sfs980_{}", Uuid::new_v4().simple());
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    let isolated_dsn = format!("{dsn}{separator}options=-csearch_path%3D{schema}");
+    // A volume row is not needed: only the advisory lock and schema probe run.
+    let volume_id = i64::from(rand::random::<u32>()) + 1_000_000_000;
+
+    let sql = |statement: String| {
+        let dsn = isolated_dsn.clone();
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| MetaError::Storage(pg_err(error)))?;
+            let task = tokio::spawn(connection);
+            let result = client.batch_execute(&statement).await.map_err(pg_err);
+            task.abort();
+            Ok::<_, MetaError>(result)
+        })
+        .expect("connect to isolated schema")
+    };
+    let query_i64 = |statement: &'static str| {
+        let dsn = isolated_dsn.clone();
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|error| MetaError::Storage(pg_err(error)))?;
+            let task = tokio::spawn(connection);
+            let value: i64 = client
+                .query_one(statement, &[])
+                .await
+                .map_err(|error| MetaError::Storage(pg_err(error)))?
+                .get(0);
+            task.abort();
+            Ok::<_, MetaError>(value)
+        })
+        .expect("query isolated schema")
+    };
+    let verdict = || {
+        let mut session = PgJanitorSession::new(isolated_dsn.clone(), volume_id);
+        assert!(
+            session
+                .try_acquire_global_janitor_lock()
+                .expect("acquire lock")
+        );
+        let verdict = session.verify_payload_gc_schema();
+        session.release_global_janitor_lock().expect("release lock");
+        verdict
+    };
+    let refused = |reason: &str| match verdict() {
+        Err(crate::JanitorMetadataError::SchemaUnavailable(message)) => assert!(
+            message.contains(reason),
+            "expected refusal containing {reason:?}, got {message:?}"
+        ),
+        other => panic!("expected schema refusal containing {reason:?}, got {other:?}"),
+    };
+
+    sql(format!("CREATE SCHEMA {schema}")).expect("create isolated schema");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Empty database: nothing deployed.
+        refused("SQLSTATE 42P01");
+
+        // Interrupted application: the final marker insert fails, and the
+        // single-transaction batch leaves no partial GC table behind.
+        sql("CREATE VIEW studiofs_schema_components AS SELECT ''::TEXT AS component, 0 AS version, now() AS applied_at".to_owned())
+            .expect("plant a conflicting object");
+        assert!(sql(studiofs_pg_schema_sql().to_owned()).is_err());
+        assert_eq!(
+            query_i64(
+                "SELECT count(*) FROM pg_class WHERE relname = 'snapshot_payload_gc_candidates' AND relnamespace = current_schema()::regnamespace"
+            ),
+            0
+        );
+        refused("version is not recorded");
+        sql("DROP VIEW studiofs_schema_components".to_owned()).expect("remove the conflict");
+
+        // Retry and repeatable application on empty and populated databases.
+        sql(studiofs_pg_schema_sql().to_owned()).expect("first application");
+        verdict().expect("deployed schema is accepted");
+        sql(format!(
+            "INSERT INTO volumes (vol, name, uuid, block_size) VALUES ({volume_id}, 'sfs980', 'sfs980', 8192); \
+             INSERT INTO snapshot_payload_gc_candidates (vol, object_id) VALUES ({volume_id}, 7); \
+             INSERT INTO snapshot_payload_sweep_checkpoints (vol, schema_version, volume_uuid, endpoint, bucket, data_prefix, listing_strategy, after_key) \
+                 VALUES ({volume_id}, 1, 'sfs980', 'e', 'b', 'p/', 's', 'p/0007/0000000000000007')"
+        ))
+        .expect("populate GC state");
+        sql(studiofs_pg_schema_sql().to_owned()).expect("second application");
+        verdict().expect("re-applied schema is accepted");
+        assert_eq!(
+            query_i64("SELECT count(*) FROM snapshot_payload_gc_candidates"),
+            1
+        );
+        assert_eq!(
+            query_i64(
+                "SELECT count(*) FROM snapshot_payload_sweep_checkpoints WHERE after_key IS NOT NULL"
+            ),
+            1
+        );
+        assert_eq!(
+            query_i64(
+                "SELECT count(*)::BIGINT FROM studiofs_schema_components WHERE component = 'payload_gc' AND version = 1"
+            ),
+            1
+        );
+
+        // Drift: a dropped or disabled guard is refused until re-application.
+        sql("DROP TRIGGER studiofs_payload_watermark_delete_guard ON snapshot_payload_upload_watermarks".to_owned())
+            .expect("drop a guard");
+        refused("incomplete");
+        sql(studiofs_pg_schema_sql().to_owned()).expect("repair application");
+        verdict().expect("repaired schema is accepted");
+        sql(
+            "ALTER TABLE event_log DISABLE TRIGGER studiofs_snapshot_source_event_prune_guard"
+                .to_owned(),
+        )
+        .expect("disable a guard");
+        refused("incomplete");
+        sql(studiofs_pg_schema_sql().to_owned()).expect("re-enabling application");
+        verdict().expect("re-created guard is accepted");
+
+        // A newer schema is unsupported, and re-application never downgrades it.
+        sql(format!(
+            "UPDATE studiofs_schema_components SET version = {} WHERE component = 'payload_gc'",
+            PAYLOAD_GC_SCHEMA_VERSION + 1
+        ))
+        .expect("simulate a newer schema");
+        refused("version is unsupported");
+        sql(studiofs_pg_schema_sql().to_owned()).expect("older application");
+        refused("version is unsupported");
+    }));
+    sql(format!("DROP SCHEMA {schema} CASCADE")).expect("drop isolated schema");
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
