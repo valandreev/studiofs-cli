@@ -34,3 +34,4 @@ deslop*.txt
 # User guide site build output (docs/user-guide/build-site.sh)
 /docs/user-guide/.build/
 /site/docs/
+__pycache__/

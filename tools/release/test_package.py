@@ -79,8 +79,8 @@ class ReleasePackageTests(unittest.TestCase):
 
     def test_windows_zip_contains_only_allowlisted_files_and_build_metadata(self) -> None:
         archive_path = self.package()
-        self.assertEqual(archive_path.name, "studiofs-9.8.7-x86_64-pc-windows-msvc.zip")
-        folder = "studiofs-9.8.7-x86_64-pc-windows-msvc"
+        self.assertEqual(archive_path.name, "studiofs-9.8.7-x86_64-pc-windows.zip")
+        folder = "studiofs-9.8.7-x86_64-pc-windows"
         expected = {
             f"{folder}/studiofs.exe",
             f"{folder}/LICENSE",
@@ -116,6 +116,17 @@ class ReleasePackageTests(unittest.TestCase):
             sidecar.read_text(encoding="ascii"),
             f"{hashlib.sha256(archive_path.read_bytes()).hexdigest()}  {archive_path.name}\n",
         )
+
+    def test_linux_archive_name_drops_unknown_vendor(self) -> None:
+        self.target = "x86_64-unknown-linux-gnu"
+        self.binary = self.repo / "target" / self.target / "release" / "studiofs"
+        self.binary.parent.mkdir(parents=True)
+        self.binary.write_bytes(b"fake linux executable")
+        archive_path = self.package()
+        self.assertEqual(archive_path.name, "studiofs-9.8.7-x86_64-linux-gnu.tar.gz")
+        with tarfile.open(archive_path, "r:gz") as archive:
+            info = json.loads(archive.extractfile("studiofs-9.8.7-x86_64-linux-gnu/BUILD-INFO.json").read())
+        self.assertEqual(info["target"], "x86_64-unknown-linux-gnu")
 
     def test_unix_tar_contains_allowlist_and_preserves_executable_mode(self) -> None:
         self.target = "aarch64-apple-darwin"
