@@ -907,6 +907,13 @@ is retained, and local payload cache cleanup follows normal unlink behavior.
 Existing trash-like roots are hidden from root directory listings so they are
 not exposed as user-visible folders in mounted trees.
 
+The planned 0.2.3 recoverable-trash behavior is specified in the
+[approved interview contract](superpowers/specs/2026-11-12-recoverable-trash-design.md).
+It is not implemented by the version bump: native OS integration and enforced
+old-client compatibility must pass their validation gates first. The planned
+volume-wide `trash days` setting defaults to zero (disabled), with a CLI update
+after creation; direct unlink and permanent-delete operations bypass retention.
+
 ### macOS metadata file filtering
 
 Finder and related macOS services may also try to create metadata sidecar files
