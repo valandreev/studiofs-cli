@@ -11,10 +11,10 @@ StudioFS 0.2.1 targets these five native platforms:
 
 | Download suffix | System | GitHub builder |
 | --- | --- | --- |
-| `x86_64-pc-windows-msvc.zip` | Windows x86-64 | `windows-2025` |
-| `aarch64-pc-windows-msvc.zip` | Windows ARM64 | `windows-11-arm` |
-| `x86_64-unknown-linux-gnu.tar.gz` | Linux x86-64 | `ubuntu-24.04` |
-| `aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64 | `ubuntu-24.04-arm` |
+| `x86_64-pc-windows.zip` | Windows x86-64 | `windows-2025` |
+| `aarch64-pc-windows.zip` | Windows ARM64 | `windows-11-arm` |
+| `x86_64-linux-gnu.tar.gz` | Linux x86-64 | `ubuntu-24.04` |
+| `aarch64-linux-gnu.tar.gz` | Linux ARM64 | `ubuntu-24.04-arm` |
 | `aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | `macos-15` |
 
 Download the archive for your machine from

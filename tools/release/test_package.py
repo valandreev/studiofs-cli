@@ -79,8 +79,8 @@ class ReleasePackageTests(unittest.TestCase):
 
     def test_windows_zip_contains_only_allowlisted_files_and_build_metadata(self) -> None:
         archive_path = self.package()
-        self.assertEqual(archive_path.name, "studiofs-9.8.7-x86_64-pc-windows-msvc.zip")
-        folder = "studiofs-9.8.7-x86_64-pc-windows-msvc"
+        self.assertEqual(archive_path.name, "studiofs-9.8.7-x86_64-pc-windows.zip")
+        folder = "studiofs-9.8.7-x86_64-pc-windows"
         expected = {
             f"{folder}/studiofs.exe",
             f"{folder}/LICENSE",
