@@ -9,13 +9,13 @@ below describe the published v0.2.1 packages.
 
 StudioFS 0.2.1 targets these five native platforms:
 
-| Download suffix | System | GitHub builder |
-| --- | --- | --- |
-| `x86_64-pc-windows.zip` | Windows x86-64 | `windows-2025` |
-| `aarch64-pc-windows.zip` | Windows ARM64 | `windows-11-arm` |
-| `x86_64-linux-gnu.tar.gz` | Linux x86-64 | `ubuntu-24.04` |
-| `aarch64-linux-gnu.tar.gz` | Linux ARM64 | `ubuntu-24.04-arm` |
-| `aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | `macos-15` |
+| Download suffix | Rust target triple | System | GitHub builder |
+| --- | --- | --- | --- |
+| `x86_64-pc-windows.zip` | `x86_64-pc-windows-msvc` | Windows x86-64 | `windows-2025` |
+| `aarch64-pc-windows.zip` | `aarch64-pc-windows-msvc` | Windows ARM64 | `windows-11-arm` |
+| `x86_64-linux-gnu.tar.gz` | `x86_64-unknown-linux-gnu` | Linux x86-64 | `ubuntu-24.04` |
+| `aarch64-linux-gnu.tar.gz` | `aarch64-unknown-linux-gnu` | Linux ARM64 | `ubuntu-24.04-arm` |
+| `aarch64-apple-darwin.tar.gz` | `aarch64-apple-darwin` | macOS Apple Silicon | `macos-15` |
 
 Download the archive for your machine from
 [GitHub Releases](https://github.com/valandreev/studiofs-cli/releases), verify
@@ -85,7 +85,7 @@ export STUDIOFS_MFMOUNT_FRAMEWORK_DIR="$PWD/target/no-mfmount"
 ```
 
 On a native machine matching the chosen download, replace `<target>` with the
-table's target triple (without `.zip` or `.tar.gz`):
+table's Rust target triple (not the download suffix):
 
 ```bash
 rustup toolchain install 1.95.0 --profile minimal

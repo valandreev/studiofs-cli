@@ -129,7 +129,7 @@ def create_package(
         "cargo_lock_sha256": current_lock_hash,
     }
     # Public asset names drop the redundant "-msvc"/"-unknown" triple parts; BUILD-INFO keeps the full triple.
-    package_name = f"studiofs-{version}-{target.replace('-msvc', '').replace('-unknown', '')}"
+    package_name = f"studiofs-{version}-{target.removesuffix('-msvc').replace('-unknown-', '-')}"
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_path = output_dir / (f"{package_name}.zip" if target in WINDOWS_TARGETS else f"{package_name}.tar.gz")
 
