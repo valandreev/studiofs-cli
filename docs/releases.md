@@ -11,13 +11,18 @@ below describe the published v0.2.2 packages.
 
 StudioFS 0.2.2 targets these five native platforms:
 
-| Download suffix | Rust target triple | System | GitHub builder |
-| --- | --- | --- | --- |
-| `x86_64-pc-windows-msvc.zip` | `x86_64-pc-windows-msvc` | Windows x86-64 | `windows-2025` |
-| `aarch64-pc-windows-msvc.zip` | `aarch64-pc-windows-msvc` | Windows ARM64 | `windows-11-arm` |
-| `x86_64-unknown-linux-gnu.tar.gz` | `x86_64-unknown-linux-gnu` | Linux x86-64 | `ubuntu-24.04` |
-| `aarch64-unknown-linux-gnu.tar.gz` | `aarch64-unknown-linux-gnu` | Linux ARM64 | `ubuntu-24.04-arm` |
-| `aarch64-apple-darwin.tar.gz` | `aarch64-apple-darwin` | macOS Apple Silicon | `macos-15` |
+| v0.2.2 download suffix | Suffix from v0.2.3 | Rust target triple | System | GitHub builder |
+| --- | --- | --- | --- | --- |
+| `x86_64-pc-windows-msvc.zip` | `x86_64-pc-windows.zip` | `x86_64-pc-windows-msvc` | Windows x86-64 | `windows-2025` |
+| `aarch64-pc-windows-msvc.zip` | `aarch64-pc-windows.zip` | `aarch64-pc-windows-msvc` | Windows ARM64 | `windows-11-arm` |
+| `x86_64-unknown-linux-gnu.tar.gz` | `x86_64-linux-gnu.tar.gz` | `x86_64-unknown-linux-gnu` | Linux x86-64 | `ubuntu-24.04` |
+| `aarch64-unknown-linux-gnu.tar.gz` | `aarch64-linux-gnu.tar.gz` | `aarch64-unknown-linux-gnu` | Linux ARM64 | `ubuntu-24.04-arm` |
+| `aarch64-apple-darwin.tar.gz` | `aarch64-apple-darwin.tar.gz` | `aarch64-apple-darwin` | macOS Apple Silicon | `macos-15` |
+
+Releases up to v0.2.2 name archives `studiofs-<version>-<full target triple>`.
+Starting with the next release (workspace `0.2.3`), `tools/release/package.py`
+drops the redundant `-msvc` suffix and `-unknown-` vendor part from archive and
+folder names; `BUILD-INFO.json` still records the full target triple.
 
 Download the archive for your machine from
 [GitHub Releases](https://github.com/valandreev/studiofs-cli/releases), verify
