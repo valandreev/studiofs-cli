@@ -1187,13 +1187,14 @@ mod tests {
         });
         anyhow::ensure!(
             binary.is_file(),
-            "Cargo did not produce the standalone CLI at {}; run this ignored test with --workspace --all-targets",
+            "standalone CLI is missing at {}; run cargo test with --workspace --all-targets to build it",
             binary.display()
         );
         Ok(binary)
     }
 
     #[test]
+    #[ignore = "requires --workspace --all-targets to build the standalone CLI"]
     fn cli_binary_is_built_for_the_current_test_profile() {
         let binary = cli_binary().expect("standalone CLI should be available to the test harness");
         assert!(binary.is_file(), "{}", binary.display());
