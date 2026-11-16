@@ -374,7 +374,9 @@ impl RedbMetaEngine {
         lifecycle
             .retain(|_, _| false)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut preserved_inos = HashSet::with_capacity(preserved_deleted.len());
         for record in preserved_deleted {
+            preserved_inos.insert(record.ino);
             let bytes = encode(&record)?;
             lifecycle
                 .insert(record.ino, bytes.as_slice())
@@ -398,6 +400,10 @@ impl RedbMetaEngine {
             inos
         };
         for ino in regular_inos {
+            // Inode numbers are never reused, so DeletedBeforePublish is terminal even if a remote snapshot still contains the inode.
+            if preserved_inos.contains(&ino) {
+                continue;
+            }
             let Some(attr) = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)? else {
                 continue;
             };
@@ -1009,6 +1015,116 @@ impl RedbMetaEngine {
         );
         Self::put_inode_lifecycle_in_txn(txn, &record)?;
         Ok(Some(record))
+    }
+
+    /// Re-synchronize `INODE_LIFECYCLE_TABLE` for regular-file inodes touched by
+    /// pending local serving replay after a snapshot replace or repair open.
+    /// Keeps `DeletedBeforePublish` rows intact when `INODES_TABLE` has no live
+    /// attr (or `nlink == 0`), preserves `deferred_cleanup_object_ids`, and
+    /// leaves `PENDING_REGULAR_FILE_RECOVERY_TABLE` untouched.
+    pub(super) fn sync_replayed_inode_lifecycles_in_txn<E: Borrow<crate::events::MetaEvent>>(
+        txn: &redb::WriteTransaction,
+        events: &[E],
+    ) -> MetaResult<()> {
+        let mut candidate_inos = BTreeSet::new();
+        for event in events {
+            match event.borrow() {
+                crate::events::MetaEvent::SetAttr { attr } => {
+                    candidate_inos.insert(attr.ino);
+                }
+                crate::events::MetaEvent::RemoveAttr { ino }
+                | crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+                | crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                | crate::events::MetaEvent::RemoveRegularFileGraph { ino } => {
+                    candidate_inos.insert(*ino);
+                }
+                crate::events::MetaEvent::AddEntry { entry, .. } => {
+                    if entry.kind == FileType::RegularFile {
+                        candidate_inos.insert(entry.ino);
+                    }
+                }
+                crate::events::MetaEvent::RenameEntry {
+                    entry,
+                    displaced_set_attr,
+                    displaced_remove_attr_ino,
+                    ..
+                } => {
+                    if entry.kind == FileType::RegularFile {
+                        candidate_inos.insert(entry.ino);
+                    }
+                    if let Some(attr) = displaced_set_attr.as_ref() {
+                        candidate_inos.insert(attr.ino);
+                    }
+                    if let Some(ino) = displaced_remove_attr_ino {
+                        candidate_inos.insert(*ino);
+                    }
+                }
+                crate::events::MetaEvent::SetVolumeSettings { .. }
+                | crate::events::MetaEvent::RemoveEntry { .. }
+                | crate::events::MetaEvent::RemoveLocalEntry { .. }
+                | crate::events::MetaEvent::SetSymlinkTarget { .. }
+                | crate::events::MetaEvent::SetXattr { .. }
+                | crate::events::MetaEvent::RemoveXattr { .. }
+                | crate::events::MetaEvent::SetAclRule { .. }
+                | crate::events::MetaEvent::RemoveAclRule { .. }
+                | crate::events::MetaEvent::AddPendingDeletion { .. }
+                | crate::events::MetaEvent::RemovePendingDeletion { .. } => {}
+            }
+        }
+
+        for ino in candidate_inos {
+            let existing = {
+                txn.open_table(INODE_LIFECYCLE_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                    .get(ino)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                    .map(|value| decode::<InodeLifecycleRecord>(value.value()))
+                    .transpose()?
+            };
+            if existing
+                .as_ref()
+                .is_some_and(|record| record.state == InodeLifecycleState::DeletedBeforePublish)
+            {
+                continue;
+            }
+            let current_attr = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)?;
+            match current_attr {
+                Some(attr) if attr.kind == FileType::RegularFile => {
+                    let deferred_cleanup_object_ids = existing
+                        .map(|record| record.deferred_cleanup_object_ids)
+                        .unwrap_or_default();
+                    let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+                        txn,
+                        REGULAR_FILE_OVERLAY_TABLE,
+                        ino,
+                    )?;
+                    let has_published_base = Self::has_regular_file_chunk_rows_in_write_txn(
+                        txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        ino,
+                    )? || attr.committed_size > 0
+                        || attr.committed_content_epoch > 0;
+                    let record = Self::compute_inode_lifecycle_record(
+                        &attr,
+                        overlay_chunks.values(),
+                        has_published_base,
+                        deferred_cleanup_object_ids,
+                    );
+                    Self::put_inode_lifecycle_in_txn(txn, &record)?;
+                }
+                _ => {
+                    if existing.is_some() {
+                        let mut table = txn
+                            .open_table(INODE_LIFECYCLE_TABLE)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        let _ = table
+                            .remove(ino)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `overlay_chunks` must be the inode's complete overlay as written in `txn`.

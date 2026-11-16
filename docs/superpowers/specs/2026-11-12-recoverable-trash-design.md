@@ -69,7 +69,42 @@ validation remain pending. This records the contract, not an implementation plan
   remote payload GC; shared settlement and live/snapshot references fence it.
   A failed or conflicting restore must not discard accepted local data. Define
   and test the conflict outcome before enabling retained data.
+- A shared `PurgeRequested` row names a receipt, not an inode: a losing offline
+  restore preserves inode and hardlink identity, adopts complete fresh durable
+  local payload objects, and journals namespace reconstruction before accepting
+  the restored name. Existing handles and mapped writes keep that identity.
+  A losing receipt transition retires only that record, never the accepted
+  namespace/content recovery journal. Purge settlement must re-verify that
+  `receipt/data` still links to that inode and settle only that link; it must
+  never delete, unlink or GC by `inode` alone.
+  The same holds for open-unlink finalization of a purged retained child (last
+  handle close or restart replay): it rechecks the inode's current links in
+  the same local transaction and defers while the child purge is not yet
+  acknowledged by shared authority, so a losing purge never deletes a restored
+  child's graph or publishes its removal. The unacknowledged purge span itself
+  identifies the child, wherever a later local restore moved its parent, and
+  upload cancellation for the inode starts only once that finalization removes it.
+- Purge settlement must never delete a `trash_entry_authority` row, nor the
+  winner's base receipt xattr, while a delayed client could still hold a local
+  terminal record for that receipt. Loser classification reads the shared row,
+  and restart self-ack proves a loss only from the winner replayed into base;
+  without them a losing record stays pending and blocks that client's journal.
 - Do not purge before retention expires to relieve disk or quota pressure.
+- Approved user decision (2026-11-15): directory Clear behaves like a local
+  disk. Each successful child delete inside a retained directory is permanent;
+  Cancel, Ctrl+C, or a killed process leaves the remaining children visible and
+  restorable. The child delete is a durable local commit journaled behind the
+  receipt's `Retained` authority fence, so it loses (and is retired locally)
+  against a peer's earlier terminal transition and never deletes a restored live
+  child. No mount-local tombstone, timer, or rollback-on-cancel exists. Only the
+  losing child delete retires; an earlier child delete already committed in
+  PostgreSQL stays in the journal for its own acknowledgement. A losing delete
+  of a child with uploaded but unpublished bytes keeps their local deletion
+  marker: the delete dropped the only local reference, and abandoned-upload
+  retirement re-checks shared references, so published bytes stay protected.
+  A native whole-item "Delete permanently" or Empty Trash (the GVFS rename into
+  `.Trash-<uid>/expunged`) purges a whole retained entry in one step, as expiry
+  does; per-child deletes a client issues itself still follow the per-child rule.
 - Establish an enforced persisted-format/capability boundary that incompatible
   old clients actually reject before writing any retained entries. Documentation
   alone or an unknown flag silently ignored by old clients is insufficient.

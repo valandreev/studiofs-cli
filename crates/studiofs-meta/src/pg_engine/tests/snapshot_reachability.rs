@@ -604,6 +604,86 @@ fn final_reference_close_queues_published_payload_and_reopen_removes_stale_candi
 
 #[test]
 #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn stage_overlay_and_remove_attr_do_not_reference_adopted_fresh_objects() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let volume = PgTestVolume::new(&dsn, "snapshot-reachability-stage-overlay");
+
+    run_async(async {
+        let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, 31, 'published')",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("seed published upload ledger row");
+
+        let stage_ino = 900_u64;
+        let real_ino = 7_u64;
+        let fresh_object = 31_u64;
+        let stage_events = vec![
+            MetaEvent::SetRegularFileOverlaySlices {
+                ino: stage_ino,
+                chunk_slices: vec![(ChunkId(0), vec![published_slice(fresh_object)])],
+            },
+            publish_event(real_ino, fresh_object),
+            MetaEvent::RemoveAttr { ino: stage_ino },
+        ];
+
+        let tx = client
+            .transaction()
+            .await
+            .expect("start stage adoption transaction");
+        apply_object_lifetime_changes(&tx, volume.volume_id, 1, &stage_events)
+            .await
+            .expect("apply stage overlay, adoption, and stage remove attr");
+        tx.commit().await.expect("commit stage adoption transaction");
+
+        let stage_refs: i64 = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM snapshot_current_references WHERE vol = $1 AND ino = $2",
+                &[&volume.volume_id, &(stage_ino as i64)],
+            )
+            .await
+            .expect("query stage inode refs")
+            .get(0);
+        assert_eq!(stage_refs, 0, "stage inode must never appear in snapshot_current_references");
+
+        let real_refs = client
+            .query(
+                "SELECT object_id FROM snapshot_current_references WHERE vol = $1 AND ino = $2",
+                &[&volume.volume_id, &(real_ino as i64)],
+            )
+            .await
+            .expect("query real inode refs")
+            .into_iter()
+            .map(|row| row.get::<_, i64>(0) as u64)
+            .collect::<Vec<_>>();
+        assert_eq!(real_refs, vec![fresh_object]);
+
+        let gc_candidates: i64 = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = $2",
+                &[&volume.volume_id, &(fresh_object as i64)],
+            )
+            .await
+            .expect("query fresh object GC candidates")
+            .get(0);
+        assert_eq!(gc_candidates, 0, "fresh adopted object must not be queued for GC");
+
+        connection_task.abort();
+        Ok::<(), MetaError>(())
+    })
+    .expect("stage overlay reachability check");
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
 fn bootstrap_defers_while_a_snapshot_is_creating() {
     let Some(dsn) = pg_dsn() else {
         return;

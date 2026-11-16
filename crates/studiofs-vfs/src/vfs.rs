@@ -45,6 +45,7 @@ mod prefetch;
 mod ram_readahead;
 mod read_context;
 mod read_path;
+mod retained_views;
 mod runtime_stats_surface;
 mod startup;
 mod startup_replay;
@@ -93,6 +94,7 @@ pub use namespace::{
     NamespacePathStyle, NamespaceResolver,
 };
 pub use os_cache::{OsCacheDisposition, OsCacheOpenDecision, OsCacheParticipation, OsCacheReason};
+pub use retained_views::NativeTrashProfile;
 pub use runtime_stats_surface::{
     RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_NAME_STR,
     RUNTIME_STATS_FILE_REPORTED_SIZE, read_runtime_stats_buffer,
@@ -1853,7 +1855,9 @@ fn resolve_cache_runtime_tuning_overrides(
         } else {
             derived.upload_cache_io_slots
         },
-        transit_memory_budget_bytes: if overrides.transit_memory_budget_bytes {
+        transit_memory_budget_bytes: if overrides.transit_memory_budget_bytes
+            && config.transit_memory_budget_bytes != DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES
+        {
             config.transit_memory_budget_bytes
         } else {
             derived.transit_memory_budget_bytes
@@ -2768,6 +2772,14 @@ struct MetricsState {
     materialize_batch_stats: MaterializeBatchStats,
     ignored_entries: OrderedMutex<IgnoredEntryRegistry>,
     next_ignored_ino: AtomicU64,
+    /// Drive prefix of this client's mount (for example `W:`); empty when not mounted.
+    native_trash_prefix: OrderedMutex<String>,
+    /// Active native trash projection profile for this client mount.
+    native_trash_profile: OrderedMutex<NativeTrashProfile>,
+    /// Deterministic client-local POSIX view names assigned to active retained receipts.
+    posix_trash_view_names: OrderedMutex<HashMap<Ino, Vec<u8>>>,
+    /// Cached metadata inode of the active profile's trash root (`0` if absent/virtual).
+    active_trash_root_ino: AtomicU64,
     /// Current number of items queued in the prefetch worker's pending queue.
     /// Useful for detecting backpressure under high handle-count workloads.
     prefetch_queue_depth: AtomicU64,
@@ -2975,6 +2987,13 @@ impl MetricsState {
             materialize_batch_stats: MaterializeBatchStats::default(),
             ignored_entries: OrderedMutex::new(IgnoredEntryRegistry::default(), LockTier::Metrics),
             next_ignored_ino: AtomicU64::new(FIRST_IGNORED_INO),
+            native_trash_prefix: OrderedMutex::new(String::new(), LockTier::Metrics),
+            native_trash_profile: OrderedMutex::new(
+                NativeTrashProfile::default(),
+                LockTier::Metrics,
+            ),
+            posix_trash_view_names: OrderedMutex::new(HashMap::new(), LockTier::Metrics),
+            active_trash_root_ino: AtomicU64::new(0),
             prefetch_queue_depth: AtomicU64::new(0),
             prefetch_ingress_dropped_hints: AtomicU64::new(0),
             prefetch_ingress_dropped_blocks: AtomicU64::new(0),
@@ -4124,6 +4143,25 @@ struct PendingCoherenceInvalidation {
     deferred: bool,
 }
 
+/// Points where a test can interleave concurrent retained restores.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedRestoreStage {
+    /// Before the restore gate is acquired.
+    Entered,
+    /// After a copy chunk is read, before it is written back.
+    CopyRead,
+    /// Before source permits are acquired and the staged fork begins.
+    BeforeSourceGates,
+}
+
+#[cfg(test)]
+type RetainedRestoreHook = Arc<
+    dyn Fn(&StudioVfs, RetainedRestoreStage) -> futures::future::BoxFuture<'static, ()>
+        + Send
+        + Sync,
+>;
+
 /// The core VFS - satisfies filesystem operations using metadata + data + cache.
 pub struct StudioVfs {
     /// Preferred metadata execution boundary for hot-path call sites.
@@ -4221,6 +4259,10 @@ pub struct StudioVfs {
     zeroio_runtime_state_dir: PathBuf,
     landing_zone: LandingZone,
     landing_zone_recovery_gate: tokio::sync::Mutex<()>,
+    /// Orders retained restores across their awaited check, copy and commit.
+    retained_restore_gate: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    retained_restore_hook: Mutex<Option<RetainedRestoreHook>>,
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
     /// Bounded generation snapshots and active writer participation.
@@ -8425,7 +8467,9 @@ impl StudioVfs {
         match self.enforce_access(ino, AccessLevel::ReadWrite) {
             Ok(()) => Ok(open_file),
             Err(error)
-                if open_file.active_open_overlay && Self::is_inode_not_found_error(&error, ino) =>
+                if ino < FIRST_IGNORED_INO
+                    && open_file.active_open_overlay
+                    && Self::is_inode_not_found_error(&error, ino) =>
             {
                 self.handle_table.mark_orphan(ino);
                 Ok(open_file)
@@ -10538,6 +10582,7 @@ impl StudioVfs {
     /// Called by FUSE `open()` / WinFSP `open()`.
     /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
+        self.reject_private_store_ino(ino)?;
         self.open_file_with_read_ahead_owner(ino, flags, trunc, ReadAheadOwner::Vfs)
     }
 
@@ -10640,7 +10685,23 @@ impl StudioVfs {
         if check_authority && Self::write_access_requested(flags, trunc) {
             self.enforce_no_known_foreign_hard_lock(ino)?;
         }
-        if let Some(ignored_attr) = self.ignored_entry_attr(ino) {
+        if ino >= FIRST_IGNORED_INO {
+            let ignored = self.visible_ignored_entry_snapshot(ino)?;
+            if trunc && ignored.view.is_some() {
+                return Err(VfsError::OperationNotSupported);
+            }
+            if !check_authority && ignored_entries::retained_view_receipt(&ignored).is_some() {
+                let actual = self.ignored_entry_snapshot_access_level(&ignored)?;
+                if (actual as u8) < (required_access as u8) {
+                    return Err(VfsError::Meta(MetaError::AccessDenied {
+                        ino,
+                        principal: self.acl_principal.clone(),
+                        required: required_access,
+                        actual,
+                    }));
+                }
+            }
+            let ignored_attr = ignored.attr;
             let active_open_overlay = Self::active_open_overlay_required(flags, trunc);
             let open_file =
                 self.open_file_handle(ino, flags, Some(ignored_attr), active_open_overlay);
@@ -10651,6 +10712,7 @@ impl StudioVfs {
                 self.sync_meta().note_active_open_inode(ino);
             }
             self.state.file_session.note_open_handle(ino);
+            self.sync_meta().note_open_handle(ino, true);
             self.state
                 .read
                 .increment_active_access_class(open_file.current_access_class());
@@ -10697,6 +10759,7 @@ impl StudioVfs {
             self.sync_meta().note_active_open_inode(ino);
         }
         self.state.file_session.note_open_handle(ino);
+        self.sync_meta().note_open_handle(ino, true);
         self.state
             .read
             .increment_active_access_class(open_file.current_access_class());

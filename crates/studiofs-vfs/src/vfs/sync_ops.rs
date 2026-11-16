@@ -775,7 +775,7 @@ impl StudioVfs {
 
     /// Whether the inode still has local writes or a deferred materialization that a
     /// last-handle release must drain before its attributes are trusted.
-    fn inode_has_pending_local_state(&self, ino: Ino) -> bool {
+    pub(super) fn inode_has_pending_local_state(&self, ino: Ino) -> bool {
         self.inode_has_local_dirty_state(ino)
             || self.state.deferred_materialize_inflight.contains(ino)
     }
@@ -818,6 +818,7 @@ impl StudioVfs {
             .decrement_active_access_class(open_file.current_access_class());
         debug!("release_fh fh={} ino={} remaining={}", fh, ino, remaining);
         self.state.file_session.note_close_handle(ino, remaining);
+        self.sync_meta().note_open_handle(ino, false);
         self.clear_access_tracking_for_stream(ino, stream_id);
         self.debug_pending_inode_state(ino, "release_handle_closed");
         if remaining > 0 {
@@ -836,23 +837,70 @@ impl StudioVfs {
         })
     }
 
-    async fn cleanup_orphan_on_last_handle_close(&self, ino: Ino) -> VfsResult<ReleaseFhOutcome> {
+    pub(super) async fn cleanup_orphan_on_last_handle_close(
+        &self,
+        ino: Ino,
+    ) -> VfsResult<ReleaseFhOutcome> {
         if self.release_ignored_entry(ino) {
             return Ok(ReleaseFhOutcome {
                 closed_last_handle: true,
                 flushed_local_dirty_state: false,
             });
         }
+        struct OpenHandleRegistrationGuard {
+            meta: Arc<dyn crate::runtime::VfsMeta>,
+            ino: Ino,
+        }
+        impl OpenHandleRegistrationGuard {
+            fn register(meta: Arc<dyn crate::runtime::VfsMeta>, ino: Ino) -> Self {
+                meta.note_open_handle(ino, true);
+                Self { meta, ino }
+            }
+        }
+        impl Drop for OpenHandleRegistrationGuard {
+            fn drop(&mut self) {
+                self.meta.note_open_handle(self.ino, false);
+            }
+        }
         // Last handle closed on an unlinked file — final cleanup
         debug!("orphan cleanup: ino={} (last fd closed)", ino);
+        // Stay registered as open until a deferred barrier is durable: the PG
+        // lifecycle sweep rechecks this registry in the same metadata critical
+        // section as its finalize, so it cannot remove the inode under the
+        // barrier and let the overlay flush recreate it.
+        let _open_handle_guard = OpenHandleRegistrationGuard::register(self.sync_meta(), ino);
+        self.finalize_orphan_on_last_handle_close(ino).await
+    }
 
+    async fn finalize_orphan_on_last_handle_close(&self, ino: Ino) -> VfsResult<ReleaseFhOutcome> {
         // A deferred materialization task may have snapped dirty state before
         // unlink marked this inode deleted. Callers join it before taking the
         // Release session, whose materialize gate keeps any later task parked
         // until this cleanup has removed the complete graph. Waiting for that
         // parked task here would deadlock.
 
-        let cleanup = self.collect_orphan_deleted_inode_cleanup(ino).await?;
+        let Some(cleanup) = self.collect_orphan_deleted_inode_cleanup(ino).await? else {
+            // Metadata kept the inode (live again, or an unacknowledged retained
+            // purge that may still lose): persist accepted writes instead.
+            let flushed = match self
+                .local_sync_barrier_with_outcome(
+                    ino,
+                    self.local_sync_policy_for_barrier(ino),
+                    StickyErrorPolicy::Ignore,
+                    DirtyAttrPersistPolicy::PersistIfPresent,
+                )
+                .await
+            {
+                Ok(outcome) => outcome.had_local_dirty_state,
+                // The background sweep finalized an acknowledged winner meanwhile.
+                Err(error) if Self::is_inode_not_found_error(&error, ino) => false,
+                Err(error) => return Err(error),
+            };
+            return Ok(ReleaseFhOutcome {
+                closed_last_handle: true,
+                flushed_local_dirty_state: flushed,
+            });
+        };
         let removed_blocks = cleanup.removed_ids.len();
         let freed_bytes = cleanup.freed_bytes;
         let deferred_local_payloads = self
@@ -903,7 +951,17 @@ impl StudioVfs {
         let is_orphan = self.handle_table.take_orphan(ino);
         if is_orphan {
             self.release_ignored_entry(ino);
-        } else if attr.kind == FileType::RegularFile {
+        } else if attr.kind == FileType::RegularFile
+            && !self.ignored_entry(ino).is_some_and(|entry| {
+                entry.view.is_none()
+                    && matches!(
+                        self.trash_container_role(entry.parent),
+                        Ok(Some(super::retained_views::TrashContainerRole::LinuxInfo(
+                            _
+                        )))
+                    )
+            })
+        {
             self.detach_ignored_entry_name(ino);
         }
         Some(LastHandleReleaseAction::IgnoredEntry)
@@ -1392,6 +1450,18 @@ impl StudioVfs {
         }
     }
 
+    /// Caller has joined deferred materialization and owns the Restore permit.
+    pub(super) async fn flush_retained_source_ordered(&self, ino: Ino) -> VfsResult<()> {
+        self.local_sync_barrier_with_outcome(
+            ino,
+            LocalSyncPolicy::Strict,
+            StickyErrorPolicy::Report,
+            DirtyAttrPersistPolicy::PersistIfPresent,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Run an ino-scoped local sync barrier and return whether it flushed local dirty state.
     ///
     /// This is used for callback paths that need an explicit per-inode durability barrier.
@@ -1411,6 +1481,11 @@ impl StudioVfs {
             .enter_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<ExplicitFlushOutcome> = async {
+            if ino >= super::FIRST_IGNORED_INO {
+                let _ignored = self.visible_ignored_entry_snapshot(ino)?;
+                self.enforce_access(ino, AccessLevel::ReadOnly)?;
+                return Ok(ExplicitFlushOutcome::default());
+            }
             let outcome = self
                 .local_sync_barrier_with_outcome(
                     ino,
@@ -1451,6 +1526,11 @@ impl StudioVfs {
         let Some(open_file) = self.handle_table.get(fh) else {
             return Ok(ExplicitFlushOutcome::default());
         };
+        if open_file.ino >= super::FIRST_IGNORED_INO {
+            let _ignored = self.visible_ignored_entry_snapshot(open_file.ino)?;
+            self.enforce_access(open_file.ino, AccessLevel::ReadOnly)?;
+            return Ok(ExplicitFlushOutcome::default());
+        }
         let ((), metadata_result) = tokio::join!(
             self.wait_for_deferred_release_inflight(open_file.ino),
             self.wait_for_deferred_namespace_metadata(open_file.ino)
@@ -1582,7 +1662,8 @@ impl StudioVfs {
             .await;
         let result: VfsResult<FsyncOutcome> = async {
             self.enforce_access(ino, AccessLevel::ReadOnly)?;
-            if self.ignored_entry_attr(ino).is_some() {
+            if ino >= super::FIRST_IGNORED_INO {
+                let _ignored = self.visible_ignored_entry_snapshot(ino)?;
                 return Ok(FsyncOutcome::default());
             }
 
@@ -1616,6 +1697,7 @@ impl StudioVfs {
     ///
     /// S3 upload remains async — same as LucidLink behaviour.
     pub async fn fsync(&self, ino: Ino, datasync: bool) -> VfsResult<()> {
+        self.reject_private_store_ino(ino)?;
         self.fsync_with_outcome(ino, datasync).await.map(|_| ())
     }
 
@@ -1626,9 +1708,14 @@ impl StudioVfs {
 
     /// Get the last attributes retained by an open file handle.
     pub fn get_open_file_attr(&self, fh: u64) -> Option<InodeAttr> {
-        self.handle_table
-            .get(fh)
-            .and_then(|open_file| open_file.open_attr())
+        let open_file = self.handle_table.get(fh)?;
+        if open_file.ino >= super::FIRST_IGNORED_INO {
+            let ignored = self.visible_ignored_entry_snapshot(open_file.ino).ok()?;
+            self.enforce_access(open_file.ino, AccessLevel::ReadOnly)
+                .ok()?;
+            return Some(ignored.attr);
+        }
+        open_file.open_attr()
     }
 
     /// Get the number of open handles for an inode.
@@ -1768,19 +1855,11 @@ impl StudioVfs {
         let mut drain_after_write = false;
         let result = async {
             self.enforce_write_access_for_handle(fh, ino)?;
+            if ino >= super::FIRST_IGNORED_INO {
+                return self.write_ignored_entry(ino, offset, data.len());
+            }
             if data.is_empty() {
                 return Ok(0);
-            }
-            if self.ignored_entry_attr(ino).is_some() {
-                let size = offset.saturating_add(data.len() as u64);
-                let _ = self.update_ignored_entry(ino, |attr| {
-                    if size > attr.size {
-                        attr.size = size;
-                        attr.committed_size = size;
-                    }
-                    attr.touch_mtime();
-                });
-                return Ok(data.len() as u32);
             }
             self.note_vfs_write_call(data.len());
 
@@ -2010,19 +2089,11 @@ impl StudioVfs {
         // ── Buffer phase (fast: ~0.1 ms) ────────────────────────────────
         let result = async {
             self.enforce_write_access_for_handle(fh, ino)?;
+            if ino >= super::FIRST_IGNORED_INO {
+                return self.write_ignored_entry(ino, offset, data.len());
+            }
             if data.is_empty() {
                 return Ok(0);
-            }
-            if self.ignored_entry_attr(ino).is_some() {
-                let size = offset.saturating_add(data.len() as u64);
-                let _ = self.update_ignored_entry(ino, |attr| {
-                    if size > attr.size {
-                        attr.size = size;
-                        attr.committed_size = size;
-                    }
-                    attr.touch_mtime();
-                });
-                return Ok(data.len() as u32);
             }
             self.note_vfs_write_call(data.len());
 

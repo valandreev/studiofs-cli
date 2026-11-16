@@ -198,6 +198,9 @@ impl BootstrapCheckpointDescriptor {
 #[derive(Debug, Clone, thiserror::Error)]
 /// Common metadata-layer error surface shared by all engine backends.
 pub enum MetaError {
+    /// A namespace target changed while a staged operation was in progress.
+    #[error("target changed during operation")]
+    TargetChanged,
     /// The requested inode does not exist in metadata.
     #[error("inode not found: {0}")]
     InodeNotFound(Ino),
@@ -373,7 +376,7 @@ pub enum MetaError {
 
     /// A persisted local or PostgreSQL metadata format is unsupported by this binary.
     #[error(
-        "unsupported metadata/PG sync format version: found {found}, expected {expected}; use a matching StudioFS binary. If the stored state is older than this binary, recreate the incompatible metadata or volume, then run `studiofs discover` for a fresh client"
+        "unsupported metadata/PG sync format version: found {found}, expected {expected}; use a matching StudioFS binary. For format 5 to 6, stop mounts and janitors and run `studiofs upgrade NAME` on each cache; preserve accepted local data and never reinitialize it"
     )]
     UnsupportedFormatVersion {
         /// Version stored in local or PostgreSQL metadata.
@@ -1193,6 +1196,25 @@ pub struct DeferredDeleteRecord {
     pub created_at: i64,
 }
 
+/// Result of the last-handle (or restart) finalization of an open-unlinked inode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrphanInodeFinalization {
+    /// The graph and inode were removed in one transaction and the freed
+    /// objects queued for deletion.
+    Removed {
+        /// Unique object ids that left the local graph.
+        removed_ids: Vec<u64>,
+        /// Bytes subtracted from the used-space counter.
+        freed_bytes: u64,
+    },
+    /// A current binding (`nlink > 0`) owns the inode again, for example after
+    /// a losing retained child purge was reconciled; nothing was deleted.
+    Live,
+    /// The unlink is a retained child purge that shared authority has not
+    /// acknowledged yet; it may still lose, so nothing was deleted.
+    Deferred,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 /// Crash-recovery record for a namespace create that may need replay or cleanup.
 pub struct PendingCreateRecord {
@@ -1913,6 +1935,15 @@ pub trait MetaRecovery: Send + Sync {
 
     /// List deferred delete records pending replay/recovery.
     fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>>;
+
+    /// Atomically finalize an orphaned (open-unlinked) inode against its
+    /// current bindings: remove its graph and attributes only when it still has
+    /// no link and no unacknowledged retained child purge can revive it.
+    fn finalize_orphan_inode(
+        &self,
+        ino: Ino,
+        deletion_timestamp: i64,
+    ) -> MetaResult<OrphanInodeFinalization>;
 }
 
 /// Capability trait for symlink target storage.
@@ -1982,6 +2013,10 @@ pub trait MetaReplication: Send + Sync {
 
     /// Release a previously recorded VFS-local open handle.
     fn note_inactive_open_inode(&self, ino: Ino);
+
+    /// Record that any VFS handle, read-only included, opened (`true`) or
+    /// released (`false`) `ino`. Retained purge settlement defers while one is open.
+    fn note_open_handle(&self, _ino: Ino, _open: bool) {}
 
     /// Force metadata synchronization from the periodic invalidation fallback poll.
     fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()>;
@@ -2087,6 +2122,11 @@ pub trait MetaEngine:
     + MetaReplication
     + crate::snapshot_ports::UploadedFragmentLedger
 {
+    /// Local retained-store capability, absent for engines without this lifecycle.
+    fn retained_store(&self) -> Option<&dyn crate::trash::MetaRetainedStore> {
+        None
+    }
+
     /// Returns the PostgreSQL-backed Snapshot v2 job store when this engine
     /// owns one, or `None` for local-only metadata engines.
     fn snapshot_job_store(&self) -> Option<Arc<dyn crate::snapshot_ports::SnapshotJobStore>> {

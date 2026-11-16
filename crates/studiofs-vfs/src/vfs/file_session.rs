@@ -412,10 +412,12 @@ pub(super) enum FileSessionOperation {
     Finalize,
     /// Delete operation.
     Delete,
+    /// Retained-restore commit: fences and moves the source out of its namespace.
+    Restore,
 }
 
 impl FileSessionOperation {
-    const COUNT: usize = 9;
+    const COUNT: usize = 10;
 
     fn as_str(self) -> &'static str {
         match self {
@@ -428,6 +430,7 @@ impl FileSessionOperation {
             Self::Upload => "upload",
             Self::Finalize => "finalize",
             Self::Delete => "delete",
+            Self::Restore => "restore",
         }
     }
 
@@ -438,7 +441,7 @@ impl FileSessionOperation {
     fn blocks_materialize(self) -> bool {
         matches!(
             self,
-            Self::Flush | Self::Fsync | Self::Release | Self::Upload | Self::Delete
+            Self::Flush | Self::Fsync | Self::Release | Self::Upload | Self::Delete | Self::Restore
         )
     }
 
@@ -453,6 +456,7 @@ impl FileSessionOperation {
             Self::Upload => 6,
             Self::Finalize => 7,
             Self::Delete => 8,
+            Self::Restore => 9,
         }
     }
 
@@ -467,6 +471,7 @@ impl FileSessionOperation {
             6 => Some(Self::Upload),
             7 => Some(Self::Finalize),
             8 => Some(Self::Delete),
+            9 => Some(Self::Restore),
             _ => None,
         }
     }

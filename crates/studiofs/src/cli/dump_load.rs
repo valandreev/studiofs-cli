@@ -122,6 +122,11 @@ pub enum DumpLoadError {
         .tables.join(", ")
     )]
     TargetHasAccountingState { tables: Vec<&'static str> },
+    #[error(
+        "cannot load metadata over existing trash authority state ({}); a replacement would drop terminal receipts that delayed clients rely on, so load into a new, empty metadata database",
+        .tables.join(", ")
+    )]
+    TargetHasTrashAuthorityState { tables: Vec<&'static str> },
     #[error("write dump output '{}': {source:#}", .path.display())]
     WriteOutput {
         path: PathBuf,
@@ -150,6 +155,11 @@ const ACCOUNTING_TABLES: [&str; 8] = [
     "snapshot_payload_gc_candidates",
     "snapshot_payload_sweep_checkpoints",
 ];
+
+/// Shared receipt authority and exact-retry receipts. Load rebuilds the
+/// authority from the dump; stale rows could contradict it or turn a new
+/// publication into a skipped "retry".
+const TRASH_AUTHORITY_TABLES: [&str; 2] = ["trash_entry_authority", "trash_publication_receipts"];
 
 type DumpLoadResult<T> = std::result::Result<T, DumpLoadError>;
 
@@ -451,6 +461,14 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                 });
             }
 
+            let trash_tables =
+                tables_with_volume_rows(&tx, target_vol, &TRASH_AUTHORITY_TABLES).await?;
+            if !trash_tables.is_empty() {
+                return Err(DumpLoadError::TargetHasTrashAuthorityState {
+                    tables: trash_tables,
+                });
+            }
+
             // The volume row lock blocks new FK-backed rows, so the guarded
             // snapshot and accounting tables stay empty until commit.
             tx.execute("DELETE FROM counters WHERE vol = $1", &[&target_vol])
@@ -516,6 +534,26 @@ fn apply_dump(postgres_address: &str, dump: &MetadataDump) -> DumpLoadResult<i64
                     )
                 })?;
             }
+
+            let events = dump
+                .event_log
+                .iter()
+                .map(|event| {
+                    (
+                        event.batch_version,
+                        event.event_type.as_str(),
+                        event.event_payload.as_slice(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            studiofs_meta::pg_engine::seed_retained_authority(
+                &tx,
+                target_vol,
+                &dump.metadata_state_snapshot,
+                dump.metadata_state_checkpoint_version,
+                &events,
+            )
+            .await?;
 
             tx.commit()
                 .await
@@ -761,7 +799,8 @@ mod tests {
     }
 
     fn test_dump() -> MetadataDump {
-        let snapshot = vec![1, 2, 3];
+        // An empty serving checkpoint: six empty postcard sequences.
+        let snapshot = vec![0; 6];
         MetadataDump {
             dump_version: 4,
             volume: DumpVolume {
@@ -770,7 +809,7 @@ mod tests {
                 uuid: "test".to_string(),
                 block_size: 4096,
             },
-            metadata_state_format_version: 5,
+            metadata_state_format_version: 6,
             metadata_state_version: 1,
             metadata_state_checkpoint_version: 1,
             metadata_state_snapshot: snapshot.clone(),
@@ -875,8 +914,16 @@ mod tests {
     fn test_event(batch_version: i64) -> DumpEvent {
         DumpEvent {
             batch_version,
-            event_type: "test".to_string(),
-            event_payload: vec![1, 2, 3],
+            event_type: "set_xattr".to_string(),
+            event_payload: studiofs_meta::events::encode_event(
+                &studiofs_meta::MetaEvent::SetXattr {
+                    ino: 1,
+                    name: b"user.test".to_vec(),
+                    value: vec![1, 2, 3],
+                    flags: 0,
+                },
+            )
+            .unwrap(),
             client_id: None,
             client_timestamp: None,
         }
@@ -906,7 +953,7 @@ mod tests {
             err,
             DumpLoadError::Meta(MetaError::UnsupportedFormatVersion {
                 found: 4,
-                expected: 5
+                expected: 6
             })
         ));
     }
@@ -1133,6 +1180,18 @@ mod tests {
             .find_map(|(key, value)| (key == "STUDIOFS_TEST_PG_DSN").then_some(value))
     }
 
+    /// Serializes this module's PostgreSQL tests. The tail test holds a
+    /// table-wide `counters` lock while its loader waits on the process-wide
+    /// `runtime_bridge` runtime mutex; a concurrent `apply_dump` holding that
+    /// mutex and blocked on `counters` deadlocks the pair until the timeout.
+    static PG_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn pg_test_serial() -> std::sync::MutexGuard<'static, ()> {
+        PG_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     // Keep this guard in the synchronous test scope; Drop calls `Runtime::block_on`.
     struct PgTestVolumeCleanup<'a> {
         runtime: &'a tokio::runtime::Runtime,
@@ -1179,6 +1238,7 @@ mod tests {
     fn dump_snapshot_preserves_tail_pruned_after_metadata_read() {
         use std::time::Duration;
 
+        let _serial = pg_test_serial();
         let runtime = tokio::runtime::Runtime::new().expect("build PostgreSQL test runtime");
 
         let raw_dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
@@ -1301,5 +1361,217 @@ mod tests {
             assert_eq!(captured.event_log.len(), 1);
             assert_eq!(captured.event_log[0].batch_version, 101);
         });
+    }
+
+    #[test]
+    #[ignore = "requires the PostgreSQL test database"]
+    fn load_seeds_trash_authority_and_rejects_existing_trash_rows() {
+        use studiofs_meta::schema::ROOT_INO;
+        use studiofs_meta::trash::{MetaVolumeSettings, RetainedEntry, VolumeSettings};
+        use studiofs_meta::{MetaFormat, MetaFsOps, MetaInodes, RedbMetaEngine};
+
+        let _serial = pg_test_serial();
+        let runtime = tokio::runtime::Runtime::new().expect("build PostgreSQL test runtime");
+        let raw_dsn = test_pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+        let metadata_dsn = runtime
+            .block_on(ensure_studiofs_database(&raw_dsn))
+            .expect("resolve PostgreSQL test database")
+            .metadata_dsn;
+
+        // Source state: a still-retained receipt and a restored (terminal) one
+        // in the checkpoint, plus a receipt admitted in the post-checkpoint tail.
+        let temp = studiofs_test_support::workspace_target_tempdir("load-trash-");
+        let source = RedbMetaEngine::open(temp.path().join("source")).unwrap();
+        source.init_root(0, 0).unwrap();
+        source
+            .set_format_info(&decode_format_info(&test_dump().metadata_state_format_info).unwrap())
+            .unwrap();
+        // Settle the TTL into base so the serving checkpoint carries it.
+        let checkpoint_settings = source.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        source
+            .apply_replica_events_to_base(&[studiofs_meta::MetaEvent::SetVolumeSettings {
+                settings: checkpoint_settings,
+            }])
+            .unwrap();
+        let store = source
+            .create_dir(ROOT_INO, b"private", 0, 0, 0o700)
+            .unwrap();
+        let mut receipts = Vec::new();
+        for name in [&b"kept"[..], b"done", b"tail"] {
+            source.create_dir(ROOT_INO, name, 0, 0, 0o700).unwrap();
+        }
+        for name in [&b"kept"[..], b"done"] {
+            let receipt = source.next_inode().unwrap();
+            source
+                .retain_namespace_entry(ROOT_INO, name, store.ino, receipt)
+                .unwrap();
+            receipts.push(receipt);
+        }
+        source
+            .create_dir(receipts[1], b"stage", 0, 0, 0o700)
+            .unwrap();
+        let data = studiofs_meta::MetaNamespace::lookup(&source, receipts[1], b"data").unwrap();
+        let data_attr = source.get_attr(data.ino).unwrap();
+        let fence = studiofs_meta::trash::RetainedSourceFence {
+            ino: data.ino,
+            ctime: data_attr.ctime,
+            size: data_attr.size,
+            content_epoch: data_attr.content_epoch,
+        };
+        source
+            .restore_retained_entry(receipts[1], ROOT_INO, b"restored", b"stage", &[fence])
+            .unwrap();
+        let snapshot = source.export_serving_checkpoint_bytes().unwrap();
+        let tail_start = source
+            .get_counter(studiofs_meta::schema::counters::NEXT_EVENT_SEQ)
+            .unwrap();
+        let tail_receipt = source.next_inode().unwrap();
+        source
+            .retain_namespace_entry(ROOT_INO, b"tail", store.ino, tail_receipt)
+            .unwrap();
+        receipts.push(tail_receipt);
+        let tail = source.read_events_range(tail_start, u64::MAX).unwrap();
+        assert!(!tail.is_empty());
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut dump = test_dump();
+        dump.volume.name = format!("sfs-1054-load-{id}");
+        dump.volume.uuid = id;
+        let mut format_info = decode_format_info(&dump.metadata_state_format_info).unwrap();
+        format_info.metadata.backend = studiofs_meta::MetadataBackend::Postgres;
+        format_info.metadata.postgres = Some(studiofs_meta::PostgresConfig {
+            url: "test-postgres-dsn".to_string(),
+            volume_id: 1,
+        });
+        dump.metadata_state_format_info = serde_json::to_vec(&format_info).unwrap();
+        dump.metadata_state_checkpoint_version = 1;
+        dump.metadata_state_version = 2;
+        dump.metadata_state_checkpoint_sha256 = Sha256::digest(&snapshot).to_vec();
+        dump.metadata_state_snapshot = snapshot;
+        dump.event_log = tail
+            .iter()
+            .map(|event| DumpEvent {
+                batch_version: 2,
+                event_type: event.kind().to_string(),
+                event_payload: studiofs_meta::events::encode_event(event).unwrap(),
+                client_id: None,
+                client_timestamp: None,
+            })
+            .collect();
+        validate_dump(&dump).expect("synthetic dump is valid");
+
+        let volume_id = apply_dump(&metadata_dsn, &dump).expect("load dump");
+        let _cleanup = PgTestVolumeCleanup {
+            runtime: &runtime,
+            metadata_dsn: metadata_dsn.clone(),
+            volume_id,
+            connection_tasks: Vec::new(),
+            loader: None,
+        };
+        let stored_settings = |volume_id: i64| {
+            runtime.block_on(async {
+                let (client, connection) = connect_studiofs_postgres(&metadata_dsn).await.unwrap();
+                let task = tokio::spawn(connection);
+                let bytes: Option<Vec<u8>> = client
+                    .query_one(
+                        "SELECT volume_settings FROM metadata_state WHERE vol = $1",
+                        &[&volume_id],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                task.abort();
+                bytes.map(|bytes| serde_json::from_slice::<VolumeSettings>(&bytes).unwrap())
+            })
+        };
+        assert_eq!(
+            stored_settings(volume_id),
+            Some(checkpoint_settings),
+            "load must seed the trash-days CAS row from the checkpoint"
+        );
+        let seeded = runtime.block_on(async {
+            let (client, connection) = connect_studiofs_postgres(&metadata_dsn).await.unwrap();
+            let task = tokio::spawn(connection);
+            let rows = client
+                .query(
+                    "SELECT receipt, record FROM trash_entry_authority WHERE vol = $1 ORDER BY receipt",
+                    &[&volume_id],
+                )
+                .await
+                .unwrap();
+            task.abort();
+            rows.iter()
+                .map(|row| {
+                    let record: RetainedEntry =
+                        serde_json::from_slice(&row.get::<_, Vec<u8>>(1)).unwrap();
+                    (row.get::<_, i64>(0) as u64, record)
+                })
+                .collect::<Vec<_>>()
+        });
+        let expected = receipts
+            .iter()
+            .map(|receipt| (*receipt, source.retained_entry(*receipt).unwrap().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(seeded, expected, "load must seed the receipt authority");
+
+        // Reloading would replace the projection and its terminal tombstones.
+        let error = apply_dump(&metadata_dsn, &dump).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                DumpLoadError::TargetHasTrashAuthorityState { tables }
+                    if tables == &vec!["trash_entry_authority"]
+            ),
+            "{error}"
+        );
+
+        // A tag-19 tail disabling trash supersedes the checkpoint and keeps
+        // the last positive TTL; the shared CAS continues from its revision.
+        let disabled = source
+            .compare_and_set_trash_days(checkpoint_settings.revision, 0)
+            .unwrap()
+            .unwrap();
+        let disable_event = studiofs_meta::MetaEvent::SetVolumeSettings { settings: disabled };
+        let id = uuid::Uuid::new_v4().to_string();
+        dump.volume.name = format!("sfs-1054-load-{id}");
+        dump.volume.uuid = id;
+        dump.metadata_state_version = 3;
+        dump.event_log.push(DumpEvent {
+            batch_version: 3,
+            event_type: disable_event.kind().to_string(),
+            event_payload: studiofs_meta::events::encode_event(&disable_event).unwrap(),
+            client_id: None,
+            client_timestamp: None,
+        });
+        validate_dump(&dump).expect("synthetic dump with settings tail is valid");
+        let tail_volume_id = apply_dump(&metadata_dsn, &dump).expect("load dump with settings");
+        let _tail_cleanup = PgTestVolumeCleanup {
+            runtime: &runtime,
+            metadata_dsn: metadata_dsn.clone(),
+            volume_id: tail_volume_id,
+            connection_tasks: Vec::new(),
+            loader: None,
+        };
+        assert_eq!(stored_settings(tail_volume_id), Some(disabled));
+        assert_eq!(disabled.trash.existing_entry_days(), 7);
+        let next = runtime.block_on(async {
+            let (mut client, connection) = connect_studiofs_postgres(&metadata_dsn).await.unwrap();
+            let task = tokio::spawn(connection);
+            let next = studiofs_meta::pg_engine::set_shared_trash_days(
+                &mut client,
+                tail_volume_id,
+                Some(disabled.revision),
+                3,
+                "load-test",
+                0,
+            )
+            .await
+            .unwrap();
+            task.abort();
+            next
+        });
+        let next = next.expect("CAS from the loaded revision is not stale");
+        assert_eq!(next.revision, disabled.revision + 1);
+        assert_eq!(next.trash.days(), 3);
     }
 }

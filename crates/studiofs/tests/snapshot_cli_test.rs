@@ -167,6 +167,217 @@ fn create_local_volume_metadata(
 }
 
 #[test]
+#[ignore = "requires PostgreSQL test service; isolated command upgrade, no S3"]
+fn upgrade_cli_restarts_after_shared_success_and_preserves_local_journal() {
+    use studiofs_meta::{MetaFsOps, MetaInodes};
+    let raw_dsn = configured_test_pg_dsn().expect("configured PostgreSQL test service");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let dsn = runtime
+        .block_on(ensure_studiofs_database(&raw_dsn))
+        .unwrap()
+        .metadata_dsn;
+    let (client, connection) = runtime
+        .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
+        .unwrap();
+    let connection_task = runtime.spawn(connection);
+    runtime
+        .block_on(studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema(
+            &client,
+        ))
+        .unwrap();
+    let name = format!("upgrade-cli-{}", Uuid::new_v4().simple());
+    let _cleanup = PgVolumeCleanup {
+        dsn: dsn.clone(),
+        names: vec![name.clone()],
+    };
+    let (id, uuid) = runtime.block_on(insert_pg_volume(&client, &name));
+    let root = studiofs_test_support::workspace_target_tempdir("upgrade-cli-");
+    let (checkpoint, bytes) = create_local_volume_metadata(root.path(), &name, &dsn, id, &uuid);
+    runtime.block_on(seed_pg_metadata_state(&client, id, &checkpoint, &bytes));
+    let mut legacy: FormatInfo = serde_json::from_slice(&bytes).unwrap();
+    legacy.format_version = 5;
+    let bytes = serde_json::to_vec(&legacy).unwrap();
+    runtime
+        .block_on(client.execute(
+            "UPDATE metadata_state SET metadata_format_version=5,format_info=$2 WHERE vol=$1",
+            &[&id, &bytes],
+        ))
+        .unwrap();
+    let path = root
+        .path()
+        .join("meta")
+        .join(&name)
+        .join(format!("{name}.db"));
+    let local = RedbMetaEngine::open(&path).unwrap();
+    local.set_format_info(&legacy).unwrap();
+    let attr = local
+        .create_file(1, b"accepted-offline", 0, 0, 0o600)
+        .unwrap();
+    let journal = local.read_events_range(0, u64::MAX).unwrap();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_studiofs"))
+            .args(["upgrade", &name])
+            .env("STUDIOFS_CLIENT_ROOT", root.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    assert!(
+        !run().status.success(),
+        "an existing redb owner must refuse upgrade"
+    );
+    assert_eq!(
+        runtime
+            .block_on(client.query_one(
+                "SELECT metadata_format_version FROM metadata_state WHERE vol=$1",
+                &[&id]
+            ))
+            .unwrap()
+            .get::<_, i16>(0),
+        5
+    );
+    // Force server-success/local-completion-failure without a production fault hook.
+    let mut mismatched = legacy.clone();
+    mismatched.region = "local-identity-mismatch".into();
+    local.set_format_info(&mismatched).unwrap();
+    drop(local);
+    let failed = run();
+    assert!(!failed.status.success());
+    assert!(
+        output_text(&failed).contains("Shared format is upgraded"),
+        "{}",
+        output_text(&failed)
+    );
+    assert!(!output_text(&failed).contains(&dsn));
+    assert_eq!(
+        runtime
+            .block_on(client.query_one(
+                "SELECT metadata_format_version FROM metadata_state WHERE vol=$1",
+                &[&id]
+            ))
+            .unwrap()
+            .get::<_, i16>(0),
+        6
+    );
+    assert!(
+        RedbMetaEngine::open(&path).is_err(),
+        "normal mount opening must remain fenced"
+    );
+    let local = RedbMetaEngine::open_for_format_upgrade(&path).unwrap();
+    assert_eq!(local.format_info_for_upgrade().unwrap().format_version, 5);
+    assert_eq!(local.read_events_range(0, u64::MAX).unwrap(), journal);
+    local.set_format_info(&legacy).unwrap();
+    drop(local);
+    for _ in 0..2 {
+        let output = run();
+        assert!(output.status.success(), "{}", output_text(&output));
+    }
+    let local = RedbMetaEngine::open(&path).unwrap();
+    assert_eq!(local.get_format_info().unwrap().format_version, 6);
+    assert_eq!(local.get_attr(attr.ino).unwrap(), attr);
+    assert_eq!(local.read_events_range(0, u64::MAX).unwrap(), journal);
+    drop(local);
+    drop(client);
+    let _ = runtime.block_on(connection_task);
+}
+
+#[test]
+#[ignore = "requires PostgreSQL test service; isolated trash-days command, no S3"]
+fn trash_days_cli_updates_shared_setting_and_client_converges() {
+    let raw_dsn = configured_test_pg_dsn().expect("configured PostgreSQL test service");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let dsn = runtime
+        .block_on(ensure_studiofs_database(&raw_dsn))
+        .unwrap()
+        .metadata_dsn;
+    let (client, connection) = runtime
+        .block_on(tokio_postgres::connect(&dsn, tokio_postgres::NoTls))
+        .unwrap();
+    let connection_task = runtime.spawn(connection);
+    runtime
+        .block_on(studiofs_meta::pg_engine::schema::ensure_studiofs_pg_schema(
+            &client,
+        ))
+        .unwrap();
+    let name = format!("trash-days-cli-{}", Uuid::new_v4().simple());
+    let _cleanup = PgVolumeCleanup {
+        dsn: dsn.clone(),
+        names: vec![name.clone()],
+    };
+    let (id, uuid) = runtime.block_on(insert_pg_volume(&client, &name));
+    let root = studiofs_test_support::workspace_target_tempdir("trash-days-cli-");
+    let (checkpoint, bytes) = create_local_volume_metadata(root.path(), &name, &dsn, id, &uuid);
+    runtime.block_on(seed_pg_metadata_state(&client, id, &checkpoint, &bytes));
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_studiofs"))
+            .arg("trash-days")
+            .arg(&name)
+            .args(args)
+            .env("STUDIOFS_CLIENT_ROOT", root.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let shared_revision = || {
+        let bytes: Option<Vec<u8>> = runtime
+            .block_on(client.query_one(
+                "SELECT volume_settings FROM metadata_state WHERE vol=$1",
+                &[&id],
+            ))
+            .unwrap()
+            .get(0);
+        bytes.map(|bytes| {
+            serde_json::from_slice::<studiofs_meta::trash::VolumeSettings>(&bytes).unwrap()
+        })
+    };
+
+    let shown = run(&[]);
+    assert!(shown.status.success(), "{}", output_text(&shown));
+    assert!(output_text(&shown).contains("trash is disabled (0 days)"));
+    for invalid in ["1.5", "4294967296", "-1"] {
+        assert!(!run(&[invalid]).status.success(), "{invalid} must fail");
+    }
+    assert_eq!(shared_revision(), None, "invalid input must not write");
+
+    let enabled = run(&["7"]);
+    assert!(enabled.status.success(), "{}", output_text(&enabled));
+    assert!(output_text(&enabled).contains("for 7 day(s)"));
+    let disabled = run(&["0"]);
+    assert!(disabled.status.success(), "{}", output_text(&disabled));
+    assert!(
+        output_text(&disabled).contains("existing entries still expire after 7 day(s)"),
+        "{}",
+        output_text(&disabled)
+    );
+    assert!(!output_text(&disabled).contains(&dsn));
+    let shared = shared_revision().unwrap();
+    assert_eq!(shared.revision, 2);
+    assert!(!shared.trash.enabled());
+    assert_eq!(shared.trash.existing_entry_days(), 7);
+
+    // A real client replays the two ordered tag-19 events into its local view.
+    let path = root
+        .path()
+        .join("meta")
+        .join(&name)
+        .join(format!("{name}.db"));
+    let engine = studiofs_meta::open_meta_engine_with_options(
+        &path,
+        studiofs_meta::MetaOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    engine.sync_metadata().unwrap();
+    let local = engine.retained_store().unwrap().volume_settings().unwrap();
+    assert_eq!(local, shared);
+    drop(engine);
+    drop(client);
+    let _ = runtime.block_on(connection_task);
+}
+
+#[test]
 #[ignore = "requires PostgreSQL test service via STUDIOFS_TEST_PG_DSN; does not use S3"]
 fn snapshot_cli_scopes_catalog_and_policy_to_the_named_volume() {
     let raw_dsn = configured_test_pg_dsn()

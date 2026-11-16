@@ -121,7 +121,7 @@ First, make sure you are looking at the mounted drive, the correct volume, and t
 
 Ask the author exactly where they saved the file and whether synchronization finished. Check whether it was renamed or moved. Compare client versions and ask the administrator to confirm the volume identity: the same local name on two computers does not, by itself, prove they are connected to one shared drive.
 
-If you suspect deletion or a conflict, stop making changes in that folder and preserve any available independent copies. Do not run `init` again, restore over the current volume, or start bulk copying without understanding the cause. Check backups with the administrator. StudioFS has no universal trash bin that will bring everything back with one click.
+If you suspect deletion or a conflict, stop making changes in that folder and preserve any available independent copies. Do not run `init` again, restore over the current volume, or start bulk copying without understanding the cause. Check backups with the administrator. If the volume's trash is enabled, check it for items moved there with Move to Trash; other deletions cannot be brought back from it (see chapter 23).
 
 ## When you need help
 

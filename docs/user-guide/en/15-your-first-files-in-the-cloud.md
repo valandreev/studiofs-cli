@@ -61,7 +61,7 @@ An application can write again after that confirmation. Before shutting down you
 
 Once you have checked reading, editing, and renaming, delete `hello-again.txt` from `notes`. Check that it is gone, then delete the empty `notes` and `first-test` folders. Look at the name and path once more before confirming.
 
-**Do not count on the system Recycle Bin or Trash.** Deletion on a mounted volume may be permanent, and the change propagates to the shared file space. That is why we practiced in a separate folder and kept the original text on the local drive. We will discuss deletion in more detail in chapter 23.
+**Do not count on the system Recycle Bin or Trash.** The StudioFS trash is off unless an administrator enables it for the volume, so deletion on a mounted volume may be permanent, and the change propagates to the shared file space. That is why we practiced in a separate folder and kept the original text on the local drive. We will discuss deletion in more detail in chapter 23.
 
 ---
 

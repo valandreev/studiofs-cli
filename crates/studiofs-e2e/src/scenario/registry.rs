@@ -52,6 +52,11 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             RandomWritePacking.definition(),
             MacosMmapExec.definition(),
             PosixAclXattrRejection.definition(),
+            RecoverableTrash.definition(),
+            RecoverableTrashDurability::OfflineCrashReplay.definition(),
+            RecoverableTrashDurability::S3OutageCrashReplay.definition(),
+            RecoverableTrashDurability::ColdBootstrap.definition(),
+            RecoverableTrashJanitor.definition(),
         ]
     })
 }
@@ -59,6 +64,17 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
 /// Resolves a scenario name to a concrete scenario implementation.
 pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
     match name {
+        "mounted-recoverable-trash-two-client" => Some(Box::new(RecoverableTrash)),
+        "mounted-recoverable-trash-durability" => {
+            Some(Box::new(RecoverableTrashDurability::OfflineCrashReplay))
+        }
+        "mounted-recoverable-trash-s3-crash-replay" => {
+            Some(Box::new(RecoverableTrashDurability::S3OutageCrashReplay))
+        }
+        "mounted-recoverable-trash-cold-bootstrap" => {
+            Some(Box::new(RecoverableTrashDurability::ColdBootstrap))
+        }
+        "mounted-recoverable-trash-janitor-gc" => Some(Box::new(RecoverableTrashJanitor)),
         "mounted-random-write-packing" => Some(Box::new(RandomWritePacking)),
         "mounted-macos-mmap-exec" => Some(Box::new(MacosMmapExec)),
         "mounted-posix-acl-xattr-rejection" => Some(Box::new(PosixAclXattrRejection)),

@@ -30,7 +30,7 @@ pub(super) const INIT_SCHEMA_ADVISORY_LOCK: i64 = 902_202_603;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-async fn with_postgres_client<T, F, Fut>(dsn: &str, f: F) -> anyhow::Result<T>
+pub(super) async fn with_postgres_client<T, F, Fut>(dsn: &str, f: F) -> anyhow::Result<T>
 where
     F: FnOnce(tokio_postgres::Client) -> Fut,
     Fut: Future<Output = anyhow::Result<T>>,
@@ -83,6 +83,7 @@ struct InitRunRequest {
     postgres_dsn: String,
     deprecated_metadata: DeprecatedMetadataArgs,
     meta_dir: PathBuf,
+    trash_days: u32,
 }
 
 impl InitRunRequest {
@@ -119,6 +120,7 @@ impl InitRunRequest {
                 region: args.metadata_region,
             },
             meta_dir,
+            trash_days: args.trash_days,
         })
     }
 }
@@ -210,6 +212,11 @@ pub(crate) struct InitArgs {
     /// Deprecated option. Metadata is PostgreSQL-only now.
     #[arg(long, hide = true)]
     metadata_region: Option<String>,
+
+    /// Whole days to keep native Move to Trash entries; 0 (default) disables
+    /// trash. Change later with `studiofs trash-days`.
+    #[arg(long, default_value_t = 0)]
+    trash_days: u32,
 }
 
 impl std::fmt::Debug for InitArgs {
@@ -499,6 +506,7 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
         postgres_dsn,
         deprecated_metadata,
         meta_dir,
+        trash_days,
     } = request;
     let rt = tokio::runtime::Runtime::new()?;
     let postgres_dsn = rt
@@ -608,6 +616,34 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
         &format_info_bytes,
     )?;
     drop(engine);
+    if trash_days > 0 {
+        // Same ordered shared path as `studiofs trash-days`; peers replay its event.
+        rt.block_on(with_postgres_client(&postgres_dsn, |mut client| async move {
+            let now_ms = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_millis(),
+            )?;
+            let client_id = format!("cli-init-{}", Uuid::new_v4());
+            studiofs_meta::pg_engine::set_shared_trash_days(
+                &mut client,
+                postgres_volume_id,
+                Some(0),
+                trash_days,
+                &client_id,
+                now_ms,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("new volume settings changed concurrently"))?;
+            Ok(())
+        }))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Volume was created with trash disabled; setting trash days failed ({error}). Retry with `studiofs trash-days {name} {trash_days}`."
+            )
+        })?;
+        println!("✓ Trash keeps native Move to Trash entries for {trash_days} day(s).");
+    }
 
     let primed_engine = open_meta_engine_with_options(
         &db_path,

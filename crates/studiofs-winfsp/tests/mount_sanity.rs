@@ -655,6 +655,47 @@ fn make_test_vfs_with_format_info(
     vfs
 }
 
+fn make_trash_enabled_test_vfs_with_format_info(
+    tmp: &tempfile::TempDir,
+    volume_suffix: &str,
+    rt: &tokio::runtime::Runtime,
+) -> (Arc<StudioVfs>, FormatInfo) {
+    use studiofs_meta::trash::MetaVolumeSettings;
+    let format_info = test_format_info(volume_suffix);
+    let db_path = tmp.path().join("meta.redb");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+    meta.init_root(0, 0).expect("init root");
+    meta.set_format_info(&format_info).expect("set format info");
+    meta.compare_and_set_trash_days(0, 7)
+        .expect("enable trash")
+        .expect("fresh revision");
+    let data_config = DataStoreConfig::from(&format_info);
+    let cache_dir = tmp.path().join("cache");
+    let _guard = rt.enter();
+    let vfs = StudioVfs::new(
+        meta,
+        &data_config,
+        cache_dir.to_str().expect("cache dir str"),
+        64 * 1024 * 1024,
+        32 * 1024 * 1024,
+        VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate"),
+    )
+    .expect("create vfs");
+    vfs.start().expect("start vfs background workers");
+    (vfs, format_info)
+}
+
+/// Same as `make_test_vfs`, with a positive trash period so Move to Trash retains.
+fn make_trash_enabled_test_vfs(
+    tmp: &tempfile::TempDir,
+    volume_suffix: &str,
+    rt: &tokio::runtime::Runtime,
+) -> Arc<StudioVfs> {
+    make_trash_enabled_test_vfs_with_format_info(tmp, volume_suffix, rt).0
+}
+
 fn signal_named_event(name: &str) {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
@@ -824,6 +865,1504 @@ fn winfsp_mount_unmount_smoke() {
     let vfs = make_test_vfs(&tmp, "mount_sanity", &rt);
     let event_name = format!("Local\\StudioFsMountSmoke-{}", std::process::id());
     with_winfsp_mount(vfs, rt, mount_point, event_name, |_| {});
+}
+
+/// Shell recycle oracle: prints volume signals, recycles `$env:F`, and counts `$I`
+/// records whose decoded original path is exactly that file (removing the pair if asked).
+const RECYCLE_PROBE_PS1: &str = r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System; using System.Runtime.InteropServices; using System.Text;
+public static class Vd {
+ [DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern uint GetDriveTypeW(string r);
+ [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool GetVolumeInformationW(string r, StringBuilder n, int ns, out uint ser, out uint mcl, out uint flags, StringBuilder fs, int fss);
+ [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern bool GetVolumeNameForVolumeMountPointW(string mp, StringBuilder v, int n);
+ public struct Rbi { public int cbSize; public long i64Size; public long i64NumItems; }
+ [DllImport("shell32.dll", CharSet=CharSet.Unicode)] public static extern int SHQueryRecycleBinW(string r, ref Rbi q);
+}
+"@
+$root = [IO.Path]::GetPathRoot($env:F)
+$n = New-Object Text.StringBuilder 261; $fs = New-Object Text.StringBuilder 261; $ser = 0; $mcl = 0; $fl = 0
+$null = [Vd]::GetVolumeInformationW($root, $n, 261, [ref]$ser, [ref]$mcl, [ref]$fl, $fs, 261)
+$g = New-Object Text.StringBuilder 100; $gok = [Vd]::GetVolumeNameForVolumeMountPointW($root, $g, 100)
+$q = New-Object Vd+Rbi; $q.cbSize = [Runtime.InteropServices.Marshal]::SizeOf($q)
+$hr = [Vd]::SHQueryRecycleBinW($root, [ref]$q)
+'drive_type={0} fs={1} fs_flags=0x{2:X8} volume_guid={3} shquery_hr=0x{4:X8}' -f [Vd]::GetDriveTypeW($root), $fs, $fl, ($gok -and $g.Length -gt 0), $hr
+$top = Join-Path $root '$Recycle.Bin'
+# Shell uses a per-SID folder on ACL volumes and the shared top folder otherwise (FAT-style).
+$bins = @((Join-Path $top ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value), $top)
+Add-Type -AssemblyName Microsoft.VisualBasic
+[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:F, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+$hits = @($bins | ForEach-Object { Get-ChildItem -LiteralPath $_ -Force -File -Filter '$I*' -ErrorAction SilentlyContinue } | Where-Object {
+  $b = [IO.File]::ReadAllBytes($_.FullName)
+  $b.Length -gt 28 -and [BitConverter]::ToInt64($b, 0) -eq 2 -and [Text.Encoding]::Unicode.GetString($b, 28, $b.Length - 28).TrimEnd([char]0) -eq $env:F -and
+    (Test-Path -LiteralPath (Join-Path $_.DirectoryName ('$R' + $_.Name.Substring(2)))) })
+$payloads = @($hits | ForEach-Object { Join-Path $_.DirectoryName ('$R' + $_.Name.Substring(2)) })
+$listed = @((New-Object -ComObject Shell.Application).NameSpace(10).Items() | Where-Object { $payloads -contains $_.Path }).Count
+'top_listing={0}' -f ((Get-ChildItem -LiteralPath $top -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ',')
+'source_exists={0} recycled_metadata={1} shell_listed={2} layout={3}' -f (Test-Path -LiteralPath $env:F), $hits.Count, $listed, (@($hits | ForEach-Object { if ($_.DirectoryName -eq $top) { 'shared' } else { 'per-sid' } }) -join ',')
+if ($env:CLEAN -eq '1') { foreach ($i in $hits) { Remove-Item -LiteralPath $i.FullName, (Join-Path $i.DirectoryName ('$R' + $i.Name.Substring(2))) -Force } }
+"#;
+
+/// Runs [`RECYCLE_PROBE_PS1`] on one self-created empty file with a 20 s bound.
+fn shell_recycle_probe(script: &std::path::Path, file: &std::path::Path, clean: bool) -> String {
+    std::fs::File::create(file).expect("create empty recycle probe file");
+    run_shell_probe_ps1(script, file, clean)
+}
+
+fn run_shell_probe_ps1(script: &std::path::Path, target: &std::path::Path, clean: bool) -> String {
+    use std::process::{Command, Stdio};
+    // Per-test step log (written only by the restore script): names the Shell call that stalled.
+    let steps_path = script.with_extension("steps.txt");
+    let mut child = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(script)
+        .env("F", target)
+        .env("CLEAN", if clean { "1" } else { "0" })
+        .env("STUDIOFS_PROBE_STEPS", &steps_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start Shell recycle probe");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while child.try_wait().expect("query Shell probe").is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("stop timed-out Shell probe");
+            child.wait().expect("join Shell probe");
+            let steps = std::fs::read_to_string(&steps_path)
+                .unwrap_or_else(|_| "<no step log>".to_string());
+            panic!("Shell recycle probe did not finish within 20 seconds; step log:\n{steps}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = child
+        .wait_with_output()
+        .expect("collect Shell probe output");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    eprintln!(
+        "shell recycle probe {}: status={} stdout={stdout} stderr={}",
+        target.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "Shell recycle probe failed");
+    stdout
+}
+
+/// Native Windows trash gate: Shell recycling of an empty file on a fresh WinFSP volume
+/// must produce a `$I` record for exactly that path, as it does on the NTFS control.
+/// Restore, Clear and Explorer UI need separate proof.
+/// Restore and Clear through Shell on owned data. Restore uses the namespace-10
+/// `undelete` verb; Clear removes only this run's own `$I`/`$R` pair.
+const RECYCLE_RESTORE_PS1: &str = r#"
+$ErrorActionPreference = "Stop"
+$log = $env:STUDIOFS_PROBE_STEPS
+function Step([string]$s) { Add-Content -LiteralPath $log -Value ((Get-Date).ToString("HH:mm:ss.fff") + " " + $s) }
+Remove-Item -LiteralPath $log -ErrorAction SilentlyContinue
+Add-Type -AssemblyName Microsoft.VisualBasic
+$root = [IO.Path]::GetPathRoot($env:F)
+$top = Join-Path $root ('$Recycle.Bin')
+Step "start"
+function Pair-For([string]$path) {
+  @(Get-ChildItem -LiteralPath $top -Force -File -Filter '$I*' -ErrorAction SilentlyContinue | Where-Object {
+    $b = [IO.File]::ReadAllBytes($_.FullName)
+    $b.Length -gt 28 -and [BitConverter]::ToInt64($b, 0) -eq 2 -and [Text.Encoding]::Unicode.GetString($b, 28, $b.Length - 28).TrimEnd([char]0) -eq $path })
+}
+[IO.File]::WriteAllText($env:F, 'restore-me')
+Step "written"
+[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:F, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+$hit = Pair-For $env:F
+Step "pair_found=$($hit.Count)"
+$payload = Join-Path $top ('$R' + $hit[0].Name.Substring(2))
+'view_bytes_ok={0}' -f ([Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($payload)) -eq 'restore-me')
+$ns = (New-Object -ComObject Shell.Application).NameSpace(10)
+Step "shell_namespace"
+$item = $ns.Items() | Where-Object { $_.Path -eq $payload } | Select-Object -First 1
+Step "invoke_undelete item_found=$($null -ne $item)"
+$item.InvokeVerb('undelete')
+Step "invoked"
+$deadline = (Get-Date).AddSeconds(15)
+while (-not (Test-Path -LiteralPath $env:F) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+$restored = Test-Path -LiteralPath $env:F
+Step "waited restored=$restored"
+$content_ok = $restored -and ([IO.File]::ReadAllText($env:F) -eq 'restore-me')
+'restored_exists={0} content_ok={1} pairs_after_restore={2}' -f $restored, $content_ok, @(Pair-For $env:F).Count
+Step "checked content_ok=$content_ok"
+[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:F, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+Step "recycled_again"
+$own = Pair-For $env:F
+foreach ($i in $own) { Remove-Item -LiteralPath $i.FullName, (Join-Path $i.DirectoryName ('$R' + $i.Name.Substring(2))) -Force -ErrorAction SilentlyContinue }
+'cleared_pairs={0}' -f @(Pair-For $env:F).Count
+Step "cleared"
+"#;
+
+/// Installs a file-backed callback trace when `STUDIOFS_WINFSP_TRACE_LOG` names a
+/// path. `STUDIOFS_WINFSP_TRACE_FILTER` narrows the levels (for example `=error` for a
+/// light trace that barely perturbs timing). Diagnostics only: the default probe run
+/// installs nothing.
+fn install_probe_trace_log() {
+    use std::sync::Mutex;
+    let Some(path) = std::env::var_os("STUDIOFS_WINFSP_TRACE_LOG") else {
+        return;
+    };
+    let filter = std::env::var("STUDIOFS_WINFSP_TRACE_FILTER").unwrap_or_else(|_| {
+        "studiofs_winfsp=debug,studiofs_vfs=debug,studiofs_winfsp::metadata_baseline=trace"
+            .to_string()
+    });
+    let file = std::fs::File::create(&path).expect("create WinFSP probe trace log");
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(Mutex::new(file))
+        .with_ansi(false)
+        .with_thread_ids(true)
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+        .finish();
+    // A second install in the same process keeps the first subscriber.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// Ignored Shell round trip on an owned mount with retention enabled.
+#[test]
+#[ignore = "requires WinFSP runtime, an explicitly selected unused drive, and an owned test volume"]
+fn winfsp_native_trash_restore_and_clear_shell_probe() {
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+    install_probe_trace_log();
+
+    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
+        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let bytes = mount_point.as_bytes();
+    assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
+    // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
+    let drives = unsafe { GetLogicalDrives() };
+    assert_eq!(drives & (1 << (bytes[0] - b'A')), 0, "drive is occupied");
+    let tmp = studiofs_test_support::workspace_target_tempdir("trash-native-restore-");
+    let script = tmp.path().join("recycle-restore.ps1");
+    std::fs::write(&script, RECYCLE_RESTORE_PS1).expect("write Shell restore probe");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_trash_enabled_test_vfs(&tmp, "trash-native-restore", &rt);
+    let observer = vfs.clone();
+    let event = format!(r"Local\StudioFsNativeRestoreProbe-{}", std::process::id());
+    with_winfsp_mount(vfs, rt, mount_point, event, |root| {
+        let file = std::path::Path::new(root).join("shell-native-restore.txt");
+        let out = shell_recycle_probe(&script, &file, false);
+        assert!(
+            out.contains("view_bytes_ok=True"),
+            "the $R view must read the retained bytes: {out}"
+        );
+        assert!(
+            out.contains("restored_exists=True content_ok=True pairs_after_restore=0"),
+            "restore output: {out}"
+        );
+        assert!(out.contains("cleared_pairs=0"), "clear output: {out}");
+        use studiofs_meta::trash::{RetainedEntryState, RetainedPurgeReason};
+        let meta = observer.meta();
+        let store_dir = meta
+            .lookup(1, b".studiofs-retained")
+            .expect("private retained store directory");
+        let store = meta.retained_store().expect("retained store");
+        let states: Vec<_> = meta
+            .readdir(store_dir.ino)
+            .expect("list retained store")
+            .into_iter()
+            .filter_map(|child| {
+                std::str::from_utf8(&child.name)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .map(|receipt| store.retained_entry(receipt).unwrap().unwrap().state)
+            .collect();
+        assert_eq!(states.len(), 2, "restore + clear receipts: {states:?}");
+        assert!(
+            states.iter().any(|s| matches!(
+                s,
+                RetainedEntryState::Restored { parent: 1, name } if name == b"shell-native-restore.txt"
+            )),
+            "expected Restored receipt: {states:?}"
+        );
+        assert!(
+            states.contains(&RetainedEntryState::PurgeRequested {
+                reason: RetainedPurgeReason::User,
+            }),
+            "expected PurgeRequested(User) receipt after clear: {states:?}"
+        );
+    });
+}
+
+const RECYCLE_DIR_RESTORE_PS1: &str = r#"
+$ErrorActionPreference = "Stop"
+$log = $env:STUDIOFS_PROBE_STEPS
+function Step([string]$s) { Add-Content -LiteralPath $log -Value ((Get-Date).ToString("HH:mm:ss.fff") + " " + $s) }
+Remove-Item -LiteralPath $log -ErrorAction SilentlyContinue
+Add-Type -AssemblyName Microsoft.VisualBasic
+$root = [IO.Path]::GetPathRoot($env:F)
+$top = Join-Path $root ('$Recycle.Bin')
+Step "start"
+function Pair-For([string]$path) {
+  @(Get-ChildItem -LiteralPath $top -Force -File -Filter '$I*' -ErrorAction SilentlyContinue | Where-Object {
+    $b = [IO.File]::ReadAllBytes($_.FullName)
+    $b.Length -gt 28 -and [BitConverter]::ToInt64($b, 0) -eq 2 -and [Text.Encoding]::Unicode.GetString($b, 28, $b.Length - 28).TrimEnd([char]0) -eq $path })
+}
+$nested = Join-Path $env:F 'nested'
+New-Item -ItemType Directory -Path $nested -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $env:F 'a.txt'), 'alpha-123')
+[IO.File]::WriteAllText((Join-Path $nested 'b.txt'), 'beta-4567')
+Step "written"
+[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($env:F, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+$hit = Pair-For $env:F
+Step "pair_found=$($hit.Count)"
+$iBytes = [IO.File]::ReadAllBytes($hit[0].FullName)
+$iSize = [BitConverter]::ToInt64($iBytes, 8)
+$payload = Join-Path $top ('$R' + $hit[0].Name.Substring(2))
+$rItem = Get-Item -LiteralPath $payload -Force
+$rIsDir = $rItem.PSIsContainer
+$rChildren = @(Get-ChildItem -LiteralPath $payload -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName.Substring($payload.Length) })
+$rABytesOk = (Test-Path -LiteralPath (Join-Path $payload 'a.txt')) -and ([IO.File]::ReadAllText((Join-Path $payload 'a.txt')) -eq 'alpha-123')
+$rBBytesOk = (Test-Path -LiteralPath (Join-Path $payload 'nested\b.txt')) -and ([IO.File]::ReadAllText((Join-Path $payload 'nested\b.txt')) -eq 'beta-4567')
+'i_size={0} r_isdir={1} r_children={2} r_a_ok={3} r_b_ok={4}' -f $iSize, $rIsDir, ($rChildren -join ';'), $rABytesOk, $rBBytesOk
+$ns = (New-Object -ComObject Shell.Application).NameSpace(10)
+Step "shell_namespace"
+$item = $ns.Items() | Where-Object { $_.Path -eq $payload } | Select-Object -First 1
+Step "invoke_undelete item_found=$($null -ne $item) is_folder=$($item.IsFolder)"
+'shell_found={0} shell_isfolder={1}' -f ($null -ne $item), ($null -ne $item -and $item.IsFolder)
+$item.InvokeVerb('undelete')
+Step "invoked"
+$deadline = (Get-Date).AddSeconds(15)
+while (-not (Test-Path -LiteralPath (Join-Path $env:F 'nested\b.txt')) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+$restored = (Test-Path -LiteralPath $env:F) -and (Test-Path -LiteralPath (Join-Path $env:F 'a.txt')) -and (Test-Path -LiteralPath (Join-Path $env:F 'nested\b.txt'))
+Step "waited restored=$restored"
+$aOk = $restored -and ([IO.File]::ReadAllText((Join-Path $env:F 'a.txt')) -eq 'alpha-123')
+$bOk = $restored -and ([IO.File]::ReadAllText((Join-Path $env:F 'nested\b.txt')) -eq 'beta-4567')
+'restored_exists={0} a_ok={1} b_ok={2} pairs_after_restore={3}' -f $restored, $aOk, $bOk, @(Pair-For $env:F).Count
+Step "checked a_ok=$aOk b_ok=$bOk"
+[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($env:F, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+Step "recycled_again"
+$own = Pair-For $env:F
+foreach ($i in $own) {
+  $r = Join-Path $i.DirectoryName ('$R' + $i.Name.Substring(2))
+  Remove-Item -LiteralPath $r -Recurse -Force
+  Remove-Item -LiteralPath $i.FullName -Force -ErrorAction SilentlyContinue
+}
+'cleared_pairs={0}' -f @(Pair-For $env:F).Count
+Step "cleared"
+"#;
+
+#[test]
+#[ignore = "requires WinFSP runtime, an explicitly selected unused drive, and an owned test volume"]
+fn winfsp_native_trash_directory_restore_and_clear_shell_probe() {
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+    install_probe_trace_log();
+
+    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
+        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let bytes = mount_point.as_bytes();
+    assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
+    // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
+    let drives = unsafe { GetLogicalDrives() };
+    assert_eq!(drives & (1 << (bytes[0] - b'A')), 0, "drive is occupied");
+    let tmp = studiofs_test_support::workspace_target_tempdir("trash-native-dir-restore-");
+    let script = tmp.path().join("recycle-dir-restore.ps1");
+    std::fs::write(&script, RECYCLE_DIR_RESTORE_PS1).expect("write Shell dir restore probe");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_trash_enabled_test_vfs(&tmp, "trash-native-dir-restore", &rt);
+    let observer = vfs.clone();
+    let event = format!(
+        r"Local\StudioFsNativeDirRestoreProbe-{}",
+        std::process::id()
+    );
+    with_winfsp_mount(vfs, rt, mount_point, event, |root| {
+        let dir = std::path::Path::new(root).join("shell-dir-restore");
+        let out = run_shell_probe_ps1(&script, &dir, false);
+        assert!(
+            out.contains("i_size=18")
+                && out.contains("r_isdir=True")
+                && out.contains("r_a_ok=True r_b_ok=True"),
+            "the $R directory view must expose directory kind, recursive size 18, and readable nested files: {out}"
+        );
+        assert!(
+            out.contains("shell_found=True shell_isfolder=True"),
+            "Shell NameSpace(10) must see recycled directory as folder: {out}"
+        );
+        assert!(
+            out.contains("restored_exists=True a_ok=True b_ok=True pairs_after_restore=0"),
+            "directory restore output: {out}"
+        );
+        assert!(out.contains("cleared_pairs=0"), "clear output: {out}");
+        use studiofs_meta::trash::{RetainedEntryState, RetainedPurgeReason};
+        let meta = observer.meta();
+        let store_dir = meta
+            .lookup(1, b".studiofs-retained")
+            .expect("private retained store directory");
+        let store = meta.retained_store().expect("retained store");
+        let states: Vec<_> = meta
+            .readdir(store_dir.ino)
+            .expect("list retained store")
+            .into_iter()
+            .filter_map(|child| {
+                std::str::from_utf8(&child.name)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .map(|receipt| store.retained_entry(receipt).unwrap().unwrap().state)
+            .collect();
+        assert_eq!(states.len(), 2, "restore + clear receipts: {states:?}");
+        assert!(
+            states.iter().any(|s| matches!(
+                s,
+                RetainedEntryState::Restored { parent: 1, name } if name == b"shell-dir-restore"
+            )),
+            "expected Restored receipt: {states:?}"
+        );
+        assert!(
+            states.contains(&RetainedEntryState::PurgeRequested {
+                reason: RetainedPurgeReason::User,
+            }),
+            "expected PurgeRequested(User) receipt after clear: {states:?}"
+        );
+    });
+}
+
+const RECYCLE_DIR_PARTIAL_CLEAR_PS1: &str = r#"
+$ErrorActionPreference = "Stop"
+$log = $env:STUDIOFS_PROBE_STEPS
+function Step([string]$s) { Add-Content -LiteralPath $log -Value ((Get-Date).ToString("HH:mm:ss.fff") + " " + $s) }
+Remove-Item -LiteralPath $log -ErrorAction SilentlyContinue
+Add-Type -AssemblyName Microsoft.VisualBasic
+$root = [IO.Path]::GetPathRoot($env:F)
+$top = Join-Path $root ('$Recycle.Bin')
+function Pair-For([string]$path) {
+  @(Get-ChildItem -LiteralPath $top -Force -File -Filter '$I*' -ErrorAction SilentlyContinue | Where-Object {
+    $b = [IO.File]::ReadAllBytes($_.FullName)
+    $b.Length -gt 28 -and [BitConverter]::ToInt64($b, 0) -eq 2 -and [Text.Encoding]::Unicode.GetString($b, 28, $b.Length - 28).TrimEnd([char]0) -eq $path })
+}
+$nested = Join-Path $env:F 'nested'
+New-Item -ItemType Directory -Path $nested -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $env:F 'a.txt'), 'alpha-123')
+[IO.File]::WriteAllText((Join-Path $nested 'b.txt'), 'beta-4567')
+[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($env:F, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+$hit = Pair-For $env:F
+Step "pair_found=$($hit.Count)"
+$payload = Join-Path $top ('$R' + $hit[0].Name.Substring(2))
+# Native recursive delete of one child subtree only; the rest of the Clear never happens.
+Remove-Item -LiteralPath (Join-Path $payload 'nested') -Recurse -Force
+Step "child_deleted"
+$iSize = [BitConverter]::ToInt64([IO.File]::ReadAllBytes($hit[0].FullName), 8)
+$nestedGone = -not (Test-Path -LiteralPath (Join-Path $payload 'nested'))
+$aOk = [IO.File]::ReadAllText((Join-Path $payload 'a.txt')) -eq 'alpha-123'
+'after_child_delete i_size={0} nested_gone={1} a_ok={2}' -f $iSize, $nestedGone, $aOk
+[IO.Directory]::Move($payload, $env:F)
+Step "restored"
+$restoredA = [IO.File]::ReadAllText((Join-Path $env:F 'a.txt')) -eq 'alpha-123'
+$restoredNestedAbsent = -not (Test-Path -LiteralPath (Join-Path $env:F 'nested'))
+'restored_a_ok={0} restored_nested_absent={1} pairs_after_restore={2}' -f $restoredA, $restoredNestedAbsent, @(Pair-For $env:F).Count
+"#;
+
+#[test]
+#[ignore = "requires WinFSP runtime, an explicitly selected unused drive, and an owned test volume"]
+fn winfsp_native_trash_directory_partial_clear_shell_probe() {
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+    install_probe_trace_log();
+
+    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
+        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let bytes = mount_point.as_bytes();
+    assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
+    // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
+    let drives = unsafe { GetLogicalDrives() };
+    assert_eq!(drives & (1 << (bytes[0] - b'A')), 0, "drive is occupied");
+    let tmp = studiofs_test_support::workspace_target_tempdir("trash-native-dir-partial-");
+    let script = tmp.path().join("recycle-dir-partial-clear.ps1");
+    std::fs::write(&script, RECYCLE_DIR_PARTIAL_CLEAR_PS1).expect("write partial Clear probe");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_trash_enabled_test_vfs(&tmp, "trash-native-dir-partial", &rt);
+    let observer = vfs.clone();
+    let event = format!(
+        r"Local\StudioFsNativeDirPartialProbe-{}",
+        std::process::id()
+    );
+    with_winfsp_mount(vfs, rt, mount_point, event, |root| {
+        let dir = std::path::Path::new(root).join("shell-dir-partial");
+        let out = run_shell_probe_ps1(&script, &dir, false);
+        assert!(
+            out.contains("after_child_delete i_size=9 nested_gone=True a_ok=True"),
+            "a completed child delete is permanent and $I reflects the surviving tree: {out}"
+        );
+        assert!(
+            out.contains("restored_a_ok=True restored_nested_absent=True pairs_after_restore=0"),
+            "the remaining tree restores with exact bytes and no deleted child: {out}"
+        );
+        use studiofs_meta::trash::RetainedEntryState;
+        let meta = observer.meta();
+        let store_dir = meta
+            .lookup(1, b".studiofs-retained")
+            .expect("private retained store directory");
+        let store = meta.retained_store().expect("retained store");
+        let states: Vec<_> = meta
+            .readdir(store_dir.ino)
+            .expect("list retained store")
+            .into_iter()
+            .filter_map(|child| {
+                std::str::from_utf8(&child.name)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .map(|receipt| store.retained_entry(receipt).unwrap().unwrap().state)
+            .collect();
+        assert!(
+            matches!(
+                states.as_slice(),
+                [RetainedEntryState::Restored { parent: 1, name }] if name == b"shell-dir-partial"
+            ),
+            "expected one Restored receipt: {states:?}"
+        );
+    });
+}
+
+const RECYCLE_DIR_COLLISION_PS1: &str = r##"
+$ErrorActionPreference = "Stop"
+$log = $env:STUDIOFS_PROBE_STEPS
+function Step([string]$s) { Add-Content -LiteralPath $log -Value ((Get-Date).ToString("HH:mm:ss.fff") + " " + $s) }
+Remove-Item -LiteralPath $log -ErrorAction SilentlyContinue
+Add-Type -AssemblyName Microsoft.VisualBasic
+Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class WinDialogProbe {
+  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int max);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool MoveFileEx(string src, string dst, uint flags);
+  public const uint WM_CLOSE = 0x0010;
+  public static List<string> ExplorerDialogs(uint childPid) {
+    var list = new List<string>();
+    var targetPids = new HashSet<uint>();
+    foreach (var p in Process.GetProcessesByName("explorer")) targetPids.Add((uint)p.Id);
+    if (childPid != 0) targetPids.Add(childPid);
+    EnumWindows((h, _) => {
+      if (!IsWindowVisible(h)) return true;
+      uint pid;
+      GetWindowThreadProcessId(h, out pid);
+      if (!targetPids.Contains(pid)) return true;
+      var cls = new StringBuilder(128);
+      GetClassName(h, cls, cls.Capacity);
+      var c = cls.ToString();
+      if (c == "#32770" || c == "OperationStatusWindow") {
+        var title = new StringBuilder(256);
+        GetWindowText(h, title, title.Capacity);
+        list.Add(h.ToInt64() + "|" + c + "|" + title.ToString());
+      }
+      return true;
+    }, IntPtr.Zero);
+    return list;
+  }
+  public static void CloseHandle(long raw) {
+    PostMessage(new IntPtr(raw), WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+  }
+}
+"@
+$root = [IO.Path]::GetPathRoot($env:F)
+$top = Join-Path $root ('$Recycle.Bin')
+Step "start"
+function Pair-For([string]$path) {
+  @(Get-ChildItem -LiteralPath $top -Force -File -Filter '$I*' -ErrorAction SilentlyContinue | Where-Object {
+    $b = [IO.File]::ReadAllBytes($_.FullName)
+    $b.Length -gt 28 -and [BitConverter]::ToInt64($b, 0) -eq 2 -and [Text.Encoding]::Unicode.GetString($b, 28, $b.Length - 28).TrimEnd([char]0) -eq $path })
+}
+[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($env:F, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+$hit = Pair-For $env:F
+Step "pair_found=$($hit.Count)"
+$payload = Join-Path $top ('$R' + $hit[0].Name.Substring(2))
+$blockerNested = Join-Path $env:F 'keep.txt'
+New-Item -ItemType Directory -Path $env:F -Force | Out-Null
+[IO.File]::WriteAllText($blockerNested, 'KEEP-COLLIDING')
+Step "blocker_written"
+$beforeDialogs = @([WinDialogProbe]::ExplorerDialogs(0))
+$env:STUDIOFS_COLLISION_PAYLOAD = $payload
+$childScript = '$ns = (New-Object -ComObject Shell.Application).NameSpace(10); $item = $ns.Items() | Where-Object { $_.Path -eq $env:STUDIOFS_COLLISION_PAYLOAD } | Select-Object -First 1; if ($null -ne $item) { $item.InvokeVerb("undelete") }'
+$encodedChild = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = 'powershell.exe'
+$psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedChild"
+$psi.UseShellExecute = $false
+$psi.CreateNoWindow = $true
+$proc = [System.Diagnostics.Process]::Start($psi)
+$promptInfo = ''
+$promptClass = 'none'
+$deadline = (Get-Date).AddSeconds(4)
+while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
+  $nowDialogs = @([WinDialogProbe]::ExplorerDialogs([uint32]$proc.Id))
+  $newDialogs = @($nowDialogs | Where-Object { $beforeDialogs -notcontains $_ })
+  if ($newDialogs.Count -gt 0) {
+    $promptInfo = $newDialogs[0]
+    $promptClass = $promptInfo.Split('|')[1]
+    foreach ($d in $newDialogs) {
+      $hwndRaw = [long]($d.Split('|')[0])
+      [WinDialogProbe]::CloseHandle($hwndRaw) | Out-Null
+    }
+    $null = $proc.WaitForExit(1500)
+    break
+  }
+  Start-Sleep -Milliseconds 50
+}
+$undeleteExited = $proc.HasExited
+if (-not $undeleteExited) {
+  try { $proc.Kill() } catch {}
+  $null = $proc.WaitForExit(1500)
+}
+Remove-Item Env:\STUDIOFS_COLLISION_PAYLOAD -ErrorAction SilentlyContinue
+$keepOk = (Test-Path -LiteralPath $blockerNested) -and ([IO.File]::ReadAllText($blockerNested) -eq 'KEEP-COLLIDING')
+$noSilentOverwrite = -not (Test-Path -LiteralPath (Join-Path $env:F 'a.txt')) -and -not (Test-Path -LiteralPath (Join-Path $env:F 'nested\b.txt'))
+$pairPreserved = (@(Pair-For $env:F).Count -eq 1) -and ([IO.File]::ReadAllText((Join-Path $payload 'a.txt')) -eq 'alpha-123') -and ([IO.File]::ReadAllText((Join-Path $payload 'nested\b.txt')) -eq 'beta-4567')
+Step "after_undelete exited=$undeleteExited prompt=$promptInfo keep=$keepOk no_overwrite=$noSilentOverwrite pair=$pairPreserved"
+
+$blocked = $env:F + '-blocked'
+New-Item -ItemType Directory -Path $blocked -Force | Out-Null
+[IO.File]::WriteAllText((Join-Path $blocked 'blocker.txt'), 'BLOCKER-KEEP')
+$blockedRenameRefused = $false
+try {
+  [IO.Directory]::Move($payload, $blocked)
+} catch {
+  $blockedRenameRefused = $true
+}
+$replaceRenameRefused = -not ([WinDialogProbe]::MoveFileEx($payload, $blocked, 1))
+$blockerIntact = ([IO.File]::ReadAllText((Join-Path $blocked 'blocker.txt')) -eq 'BLOCKER-KEEP') -and (-not (Test-Path -LiteralPath (Join-Path $blocked 'a.txt')))
+
+$alt = $env:F + '-alt'
+[IO.Directory]::Move($payload, $alt)
+$altRestoredOk = (Test-Path -LiteralPath (Join-Path $alt 'a.txt')) -and ([IO.File]::ReadAllText((Join-Path $alt 'a.txt')) -eq 'alpha-123') -and (Test-Path -LiteralPath (Join-Path $alt 'nested\b.txt')) -and ([IO.File]::ReadAllText((Join-Path $alt 'nested\b.txt')) -eq 'beta-4567')
+$pairsAfterAltRestore = @(Pair-For $env:F).Count
+Step "after_alt blocked_refused=$blockedRenameRefused replace_refused=$replaceRenameRefused blocker_intact=$blockerIntact alt_ok=$altRestoredOk pairs=$pairsAfterAltRestore"
+'undelete_exited={0} prompt_seen={1} prompt_class={2} keep_ok={3} no_silent_overwrite={4} pair_preserved={5} blocked_rename_refused={6} replace_rename_refused={7} blocker_intact={8} alt_restored_ok={9} pairs_after_alt_restore={10}' -f $undeleteExited, ($promptInfo -ne ''), $promptClass, $keepOk, $noSilentOverwrite, $pairPreserved, $blockedRenameRefused, $replaceRenameRefused, $blockerIntact, $altRestoredOk, $pairsAfterAltRestore
+"##;
+
+#[test]
+#[ignore = "requires WinFSP runtime, an explicitly selected unused drive, and an owned test volume"]
+fn winfsp_native_trash_directory_collision_shell_probe() {
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+    install_probe_trace_log();
+
+    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
+        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let bytes = mount_point.as_bytes();
+    assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
+    // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
+    let drives = unsafe { GetLogicalDrives() };
+    assert_eq!(drives & (1 << (bytes[0] - b'A')), 0, "drive is occupied");
+    let tmp = studiofs_test_support::workspace_target_tempdir("trash-native-dir-conflict-");
+    let script = tmp.path().join("recycle-dir-conflict.ps1");
+    std::fs::write(&script, RECYCLE_DIR_COLLISION_PS1).expect("write Shell dir conflict probe");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_trash_enabled_test_vfs(&tmp, "trash-native-dir-conflict", &rt);
+    let observer = vfs.clone();
+    let event = format!(
+        r"Local\StudioFsNativeDirConflictProbe-{}",
+        std::process::id()
+    );
+    with_winfsp_mount(vfs, rt, mount_point, event, |root| {
+        let dir = std::path::Path::new(root).join("shell-dir-conflict");
+        let nested = dir.join("nested");
+        std::fs::create_dir_all(&nested).expect("create conflict source dir");
+        std::fs::write(dir.join("a.txt"), "alpha-123").expect("write a.txt");
+        std::fs::write(nested.join("b.txt"), "beta-4567").expect("write b.txt");
+        let orig_dir_ino = observer
+            .lookup(1, b"shell-dir-conflict")
+            .expect("lookup source dir before recycle")
+            .ino;
+
+        let out = run_shell_probe_ps1(&script, &dir, false);
+        assert!(
+            out.contains("keep_ok=True no_silent_overwrite=True pair_preserved=True"),
+            "collision must never silently overwrite existing files and must preserve $R/$I: {out}"
+        );
+        assert!(
+            out.contains(
+                "blocked_rename_refused=True replace_rename_refused=True blocker_intact=True"
+            ),
+            "occupied alternate rename restore must refuse without overwrite: {out}"
+        );
+        assert!(
+            out.contains("alt_restored_ok=True pairs_after_alt_restore=0"),
+            "explicit alternate-destination restore must succeed cleanly: {out}"
+        );
+
+        let restored_alt_ino = observer
+            .lookup(1, b"shell-dir-conflict-alt")
+            .expect("lookup restored alternate directory")
+            .ino;
+        assert_eq!(
+            restored_alt_ino, orig_dir_ino,
+            "restored directory must preserve original inode identity"
+        );
+
+        use studiofs_meta::trash::RetainedEntryState;
+        let meta = observer.meta();
+        let store_dir = meta
+            .lookup(1, b".studiofs-retained")
+            .expect("private retained store directory");
+        let store = meta.retained_store().expect("retained store");
+        let entries: Vec<_> = meta
+            .readdir(store_dir.ino)
+            .expect("list retained store")
+            .into_iter()
+            .filter_map(|child| {
+                std::str::from_utf8(&child.name)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .map(|receipt| store.retained_entry(receipt).unwrap().unwrap())
+            .collect();
+        assert_eq!(entries.len(), 1, "single receipt expected: {entries:?}");
+        assert_eq!(entries[0].inode, orig_dir_ino);
+        assert!(matches!(
+            &entries[0].state,
+            RetainedEntryState::Restored { parent: 1, name } if name == b"shell-dir-conflict-alt"
+        ));
+
+        for suffix in ["", "-blocked", "-alt"] {
+            let p = std::path::Path::new(root).join(format!("shell-dir-conflict{suffix}"));
+            if p.exists() {
+                std::fs::remove_dir_all(&p).expect("clean owned conflict test directory");
+            }
+        }
+    });
+}
+
+const REMOTE_RECOVERY_PROBE_PS1: &str = r##"
+$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName Microsoft.VisualBasic
+Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class RemoteRecoveryWinApi {
+  public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern bool MoveFileEx(string src, string dst, uint flags);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hWndParent, EnumProc cb, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int max);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder sb, int max);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+  public const uint WM_CLOSE = 0x0010;
+  public static List<string> CaptureDialogs(uint childPid) {
+    var list = new List<string>();
+    var targetPids = new HashSet<uint>();
+    foreach (var p in Process.GetProcessesByName("explorer")) targetPids.Add((uint)p.Id);
+    if (childPid != 0) targetPids.Add(childPid);
+    EnumWindows((h, _) => {
+      if (!IsWindowVisible(h)) return true;
+      uint pid;
+      GetWindowThreadProcessId(h, out pid);
+      if (!targetPids.Contains(pid)) return true;
+      var cls = new StringBuilder(128);
+      GetClassName(h, cls, cls.Capacity);
+      var c = cls.ToString();
+      if (c == "#32770" || c == "OperationStatusWindow") {
+        var title = new StringBuilder(256);
+        GetWindowText(h, title, title.Capacity);
+        var children = new List<string>();
+        EnumChildWindows(h, (ch, __) => {
+          var ccls = new StringBuilder(128);
+          GetClassName(ch, ccls, ccls.Capacity);
+          var ctxt = new StringBuilder(512);
+          GetWindowText(ch, ctxt, ctxt.Capacity);
+          var t = ctxt.ToString().Replace("\r", " ").Replace("\n", " ").Trim();
+          if (t.Length > 0) children.Add(ccls.ToString() + "=" + t);
+          return true;
+        }, IntPtr.Zero);
+        list.Add(h.ToInt64() + "|" + c + "|" + title.ToString() + "|[" + string.Join("; ", children) + "]");
+      }
+      return true;
+    }, IntPtr.Zero);
+    return list;
+  }
+  public static void CloseHandle(long raw) {
+    PostMessage(new IntPtr(raw), WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+  }
+}
+"@
+
+function Pair-For([string]$path) {
+  $root = [IO.Path]::GetPathRoot($path)
+  $top = Join-Path $root '$Recycle.Bin'
+  @(Get-ChildItem -LiteralPath $top -Force -File -Filter '$I*' -ErrorAction SilentlyContinue | Where-Object {
+    $b = [IO.File]::ReadAllBytes($_.FullName)
+    $b.Length -gt 28 -and [BitConverter]::ToInt64($b, 0) -eq 2 -and [Text.Encoding]::Unicode.GetString($b, 28, $b.Length - 28).TrimEnd([char]0) -eq $path })
+}
+
+switch ($env:STUDIOFS_OP) {
+  'recycle_dir' {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($env:TARGET, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+    $hit = Pair-For $env:TARGET
+    if ($hit.Count -ne 1) { throw "expected 1 pair for dir, got $($hit.Count)" }
+    $r = Join-Path $hit[0].DirectoryName ('$R' + $hit[0].Name.Substring(2))
+    "pair=$($hit[0].FullName)|$r"
+  }
+  'recycle_file' {
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:TARGET, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')
+    $hit = Pair-For $env:TARGET
+    if ($hit.Count -ne 1) { throw "expected 1 pair for file, got $($hit.Count)" }
+    $r = Join-Path $hit[0].DirectoryName ('$R' + $hit[0].Name.Substring(2))
+    "pair=$($hit[0].FullName)|$r"
+  }
+  'win32_move' {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $ok = [RemoteRecoveryWinApi]::MoveFileEx($env:SRC, $env:DST, 0)
+    $err = if ($ok) { 0 } else { [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+    $sw.Stop()
+    "move_ok=$ok win32_err=$err elapsed_ms=$($sw.ElapsedMilliseconds)"
+  }
+  'shell_undelete' {
+    $before = @([RemoteRecoveryWinApi]::CaptureDialogs(0))
+    $env:STUDIOFS_SHELL_UNDELETE_PAYLOAD = $env:SRC
+    $childScript = '$ns = (New-Object -ComObject Shell.Application).NameSpace(10); $item = $ns.Items() | Where-Object { $_.Path -eq $env:STUDIOFS_SHELL_UNDELETE_PAYLOAD } | Select-Object -First 1; if ($null -eq $item) { exit 2 }; $item.InvokeVerb("undelete")'
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $proc = [Diagnostics.Process]::Start($psi)
+    $seen = New-Object Collections.Generic.List[string]
+    $deadline = (Get-Date).AddSeconds(4)
+    while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
+      $now = @([RemoteRecoveryWinApi]::CaptureDialogs([uint32]$proc.Id))
+      $new = @($now | Where-Object { $before -notcontains $_ })
+      if ($new.Count -gt 0) {
+        foreach ($d in $new) {
+          $seen.Add($d)
+          [RemoteRecoveryWinApi]::CloseHandle([long]($d.Split('|')[0])) | Out-Null
+        }
+        $null = $proc.WaitForExit(1500)
+        break
+      }
+      Start-Sleep -Milliseconds 50
+    }
+    $exited = $proc.HasExited
+    $exitCode = if ($exited) { $proc.ExitCode } else { -1 }
+    if (-not $exited) {
+      try { $proc.Kill() } catch {}
+      $null = $proc.WaitForExit(1500)
+    }
+    $sw.Stop()
+    Remove-Item Env:\STUDIOFS_SHELL_UNDELETE_PAYLOAD -ErrorAction SilentlyContinue
+    "shell_exited=$exited exit_code=$exitCode elapsed_ms=$($sw.ElapsedMilliseconds) dialogs=$($seen.Count) dialog_details=$($seen -join ' ;; ')"
+  }
+  default {
+    throw "unknown STUDIOFS_OP=$($env:STUDIOFS_OP)"
+  }
+}
+"##;
+
+fn run_remote_recovery_ps1(script: &std::path::Path, envs: &[(&str, &str)]) -> String {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+    ])
+    .arg(script)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let output = cmd.output().expect("run remote recovery PowerShell probe");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "remote recovery PowerShell probe failed (status={}): stdout={stdout} stderr={stderr}",
+        output.status
+    );
+    stdout
+}
+
+fn wait_for_lookup_in(
+    vfs: &StudioVfs,
+    parent: u64,
+    name: &[u8],
+    label: &str,
+    timeout: Duration,
+) -> InodeAttr {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match vfs.lookup(parent, name) {
+            Ok(attr) => return attr,
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "lookup {label}: {error:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn collect_inode_object_ids(vfs: &StudioVfs, ino: u64, size: u64) -> Vec<u64> {
+    let spans = vfs
+        .meta()
+        .lookup_regular_file_slices(ino, 0, size)
+        .expect("lookup regular file slices");
+    let mut ids: Vec<u64> = spans
+        .into_iter()
+        .filter_map(|span| span.payload.map(|p| p.object_id))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn wait_for_cached_objects(vfs: &StudioVfs, object_ids: &[u64], label: &str, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if object_ids
+            .iter()
+            .all(|&id| vfs.cached_store().get(id).is_some())
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label}: background S3 prefetch did not populate cached objects {object_ids:?} within {} s",
+            timeout.as_secs()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Ignored native probe on disposable W: + configured S3:
+/// proves evicted retained directory (Win32 MoveFileEx) and file (Shell NameSpace 10
+/// `InvokeVerb('undelete')`) fail fast without premature Restored receipt, trigger background
+/// S3 fetch, preserve original inodes, and restore exact bytes on retry.
+#[test]
+#[ignore = "requires WinFSP runtime, configured S3 backend, and unused STUDIOFS_WINFSP_TEST_MOUNT_POINT"]
+fn winfsp_native_trash_remote_only_retry_probe() {
+    use studiofs_data::store::DataStore;
+    use studiofs_meta::trash::RetainedEntryState;
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+
+    if !require_online_upload_backend("winfsp_native_trash_remote_only_retry_probe") {
+        return;
+    }
+    install_probe_trace_log();
+
+    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
+        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let bytes = mount_point.as_bytes();
+    assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
+    // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
+    let drives = unsafe { GetLogicalDrives() };
+    assert_eq!(drives & (1 << (bytes[0] - b'A')), 0, "drive is occupied");
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("trash-native-remote-");
+    let script = tmp.path().join("remote-recovery.ps1");
+    std::fs::write(&script, REMOTE_RECOVERY_PROBE_PS1).expect("write remote recovery PS1");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let (vfs, format_info) =
+        make_trash_enabled_test_vfs_with_format_info(&tmp, "trash-native-remote", &rt);
+    let data_store = DataStore::new(&DataStoreConfig::from(&format_info))
+        .expect("create DataStore for S3 cleanup");
+    let observer = vfs.clone();
+    let cleanup_rt = rt.clone();
+    let event = format!(r"Local\StudioFsNativeRemoteProbe-{}", std::process::id());
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_winfsp_mount(vfs, rt, mount_point, event, |root| {
+            // --- Phase 1: Evicted remote-only directory via Win32 MoveFileEx ---
+            let dir = std::path::Path::new(root).join("remote-dir-probe");
+            let sub = dir.join("sub");
+            std::fs::create_dir_all(&sub).expect("create remote dir tree");
+            let a_bytes: Vec<u8> = (0..16384u32)
+                .map(|i| (i as u8).wrapping_mul(11).wrapping_add(3))
+                .collect();
+            let b_bytes: Vec<u8> = (0..24576u32)
+                .map(|i| (i as u8).wrapping_mul(17).wrapping_add(9))
+                .collect();
+            std::fs::write(dir.join("a.bin"), &a_bytes).expect("write a.bin");
+            std::fs::write(sub.join("b.bin"), &b_bytes).expect("write b.bin");
+
+            let orig_dir_ino = wait_for_lookup_in(
+                &observer,
+                1,
+                b"remote-dir-probe",
+                "remote-dir-probe",
+                Duration::from_secs(5),
+            )
+            .ino;
+            let orig_sub_ino = wait_for_lookup_in(
+                &observer,
+                orig_dir_ino,
+                b"sub",
+                "sub",
+                Duration::from_secs(5),
+            )
+            .ino;
+            let orig_a_ino = wait_for_lookup_in(
+                &observer,
+                orig_dir_ino,
+                b"a.bin",
+                "a.bin",
+                Duration::from_secs(5),
+            )
+            .ino;
+            let orig_b_ino = wait_for_lookup_in(
+                &observer,
+                orig_sub_ino,
+                b"b.bin",
+                "b.bin",
+                Duration::from_secs(5),
+            )
+            .ino;
+            wait_for_upload_ready(
+                &observer,
+                orig_a_ino,
+                "a.bin S3 upload",
+                Duration::from_secs(30),
+            );
+            wait_for_upload_ready(
+                &observer,
+                orig_b_ino,
+                "b.bin S3 upload",
+                Duration::from_secs(30),
+            );
+
+            let mut dir_obj_ids =
+                collect_inode_object_ids(&observer, orig_a_ino, a_bytes.len() as u64);
+            dir_obj_ids.extend(collect_inode_object_ids(
+                &observer,
+                orig_b_ino,
+                b_bytes.len() as u64,
+            ));
+            assert!(
+                dir_obj_ids.len() >= 2,
+                "expected S3 objects for a.bin and b.bin: {dir_obj_ids:?}"
+            );
+
+            let dir_str = dir.to_string_lossy().into_owned();
+            let recycle_dir_out = run_remote_recovery_ps1(
+                &script,
+                &[("STUDIOFS_OP", "recycle_dir"), ("TARGET", &dir_str)],
+            );
+            let pair_line = recycle_dir_out
+                .lines()
+                .find_map(|l| l.strip_prefix("pair="))
+                .expect("pair line from recycle_dir");
+            let (dir_i_path, dir_r_path) = pair_line.split_once('|').expect("I|R split");
+            let dir_receipt_hex = std::path::Path::new(dir_r_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| s.strip_prefix("$R"))
+                .expect("$R hex suffix");
+            let dir_receipt = u64::from_str_radix(dir_receipt_hex, 16).expect("parse receipt");
+
+            // Evict ALL local payloads without reading $R first.
+            for &id in &dir_obj_ids {
+                observer
+                    .cached_store()
+                    .remove(id)
+                    .expect("evict dir object");
+                assert!(
+                    observer.cached_store().get(id).is_none(),
+                    "evicted object {id} must be absent from local cache"
+                );
+            }
+
+            let move1_out = run_remote_recovery_ps1(
+                &script,
+                &[
+                    ("STUDIOFS_OP", "win32_move"),
+                    ("SRC", dir_r_path),
+                    ("DST", &dir_str),
+                ],
+            );
+            eprintln!("remote-dir first Win32 MoveFileEx: {}", move1_out.trim());
+            assert!(
+                move1_out.contains("move_ok=False win32_err=31"),
+                "expected ERROR_GEN_FAILURE (31) from STATUS_UNSUCCESSFUL on remote-only dir restore, got: {move1_out}"
+            );
+            assert!(
+                !dir.exists(),
+                "failed remote dir restore must leave destination absent"
+            );
+            assert!(
+                std::path::Path::new(dir_i_path).exists()
+                    && std::path::Path::new(dir_r_path).exists(),
+                "failed remote dir restore must preserve $I/$R pair"
+            );
+            let meta = observer.meta();
+            let store = meta.retained_store().expect("retained store");
+            assert_eq!(
+                store.retained_entry(dir_receipt).unwrap().unwrap().state,
+                RetainedEntryState::Retained,
+                "failed remote dir restore must not emit premature Restored receipt"
+            );
+
+            wait_for_cached_objects(
+                &observer,
+                &dir_obj_ids,
+                "remote-dir-probe background S3 fetch",
+                Duration::from_secs(30),
+            );
+
+            let move2_out = run_remote_recovery_ps1(
+                &script,
+                &[
+                    ("STUDIOFS_OP", "win32_move"),
+                    ("SRC", dir_r_path),
+                    ("DST", &dir_str),
+                ],
+            );
+            eprintln!("remote-dir retry Win32 MoveFileEx: {}", move2_out.trim());
+            assert!(
+                move2_out.contains("move_ok=True"),
+                "retry dir restore must succeed once S3 objects are cached: {move2_out}"
+            );
+            assert_eq!(
+                std::fs::read(dir.join("a.bin")).expect("read restored a.bin"),
+                a_bytes
+            );
+            assert_eq!(
+                std::fs::read(sub.join("b.bin")).expect("read restored b.bin"),
+                b_bytes
+            );
+            assert_eq!(
+                observer.lookup(1, b"remote-dir-probe").unwrap().ino,
+                orig_dir_ino
+            );
+            assert_eq!(
+                observer.meta().lookup(orig_dir_ino, b"sub").unwrap().ino,
+                orig_sub_ino
+            );
+            assert_eq!(
+                observer.meta().lookup(orig_dir_ino, b"a.bin").unwrap().ino,
+                orig_a_ino
+            );
+            assert_eq!(
+                observer.meta().lookup(orig_sub_ino, b"b.bin").unwrap().ino,
+                orig_b_ino
+            );
+            assert!(matches!(
+                store.retained_entry(dir_receipt).unwrap().unwrap().state,
+                RetainedEntryState::Restored { parent: 1, ref name } if name == b"remote-dir-probe"
+            ));
+            assert!(
+                !std::path::Path::new(dir_i_path).exists()
+                    && !std::path::Path::new(dir_r_path).exists(),
+                "successful dir retry restore must remove $I/$R pair"
+            );
+            std::fs::remove_dir_all(&dir).expect("clean restored dir");
+
+            // --- Phase 2: Evicted remote-only file via Shell NameSpace(10) InvokeVerb('undelete') ---
+            let file = std::path::Path::new(root).join("shell-remote-file.bin");
+            let file_bytes: Vec<u8> = (0..65536u32)
+                .map(|i| (i as u8).wrapping_mul(19).wrapping_add(0x41))
+                .collect();
+            std::fs::write(&file, &file_bytes).expect("write shell-remote-file.bin");
+            let orig_file_ino = wait_for_lookup(
+                &observer,
+                b"shell-remote-file.bin",
+                "shell-remote-file.bin",
+                Duration::from_secs(5),
+            )
+            .ino;
+            wait_for_upload_ready(
+                &observer,
+                orig_file_ino,
+                "shell-remote-file.bin S3 upload",
+                Duration::from_secs(30),
+            );
+            let file_obj_ids =
+                collect_inode_object_ids(&observer, orig_file_ino, file_bytes.len() as u64);
+            assert!(
+                !file_obj_ids.is_empty(),
+                "expected S3 object for shell-remote-file.bin"
+            );
+
+            let file_str = file.to_string_lossy().into_owned();
+            let recycle_file_out = run_remote_recovery_ps1(
+                &script,
+                &[("STUDIOFS_OP", "recycle_file"), ("TARGET", &file_str)],
+            );
+            let file_pair = recycle_file_out
+                .lines()
+                .find_map(|l| l.strip_prefix("pair="))
+                .expect("pair line from recycle_file");
+            let (file_i_path, file_r_path) = file_pair.split_once('|').expect("I|R split");
+            let file_receipt_hex = std::path::Path::new(file_r_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|s| s.strip_prefix("$R"))
+                .expect("$R hex suffix");
+            let file_receipt =
+                u64::from_str_radix(file_receipt_hex, 16).expect("parse file receipt");
+
+            for &id in &file_obj_ids {
+                observer
+                    .cached_store()
+                    .remove(id)
+                    .expect("evict file object");
+                assert!(observer.cached_store().get(id).is_none());
+            }
+
+            let shell1_out = run_remote_recovery_ps1(
+                &script,
+                &[("STUDIOFS_OP", "shell_undelete"), ("SRC", file_r_path)],
+            );
+            eprintln!(
+                "shell-remote-file first InvokeVerb('undelete'): {}",
+                shell1_out.trim()
+            );
+            // Do not assume whether Explorer completed via implicit retry or surfaced a modal dialog;
+            // observe both possibilities carefully while strictly forbidding silent loss / corruption.
+            let already_restored = file.exists();
+            if !already_restored {
+                assert!(
+                    std::path::Path::new(file_i_path).exists()
+                        && std::path::Path::new(file_r_path).exists(),
+                    "unrestored remote file must preserve $I/$R pair; shell1={shell1_out}"
+                );
+                assert_eq!(
+                    store.retained_entry(file_receipt).unwrap().unwrap().state,
+                    RetainedEntryState::Retained,
+                    "unrestored remote file must keep Retained receipt; shell1={shell1_out}"
+                );
+                wait_for_cached_objects(
+                    &observer,
+                    &file_obj_ids,
+                    "shell-remote-file background S3 fetch",
+                    Duration::from_secs(30),
+                );
+                let shell2_out = run_remote_recovery_ps1(
+                    &script,
+                    &[("STUDIOFS_OP", "shell_undelete"), ("SRC", file_r_path)],
+                );
+                eprintln!(
+                    "shell-remote-file retry InvokeVerb('undelete'): {}",
+                    shell2_out.trim()
+                );
+                let wait_deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !file.exists() && std::time::Instant::now() < wait_deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            assert!(
+                file.exists(),
+                "shell-remote-file.bin must exist after remote recovery flow; shell1={shell1_out}"
+            );
+            assert_eq!(
+                std::fs::read(&file).expect("read restored shell-remote-file.bin"),
+                file_bytes
+            );
+            assert_eq!(
+                observer.lookup(1, b"shell-remote-file.bin").unwrap().ino,
+                orig_file_ino,
+                "Shell restore must preserve original inode identity (no copy+delete fallback)"
+            );
+            assert!(matches!(
+                store.retained_entry(file_receipt).unwrap().unwrap().state,
+                RetainedEntryState::Restored { parent: 1, ref name } if name == b"shell-remote-file.bin"
+            ));
+            assert!(
+                !std::path::Path::new(file_i_path).exists()
+                    && !std::path::Path::new(file_r_path).exists(),
+                "restored shell-remote-file must clean up $I/$R pair"
+            );
+            std::fs::remove_file(&file).expect("clean restored shell-remote-file.bin");
+        });
+    }));
+
+    // Always clean up our owned S3 volume prefix even on panic.
+    let s3_clean = cleanup_rt.block_on(data_store.delete_volume_data());
+    if let Err(err) = s3_clean {
+        eprintln!("warning: S3 test volume cleanup failed: {err}");
+    }
+    if let Err(payload) = outcome {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// Ignored native probe: a read-write mapped writer whose original file handle is
+/// closed before the view is modified. Cleanup arrives first; the section keeps the
+/// file object, so the mapped flush must still reach the mount as paging writes.
+/// Passes only when the bytes reopen exact and the trace orders cleanup before them.
+#[test]
+#[ignore = "requires WinFSP runtime, an explicitly selected unused drive, and STUDIOFS_WINFSP_TRACE_LOG"]
+fn winfsp_native_mapped_writer_survives_handle_close_probe() {
+    mapped_writer_probe(false);
+}
+
+#[test]
+#[ignore = "requires WinFSP runtime, unused drive, and STUDIOFS_WINFSP_TRACE_LOG"]
+fn winfsp_native_mapped_writer_survives_restore_probe() {
+    mapped_writer_probe(true);
+}
+
+fn mapped_writer_probe(restore: bool) {
+    use std::io::Write;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+    use windows::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_WRITE, FlushViewOfFile, MapViewOfFile, PAGE_READWRITE,
+        UnmapViewOfFile,
+    };
+    install_probe_trace_log();
+    let trace_path = std::env::var_os("STUDIOFS_WINFSP_TRACE_LOG")
+        .expect("set STUDIOFS_WINFSP_TRACE_LOG so cleanup and paging order is observable");
+    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
+        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let bytes = mount_point.as_bytes();
+    assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
+    // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
+    let drives = unsafe { GetLogicalDrives() };
+    assert_eq!(drives & (1 << (bytes[0] - b'A')), 0, "drive is occupied");
+
+    const NAME: &str = "mapped-writer.bin";
+    const LEN: usize = 64 * 1024;
+    const NEW: &[u8] = b"MAPPED-WRITER-NEW-BYTES";
+    let original: Vec<u8> = (0..LEN)
+        .map(|index| (index as u8).wrapping_mul(7).wrapping_add(0x31))
+        .collect();
+    let mut expected = original.clone();
+    expected[..NEW.len()].copy_from_slice(NEW);
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("mapped-writer-native-");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = if restore {
+        make_trash_enabled_test_vfs(&tmp, "mapped-writer-native", &rt)
+    } else {
+        make_test_vfs(&tmp, "mapped-writer-native", &rt)
+    };
+    let observer = vfs.clone();
+    let event = format!(r"Local\StudioFsMappedWriterProbe-{}", std::process::id());
+    let restore_rt = rt.clone();
+    let ino = with_winfsp_mount(vfs, rt, mount_point, event, |root| {
+        let path = std::path::Path::new(root).join(NAME);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open read-write mapped writer through WinFSP mount");
+        file.write_all(&original).expect("write original bytes");
+        let ino = wait_for_lookup(
+            &observer,
+            NAME.as_bytes(),
+            "mapped writer",
+            Duration::from_secs(5),
+        )
+        .ino;
+
+        // SAFETY: `file` is open read-write; the mapping covers the whole file size.
+        let mapping = unsafe {
+            CreateFileMappingW(
+                HANDLE(file.as_raw_handle()),
+                None,
+                PAGE_READWRITE,
+                0,
+                0,
+                None,
+            )
+        }
+        .expect("create read-write file mapping through WinFSP mount");
+        // SAFETY: `mapping` is valid; the view maps exactly `LEN` bytes.
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, LEN) };
+        assert!(!view.Value.is_null(), "MapViewOfFile returned a null view");
+        // SAFETY: the view is `LEN` readable and writable bytes until unmapped below.
+        let mapped = unsafe { std::slice::from_raw_parts_mut(view.Value as *mut u8, LEN) };
+        assert_eq!(
+            &mapped[..],
+            &original[..],
+            "mapped view must expose the written bytes"
+        );
+
+        // Close the original handle first. Cleanup arrives; the mapping keeps the file object.
+        drop(file);
+        if restore {
+            // Windows refuses Shell recycling a mapped section. Exercise the
+            // retained-store transition directly while native paging I/O stays live.
+            restore_rt.block_on(observer.fsync(ino, false)).unwrap();
+            observer
+                .rename(1, NAME.as_bytes(), 1, b"mapped-retained.bin", false)
+                .unwrap();
+            let meta = observer.meta();
+            let private = meta.create_dir(1, b"private", 0, 0, 0o700).unwrap();
+            let receipt = meta.next_inode().unwrap();
+            let store = meta.retained_store().unwrap();
+            store
+                .retain_namespace_entry(1, b"mapped-retained.bin", private.ino, receipt)
+                .unwrap();
+            restore_rt
+                .block_on(observer.restore_retained_entry(store, receipt, 1, NAME.as_bytes()))
+                .unwrap();
+            assert_eq!(observer.lookup(1, NAME.as_bytes()).unwrap().ino, ino);
+        }
+        mapped[..NEW.len()].copy_from_slice(NEW);
+        // SAFETY: the view and mapping are valid and unused after this point.
+        unsafe {
+            FlushViewOfFile(view.Value, LEN).expect("flush mapped view after handle close");
+            UnmapViewOfFile(view).expect("unmap mapped view");
+            CloseHandle(mapping).expect("close mapping handle");
+        }
+        let reopened = std::fs::read(&path).expect("reopen mapped writer target");
+        assert_eq!(
+            reopened, expected,
+            "mapped bytes must persist after the handle closed"
+        );
+        ino
+    });
+
+    // Diagnostics: cleanup for this file must precede a paging write, and the close last.
+    let trace = std::fs::read_to_string(trace_path).expect("read WinFSP probe trace");
+    let needle = format!("ino={ino} ");
+    let cleanup_at = trace
+        .lines()
+        .position(|line| line.contains("cleanup") && line.contains(&needle))
+        .expect("cleanup callback for the mapped writer handle must be traced");
+    let paging_after_cleanup = trace.lines().skip(cleanup_at + 1).any(|line| {
+        line.contains("write") && line.contains(&needle) && line.contains("constrained_io=true")
+    });
+    assert!(
+        paging_after_cleanup,
+        "a constrained (paging) write must follow the handle's cleanup:\n{trace}"
+    );
+}
+
+/// Default-disabled control: with a zero period, Shell's Move to Trash is a direct
+/// delete. The source is gone, no `$I`/`$R` pair is published, and Shell reports
+/// no refusal.
+#[test]
+#[ignore = "requires WinFSP runtime and an explicitly selected unused drive"]
+fn winfsp_default_disabled_trash_is_destructive_shell_probe() {
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+
+    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
+        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let bytes = mount_point.as_bytes();
+    assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
+    // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
+    let drives = unsafe { GetLogicalDrives() };
+    assert_eq!(drives & (1 << (bytes[0] - b'A')), 0, "drive is occupied");
+    let tmp = studiofs_test_support::workspace_target_tempdir("trash-native-disabled-");
+    // Refusal is the expected outcome here, so catch it and report it as output.
+    let disabled_probe = RECYCLE_PROBE_PS1.replace(
+        "[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:F, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException')",
+        "try { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:F, 'OnlyErrorDialogs', 'SendToRecycleBin', 'ThrowException') } catch { 'delete_refused=' + $_.Exception.Message }",
+    );
+    assert!(
+        disabled_probe.contains("delete_refused="),
+        "probe must catch the refusal"
+    );
+    let script = tmp.path().join("recycle-probe-disabled.ps1");
+    std::fs::write(&script, disabled_probe).expect("write Shell recycle probe");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "trash-native-disabled", &rt);
+    let event = format!(r"Local\StudioFsNativeDisabledProbe-{}", std::process::id());
+    with_winfsp_mount(vfs, rt, mount_point, event, |root| {
+        let out = shell_recycle_probe(
+            &script,
+            &std::path::Path::new(root).join("shell-native-disabled.txt"),
+            false,
+        );
+        assert!(
+            out.contains("source_exists=False recycled_metadata=0")
+                && !out.contains("delete_refused="),
+            "disabled trash must delete directly without publishing a pair: {out}"
+        );
+    });
+}
+
+/// Product-path Shell check: the same Move to Trash oracle on a mount whose
+/// trash period is positive. Restore and Clear are not covered by this probe.
+#[test]
+#[ignore = "requires WinFSP runtime, an explicitly selected unused drive, and an owned test volume"]
+fn winfsp_native_trash_retention_shell_probe() {
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+
+    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
+        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let bytes = mount_point.as_bytes();
+    assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
+    // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
+    let drives = unsafe { GetLogicalDrives() };
+    assert_eq!(drives & (1 << (bytes[0] - b'A')), 0, "drive is occupied");
+    let tmp = studiofs_test_support::workspace_target_tempdir("trash-native-probe-");
+    let script = tmp.path().join("recycle-probe.ps1");
+    std::fs::write(&script, RECYCLE_PROBE_PS1).expect("write Shell recycle probe");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_trash_enabled_test_vfs(&tmp, "trash-native-probe", &rt);
+    let event = format!(r"Local\StudioFsNativeTrashProbe-{}", std::process::id());
+    with_winfsp_mount(vfs, rt, mount_point, event, |root| {
+        let mounted = shell_recycle_probe(
+            &script,
+            &std::path::Path::new(root).join("shell-native-trash.txt"),
+            false,
+        );
+        assert!(
+            mounted.contains("source_exists=False recycled_metadata=1 shell_listed=1"),
+            "mounted Shell output: {mounted}"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires WinFSP runtime and an explicitly selected unused drive"]
+fn winfsp_recycle_namespace_feasibility_probe() {
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+
+    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
+        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let bytes = mount_point.as_bytes();
+    assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
+    // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
+    let drives = unsafe { GetLogicalDrives() };
+    assert_ne!(drives, 0, "query drive occupancy");
+    assert_eq!(drives & (1 << (bytes[0] - b'A')), 0, "drive is occupied");
+    let tmp = studiofs_test_support::workspace_target_tempdir("trash-probe-");
+    let script = tmp.path().join("recycle-probe.ps1");
+    std::fs::write(&script, RECYCLE_PROBE_PS1).expect("write Shell recycle probe");
+    // Oracle self-check on the host volume; removes only its own `$I`/`$R` pair.
+    let control = shell_recycle_probe(&script, &tmp.path().join("control-empty.txt"), true);
+    assert!(
+        control.contains("source_exists=False recycled_metadata=1 shell_listed=1"),
+        "control volume must recycle through the same Shell path"
+    );
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "recycle-probe", &rt);
+    let event = format!(r"Local\StudioFsRecycleProbe-{}", std::process::id());
+    with_winfsp_mount(vfs, rt, mount_point, event, |root| {
+        let mounted = shell_recycle_probe(
+            &script,
+            &std::path::Path::new(root).join("shell-probe-empty.txt"),
+            false,
+        );
+        assert!(
+            mounted.contains("source_exists=False recycled_metadata=1 shell_listed=1"),
+            "WinFSP volume must recycle, not permanently delete"
+        );
+    });
 }
 
 /// Full lifecycle smoke test: mount → write → read → readdir → delete → unmount.

@@ -207,6 +207,91 @@ fn split_publication_prefix_ack_waits_for_last_page_and_survives_rollback() {
 }
 
 #[test]
+fn split_publication_self_ack_survives_reopen_between_pages() {
+    let (dir, pg) = temp_pg_engine_for_unit();
+    let db_path = dir.path().join("meta.redb");
+    let start = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.local
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, start)
+        .unwrap();
+    let attr = uploaded_pending_file(&pg, b"split-reopen.bin", 91_001);
+    pg.publish_regular_file_overlay_to_base_if_matches(attr.ino, attr.content_epoch)
+        .unwrap();
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let projected = RemoteApplyCoordinator::project_local_batch(
+        &pg.local.read_events_range(start, end).unwrap(),
+    );
+    let split = projected.events.len() / 2;
+    assert!(split > 0 && split < projected.events.len());
+    pg.apply_replay_page_atomically(
+        vec![DecodedReplayBatch {
+            batch_version: 1,
+            events: projected.events[..split].to_vec(),
+            is_self_batch: true,
+        }],
+        None,
+        RemoteReplayApplyContext {
+            last_seq: pg.local_version.load(Ordering::SeqCst),
+            current_namespace_version: pg.namespace_version.load(Ordering::SeqCst),
+            flushed_event_seq: pg.flushed_event_seq.load(Ordering::SeqCst),
+            next_event_seq: end,
+            initial_overlay: pg.local_overlay_conflicts().unwrap(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&pg.local).unwrap(),
+        start
+    );
+    pg.prepare_for_close().unwrap();
+    drop(pg);
+
+    // Reopen drops in-memory published_prefixes; remaining self page must still ack the full prefix.
+    let reopened = reopen_unit_pg_engine_for_test(&db_path);
+    assert!(
+        reopened
+            .unprocessed_local_event_progress()
+            .unwrap()
+            .published_prefixes
+            .is_empty()
+    );
+    reopened
+        .apply_replay_page_atomically(
+            vec![DecodedReplayBatch {
+                batch_version: 2,
+                events: projected.events[split..].to_vec(),
+                is_self_batch: true,
+            }],
+            None,
+            RemoteReplayApplyContext {
+                last_seq: reopened.local_version.load(Ordering::SeqCst),
+                current_namespace_version: reopened.namespace_version.load(Ordering::SeqCst),
+                flushed_event_seq: reopened.flushed_event_seq.load(Ordering::SeqCst),
+                next_event_seq: end,
+                initial_overlay: reopened.local_overlay_conflicts().unwrap(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        PgMetaEngine::load_persisted_flushed_event_seq(&reopened.local).unwrap(),
+        end
+    );
+    assert_eq!(
+        PgMetaEngine::load_persisted_local_version(&reopened.local).unwrap(),
+        2
+    );
+    let reopened_again = {
+        reopened.prepare_for_close().unwrap();
+        drop(reopened);
+        reopen_unit_pg_engine_for_test(&db_path)
+    };
+    let txn = reopened_again.local.begin_write_txn().unwrap();
+    let pending = RedbMetaEngine::read_pending_self_replay_in_txn(&txn).unwrap();
+    assert!(pending.batches.is_empty());
+    txn.abort().unwrap();
+}
+
+#[test]
 fn local_graph_repair_marker_clears_only_after_conflicting_payload_is_published() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let name = b"repair-conflicting-name.bin";

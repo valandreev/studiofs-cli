@@ -1,6 +1,7 @@
 use super::{DeletedInodeCleanup, Ino, MetaError, StudioVfs, VfsMeta, VfsResult};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use studiofs_meta::OrphanInodeFinalization;
 use tracing::{debug, warn};
 
 use crate::runtime::{run_local_cache_io_blocking, run_meta};
@@ -376,54 +377,37 @@ impl StudioVfs {
         })
     }
 
+    /// Finalizes an orphaned inode through the shared metadata guard. `None`
+    /// means current metadata still binds it (or a retained child purge is not
+    /// acknowledged yet), so nothing was deleted and its runtime state stays.
     pub(super) async fn collect_orphan_deleted_inode_cleanup(
         &self,
         ino: Ino,
-    ) -> VfsResult<DeletedInodeCleanup> {
-        self.mark_inode_deleted_for_uploads(ino);
-
+    ) -> VfsResult<Option<DeletedInodeCleanup>> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let meta = self.meta.clone();
-        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            let graph_usage = match engine.get_regular_file_graph_object_usage(ino) {
-                Ok(usage) => usage,
-                Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                Err(err) => return Err(err),
-            };
-            let freed_bytes = graph_usage
-                .iter()
-                .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
-
-            let removed_ids = match engine.remove_regular_file_graph(ino, None) {
-                Ok(ids) => ids,
-                Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                Err(err) => return Err(err),
-            };
-            let entries: Vec<_> = removed_ids
-                .iter()
-                .map(|&object_id| (object_id, timestamp))
-                .collect();
-            engine.add_pending_deletions(&entries)?;
-
-            if freed_bytes > 0 {
-                engine.decr_counter(studiofs_meta::types::counters::USED_SPACE, freed_bytes)?;
-            }
-
-            match engine.remove_attr(ino) {
-                Ok(()) | Err(MetaError::InodeNotFound(_)) => {}
-                Err(err) => return Err(err),
-            }
-            let _ = engine.remove_deferred_delete(ino);
-
-            Ok(DeletedInodeCleanup {
+        let outcome = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.finalize_orphan_inode(ino, timestamp)
+        })
+        .await?;
+        Ok(match outcome {
+            OrphanInodeFinalization::Removed {
                 removed_ids,
                 freed_bytes,
-            })
+            } => {
+                // Only a committed removal cancels uploads: the tombstone set is
+                // insert-only, and a live or deferred inode keeps its accepted bytes.
+                self.mark_inode_deleted_for_uploads(ino);
+                Some(DeletedInodeCleanup {
+                    removed_ids,
+                    freed_bytes,
+                })
+            }
+            OrphanInodeFinalization::Live | OrphanInodeFinalization::Deferred => None,
         })
-        .await
     }
 
     pub(super) async fn finalize_deleted_inode_runtime_cleanup(

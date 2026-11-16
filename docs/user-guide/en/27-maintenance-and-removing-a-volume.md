@@ -3,6 +3,50 @@
 
 Maintaining StudioFS involves several different tasks: checking metadata, finding unused objects in S3, removing a client's local data, or permanently deleting a volume. Each has its own command. We will start with checks and move on to deletion once we understand exactly what it removes.
 
+## Upgrade an existing format-5 volume
+
+Before using format 6, stop the volume's mounts and janitors on all computers.
+Keep each computer's metadata and payload cache, including unpublished offline
+changes. Run the updated binary on each stopped local cache:
+
+```bash
+studiofs upgrade myvolume
+```
+
+The command requires online PostgreSQL access and schema deployment privileges.
+It verifies the volume identity, fences old publishers and deletion claims,
+then completes the local header without clearing the journal or cached data.
+If a janitor still owns a deletion, let it settle and stop it before retrying.
+After a timeout, lost response or failed local completion, repeat the same
+command; do not reinitialize the volume or clear its cache. Other computers
+must complete their own local upgrade before mounting with the updated binary.
+Older clients cannot publish into the upgraded volume.
+
+Schema deployment changes the database-wide `payload_gc` schema marker to 2.
+Older janitors fail closed throughout that database, including volumes still
+using format 5. Use a compatible updated janitor for every volume in that
+database. This command upgrades compatibility; it does not enable retention.
+
+## Trash retention: `trash-days`
+
+Trash retention is a shared, per-volume setting in whole days. It defaults to 0,
+which disables the trash. Show or change it on any computer where the volume is
+discovered; the volume may stay mounted, but PostgreSQL must be reachable:
+
+```bash
+studiofs trash-days myvolume       # show the current setting
+studiofs trash-days myvolume 7     # keep native Move to Trash items for 7 days
+studiofs trash-days myvolume 0     # stop keeping new items
+```
+
+A new volume can be created with `studiofs init ... --trash-days 7`. The setting
+needs format 6 on every computer; `studiofs upgrade` does not change it.
+Setting 0 does not clear existing items: they expire under the last positive
+period. Purged and expired items free S3 space only after a `janitor` run.
+What is kept, who can restore or clear an item, and how each operating system
+shows the trash are described in
+[chapter 23](23-deleting-files-there-is-no-magic-trash-can.md).
+
 ## Checking metadata: `fsck`
 
 `fsck` looks for inconsistencies in the file system structure: directory entries without a corresponding metadata object, objects disconnected from directories, incorrect link counts, and unfinished internal operations. For a PostgreSQL-backed volume, the command first synchronizes local metadata with the server, then builds its report.

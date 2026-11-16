@@ -128,6 +128,12 @@ impl StudioVfs {
 
     /// Computes effective access for an inode by walking up namespace ACL rules and caching the result.
     pub(super) fn effective_access_level(&self, ino: Ino) -> VfsResult<AccessLevel> {
+        if ino >= super::FIRST_IGNORED_INO {
+            let ignored = self
+                .ignored_entry(ino)
+                .ok_or(VfsError::Meta(MetaError::InodeNotFound(ino)))?;
+            return self.ignored_entry_snapshot_access_level(&ignored);
+        }
         if let Some(access_level) = self.effective_access_level_cached(ino) {
             return Ok(access_level);
         }
@@ -177,15 +183,12 @@ impl StudioVfs {
         }
     }
 
-    /// Enforces minimum required access level, or returns `AccessDenied` / not-found errors.
-    pub(super) fn enforce_access(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
-        trace!(
-            target: "studiofs_vfs::metadata_baseline::acl_check",
-            "VFS ACL check"
-        );
-        self.enforce_metadata_serving_lifecycle()?;
-        self.enforce_snapshot_mount_fence(ino)?;
-        let actual = self.effective_access_level(ino)?;
+    fn finish_enforce_access(
+        &self,
+        ino: Ino,
+        required: AccessLevel,
+        actual: AccessLevel,
+    ) -> VfsResult<()> {
         if Self::access_satisfies(actual, required) {
             if required == AccessLevel::ReadWrite {
                 self.enforce_metadata_mutation_authority(ino)?;
@@ -203,6 +206,79 @@ impl StudioVfs {
         }))
     }
 
+    async fn effective_access_level_for_ignored_async(&self, ino: Ino) -> VfsResult<AccessLevel> {
+        let ignored = self
+            .ignored_entry(ino)
+            .ok_or(VfsError::Meta(MetaError::InodeNotFound(ino)))?;
+        if super::ignored_entries::retained_view_receipt(&ignored).is_some() {
+            return self.ignored_entry_snapshot_access_level(&ignored);
+        }
+        let real_parent = self.ignored_entry_real_parent(&ignored)?;
+        if real_parent == 0 {
+            return Ok(AccessLevel::ReadWrite);
+        }
+        if let Some(actual) = self.effective_access_level_cached(real_parent) {
+            return Ok(actual);
+        }
+        let meta = self.meta.clone();
+        let principal = self.acl_principal.clone();
+        let actual = run_meta(meta, move |engine| {
+            Self::effective_access_level_meta(engine.as_ref(), &principal, real_parent)
+        })
+        .await?;
+        self.effective_access_level_cache_insert(real_parent, actual);
+        Ok(actual)
+    }
+
+    /// Enforces minimum required access level, or returns `AccessDenied` / not-found errors.
+    pub(super) fn enforce_access(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
+        self.enforce_access_internal(ino, required, true, true)
+    }
+
+    /// [`Self::enforce_access`] without `trusted_retained_scope` ancestor-ACL bypass.
+    /// Used for user-visible destination and `original_parent` checks during restore/Clear.
+    pub(super) fn enforce_public_access(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
+        self.enforce_access_internal(ino, required, true, false)
+    }
+
+    /// [`Self::enforce_access`] for the local drain of an inode's own accepted
+    /// bytes. A retained payload is private to user paths, but its pending
+    /// writes must still reach shared metadata, or restore stays refused.
+    pub(super) fn enforce_access_for_local_drain(
+        &self,
+        ino: Ino,
+        required: AccessLevel,
+    ) -> VfsResult<()> {
+        self.enforce_access_internal(ino, required, false, true)
+    }
+
+    fn enforce_access_internal(
+        &self,
+        ino: Ino,
+        required: AccessLevel,
+        private_guard: bool,
+        allow_trusted_private_acl_bypass: bool,
+    ) -> VfsResult<()> {
+        trace!(
+            target: "studiofs_vfs::metadata_baseline::acl_check",
+            "VFS ACL check"
+        );
+        self.enforce_metadata_serving_lifecycle()?;
+        self.enforce_snapshot_mount_fence(ino)?;
+        if private_guard {
+            self.reject_private_store_ino(ino)?;
+        }
+        if allow_trusted_private_acl_bypass
+            && ino < super::FIRST_IGNORED_INO
+            && super::retained_views::in_trusted_retained_scope()
+            && self.inode_is_in_private_store(ino)?
+        {
+            return self.finish_enforce_access(ino, required, AccessLevel::ReadWrite);
+        }
+        let actual = self.effective_access_level(ino)?;
+        self.finish_enforce_access(ino, required, actual)
+    }
+
     /// Same as [`Self::enforce_access`], but fetches metadata using async execution path when needed.
     pub(super) async fn enforce_access_async(
         &self,
@@ -215,22 +291,18 @@ impl StudioVfs {
         );
         self.enforce_metadata_serving_lifecycle()?;
         self.enforce_snapshot_mount_fence(ino)?;
+        self.reject_private_store_ino(ino)?;
+        if ino >= super::FIRST_IGNORED_INO {
+            let actual = self.effective_access_level_for_ignored_async(ino).await?;
+            return self.finish_enforce_access(ino, required, actual);
+        }
+        if super::retained_views::in_trusted_retained_scope()
+            && self.inode_is_in_private_store(ino)?
+        {
+            return self.finish_enforce_access(ino, required, AccessLevel::ReadWrite);
+        }
         if let Some(actual) = self.effective_access_level_cached(ino) {
-            if Self::access_satisfies(actual, required) {
-                if required == AccessLevel::ReadWrite {
-                    self.enforce_metadata_mutation_authority(ino)?;
-                }
-                return Ok(());
-            }
-            if actual == AccessLevel::NoAccess {
-                return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
-            }
-            return Err(VfsError::Meta(MetaError::AccessDenied {
-                ino,
-                principal: self.acl_principal.clone(),
-                required,
-                actual,
-            }));
+            return self.finish_enforce_access(ino, required, actual);
         }
 
         let meta = self.meta.clone();
@@ -240,21 +312,7 @@ impl StudioVfs {
         })
         .await?;
         self.effective_access_level_cache_insert(ino, actual);
-        if Self::access_satisfies(actual, required) {
-            if required == AccessLevel::ReadWrite {
-                self.enforce_metadata_mutation_authority(ino)?;
-            }
-            return Ok(());
-        }
-        if actual == AccessLevel::NoAccess {
-            return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
-        }
-        Err(VfsError::Meta(MetaError::AccessDenied {
-            ino,
-            principal: self.acl_principal.clone(),
-            required,
-            actual,
-        }))
+        self.finish_enforce_access(ino, required, actual)
     }
 
     /// Sets (or overwrites) an ACL rule for an inode and principal.

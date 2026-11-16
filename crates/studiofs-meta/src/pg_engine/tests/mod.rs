@@ -464,19 +464,65 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
     local
         .set_remote_namespace_visibility_filter(true)
         .expect("enable remote namespace visibility filter");
-    let flushed_event_seq = local
-        .get_counter(NEXT_EVENT_SEQ)
-        .expect("read local event cursor after initializing root");
+    let engine = unit_pg_engine_from_local(local);
+
+    PgMetaEngine::persist_client_slot(&engine.local, 0).expect("persist unit test client slot");
+    let allocator_state = AllocatorStateV1::new(
+        AllocatorRecord::new(1, 0).expect("inode namespace"),
+        AllocatorRecord::new(2, 0).expect("payload namespace"),
+    )
+    .expect("allocator state");
+    engine
+        .local
+        .replace_allocator_state(allocator_state)
+        .expect("persist unit test allocator state");
+    engine
+        .bootstrap_allocator_state()
+        .expect("bootstrap allocator state");
+
+    (dir, engine)
+}
+
+pub(crate) fn reopen_unit_pg_engine_for_test(path: &Path) -> PgMetaEngine {
+    let local = Arc::new(RedbMetaEngine::open_relaxed_with_interval_for_test(
+        path,
+        Duration::from_secs(3600),
+    ));
+    local
+        .set_remote_namespace_visibility_filter(true)
+        .expect("enable remote namespace visibility filter");
+    let engine = unit_pg_engine_from_local(local);
+    engine
+        .bootstrap_allocator_state()
+        .expect("bootstrap allocator state");
+    engine
+}
+
+fn unit_pg_engine_from_local(local: Arc<RedbMetaEngine>) -> PgMetaEngine {
+    let local_version =
+        PgMetaEngine::load_persisted_local_version(&local).expect("read local version");
+    let namespace_version =
+        PgMetaEngine::load_persisted_namespace_version(&local).expect("read namespace version");
+    let flushed_event_seq =
+        PgMetaEngine::load_persisted_flushed_event_seq(&local).expect("read flushed event seq");
+    let flushed_event_seq = if flushed_event_seq == 0 && local_version == 0 {
+        let root_seq = local
+            .get_counter(NEXT_EVENT_SEQ)
+            .expect("read local event cursor");
+        if root_seq <= 2 { root_seq } else { 0 }
+    } else {
+        flushed_event_seq
+    };
 
     let metadata_invalidation_notify = Arc::clone(&local.invalidation_notify);
-    let engine = PgMetaEngine {
+    PgMetaEngine {
         local,
         postgres_url: "postgres://127.0.0.1:1/studiofs".to_string(),
         volume_id: 1,
         client_id: Mutex::new("unit-test".to_string()),
         client_slot_plus_one: AtomicU64::new(0),
-        local_version: AtomicI64::new(0),
-        namespace_version: AtomicI64::new(0),
+        local_version: AtomicI64::new(local_version),
+        namespace_version: AtomicI64::new(namespace_version),
         flushed_event_seq: AtomicU64::new(flushed_event_seq),
         local_event_progress: Mutex::new(LocalEventProgress::default()),
         local_position_lock: Mutex::new(()),
@@ -524,6 +570,8 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         file_lock_cache: Mutex::new(HashMap::new()),
         held_file_locks: Mutex::new(HashMap::new()),
         active_open_inodes: Mutex::new(HashMap::new()),
+        open_handle_inodes: Mutex::new(HashMap::new()),
+        retained_orphan_cursor: AtomicU64::new(0),
         snapshot_import_after_active_open_capture_hook: Mutex::new(None),
         catch_up_fault_hook: Mutex::new(None),
         allocator_bootstrap_hook: Mutex::new(None),
@@ -546,23 +594,7 @@ pub(crate) fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
         remote_identity_validated: AtomicBool::new(true),
         remote_transport_unavailable: AtomicBool::new(false),
         remote_validation_lock: Mutex::new(()),
-    };
-
-    PgMetaEngine::persist_client_slot(&engine.local, 0).expect("persist unit test client slot");
-    let allocator_state = AllocatorStateV1::new(
-        AllocatorRecord::new(1, 0).expect("inode namespace"),
-        AllocatorRecord::new(2, 0).expect("payload namespace"),
-    )
-    .expect("allocator state");
-    engine
-        .local
-        .replace_allocator_state(allocator_state)
-        .expect("persist unit test allocator state");
-    engine
-        .bootstrap_allocator_state()
-        .expect("bootstrap allocator state");
-
-    (dir, engine)
+    }
 }
 
 fn apply_projected_remote_range(

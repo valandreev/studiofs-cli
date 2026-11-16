@@ -469,6 +469,24 @@ impl MetaRecovery for PgMetaEngine {
         self.local.list_deferred_deletes()
     }
 
+    fn finalize_orphan_inode(
+        &self,
+        ino: Ino,
+        deletion_timestamp: i64,
+    ) -> MetaResult<crate::engine::OrphanInodeFinalization> {
+        // Shared authority can still reject an unacknowledged retained child purge.
+        self.mutate_with_hint(
+            |local| {
+                local.finalize_orphan_inode_guarded(
+                    ino,
+                    deletion_timestamp,
+                    Some(&mut Default::default()),
+                )
+            },
+            |_| PendingMutationHint::Unknown,
+        )
+    }
+
     fn recover_pending_creates(&self) -> MetaResult<Vec<Ino>> {
         self.mutate(|local| local.recover_pending_creates())
     }
@@ -486,7 +504,7 @@ impl MetaRecovery for PgMetaEngine {
     }
 
     fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
-        self.mutate(|local| local.recover_undo_logs())
+        self.mutate(|local| local.recover_undo_logs_guarded(true))
     }
 
     fn append_undo_log(&self, record: &UndoLogRecord) -> MetaResult<()> {
@@ -549,6 +567,9 @@ impl MetaAcl for PgMetaEngine {
 }
 
 impl MetaEngine for PgMetaEngine {
+    fn retained_store(&self) -> Option<&dyn crate::trash::MetaRetainedStore> {
+        Some(self)
+    }
     fn snapshot_job_store(&self) -> Option<Arc<dyn crate::snapshot_ports::SnapshotJobStore>> {
         self.self_weak
             .get()

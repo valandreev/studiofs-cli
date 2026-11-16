@@ -608,13 +608,15 @@ impl TryFrom<VfsConfig> for VfsConfigValidated {
     type Error = VfsError;
 
     fn try_from(value: VfsConfig) -> Result<Self, Self::Error> {
+        let transit_override =
+            value.transit_memory_budget_bytes != DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES;
         normalize_vfs_config(
             value,
             CacheRuntimeTuningOverrides {
                 max_dirty_bytes: true,
                 write_eager_flush_batch_bytes: true,
                 upload_cache_io_slots: true,
-                transit_memory_budget_bytes: true,
+                transit_memory_budget_bytes: transit_override,
             },
         )
     }
@@ -1138,5 +1140,50 @@ mod tests {
     fn opportunistic_local_sync_defers_on_write_path() {
         let trigger = write_path_sync_trigger(LocalSyncPolicy::Opportunistic);
         assert_eq!(trigger, None);
+    }
+
+    #[test]
+    fn vfs_config_default_try_from_does_not_force_zero_transit_budget() {
+        let validated: VfsConfigValidated = VfsConfig::default()
+            .try_into()
+            .expect("default VFS config validates");
+        assert!(
+            !validated
+                .cache_runtime_overrides()
+                .transit_memory_budget_bytes,
+            "sentinel 0 transit budget in VfsConfig::default() must stay auto-derived"
+        );
+        let derived = crate::vfs::derive_cache_runtime_tuning(
+            64 * 1024 * 1024,
+            16 * 1024 * 1024,
+            32 * 1024 * 1024,
+        );
+        let resolved = crate::vfs::resolve_cache_runtime_tuning_overrides(
+            derived,
+            &validated,
+            validated.cache_runtime_overrides(),
+        );
+        assert!(
+            resolved.transit_memory_budget_bytes >= CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES,
+            "resolved transit budget must remain usable, got {}",
+            resolved.transit_memory_budget_bytes
+        );
+
+        let custom: VfsConfigValidated = VfsConfig {
+            transit_memory_budget_bytes: 128 * 1024 * 1024,
+            ..VfsConfig::default()
+        }
+        .try_into()
+        .expect("custom VFS config validates");
+        assert!(custom.cache_runtime_overrides().transit_memory_budget_bytes);
+        let custom_resolved = crate::vfs::resolve_cache_runtime_tuning_overrides(
+            derived,
+            &custom,
+            custom.cache_runtime_overrides(),
+        );
+        assert_eq!(
+            custom_resolved.transit_memory_budget_bytes,
+            128 * 1024 * 1024
+        );
     }
 }

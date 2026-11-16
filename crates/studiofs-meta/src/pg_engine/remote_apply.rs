@@ -304,11 +304,20 @@ pub(super) struct ProjectedRemoteBatch {
     pub(super) overlay: OverlayConflictSets,
 }
 
+struct SelfBatchPrepareInput<'a> {
+    batch_version: i64,
+    batch_events: &'a [MetaEvent],
+    pending_self_batches: &'a [Vec<MetaEvent>],
+    flushed_event_seq: u64,
+    next_event_seq: u64,
+}
+
 pub(super) struct RemoteApplyCoordinator<'a> {
     pub(super) local: &'a RedbMetaEngine,
     local_event_ack_barrier: Option<u64>,
     local_event_overlay_exclusions: Vec<LocalEventRange>,
     published_prefixes: Vec<(i64, Vec<LocalEventRange>)>,
+    published_ranges: Vec<LocalEventRange>,
     local_only_completed: Vec<LocalEventRange>,
 }
 
@@ -319,8 +328,15 @@ impl<'a> RemoteApplyCoordinator<'a> {
             local_event_ack_barrier: None,
             local_event_overlay_exclusions: Vec::new(),
             published_prefixes: Vec::new(),
+            published_ranges: Vec::new(),
             local_only_completed: Vec::new(),
         }
+    }
+
+    /// Local journal ranges already committed to PG but not yet acknowledged.
+    pub(super) fn with_published_ranges(mut self, ranges: Vec<LocalEventRange>) -> Self {
+        self.published_ranges = ranges;
+        self
     }
 
     pub(super) fn with_local_event_ack_barrier(mut self, barrier: Option<u64>) -> Self {
@@ -407,12 +423,37 @@ impl<'a> RemoteApplyCoordinator<'a> {
         source_event_indices: Option<&mut Vec<usize>>,
     ) -> ProjectedRemoteBatch {
         let hidden_regular_inodes = Self::hidden_regular_inodes_for_local_events(events);
-        let remote_events =
-            Self::project_local_events(events, &hidden_regular_inodes, source_event_indices);
-        let visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
-        let needs_eager_flush = Self::local_events_need_eager_flush(&remote_events);
         let needs_local_replay =
             Self::local_events_need_serving_replay(events, &hidden_regular_inodes);
+        // A restore's reconstruction names must not be acknowledged as hidden
+        // suffixes before its complete fresh payload set has published.
+        let deleted: HashSet<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                MetaEvent::RemoveAttr { ino } => Some(*ino),
+                _ => None,
+            })
+            .collect();
+        let hidden_namespace = events.iter().any(|event| match event {
+            MetaEvent::AddEntry { entry, .. } | MetaEvent::RenameEntry { entry, .. } => {
+                hidden_regular_inodes.contains(&entry.ino) && !deleted.contains(&entry.ino)
+            }
+            _ => false,
+        });
+        let pending_restore = hidden_namespace
+            && events.iter().any(|event| {
+                matches!(event, MetaEvent::SetXattr { ino, name, value, .. }
+                if name == crate::trash::RETAINED_RECEIPT_XATTR
+                    && RedbMetaEngine::decode_retained_entry(*ino, value).is_ok_and(|entry|
+                        matches!(entry.state, crate::trash::RetainedEntryState::Restored { .. })))
+            });
+        let remote_events = if pending_restore {
+            Vec::new()
+        } else {
+            Self::project_local_events(events, &hidden_regular_inodes, source_event_indices)
+        };
+        let visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
+        let needs_eager_flush = Self::local_events_need_eager_flush(&remote_events);
         let overlay = Self::overlay_conflicts_for_events(&remote_events);
         ProjectedRemoteBatch {
             events: remote_events,
@@ -499,7 +540,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
     fn fold_local_projection_event(state: &mut RegularFileProjectionState, event: &MetaEvent) {
         match event {
             MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
-                state.committed |= attr.committed_content_epoch > 0;
+                state.committed = attr.committed_content_epoch > 0;
                 state.unready |= !Self::regular_file_attr_is_ready_for_serving(attr);
                 // Latest attr wins: a draft rewritten and published in one window is no longer empty.
                 state.empty_draft = attr.is_unpublished_empty_draft();
@@ -607,6 +648,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
     // Publication passes projected events; local-only variants remain non-eager.
     fn local_events_need_eager_flush(events: &[MetaEvent]) -> bool {
         events.iter().any(|event| match event {
+            MetaEvent::SetVolumeSettings { .. } => false,
             MetaEvent::SetAttr { attr } if attr.is_unpublished_empty_draft() => false,
             MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::RemoveRegularFileGraph { .. }
@@ -691,6 +733,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         event: &MetaEvent,
     ) {
         match event {
+            MetaEvent::SetVolumeSettings { .. } => {}
             MetaEvent::SetAttr { attr } => {
                 overlay.attr_inodes.insert(attr.ino);
             }
@@ -714,8 +757,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 displaced_set_attr,
                 displaced_remove_attr_ino,
                 moved_dir_attr,
-                old_parent_attr,
-                new_parent_attr,
+                old_parent_attr: _,
+                new_parent_attr: _,
             } => {
                 overlay.dentry_keys.insert(encode_dentry_key(*parent, name));
                 overlay
@@ -729,12 +772,6 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     overlay.attr_inodes.insert(*ino);
                 }
                 if let Some(attr) = moved_dir_attr.as_ref() {
-                    overlay.attr_inodes.insert(attr.ino);
-                }
-                if let Some(attr) = old_parent_attr.as_ref() {
-                    overlay.attr_inodes.insert(attr.ino);
-                }
-                if let Some(attr) = new_parent_attr.as_ref() {
                     overlay.attr_inodes.insert(attr.ino);
                 }
             }
@@ -856,6 +893,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
 
     pub(super) fn event_has_aux_apply_effect(event: &MetaEvent) -> bool {
         match event {
+            MetaEvent::SetVolumeSettings { .. } => true,
             MetaEvent::RemoveAttr { .. }
             | MetaEvent::RemoveRegularFileGraph { .. }
             | MetaEvent::PublishRegularFileBaseSlices { .. }
@@ -882,6 +920,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         removed_inodes_with_local_regular_file_state: &HashSet<Ino>,
     ) -> bool {
         match event {
+            MetaEvent::SetVolumeSettings { .. } => false,
             MetaEvent::RemoveAttr { ino } => {
                 if overlay.remove_attr_inodes.contains(ino) {
                     return true;
@@ -940,6 +979,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         removed_inodes_with_local_regular_file_state: &HashSet<Ino>,
     ) -> bool {
         match event {
+            MetaEvent::SetVolumeSettings { .. } => false,
             MetaEvent::SetAttr { attr } => {
                 overlay.block_inodes.contains(&attr.ino) || overlay.attr_inodes.contains(&attr.ino)
             }
@@ -1026,6 +1066,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         publish_inodes
             .into_iter()
             .filter(|ino| match ready_sizes.get(ino) {
+                Some(0) => false,
                 Some(committed_size) => !Self::batch_publish_payload_covers_committed_extent(
                     batch_events,
                     *ino,
@@ -1250,6 +1291,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         &self,
         txn: &RedbWriteTransaction<'_>,
         inodes: &HashSet<Ino>,
+        pending_restored_inodes: &HashSet<Ino>,
     ) -> MetaResult<Vec<MetaEvent>> {
         let mut events = Vec::new();
         for ino in inodes {
@@ -1261,7 +1303,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
             if attr.kind != FileType::RegularFile {
                 continue;
             }
-            attr.upload_state = UploadState::Ready;
+            // A pending restore owns a fresh generation which still needs its
+            // normal uploader/finalizer; Ready here would permanently skip it.
+            if !pending_restored_inodes.contains(ino) {
+                attr.upload_state = UploadState::Ready;
+            }
             events.push(MetaEvent::SetAttr { attr });
         }
         Ok(events)
@@ -1790,6 +1836,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 removed_inodes_with_local_regular_file_state.insert(*ino);
             }
         }
+        let pending_restored_inodes = if removed_inodes.is_empty() {
+            HashSet::new()
+        } else {
+            RedbMetaEngine::pending_restored_inodes_in_txn(txn, &overlay.dentry_keys)?
+        };
+        removed_inodes_with_local_regular_file_state
+            .extend(pending_restored_inodes.iter().copied());
         // A publication carries the sender's whole graph, and own history replays onto a rebuilt
         // base in PostgreSQL order, so it replaces base instead of merging as a partial update.
         let partial_publish_inodes = if replays_own_history {
@@ -1898,6 +1951,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let grandfathered_attrs = self.grandfather_removed_local_regular_file_attrs_in_txn(
             txn,
             &removed_inodes_with_local_regular_file_state,
+            &pending_restored_inodes,
         )?;
         if !grandfathered_attrs.is_empty() {
             RedbMetaEngine::apply_replica_serving_state_in_txn(txn, &grandfathered_attrs, false)?;
@@ -1905,6 +1959,11 @@ impl<'a> RemoteApplyCoordinator<'a> {
         let mut aux_events = batch_events
             .iter()
             .filter(|event| {
+                if matches!(event, MetaEvent::RemoveRegularFileGraph { ino }
+                    if pending_restored_inodes.contains(ino))
+                {
+                    return false;
+                }
                 if !Self::event_has_aux_apply_effect(event) {
                     return false;
                 }
@@ -2307,12 +2366,16 @@ impl<'a> RemoteApplyCoordinator<'a> {
     fn prepare_self_batch_in_txn(
         &self,
         txn: &RedbWriteTransaction<'_>,
-        batch_version: i64,
-        batch_events: &[MetaEvent],
-        flushed_event_seq: u64,
-        next_event_seq: u64,
+        input: &SelfBatchPrepareInput<'_>,
         execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<(Option<u64>, HashSet<Ino>)> {
+        let SelfBatchPrepareInput {
+            batch_version,
+            batch_events,
+            pending_self_batches,
+            flushed_event_seq,
+            next_event_seq,
+        } = *input;
         if batch_events.is_empty() || next_event_seq <= flushed_event_seq {
             return Ok((None, HashSet::new()));
         }
@@ -2323,8 +2386,51 @@ impl<'a> RemoteApplyCoordinator<'a> {
             next_event_seq,
             || execution.map_or(Ok(()), RemoteReplayExecution::check),
         )?;
-        let acknowledged = Self::matching_local_prefix(&local_events, batch_events, execution)?
-            .map(|consumed| start.saturating_add(consumed as u64));
+        // After a restart the in-memory retirement is gone; only base proves a loss.
+        let lost = super::retained::lost_terminal_records_in_txn(txn, &local_events)?;
+        let consumed = if pending_self_batches.is_empty() {
+            Self::matching_local_prefix_omitting(&local_events, batch_events, &lost, execution)?
+        } else {
+            let mut matched = None;
+            for skip in 0..=pending_self_batches.len() {
+                if let Some(execution) = execution {
+                    execution.check()?;
+                }
+                if skip == pending_self_batches.len() {
+                    matched = Self::matching_local_prefix_omitting(
+                        &local_events,
+                        batch_events,
+                        &lost,
+                        execution,
+                    )?;
+                } else {
+                    let tail_len: usize = pending_self_batches[skip..]
+                        .iter()
+                        .map(Vec::len)
+                        .sum::<usize>()
+                        .saturating_add(batch_events.len());
+                    if local_events.len() < tail_len {
+                        continue;
+                    }
+                    let mut combined = Vec::with_capacity(tail_len);
+                    for prefix_batch in &pending_self_batches[skip..] {
+                        combined.extend(prefix_batch.iter().cloned());
+                    }
+                    combined.extend(batch_events.iter().cloned());
+                    matched = Self::matching_local_prefix_omitting(
+                        &local_events,
+                        &combined,
+                        &lost,
+                        execution,
+                    )?;
+                }
+                if matched.is_some() {
+                    break;
+                }
+            }
+            matched
+        };
+        let acknowledged = consumed.map(|consumed| start.saturating_add(consumed as u64));
         let boundary = acknowledged.or_else(|| {
             self.published_prefixes
                 .iter()
@@ -2375,6 +2481,23 @@ impl<'a> RemoteApplyCoordinator<'a> {
     pub(super) fn matching_local_prefix(
         local_events: &[MetaEvent],
         batch_events: &[MetaEvent],
+        execution: Option<&RemoteReplayExecution<'_>>,
+    ) -> MetaResult<Option<usize>> {
+        Self::matching_local_prefix_omitting(
+            local_events,
+            batch_events,
+            &BTreeSet::new(),
+            execution,
+        )
+    }
+
+    /// `lost` holds local indices proven to have lost their shared outcome
+    /// (see `retained::lost_terminal_records_in_txn`). No successful self batch
+    /// can carry them, so they are never visible and never compared.
+    pub(super) fn matching_local_prefix_omitting(
+        local_events: &[MetaEvent],
+        batch_events: &[MetaEvent],
+        lost: &BTreeSet<usize>,
         execution: Option<&RemoteReplayExecution<'_>>,
     ) -> MetaResult<Option<usize>> {
         if batch_events.is_empty() || local_events.len() < batch_events.len() {
@@ -2430,8 +2553,9 @@ impl<'a> RemoteApplyCoordinator<'a> {
             };
             let changed_ino = Self::observe_local_projection_event(&mut states, &mut hidden, event);
             let prefix = &local_events[..=index];
-            let mut changed =
-                Self::update_prefix_event_visibility(prefix, index, &hidden, &mut visible);
+            // A lost record is never a dependent, so skipping it here is enough.
+            let mut changed = !lost.contains(&index)
+                && Self::update_prefix_event_visibility(prefix, index, &hidden, &mut visible);
             if let Some(previous) = parent_index {
                 changed |=
                     Self::update_prefix_event_visibility(prefix, previous, &hidden, &mut visible);
@@ -2754,6 +2878,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
         }
         let repair_self_replay_end =
             txn.get_counter(super::LOCAL_PG_REPAIR_SELF_REPLAY_END_COUNTER)?;
+        let mut pending_self = RedbMetaEngine::read_pending_self_replay_in_txn(txn)?;
+        let initial_pending_self_empty = pending_self.batches.is_empty();
+        if pending_self.cursor != context.flushed_event_seq {
+            pending_self.cursor = context.flushed_event_seq;
+            pending_self.batches.clear();
+        }
         for batch in batches {
             if let Some(execution) = execution {
                 execution.check()?;
@@ -2798,10 +2928,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 .then(|| {
                     self.prepare_self_batch_in_txn(
                         txn,
-                        batch.batch_version,
-                        &batch.events,
-                        context.flushed_event_seq,
-                        context.next_event_seq,
+                        &SelfBatchPrepareInput {
+                            batch_version: batch.batch_version,
+                            batch_events: &batch.events,
+                            pending_self_batches: &pending_self.batches,
+                            flushed_event_seq: context.flushed_event_seq,
+                            next_event_seq: context.next_event_seq,
+                        },
                         execution,
                     )
                 })
@@ -2817,6 +2950,49 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     applied_self_batch = true;
                 }
                 _ => {
+                    if !batch.is_self_batch {
+                        let mut reconciled_child_purge = false;
+                        for event in &batch.events {
+                            if let MetaEvent::SetXattr {
+                                ino, name, value, ..
+                            } = event
+                                && name == crate::trash::RETAINED_RECEIPT_XATTR
+                                && let Ok(winner) =
+                                    RedbMetaEngine::decode_retained_entry(*ino, value)
+                                && winner.state != crate::trash::RetainedEntryState::Retained
+                            {
+                                reconciled_child_purge |=
+                                    RedbMetaEngine::reconcile_losing_retained_child_purges_in_txn(
+                                        txn,
+                                        *ino,
+                                        &winner,
+                                        context.flushed_event_seq,
+                                        // A published span is already in PG; its own self batch acknowledges it.
+                                        &|seq| {
+                                            !self
+                                                .published_ranges
+                                                .iter()
+                                                .any(|range| range.start <= seq && seq < range.end)
+                                        },
+                                        false,
+                                        &mut reconcile_dentry_keys,
+                                        &mut reconcile_inodes,
+                                    )?;
+                            }
+                        }
+                        if reconciled_child_purge {
+                            overlay = Self::overlay_conflicts_for_local_range_in_txn(
+                                txn,
+                                context.flushed_event_seq,
+                                replay_next_event_seq,
+                                &self.local_event_overlay_exclusions,
+                                execution,
+                            )?;
+                            overlay
+                                .dentry_keys
+                                .extend(protected_local_bindings.keys().cloned());
+                        }
+                    }
                     let effective_overlay =
                         Self::effective_replay_overlay(&overlay, recent_flush, batch.batch_version);
                     let protected_base_inodes =
@@ -2839,6 +3015,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
                     );
                 }
             }
+            let mut batch_acknowledged = false;
             if let Some((Some(next_flushed_event_seq), _)) = prepared_self_batch
                 && self
                     .local_event_ack_barrier
@@ -2846,7 +3023,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
             {
                 context.flushed_event_seq = next_flushed_event_seq;
                 acknowledged_flushed_event_seq = Some(next_flushed_event_seq);
+                pending_self.cursor = next_flushed_event_seq;
+                pending_self.batches.clear();
                 overlay_is_dirty = true;
+                batch_acknowledged = true;
                 Self::retire_acknowledged_xattr_tombstones_in_txn(
                     txn,
                     &batch.events,
@@ -2879,6 +3059,23 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 }
                 overlay_is_dirty = false;
             }
+            if !batch_acknowledged {
+                if !batch.is_self_batch
+                    || !replay_as_self
+                    || matches!(prepared_self_batch, Some((Some(_), _)))
+                {
+                    pending_self.batches.clear();
+                } else if !batch.events.is_empty() {
+                    const MAX_PENDING_SELF_REPLAY_BATCHES: usize = 64;
+                    if pending_self.batches.len() >= MAX_PENDING_SELF_REPLAY_BATCHES {
+                        pending_self.batches.remove(0);
+                    }
+                    pending_self.batches.push(batch.events);
+                }
+            }
+        }
+        if !initial_pending_self_empty || !pending_self.batches.is_empty() {
+            RedbMetaEngine::write_pending_self_replay_in_txn(txn, &pending_self)?;
         }
         if let Some(execution) = execution {
             execution.check()?;

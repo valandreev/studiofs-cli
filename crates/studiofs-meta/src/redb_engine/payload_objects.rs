@@ -857,7 +857,7 @@ impl RedbMetaEngine {
         Ok(true)
     }
 
-    fn apply_regular_file_overlay_mutation_in_txn(
+    pub(super) fn apply_regular_file_overlay_mutation_in_txn(
         &self,
         txn: &redb::WriteTransaction,
         ino: Ino,
@@ -1028,7 +1028,7 @@ impl RedbMetaEngine {
         Ok((normalized_attr, true))
     }
 
-    fn is_fully_published_regular_file(attr: &InodeAttr) -> bool {
+    pub(super) fn is_fully_published_regular_file(attr: &InodeAttr) -> bool {
         attr.kind == FileType::RegularFile
             && attr.upload_state == UploadState::Ready
             && attr.content_epoch == attr.committed_content_epoch
@@ -1145,6 +1145,9 @@ impl RedbMetaEngine {
 }
 
 impl crate::engine::MetaEngine for RedbMetaEngine {
+    fn retained_store(&self) -> Option<&dyn crate::trash::MetaRetainedStore> {
+        Some(self)
+    }
     fn apply_regular_file_overlay_batch(
         &self,
         mutations: &[crate::engine::RegularFileOverlayMutation],
@@ -1159,6 +1162,106 @@ impl crate::engine::MetaEngine for RedbMetaEngine {
         attr: Option<&InodeAttr>,
     ) -> MetaResult<Option<InodeAttr>> {
         self.flush_regular_file_overlay_slices_with_attr_txn(ino, chunk_slices, attr)
+    }
+}
+
+impl RedbMetaEngine {
+    /// Finalizes an orphaned inode in one write transaction, so the live-binding
+    /// check and the deletion cannot interleave with a reconcile or foreign apply.
+    /// The replicated engine passes `defer_unacknowledged_retained_purge`: a
+    /// retained child purge can still lose to a peer restore until acknowledged.
+    /// One pass over many inodes shares the scan state.
+    pub(crate) fn finalize_orphan_inode_guarded(
+        &self,
+        ino: Ino,
+        deletion_timestamp: i64,
+        defer_unacknowledged_retained_purge: Option<&mut super::UnackedChildPurges>,
+    ) -> MetaResult<crate::engine::OrphanInodeFinalization> {
+        use crate::engine::OrphanInodeFinalization;
+
+        let txn = self.begin_write_txn()?;
+        let deferred = txn
+            .open_table(DEFERRED_DELETES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .get(ino)?
+            .map(|value| decode::<DeferredDeleteRecord>(value.value()))
+            .transpose()?;
+        let live = match Self::get_attr_merged_in_write_txn(&txn, ino) {
+            Ok(attr) => attr.nlink > 0,
+            // Already finalized (a sweep and a last close may both try).
+            Err(MetaError::InodeNotFound(_)) if deferred.is_none() => {
+                return Ok(OrphanInodeFinalization::Removed {
+                    removed_ids: Vec::new(),
+                    freed_bytes: 0,
+                });
+            }
+            Err(MetaError::InodeNotFound(_)) => false,
+            Err(error) => return Err(error),
+        };
+        if live {
+            if deferred.is_some() {
+                Self::remove_deferred_delete_in_txn(&txn, ino)?;
+                txn.commit()
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+            return Ok(OrphanInodeFinalization::Live);
+        }
+        if let Some(unacked) = defer_unacknowledged_retained_purge
+            && deferred.is_some()
+            && Self::unacknowledged_retained_child_purge_in_txn(&txn, unacked, ino)?
+        {
+            return Ok(OrphanInodeFinalization::Deferred);
+        }
+
+        let mut usage = std::collections::BTreeMap::new();
+        for table in [REGULAR_FILE_OVERLAY_TABLE, REGULAR_FILE_BASE_TABLE] {
+            for chunk_state in
+                Self::regular_file_chunk_states_for_inode_in_write_txn(&txn, table, ino)?.values()
+            {
+                for slice in chunk_state.slices.values() {
+                    if let Some(block) = &slice.payload {
+                        record_regular_file_object_usage(&mut usage, block);
+                    }
+                }
+            }
+        }
+        let freed_bytes = usage
+            .values()
+            .fold(0_u64, |acc, bytes| acc.saturating_add(*bytes));
+        let removed_ids: Vec<u64> = usage.into_keys().collect();
+
+        Self::clear_regular_file_graph_in_txn(&txn, ino)?;
+        Self::remove_pending_regular_file_recovery_in_txn(&txn, ino)?;
+        Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
+        Self::append_event_in_txn(
+            &txn,
+            &crate::events::MetaEvent::RemoveRegularFileGraph { ino },
+        )?;
+        fs_ops::NamespaceDeleteTxn::new(&txn)
+            .queue_pending_deletions_in_txn(&removed_ids, deletion_timestamp)?;
+        Self::remove_inode_overlay_in_txn(&txn, ino)?;
+        Self::clear_inode_overlay_aux_in_txn(&txn, ino)?;
+        Self::remove_inode_lifecycle_in_txn(&txn, ino)?;
+        Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveAttr { ino })?;
+        Self::remove_deferred_delete_in_txn(&txn, ino)?;
+        if freed_bytes > 0 {
+            Self::update_counter_in_txn(&txn, counters::USED_SPACE, |current| {
+                Ok(current.saturating_sub(freed_bytes))
+            })?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(OrphanInodeFinalization::Removed {
+            removed_ids,
+            freed_bytes,
+        })
+    }
+
+    fn remove_deferred_delete_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+        txn.open_table(DEFERRED_DELETES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .remove(ino)?;
+        Self::remove_undo_logs_for_in_txn(txn, UndoLogKind::DeferredDelete, ino)
     }
 }
 

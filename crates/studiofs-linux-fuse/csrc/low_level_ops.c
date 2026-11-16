@@ -597,6 +597,13 @@ int studiofs_linux_fuse_notify_inval_inode(struct fuse_session *session,
     return fuse_lowlevel_notify_inval_inode(session, ino, offset, len);
 }
 
+int studiofs_linux_fuse_notify_inval_entry(struct fuse_session *session,
+                                          uint64_t parent,
+                                          const char *name,
+                                          size_t name_len) {
+    return fuse_lowlevel_notify_inval_entry(session, parent, name, name_len);
+}
+
 void studiofs_linux_fuse_dir_file_info_init(struct fuse_file_info *info, uint64_t fh) {
     info->fh = fh;
     info->keep_cache = 1;

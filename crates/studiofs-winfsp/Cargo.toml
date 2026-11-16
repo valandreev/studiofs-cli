@@ -20,6 +20,7 @@ parking_lot.workspace = true
 [dev-dependencies]
 studiofs-data.workspace = true
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 dotenvy.workspace = true
 studiofs-test-support.workspace = true
 

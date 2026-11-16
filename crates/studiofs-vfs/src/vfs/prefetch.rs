@@ -6,13 +6,15 @@ use super::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
-use tracing::info;
+use tracing::{info, warn};
 
 pub(super) const PREFETCH_INGRESS_CAPACITY: usize = 256;
 pub(super) const MAX_PREFETCH_PENDING_HINTS: usize = 8192;
 
 #[derive(Debug, Clone)]
 pub(super) enum PrefetchWorkItem {
+    /// Required by an explicitly authorized restore, independent of read-ahead relevance.
+    RestorePayload(u64),
     ReadHint {
         ino: Ino,
         stream_id: u64,
@@ -300,7 +302,7 @@ impl PrefetchWorker {
                     self.shutdown().await;
                     break;
                 }
-                Some(work_item) = self.prefetch_rx.recv() => {
+                Some(work_item) = self.prefetch_rx.recv(), if self.inflight.len() < self.vfs.prefetch_concurrency.max(1) => {
                     self.enqueue_work_item(work_item);
                 }
                 joined = self.inflight.join_next(), if !self.inflight.is_empty() => {
@@ -377,6 +379,28 @@ impl PrefetchWorker {
         }
 
         let planned = match work_item {
+            PrefetchWorkItem::RestorePayload(object_id) => {
+                // Ingress is bounded by the same owned workers and semaphore as read-ahead.
+                let Ok(permit) = self.prefetch_sem.clone().try_acquire_owned() else {
+                    return;
+                };
+                let vfs = self.vfs.clone();
+                self.inflight.spawn(async move {
+                    let _permit = permit;
+                    let keys = super::format_object_fragment_keys(&vfs.data_prefix, object_id);
+                    // Required by an explicit user restore; must not be dropped by speculative read-ahead skips.
+                    if let Err(error) = vfs.fetch_scheduler.fetch_block(object_id, &keys).await
+                        && !vfs.shutdown_requested()
+                    {
+                        warn!(
+                            object_id,
+                            error = %error,
+                            "restore payload background fetch failed"
+                        );
+                    }
+                });
+                return;
+            }
             PrefetchWorkItem::ReadHint {
                 ino,
                 stream_id,

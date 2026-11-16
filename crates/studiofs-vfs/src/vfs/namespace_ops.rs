@@ -146,7 +146,11 @@ impl StudioVfs {
         Ok(())
     }
 
-    fn reject_runtime_stats_entry_mutation(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+    pub(super) fn reject_runtime_stats_entry_mutation(
+        &self,
+        parent: Ino,
+        name: &[u8],
+    ) -> VfsResult<()> {
         if self.is_runtime_stats_file_name(parent, name) {
             return Err(Self::runtime_stats_access_denied_error());
         }
@@ -227,7 +231,7 @@ impl StudioVfs {
     /// Apply a committed link count change to local attributes that answer
     /// getattr before metadata: dirty writer state and a lingering attr-only
     /// setattr. `ctime` is the committed inode ctime when the inode survives.
-    fn record_committed_link_change(&self, ino: Ino, nlink: u32, ctime: Option<i64>) {
+    pub(super) fn record_committed_link_change(&self, ino: Ino, nlink: u32, ctime: Option<i64>) {
         let apply = |attr: &mut InodeAttr| {
             attr.nlink = nlink;
             if let Some(ctime) = ctime {
@@ -677,10 +681,13 @@ impl StudioVfs {
                                 .file_session
                                 .enter_op(ino, FileSessionOperation::Delete) => session,
                         };
-                        let cleanup = cleanup_vfs.collect_orphan_deleted_inode_cleanup(ino).await?;
-                        cleanup_vfs
-                            .finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
-                            .await;
+                        if let Some(cleanup) =
+                            cleanup_vfs.collect_orphan_deleted_inode_cleanup(ino).await?
+                        {
+                            cleanup_vfs
+                                .finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
+                                .await;
+                        }
                         Ok::<_, VfsError>(())
                     }
                     .await;
@@ -888,7 +895,11 @@ impl StudioVfs {
         Ok(())
     }
 
-    async fn wait_for_deferred_namespace_entry(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+    pub(super) async fn wait_for_deferred_namespace_entry(
+        &self,
+        parent: Ino,
+        name: &[u8],
+    ) -> VfsResult<()> {
         if let Some(attr) = self.deferred_namespace_lookup(parent, name) {
             self.wait_for_deferred_namespace_metadata(attr.ino).await?;
         }
@@ -1521,6 +1532,16 @@ impl StudioVfs {
         result
     }
 
+    fn retained_view_setattr_noop_allowed(args: &SetattrArgs) -> bool {
+        args.size.is_none()
+            && args.mode.is_none()
+            && args.uid.is_none()
+            && args.gid.is_none()
+            && matches!(args.atime, TimeSpec::Omit)
+            && matches!(args.mtime, TimeSpec::Omit)
+            && matches!(args.crtime, TimeSpec::Omit)
+    }
+
     fn setattr_attr_only_deferred_local(
         &self,
         ino: Ino,
@@ -1530,12 +1551,29 @@ impl StudioVfs {
             return Err(Self::runtime_stats_access_denied_error());
         }
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        if let Some(attr) = self.update_ignored_entry(ino, |attr| {
-            if args.apply_attr_only(attr) {
-                attr.touch_ctime();
+        if ino >= super::FIRST_IGNORED_INO {
+            let ignored = self.visible_ignored_entry_snapshot(ino)?;
+            if ignored.view.is_some() {
+                if (self.is_trash_container_ignored_ino(ino) && args.size.is_none())
+                    || Self::retained_view_setattr_noop_allowed(&args)
+                {
+                    return Ok(ignored.attr);
+                }
+                return Err(VfsError::OperationNotSupported);
             }
-        }) {
-            return Ok(attr);
+            return self
+                .update_ignored_entry(ino, |attr| {
+                    if args.apply_attr_only(attr) {
+                        attr.touch_ctime();
+                    }
+                })
+                .ok_or(VfsError::Meta(MetaError::InodeNotFound(ino)));
+        }
+        if self.is_trash_container_ino(ino)? {
+            if args.size.is_none() {
+                return Ok(self.normalize_trash_root_attr(self.attr_only_setattr_base_attr(ino)?));
+            }
+            return Err(VfsError::OperationNotSupported);
         }
 
         let mut attr = self.attr_only_setattr_base_attr(ino)?;
@@ -1628,38 +1666,58 @@ impl StudioVfs {
             return Err(Self::runtime_stats_access_denied_error());
         }
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        if let Some(attr) = self.update_ignored_entry(ino, |attr| {
-            if let Some(new_size) = args.size {
-                if update_mtime && new_size != attr.size && matches!(args.mtime, TimeSpec::Omit) {
-                    attr.touch_mtime();
+        if ino >= super::FIRST_IGNORED_INO {
+            let ignored = self.visible_ignored_entry_snapshot(ino)?;
+            if ignored.view.is_some() {
+                if (self.is_trash_container_ignored_ino(ino) && args.size.is_none())
+                    || Self::retained_view_setattr_noop_allowed(&args)
+                {
+                    return Ok(ignored.attr);
                 }
-                attr.size = new_size;
-                attr.committed_size = new_size;
+                return Err(VfsError::OperationNotSupported);
             }
-            if let Some(mode) = args.mode {
-                attr.mode = mode & 0o7777;
+            return self
+                .update_ignored_entry(ino, |attr| {
+                    if let Some(new_size) = args.size {
+                        if update_mtime
+                            && new_size != attr.size
+                            && matches!(args.mtime, TimeSpec::Omit)
+                        {
+                            attr.touch_mtime();
+                        }
+                        attr.size = new_size;
+                        attr.committed_size = new_size;
+                    }
+                    if let Some(mode) = args.mode {
+                        attr.mode = mode & 0o7777;
+                    }
+                    if let Some(uid) = args.uid {
+                        attr.uid = uid;
+                    }
+                    if let Some(gid) = args.gid {
+                        attr.gid = gid;
+                    }
+                    if let Some(ns) = args.atime.resolve() {
+                        attr.atime = ns;
+                    }
+                    if let Some(ns) = args.mtime.resolve() {
+                        attr.mtime = ns;
+                    }
+                    if let Some(ns) = args.crtime.resolve() {
+                        attr.crtime = ns;
+                    }
+                    if let Some(wa) = args.win_attrs {
+                        attr.win_attrs = wa;
+                    }
+                    attr.touch_ctime();
+                })
+                .ok_or(VfsError::Meta(MetaError::InodeNotFound(ino)));
+        }
+        if self.is_trash_container_ino(ino)? {
+            if args.size.is_none() {
+                return Ok(self.normalize_trash_root_attr(self.attr_only_setattr_base_attr(ino)?));
             }
-            if let Some(uid) = args.uid {
-                attr.uid = uid;
-            }
-            if let Some(gid) = args.gid {
-                attr.gid = gid;
-            }
-            if let Some(ns) = args.atime.resolve() {
-                attr.atime = ns;
-            }
-            if let Some(ns) = args.mtime.resolve() {
-                attr.mtime = ns;
-            }
-            if let Some(ns) = args.crtime.resolve() {
-                attr.crtime = ns;
-            }
-            if let Some(wa) = args.win_attrs {
-                attr.win_attrs = wa;
-            }
-            attr.touch_ctime();
-        }) {
-            return Ok(attr);
+            return Err(VfsError::OperationNotSupported);
         }
 
         let attr = self.attr_only_setattr_base_attr(ino)?;
@@ -2517,6 +2575,35 @@ impl StudioVfs {
     pub(super) fn lookup_component_impl(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
         self.enforce_access(parent, AccessLevel::ReadOnly)?;
         super::validate_name_len(name)?;
+        self.reject_private_store_path(parent, name)?;
+        if parent == super::ROOT_INO
+            && let Some(attr) = self.visible_trash_root(name)?
+        {
+            return Ok(attr);
+        }
+        if self.is_trash_container_ino(parent)? {
+            if let Some(attr) = self.trash_child_attr(parent, name)? {
+                return Ok(attr);
+            }
+            if self.ignored_entry_has_retained_view(parent, name) {
+                self.unlink_ignored_entry(parent, name);
+                self.dentry_cache_insert_negative(parent, name);
+                return Err(Self::ignored_entry_not_found(parent, name));
+            }
+            if let Some(ignored) = self.ignored_entry_lookup(parent, name) {
+                return Ok(ignored.attr);
+            }
+            if parent >= super::FIRST_IGNORED_INO {
+                return Err(Self::ignored_entry_not_found(parent, name));
+            }
+        }
+        if parent >= super::FIRST_IGNORED_INO && self.is_retained_view_ino(parent) {
+            if let Some(attr) = self.trash_subtree_child_attr(parent, name)? {
+                return Ok(attr);
+            }
+            self.unlink_ignored_entry(parent, name);
+            return Err(Self::ignored_entry_not_found(parent, name));
+        }
         if parent == super::ROOT_INO && super::is_probable_trash_component(name) {
             self.heal_dangling_entry_if_inode_missing(parent, name)?;
             self.dentry_cache_insert_negative(parent, name);
@@ -2630,6 +2717,10 @@ impl StudioVfs {
             return Ok((Vec::new(), HashMap::new()));
         }
 
+        if ino == super::ROOT_INO {
+            self.ensure_trash_root_when_enabled()?;
+        }
+
         let meta = self.sync_meta();
         let observed = self.namespace_cache_token_for_parent(ino);
         // Capture pending names before redb: settlement commits there before retiring them.
@@ -2652,12 +2743,19 @@ impl StudioVfs {
             "VFS readdir"
         );
         let mut entries = meta.readdir(ino)?;
-        if ino == super::ROOT_INO {
+        let show_trash_root = if ino == super::ROOT_INO {
+            let show = self.trash_root_is_listed()?;
+            let profile = self.native_trash_profile();
             entries.retain(|entry| {
                 !super::is_blocked_root_macos_metadata(&entry.name)
-                    && !super::is_probable_trash_component(&entry.name)
+                    && (!super::is_probable_trash_component(&entry.name)
+                        || (show && profile.matches_root_name(&entry.name)))
+                    && entry.name.as_slice() != super::retained_views::PRIVATE_STORE_NAME
             });
-        }
+            show
+        } else {
+            false
+        };
 
         let existing_names = entries
             .iter()
@@ -2737,7 +2835,9 @@ impl StudioVfs {
             let now = Instant::now();
             let mut attr_cache = self.state.namespace.attr_read_cache.lock();
             for entry in &entries {
-                if local_attr_inos.contains(&entry.ino) {
+                if local_attr_inos.contains(&entry.ino)
+                    || self.should_bypass_bridge_entry_cache(entry.ino)
+                {
                     attr_cache.remove(entry.ino);
                     continue;
                 }
@@ -2756,6 +2856,28 @@ impl StudioVfs {
                 }
             }
             drop(attr_cache);
+        }
+
+        if ino == super::ROOT_INO {
+            let profile = self.native_trash_profile();
+            if let Some(trash_ino) = self.trash_root_ino()?
+                && let Some(attr) = attrs_by_ino.get_mut(&trash_ino)
+            {
+                *attr = self.normalize_trash_root_attr(attr.clone());
+            }
+            if show_trash_root
+                && !entries
+                    .iter()
+                    .any(|entry| profile.matches_root_name(&entry.name))
+                && let Some(trash_attr) = self.visible_trash_root(&profile.root_name())?
+            {
+                entries.push(DirEntry {
+                    name: profile.root_name(),
+                    ino: trash_attr.ino,
+                    kind: trash_attr.kind,
+                });
+                attrs_by_ino.insert(trash_attr.ino, trash_attr);
+            }
         }
 
         let mut cache_updates: Vec<(Ino, AccessLevel)> = Vec::with_capacity(entries.len());
@@ -2841,12 +2963,72 @@ impl StudioVfs {
     /// The method applies ACL filtering, skips inaccessible entries, drops platform/root
     /// blocked entries when necessary, and hydrates the attribute cache.
     pub fn readdir(&self, ino: Ino) -> VfsResult<Vec<DirEntry>> {
+        self.reject_private_store_dir(ino)?;
+        if let Some(listing) = self.trash_container_listing(ino)? {
+            return Ok(listing
+                .into_iter()
+                .map(|(name, attr)| DirEntry {
+                    name,
+                    ino: attr.ino,
+                    kind: attr.kind,
+                })
+                .collect());
+        }
+        if ino >= super::FIRST_IGNORED_INO
+            && let Some(listing) = self.trash_subtree_listing(ino)?
+        {
+            return Ok(listing
+                .into_iter()
+                .map(|(name, attr)| DirEntry {
+                    name,
+                    ino: attr.ino,
+                    kind: attr.kind,
+                })
+                .collect());
+        }
         let (entries, _) = self.readdir_entries_and_attrs(ino)?;
         Ok(entries)
     }
 
     /// Read directory entries and child attributes from the same metadata batch.
     pub fn readdir_with_attrs(&self, ino: Ino) -> VfsResult<Vec<super::DirEntryWithAttr>> {
+        self.reject_private_store_dir(ino)?;
+        if let Some(listing) = self.trash_container_listing(ino)? {
+            return Ok(listing
+                .into_iter()
+                .map(|(name, attr)| super::DirEntryWithAttr {
+                    entry: DirEntry {
+                        name,
+                        ino: attr.ino,
+                        kind: attr.kind,
+                    },
+                    attr: Some(attr),
+                })
+                .collect());
+        }
+        if ino >= super::FIRST_IGNORED_INO
+            && let Some(listing) = self.trash_subtree_listing(ino)?
+        {
+            return Ok(listing
+                .into_iter()
+                .map(|(name, attr)| super::DirEntryWithAttr {
+                    entry: DirEntry {
+                        name,
+                        ino: attr.ino,
+                        kind: attr.kind,
+                    },
+                    attr: Some(attr),
+                })
+                .collect());
+        }
+        self.readdir_with_attrs_unguarded(ino)
+    }
+
+    /// `readdir_with_attrs` without the private-store guard; only restore copies use it.
+    pub(super) fn readdir_with_attrs_unguarded(
+        &self,
+        ino: Ino,
+    ) -> VfsResult<Vec<super::DirEntryWithAttr>> {
         let (entries, mut attrs_by_ino) = self.readdir_entries_and_attrs(ino)?;
         let deferred = self.state.namespace.deferred.inner.lock();
         Ok(entries
@@ -3018,9 +3200,16 @@ impl StudioVfs {
         self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
         validate_name(new_name)?;
         self.reject_runtime_stats_entry_creation(new_parent, new_name)?;
+        if self.is_retained_view_ino(ino)
+            || self.is_retained_view_ino(new_parent)
+            || self.is_trash_container_ino(ino)?
+            || self.is_trash_container_ino(new_parent)?
+        {
+            return Err(VfsError::OperationNotSupported);
+        }
         if self.should_ignore_regular_file_path(new_parent, new_name) {
             let source_attr = self.getattr(ino)?;
-            let ignored = self.create_ignored_entry(
+            let ignored = self.create_public_ignored_entry(
                 new_parent,
                 new_name,
                 source_attr.uid,
@@ -3120,11 +3309,29 @@ impl StudioVfs {
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
         self.reject_runtime_stats_entry_creation(parent, name)?;
+        if self.is_retained_view_ino(parent) {
+            return Err(VfsError::OperationNotSupported);
+        }
+        if self.is_active_retained_sidecar_name(parent, name)? {
+            return Err(VfsError::Meta(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).into_owned(),
+            }));
+        }
         if self.should_ignore_regular_file_path(parent, name) {
-            let attr =
-                self.create_ignored_entry(parent, name, uid, gid, mode, FileType::RegularFile);
+            let attr = self.create_public_ignored_entry(
+                parent,
+                name,
+                uid,
+                gid,
+                mode,
+                FileType::RegularFile,
+            );
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
+        }
+        if self.is_trash_container_ino(parent)? {
+            return Err(VfsError::OperationNotSupported);
         }
         let attr = self.observe_metadata_commit(|| {
             let ino = self.reserve_namespace_ino()?;
@@ -3195,11 +3402,29 @@ impl StudioVfs {
         self.ensure_no_deferred_namespace_error(parent)?;
         validate_name(name)?;
         self.reject_runtime_stats_entry_creation(parent, name)?;
+        if self.is_retained_view_ino(parent) {
+            return Err(VfsError::OperationNotSupported);
+        }
+        if self.is_active_retained_sidecar_name(parent, name)? {
+            return Err(VfsError::Meta(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).into_owned(),
+            }));
+        }
         if self.should_ignore_regular_file_path(parent, name) {
-            let attr =
-                self.create_ignored_entry(parent, name, uid, gid, mode, FileType::RegularFile);
+            let attr = self.create_public_ignored_entry(
+                parent,
+                name,
+                uid,
+                gid,
+                mode,
+                FileType::RegularFile,
+            );
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
+        }
+        if self.is_trash_container_ino(parent)? {
+            return Err(VfsError::OperationNotSupported);
         }
         self.reject_existing_deferred_or_persisted_entry(parent, name)?;
         self.ensure_deferred_namespace_admission(
@@ -3241,6 +3466,28 @@ impl StudioVfs {
         Ok(attr)
     }
 
+    fn reject_trash_container_mkdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        let Some(role) = self.trash_container_role(parent)? else {
+            return Ok(());
+        };
+        let exists = match role {
+            super::retained_views::TrashContainerRole::LinuxRoot(_) => {
+                name == b"files" || name == b"info" || name == b"expunged"
+            }
+            super::retained_views::TrashContainerRole::MacOsRoot(_) => {
+                matches!(self.native_trash_profile(), super::NativeTrashProfile::MacOs { uid } if name == uid.to_string().as_bytes())
+            }
+            _ => false,
+        };
+        if exists {
+            return Err(VfsError::Meta(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).into_owned(),
+            }));
+        }
+        Err(VfsError::OperationNotSupported)
+    }
+
     /// Create a directory under `parent`.
     ///
     /// Applies name validation, handles ignored-path routing, records namespace
@@ -3259,8 +3506,13 @@ impl StudioVfs {
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
         self.reject_runtime_stats_entry_creation(parent, name)?;
+        if self.is_retained_view_ino(parent) {
+            return Err(VfsError::OperationNotSupported);
+        }
+        self.reject_trash_container_mkdir(parent, name)?;
         if self.should_ignore_directory_path(parent, name) {
-            let attr = self.create_ignored_entry(parent, name, uid, gid, mode, FileType::Directory);
+            let attr =
+                self.create_public_ignored_entry(parent, name, uid, gid, mode, FileType::Directory);
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
         }
@@ -3301,8 +3553,13 @@ impl StudioVfs {
         self.ensure_no_deferred_namespace_error(parent)?;
         validate_name(name)?;
         self.reject_runtime_stats_entry_creation(parent, name)?;
+        if self.is_retained_view_ino(parent) {
+            return Err(VfsError::OperationNotSupported);
+        }
+        self.reject_trash_container_mkdir(parent, name)?;
         if self.should_ignore_directory_path(parent, name) {
-            let attr = self.create_ignored_entry(parent, name, uid, gid, mode, FileType::Directory);
+            let attr =
+                self.create_public_ignored_entry(parent, name, uid, gid, mode, FileType::Directory);
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
         }
@@ -3391,6 +3648,9 @@ impl StudioVfs {
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
         self.reject_runtime_stats_entry_creation(parent, name)?;
+        if self.is_retained_view_ino(parent) || self.is_trash_container_ino(parent)? {
+            return Err(VfsError::OperationNotSupported);
+        }
         self.wait_for_deferred_namespace_create(parent).await?;
         self.symlink_committed(parent, name, target, uid, gid)
     }
@@ -3407,8 +3667,12 @@ impl StudioVfs {
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
         self.reject_runtime_stats_entry_creation(parent, name)?;
+        if self.is_retained_view_ino(parent) || self.is_trash_container_ino(parent)? {
+            return Err(VfsError::OperationNotSupported);
+        }
         if self.should_ignore_regular_file_path(parent, name) {
-            let attr = self.create_ignored_entry(parent, name, uid, gid, 0o777, FileType::Symlink);
+            let attr =
+                self.create_public_ignored_entry(parent, name, uid, gid, 0o777, FileType::Symlink);
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
         }
@@ -3424,9 +3688,17 @@ impl StudioVfs {
 
     /// Read the symlink target bytes for `ino`.
     pub fn readlink(&self, ino: Ino) -> VfsResult<Vec<u8>> {
+        self.reject_private_store_ino(ino)?;
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
-        if matches!(self.ignored_entry_attr(ino), Some(attr) if attr.kind == FileType::Symlink) {
-            return Ok(Vec::new());
+        if ino >= super::FIRST_IGNORED_INO {
+            let ignored = self.visible_ignored_entry_snapshot(ino)?;
+            if ignored.attr.kind == FileType::Symlink {
+                if let Some(source_ino) = self.retained_view_source_ino(&ignored)? {
+                    return Ok(self.sync_meta().get_symlink_target(source_ino)?);
+                }
+                return Ok(Vec::new());
+            }
+            return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
         }
         Ok(self.sync_meta().get_symlink_target(ino)?)
     }
@@ -3443,14 +3715,40 @@ impl StudioVfs {
         self.run_sync_future(self.unlink_inner(parent, name))
     }
 
-    async fn unlink_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<Option<InodeAttr>> {
+    pub(super) async fn unlink_inner(
+        &self,
+        parent: Ino,
+        name: &[u8],
+    ) -> VfsResult<Option<InodeAttr>> {
+        if let Some(receipt) = self.trash_purge_receipt_for(parent, name)? {
+            if let Some(view_attr) = self.trash_child_attr(parent, name)?
+                && view_attr.kind == FileType::Directory
+            {
+                return Err(VfsError::Meta(MetaError::IsADirectory(view_attr.ino)));
+            }
+            self.request_trash_view_purge(receipt)?;
+            self.namespace_mutations()
+                .record_removal(parent, name, std::iter::empty());
+            return Ok(None);
+        }
+        self.reject_private_store_path(parent, name)?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         super::validate_name_len(name)?;
         self.reject_runtime_stats_entry_mutation(parent, name)?;
-        if self.unlink_ignored_entry(parent, name) || self.ignored_dir_attr(parent).is_some() {
+        if parent >= super::FIRST_IGNORED_INO && self.trash_subtree_unlink(parent, name).await? {
             namespace_mutations.record_removal(parent, name, std::iter::empty());
             return Ok(None);
+        }
+        if (self.lookup_public_ignored_entry(parent, name).is_some()
+            && self.unlink_ignored_entry(parent, name))
+            || self.ignored_dir_attr(parent).is_some()
+        {
+            namespace_mutations.record_removal(parent, name, std::iter::empty());
+            return Ok(None);
+        }
+        if parent >= super::FIRST_IGNORED_INO {
+            return Err(Self::ignored_entry_not_found(parent, name));
         }
 
         let meta = self.sync_meta();
@@ -3548,14 +3846,64 @@ impl StudioVfs {
         ))
     }
 
-    async fn rmdir_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<Option<InodeAttr>> {
+    pub(super) async fn rmdir_inner(
+        &self,
+        parent: Ino,
+        name: &[u8],
+    ) -> VfsResult<Option<InodeAttr>> {
         let namespace_mutations = self.namespace_mutations();
-        self.enforce_access(parent, AccessLevel::ReadWrite)?;
         super::validate_name_len(name)?;
         self.reject_runtime_stats_entry_mutation(parent, name)?;
-        if self.unlink_ignored_subtree(parent, name) || self.ignored_dir_attr(parent).is_some() {
+        if let Some(receipt) = self.trash_view_receipt_for(parent, name)? {
+            let Some(view_attr) = self.trash_child_attr(parent, name)? else {
+                return Err(Self::ignored_entry_not_found(parent, name));
+            };
+            if view_attr.kind != FileType::Directory {
+                return Err(VfsError::Meta(MetaError::NotADirectory(view_attr.ino)));
+            }
+            if let Some((_, _, original_parent)) = self.retained_view_subtree_dir(view_attr.ino)? {
+                self.enforce_public_access(original_parent, AccessLevel::ReadWrite)?;
+            }
+            if self
+                .trash_subtree_listing(view_attr.ino)?
+                .is_some_and(|entries| !entries.is_empty())
+            {
+                return Err(VfsError::Meta(MetaError::DirNotEmpty(view_attr.ino)));
+            }
+            self.request_trash_view_purge(receipt)?;
             namespace_mutations.record_removal(parent, name, std::iter::empty());
             return Ok(None);
+        }
+        if matches!(
+            self.trash_container_role(parent)?,
+            Some(super::retained_views::TrashContainerRole::LinuxRoot(_))
+        ) && (name == b"files" || name == b"info" || name == b"expunged")
+        {
+            return Err(VfsError::OperationNotSupported);
+        }
+        if matches!(
+            self.trash_container_role(parent)?,
+            Some(super::retained_views::TrashContainerRole::MacOsRoot(_))
+        ) && matches!(
+            self.native_trash_profile(),
+            super::NativeTrashProfile::MacOs { uid } if name == uid.to_string().as_bytes()
+        ) {
+            return Err(VfsError::OperationNotSupported);
+        }
+        self.enforce_access(parent, AccessLevel::ReadWrite)?;
+        if parent >= super::FIRST_IGNORED_INO && self.trash_subtree_rmdir(parent, name).await? {
+            namespace_mutations.record_removal(parent, name, std::iter::empty());
+            return Ok(None);
+        }
+        if (self.lookup_public_ignored_entry(parent, name).is_some()
+            && self.unlink_ignored_subtree(parent, name))
+            || self.ignored_dir_attr(parent).is_some()
+        {
+            namespace_mutations.record_removal(parent, name, std::iter::empty());
+            return Ok(None);
+        }
+        if parent >= super::FIRST_IGNORED_INO {
+            return Err(Self::ignored_entry_not_found(parent, name));
         }
         // Serialize directory removal with child namespace mutations. A
         // nested rmdir holds this parent gate while it waits for its own
@@ -3678,8 +4026,10 @@ impl StudioVfs {
     /// Atomically rename an entry, optionally replacing an existing destination.
     ///
     /// When replacement is disabled, a destination collision leaves both entries
-    /// unchanged. Destructive trash and filtered-entry renames are unsupported
-    /// in this mode because they do not share the metadata transaction.
+    /// unchanged. Filtered-entry renames are unsupported in this mode because they
+    /// do not share the metadata transaction. A rename into the trash with the
+    /// period at zero deletes the source directly, and refuses only an existing
+    /// trash name.
     pub fn rename(
         &self,
         parent: Ino,
@@ -3697,10 +4047,15 @@ impl StudioVfs {
         ))
     }
 
-    fn reject_nontransactional_no_replace(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
-        // This path never mutates either registry. A lookup is sufficient for
-        // classifying the rejection; it must never authorize a later mutation.
-        let exists = if self.ignored_entry_lookup(parent, name).is_some() {
+    pub(super) fn reject_nontransactional_no_replace(
+        &self,
+        parent: Ino,
+        name: &[u8],
+    ) -> VfsResult<()> {
+        // This path never mutates regular metadata, though hidden generated cache
+        // entries are pruned by `lookup_public_ignored_entry` so they do not
+        // appear as existing targets.
+        let exists = if self.lookup_public_ignored_entry(parent, name).is_some() {
             true
         } else if self.ignored_dir_attr(parent).is_some() {
             false
@@ -3766,6 +4121,7 @@ impl StudioVfs {
                 stack.push((current_ino, entry.name, entry.ino, entry.kind, false));
             }
         }
+        self.cleanup_posix_draft_trashinfo(new_parent, new_name);
         namespace_mutations.record_absent_target(new_parent, new_name);
         info!(
             parent,
@@ -3798,9 +4154,44 @@ impl StudioVfs {
         );
         let namespace_mutations = self.namespace_mutations();
         let meta = self.sync_meta();
+        super::validate_name_len(name)?;
+        if let Some(receipt) = self.trash_view_receipt_for(parent, name)? {
+            self.reject_private_store_path(new_parent, new_name)?;
+            self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
+            // GVFS delete/Empty Trash: `files/<entry>` -> `.Trash-<uid>/expunged/<n>`.
+            if matches!(
+                self.trash_container_role(new_parent)?,
+                Some(super::retained_views::TrashContainerRole::LinuxExpunged(_))
+            ) {
+                self.request_trash_view_purge(receipt)?;
+                // One admitted record: source and `expunged/<n>` both cached absent.
+                namespace_mutations.record_ignored_rename(
+                    parent,
+                    name,
+                    new_parent,
+                    Some(new_name),
+                    std::iter::empty(),
+                );
+                return Ok(());
+            }
+            if self.is_retained_view_ino(new_parent) || self.is_trash_container_ino(new_parent)? {
+                return Err(VfsError::OperationNotSupported);
+            }
+            return self
+                .restore_trash_view_entry(receipt, new_parent, new_name)
+                .await;
+        }
+        // A retried GVFS expunge of an already purged entry is ENOENT, not ENOTSUP.
+        if matches!(
+            self.trash_container_role(new_parent)?,
+            Some(super::retained_views::TrashContainerRole::LinuxExpunged(_))
+        ) {
+            self.lookup(parent, name)?;
+        }
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
-        super::validate_name_len(name)?;
+        self.reject_private_store_path(parent, name)?;
+        self.reject_private_store_path(new_parent, new_name)?;
         if parent == new_parent && name == new_name {
             debug!(
                 parent,
@@ -3815,7 +4206,36 @@ impl StudioVfs {
         validate_name(new_name)?;
         self.reject_runtime_stats_entry_mutation(parent, name)?;
         self.reject_runtime_stats_entry_mutation(new_parent, new_name)?;
-        let source_ignored = self.ignored_entry_lookup(parent, name);
+        let source_ignored = self.lookup_public_ignored_entry(parent, name);
+        let local_sidecar_rename = parent == new_parent
+            && self.is_trash_sidecar_draft(parent, name)
+            && self.is_trash_sidecar_draft(new_parent, new_name)
+            && source_ignored
+                .as_ref()
+                .is_some_and(|entry| entry.view.is_none());
+        if local_sidecar_rename && self.is_active_retained_sidecar_name(new_parent, new_name)? {
+            return Err(VfsError::Meta(MetaError::EntryExists {
+                parent: new_parent,
+                name: String::from_utf8_lossy(new_name).into_owned(),
+            }));
+        }
+        if self.is_retained_view_ino(parent)
+            || self.is_retained_view_ino(new_parent)
+            || (!local_sidecar_rename
+                && (self.is_trash_non_target_container_ino(parent)?
+                    || self.is_trash_non_target_container_ino(new_parent)?))
+        {
+            return Err(VfsError::OperationNotSupported);
+        }
+        if source_ignored
+            .as_ref()
+            .is_some_and(|ignored| ignored.view.is_some())
+        {
+            return Err(VfsError::OperationNotSupported);
+        }
+        if parent >= super::FIRST_IGNORED_INO && source_ignored.is_none() {
+            return Err(Self::ignored_entry_not_found(parent, name));
+        }
         let target_is_ignored = self.should_ignore_regular_file_path(new_parent, new_name)
             || self.should_ignore_directory_path(new_parent, new_name);
         let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
@@ -3831,17 +4251,33 @@ impl StudioVfs {
         };
         let target_is_trash =
             if !replace_if_exists && source_ignored.is_none() && !target_is_ignored {
-                self.directory_has_probable_trash_ancestor(new_parent)?
+                if self.is_posix_trash_move_target_dir(new_parent)? {
+                    true
+                } else {
+                    self.directory_has_probable_trash_ancestor(new_parent)?
+                }
             } else {
                 false
             };
-        if !replace_if_exists && (source_ignored.is_some() || target_is_ignored || target_is_trash)
+        if !replace_if_exists && (source_ignored.is_some() || target_is_ignored) {
+            return self.reject_nontransactional_no_replace(new_parent, new_name);
+        }
+        // Period zero is a direct delete (the OS "do not use the Recycle Bin"
+        // behavior). A fresh trash name is not a collision; an existing one is.
+        if !replace_if_exists
+            && target_is_trash
+            && !self.trash_retention_enabled()?
+            && if new_parent >= super::FIRST_IGNORED_INO {
+                self.trash_child_attr(new_parent, new_name)?.is_some()
+            } else {
+                meta.lookup(new_parent, new_name).is_ok()
+            }
         {
             return self.reject_nontransactional_no_replace(new_parent, new_name);
         }
         if let Some(source) = source_ignored {
             if target_is_ignored && !target_is_ignored_trash {
-                self.create_ignored_entry(
+                self.create_public_ignored_entry(
                     new_parent,
                     new_name,
                     source.attr.uid,
@@ -3947,7 +4383,18 @@ impl StudioVfs {
         self.enforce_no_known_foreign_hard_lock(source_entry.ino)?;
         let source_attr = meta.get_attr(source_entry.ino)?;
         let target_is_trash = target_is_trash
-            || (replace_if_exists && self.directory_has_probable_trash_ancestor(new_parent)?);
+            || (replace_if_exists
+                && (self.is_posix_trash_move_target_dir(new_parent)?
+                    || self.directory_has_probable_trash_ancestor(new_parent)?));
+        if target_is_trash && self.trash_retention_enabled()? {
+            return self.retain_entry_into_trash(
+                &namespace_mutations,
+                parent,
+                name,
+                new_parent,
+                new_name,
+            );
+        }
         if target_is_trash {
             debug!(
                 parent,
@@ -4045,12 +4492,13 @@ impl StudioVfs {
                         .file_session
                         .enter_op(ino, FileSessionOperation::Release)
                         .await;
-                    let cleanup = self.collect_orphan_deleted_inode_cleanup(ino).await?;
-                    // Atomic-save renames must not wait for local payload eviction.
-                    self.finalize_deleted_inode_runtime_cleanup_deferred_cache_eviction(
-                        ino,
-                        cleanup.removed_ids,
-                    );
+                    if let Some(cleanup) = self.collect_orphan_deleted_inode_cleanup(ino).await? {
+                        // Atomic-save renames must not wait for local payload eviction.
+                        self.finalize_deleted_inode_runtime_cleanup_deferred_cache_eviction(
+                            ino,
+                            cleanup.removed_ids,
+                        );
+                    }
                     drop(session);
                     self.state.file_session.gc_if_idle(ino);
                 }
@@ -4526,21 +4974,67 @@ mod tests {
         );
     }
 
+    /// Period 0 refuses a no-replace move onto an existing trash name and keeps the source.
     #[test]
-    fn sfs815_no_replace_preserves_source_for_trash_destination() {
+    fn sfs815_no_replace_preserves_source_for_trash_collision() {
         let tmp = studiofs_test_support::workspace_target_tempdir("sfs815-trash-");
         let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs815-trash");
         let source = meta.create_file(ROOT_INO, b"source", 0, 0, 0o644).unwrap();
         let trash = meta
             .create_dir(ROOT_INO, b"$RECYCLE.BIN", 0, 0, 0o755)
             .unwrap();
+        let existing = meta
+            .create_file(trash.ino, b"destination", 0, 0, 0o644)
+            .unwrap();
 
         assert!(matches!(
             vfs.rename(ROOT_INO, b"source", trash.ino, b"destination", false),
-            Err(VfsError::OperationNotSupported)
+            Err(VfsError::Meta(MetaError::EntryExists { .. }))
         ));
         assert_eq!(meta.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
+        assert_eq!(
+            meta.lookup(trash.ino, b"destination").unwrap().ino,
+            existing.ino
+        );
+    }
+
+    /// Period 0 with a fresh trash name is a direct delete (OS "do not use the Recycle Bin").
+    #[test]
+    fn sfs815_period_zero_fresh_trash_name_is_direct_delete() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("sfs815-direct-");
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs815-direct");
+        meta.create_file(ROOT_INO, b"source", 0, 0, 0o644).unwrap();
+        let trash = meta
+            .create_dir(ROOT_INO, b"$RECYCLE.BIN", 0, 0, 0o755)
+            .unwrap();
+
+        vfs.rename(ROOT_INO, b"source", trash.ino, b"destination", false)
+            .expect("period zero deletes the source");
+        assert!(meta.lookup(ROOT_INO, b"source").is_err());
         assert!(meta.lookup(trash.ino, b"destination").is_err());
+    }
+
+    /// A positive period retains a move into the trash root as one `$R` view.
+    #[test]
+    fn sfs815_positive_period_retains_trash_root_move() {
+        use studiofs_meta::trash::MetaVolumeSettings;
+        let tmp = studiofs_test_support::workspace_target_tempdir("sfs815-retain-");
+        let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs815-retain");
+        meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        meta.create_file(ROOT_INO, b"source", 0, 0, 0o644).unwrap();
+        let trash = meta
+            .create_dir(ROOT_INO, b"$RECYCLE.BIN", 0, 0, 0o755)
+            .unwrap();
+
+        vfs.rename(ROOT_INO, b"source", trash.ino, b"destination", false)
+            .expect("positive period retains the source");
+        assert!(meta.lookup(ROOT_INO, b"source").is_err());
+        let views = vfs.readdir(trash.ino).expect("list trash root");
+        // One receipt projects as a `$R` view and its paired `$I` record.
+        let mut names: Vec<_> = views.iter().map(|entry| entry.name.clone()).collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "one retained pair");
+        assert!(names[0].starts_with(b"$I") && names[1].starts_with(b"$R"));
     }
 
     #[must_use = "bind this guard so the snapshot hook remains armed for the test scope"]

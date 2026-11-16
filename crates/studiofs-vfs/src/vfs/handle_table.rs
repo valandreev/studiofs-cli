@@ -32,6 +32,9 @@ pub(super) struct HandleTable {
     handles: RwLock<HandleTableData>,
     /// Inodes that were unlinked while still open (deferred deletion).
     orphans: Mutex<HashSet<Ino>>,
+    /// Signalled after each close updates the counts. A waiter must arm
+    /// (`notified()` + `enable()`) before it reads the count it waits on.
+    pub(super) closed: tokio::sync::Notify,
 }
 
 impl HandleTable {
@@ -40,6 +43,7 @@ impl HandleTable {
             next_fh: AtomicU64::new(1),
             handles: RwLock::new(HandleTableData::default()),
             orphans: Mutex::new(HashSet::new()),
+            closed: tokio::sync::Notify::new(),
         }
     }
 
@@ -164,6 +168,8 @@ impl HandleTable {
         if counts_for_inode.open == 0 {
             handles.counts.remove(&open_file.ino);
         }
+        // Counts are final under the lock; a waiter re-reads them after waking.
+        self.closed.notify_waiters();
         Some((open_file, remaining, remaining_write))
     }
 

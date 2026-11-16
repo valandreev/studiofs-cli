@@ -1309,6 +1309,7 @@ impl StudioFsContext {
         file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
     ) -> bool {
         if self.vfs.is_runtime_stats_file_ino(handle.ino)
+            || self.vfs.is_generated_trash_record_ino(handle.ino)
             || !self
                 .metadata_cache_policy
                 .allows_read_only_admission(&self.vfs)
@@ -1373,6 +1374,9 @@ impl StudioFsContext {
     }
 
     fn heal_directory_orphans_for_delete(&self, dir_ino: Ino) -> winfsp::Result<usize> {
+        if self.vfs.is_synthesized_ignored_ino(dir_ino) {
+            return Ok(0);
+        }
         let meta = self.vfs.meta();
         let entries = meta
             .readdir(dir_ino)
@@ -2296,10 +2300,16 @@ impl FileSystemContext for StudioFsContext {
         delete_file: bool,
     ) -> winfsp::Result<()> {
         self.ensure_writable()?;
-        if delete_file && self.vfs.is_runtime_stats_file_ino(context.ino) {
+        if !delete_file {
+            return Ok(());
+        }
+        if self.vfs.is_runtime_stats_file_ino(context.ino) {
             return Err(winfsp::FspError::from(STATUS_ACCESS_DENIED));
         }
-        if delete_file && context.is_dir {
+        self.vfs
+            .enforce_retained_view_delete_access(context.ino)
+            .map_err(vfs_to_winfsp_err)?;
+        if context.is_dir {
             let healed_orphans = self.heal_directory_orphans_for_delete(context.ino)?;
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
             debug!(
@@ -2316,7 +2326,12 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
-        trace!(target: "studiofs_winfsp::metadata_baseline::cleanup", "callback entry");
+        trace!(
+            target: "studiofs_winfsp::metadata_baseline::cleanup",
+            ino = context.ino,
+            fh = context.fh,
+            "callback entry"
+        );
         // Current dirty-handle ordering is:
         //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
         //
@@ -2602,6 +2617,15 @@ impl AsyncFileSystemContext for StudioFsContext {
         constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> impl std::future::Future<Output = winfsp::Result<u32>> + Send {
+        trace!(
+            target: "studiofs_winfsp::metadata_baseline::write",
+            ino = context.ino,
+            fh = context.fh,
+            offset,
+            len = buffer.len(),
+            constrained_io,
+            "callback entry"
+        );
         let callback_started = Instant::now();
         let ino = context.ino;
         let fh = context.fh;
@@ -5183,6 +5207,88 @@ mod tests {
         let status = result
             .expect_err("runtime stats delete should be denied")
             .to_ntstatus();
+        assert_eq!(status, STATUS_ACCESS_DENIED.0);
+    }
+
+    #[test]
+    fn set_delete_cancellation_and_access_denial_for_retained_views() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("retained_view_set_delete");
+        vfs.meta()
+            .retained_store()
+            .expect("retained store")
+            .compare_and_set_trash_days(0, 7)
+            .expect("set trash days txn")
+            .expect("set trash days cas");
+        let work = vfs
+            .mkdir(ROOT_INO, b"work", 0, 0, 0o755)
+            .expect("mkdir work");
+        let dir = vfs.mkdir(work.ino, b"dir", 0, 0, 0o755).expect("mkdir dir");
+        let nested = vfs
+            .mkdir(dir.ino, b"nested", 0, 0, 0o755)
+            .expect("mkdir nested");
+        let _b = vfs
+            .create(nested.ino, b"b.txt", 0, 0, 0o644)
+            .expect("create b.txt");
+        let _keep = vfs
+            .create(dir.ino, b"keep.txt", 0, 0, 0o644)
+            .expect("create keep.txt");
+        let _ = vfs.readdir(ROOT_INO).expect("materialize trash root");
+        let trash = vfs
+            .lookup(ROOT_INO, b"$RECYCLE.BIN")
+            .expect("lookup trash root");
+        vfs.rename(work.ino, b"dir", trash.ino, b"$RSETDEL", false)
+            .expect("move dir to trash");
+
+        let r_entry = vfs
+            .readdir(trash.ino)
+            .expect("readdir trash")
+            .into_iter()
+            .find(|e| e.name.starts_with(b"$R"))
+            .expect("$R view entry");
+        let r_name = String::from_utf8(r_entry.name.clone()).expect("utf8 $R name");
+        let r_path = U16CString::from_str(format!(r"\$RECYCLE.BIN\{r_name}")).expect("u16 path");
+        let r_handle = StudioFileHandle::new(r_entry.ino, true, 0, OpenFlags::RDWR);
+
+        let r_nested = vfs.lookup(r_entry.ino, b"nested").expect("lookup nested");
+        vfs.unlink(r_nested.ino, b"b.txt")
+            .expect("unlink nested b.txt");
+        vfs.rmdir(r_entry.ino, b"nested").expect("rmdir nested");
+        assert!(
+            vfs.lookup(r_entry.ino, b"nested").is_err(),
+            "each completed child delete is permanent mid-Clear"
+        );
+
+        // Cancelling the remaining Clear (set_delete(..., false)) keeps the
+        // completed child deletes, like a local disk, and keeps the root retained.
+        <StudioFsContext as FileSystemContext>::set_delete(
+            &ctx,
+            &r_handle,
+            r_path.as_ucstr(),
+            false,
+        )
+        .expect("set_delete(false) should succeed");
+        assert!(
+            vfs.lookup(r_entry.ino, b"nested").is_err(),
+            "delete cancellation must not resurrect a permanently deleted child"
+        );
+        assert_eq!(
+            vfs.lookup(trash.ino, r_name.as_bytes())
+                .expect("cancelled Clear keeps the $R root visible")
+                .ino,
+            r_entry.ino
+        );
+
+        // set_delete(true) must deny when original_parent is ReadOnly instead of reporting DirNotEmpty/Ok.
+        vfs.set_acl_rule(work.ino, "*", studiofs_meta::AccessLevel::ReadOnly)
+            .expect("set work ReadOnly");
+        let status = <StudioFsContext as FileSystemContext>::set_delete(
+            &ctx,
+            &r_handle,
+            r_path.as_ucstr(),
+            true,
+        )
+        .expect_err("set_delete(true) on retained view with ReadOnly original_parent must deny")
+        .to_ntstatus();
         assert_eq!(status, STATUS_ACCESS_DENIED.0);
     }
 

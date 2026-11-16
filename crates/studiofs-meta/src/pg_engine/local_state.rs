@@ -196,13 +196,16 @@ impl PgMetaEngine {
         })
     }
 
-    pub(super) fn reset_local_event_progress_after_state_replacement_locked(&self) {
+    pub(super) fn reset_local_event_progress_after_state_replacement_locked(
+        &self,
+    ) -> MetaResult<()> {
         self.flushed_event_seq.store(0, Ordering::SeqCst);
         *self
             .local_event_progress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             super::LocalEventProgress::default();
+        self.local.clear_pending_self_replay()
     }
 
     pub(super) fn prune_local_event_log_once(&self) -> MetaResult<LocalEventLogPruneBatch> {

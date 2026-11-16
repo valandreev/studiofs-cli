@@ -442,6 +442,18 @@ impl RedbMetaEngine {
         checkpoint: &crate::snapshot::ServingCheckpoint,
     ) -> MetaResult<RedbSnapshot> {
         let mut snapshot = self.export_snapshot()?;
+        if let Some((_, bytes)) = snapshot.settings.iter().find(|(key, _)| key == "format") {
+            crate::decode_format_info(bytes)?;
+        }
+        snapshot.settings.retain(|(key, _)| {
+            key != super::volume_settings::VOLUME_SETTINGS_KEY
+                && key != super::volume_settings::BASE_VOLUME_SETTINGS_KEY
+        });
+        snapshot.settings.push((
+            super::volume_settings::BASE_VOLUME_SETTINGS_KEY.into(),
+            serde_json::to_vec(&checkpoint.volume_settings)
+                .map_err(|error| MetaError::Serialization(error.to_string()))?,
+        ));
         let next_inode = checkpoint
             .inodes
             .iter()
@@ -575,7 +587,9 @@ impl RedbMetaEngine {
         if !preserve_local_state {
             Self::clear_table_in_txn(&txn, PENDING_REGULAR_FILE_COMPACTION_TABLE)?;
         }
-        Self::clear_table_in_txn(&txn, INODE_LIFECYCLE_TABLE)?;
+        if !preserve_event_log {
+            Self::clear_table_in_txn(&txn, INODE_LIFECYCLE_TABLE)?;
+        }
 
         {
             let mut table = txn
@@ -585,6 +599,17 @@ impl RedbMetaEngine {
                 .retain(|_, _| false)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             for (k, v) in &snapshot.settings {
+                if k == super::volume_settings::VOLUME_SETTINGS_KEY
+                    || k == super::volume_settings::BASE_VOLUME_SETTINGS_KEY
+                {
+                    if let Some((_, format)) =
+                        snapshot.settings.iter().find(|(key, _)| key == "format")
+                    {
+                        crate::decode_format_info(format)?;
+                    }
+                    serde_json::from_slice::<crate::trash::VolumeSettings>(v)
+                        .map_err(|error| MetaError::Serialization(error.to_string()))?;
+                }
                 table
                     .insert(k.as_str(), v.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;

@@ -915,6 +915,8 @@ impl StudioVfsAdapter {
             .max(1)
             .min(u32::MAX as usize)
             .min(Semaphore::MAX_PERMITS) as u32;
+        let mount_uid = current_uid();
+        vfs.set_native_trash_profile(studiofs_vfs::NativeTrashProfile::MacOs { uid: mount_uid });
         Self {
             vfs,
             runtime_handle,
@@ -922,7 +924,7 @@ impl StudioVfsAdapter {
             namespace_reply_shutdown: CancellationToken::new(),
             read_only,
             available_memory,
-            mount_uid: current_uid(),
+            mount_uid,
             mount_gid: current_gid(),
             directory_handles: ParkingMutex::new(HashMap::new()),
             next_directory_handle: AtomicU64::new(1),
@@ -946,6 +948,14 @@ impl StudioVfsAdapter {
             runtime_stats_handles: Arc::new(ParkingMutex::new(HashMap::new())),
             #[cfg(test)]
             symlink_deferred_wait_entered: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub(crate) fn entry_ttl(&self, ino: u64) -> f64 {
+        if self.vfs.should_bypass_bridge_entry_cache(ino) {
+            0.0
+        } else {
+            TTL_SECONDS
         }
     }
 
@@ -1425,7 +1435,18 @@ impl StudioVfsAdapter {
         open_result: VfsResult<u64>,
     ) -> Result<OpenReply, i32> {
         let fh = open_result.map_err(|error| vfs_err_to_errno(&error))?;
-        let policy = if flag_policy.write_capable {
+        let policy = if self.vfs.is_generated_trash_record_ino(ino) {
+            let _ = self
+                .vfs
+                .prepare_os_cache_open(fh, OsCacheParticipation::Disabled);
+            #[cfg(test)]
+            self.shared.open_cache_snapshots.lock().pop(&ino);
+            MacFuseOpenCachePolicy {
+                direct_io: true,
+                keep_cache: false,
+                write_capable: flag_policy.write_capable,
+            }
+        } else if flag_policy.write_capable {
             let decision = self
                 .vfs
                 .prepare_os_cache_open(fh, OsCacheParticipation::Enabled);
@@ -1459,6 +1480,18 @@ impl StudioVfsAdapter {
         fh: u64,
         available_memory: Option<u64>,
     ) -> MacFuseOpenCachePolicy {
+        if self.vfs.is_generated_trash_record_ino(ino) {
+            let _ = self
+                .vfs
+                .prepare_os_cache_open(fh, OsCacheParticipation::Disabled);
+            #[cfg(test)]
+            self.shared.open_cache_snapshots.lock().pop(&ino);
+            return MacFuseOpenCachePolicy {
+                direct_io: true,
+                keep_cache: false,
+                write_capable: false,
+            };
+        }
         let attr = self.vfs.getattr(ino).ok();
         let participation = if attr.is_some() {
             OsCacheParticipation::Enabled
@@ -1645,7 +1678,8 @@ impl StudioVfsAdapter {
                         "macFUSE symlink callback created entry"
                     );
                     let stat = adapter.attr_to_stat(&attr);
-                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let ttl = adapter.entry_ttl(attr.ino);
+                    let entry = Entry::new(attr.ino, 0, stat, ttl, ttl);
                     let _ = Reply::new(request).entry(&entry);
                 }
                 Err(errno) => {
@@ -3756,8 +3790,9 @@ macfuse_callback! {
         match state.adapter.lookup(parent, name) {
             Ok(attr) => {
                 let stat = state.adapter.attr_to_stat(&attr);
+                let ttl = state.adapter.entry_ttl(attr.ino);
                 if let Some(request) = pending.take() {
-                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let entry = Entry::new(attr.ino, 0, stat, ttl, ttl);
                     let _ = Reply::new(request).entry(&entry);
                 }
             }
@@ -3800,7 +3835,7 @@ macfuse_callback! {
         match state.adapter.getattr(ino) {
             Ok(attr) => {
                 if let Some(request) = pending.take() {
-                    let _ = Reply::new(request).attr(&attr, TTL_SECONDS);
+                    let _ = Reply::new(request).attr(&attr, state.adapter.entry_ttl(ino));
                 }
             }
             Err(errno) => {
@@ -3839,8 +3874,9 @@ macfuse_callback! {
                     "macFUSE mkdir callback created entry"
                 );
                 let stat = state.adapter.attr_to_stat(&attr);
+                let ttl = state.adapter.entry_ttl(attr.ino);
                 if let Some(request) = pending.take() {
-                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let entry = Entry::new(attr.ino, 0, stat, ttl, ttl);
                     let _ = Reply::new(request).entry(&entry);
                 }
             }
@@ -3911,8 +3947,9 @@ macfuse_callback! {
                     "macFUSE mknod callback created entry"
                 );
                 let stat = state.adapter.attr_to_stat(&attr);
+                let ttl = state.adapter.entry_ttl(attr.ino);
                 if let Some(request) = pending.take() {
-                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let entry = Entry::new(attr.ino, 0, stat, ttl, ttl);
                     let _ = Reply::new(request).entry(&entry);
                 }
             }
@@ -3961,8 +3998,9 @@ macfuse_callback! {
                     "macFUSE create callback created entry"
                 );
                 let stat = state.adapter.attr_to_stat(&attr);
+                let ttl = state.adapter.entry_ttl(attr.ino);
                 if let Some(request) = pending.take() {
-                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let entry = Entry::new(attr.ino, 0, stat, ttl, ttl);
                     if let Err(error) = Reply::new(request).create(&entry, open) {
                         warn!(
                             ino = attr.ino,
@@ -4100,8 +4138,9 @@ macfuse_callback! {
         match state.adapter.link(ino, newparent, newname) {
             Ok(attr) => {
                 let stat = state.adapter.attr_to_stat(&attr);
+                let ttl = state.adapter.entry_ttl(attr.ino);
                 if let Some(request) = pending.take() {
-                    let entry = Entry::new(attr.ino, 0, stat, TTL_SECONDS, TTL_SECONDS);
+                    let entry = Entry::new(attr.ino, 0, stat, ttl, ttl);
                     let _ = Reply::new(request).entry(&entry);
                 }
             }
@@ -4381,7 +4420,7 @@ fn setattr_callback(
             {
                 Ok(stat) => {
                     if let Some(request) = pending.take() {
-                        let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                        let _ = Reply::new(request).attr(&stat, state.adapter.entry_ttl(ino));
                     }
                 }
                 Err(errno) => {
@@ -4416,7 +4455,7 @@ fn setattr_callback(
     {
         Ok(stat) => {
             if let Some(request) = pending.take() {
-                let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                let _ = Reply::new(request).attr(&stat, state.adapter.entry_ttl(ino));
             }
         }
         Err(errno) => {
@@ -4487,7 +4526,7 @@ fn setattr_x_callback(
     ) {
         Ok(stat) => {
             if let Some(request) = pending.take() {
-                let _ = Reply::new(request).attr(&stat, TTL_SECONDS);
+                let _ = Reply::new(request).attr(&stat, state.adapter.entry_ttl(ino));
             }
         }
         Err(errno) => {
@@ -5093,6 +5132,7 @@ async fn acquire_read_admission<'a>(
 mod tests {
     use super::*;
     use studiofs_meta::engine::XATTR_REPLACE_FLAG;
+    use studiofs_meta::trash::MetaVolumeSettings;
     use studiofs_vfs::contract_harness::ContractVfsFixture;
 
     fn file_flags_fixture_file(name: &str) -> (ContractVfsFixture, StudioVfsAdapter, InodeAttr) {
@@ -6446,5 +6486,48 @@ mod tests {
         assert_eq!(xattr_size_from_position(value.len(), value.len() + 8), 0);
         assert_eq!(xattr_value_from_position(value, 9), b"fork-payload");
         assert_eq!(xattr_value_from_position(value, value.len() + 8), b"");
+    }
+
+    #[test]
+    fn macfuse_adapter_configures_macos_profile_and_zero_ttl_for_trash_containers() {
+        let fixture = ContractVfsFixture::new("macfuse-macos-trash").expect("create VFS fixture");
+        fixture
+            .meta()
+            .compare_and_set_trash_days(0, 7)
+            .unwrap()
+            .unwrap();
+        let adapter = StudioVfsAdapter::new_with_read_queue_byte_limit_for_test(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            1024 * 1024,
+        );
+        let expected_uid = current_uid();
+        assert_eq!(
+            adapter.vfs.native_trash_profile(),
+            studiofs_vfs::NativeTrashProfile::MacOs { uid: expected_uid }
+        );
+
+        let trashes = adapter.lookup(ROOT_INO, b".Trashes").unwrap();
+        let user_dir = adapter
+            .lookup(trashes.ino, expected_uid.to_string().as_bytes())
+            .unwrap();
+        assert_eq!(adapter.entry_ttl(trashes.ino), 0.0);
+        assert_eq!(adapter.entry_ttl(user_dir.ino), 0.0);
+
+        let file = adapter
+            .vfs
+            .create(
+                ROOT_INO,
+                b"clip.mov",
+                expected_uid,
+                adapter.mount_gid,
+                0o644,
+            )
+            .unwrap();
+        assert_eq!(adapter.entry_ttl(file.ino), TTL_SECONDS);
+        adapter
+            .rename(ROOT_INO, b"clip.mov", user_dir.ino, b"clip.mov")
+            .unwrap();
+        assert!(adapter.lookup(user_dir.ino, b"clip.mov").is_ok());
     }
 }

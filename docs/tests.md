@@ -1456,6 +1456,58 @@ to converge and read both files. It restarts PostgreSQL even when the outage
 phase fails. The summary artifact is `concurrent-mkdir-merge-summary.json`; see
 ADR 0012 for the merge rule it checks.
 
+`mounted-recoverable-trash-two-client` is a focused Linux GIO/FUSE acceptance
+with real PostgreSQL/S3 and two independent local metadata/cache roots. It
+checks shared retained file/directory listing, exact peer bytes after writer
+shutdown and peer restart, peer restore and recursive Clear, then writer
+remount convergence. It captures the original file's real inode before GIO,
+creates an outside hardlink, and verifies both restored and alias names retain
+that inode, `nlink=2` and exact bytes on the restoring peer and remounted writer.
+The synthetic trash-view inode is not the identity oracle. The peer performs
+only metadata checks before its first retained payload read, including for the
+outside alias. It waits for peer receipt publication before shutdown;
+GIO completion alone is a local commit, not a remote publication barrier.
+`trash-summary.json` records the exact payload hashes and accepted phases.
+It does not exercise desktop `trash:///`, crash recovery, remote-only restore
+retry UX or actual janitor GC.
+
+Example from the current checkout in WSL (build artifacts stay under `target/`,
+while the runner's owned mounts/cache/client roots use ext4):
+
+```bash
+export CARGO_TARGET_DIR="$PWD/target/posix-linux"
+cargo build -p studiofs -p studiofs-e2e
+NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
+  "$CARGO_TARGET_DIR/debug/studiofs-e2e" run mounted-recoverable-trash-two-client \
+  --studiofs-bin "$CARGO_TARGET_DIR/debug/studiofs" --platform linux-fuse \
+  --root /tmp/studiofs-trash-e2e --retain always --infra compose
+```
+
+The registered Linux durability probes use the same runner and owned Compose
+services. Run each name separately with the command above:
+
+- `mounted-recoverable-trash-cold-bootstrap` publishes file/directory restores
+  and a retained file, unmounts both warm clients, then discovers the volume in
+  an entirely new metadata/cache directory. It checks exact bytes, names,
+  receipt paths and attributes, and requires the new client's S3 GET counter
+  to increase from zero. This is a cold bootstrap test, not a crash test.
+- `mounted-recoverable-trash-durability` stops its owned PostgreSQL and S3
+  before creating locally fsynced payloads and GIO receipts, proves pending
+  journal state and peer absence, kills the writer, and attempts an offline
+  reopen of the same metadata/cache. This currently exposes the existing
+  PostgreSQL requirement of redb graph repair after an unclean shutdown.
+- `mounted-recoverable-trash-s3-crash-replay` keeps PostgreSQL available for
+  graph repair while its owned S3 remains stopped. It checks no receipt event
+  reached shared authority before the kill, then exact retained bytes and
+  receipts after reopening. Its restore phase currently exposes a base
+  `receipt/data` binding hidden by the namespace visibility filter after repair;
+  the underlying attr/lifecycle cause is still under diagnosis. Retained reads do not
+  establish successful restore or later peer publication.
+
+The latter two probes are retained failing regressions, not accepted durability
+coverage. See the living recoverable-trash ExecPlan for exact run artifacts and
+the outstanding repair boundaries. None changes host networking or host trash.
+
 SFS-438 mounted runner lifecycle smoke for local operator validation:
 
 ```powershell

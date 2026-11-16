@@ -838,6 +838,12 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
     local.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, local_event_start)
         .unwrap();
     local.set_counter("pgClientSlotPlusOne", 8).unwrap();
+    local
+        .set_counter(
+            crate::pg_engine::LOCAL_PG_RETAINED_RESTORE_OWNER_COUNTER,
+            77,
+        )
+        .unwrap();
     local.set_counter(counters::NEXT_INODE, 50_000).unwrap();
     let local_event_end = local.get_counter(NEXT_EVENT_SEQ).unwrap();
 
@@ -858,6 +864,12 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
     source.set_counter("pgLastAppliedBatchVersion", 12).unwrap();
     source.set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, 99).unwrap();
     source.set_counter("pgClientSlotPlusOne", 99).unwrap();
+    source
+        .set_counter(
+            crate::pg_engine::LOCAL_PG_RETAINED_RESTORE_OWNER_COUNTER,
+            99,
+        )
+        .unwrap();
     let snapshot = source.export_snapshot().unwrap();
 
     local
@@ -886,6 +898,12 @@ fn import_remote_snapshot_preserving_local_state_keeps_local_overlay_and_event_l
     );
     assert_eq!(local.get_counter(LOCAL_PG_FLUSHED_EVENT_SEQ).unwrap(), local_event_start);
     assert_eq!(local.get_counter("pgClientSlotPlusOne").unwrap(), 8);
+    assert_eq!(
+        local
+            .get_counter(crate::pg_engine::LOCAL_PG_RETAINED_RESTORE_OWNER_COUNTER)
+            .unwrap(),
+        77
+    );
     assert_eq!(local.get_counter("pgLastAppliedBatchVersion").unwrap(), 12);
 }
 

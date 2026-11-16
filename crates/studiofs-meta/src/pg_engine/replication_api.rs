@@ -97,6 +97,20 @@ impl MetaReplication for PgMetaEngine {
         }
     }
 
+    fn note_open_handle(&self, ino: Ino, open: bool) {
+        if let Ok(mut handles) = self.open_handle_inodes.lock() {
+            let count = handles.entry(ino).or_insert(0);
+            *count = if open {
+                count.saturating_add(1)
+            } else {
+                count.saturating_sub(1)
+            };
+            if *count == 0 {
+                handles.remove(&ino);
+            }
+        }
+    }
+
     fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()> {
         let _ = self.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)?;
         Ok(())

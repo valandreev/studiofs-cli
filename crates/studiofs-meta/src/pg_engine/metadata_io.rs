@@ -66,7 +66,7 @@ fn try_descriptor_from_row(row: &tokio_postgres::Row) -> MetaResult<BootstrapChe
     })
 }
 
-async fn read_bootstrap_checkpoint_and_decode_with_pool(
+pub(super) async fn read_bootstrap_checkpoint_and_decode_with_pool(
     command_pool: Arc<runtime::PgConnectionPool>,
     volume_id: i64,
     command_timeout: std::time::Duration,
@@ -486,7 +486,7 @@ impl PgMetaEngine {
         match import_mode {
             StartupSnapshotImportMode::ReplaceLocalState => {
                 self.local.import_serving_checkpoint(checkpoint)?;
-                self.reset_local_event_progress_after_state_replacement_locked();
+                self.reset_local_event_progress_after_state_replacement_locked()?;
             }
             StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog => {
                 self.local
@@ -569,6 +569,14 @@ impl PgMetaEngine {
         events: Vec<MetaEvent>,
         oversized_event_index: &mut Option<usize>,
     ) -> MetaResult<i64> {
+        if events
+            .iter()
+            .any(|event| matches!(event, MetaEvent::SetVolumeSettings { .. }))
+        {
+            return Err(MetaError::Storage(
+                "volume settings require the online authoritative compare-and-set".into(),
+            ));
+        }
         if events.is_empty() {
             return Ok(self.local_version.load(Ordering::SeqCst));
         }
@@ -576,6 +584,7 @@ impl PgMetaEngine {
         self.ensure_remote_format_validated()?;
 
         let client_id = self.current_client_id()?;
+        let retained_digest = super::retained::publication_digest(&client_id, &events)?;
         let batches = Self::split_projected_event_batches(
             events,
             &client_id,
@@ -605,7 +614,26 @@ impl PgMetaEngine {
                         .map_err(|e| Self::classify_pg_error("postgres begin tx failed", e))?;
 
                     let mut last_batch_version = None;
+                    let mut retained_locked = std::collections::HashMap::new();
                     let mut last_observation = None;
+                    if let Some(digest) = &retained_digest {
+                        // Serialize receipt lookup with publication. A lost response
+                        // retries the whole transaction without replaying namespace data.
+                        let row = tx.query_one(
+                            &format!("{} FOR UPDATE", sql::SELECT_CHECKPOINT_FRESHNESS),
+                            &[&volume_id],
+                        ).await.map_err(|e| Self::classify_pg_error("lock retained publication", e))?;
+                        crate::ensure_supported_pg_sync_format_version(row.get::<_, Option<i16>>(6))?;
+                        if let Some(receipt) = tx.query_opt(
+                            "SELECT version FROM trash_publication_receipts WHERE vol=$1 AND digest=$2",
+                            &[&volume_id, digest],
+                        ).await.map_err(|e| Self::classify_pg_error("read retained publication receipt", e))? {
+                            let observation = checkpoint_freshness_observation_from_row(&row)?;
+                            let version = receipt.get::<_, i64>(0);
+                            tx.commit().await.map_err(|e| Self::classify_pg_error("commit retained publication retry", e))?;
+                            return Ok((version, observation));
+                        }
+                    }
                     for batch in batches {
                         let batch_version_row = tx
                             .query_opt(
@@ -650,6 +678,8 @@ impl PgMetaEngine {
                         let batch_observation =
                             checkpoint_freshness_observation_from_row(&batch_version_row)?;
                         last_observation = Some(batch_observation);
+
+                        super::retained::apply_retained_authority(&tx, volume_id, &batch.events, true, &mut retained_locked).await?;
 
                         for (event_chunk, payload_chunk) in batch
                             .events
@@ -736,6 +766,12 @@ impl PgMetaEngine {
                     })?;
 
                     let channel = Self::metadata_notify_channel(volume_id);
+                    if let Some(digest) = &retained_digest {
+                        tx.execute(
+                            "INSERT INTO trash_publication_receipts(vol,digest,version) VALUES($1,$2,$3)",
+                            &[&volume_id, digest, &last_batch_version],
+                        ).await.map_err(|e| Self::classify_pg_error("record retained publication receipt", e))?;
+                    }
                     let _ = tx
                         .execute(
                             "SELECT pg_notify($1, $2)",
@@ -765,6 +801,71 @@ impl PgMetaEngine {
         result.map(|(version, _)| version)
     }
 
+    fn projected_child_purge_group_len(events: &[MetaEvent], start: usize) -> usize {
+        let Some(MetaEvent::SetXattr {
+            ino, name, value, ..
+        }) = events.get(start)
+        else {
+            return 1;
+        };
+        if name != crate::trash::RETAINED_RECEIPT_XATTR {
+            return 1;
+        }
+        let Ok(entry) = crate::redb_engine::RedbMetaEngine::decode_retained_entry(*ino, value)
+        else {
+            return 1;
+        };
+        if entry.state != crate::trash::RetainedEntryState::Retained {
+            return 1;
+        }
+        let receipt = entry.receipt;
+        let Some(tail) = events.get(start + 1..) else {
+            return 1;
+        };
+        match tail {
+            [
+                MetaEvent::SetAttr { attr: p_attr },
+                MetaEvent::RemoveAttr { ino: c_ino },
+                MetaEvent::RemoveEntry { parent, .. },
+                ..,
+            ] if p_attr.kind == crate::FileType::Directory
+                && *parent == p_attr.ino
+                && *c_ino != receipt =>
+            {
+                4
+            }
+            [
+                MetaEvent::RemoveEntry { parent, .. },
+                MetaEvent::SetAttr { attr: c_attr },
+                MetaEvent::SetAttr { attr: p_attr },
+                ..,
+            ] if *parent == p_attr.ino
+                && p_attr.kind == crate::FileType::Directory
+                && c_attr.ino != *parent =>
+            {
+                4
+            }
+            [
+                MetaEvent::RemoveEntry { parent, .. },
+                MetaEvent::RemoveAttr { .. },
+                MetaEvent::SetAttr { attr: p_attr },
+                ..,
+            ] if *parent == p_attr.ino && p_attr.kind == crate::FileType::Directory => 4,
+            [
+                MetaEvent::RemoveEntry { parent, .. },
+                MetaEvent::PublishRegularFileBaseSlices { ino: c1, .. },
+                MetaEvent::SetAttr { attr: c2 },
+                ..,
+            ] if *c1 == c2.ino && *parent != receipt => 4,
+            [
+                MetaEvent::PublishRegularFileBaseSlices { ino: c1, .. },
+                MetaEvent::SetAttr { attr: c2 },
+                ..,
+            ] if *c1 == c2.ino => 3,
+            _ => 1,
+        }
+    }
+
     fn split_projected_event_batches(
         events: Vec<MetaEvent>,
         client_id: &str,
@@ -778,23 +879,51 @@ impl PgMetaEngine {
         let mut batch_response_bytes = 0_i64;
         let mut batch_payload_bytes = 0_i64;
 
-        for (event_index, event) in events.into_iter().enumerate() {
-            let payload = encode_event(&event)?;
-            let payload_len = i64::try_from(payload.len()).map_err(|_| {
-                MetaError::Storage("event payload length exceeds BIGINT".to_string())
-            })?;
-            let event_response_bytes =
-                encoded_event_response_bytes(event.kind(), payload.len(), client_id)?;
-            if event_response_bytes > max_response_bytes {
+        let mut event_index = 0usize;
+        while event_index < events.len() {
+            let group_len = Self::projected_child_purge_group_len(&events, event_index);
+            let mut group_encoded = Vec::with_capacity(group_len);
+            let mut group_response_bytes = 0_i64;
+            let mut group_payload_bytes = 0_i64;
+            for offset in 0..group_len {
+                let idx = event_index + offset;
+                let event = &events[idx];
+                let payload = encode_event(event)?;
+                let payload_len = i64::try_from(payload.len()).map_err(|_| {
+                    MetaError::Storage("event payload length exceeds BIGINT".to_string())
+                })?;
+                let event_response_bytes =
+                    encoded_event_response_bytes(event.kind(), payload.len(), client_id)?;
+                if event_response_bytes > max_response_bytes {
+                    *oversized_event_index = Some(idx);
+                    return Err(MetaError::EventTooLarge {
+                        estimated: event_response_bytes,
+                        limit: max_response_bytes,
+                    });
+                }
+                group_response_bytes = group_response_bytes
+                    .checked_add(event_response_bytes)
+                    .ok_or_else(|| {
+                        MetaError::Storage("event response size exceeds BIGINT".to_string())
+                    })?;
+                group_payload_bytes =
+                    group_payload_bytes
+                        .checked_add(payload_len)
+                        .ok_or_else(|| {
+                            MetaError::Storage("event payload size exceeds BIGINT".to_string())
+                        })?;
+                group_encoded.push(payload);
+            }
+            if group_response_bytes > max_response_bytes {
                 *oversized_event_index = Some(event_index);
                 return Err(MetaError::EventTooLarge {
-                    estimated: event_response_bytes,
+                    estimated: group_response_bytes,
                     limit: max_response_bytes,
                 });
             }
 
             let would_exceed = batch_response_bytes
-                .checked_add(event_response_bytes)
+                .checked_add(group_response_bytes)
                 .is_none_or(|bytes| bytes > max_response_bytes);
             if !batch_events.is_empty() && would_exceed {
                 batches.push(EncodedRemoteEventBatch {
@@ -807,18 +936,20 @@ impl PgMetaEngine {
             }
 
             batch_response_bytes = batch_response_bytes
-                .checked_add(event_response_bytes)
+                .checked_add(group_response_bytes)
                 .ok_or_else(|| {
                     MetaError::Storage("event response size exceeds BIGINT".to_string())
                 })?;
-            batch_payload_bytes =
-                batch_payload_bytes
-                    .checked_add(payload_len)
-                    .ok_or_else(|| {
-                        MetaError::Storage("event payload size exceeds BIGINT".to_string())
-                    })?;
-            batch_events.push(event);
-            batch_payloads.push(payload);
+            batch_payload_bytes = batch_payload_bytes
+                .checked_add(group_payload_bytes)
+                .ok_or_else(|| {
+                    MetaError::Storage("event payload size exceeds BIGINT".to_string())
+                })?;
+            for (offset, payload) in group_encoded.into_iter().enumerate() {
+                batch_events.push(events[event_index + offset].clone());
+                batch_payloads.push(payload);
+            }
+            event_index += group_len;
         }
 
         if !batch_events.is_empty() {

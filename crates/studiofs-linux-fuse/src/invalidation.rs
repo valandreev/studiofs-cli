@@ -385,9 +385,15 @@ pub(crate) struct FuseInvalidationQueueClosed;
 
 struct FuseInvalidationQueueState {
     closed: bool,
-    order: VecDeque<u64>,
-    pending: HashMap<u64, PendingInvalidation>,
+    order: VecDeque<FuseInvalidationTarget>,
+    pending: HashMap<FuseInvalidationTarget, PendingInvalidation>,
     waiting_producers: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum FuseInvalidationTarget {
+    Inode(u64),
+    Entry { parent: u64, name: Vec<u8> },
 }
 
 struct PendingInvalidation {
@@ -499,12 +505,35 @@ impl FuseInvalidationQueue {
         ino: u64,
         kind: FuseInvalidationKind,
     ) -> Result<FuseInvalidationReceipt, FuseInvalidationQueueClosed> {
+        self.push_target(FuseInvalidationTarget::Inode(ino), kind)
+    }
+
+    pub(crate) fn push_entry(
+        &self,
+        parent: u64,
+        name: &[u8],
+    ) -> Result<(), FuseInvalidationQueueClosed> {
+        self.push_target(
+            FuseInvalidationTarget::Entry {
+                parent,
+                name: name.to_vec(),
+            },
+            FuseInvalidationKind::Attributes,
+        )
+        .map(|_| ())
+    }
+
+    fn push_target(
+        &self,
+        target: FuseInvalidationTarget,
+        kind: FuseInvalidationKind,
+    ) -> Result<FuseInvalidationReceipt, FuseInvalidationQueueClosed> {
         let mut state = lock_poison_tolerant(&self.inner.state);
         loop {
             if state.closed {
                 return Err(FuseInvalidationQueueClosed);
             }
-            if let Some(current) = state.pending.get_mut(&ino) {
+            if let Some(current) = state.pending.get_mut(&target) {
                 current.kind = current.kind.coalesce(kind);
                 self.inner.metrics.coalesced.fetch_add(1, Ordering::Relaxed);
                 return Ok(FuseInvalidationReceipt {
@@ -513,9 +542,9 @@ impl FuseInvalidationQueue {
             }
             if state.pending.len() < self.inner.capacity {
                 let completion = Arc::new(FuseInvalidationReceiptInner::default());
-                state.order.push_back(ino);
+                state.order.push_back(target.clone());
                 state.pending.insert(
-                    ino,
+                    target,
                     PendingInvalidation {
                         kind,
                         completion: Arc::clone(&completion),
@@ -543,19 +572,22 @@ impl FuseInvalidationQueue {
 
     #[cfg(test)]
     pub(crate) fn pop(&self) -> Option<(u64, FuseInvalidationKind)> {
-        self.pop_pending().map(|(ino, pending)| {
+        self.pop_pending().map(|(target, pending)| {
             pending
                 .completion
                 .complete(FuseInvalidationReceiptOutcome::SkippedUnobserved);
+            let FuseInvalidationTarget::Inode(ino) = target else {
+                panic!("expected inode invalidation");
+            };
             (ino, pending.kind)
         })
     }
 
-    fn pop_pending(&self) -> Option<(u64, PendingInvalidation)> {
+    fn pop_pending(&self) -> Option<(FuseInvalidationTarget, PendingInvalidation)> {
         let mut state = lock_poison_tolerant(&self.inner.state);
         loop {
-            if let Some(ino) = state.order.pop_front() {
-                let Some(pending) = state.pending.remove(&ino) else {
+            if let Some(target) = state.order.pop_front() {
+                let Some(pending) = state.pending.remove(&target) else {
                     continue;
                 };
                 self.inner
@@ -563,7 +595,7 @@ impl FuseInvalidationQueue {
                     .queue_depth
                     .fetch_sub(1, Ordering::Relaxed);
                 self.inner.changed.notify_all();
-                return Some((ino, pending));
+                return Some((target, pending));
             }
             if state.closed {
                 return None;
@@ -728,10 +760,27 @@ impl FuseInvalidationWorker {
         Self::spawn_with_observer(queue, liveness, notifier, |_| {})
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn_with_observer(
         queue: FuseInvalidationQueue,
         liveness: FuseInodeLiveness,
         notifier: impl Fn(u64, FuseInvalidationGeometry) -> Result<(), ()> + Send + 'static,
+        observe_metrics: impl Fn(FuseInvalidationMetricsSnapshot) + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn_with_entry_observer(
+            queue,
+            liveness,
+            move |ino, geometry, _| notifier(ino, geometry),
+            observe_metrics,
+        )
+    }
+
+    pub(crate) fn spawn_with_entry_observer(
+        queue: FuseInvalidationQueue,
+        liveness: FuseInodeLiveness,
+        notifier: impl Fn(u64, FuseInvalidationGeometry, Option<&[u8]>) -> Result<(), ()>
+        + Send
+        + 'static,
         observe_metrics: impl Fn(FuseInvalidationMetricsSnapshot) + Send + 'static,
     ) -> io::Result<Self> {
         if queue
@@ -755,7 +804,13 @@ impl FuseInvalidationWorker {
                 let _completion = FuseInvalidationCompletionGuard {
                     completion: worker_completion,
                 };
-                while let Some((ino, pending)) = worker_queue.pop_pending() {
+                while let Some((target, pending)) = worker_queue.pop_pending() {
+                    let (ino, name) = match &target {
+                        FuseInvalidationTarget::Inode(ino) => (*ino, None),
+                        FuseInvalidationTarget::Entry { parent, name } => {
+                            (*parent, Some(name.as_slice()))
+                        }
+                    };
                     let geometry = FuseInvalidationGeometry::for_kind(pending.kind);
                     let mut notify_result = None;
                     let admission = liveness.admit_invalidation(ino, || {
@@ -766,7 +821,7 @@ impl FuseInvalidationWorker {
                             in_flight: &metrics.notification_in_flight,
                         };
                         let started = Instant::now();
-                        notify_result = Some(notifier(ino, geometry));
+                        notify_result = Some(notifier(ino, geometry, name));
                         metrics.record_notify_latency(started.elapsed());
                     });
                     if !admission.notified_now() {
@@ -1331,6 +1386,48 @@ mod tests {
         let queue = FuseInvalidationQueue::default();
 
         assert_eq!(queue.capacity(), 8192);
+    }
+
+    #[test]
+    fn worker_drains_distinct_entry_names_without_coalescing_parent_inode() {
+        let queue = FuseInvalidationQueue::with_capacity(3);
+        queue.push_entry(ROOT_INODE, b"first").unwrap();
+        queue.push_entry(ROOT_INODE, b"second").unwrap();
+        queue.push_entry(ROOT_INODE, b"first").unwrap();
+        queue.push(ROOT_INODE, FuseInvalidationKind::Data).unwrap();
+        let notifications = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&notifications);
+        let worker = FuseInvalidationWorker::spawn_with_entry_observer(
+            queue,
+            FuseInodeLiveness::default(),
+            move |ino, geometry, name| {
+                lock_poison_tolerant(&observed).push((ino, geometry, name.map(<[u8]>::to_vec)));
+                Ok(())
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            worker.shutdown(Duration::from_secs(1)),
+            FuseInvalidationShutdownOutcome::Drained
+        );
+        assert_eq!(
+            *lock_poison_tolerant(&notifications),
+            vec![
+                (
+                    ROOT_INODE,
+                    FuseInvalidationGeometry::ATTRIBUTES,
+                    Some(b"first".to_vec())
+                ),
+                (
+                    ROOT_INODE,
+                    FuseInvalidationGeometry::ATTRIBUTES,
+                    Some(b"second".to_vec())
+                ),
+                (ROOT_INODE, FuseInvalidationGeometry::DATA, None),
+            ]
+        );
+        assert_eq!(worker.metrics().coalesced, 1);
     }
 
     #[test]

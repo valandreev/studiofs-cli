@@ -39,6 +39,8 @@ pub mod schema;
 pub mod snapshot;
 /// Backend-agnostic Snapshot v2 application ports.
 pub mod snapshot_ports;
+/// Shared recoverable-trash retention policy.
+pub mod trash;
 /// Public metadata model types shared across engines and callers.
 pub mod types;
 
@@ -54,8 +56,9 @@ pub use engine::{
     MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult, MetaSymlink,
     MetaXattr, MetadataBatchWriteObservability, MetadataCheckpointFreshnessDiagnostics,
     MetadataCheckpointRefreshReason, MetadataCoherenceProgress, MetadataWriteObservability,
-    MetadataWriteStageTiming, NamespaceMutation, PgSyncDiagnostics, PgSyncFailure, PgSyncLifecycle,
-    PgSyncPageDiagnostics, PgSyncStatus, PgSyncWriteAuthorityReason, RegularFileOverlayMutation,
+    MetadataWriteStageTiming, NamespaceMutation, OrphanInodeFinalization, PgSyncDiagnostics,
+    PgSyncFailure, PgSyncLifecycle, PgSyncPageDiagnostics, PgSyncStatus,
+    PgSyncWriteAuthorityReason, RegularFileOverlayMutation,
 };
 pub use events::MetaEvent;
 pub use janitor::{
@@ -66,7 +69,10 @@ pub use janitor::{
 pub use pg_dsn::{
     STUDIOFS_METADATA_DB, StudioPgDsns, ensure_studiofs_database, resolve_studiofs_pg_dsns,
 };
-pub use pg_engine::{DEFAULT_PG_POOL_SIZE, PgMetaEngine, PgOpenOptions, PgSnapshotBackend};
+pub use pg_engine::{
+    DEFAULT_PG_POOL_SIZE, LOCAL_PG_RETAINED_RESTORE_OWNER_COUNTER, PgMetaEngine, PgOpenOptions,
+    PgSnapshotBackend,
+};
 pub use pg_transport::connect_studiofs_postgres;
 pub use read_only::ReadOnlyMetaEngine;
 pub use redb_engine::RedbMetaEngine;

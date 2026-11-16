@@ -39,7 +39,9 @@ pub mod test;
 pub use self::benchmark_profile_stub as benchmark_profile;
 pub mod benchmark_profile_common;
 pub mod benchmark_profile_types;
+pub mod trash;
 pub mod umount;
+pub mod upgrade;
 pub mod utils;
 #[cfg(windows)]
 pub mod winfsp_bootstrap;
@@ -156,6 +158,9 @@ enum Commands {
     Bench(bench::BenchArgs),
     Devbench(bench::DevbenchArgs),
     Init(init::InitArgs),
+    Upgrade(upgrade::UpgradeArgs),
+    /// Show or change the shared trash retention period in whole days
+    TrashDays(trash::TrashDaysArgs),
     Discover(discovery::DiscoverArgs),
     Mount(mount::MountArgs),
     Smount(smount::SmountArgs),
@@ -179,6 +184,8 @@ impl Commands {
             Self::Bench(args) => args.dispatch(),
             Self::Devbench(args) => args.dispatch(),
             Self::Init(args) => args.dispatch(),
+            Self::Upgrade(args) => args.dispatch(),
+            Self::TrashDays(args) => args.dispatch(),
             Self::Discover(args) => args.dispatch(),
             Self::Mount(args) => args.dispatch_with_auto_tray(),
             Self::Smount(args) => args.dispatch(),

@@ -13,7 +13,7 @@ impl StudioVfs {
             }
             return Err(err);
         }
-        if self.ignored_entry_attr(ino).is_some() {
+        if ino >= super::FIRST_IGNORED_INO {
             return Ok(None);
         }
         Ok(self.sync_meta().get_xattr(ino, name)?)
@@ -27,7 +27,7 @@ impl StudioVfs {
             }
             return Err(err);
         }
-        if self.ignored_entry_attr(ino).is_some() {
+        if ino >= super::FIRST_IGNORED_INO {
             return Ok(None);
         }
         Ok(self.sync_meta().get_xattr_size(ino, name)?)
@@ -37,7 +37,11 @@ impl StudioVfs {
     pub fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> VfsResult<()> {
         let operation = self.try_mutating_operation_admission()?;
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        if self.ignored_entry_attr(ino).is_some() {
+        if ino >= super::FIRST_IGNORED_INO {
+            let ignored = self.visible_ignored_entry_snapshot(ino)?;
+            if ignored.view.is_some() {
+                return Err(VfsError::OperationNotSupported);
+            }
             return Ok(());
         }
         if value.len() > self.max_xattr_bytes {
@@ -55,7 +59,11 @@ impl StudioVfs {
     pub fn remove_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<()> {
         let operation = self.try_mutating_operation_admission()?;
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        if self.ignored_entry_attr(ino).is_some() {
+        if ino >= super::FIRST_IGNORED_INO {
+            let ignored = self.visible_ignored_entry_snapshot(ino)?;
+            if ignored.view.is_some() {
+                return Err(VfsError::OperationNotSupported);
+            }
             return Ok(());
         }
         self.commit_xattr_mutation(&operation, ino, || self.sync_meta().remove_xattr(ino, name))
@@ -115,7 +123,7 @@ impl StudioVfs {
             }
             return Err(err);
         }
-        if self.ignored_entry_attr(ino).is_some() {
+        if ino >= super::FIRST_IGNORED_INO {
             return Ok(Vec::new());
         }
         Ok(self.sync_meta().list_xattrs(ino)?)
@@ -185,6 +193,15 @@ impl StudioVfs {
     /// own bindings, so the cost tracks path depth rather than the size of the
     /// root directory.
     pub(super) fn directory_has_probable_trash_ancestor(&self, dir_ino: Ino) -> VfsResult<bool> {
+        self.directory_has_root_child_ancestor(dir_ino, super::is_probable_trash_component)
+    }
+
+    /// True when `dir_ino` is, or lies below, a root child whose name matches.
+    pub(super) fn directory_has_root_child_ancestor(
+        &self,
+        dir_ino: Ino,
+        matches: impl Fn(&[u8]) -> bool,
+    ) -> VfsResult<bool> {
         let meta = self.sync_meta();
         let mut current = dir_ino;
         let mut hops = 0usize;
@@ -210,7 +227,7 @@ impl StudioVfs {
 
         // Bindings are candidates; confirm each through the merged lookup.
         for (parent, name) in meta.entry_bindings_for_inode(root_child)? {
-            if parent != ROOT_INO || !super::is_probable_trash_component(&name) {
+            if parent != ROOT_INO || !matches(&name) {
                 continue;
             }
             match meta.lookup(ROOT_INO, &name) {

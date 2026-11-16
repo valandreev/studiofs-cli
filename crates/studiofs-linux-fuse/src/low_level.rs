@@ -221,6 +221,12 @@ unsafe extern "C" {
         offset: off_t,
         len: off_t,
     ) -> c_int;
+    fn studiofs_linux_fuse_notify_inval_entry(
+        session: *mut raw::FuseSession,
+        parent: u64,
+        name: *const c_char,
+        name_len: usize,
+    ) -> c_int;
     fn studiofs_linux_fuse_dir_file_info_init(info: *mut raw::FuseFileInfo, fh: u64);
     #[cfg(test)]
     fn studiofs_linux_fuse_dir_file_info_cache_readdir_after_init() -> c_int;
@@ -349,6 +355,8 @@ impl SessionState {
         ));
         let cache_policy = linux_fuse_cache_policy_from_env();
         let async_write_source = register_async_write_metrics(&vfs, &async_writes, cache_policy);
+        let mount_uid = current_uid();
+        vfs.set_native_trash_profile(studiofs_vfs::NativeTrashProfile::Linux { uid: mount_uid });
         Self {
             async_write_source,
             vfs,
@@ -356,7 +364,7 @@ impl SessionState {
             async_writes,
             read_only,
             allow_other: false,
-            mount_uid: current_uid(),
+            mount_uid,
             mount_gid: current_gid(),
             connection_config,
             cache_policy,
@@ -389,6 +397,14 @@ impl SessionState {
             .unwrap_or(usize::MAX)
             .max(1),
             inline_writes: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn fuse_ttl_for_ino(&self, ino: u64) -> f64 {
+        if self.vfs.should_bypass_bridge_entry_cache(ino) {
+            0.0
+        } else {
+            TTL_SECONDS
         }
     }
 
@@ -973,10 +989,13 @@ impl Session {
             let invalidation_metrics_generation = Arc::new(AtomicU64::new(0));
             let metrics_vfs = Arc::clone(&state.vfs);
             let worker_metrics_generation = Arc::clone(&invalidation_metrics_generation);
-            let invalidation_worker = match FuseInvalidationWorker::spawn_with_observer(
+            let invalidation_worker = match FuseInvalidationWorker::spawn_with_entry_observer(
                 invalidation_queue.clone(),
                 state.inode_liveness.clone(),
-                move |ino, geometry| notify_target.notify(ino, geometry),
+                move |ino, geometry, name| match name {
+                    Some(name) => notify_target.notify_entry(ino, name),
+                    None => notify_target.notify(ino, geometry),
+                },
                 move |metrics| {
                     record_invalidation_metrics(&metrics_vfs, &worker_metrics_generation, metrics);
                 },
@@ -1249,6 +1268,29 @@ impl LinuxFuseKernelInvalidator {
 }
 
 impl SessionInvalidationTarget {
+    fn notify_entry(&self, parent: u64, name: &[u8]) -> Result<(), ()> {
+        let name = CString::new(name).map_err(|_| ())?;
+        let Some(_active) = self.state.begin_invalidation() else {
+            return Err(());
+        };
+        // SAFETY: the guard keeps the session alive; libfuse reads namelen + 1
+        // bytes, including the CString's terminating NUL, during this worker call.
+        let result = unsafe {
+            studiofs_linux_fuse_notify_inval_entry(
+                self.session.as_ptr(),
+                parent,
+                name.as_ptr(),
+                name.as_bytes().len(),
+            )
+        };
+        if result != 0 && result != -libc::ENOENT {
+            warn!(parent, result, "Linux FUSE entry invalidation failed");
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+
     fn notify(&self, ino: u64, geometry: FuseInvalidationGeometry) -> Result<(), ()> {
         let Some(_active) = self.state.begin_invalidation() else {
             debug!(
@@ -1344,7 +1386,7 @@ pub extern "C" fn studiofs_linux_fuse_getattr(
     match state.getattr(ino) {
         Ok(attr) => {
             // SAFETY: `attr` is initialized and valid for this synchronous reply.
-            unsafe { raw::fuse_reply_attr(req, &attr, TTL_SECONDS) };
+            unsafe { raw::fuse_reply_attr(req, &attr, state.fuse_ttl_for_ino(ino)) };
         }
         Err(errno) => reply_error(req, errno),
     }
@@ -1377,7 +1419,7 @@ pub extern "C" fn studiofs_linux_fuse_setattr(
         Ok(attr) => {
             let attr = state.attr_to_stat(&attr);
             // SAFETY: `attr` is initialized and valid for this synchronous reply.
-            unsafe { raw::fuse_reply_attr(req, &attr, TTL_SECONDS) };
+            unsafe { raw::fuse_reply_attr(req, &attr, state.fuse_ttl_for_ino(ino)) };
         }
         Err(errno) => reply_error(req, errno),
     }
@@ -1527,7 +1569,18 @@ pub extern "C" fn studiofs_linux_fuse_rename(
     .flatten()
     .unwrap_or(Err(libc::EINVAL));
     match result {
-        Ok(()) => reply_error(req, 0),
+        Ok(()) => {
+            let target_name = (state.vfs.should_bypass_bridge_entry_cache(parent)
+                || state.vfs.should_bypass_bridge_entry_cache(newparent))
+            .then(|| with_name_bytes(newname, <[u8]>::to_vec))
+            .flatten();
+            reply_error(req, 0);
+            // Rename keeps the source kernel inode, while trash/restore changes
+            // the projected inode. Notify off-callback after releasing its reply.
+            if let Some(name) = target_name {
+                let _ = state.invalidation_queue.push_entry(newparent, &name);
+            }
+        }
         Err(errno) => reply_error(req, errno),
     }
 }
@@ -1548,7 +1601,11 @@ pub extern "C" fn studiofs_linux_fuse_link(
         .unwrap_or(Err(libc::EINVAL));
     match result {
         Ok((attr, cache_safe)) => {
-            let attr_timeout = if cache_safe { TTL_SECONDS } else { 0.0 };
+            let attr_timeout = if cache_safe {
+                state.fuse_ttl_for_ino(attr.ino)
+            } else {
+                0.0
+            };
             reply_reserved_entry_with_timeout(state, &attr, lookup, attr_timeout, |entry| {
                 // SAFETY: `entry` is initialized and valid for this synchronous reply.
                 unsafe { raw::fuse_reply_entry(req, entry) }
@@ -2446,9 +2503,9 @@ impl SessionState {
 
     fn prepare_file_open(&self, attr: &InodeAttr, flags: c_int, fh: u64) -> LinuxFusePreparedOpen {
         let ino = attr.ino;
-        let participation = if self.cache_policy == LinuxFuseCachePolicy::Direct
-            || self.vfs.is_runtime_stats_file_ino(ino)
-        {
+        let force_uncached =
+            self.vfs.is_runtime_stats_file_ino(ino) || self.vfs.is_generated_trash_record_ino(ino);
+        let participation = if self.cache_policy == LinuxFuseCachePolicy::Direct || force_uncached {
             OsCacheParticipation::Disabled
         } else {
             OsCacheParticipation::Enabled
@@ -2460,7 +2517,7 @@ impl SessionState {
             .available_memory
             .as_ref()
             .and_then(SystemMemorySampler::available_memory);
-        let cache = if self.vfs.is_runtime_stats_file_ino(ino) {
+        let cache = if force_uncached {
             LinuxFuseOpenCachePolicy {
                 direct_io: true,
                 keep_cache: false,
@@ -3118,7 +3175,10 @@ impl SessionState {
                     // Read after reservation: later invalidations mark the pending reply.
                     match self.getattr_attr(entry.ino) {
                         Ok(entry_attr) => {
-                            let param = entry_param(self.attr_to_stat(&entry_attr), TTL_SECONDS);
+                            let param = entry_param(
+                                self.attr_to_stat(&entry_attr),
+                                self.fuse_ttl_for_ino(entry_attr.ino),
+                            );
                             let pushed = buffer.push_plus(req, name, &param, next_offset)?;
                             if pushed {
                                 reservations.push((entry.ino, reservation));
@@ -3149,6 +3209,17 @@ impl SessionState {
     // shortcut: an uncached capture still holds O(N) names per handle, as WinFSP's
     // DirBuffer does; use metadata cursors if large directories need bounded memory.
     fn directory_snapshot(&self, ino: u64) -> Result<CapturedDirectory, i32> {
+        if self.vfs.should_bypass_bridge_entry_cache(ino) {
+            let entries = DirectorySnapshot::from(
+                self.vfs
+                    .readdir(ino)
+                    .map_err(|error| vfs_err_to_errno(&error))?,
+            );
+            return Ok(CapturedDirectory {
+                entries,
+                observation: None,
+            });
+        }
         let observe = || {
             self.vfs
                 .directory_enumeration_observation(ino)
@@ -3569,7 +3640,13 @@ fn reply_reserved_entry_with(
     reservation: FuseLookupReservation,
     reply: impl FnOnce(*const raw::FuseEntryParam) -> c_int,
 ) -> c_int {
-    reply_reserved_entry_with_timeout(state, attr, reservation, TTL_SECONDS, reply)
+    reply_reserved_entry_with_timeout(
+        state,
+        attr,
+        reservation,
+        state.fuse_ttl_for_ino(attr.ino),
+        reply,
+    )
 }
 
 fn reply_reserved_entry_with_timeout(
@@ -3579,7 +3656,11 @@ fn reply_reserved_entry_with_timeout(
     attr_timeout: f64,
     reply: impl FnOnce(*const raw::FuseEntryParam) -> c_int,
 ) -> c_int {
-    let entry = entry_param(state.attr_to_stat(attr), attr_timeout);
+    let entry = entry_param_with_timeouts(
+        state.attr_to_stat(attr),
+        state.fuse_ttl_for_ino(attr.ino),
+        attr_timeout,
+    );
     let began = reservation.begin_reply();
     debug_assert!(began, "fresh lookup reservation must begin exactly once");
     let result = reply(&entry);
@@ -3596,13 +3677,21 @@ fn reply_reserved_entry_with_timeout(
     result
 }
 
-fn entry_param(attr: stat, attr_timeout: f64) -> raw::FuseEntryParam {
+fn entry_param(attr: stat, ttl: f64) -> raw::FuseEntryParam {
+    entry_param_with_timeouts(attr, ttl, ttl)
+}
+
+fn entry_param_with_timeouts(
+    attr: stat,
+    entry_timeout: f64,
+    attr_timeout: f64,
+) -> raw::FuseEntryParam {
     raw::FuseEntryParam {
         ino: attr.st_ino,
         generation: 1,
         attr,
         attr_timeout,
-        entry_timeout: TTL_SECONDS,
+        entry_timeout,
     }
 }
 
@@ -4254,6 +4343,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use studiofs_meta::MetaInodes;
+    use studiofs_meta::trash::MetaVolumeSettings;
 
     static EXIT_SIGNAL_TEST_HITS: AtomicUsize = AtomicUsize::new(0);
 
@@ -10280,6 +10370,277 @@ mod tests {
             "kernel readahead must coalesce 4 KiB reads; saw {read_calls} VFS reads"
         );
         drop(session);
+        drop(fixture);
+        std::fs::remove_dir_all(&mount_point).expect("remove mount point");
+    }
+
+    #[test]
+    fn linux_fuse_session_configures_linux_profile_zero_ttl_direct_io_and_trash_containers() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-trash-unit")
+                .expect("create VFS fixture");
+        fixture
+            .meta()
+            .compare_and_set_trash_days(0, 7)
+            .unwrap()
+            .unwrap();
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let expected_uid = super::current_uid();
+        assert_eq!(
+            state.vfs.native_trash_profile(),
+            studiofs_vfs::NativeTrashProfile::Linux { uid: expected_uid }
+        );
+
+        let trash_dir_name = format!(".Trash-{expected_uid}");
+        let trash_root = state.lookup(1, trash_dir_name.as_bytes()).unwrap().attr;
+        assert_eq!(trash_root.uid, expected_uid);
+        assert_eq!(trash_root.mode & 0o777, 0o700);
+        assert_eq!(state.fuse_ttl_for_ino(trash_root.ino), 0.0);
+
+        let files_dir = state.lookup(trash_root.ino, b"files").unwrap().attr;
+        let info_dir = state.lookup(trash_root.ino, b"info").unwrap().attr;
+        assert_eq!(state.fuse_ttl_for_ino(files_dir.ino), 0.0);
+        assert_eq!(state.fuse_ttl_for_ino(info_dir.ino), 0.0);
+
+        let doc = state
+            .vfs
+            .create(1, b"doc.txt", expected_uid, state.mount_gid, 0o644)
+            .unwrap();
+        fixture.runtime().block_on(async {
+            state
+                .vfs
+                .write(doc.ino, 0, b"retained bytes")
+                .await
+                .unwrap();
+            state.vfs.fsync(doc.ino, false).await.unwrap();
+        });
+        assert_eq!(state.fuse_ttl_for_ino(doc.ino), super::TTL_SECONDS);
+        state
+            .rename(1, b"doc.txt", files_dir.ino, b"doc.txt")
+            .unwrap();
+
+        let trashinfo = state
+            .lookup(info_dir.ino, b"doc.txt.trashinfo")
+            .unwrap()
+            .attr;
+        assert_eq!(state.fuse_ttl_for_ino(trashinfo.ino), 0.0);
+        let open = state
+            .open_with_flags(trashinfo.ino, libc::O_RDONLY)
+            .unwrap();
+        let prepared = state.prepare_allocated_open(open).unwrap();
+        assert!(prepared.cache.direct_io);
+        assert!(!prepared.cache.keep_cache);
+        state.release(prepared.fh).unwrap();
+        let payload = state.lookup(files_dir.ino, b"doc.txt").unwrap().attr;
+        let open = state.open_with_flags(payload.ino, libc::O_RDONLY).unwrap();
+        let prepared = state.prepare_allocated_open(open).unwrap();
+        let mut read = [0; 14];
+        let count = fixture
+            .runtime()
+            .block_on(
+                state
+                    .vfs
+                    .read_into_fh(prepared.fh, payload.ino, 0, &mut read),
+            )
+            .unwrap();
+        assert_eq!(count, 14);
+        assert_eq!(&read, b"retained bytes");
+        state.release(prepared.fh).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires /dev/fuse, fusermount3, and /usr/bin/gio on a Linux host"]
+    fn mounted_linux_gio_trash_retains_lists_restores_and_clears() {
+        let fixture =
+            studiofs_vfs::contract_harness::ContractVfsFixture::new("linux-fuse-gio-trash")
+                .expect("create VFS fixture");
+        fixture.start().expect("start VFS fixture");
+        fixture
+            .meta()
+            .compare_and_set_trash_days(0, 7)
+            .unwrap()
+            .unwrap();
+
+        let mount_point = studiofs_test_support::workspace_target_temp_path("linux-fuse-gio-");
+        std::fs::create_dir_all(&mount_point).expect("create mount point");
+        let isolated_xdg = studiofs_test_support::workspace_target_tempdir("linux-fuse-xdg-");
+        std::fs::create_dir_all(isolated_xdg.path().join("data")).unwrap();
+        std::fs::create_dir_all(isolated_xdg.path().join("config")).unwrap();
+        std::fs::create_dir_all(isolated_xdg.path().join("cache")).unwrap();
+
+        let state = super::SessionState::new(
+            fixture.vfs(),
+            fixture.runtime().handle().clone(),
+            false,
+            default_connection_config(),
+        );
+        let uid = state.mount_uid;
+        let mut session =
+            super::Session::mount(state, &mount_point, "studiofs-gio-trash").expect("mount");
+        let mount_point_for_worker = mount_point.clone();
+        let xdg_root = isolated_xdg.path().to_path_buf();
+        let meta = fixture.meta();
+
+        let run_gio = move |args: &[&str]| -> std::io::Result<std::process::Output> {
+            Command::new("/usr/bin/gio")
+                .args(args)
+                .env("HOME", &xdg_root)
+                .env("XDG_DATA_HOME", xdg_root.join("data"))
+                .env("XDG_CONFIG_HOME", xdg_root.join("config"))
+                .env("XDG_CACHE_HOME", xdg_root.join("cache"))
+                .output()
+        };
+
+        let worker = std::thread::spawn(move || -> std::io::Result<std::process::ExitStatus> {
+            let guard = UnmountGuard::new(mount_point_for_worker.clone());
+            let trash_dir = mount_point_for_worker.join(format!(".Trash-{uid}"));
+            let files_dir = trash_dir.join("files");
+            let info_dir = trash_dir.join("info");
+
+            // Root listing shows only the Linux .Trash-<uid> container, containing files/ and info/.
+            let root_names: Vec<String> = std::fs::read_dir(&mount_point_for_worker)?
+                .map(|e| Ok(e?.file_name().to_string_lossy().into_owned()))
+                .collect::<std::io::Result<_>>()?;
+            assert!(root_names.iter().any(|n| n == &format!(".Trash-{uid}")));
+            assert!(files_dir.is_dir());
+            assert!(info_dir.is_dir());
+
+            // 1. Direct `gio trash` on two same-named files from distinct parents.
+            let dir_a = mount_point_for_worker.join("dir_a");
+            let dir_b = mount_point_for_worker.join("dir_b");
+            std::fs::create_dir(&dir_a)?;
+            std::fs::create_dir(&dir_b)?;
+            let file_a = dir_a.join("note.txt");
+            let file_b = dir_b.join("note.txt");
+            std::fs::write(&file_a, b"alpha-body")?;
+            std::fs::write(&file_b, b"beta-body")?;
+
+            let out_a = run_gio(&["trash", file_a.to_str().unwrap()])?;
+            assert!(
+                out_a.status.success(),
+                "gio trash note #1 failed: {}",
+                String::from_utf8_lossy(&out_a.stderr)
+            );
+            let out_b = run_gio(&["trash", file_b.to_str().unwrap()])?;
+            assert!(
+                out_b.status.success(),
+                "gio trash note #2 failed: {}",
+                String::from_utf8_lossy(&out_b.stderr)
+            );
+            assert!(!file_a.exists());
+            assert!(!file_b.exists());
+            eprintln!(
+                "trash files after gio: {:?}",
+                std::fs::read_dir(&files_dir)?
+                    .map(|entry| entry.map(|e| e.file_name()))
+                    .collect::<std::io::Result<Vec<_>>>()?
+            );
+
+            assert_eq!(
+                std::fs::read_to_string(files_dir.join("note.txt"))
+                    .expect("read first retained file"),
+                "alpha-body"
+            );
+            assert_eq!(
+                std::fs::read_to_string(files_dir.join("note.txt.2"))
+                    .expect("read second retained file"),
+                "beta-body"
+            );
+            let info1 = std::fs::read_to_string(info_dir.join("note.txt.trashinfo"))
+                .expect("read first generated trashinfo");
+            let info2 = std::fs::read_to_string(info_dir.join("note.txt.2.trashinfo"))
+                .expect("read second generated trashinfo");
+            assert!(info1.contains("Path=dir_a/note.txt\n"));
+            assert!(info2.contains("Path=dir_b/note.txt\n"));
+            eprintln!("native trash payloads and sidecars read");
+
+            // 2. Direct unlink bypasses trash retention.
+            let direct_rm = mount_point_for_worker.join("direct_rm.txt");
+            std::fs::write(&direct_rm, b"gone")?;
+            std::fs::remove_file(&direct_rm)?;
+            assert!(!files_dir.join("direct_rm.txt").exists());
+            assert!(!info_dir.join("direct_rm.txt.trashinfo").exists());
+            eprintln!("native permanent delete checked");
+
+            // 3. Collision no-overwrite on restore + restore to free slot.
+            std::fs::write(&file_a, b"occupant")?;
+            let err = std::fs::rename(files_dir.join("note.txt"), &file_a)
+                .expect_err("restore over existing file must fail with EEXIST");
+            assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
+            assert_eq!(std::fs::read_to_string(&file_a)?, "occupant");
+            assert!(files_dir.join("note.txt").exists());
+
+            let restored_a = dir_a.join("note-restored.txt");
+            std::fs::rename(files_dir.join("note.txt"), &restored_a)?;
+            assert_eq!(std::fs::read_to_string(&restored_a)?, "alpha-body");
+            assert!(!files_dir.join("note.txt").exists());
+            assert!(!info_dir.join("note.txt.trashinfo").exists());
+            assert!(files_dir.join("note.txt.2").exists());
+            eprintln!("native restore and collision checked");
+
+            // 4. Directory subtree `gio trash` + read inside trash + recursive Clear.
+            let sub = mount_point_for_worker.join("album");
+            let sub_nested = sub.join("raw");
+            std::fs::create_dir_all(&sub_nested)?;
+            std::fs::write(sub_nested.join("take.bin"), b"subtree-data")?;
+            let out_sub = run_gio(&["trash", sub.to_str().unwrap()])?;
+            assert!(
+                out_sub.status.success(),
+                "gio trash dir failed: {}",
+                String::from_utf8_lossy(&out_sub.stderr)
+            );
+            assert!(!sub.exists());
+            assert_eq!(
+                std::fs::read_to_string(files_dir.join("album/raw/take.bin"))?,
+                "subtree-data"
+            );
+            assert!(info_dir.join("album.trashinfo").is_file());
+
+            // Clear retained file via info sidecar and retained dir bottom-up.
+            std::fs::remove_file(info_dir.join("note.txt.2.trashinfo"))?;
+            assert!(!files_dir.join("note.txt.2").exists());
+            std::fs::remove_dir_all(files_dir.join("album"))?;
+            assert!(!files_dir.join("album").exists());
+            assert!(!info_dir.join("album.trashinfo").exists());
+
+            // 5. TTL=0 turns gio trash into immediate deletion without retention.
+            meta.compare_and_set_trash_days(1, 0).unwrap().unwrap();
+            let ttl0_file = mount_point_for_worker.join("ttl0.txt");
+            std::fs::write(&ttl0_file, b"no-retain")?;
+            let out_ttl0 = run_gio(&["trash", ttl0_file.to_str().unwrap()])?;
+            assert!(
+                out_ttl0.status.success(),
+                "gio trash under TTL=0 failed: {}",
+                String::from_utf8_lossy(&out_ttl0.stderr)
+            );
+            assert!(!ttl0_file.exists());
+            assert!(!files_dir.join("ttl0.txt").exists());
+            assert!(!info_dir.join("ttl0.txt.trashinfo").exists());
+
+            let status = Command::new("fusermount3")
+                .arg("-u")
+                .arg(&mount_point_for_worker)
+                .status();
+            guard.disarm();
+            status
+        });
+
+        session.run().expect("run libfuse3 session");
+        let unmount_status = worker
+            .join()
+            .expect("mounted gio trash worker should not panic")
+            .expect("mounted gio trash worker should complete");
+        assert!(unmount_status.success());
+        drop(session);
+        fixture
+            .runtime()
+            .block_on(fixture.vfs().shutdown(Duration::ZERO))
+            .expect("mounted VFS shutdown should succeed");
         drop(fixture);
         std::fs::remove_dir_all(&mount_point).expect("remove mount point");
     }
