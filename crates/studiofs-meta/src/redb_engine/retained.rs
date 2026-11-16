@@ -357,7 +357,11 @@ impl RedbMetaEngine {
                 return Ok(None);
             };
             let shared = decode_xattr_value_from_storage(RECEIPT_XATTR, stored.value());
-            let receipt = Ino::from_le_bytes(key[..8].try_into().expect("xattr key has an inode"));
+            let receipt = Ino::from_le_bytes(
+                key.get(..8)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| MetaError::Storage("corrupt receipt xattr key".into()))?,
+            );
             Ok(Self::decode_retained_entry(receipt, &shared)
                 .is_ok_and(|entry| entry.state != RetainedEntryState::Retained)
                 .then_some(shared))

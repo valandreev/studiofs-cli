@@ -246,7 +246,9 @@ async fn reject_receipt_removal(
             | MetaEvent::RenameEntry {
                 displaced_remove_attr_ino: Some(ino),
                 ..
-            } => removed.extend(i64::try_from(*ino).ok()),
+            } => removed.push(i64::try_from(*ino).map_err(|_| {
+                MetaError::Storage(format!("inode {ino} exceeds the shared BIGINT range"))
+            })?),
             _ => {}
         }
     }

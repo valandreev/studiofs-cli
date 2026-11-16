@@ -381,6 +381,7 @@ impl PrefetchWorker {
         let planned = match work_item {
             PrefetchWorkItem::RestorePayload(object_id) => {
                 // Ingress is bounded by the same owned workers and semaphore as read-ahead.
+                // Dropping is safe: restore answers EAGAIN and its retry re-enqueues the fetch.
                 let Ok(permit) = self.prefetch_sem.clone().try_acquire_owned() else {
                     return;
                 };
@@ -388,7 +389,7 @@ impl PrefetchWorker {
                 self.inflight.spawn(async move {
                     let _permit = permit;
                     let keys = super::format_object_fragment_keys(&vfs.data_prefix, object_id);
-                    // Required by an explicit user restore; must not be dropped by speculative read-ahead skips.
+                    // Serves an explicit user restore, so speculative read-ahead skips do not apply.
                     if let Err(error) = vfs.fetch_scheduler.fetch_block(object_id, &keys).await
                         && !vfs.shutdown_requested()
                     {

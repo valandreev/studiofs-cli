@@ -47,7 +47,7 @@ impl UpgradeArgs {
                 let bytes: Vec<u8> = row.get(0);
                 Ok(decode_format_info(&bytes)?)
             })).await.context("Upgrade timed out; retry the same command to complete safely")?
-        }).map_err(|_| anyhow::anyhow!("Shared upgrade did not complete locally. Stop all volume mounts and janitors, verify database connectivity and schema privileges, then retry this command. Accepted local data is preserved."))?;
+        }).context("Shared upgrade did not complete locally. Stop all volume mounts and janitors, verify database connectivity and schema privileges, then retry this command. Accepted local data is preserved.")?;
         local.upgrade_local_format5(&shared)
             .context("Shared format is upgraded; local completion failed. Keep this cache and retry upgrade; do not reinitialize or clear it")?;
         println!(

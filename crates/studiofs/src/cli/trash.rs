@@ -68,7 +68,7 @@ impl TrashDaysArgs {
                 })
             ).await })
             .context("PostgreSQL did not answer in time; nothing is confirmed, retry the command")?
-            .map_err(|_| anyhow::anyhow!("Could not reach the shared volume settings. Check PostgreSQL connectivity and that every cache uses format 6, then retry."))?;
+            .context("Could not reach the shared volume settings. Check PostgreSQL connectivity and that every cache uses format 6, then retry.")?;
         print_settings(&self.name, settings);
         Ok(())
     }
