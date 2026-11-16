@@ -400,6 +400,7 @@ WinFSP callback barrier semantics:
 - `RemoteUnavailable` → `STATUS_BAD_NETWORK_PATH`
 - `Timeout` → `STATUS_IO_TIMEOUT`
 - `MetadataPersistenceDegraded` → `STATUS_IO_DEVICE_ERROR`
+- `Retryable` (`WouldBlock` / `RemoteContentPending`) → `STATUS_UNSUCCESSFUL` (Win32 `ERROR_GEN_FAILURE` / `31`)
 - Other errors → `STATUS_UNEXPECTED_IO_ERROR`
 
 ### Mount Lifecycle
@@ -900,12 +901,132 @@ instead of a direct `unlink`; common forms include Freedesktop-style
 `.Trash-<uid>/files`, `.Trash/<uid>/files`, macOS `.Trashes`, and Windows
 `$RECYCLE.BIN`.
 
-StudioFS does not provide recoverable trash/recycle-bin semantics. Renames into
-trash-like roots are treated as immediate deletes: the source file or directory
-subtree is removed through the ordinary delete path, no trash destination entry
-is retained, and local payload cache cleanup follows normal unlink behavior.
-Existing trash-like roots are hidden from root directory listings so they are
-not exposed as user-visible folders in mounted trees.
+The 0.2.3 recoverable-trash behavior is specified in the
+[approved interview contract](superpowers/specs/2026-11-12-recoverable-trash-design.md).
+The volume-wide `trash days` setting (whole days, replicated through
+PostgreSQL; `studiofs init --trash-days N` or `studiofs trash-days NAME [DAYS]`)
+defaults to zero: a rename into a trash directory deletes immediately without
+retaining a destination. A positive period retains explicit Move to Trash
+operations; direct unlink, permanent delete (Shift+Delete), ordinary overwrite
+and rename replacement continue to bypass retention. Retention requires
+persisted format 6: format-5 clients reject the format-6 header and PostgreSQL
+fences their publication and deletion claims, so an old client cannot write
+into or garbage-collect a volume that may hold retained entries.
+
+Evidence per platform (mounted acceptance is separate from unit tests):
+
+| Platform | Proven | Unproven |
+| --- | --- | --- |
+| Windows WinFSP | Shell `SHFileOperation` recycling, namespace-10 listing, `undelete` restore, file/directory Clear, partial Clear, collision and remote-only retry probes on a local-redb mount (`winfsp_native_trash_*` in `crates/studiofs-winfsp/tests/mount_sanity.rs`) | Interactive Explorer UI; a mounted WinFSP + PostgreSQL multi-client run |
+| Linux FUSE | `gio trash`, filesystem listing/restore/Clear (`mounted_linux_gio_trash_retains_lists_restores_and_clears`); GVFS `trash:///` list, `gio trash --restore` and per-item delete through `expunged`; PG/S3 two-client, S3-outage crash replay, cold bootstrap and janitor GC E2E scenarios | Nautilus or any graphical file manager; `gio trash --empty` itself (its per-item delete is covered); GVFS while PG or S3 is down |
+| macOS | Source only | Compilation, Finder, legacy macFUSE and FSKit acceptance |
+
+All native layouts project the same shared retained receipts and payloads:
+
+| Mount | Native view |
+| --- | --- |
+| WinFSP | `$RECYCLE.BIN` with generated `$I` records and `$R` payload views |
+| Linux FUSE | `.Trash-<mount uid>/files` and generated `info/<name>.trashinfo` |
+| macFUSE / experimental FSKit | `.Trashes/<mount uid>` |
+
+Only the active platform's trash root appears in the volume root. Per-user
+folder names identify the local OS layout, not independent shared trash stores.
+Visibility and restore/clear authority follow the original parent's current
+StudioFS ACL. A read-only mount can project existing receipts without creating
+shared metadata. Restore refuses an occupied destination and preserves the
+retained entry. Linux `.trashinfo` paths are volume-relative and percent encoded;
+native draft sidecars and macOS trash metadata stay client-local. Linux records
+use the client's local deletion time without a zone, as required by the
+[Freedesktop Trash specification](https://specifications.freedesktop.org/trash/latest/).
+Linux also projects an always-empty `.Trash-<uid>/expunged`: GVFS `trash:///`
+delete and Empty Trash rename `files/<entry>` into it, and StudioFS treats that
+rename as Clear of the whole receipt under the same original-parent write check.
+No live entry can be renamed or created there.
+
+Linux FUSE and both macOS transports return zero entry/attribute TTLs for trash
+containers and retained views. Linux bypasses its shared directory snapshot
+cache for those directories; macOS refreshes handle snapshots at offset zero.
+Generated `$I` and `.trashinfo` bytes bypass OS page caching because receipt
+state can change their contents without a file write.
+
+Linux trash renames change the projected inode identity. After sending the
+rename reply, the bridge queues target-entry invalidation on its bounded,
+owned invalidation worker, so the kernel resolves the retained/restored inode
+instead of using the moved source dentry. Entry names have separate queue keys
+from inode invalidations and drain through the same shutdown gate. Retained
+Linux directories are owned by the mount uid with mode `0700`, allowing recursive
+Clear through kernel `default_permissions`; VFS still rejects new children and
+payload writes and enforces the original parent's ACL for permanent deletion.
+
+Focused bridge checks (not full crate suites):
+
+```bash
+cargo test -p studiofs-linux-fuse --lib linux_fuse_session_configures_linux_profile_zero_ttl_direct_io_and_trash_containers
+cargo test -p studiofs-linux-fuse --lib low_level::tests::mounted_linux_gio_trash_retains_lists_restores_and_clears -- --ignored --exact --nocapture
+cargo test -p studiofs-macfuse --lib macfuse_adapter_configures_macos_profile_and_zero_ttl_for_trash_containers
+```
+
+On WSL with sources on DrvFS, keep build output separate and run the rebuilt
+test executable directly with an ext4 runtime root, for example
+`CARGO_TARGET_DIR=/tmp/studiofs-trash-runtime <test-binary> <fully-qualified-test> --ignored --exact --nocapture`.
+The runtime override places the owned test mount/cache/XDG paths on ext4;
+`fusermount3` rejects the DrvFS mount location. Use the executable rebuilt from
+the current checkout.
+
+Linux rename dentry invalidation is queued after the callback reply to avoid
+a kernel directory-lock deadlock. An immediate lookup can briefly return ENOENT
+before the worker invalidates the old dentry. GVFS `trash:///` listing, restore
+and per-item delete are proven by the two-client scenario below; Nautilus is not.
+
+The mounted Linux check uses its own mount and isolated HOME/XDG directories;
+it never empties the host trash. macOS compilation and native Finder restore /
+Clear acceptance for legacy macFUSE and FSKit require a macOS host. Shared VFS
+tests and Linux FUSE acceptance do not establish those macOS gates.
+
+For real PostgreSQL/S3 multi-client acceptance, use the registered
+`mounted-recoverable-trash-two-client` E2E scenario. It starts two independent
+mounted clients on one disposable volume, moves a file and directory through
+GIO, waits for peer receipt publication, stops the writer, restarts the peer
+before its first payload read, and checks exact retained bytes, listing,
+restore and recursive Clear. Remounting the writer verifies restored bytes and
+receipt removal. The runner owns Compose service/volume cleanup. On WSL use an
+owned ext4 `--root` for its client roots, caches and mounts; keep the product
+binary rebuilt from the current checkout. The same scenario also checks the
+original real inode and an outside hard link across restore, then drives GVFS
+`trash:///` (`gio list`, `gio trash --restore`, `gio remove trash:///…`) in a
+private D-Bus session with isolated XDG paths; it never runs host-wide
+`gio trash --empty`. Related registered scenarios:
+`mounted-recoverable-trash-s3-crash-replay` (S3 down, writer killed, same-cache
+reopen restores, then peer and cold-client reads),
+`mounted-recoverable-trash-cold-bootstrap` (fresh client with no local state)
+and `mounted-recoverable-trash-janitor-gc` (purged payloads are reclaimed only by
+`studiofs janitor`; snapshot pins, outside hard links and a peer restore that
+wins over an offline purge stay protected). `mounted-recoverable-trash-durability`
+(PostgreSQL and S3 both down before a crash) is registered but expected to fail:
+repair startup intentionally refuses to serve without a shared snapshot.
+
+Directory Clear on WinFSP behaves like a local disk. Windows deletes a recycled directory child by child (each child is an
+independent open, delete disposition, and close; the `$R` root is deleted last).
+Every successful child delete is a permanent local metadata delete fenced by the
+receipt's `Retained` record in the same commit. Cancelling, Ctrl+C, or killing
+the deleting process leaves the remaining children visible and restorable, and
+the `$I` size reflects the surviving bytes; `set_delete(false)` rolls nothing
+back. If a peer's restore or purge reaches PostgreSQL first, the child delete
+loses, is retired locally, and the peer's restored child stays live. A child
+delete otherwise follows ordinary unlink rules for hard links, open handles, and
+deferred payload cleanup. Generated `$I` records bypass the WinFSP OS cache
+because their bytes change without a write.
+
+When a retained file or directory's payloads are evicted (remote-only), foreground
+WinFSP restore stays local-only and never blocks on S3 callbacks: it cleans up any
+partial staging entries, keeps the `$I`/`$R` pair and `Retained` receipt intact,
+enqueues background `RestorePayload` fetches for all missing objects via the
+prefetch worker (`fetch_block`), and returns `RemoteContentPending` →
+`Retryable` → `STATUS_UNSUCCESSFUL` (Win32 `ERROR_GEN_FAILURE` / `31`). Under
+Shell-automated Recycle Bin restore (`InvokeVerb("undelete")`, the same verb
+Explorer uses), the Shell fails fast with `OperationStatusWindow`
+(`"1 Interrupted Action"`) without falling back to cross-volume copy+delete; retrying after background fetch populates local cache
+restores the exact bytes with original inode identity preserved.
 
 ### macOS metadata file filtering
 

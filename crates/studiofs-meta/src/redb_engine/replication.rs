@@ -667,6 +667,7 @@ impl RedbMetaEngine {
         }
         use crate::events::MetaEvent;
         match event {
+            MetaEvent::SetVolumeSettings { .. } => {}
             MetaEvent::SetAttr { attr } => {
                 Self::invalidate_replica_inode(
                     txn,
@@ -806,6 +807,12 @@ impl RedbMetaEngine {
     ) -> MetaResult<RedbSnapshot> {
         check()?;
         let mut snapshot = Self::export_snapshot_from_read_txn_with_check(txn, false, check)?;
+        Self::project_shared_receipt_records(txn, &mut snapshot.xattrs)?;
+        // Only settled settings belong in peer bootstrap; local CAS may still
+        // be awaiting control-plane acceptance.
+        snapshot
+            .settings
+            .retain(|(key, _)| key != super::volume_settings::VOLUME_SETTINGS_KEY);
         let mut published_regular_inodes = HashSet::new();
         for (ino, bytes) in &snapshot.regular_file_base {
             check()?;
@@ -933,6 +940,21 @@ impl RedbMetaEngine {
     ) -> MetaResult<crate::snapshot::ServingCheckpoint> {
         check()?;
         let snapshot = Self::export_remote_snapshot_from_read_txn_with_check(txn, check)?;
+        // Validate any persisted header before producing checkpoint format 3.
+        // Unformatted engines are used by local contract fixtures only.
+        if snapshot.settings.iter().any(|(key, _)| key == "format") {
+            Self::read_format_info_from_read_txn(txn)?;
+        }
+        let volume_settings = snapshot
+            .settings
+            .iter()
+            .find(|(key, _)| key == super::volume_settings::BASE_VOLUME_SETTINGS_KEY)
+            .map(|(_, bytes)| {
+                serde_json::from_slice(bytes)
+                    .map_err(|error| MetaError::Serialization(error.to_string()))
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(crate::snapshot::ServingCheckpoint {
             inodes: snapshot.inodes,
             dentries: snapshot.dentries,
@@ -941,6 +963,7 @@ impl RedbMetaEngine {
             xattrs: snapshot.xattrs,
             acl_rules: snapshot.acl_rules,
             directory_aliases: snapshot.directory_aliases,
+            volume_settings,
         })
     }
 
@@ -1226,6 +1249,13 @@ impl RedbMetaEngine {
         for event in events {
             Self::invalidate_replica_event(txn, event)?;
             match event {
+                crate::events::MetaEvent::SetVolumeSettings { settings } => {
+                    Self::apply_volume_settings_in_txn(
+                        txn,
+                        super::volume_settings::BASE_VOLUME_SETTINGS_KEY,
+                        settings,
+                    )?
+                }
                 crate::events::MetaEvent::SetAttr { .. } => {}
                 crate::events::MetaEvent::RemoveAttr { ino } => {
                     let mut symlinks = txn
@@ -1411,6 +1441,13 @@ impl RedbMetaEngine {
         for event in events {
             Self::invalidate_replica_event(txn, event)?;
             match event {
+                crate::events::MetaEvent::SetVolumeSettings { settings } => {
+                    Self::apply_volume_settings_in_txn(
+                        txn,
+                        super::volume_settings::BASE_VOLUME_SETTINGS_KEY,
+                        settings,
+                    )?
+                }
                 crate::events::MetaEvent::SetAttr { attr } => {
                     let data = encode(attr)?;
                     let mut table = txn
@@ -1490,24 +1527,45 @@ impl RedbMetaEngine {
                         Self::lookup_exact_in_write_table(txn, BASE_DENTRIES_TABLE, *parent, name)?
                             .map(|current| current.ino == entry.ino && current.kind == entry.kind)
                             .unwrap_or(false);
+                    let prior_keys = if src_matches {
+                        Vec::new()
+                    } else {
+                        Self::base_dentry_keys_for_rename_entry(txn, entry)?
+                    };
+                    let removed_dir_parent = if entry.kind == FileType::Directory {
+                        if src_matches {
+                            Some(*parent)
+                        } else if prior_keys.len() == 1 {
+                            Some(decode_dentry_key(&prior_keys[0])?.0)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let displaced_base_is_dir = Self::lookup_exact_in_write_table(
+                        txn,
+                        BASE_DENTRIES_TABLE,
+                        *new_parent,
+                        new_name,
+                    )?
+                    .is_some_and(|existing| existing.kind == FileType::Directory);
+
                     if src_matches {
                         Self::remove_base_dentry_in_txn(txn, *parent, name)?;
-                    } else {
-                        let prior_keys = Self::base_dentry_keys_for_rename_entry(txn, entry)?;
-                        if prior_keys.len() > 1 {
-                            tracing::warn!(
-                                ino = entry.ino,
-                                source_parent = *parent,
-                                source_name = %String::from_utf8_lossy(name),
-                                destination_parent = *new_parent,
-                                destination_name = %String::from_utf8_lossy(new_name),
-                                prior_key_count = prior_keys.len(),
-                                "replica rename found multiple base dentries for inode; preserving existing links and applying destination"
-                            );
-                        } else if let Some(prior_key) = prior_keys.first() {
-                            let (prior_parent, prior_name) = decode_dentry_key(prior_key)?;
-                            Self::remove_base_dentry_in_txn(txn, prior_parent, prior_name)?;
-                        }
+                    } else if prior_keys.len() > 1 {
+                        tracing::warn!(
+                            ino = entry.ino,
+                            source_parent = *parent,
+                            source_name = %String::from_utf8_lossy(name),
+                            destination_parent = *new_parent,
+                            destination_name = %String::from_utf8_lossy(new_name),
+                            prior_key_count = prior_keys.len(),
+                            "replica rename found multiple base dentries for inode; preserving existing links and applying destination"
+                        );
+                    } else if let Some(prior_key) = prior_keys.first() {
+                        let (prior_parent, prior_name) = decode_dentry_key(prior_key)?;
+                        Self::remove_base_dentry_in_txn(txn, prior_parent, prior_name)?;
                     }
                     Self::remove_base_dentry_in_txn(txn, *new_parent, new_name)?;
                     Self::set_base_dentry_in_txn(txn, *new_parent, new_name, entry)?;
@@ -1530,17 +1588,67 @@ impl RedbMetaEngine {
                             .insert(attr.ino, data.as_slice())
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
                     }
-                    if let Some(attr) = old_parent_attr.as_ref() {
-                        let data = encode(attr)?;
+                    let nlink_delta_for = |ino: Ino| -> i32 {
+                        let mut delta = 0_i32;
+                        if entry.kind == FileType::Directory {
+                            if removed_dir_parent == Some(ino) {
+                                delta -= 1;
+                            }
+                            if *new_parent == ino {
+                                delta += 1;
+                            }
+                        }
+                        if displaced_base_is_dir && *new_parent == ino {
+                            delta -= 1;
+                        }
+                        delta
+                    };
+                    for incoming in [
+                        old_parent_attr.as_ref().as_ref(),
+                        new_parent_attr.as_ref().as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let existing = inodes
+                            .get(incoming.ino)?
+                            .map(|bytes| decode::<InodeAttr>(bytes.value()))
+                            .transpose()?;
+                        let merged = match existing {
+                            Some(mut current) => {
+                                current.mtime = current.mtime.max(incoming.mtime);
+                                current.ctime = current.ctime.max(incoming.ctime);
+                                let delta = nlink_delta_for(incoming.ino);
+                                if delta >= 0 {
+                                    current.nlink = current.nlink.saturating_add(delta as u32);
+                                } else {
+                                    current.nlink =
+                                        current.nlink.saturating_sub(delta.unsigned_abs());
+                                }
+                                current
+                            }
+                            None => incoming.clone(),
+                        };
+                        let data = encode(&merged)?;
                         inodes
-                            .insert(attr.ino, data.as_slice())
+                            .insert(merged.ino, data.as_slice())
                             .map_err(|e| MetaError::Storage(e.to_string()))?;
                     }
-                    if let Some(attr) = new_parent_attr.as_ref() {
-                        let data = encode(attr)?;
-                        inodes
-                            .insert(attr.ino, data.as_slice())
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    if let Some(prior_p) = removed_dir_parent
+                        && prior_p != *parent
+                        && prior_p != *new_parent
+                    {
+                        let prior_attr = inodes
+                            .get(prior_p)?
+                            .map(|bytes| decode::<InodeAttr>(bytes.value()))
+                            .transpose()?;
+                        if let Some(mut prior_attr) = prior_attr {
+                            prior_attr.nlink = prior_attr.nlink.saturating_sub(1);
+                            let data = encode(&prior_attr)?;
+                            inodes
+                                .insert(prior_attr.ino, data.as_slice())
+                                .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        }
                     }
                 }
                 crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
@@ -1665,6 +1773,7 @@ impl RedbMetaEngine {
             live_events
         };
         Self::apply_replica_serving_state_in_txn_with(&txn, &live_events, true, true)?;
+        Self::sync_replayed_inode_lifecycles_in_txn(&txn, &live_events)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
@@ -1878,10 +1987,18 @@ impl RedbMetaEngine {
         reject_stale_ready_growth: bool,
     ) -> MetaResult<()> {
         let mut local_removals = ReplayLocalJournal::default();
+        let mut rename_parent_inos_to_refresh = HashSet::new();
         for event in events {
             let event = event.borrow();
             Self::invalidate_replica_event(txn, event)?;
             match event {
+                crate::events::MetaEvent::SetVolumeSettings { settings } => {
+                    Self::apply_volume_settings_in_txn(
+                        txn,
+                        super::volume_settings::VOLUME_SETTINGS_KEY,
+                        settings,
+                    )?
+                }
                 crate::events::MetaEvent::SetAttr { attr } => {
                     let current = match Self::get_attr_merged_in_write_txn(txn, attr.ino) {
                         Ok(current) => Some(current),
@@ -1950,6 +2067,13 @@ impl RedbMetaEngine {
                         continue;
                     }
                     Self::set_inode_in_txn(txn, attr)?;
+                    if attr.kind == FileType::Directory
+                        && !Self::merged_children_in_write_txn(txn, attr.ino)?
+                            .1
+                            .is_empty()
+                    {
+                        rename_parent_inos_to_refresh.insert(attr.ino);
+                    }
                     if Self::ready_regular_file_attr_can_follow_base_in_txn(txn, attr)? {
                         Self::clear_regular_file_serving_overlay_in_txn(txn, attr.ino)?;
                     }
@@ -2030,11 +2154,32 @@ impl RedbMetaEngine {
                     if let Some(attr) = moved_dir_attr.as_ref() {
                         Self::set_inode_in_txn(txn, attr)?;
                     }
-                    if let Some(attr) = old_parent_attr.as_ref() {
-                        Self::set_inode_in_txn(txn, attr)?;
-                    }
-                    if let Some(attr) = new_parent_attr.as_ref() {
-                        Self::set_inode_in_txn(txn, attr)?;
+                    for incoming in [
+                        old_parent_attr.as_ref().as_ref(),
+                        new_parent_attr.as_ref().as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        match Self::get_attr_merged_in_write_txn(txn, incoming.ino) {
+                            Ok(mut current) => {
+                                let updated_mtime = current.mtime.max(incoming.mtime);
+                                let updated_ctime = current.ctime.max(incoming.ctime);
+                                if updated_mtime != current.mtime || updated_ctime != current.ctime
+                                {
+                                    current.mtime = updated_mtime;
+                                    current.ctime = updated_ctime;
+                                    Self::set_inode_in_txn(txn, &current)?;
+                                }
+                                if current.kind == FileType::Directory {
+                                    rename_parent_inos_to_refresh.insert(incoming.ino);
+                                }
+                            }
+                            Err(MetaError::InodeNotFound(_)) => {
+                                Self::set_inode_in_txn(txn, incoming)?;
+                            }
+                            Err(err) => return Err(err),
+                        }
                     }
                 }
                 crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
@@ -2125,6 +2270,28 @@ impl RedbMetaEngine {
                 crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. } => {}
+            }
+        }
+
+        for parent_ino in rename_parent_inos_to_refresh {
+            match Self::get_attr_merged_in_write_txn(txn, parent_ino) {
+                Ok(mut attr) if attr.kind == FileType::Directory => {
+                    let (children, _) = Self::merged_children_in_write_txn(txn, parent_ino)?;
+                    let subdirs = u32::try_from(
+                        children
+                            .into_iter()
+                            .filter(|child| child.kind == FileType::Directory)
+                            .count(),
+                    )
+                    .unwrap_or(u32::MAX);
+                    let expected_nlink = 2_u32.saturating_add(subdirs);
+                    if attr.nlink != expected_nlink {
+                        attr.nlink = expected_nlink;
+                        Self::set_inode_in_txn(txn, &attr)?;
+                    }
+                }
+                Ok(_) | Err(MetaError::InodeNotFound(_)) => {}
+                Err(err) => return Err(err),
             }
         }
 

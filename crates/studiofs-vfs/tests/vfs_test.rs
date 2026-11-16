@@ -470,7 +470,7 @@ fn parse_env_f64(key: &str) -> Option<f64> {
         .filter(|v| *v > 0.0)
 }
 
-fn test_vfs_config_from_env() -> VfsConfigValidated {
+fn test_vfs_config_raw_from_env() -> VfsConfigRaw {
     load_test_env();
     let mut config = VfsConfigRaw::default();
     if let Some(v) = locked_env_var("STUDIOFS_MAX_DIRTY_BYTES")
@@ -691,7 +691,13 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     } else if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_MAX_SPAWNED") {
         config.upload_worker_count = Some(value);
     }
-    config.validate().expect("test VFS config should validate")
+    config
+}
+
+fn test_vfs_config_from_env() -> VfsConfigValidated {
+    test_vfs_config_raw_from_env()
+        .validate()
+        .expect("test VFS config should validate")
 }
 
 fn load_test_env() {
@@ -832,18 +838,19 @@ fn make_vfs_with_config(
 }
 
 fn fast_janitor_vfs_config() -> VfsConfigValidated {
-    let mut config = test_vfs_config_from_env().into_inner();
-    config.janitor_interval_secs = 2;
-    config.janitor_skip_newer_secs = 0;
-    config.janitor_max_deletes = 50;
-    VfsConfigValidated::try_from(config).expect("valid fast janitor test config")
+    let mut config = test_vfs_config_raw_from_env();
+    config.janitor_interval_secs = Some(2);
+    config.janitor_skip_newer_secs = Some(0);
+    config.janitor_max_deletes = Some(50);
+    config.validate().expect("valid fast janitor test config")
 }
 
 #[allow(dead_code)]
-fn make_vfs_from_meta(
+fn make_vfs_from_meta_with_config(
     meta: Arc<dyn MetaEngine>,
     format_info: &FormatInfo,
     cache_dir_str: &str,
+    config: VfsConfigValidated,
 ) -> Arc<StudioVfs> {
     let data_config = DataStoreConfig::from(format_info);
     let vfs = StudioVfs::new(
@@ -852,12 +859,21 @@ fn make_vfs_from_meta(
         cache_dir_str,
         1024 * 1024 * 1024,
         512 * 1024 * 1024,
-        test_vfs_config_from_env(),
+        config,
     )
     .expect("failed to create StudioVfs");
     vfs.start()
         .expect("failed to start StudioVfs background workers");
     vfs
+}
+
+#[allow(dead_code)]
+fn make_vfs_from_meta(
+    meta: Arc<dyn MetaEngine>,
+    format_info: &FormatInfo,
+    cache_dir_str: &str,
+) -> Arc<StudioVfs> {
+    make_vfs_from_meta_with_config(meta, format_info, cache_dir_str, test_vfs_config_from_env())
 }
 
 fn make_vfs_with_meta(
@@ -4503,6 +4519,1445 @@ fn pg_backed_flock_blocks_conflicting_peer_until_unlock() {
             .shutdown(Duration::from_secs(15))
             .await
             .expect("remote VFS shutdown should succeed");
+    });
+    rt.shutdown_background();
+}
+
+fn published_object_ids(meta: &PgMetaEngine, ino: Ino) -> std::collections::BTreeSet<u64> {
+    let size = meta.get_attr(ino).unwrap().size;
+    meta.lookup_regular_file_slices(ino, 0, size)
+        .unwrap()
+        .into_iter()
+        .filter_map(|span| span.payload.map(|payload| payload.object_id))
+        .collect()
+}
+
+fn publish_overlay_from_local_bodies(vfs: &StudioVfs, meta: &PgMetaEngine, ino: Ino) -> u64 {
+    let attr = meta.get_attr(ino).expect("load pending fixture attr");
+    let object_ids = meta
+        .get_regular_file_overlay_object_ids(ino)
+        .expect("load local overlay objects");
+    assert!(!object_ids.is_empty(), "fixture needs local overlay bodies");
+    for object_id in object_ids {
+        assert!(vfs.local_payload_backend().contains(object_id));
+        vfs.local_payload_backend()
+            .mark_uploaded(object_id)
+            .expect("mark fixture body locally uploaded");
+        assert!(
+            meta.mark_regular_file_overlay_object_uploaded_if_matches(
+                ino,
+                attr.content_epoch,
+                object_id,
+            )
+            .expect("mark fixture overlay object uploaded")
+        );
+    }
+    assert!(
+        meta.publish_regular_file_overlay_to_base_if_matches(ino, attr.content_epoch)
+            .expect("publish fixture overlay as Ready"),
+        "fixture overlay should promote at its captured epoch"
+    );
+    attr.content_epoch
+}
+
+#[test]
+fn retained_restore_preserves_live_writers_and_skips_occupied_destination() {
+    use studiofs_meta::trash::{MetaVolumeSettings, RetainedEntryState};
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    let tmp = studiofs_test_support::workspace_target_tempdir("retained-copy-");
+    let cache_dir = tmp.path().join("cache").to_str().unwrap().to_string();
+    let format_info = make_format_info_with_endpoint(
+        &format!("retained-copy-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (meta, _data_config, vfs) = make_local_zeroio_test_vfs(
+            &tmp.path().join("meta.redb"),
+            &cache_dir,
+            &format_info,
+            VfsConfigRaw::default().validate().unwrap(),
+        );
+        vfs.start().unwrap();
+        meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let store = vfs.mkdir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let retain = |name: &[u8]| {
+            let file = vfs.create(ROOT_INO, name, 0, 0, 0o644).unwrap();
+            (file, name.to_vec())
+        };
+
+        // Existing handles retain identity and continue writing after restore.
+        let (open_file, open_name) = retain(b"open.bin");
+        vfs.write(open_file.ino, 0, b"open").await.unwrap();
+        vfs.fsync(open_file.ino, false).await.unwrap();
+        let open_receipt = meta.next_inode().unwrap();
+        meta.retain_namespace_entry(ROOT_INO, &open_name, store.ino, open_receipt)
+            .unwrap();
+        let fh = vfs
+            .open_file(open_file.ino, OpenFlags::RDWR, false)
+            .unwrap();
+        vfs.restore_retained_entry(meta.as_ref(), open_receipt, ROOT_INO, b"open-restored")
+            .await
+            .unwrap();
+        vfs.write_fh(fh, open_file.ino, 0, b"LIVE").await.unwrap();
+        vfs.flush_fh(fh).await.unwrap();
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"open-restored").unwrap().ino,
+            open_file.ino
+        );
+        assert_eq!(
+            vfs.read(open_file.ino, 0, 4).await.unwrap().as_ref(),
+            b"LIVE"
+        );
+        vfs.release_fh(fh).await.unwrap();
+
+        // Outside hardlinks share the restored identity and future writes.
+        let (linked, linked_name) = retain(b"linked.bin");
+        vfs.write(linked.ino, 0, b"linked").await.unwrap();
+        vfs.fsync(linked.ino, false).await.unwrap();
+        vfs.link(linked.ino, ROOT_INO, b"alias.bin").unwrap();
+        let linked_receipt = meta.next_inode().unwrap();
+        meta.retain_namespace_entry(ROOT_INO, &linked_name, store.ino, linked_receipt)
+            .unwrap();
+        vfs.restore_retained_entry(meta.as_ref(), linked_receipt, ROOT_INO, b"linked-restored")
+            .await
+            .unwrap();
+        let restored_linked = vfs.lookup(ROOT_INO, b"linked-restored").unwrap();
+        assert_eq!(restored_linked.ino, linked.ino);
+        assert_eq!(restored_linked.nlink, 2);
+        assert_eq!(vfs.lookup(ROOT_INO, b"alias.bin").unwrap().ino, linked.ino);
+        assert_eq!(vfs.getattr(linked.ino).unwrap().nlink, 2);
+        vfs.write(linked.ino, 0, b"alias!").await.unwrap();
+        vfs.fsync(linked.ino, false).await.unwrap();
+        assert_eq!(
+            vfs.read(restored_linked.ino, 0, 6).await.unwrap().as_ref(),
+            b"alias!"
+        );
+        assert!(matches!(
+            meta.retained_entry(open_receipt).unwrap().unwrap().state,
+            RetainedEntryState::Restored { .. }
+        ));
+
+        // An occupied destination fails before any copy touches the payload.
+        let (busy, busy_name) = retain(b"busy.bin");
+        vfs.write(busy.ino, 0, b"busy").await.unwrap();
+        vfs.fsync(busy.ino, false).await.unwrap();
+        let busy_receipt = meta.next_inode().unwrap();
+        meta.retain_namespace_entry(ROOT_INO, &busy_name, store.ino, busy_receipt)
+            .unwrap();
+        vfs.create(ROOT_INO, b"taken.bin", 0, 0, 0o644).unwrap();
+        let before = vfs.getattr(busy.ino).unwrap();
+        let slices_before = meta.lookup_payload_slices(busy.ino).unwrap();
+        assert!(
+            vfs.restore_retained_entry(meta.as_ref(), busy_receipt, ROOT_INO, b"taken.bin")
+                .await
+                .is_err()
+        );
+        let after = vfs.getattr(busy.ino).unwrap();
+        assert_eq!((after.mtime, after.ctime), (before.mtime, before.ctime));
+        assert_eq!(meta.lookup_payload_slices(busy.ino).unwrap(), slices_before);
+        assert!(vfs.lookup(busy_receipt, b"data").is_ok());
+
+        // A permitted restore forks payloads, moves the original inode, and keeps its bytes.
+        let restored = vfs
+            .restore_retained_entry(meta.as_ref(), busy_receipt, ROOT_INO, b"busy-restored")
+            .await
+            .unwrap();
+        assert!(matches!(
+            restored.state,
+            RetainedEntryState::Restored { .. }
+        ));
+        let restored_busy = vfs.lookup(ROOT_INO, b"busy-restored").unwrap();
+        assert_eq!(restored_busy.ino, busy.ino);
+        assert_eq!(
+            vfs.read(restored_busy.ino, 0, 4).await.unwrap().as_ref(),
+            b"busy"
+        );
+        assert!(meta.get_attr(busy.ino).is_ok());
+        vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn retained_restore_denies_without_source_or_original_parent_write() {
+    use studiofs_meta::trash::{MetaVolumeSettings, RetainedEntryState};
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    let tmp = studiofs_test_support::workspace_target_tempdir("retained-acl-");
+    let cache_dir = tmp.path().join("cache").to_str().unwrap().to_string();
+    let format_info = make_format_info_with_endpoint(
+        &format!("retained-acl-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (meta, _data_config, vfs) = make_local_zeroio_test_vfs(
+            &tmp.path().join("meta.redb"),
+            &cache_dir,
+            &format_info,
+            VfsConfigRaw::default().validate().unwrap(),
+        );
+        vfs.start().unwrap();
+        meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let store = vfs.mkdir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let original = vfs.mkdir(ROOT_INO, b"docs", 0, 0, 0o755).unwrap();
+        let payload = vfs.mkdir(original.ino, b"sub", 0, 0, 0o755).unwrap();
+        let receipt = meta.next_inode().unwrap();
+        meta.retain_namespace_entry(original.ino, b"sub", store.ino, receipt)
+            .unwrap();
+
+        // The destination is writable; the original parent or the receipt
+        // (the stage parent) is not.
+        for denied in [original.ino, store.ino] {
+            vfs.set_acl_rule(denied, "*", AccessLevel::ReadOnly)
+                .unwrap();
+            let result = vfs
+                .restore_retained_entry(meta.as_ref(), receipt, ROOT_INO, b"restored")
+                .await;
+            assert!(
+                matches!(result, Err(VfsError::Meta(MetaError::AccessDenied { .. }))),
+                "{result:?}"
+            );
+            assert_eq!(
+                meta.retained_entry(receipt).unwrap().unwrap().state,
+                RetainedEntryState::Retained,
+                "a denied restore leaves the entry recoverable"
+            );
+            vfs.set_acl_rule(denied, "*", AccessLevel::ReadWrite)
+                .unwrap();
+        }
+        vfs.restore_retained_entry(meta.as_ref(), receipt, ROOT_INO, b"restored")
+            .await
+            .unwrap();
+        let restored = vfs.lookup(ROOT_INO, b"restored").unwrap();
+        assert_eq!(restored.ino, payload.ino);
+        assert!(meta.get_attr(payload.ino).is_ok());
+        vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn retained_restore_retry_is_idempotent_after_original_parent_removed() {
+    use studiofs_meta::trash::MetaVolumeSettings;
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    let tmp = studiofs_test_support::workspace_target_tempdir("retained-retry-");
+    let cache_dir = tmp.path().join("cache").to_str().unwrap().to_string();
+    let format_info = make_format_info_with_endpoint(
+        &format!("retained-retry-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (meta, _data_config, vfs) = make_local_zeroio_test_vfs(
+            &tmp.path().join("meta.redb"),
+            &cache_dir,
+            &format_info,
+            VfsConfigRaw::default().validate().unwrap(),
+        );
+        vfs.start().unwrap();
+        meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let store = vfs.mkdir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let original = vfs.mkdir(ROOT_INO, b"docs", 0, 0, 0o755).unwrap();
+        let payload = vfs.mkdir(original.ino, b"sub", 0, 0, 0o755).unwrap();
+        let receipt = meta.next_inode().unwrap();
+        meta.retain_namespace_entry(original.ino, b"sub", store.ino, receipt)
+            .unwrap();
+        let restored = vfs
+            .restore_retained_entry(meta.as_ref(), receipt, ROOT_INO, b"restored")
+            .await
+            .unwrap();
+        let restored_entry = vfs.lookup(ROOT_INO, b"restored").unwrap();
+        assert_eq!(restored_entry.ino, payload.ino);
+        // The completed restore no longer depends on its original parent.
+        vfs.rmdir(ROOT_INO, b"docs").unwrap();
+        let retry = vfs
+            .restore_retained_entry(meta.as_ref(), receipt, ROOT_INO, b"restored")
+            .await;
+        assert_eq!(retry.unwrap(), restored);
+        assert_eq!(
+            vfs.lookup(ROOT_INO, b"restored").unwrap().ino,
+            restored_entry.ino
+        );
+        assert!(meta.get_attr(payload.ino).is_ok());
+        let elsewhere = vfs
+            .restore_retained_entry(meta.as_ref(), receipt, ROOT_INO, b"elsewhere")
+            .await;
+        assert!(
+            matches!(elsewhere, Err(VfsError::Meta(MetaError::Storage(_)))),
+            "{elsewhere:?}"
+        );
+        vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn retained_receipt_xattr_is_not_user_mutable_through_vfs() {
+    use studiofs_meta::trash::MetaVolumeSettings;
+    const RESERVED: &[u8] = b"system.studiofs.retained.v1";
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    let tmp = studiofs_test_support::workspace_target_tempdir("retained-xattr-");
+    let cache_dir = tmp.path().join("cache").to_str().unwrap().to_string();
+    let format_info = make_format_info_with_endpoint(
+        &format!("retained-xattr-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (meta, _data_config, vfs) = make_local_zeroio_test_vfs(
+            &tmp.path().join("meta.redb"),
+            &cache_dir,
+            &format_info,
+            VfsConfigRaw::default().validate().unwrap(),
+        );
+        vfs.start().unwrap();
+        meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let store = vfs.mkdir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let file = vfs.create(ROOT_INO, b"forged.bin", 0, 0, 0o644).unwrap();
+        vfs.mkdir(ROOT_INO, b"source", 0, 0, 0o755).unwrap();
+        let receipt = meta.next_inode().unwrap();
+        let entry = meta
+            .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+            .unwrap();
+        let record = vfs.get_xattr(receipt, RESERVED).unwrap().unwrap();
+        for result in [
+            vfs.set_xattr(file.ino, RESERVED, &record, 0),
+            vfs.set_xattr(receipt, RESERVED, &record, 0),
+            vfs.remove_xattr(receipt, RESERVED),
+        ] {
+            assert!(
+                matches!(result, Err(VfsError::Meta(MetaError::AccessDenied { .. }))),
+                "{result:?}"
+            );
+        }
+        assert_eq!(meta.retained_entry(receipt).unwrap(), Some(entry));
+        assert_eq!(vfs.get_xattr(file.ino, RESERVED).unwrap(), None);
+        vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres and live S3"]
+fn retained_purge_settlement_defers_while_a_read_only_handle_is_open() {
+    use studiofs_meta::MetaNamespace;
+    use studiofs_meta::trash::{MetaRetainedStore, MetaVolumeSettings, RetainedPurgeReason};
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    apply_test_online_s3_env();
+    let tmp = studiofs_test_support::workspace_target_tempdir("retained-settle-open-");
+    let db = tmp.path().join("meta.redb");
+    let cache = tmp.path().join("cache").to_str().unwrap().to_string();
+    let volume = PgTestVolume::new(&dsn, "vfs-retained-settle-open");
+    let mut info = volume.format_info();
+    let s3 = test_online_s3_env();
+    info.endpoint = s3.endpoint.clone();
+    info.bucket = s3.bucket.clone();
+    info.access_key = s3.access_key.clone();
+    info.secret_key = s3.secret_key.clone();
+    seed_local(&db, &info);
+    let meta = PgMetaEngine::open_with_options(
+        &db,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("open pg meta");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    let payload: Vec<u8> = (0..(256 * 1024 + 7)).map(|i| (i % 251) as u8).collect();
+    rt.block_on(async {
+        ensure_bucket().await;
+        let vfs = make_vfs_from_meta(meta.clone(), &info, &cache);
+        meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let store = vfs.mkdir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let file = vfs.create(ROOT_INO, b"doc.bin", 0, 0, 0o644).unwrap();
+        vfs.write(file.ino, 0, &payload).await.unwrap();
+        vfs.fsync(file.ino, false).await.unwrap();
+        assert!(
+            wait_until(online_publish_timeout(), || {
+                let _ = meta.flush_metadata();
+                vfs.pending_uploads_for_inode(file.ino).is_empty()
+                    && meta
+                        .get_attr(file.ino)
+                        .is_ok_and(|attr| attr.upload_state == UploadState::Ready)
+            })
+            .await,
+            "file must publish"
+        );
+        // A read-only handle (not a write overlay) opened before Move to Trash.
+        let fh = vfs.open_file(file.ino, OpenFlags::RDONLY, false).unwrap();
+        let receipt = meta.next_inode().unwrap();
+        meta.retain_namespace_entry(ROOT_INO, b"doc.bin", store.ino, receipt)
+            .unwrap();
+        meta.request_retained_purge(receipt, RetainedPurgeReason::User)
+            .unwrap();
+        meta.flush_metadata().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sweep = meta.run_retained_lifecycle_once(now).unwrap();
+        assert_eq!((sweep.settled, sweep.deferred), (0, 1));
+        assert_eq!(meta.lookup(receipt, b"data").unwrap().ino, file.ino);
+        let mut buffer = vec![0; payload.len()];
+        let read = vfs
+            .read_into_fh(fh, file.ino, 0, &mut buffer)
+            .await
+            .unwrap();
+        assert_eq!(read as usize, payload.len());
+        assert!(
+            buffer == payload,
+            "the open handle keeps reading exact bytes"
+        );
+        vfs.release_fh(fh).await.unwrap();
+        let sweep = meta.run_retained_lifecycle_once(now).unwrap();
+        assert_eq!((sweep.settled, sweep.deferred), (1, 0));
+        assert!(meta.lookup(receipt, b"data").is_err());
+        assert!(meta.get_attr(file.ino).is_err());
+        meta.flush_metadata().unwrap();
+        vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres and live S3"]
+fn retained_restore_losing_to_peer_purge_keeps_bytes_and_republishes_new_objects() {
+    use studiofs_meta::trash::{MetaRetainedStore, MetaVolumeSettings, RetainedPurgeReason};
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _restore_sync = ScopedEnvVar::capture("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS");
+    apply_test_online_s3_env();
+    // Keep each client's pull explicit so the peer purge deterministically wins.
+    set_test_env("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "3600000");
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("retained-bytes-");
+    let a_db = tmp.path().join("meta-a.redb");
+    let b_db = tmp.path().join("meta-b.redb");
+    let a_cache = tmp.path().join("cache-a").to_str().unwrap().to_string();
+    let b_cache = tmp.path().join("cache-b").to_str().unwrap().to_string();
+    let volume = PgTestVolume::new(&dsn, "vfs-retained-bytes");
+    let mut info = volume.format_info();
+    let s3 = test_online_s3_env();
+    info.endpoint = s3.endpoint.clone();
+    info.bucket = s3.bucket.clone();
+    info.access_key = s3.access_key.clone();
+    info.secret_key = s3.secret_key.clone();
+    seed_local(&a_db, &info);
+    seed_local(&b_db, &info);
+    let open = |path: &std::path::Path| {
+        PgMetaEngine::open_with_options(
+            path,
+            PgOpenOptions {
+                background_poll: false,
+                ..Default::default()
+            },
+        )
+        .expect("open pg meta")
+    };
+    let a_meta = open(&a_db);
+    let b_meta = open(&b_db);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    let payload: Vec<u8> = (0..(3 * 1024 * 1024 + 17))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let phase_one = rt.block_on(async {
+        ensure_bucket().await;
+        let a_vfs = make_vfs_from_meta(a_meta.clone(), &info, &a_cache);
+        let b_vfs = make_vfs_from_meta(b_meta.clone(), &info, &b_cache);
+        a_meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let store = a_vfs.mkdir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let file = a_vfs.create(ROOT_INO, b"doc.bin", 0, 0, 0o644).unwrap();
+        a_vfs.write(file.ino, 0, &payload).await.unwrap();
+        a_vfs.fsync(file.ino, false).await.unwrap();
+        assert!(
+            wait_until(online_publish_timeout(), || {
+                let _ = a_meta.flush_metadata();
+                a_vfs.pending_uploads_for_inode(file.ino).is_empty()
+                    && a_meta
+                        .get_attr(file.ino)
+                        .is_ok_and(|attr| attr.upload_state == UploadState::Ready)
+            })
+            .await,
+            "original file must publish"
+        );
+        let old_objects = published_object_ids(&a_meta, file.ino);
+        assert!(!old_objects.is_empty());
+
+        let receipt = a_meta.next_inode().unwrap();
+        a_meta
+            .retain_namespace_entry(ROOT_INO, b"doc.bin", store.ino, receipt)
+            .unwrap();
+        a_meta.flush_metadata().unwrap();
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                let _ = a_meta.flush_metadata();
+                let _ = b_meta.sync_metadata();
+                b_meta.retained_entry(receipt).ok().flatten().is_some()
+            })
+            .await,
+            "peer must observe the retained receipt"
+        );
+
+        // B's purge wins the shared authority before A publishes its restore.
+        b_meta
+            .request_retained_purge(receipt, RetainedPurgeReason::User)
+            .unwrap();
+        b_meta.flush_metadata().unwrap();
+
+        // A restores offline: bytes are forked under fresh object IDs while inode identity remains stable.
+        a_vfs
+            .restore_retained_entry(a_meta.as_ref(), receipt, ROOT_INO, b"restored.bin")
+            .await
+            .unwrap();
+        let restored_a = a_vfs.lookup(ROOT_INO, b"restored.bin").unwrap();
+        assert_eq!(restored_a.ino, file.ino);
+        assert_eq!(a_meta.get_attr(file.ino).unwrap().ino, file.ino);
+        let captured = published_object_ids(&a_meta, restored_a.ino);
+        assert!(
+            captured.is_disjoint(&old_objects),
+            "restore must capture local bytes under new object IDs"
+        );
+
+        // Emulate the shared side reaching GC of the purged entry's objects.
+        let ds = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
+        for object_id in &old_objects {
+            for key in format_object_fragment_keys(&info.data_prefix, *object_id) {
+                ds.delete_by_key(&key).await.unwrap();
+            }
+        }
+
+        // A's losing restore record is dropped, the rest of its journal publishes.
+        assert!(
+            wait_until(online_publish_timeout(), || {
+                let flushed = a_meta.flush_metadata().is_ok();
+                flushed
+                    && a_vfs.pending_uploads_for_inode(restored_a.ino).is_empty()
+                    && a_meta
+                        .get_attr(restored_a.ino)
+                        .is_ok_and(|attr| attr.upload_state == UploadState::Ready)
+                    && a_meta.replication_backlog().pending_ops == 0
+            })
+            .await,
+            "accepted restore must republish after losing the shared purge"
+        );
+        a_vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+        (old_objects, b_vfs, file.ino, restored_a.ino)
+    });
+    let (old_objects, b_vfs, old_ino, ino) = phase_one;
+    drop(a_meta);
+    // Reopen A on the same cache after the old objects were deleted remotely.
+    let a_meta = open(&a_db);
+    rt.block_on(async {
+        let a_vfs = make_vfs_from_meta(a_meta.clone(), &info, &a_cache);
+        let restored = a_vfs.lookup(ROOT_INO, b"restored.bin").unwrap();
+        assert_eq!(restored.ino, ino);
+        let bytes = a_vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert!(
+            bytes.as_ref() == payload.as_slice(),
+            "A must read exact bytes"
+        );
+        // The retired loser is final: after reopen nothing is left to reject.
+        a_meta.flush_metadata().unwrap();
+        a_meta.flush_metadata().unwrap();
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                let _ = b_meta.sync_metadata();
+                b_vfs
+                    .lookup(ROOT_INO, b"restored.bin")
+                    .is_ok_and(|entry| entry.ino == ino)
+                    && published_object_ids(&b_meta, ino).is_disjoint(&old_objects)
+            })
+            .await,
+            "peer must observe the restore republished under new object IDs"
+        );
+        assert!(!published_object_ids(&b_meta, ino).is_empty());
+        assert_eq!(b_meta.get_attr(old_ino).unwrap().ino, ino);
+        let peer_bytes = b_vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert!(
+            peer_bytes.as_ref() == payload.as_slice(),
+            "peer must read the republished bytes"
+        );
+        a_vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+        b_vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres and live S3"]
+fn retained_restore_losing_to_settled_peer_purge_preserves_inode_and_bytes() {
+    use studiofs_meta::MetaEngineCore;
+    use studiofs_meta::trash::{MetaRetainedStore, MetaVolumeSettings, RetainedPurgeReason};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let _restore_sync = ScopedEnvVar::capture("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS");
+    apply_test_online_s3_env();
+    // Keep each client's pull explicit so settlement precedes the loser's restore publish.
+    set_test_env("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "3600000");
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("retained-settled-file-");
+    let a_db = tmp.path().join("meta-a.redb");
+    let b_db = tmp.path().join("meta-b.redb");
+    let a_cache = tmp.path().join("cache-a").to_str().unwrap().to_string();
+    let b_cache = tmp.path().join("cache-b").to_str().unwrap().to_string();
+    let volume = PgTestVolume::new(&dsn, "vfs-retained-settled-file");
+    let mut info = volume.format_info();
+    let s3 = test_online_s3_env();
+    info.endpoint = s3.endpoint.clone();
+    info.bucket = s3.bucket.clone();
+    info.access_key = s3.access_key.clone();
+    info.secret_key = s3.secret_key.clone();
+    seed_local(&a_db, &info);
+    seed_local(&b_db, &info);
+    let open = |path: &std::path::Path| {
+        PgMetaEngine::open_with_options(
+            path,
+            PgOpenOptions {
+                background_poll: false,
+                ..Default::default()
+            },
+        )
+        .expect("open pg meta")
+    };
+    let a_meta = open(&a_db);
+    let b_meta = open(&b_db);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    let payload: Vec<u8> = (0..(512 * 1024 + 13)).map(|i| (i % 251) as u8).collect();
+    rt.block_on(async {
+        ensure_bucket().await;
+        let probe_store = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
+        let probe_key = format!("{}restore-preflight", info.data_prefix);
+        let probe = tokio::time::timeout(
+            Duration::from_secs(15),
+            probe_store.put_by_key(&probe_key, Bytes::from_static(b"restore preflight")),
+        )
+        .await;
+        if let Ok(Err(error)) = &probe {
+            let mut redacted = format!("{error:?}");
+            for secret in [&info.endpoint, &info.access_key, &info.secret_key, &dsn] {
+                if !secret.is_empty() { redacted = redacted.replace(secret, "<redacted>"); }
+            }
+            eprintln!("restore PUT prerequisite: {redacted}");
+        }
+        assert!(
+            probe.is_ok_and(|result| result.is_ok()),
+            "S3 prerequisite PUT failed or timed out before restore"
+        );
+        probe_store.delete_by_key(&probe_key).await.unwrap();
+        let a_vfs = make_vfs_from_meta(a_meta.clone(), &info, &a_cache);
+        let b_vfs = make_vfs_from_meta(b_meta.clone(), &info, &b_cache);
+        a_meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let store = a_vfs.mkdir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let file = a_vfs.create(ROOT_INO, b"doc.bin", 0, 0, 0o644).unwrap();
+        a_vfs.write(file.ino, 0, &payload).await.unwrap();
+        a_vfs.fsync(file.ino, false).await.unwrap();
+        assert!(
+            wait_until(online_publish_timeout(), || {
+                let _ = a_meta.flush_metadata();
+                a_vfs.pending_uploads_for_inode(file.ino).is_empty()
+                    && a_meta
+                        .get_attr(file.ino)
+                        .is_ok_and(|attr| attr.upload_state == UploadState::Ready)
+            })
+            .await,
+            "original file must publish: pending={:?}, state={:?}, uploads={:?}",
+            a_vfs.pending_uploads_for_inode(file.ino),
+            a_meta.get_attr(file.ino).map(|a| a.upload_state),
+            a_vfs.upload_stats()
+        );
+        let old_objects = published_object_ids(&a_meta, file.ino);
+        assert!(!old_objects.is_empty());
+
+        let receipt = a_meta.next_inode().unwrap();
+        a_meta
+            .retain_namespace_entry(ROOT_INO, b"doc.bin", store.ino, receipt)
+            .unwrap();
+        a_meta.flush_metadata().unwrap();
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                let _ = a_meta.flush_metadata();
+                let _ = b_meta.sync_metadata();
+                b_meta.retained_entry(receipt).ok().flatten().is_some()
+            })
+            .await,
+            "peer must observe the retained receipt"
+        );
+
+        // Restart A with delayed uploads while caught up so A keeps ReadWrite authority
+        // and the fresh adopted payload stays DIRTY and unpublished across the next shutdown.
+        a_vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+        b_vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+        drop(a_vfs);
+        drop(b_vfs);
+        drop(a_meta);
+        drop(b_meta);
+        let a_meta = open(&a_db);
+        let b_meta = open(&b_db);
+        let mut delayed_upload_cfg = test_vfs_config_raw_from_env();
+        delayed_upload_cfg.upload_delay_ms = Some(60_000);
+        let delayed_upload_cfg = delayed_upload_cfg
+            .validate()
+            .expect("valid delayed upload cfg");
+        let a_vfs = make_vfs_from_meta_with_config(
+            a_meta.clone(),
+            &info,
+            &a_cache,
+            delayed_upload_cfg,
+        );
+
+        // B wins purge authority, settles it, and publishes settlement before A publishes restore.
+        b_meta
+            .request_retained_purge(receipt, RetainedPurgeReason::User)
+            .unwrap();
+        b_meta.flush_metadata().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sweep = b_meta.run_retained_lifecycle_once(now).unwrap();
+        assert_eq!(sweep.settled, 1);
+        assert!(matches!(
+            b_meta.get_attr(file.ino),
+            Err(MetaError::InodeNotFound(_))
+        ));
+        b_meta.flush_metadata().unwrap();
+
+        // Missing remote-only bodies must progress on the background fetch worker.
+        for object_id in &old_objects {
+            a_vfs.local_payload_backend().remove(*object_id).unwrap();
+            assert!(!a_vfs.local_payload_backend().contains(*object_id));
+        }
+        assert!(matches!(a_vfs.restore_retained_entry(a_meta.as_ref(), receipt, ROOT_INO, b"restored.bin").await,
+            Err(VfsError::RemoteContentPending)));
+        assert!(a_vfs.lookup(ROOT_INO, b"restored.bin").is_err());
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                old_objects
+                    .iter()
+                    .all(|id| a_vfs.local_payload_backend().contains(*id))
+            })
+            .await,
+            "queued background restore fetch must repopulate evicted bodies"
+        );
+
+        a_vfs
+            .restore_retained_entry(a_meta.as_ref(), receipt, ROOT_INO, b"restored.bin")
+            .await
+            .unwrap();
+        let restore_epoch = a_meta.get_attr(file.ino).unwrap().content_epoch;
+        let local_new_objects = published_object_ids(&a_meta, file.ino);
+        assert!(!local_new_objects.is_empty());
+        assert!(local_new_objects.is_disjoint(&old_objects));
+        let dirty_before_restart: std::collections::BTreeSet<u64> = a_vfs
+            .local_payload_backend()
+            .dirty_object_ids()
+            .into_iter()
+            .collect();
+        for object_id in &local_new_objects {
+            assert!(
+                dirty_before_restart.contains(object_id),
+                "fresh restored object {object_id} must stay DIRTY before restart"
+            );
+        }
+        assert_ne!(
+            a_meta.get_attr(file.ino).unwrap().upload_state,
+            UploadState::Ready,
+            "fresh restored inode must remain unready before upload publication"
+        );
+        let ack_before_shutdown = a_meta
+            .local_outbound_ack_snapshot()
+            .expect("local outbound ack snapshot before shutdown");
+        assert!(
+            ack_before_shutdown.local_event_end > ack_before_shutdown.durable_cursor,
+            "accepted restore must leave unpublished local journal events before shutdown: {ack_before_shutdown:?}"
+        );
+
+        // Shut down A before publication (without draining the 60s delayed upload),
+        // then inspect the offline local journal for stage-inode isolation.
+        a_vfs.shutdown(Duration::ZERO).await.unwrap();
+        drop(a_vfs);
+        drop(a_meta);
+
+        let stage_inodes: Vec<i64> = {
+            let local_only = RedbMetaEngine::open(&a_db).expect("open offline local redb");
+            let events = local_only
+                .read_events_range(1, u64::MAX)
+                .expect("read local unpublished journal");
+            let mut stage_overlay_inodes = std::collections::BTreeSet::new();
+            let mut stage_remove_attr_inodes = std::collections::BTreeSet::new();
+            for event in &events {
+                match event {
+                    studiofs_meta::events::MetaEvent::SetRegularFileOverlaySlices {
+                        ino,
+                        chunk_slices,
+                    } if *ino != file.ino => {
+                        let touches_fresh = chunk_slices.iter().any(|(_, slices)| {
+                            slices.iter().any(|slice| {
+                                slice
+                                    .payload
+                                    .as_ref()
+                                    .is_some_and(|p| local_new_objects.contains(&p.object_id))
+                            })
+                        });
+                        if touches_fresh {
+                            stage_overlay_inodes.insert(*ino);
+                        }
+                    }
+                    studiofs_meta::events::MetaEvent::RemoveAttr { ino } => {
+                        assert_ne!(*ino, file.ino, "restore must never emit RemoveAttr for adopted inode");
+                        stage_remove_attr_inodes.insert(*ino);
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                !stage_overlay_inodes.is_empty(),
+                "stage file copy must record SetRegularFileOverlaySlices on a stage inode"
+            );
+            for stage_ino in &stage_overlay_inodes {
+                assert!(
+                    stage_remove_attr_inodes.contains(stage_ino),
+                    "stage inode {stage_ino} must be retired by RemoveAttr during atomic restore"
+                );
+            }
+            stage_overlay_inodes
+                .into_iter()
+                .map(|ino| i64::try_from(ino).expect("stage ino fits i64"))
+                .collect()
+        };
+
+        // Start peer B with real mounted janitor (no manual S3 delete emulation) to
+        // reclaim all purged old_objects from S3 while A is offline pre-publication.
+        drop(b_meta);
+        let b_meta = open(&b_db);
+        b_meta.sync_metadata().unwrap();
+        assert!(
+            matches!(
+                b_meta.retained_entry(receipt).unwrap().unwrap().state,
+                studiofs_meta::trash::RetainedEntryState::PurgeRequested { .. }
+            ),
+            "peer must still see PurgeRequested (restore has not published to PG)"
+        );
+        let ds = DataStore::new(&DataStoreConfig::from(&info)).unwrap();
+        let b_vfs = make_vfs_from_meta_with_config(
+            b_meta.clone(),
+            &info,
+            &b_cache,
+            fast_janitor_vfs_config(),
+        );
+        for object_id in &old_objects {
+            assert!(
+                wait_until_object_absent(&ds, &info.data_prefix, *object_id, online_publish_timeout())
+                    .await,
+                "mounted peer janitor must reclaim settled purged object {object_id} from S3"
+            );
+        }
+
+        // Verify PG upload-ledger fence state for purged objects while A is still offline.
+        let old_objects_i64: Vec<i64> = old_objects
+            .iter()
+            .map(|id| i64::try_from(*id).expect("old object id fits i64"))
+            .collect();
+        {
+            let (pg_client, pg_conn) =
+                tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                    .await
+                    .expect("connect to verify PG fence state");
+            let pg_task = tokio::spawn(pg_conn);
+            let old_states = pg_client
+                .query(
+                    "SELECT object_id, state FROM snapshot_payload_upload_objects WHERE vol = $1 AND object_id = ANY($2::BIGINT[])",
+                    &[&volume.volume_id, &old_objects_i64],
+                )
+                .await
+                .expect("query old object states");
+            assert_eq!(old_states.len(), old_objects_i64.len());
+            for row in old_states {
+                assert_eq!(
+                    row.get::<_, String>(1),
+                    "delete_pending",
+                    "mounted janitor must leave reclaimed old object in delete_pending fence"
+                );
+            }
+            pg_task.abort();
+        }
+
+        // Restart A: StartupReplayCoordinator must resume DIRTY upload ownership,
+        // pull settled peer purge, and republish the fresh restored payload.
+        let a_meta = open(&a_db);
+        let a_vfs = make_vfs_from_meta(a_meta.clone(), &info, &a_cache);
+        a_meta.sync_metadata().unwrap();
+        assert!(
+            wait_until(online_publish_timeout(), || {
+                let flushed = a_meta.flush_metadata().is_ok();
+                let restored_ino = a_vfs
+                    .lookup(ROOT_INO, b"restored.bin")
+                    .ok()
+                    .map(|entry| entry.ino);
+                flushed
+                    && restored_ino.is_some_and(|ino| {
+                        a_vfs.pending_uploads_for_inode(ino).is_empty()
+                            && a_meta
+                                .get_attr(ino)
+                                .is_ok_and(|attr| attr.upload_state == UploadState::Ready && attr.content_epoch == restore_epoch && attr.committed_content_epoch == restore_epoch)
+                    })
+                    && a_meta.replication_backlog().pending_ops == 0
+            })
+            .await,
+            "accepted restore must resume upload ownership after restart and publish after losing settled purge: attr={:?} pending={:?} stats={:?}",
+            a_meta.get_attr(file.ino), a_vfs.pending_uploads_for_inode(file.ino), a_vfs.upload_stats()
+        );
+        b_meta.sync_metadata().unwrap();
+
+        let a_restored = a_vfs.lookup(ROOT_INO, b"restored.bin").unwrap();
+        let b_restored = b_vfs.lookup(ROOT_INO, b"restored.bin").unwrap();
+        assert_eq!(a_restored.ino, b_restored.ino);
+        assert_eq!(
+            b_restored.ino, file.ino,
+            "accepted restore preserves native identity"
+        );
+        let a_bytes = a_vfs
+            .read(a_restored.ino, 0, payload.len() as u32)
+            .await
+            .unwrap();
+        let b_bytes = b_vfs
+            .read(b_restored.ino, 0, payload.len() as u32)
+            .await
+            .unwrap();
+        assert!(a_bytes.as_ref() == payload.as_slice());
+        assert!(b_bytes.as_ref() == payload.as_slice(),
+            "peer bytes len={} expected={} first_diff={:?} attr={:?} spans={:?}",
+            b_bytes.len(), payload.len(), b_bytes.iter().zip(&payload).position(|(a,b)| a != b),
+            b_meta.get_attr(b_restored.ino), b_meta.lookup_regular_file_slices(b_restored.ino, 0, payload.len() as u64));
+        let new_objects = published_object_ids(&b_meta, b_restored.ino);
+        assert_eq!(new_objects, local_new_objects);
+        assert!(!new_objects.is_empty());
+        assert!(new_objects.is_disjoint(&old_objects));
+
+        // Direct PG SQL reachability + GC checks: no stage-inode refs and no GC candidates for adopted fresh objects.
+        let new_objects_i64: Vec<i64> = new_objects
+            .iter()
+            .map(|id| i64::try_from(*id).expect("new object id fits i64"))
+            .collect();
+        {
+            let (pg_client, pg_conn) =
+                tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+                    .await
+                    .expect("connect to verify PG reachability");
+            let pg_task = tokio::spawn(pg_conn);
+            let stage_ref_count: i64 = pg_client
+                .query_one(
+                    "SELECT count(*)::BIGINT FROM snapshot_current_references WHERE vol = $1 AND ino = ANY($2::BIGINT[])",
+                    &[&volume.volume_id, &stage_inodes],
+                )
+                .await
+                .expect("query stage inode refs")
+                .get(0);
+            assert_eq!(
+                stage_ref_count, 0,
+                "snapshot_current_references must have zero stage inode rows"
+            );
+
+            let live_pg_objects: std::collections::BTreeSet<u64> = pg_client
+                .query(
+                    "SELECT object_id FROM snapshot_current_references WHERE vol = $1 AND ino = $2",
+                    &[&volume.volume_id, &(file.ino as i64)],
+                )
+                .await
+                .expect("query restored inode refs")
+                .into_iter()
+                .map(|row| u64::try_from(row.get::<_, i64>(0)).expect("object id fits u64"))
+                .collect();
+            assert_eq!(
+                live_pg_objects, new_objects,
+                "snapshot_current_references for restored inode must match fresh adopted objects"
+            );
+
+            let new_gc_candidates: i64 = pg_client
+                .query_one(
+                    "SELECT count(*)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = ANY($2::BIGINT[])",
+                    &[&volume.volume_id, &new_objects_i64],
+                )
+                .await
+                .expect("query fresh object GC candidates")
+                .get(0);
+            assert_eq!(
+                new_gc_candidates, 0,
+                "snapshot_payload_gc_candidates must have zero candidates for adopted fresh objects"
+            );
+
+            // A test-owned orphan proves a janitor pass observed post-publication storage.
+            let sentinel_id = 0xdead_beef;
+            assert!(!old_objects.contains(&sentinel_id) && !new_objects.contains(&sentinel_id));
+            for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
+                let key = format_object_fragment_key(
+                    &info.data_prefix,
+                    sentinel_id,
+                    fragment_index as u8,
+                );
+                ds.put_by_key(&key, Bytes::from_static(b"post-restore-janitor-fence"))
+                    .await
+                    .expect("write test-owned janitor sentinel");
+            }
+            assert!(
+                wait_until_object_absent(&ds, &info.data_prefix, sentinel_id, online_publish_timeout())
+                    .await,
+                "janitor must reclaim the sentinel created after restored payload publication"
+            );
+            // The peer releases this lock only after its in-flight deletions drain.
+            assert!(
+                wait_until(online_publish_timeout(), || {
+                    tokio::task::block_in_place(|| a_meta.try_acquire_global_janitor_lock())
+                        .expect("observe peer janitor cycle completion")
+                })
+                .await,
+                "post-publication janitor cycle must finish"
+            );
+            let post_cycle_gc_candidates: i64 = pg_client
+                .query_one(
+                    "SELECT count(*)::BIGINT FROM snapshot_payload_gc_candidates WHERE vol = $1 AND object_id = ANY($2::BIGINT[])",
+                    &[&volume.volume_id, &new_objects_i64],
+                )
+                .await
+                .expect("query adopted payload GC candidates after janitor cycle")
+                .get(0);
+            tokio::task::block_in_place(|| a_meta.release_global_janitor_lock())
+                .expect("release test janitor observation lock");
+            assert_eq!(post_cycle_gc_candidates, 0);
+            for object_id in &new_objects {
+                assert!(
+                    wait_until_object_exists(&ds, &info.data_prefix, *object_id, Duration::from_secs(5))
+                        .await,
+                    "adopted object {object_id} must remain in S3 after the janitor cycle"
+                );
+            }
+            pg_task.abort();
+        }
+
+        a_vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+        b_vfs.shutdown(Duration::from_secs(15)).await.unwrap();
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; accepted unjournaled bytes must survive a losing restore and newer Ready EOF"]
+fn retained_restore_pg_winner_base_apply_preserves_unjournaled_partial_write_exactly() {
+    use studiofs_meta::MetaNamespace;
+    use studiofs_meta::trash::{MetaRetainedStore, MetaVolumeSettings, RetainedEntryState};
+
+    let _env_lock = acquire_test_env_lock();
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let _restore_sync = ScopedEnvVar::capture("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    set_test_env("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "3600000");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("retained-pg-ready-writer-");
+    let a_db = tmp.path().join("meta-a.redb");
+    let b_db = tmp.path().join("meta-b.redb");
+    let a_cache = tmp.path().join("cache-a").to_str().unwrap().to_string();
+    let b_cache = tmp.path().join("cache-b").to_str().unwrap().to_string();
+    let volume = PgTestVolume::new(&dsn, "vfs-retained-pg-ready-writer");
+    let mut info = volume.format_info();
+    info.endpoint = "http://127.0.0.1:59999".to_string();
+    info.bucket = "studiofs-test".to_string();
+    info.access_key = "studiofs".to_string();
+    info.secret_key = "studiofs123".to_string();
+    seed_local(&a_db, &info);
+    seed_local(&b_db, &info);
+    let open = |path: &std::path::Path| {
+        PgMetaEngine::open_with_options(
+            path,
+            PgOpenOptions {
+                background_poll: false,
+                ..Default::default()
+            },
+        )
+        .expect("open pg meta")
+    };
+    let a_meta = open(&a_db);
+    let mut b_meta = open(&b_db);
+    let mut delayed_upload_cfg = test_vfs_config_raw_from_env();
+    delayed_upload_cfg.upload_delay_ms = Some(60_000);
+    let delayed_upload_cfg = delayed_upload_cfg
+        .validate()
+        .expect("valid delayed upload config");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    let baseline: Vec<u8> = (0..(64 * 1024 + 13)).map(|i| (i % 239) as u8).collect();
+    let write_offset = baseline.len() + 317;
+    let replacement = b"accepted-before-journal";
+    let mut expected = baseline[..31].to_vec();
+    expected.resize(write_offset + replacement.len(), 0);
+    expected[write_offset..write_offset + replacement.len()].copy_from_slice(replacement);
+
+    rt.block_on(async {
+        let flush_pending = |meta: &PgMetaEngine| {
+            for _ in 0..16 {
+                meta.request_eager_flush();
+                meta.flush_metadata().unwrap();
+                if meta.replication_backlog().pending_ops == 0 {
+                    return;
+                }
+            }
+            panic!("fixture metadata did not publish its finite journal");
+        };
+        let a_vfs = make_vfs_from_meta_with_config(
+            a_meta.clone(),
+            &info,
+            &a_cache,
+            delayed_upload_cfg.clone(),
+        );
+        let b_vfs = make_vfs_from_meta_with_config(
+            b_meta.clone(),
+            &info,
+            &b_cache,
+            delayed_upload_cfg.clone(),
+        );
+        a_meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let store = a_vfs.mkdir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let file = a_vfs.create(ROOT_INO, b"doc.bin", 0, 0, 0o644).unwrap();
+        a_vfs.write(file.ino, 0, &baseline).await.unwrap();
+        a_vfs.fsync(file.ino, false).await.unwrap();
+        a_vfs.link(file.ino, ROOT_INO, b"alias.bin").unwrap();
+        publish_overlay_from_local_bodies(&a_vfs, &a_meta, file.ino);
+        flush_pending(&a_meta);
+        b_meta.sync_metadata().unwrap();
+
+        let baseline_objects = published_object_ids(&a_meta, file.ino);
+        assert!(!baseline_objects.is_empty());
+        for object_id in baseline_objects {
+            let body = a_vfs
+                .local_payload_backend()
+                .get(object_id)
+                .expect("winner baseline body stays local");
+            b_vfs
+                .local_payload_backend()
+                .put(object_id, body.as_ref(), false)
+                .expect("copy baseline body to peer fixture");
+        }
+
+        let receipt = a_meta.next_inode().unwrap();
+        a_meta
+            .retain_namespace_entry(ROOT_INO, b"doc.bin", store.ino, receipt)
+            .unwrap();
+        flush_pending(&a_meta);
+        b_meta.sync_metadata().unwrap();
+        assert!(matches!(
+            b_meta.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::Retained
+        ));
+
+        // Keep the distinct restores offline until B accepts its later writer-stack bytes.
+        a_vfs
+            .restore_retained_entry(a_meta.as_ref(), receipt, ROOT_INO, b"winner.bin")
+            .await
+            .unwrap();
+        publish_overlay_from_local_bodies(&a_vfs, &a_meta, file.ino);
+
+        // B loses against A's already-published receipt state but accepts a write into its
+        // in-memory writer stack before syncing the winning Ready event.
+        assert!(matches!(
+            b_meta.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::Retained
+        ));
+        let restored_b = b_vfs
+            .restore_retained_entry(b_meta.as_ref(), receipt, ROOT_INO, b"loser.bin")
+            .await
+            .unwrap();
+        assert_eq!(restored_b.inode, file.ino);
+        let b_restore_epoch = publish_overlay_from_local_bodies(&b_vfs, &b_meta, file.ino);
+        // A publishes two later incarnations so its Ready epoch is newer than B's dirty epoch.
+        a_vfs.write(file.ino, 0, &baseline[..12]).await.unwrap();
+        a_vfs.fsync(file.ino, false).await.unwrap();
+        publish_overlay_from_local_bodies(&a_vfs, &a_meta, file.ino);
+        a_vfs
+            .setattr(
+                file.ino,
+                SetattrArgs {
+                    size: Some(31),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        a_vfs.write(file.ino, 0, &baseline[..12]).await.unwrap();
+        a_vfs.fsync(file.ino, false).await.unwrap();
+        let winner_epoch = publish_overlay_from_local_bodies(&a_vfs, &a_meta, file.ino);
+        assert!(winner_epoch > b_restore_epoch + 1);
+        flush_pending(&a_meta);
+        let winner_attr = a_meta.get_attr(file.ino).unwrap();
+        assert_eq!(winner_attr.size, 31);
+        assert_eq!(
+            a_vfs.read(file.ino, 0, 31).await.unwrap().as_ref(),
+            &baseline[..31]
+        );
+        let witness_db = tmp.path().join("witness.redb");
+        seed_local(&witness_db, &info);
+        let witness = open(&witness_db);
+        witness.sync_metadata().unwrap();
+        assert_eq!(
+            witness.get_attr(file.ino).unwrap().committed_content_epoch,
+            winner_epoch,
+            "a fresh peer must observe the nonempty published winner"
+        );
+        assert!(
+            matches!(witness.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::Restored { name, .. } if name == b"winner.bin")
+        );
+        drop(witness);
+        for object_id in published_object_ids(&a_meta, file.ino) {
+            let body = a_vfs.local_payload_backend().get(object_id).unwrap();
+            b_vfs
+                .local_payload_backend()
+                .put(object_id, body.as_ref(), false)
+                .unwrap();
+        }
+        let writer = b_vfs
+            .open_file(file.ino, OpenFlags::RDWR, false)
+            .expect("open losing restored inode");
+        let next_event_before_write = b_meta.get_counter(NEXT_EVENT_SEQ).unwrap();
+        b_vfs
+            .write_fh_with_local_sync_policy(
+                writer,
+                file.ino,
+                write_offset as u64,
+                replacement,
+                studiofs_vfs::LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            b_meta.get_counter(NEXT_EVENT_SEQ).unwrap(),
+            next_event_before_write,
+            "accepted writer-stack bytes must not have entered the metadata journal yet"
+        );
+
+        b_meta.request_eager_flush();
+        let conflict = b_meta
+            .flush_metadata()
+            .expect_err("B's distinct restore must lose shared publication");
+        assert!(conflict.to_string().contains("retained"), "{conflict}");
+        assert!(
+            b_meta.lookup(ROOT_INO, b"loser.bin").is_err(),
+            "actual reconciliation removes only the losing destination"
+        );
+        b_meta.sync_metadata().unwrap();
+        let applied_attr = b_meta.get_attr(file.ino).unwrap();
+        assert_eq!(
+            applied_attr.upload_state,
+            UploadState::Ready,
+            "pristine metadata fork follows A while B still owns unjournaled accepted bytes"
+        );
+        assert_eq!(
+            applied_attr.committed_content_epoch, winner_epoch,
+            "winner Ready publication must be applied before B drains its dirty bytes"
+        );
+        assert_eq!(applied_attr.committed_size, winner_attr.committed_size);
+        let alias = b_vfs.lookup(ROOT_INO, b"alias.bin").unwrap();
+        assert_eq!(alias.ino, file.ino);
+        let after_ready = b_vfs
+            .read(alias.ino, 0, expected.len() as u32)
+            .await
+            .expect("read dirty bytes after foreign Ready refresh");
+        assert!(
+            after_ready.as_ref() == expected.as_slice(),
+            "after_ready len={} expected={} first_diff={:?}",
+            after_ready.len(),
+            expected.len(),
+            after_ready.iter().zip(&expected).position(|(a, b)| a != b)
+        );
+
+        b_vfs.flush_fh(writer).await.unwrap();
+        b_vfs.release_fh(writer).await.unwrap();
+        let after_flush = b_vfs
+            .read(alias.ino, 0, expected.len() as u32)
+            .await
+            .expect("read locally flushed exact bytes");
+        assert!(
+            after_flush.as_ref() == expected.as_slice(),
+            "after_flush len={} expected={} first_diff={:?}",
+            after_flush.len(),
+            expected.len(),
+            after_flush.iter().zip(&expected).position(|(a, b)| a != b)
+        );
+        let write_epoch = publish_overlay_from_local_bodies(&b_vfs, &b_meta, file.ino);
+        assert!(write_epoch > winner_epoch);
+        flush_pending(&b_meta);
+        for object_id in published_object_ids(&b_meta, file.ino) {
+            let body = b_vfs.local_payload_backend().get(object_id).unwrap();
+            a_vfs
+                .local_payload_backend()
+                .put(object_id, body.as_ref(), false)
+                .unwrap();
+        }
+        a_meta.sync_metadata().unwrap();
+        assert_eq!(
+            a_meta.get_attr(file.ino).unwrap().committed_content_epoch,
+            write_epoch
+        );
+        let peer_read = a_vfs
+            .read(file.ino, 0, expected.len() as u32)
+            .await
+            .unwrap();
+        assert!(
+            peer_read.as_ref() == expected.as_slice(),
+            "peer A cached read must observe B's republished bytes"
+        );
+        b_vfs.shutdown(Duration::ZERO).await.unwrap();
+        drop(b_vfs);
+        drop(b_meta);
+
+        b_meta = open(&b_db);
+        let reopened_vfs =
+            make_vfs_from_meta_with_config(b_meta.clone(), &info, &b_cache, delayed_upload_cfg);
+        b_meta.sync_metadata().unwrap();
+        let reopened_alias = reopened_vfs.lookup(ROOT_INO, b"alias.bin").unwrap();
+        assert_eq!(reopened_alias.ino, file.ino);
+        let reopened = reopened_vfs
+            .read(reopened_alias.ino, 0, expected.len() as u32)
+            .await
+            .expect("read exact bytes after local restart");
+        assert!(
+            reopened.as_ref() == expected.as_slice(),
+            "reopened len={} expected={} first_diff={:?}",
+            reopened.len(),
+            expected.len(),
+            reopened.iter().zip(&expected).position(|(a, b)| a != b)
+        );
+
+        reopened_vfs.shutdown(Duration::ZERO).await.unwrap();
+        a_vfs.shutdown(Duration::ZERO).await.unwrap();
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn retained_restore_preserves_directory_tree_symlinks_hardlinks_and_open_child() {
+    use studiofs_meta::trash::{MetaVolumeSettings, RetainedEntryState};
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    set_test_env("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    let tmp = studiofs_test_support::workspace_target_tempdir("retained-tree-");
+    let cache_dir = tmp.path().join("cache").to_str().unwrap().to_string();
+    let format_info = make_format_info_with_endpoint(
+        &format!("retained-tree-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    let doc_bytes: Vec<u8> = (0..(128 * 1024 + 5)).map(|i| (i % 241) as u8).collect();
+    rt.block_on(async {
+        let (meta, _data_config, vfs) = make_local_zeroio_test_vfs(
+            &tmp.path().join("meta.redb"),
+            &cache_dir,
+            &format_info,
+            VfsConfigRaw::default().validate().unwrap(),
+        );
+        vfs.start().unwrap();
+        meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let store = vfs.mkdir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let tree = vfs.mkdir(ROOT_INO, b"tree", 0, 0, 0o755).unwrap();
+        let sub = vfs.mkdir(tree.ino, b"sub", 0, 0, 0o755).unwrap();
+        let doc = vfs.create(sub.ino, b"doc.bin", 0, 0, 0o644).unwrap();
+        vfs.write(doc.ino, 0, &doc_bytes).await.unwrap();
+        vfs.fsync(doc.ino, false).await.unwrap();
+        let sym = vfs.symlink(sub.ino, b"link", b"doc.bin", 0, 0).unwrap();
+        let hl = vfs.create(tree.ino, b"hl_a.bin", 0, 0, 0o644).unwrap();
+        vfs.write(hl.ino, 0, b"shared-hardlink").await.unwrap();
+        vfs.fsync(hl.ino, false).await.unwrap();
+        vfs.link(hl.ino, sub.ino, b"hl_b.bin").unwrap();
+
+        let receipt = meta.next_inode().unwrap();
+        meta.retain_namespace_entry(ROOT_INO, b"tree", store.ino, receipt)
+            .unwrap();
+
+        let fh = vfs.open_file(doc.ino, OpenFlags::RDONLY, false).unwrap();
+        let restored = vfs
+            .restore_retained_entry(meta.as_ref(), receipt, ROOT_INO, b"restored-tree")
+            .await
+            .unwrap();
+        assert!(matches!(
+            restored.state,
+            RetainedEntryState::Restored { .. }
+        ));
+        let restored_tree = vfs.lookup(ROOT_INO, b"restored-tree").unwrap();
+        let restored_sub = vfs.lookup(restored_tree.ino, b"sub").unwrap();
+        let restored_doc = vfs.lookup(restored_sub.ino, b"doc.bin").unwrap();
+        let restored_sym = vfs.lookup(restored_sub.ino, b"link").unwrap();
+        let restored_hl_a = vfs.lookup(restored_tree.ino, b"hl_a.bin").unwrap();
+        let restored_hl_b = vfs.lookup(restored_sub.ino, b"hl_b.bin").unwrap();
+
+        assert_eq!(restored_tree.ino, tree.ino);
+        assert_eq!(restored_sub.ino, sub.ino);
+        assert_eq!(restored_doc.ino, doc.ino);
+        assert_eq!(restored_sym.ino, sym.ino);
+        assert_eq!(restored_hl_a.ino, hl.ino);
+        assert_eq!(restored_hl_a.ino, restored_hl_b.ino);
+        assert_eq!(vfs.getattr(restored_hl_a.ino).unwrap().nlink, 2);
+        assert_eq!(
+            vfs.read(restored_doc.ino, 0, doc_bytes.len() as u32)
+                .await
+                .unwrap()
+                .as_ref(),
+            doc_bytes.as_slice()
+        );
+        assert_eq!(vfs.readlink(restored_sym.ino).unwrap(), b"doc.bin");
+        assert_eq!(
+            vfs.read(restored_hl_b.ino, 0, 15).await.unwrap().as_ref(),
+            b"shared-hardlink"
+        );
+        assert!(vfs.readdir(receipt).unwrap().is_empty());
+        for ino in [tree.ino, sub.ino, doc.ino, sym.ino, hl.ino] {
+            assert!(
+                meta.get_attr(ino).is_ok(),
+                "restored identity {ino} must remain live"
+            );
+        }
+        vfs.release_fh(fh).await.unwrap();
+
+        vfs.shutdown(Duration::from_secs(15)).await.unwrap();
     });
     rt.shutdown_background();
 }

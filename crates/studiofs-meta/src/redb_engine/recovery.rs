@@ -207,6 +207,14 @@ impl MetaRecovery for RedbMetaEngine {
         Ok(())
     }
 
+    fn finalize_orphan_inode(
+        &self,
+        ino: Ino,
+        deletion_timestamp: i64,
+    ) -> MetaResult<OrphanInodeFinalization> {
+        self.finalize_orphan_inode_guarded(ino, deletion_timestamp, None)
+    }
+
     fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
         let txn = self.begin_read_txn()?;
         let table = txn
@@ -228,76 +236,7 @@ impl MetaRecovery for RedbMetaEngine {
     }
 
     fn recover_undo_logs(&self) -> MetaResult<Vec<Ino>> {
-        let mut touched_parents: HashSet<Ino> =
-            self.recover_pending_create_intents()?.into_iter().collect();
-
-        let deferred_by_ino: std::collections::HashMap<Ino, DeferredDeleteRecord> = self
-            .list_deferred_deletes()?
-            .into_iter()
-            .map(|record| (record.ino, record))
-            .collect();
-        let undo_logs = self.list_undo_logs()?;
-        if !undo_logs.is_empty() {
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-
-            for record in undo_logs {
-                if record.kind != UndoLogKind::DeferredDelete {
-                    continue;
-                }
-                if record.phase == UndoLogPhase::Completed {
-                    continue;
-                }
-                let Some(deferred) = deferred_by_ino.get(&record.ino) else {
-                    continue;
-                };
-                // Earlier builds recorded a deferred delete when one name of a
-                // hard-linked file was unlinked while open; that inode is live.
-                match self.get_attr(record.ino) {
-                    Ok(attr) if attr.nlink > 0 => {
-                        self.remove_deferred_delete(record.ino)?;
-                        continue;
-                    }
-                    Ok(_) | Err(MetaError::InodeNotFound(_)) => {}
-                    Err(err) => return Err(err),
-                }
-                self.set_undo_log_phase_for(
-                    record.kind.clone(),
-                    record.ino,
-                    UndoLogPhase::Replaying,
-                )?;
-
-                let graph_usage = match self.get_regular_file_graph_object_usage(record.ino) {
-                    Ok(usage) => usage,
-                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                    Err(err) => return Err(err),
-                };
-                let total_bytes: u64 = graph_usage.iter().map(|(_, bytes)| *bytes).sum();
-                let removed_ids = match self.remove_regular_file_graph(record.ino, None) {
-                    Ok(ids) => ids,
-                    Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                    Err(err) => return Err(err),
-                };
-                for object_id in removed_ids {
-                    self.add_pending_deletion(object_id, timestamp)?;
-                }
-                if total_bytes > 0 {
-                    let _ = self.decr_counter(counters::USED_SPACE, total_bytes)?;
-                }
-                match self.remove_attr(record.ino) {
-                    Ok(()) => {}
-                    Err(MetaError::InodeNotFound(_)) => {}
-                    Err(err) => return Err(err),
-                }
-                self.remove_deferred_delete(record.ino)?;
-                touched_parents.insert(deferred.parent);
-            }
-        }
-
-        self.cleanup_stale_undo_logs()?;
-        Ok(touched_parents.into_iter().collect())
+        self.recover_undo_logs_guarded(false)
     }
 
     fn add_pending_create(&self, record: &PendingCreateRecord) -> MetaResult<()> {
@@ -346,5 +285,54 @@ impl MetaRecovery for RedbMetaEngine {
             out.push(decode(v.value())?);
         }
         Ok(out)
+    }
+}
+
+impl RedbMetaEngine {
+    /// Restart replay of deferred deletes; see `finalize_orphan_inode_guarded`
+    /// for `defer_unacknowledged_retained_purge`.
+    pub(crate) fn recover_undo_logs_guarded(
+        &self,
+        defer_unacknowledged_retained_purge: bool,
+    ) -> MetaResult<Vec<Ino>> {
+        let mut touched_parents: HashSet<Ino> =
+            self.recover_pending_create_intents()?.into_iter().collect();
+
+        let deferred_by_ino: std::collections::HashMap<Ino, DeferredDeleteRecord> = self
+            .list_deferred_deletes()?
+            .into_iter()
+            .map(|record| (record.ino, record))
+            .collect();
+        let undo_logs = self.list_undo_logs()?;
+        if !undo_logs.is_empty() {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            let mut unacked =
+                defer_unacknowledged_retained_purge.then(super::UnackedChildPurges::default);
+            for record in undo_logs {
+                if record.kind != UndoLogKind::DeferredDelete {
+                    continue;
+                }
+                if record.phase == UndoLogPhase::Completed {
+                    continue;
+                }
+                let Some(deferred) = deferred_by_ino.get(&record.ino) else {
+                    continue;
+                };
+                // A live inode (an earlier build's hard-link record, or a losing
+                // retained child purge reconciled back) only drops its record.
+                if let OrphanInodeFinalization::Removed { .. } =
+                    self.finalize_orphan_inode_guarded(record.ino, timestamp, unacked.as_mut())?
+                {
+                    touched_parents.insert(deferred.parent);
+                }
+            }
+        }
+
+        self.cleanup_stale_undo_logs()?;
+        Ok(touched_parents.into_iter().collect())
     }
 }

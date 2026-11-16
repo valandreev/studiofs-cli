@@ -53,6 +53,16 @@
 //! only for its own bookkeeping. These gates are outside `LockTier` and
 //! `LockOrderGuard`.
 //!
+//! `StudioVfs::retained_restore_gate` is an async `tokio::sync::Mutex` and the
+//! outermost lock of a retained restore. The restore awaits it before any
+//! other lock and holds it across its check, the awaited payload copy, and the
+//! store commit. Every tiered guard, file session operation, and metadata
+//! transaction it takes is acquired and released inside that span, so no
+//! path may await this gate while holding another lock. It is outside
+//! `LockTier` and `LockOrderGuard`. Under it, restore takes one `Restore` file
+//! session permit per source inode, in staged traversal order over unique
+//! inodes; it is the only path that holds several session permits at once.
+//!
 //! With `LocalPayloadBackendRuntime`, cached-store first/final pin transitions
 //! acquire locks in this order:
 //! `CachedStore::pinned` -> local backend payload mutation stripe gates ->

@@ -596,6 +596,7 @@ impl PgMetaEngine {
             .name("pg-meta-poll".into())
             .spawn(move || {
                 let _cancellation = super::runtime::WorkerRemoteCancellationScope::enter();
+                let mut last_retained_sweep: Option<Instant> = None;
                 loop {
                     if shutdown.load(Ordering::Acquire) {
                         break;
@@ -678,6 +679,26 @@ impl PgMetaEngine {
                                 "postgres background event-log pruning did not complete"
                             );
                         }
+                        // Expiry and purge settlement need write authority; read-only
+                        // snapshot engines never run this loop.
+                        if retained_lifecycle_due(
+                            matches!(engine.current_pg_sync_lifecycle(), PgSyncLifecycle::Live),
+                            last_retained_sweep,
+                            Instant::now(),
+                            super::retained::RETAINED_LIFECYCLE_INTERVAL,
+                        ) {
+                            last_retained_sweep = Some(Instant::now());
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |elapsed| elapsed.as_secs());
+                            if let Err(error) = engine.run_retained_lifecycle_once(now) {
+                                warn!(
+                                    error = %error,
+                                    volume_id = engine.volume_id,
+                                    "retained trash expiry or purge settlement deferred"
+                                );
+                            }
+                        }
                     } else if let Err(error) = sync_result
                         && !matches!(
                             &error,
@@ -695,5 +716,73 @@ impl PgMetaEngine {
             .map_err(|error| {
                 MetaError::Storage(format!("failed to spawn pg-meta-poll thread: {error}"))
             })
+    }
+}
+
+/// Gate for the poll loop's retained-trash sweep: only a `Live` engine (write
+/// authority) sweeps, and at most once per `interval` since the last attempt.
+/// An attempt counts even if the sweep errors, so failures wait for the next
+/// interval rather than retrying in a loop.
+fn retained_lifecycle_due(
+    state_is_live: bool,
+    last_run: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    state_is_live && last_run.is_none_or(|last| now.saturating_duration_since(last) >= interval)
+}
+
+#[cfg(test)]
+mod retained_lifecycle_gate_tests {
+    use super::retained_lifecycle_due;
+    use std::time::{Duration, Instant};
+
+    const INTERVAL: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn retained_lifecycle_due_is_false_unless_live() {
+        let base = Instant::now();
+        assert!(!retained_lifecycle_due(false, None, base, INTERVAL));
+        assert!(!retained_lifecycle_due(
+            false,
+            Some(base),
+            base + INTERVAL,
+            INTERVAL
+        ));
+    }
+
+    #[test]
+    fn retained_lifecycle_due_runs_when_live_and_never_run() {
+        let base = Instant::now();
+        assert!(retained_lifecycle_due(true, None, base, INTERVAL));
+    }
+
+    #[test]
+    fn retained_lifecycle_due_waits_inside_interval() {
+        let base = Instant::now();
+        assert!(!retained_lifecycle_due(true, Some(base), base, INTERVAL));
+        assert!(!retained_lifecycle_due(
+            true,
+            Some(base),
+            base + Duration::from_secs(59),
+            INTERVAL
+        ));
+    }
+
+    #[test]
+    fn retained_lifecycle_due_runs_at_exact_interval_boundary() {
+        let base = Instant::now();
+        assert!(retained_lifecycle_due(
+            true,
+            Some(base),
+            base + INTERVAL,
+            INTERVAL
+        ));
+        assert!(retained_lifecycle_due(
+            true,
+            Some(base),
+            base + Duration::from_secs(61),
+            INTERVAL
+        ));
     }
 }

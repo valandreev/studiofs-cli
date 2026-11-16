@@ -272,7 +272,7 @@ fn resolve_volume(client_root: &Path, volume_name: &str) -> Result<ResolvedVolum
     })
 }
 
-fn mounted_format_info(volume_name: &str) -> Result<Option<FormatInfo>> {
+pub(super) fn mounted_format_info(volume_name: &str) -> Result<Option<FormatInfo>> {
     let active_mount = crate::cli::utils::active_mount_record_for_volume(volume_name)?;
     let Some(discovery) = crate::diagnostics::discover_local_sessions()?
         .into_iter()

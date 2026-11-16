@@ -22,6 +22,7 @@ const TAG_ADD_PENDING_DELETION: u8 = 14;
 const TAG_REMOVE_PENDING_DELETION: u8 = 15;
 // Tags 16 and 17 belonged to retired snapshot events and remain reserved.
 const TAG_REMOVE_LOCAL_ENTRY: u8 = 18;
+const TAG_SET_VOLUME_SETTINGS: u8 = 19;
 
 // These tag values are part of the persisted format: append new values, never
 // reorder or reuse an existing value.
@@ -31,6 +32,11 @@ const TAG_REMOVE_LOCAL_ENTRY: u8 = 18;
 /// to achieve Event Sourcing and Eventual Consistency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetaEvent {
+    /// An ordered mutable-volume configuration revision.
+    SetVolumeSettings {
+        /// Complete policy accepted for this revision.
+        settings: crate::trash::VolumeSettings,
+    },
     // ─── Core Inode Operations ───────────────────────────────────────────────
     /// Create or update an inode.
     SetAttr {
@@ -194,6 +200,7 @@ impl MetaEvent {
     /// Return a stable lowercase identifier for this event kind.
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::SetVolumeSettings { .. } => "set_volume_settings",
             Self::SetAttr { .. } => "set_attr",
             Self::RemoveAttr { .. } => "remove_attr",
             Self::AddEntry { .. } => "add_entry",
@@ -215,6 +222,7 @@ impl MetaEvent {
 
     fn wire_tag(&self) -> u8 {
         match self {
+            Self::SetVolumeSettings { .. } => TAG_SET_VOLUME_SETTINGS,
             Self::SetAttr { .. } => TAG_SET_ATTR,
             Self::RemoveAttr { .. } => TAG_REMOVE_ATTR,
             Self::AddEntry { .. } => TAG_ADD_ENTRY,
@@ -249,6 +257,7 @@ impl MetaEvent {
     /// This is useful for partitioning or logical clocks.
     pub fn primary_ino(&self) -> Option<u64> {
         match self {
+            Self::SetVolumeSettings { .. } => None,
             Self::SetAttr { attr } => Some(attr.ino),
             Self::RemoveAttr { ino } => Some(*ino),
             Self::AddEntry { parent, .. } => Some(*parent),
@@ -277,6 +286,7 @@ impl MetaEvent {
 pub fn encode_event(event: &MetaEvent) -> MetaResult<Vec<u8>> {
     let tag = event.wire_tag();
     match event {
+        MetaEvent::SetVolumeSettings { settings } => encode_event_envelope(tag, settings),
         MetaEvent::SetAttr { attr } => encode_event_envelope(tag, attr),
         MetaEvent::RemoveAttr { ino } => encode_event_envelope(tag, ino),
         MetaEvent::AddEntry {
@@ -362,6 +372,7 @@ pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResu
 
 fn wire_tag_for_kind(kind: &str) -> Option<u8> {
     match kind {
+        "set_volume_settings" => Some(TAG_SET_VOLUME_SETTINGS),
         "set_attr" => Some(TAG_SET_ATTR),
         "remove_attr" => Some(TAG_REMOVE_ATTR),
         "add_entry" => Some(TAG_ADD_ENTRY),
@@ -456,6 +467,9 @@ fn decode_event_payload<T: DeserializeOwned>(tag: u8, payload: &[u8]) -> MetaRes
 
 fn decode_tagged_event(tag: u8, payload: &[u8]) -> MetaResult<MetaEvent> {
     match tag {
+        TAG_SET_VOLUME_SETTINGS => Ok(MetaEvent::SetVolumeSettings {
+            settings: decode_event_payload(tag, payload)?,
+        }),
         TAG_SET_ATTR => Ok(MetaEvent::SetAttr {
             attr: decode_event_payload(tag, payload)?,
         }),
@@ -563,6 +577,29 @@ fn decode_tagged_event(tag: u8, payload: &[u8]) -> MetaResult<MetaEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_settings_tag19_roundtrip_and_policy_validation() {
+        let mut settings = crate::trash::VolumeSettings {
+            revision: 1,
+            ..Default::default()
+        };
+        settings.trash.set_days(7);
+        let event = MetaEvent::SetVolumeSettings { settings };
+        let encoded = encode_event(&event).unwrap();
+        assert_eq!(encoded[8], 19);
+        assert_eq!(decode_event(&encoded).unwrap(), event);
+        assert_eq!(
+            decode_event_with_type("set_volume_settings", &encoded).unwrap(),
+            event
+        );
+        let invalid =
+            postcard::to_stdvec(&(*b"SFS-EVT", 1_u8, 19_u8, (1_u64, (7_u32, 1_u32)))).unwrap();
+        assert!(matches!(
+            decode_event(&invalid),
+            Err(MetaError::Serialization(_))
+        ));
+    }
     use crate::types::{
         AccessLevel, ChunkId, FileType, PayloadRef, SliceId, SliceOrder, SliceRange, SliceRecord,
         UploadState,

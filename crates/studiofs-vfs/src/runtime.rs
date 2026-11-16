@@ -19,7 +19,7 @@ use studiofs_meta::{
     InodeLifecycleRecord, MetaAcl, MetaEngine, MetaEngineCore, MetaFormat, MetaFsOps, MetaGc,
     MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult,
     MetaSymlink, MetaXattr, NamespaceMutation, RenameAtomicResult, ResolvedSliceSpan, SliceRange,
-    SliceRecord, SyncMetaEngineAdapter, execute_sync_meta,
+    SliceRecord, SyncMetaEngineAdapter, execute_sync_meta, trash::MetaRetainedStore,
 };
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -43,6 +43,21 @@ pub trait VfsCommitMeta: Send + Sync {
         &self,
         mutations: &[studiofs_meta::RegularFileOverlayMutation],
     ) -> MetaResult<Vec<Option<InodeAttr>>>;
+}
+
+/// Optional SFS-1054 retained-trash capability exposed through the runtime facade.
+pub trait VfsRetainedStoreProvider: Send + Sync {
+    /// Local retained-store capability, absent for engines without it.
+    fn retained_store(&self) -> Option<&dyn MetaRetainedStore>;
+}
+
+impl<T> VfsRetainedStoreProvider for T
+where
+    T: ?Sized + MetaEngine,
+{
+    fn retained_store(&self) -> Option<&dyn MetaRetainedStore> {
+        MetaEngine::retained_store(self)
+    }
 }
 
 /// Optional Snapshot v2 ports exposed through the runtime metadata facade.
@@ -113,6 +128,7 @@ pub trait VfsMeta:
     + Sync
     + VfsCommitMeta
     + VfsSnapshotProvider
+    + VfsRetainedStoreProvider
     + MetaEngineCore
     + MetaFormat
     + MetaInodes
@@ -141,6 +157,7 @@ where
         + Sync
         + VfsCommitMeta
         + VfsSnapshotProvider
+        + VfsRetainedStoreProvider
         + MetaEngineCore
         + MetaFormat
         + MetaInodes
@@ -237,6 +254,10 @@ impl<M: ?Sized + VfsCommitMeta> VfsCommitMeta for RuntimeMetaHandle<M> {
             attr: Option<&InodeAttr>,
         ) -> MetaResult<Option<InodeAttr>>
     );
+}
+
+impl<M: ?Sized + VfsRetainedStoreProvider> VfsRetainedStoreProvider for RuntimeMetaHandle<M> {
+    forward_method!(fn retained_store(&self) -> Option<&dyn MetaRetainedStore>);
 }
 
 impl<M: ?Sized + VfsSnapshotProvider> VfsSnapshotProvider for RuntimeMetaHandle<M> {
@@ -588,6 +609,13 @@ impl<M: ?Sized + MetaRecovery> MetaRecovery for RuntimeMetaHandle<M> {
     );
     forward_method!(fn remove_deferred_delete(&self, ino: Ino) -> MetaResult<()>);
     forward_method!(fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>>);
+    forward_method!(
+        fn finalize_orphan_inode(
+            &self,
+            ino: Ino,
+            deletion_timestamp: i64,
+        ) -> MetaResult<studiofs_meta::OrphanInodeFinalization>
+    );
 }
 
 impl<M: ?Sized + MetaSymlink> MetaSymlink for RuntimeMetaHandle<M> {
@@ -637,6 +665,7 @@ impl<M: ?Sized + MetaReplication> MetaReplication for RuntimeMetaHandle<M> {
     forward_method!(fn sync_local_metadata(&self) -> MetaResult<()>);
     forward_method!(fn note_active_open_inode(&self, ino: Ino));
     forward_method!(fn note_inactive_open_inode(&self, ino: Ino));
+    forward_method!(fn note_open_handle(&self, ino: Ino, open: bool));
     forward_method!(fn sync_metadata_for_invalidation_poll(&self) -> MetaResult<()>);
     forward_method!(fn invalidation_sender_id(&self) -> Option<String>);
     forward_method!(

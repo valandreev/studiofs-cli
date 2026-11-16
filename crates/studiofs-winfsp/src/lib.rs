@@ -829,6 +829,8 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
         shutdown_event_name,
         mount_ready_callback,
     } = request;
+    // Native $I records carry this client's drive; it is never published.
+    vfs.set_native_trash_path_prefix(&mount_point);
 
     let options = parse_mount_options(&volume_label).map_err(invalid_input_io_error)?;
     tracing::debug!(

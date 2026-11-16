@@ -123,6 +123,7 @@ impl StudioVfs {
     ///
     /// If `blocking` is false and the lock cannot be acquired, returns `VfsError::WouldBlock`.
     pub async fn flock(&self, ino: Ino, op: LockKind, owner: u64, blocking: bool) -> VfsResult<()> {
+        self.reject_private_store_ino(ino)?;
         loop {
             if op == LockKind::Unlock {
                 let (had_local_lock, release_remote_lock) = {

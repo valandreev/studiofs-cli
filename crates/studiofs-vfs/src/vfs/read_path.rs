@@ -2150,8 +2150,8 @@ impl StudioVfs {
         observed: super::AttributeObservation,
     ) -> VfsResult<bool> {
         let ino = attr.ino;
-        // Synthetic attributes can change without ordinary cache retirement.
-        if ino >= super::FIRST_IGNORED_INO {
+        // Synthetic attributes and active trash containers can change without ordinary cache retirement.
+        if self.should_bypass_bridge_entry_cache(ino) {
             return Ok(false);
         }
         // Mirror the path shortcut: attributes that need an authoritative
@@ -2180,7 +2180,8 @@ impl StudioVfs {
         ino: Ino,
         expected: super::AttrReadObservation,
     ) -> VfsResult<Option<InodeAttr>> {
-        if self.ignored_entry_attr(ino).is_some()
+        if self.should_bypass_bridge_entry_cache(ino)
+            || self.ignored_entry_attr(ino).is_some()
             || self.has_deferred_namespace_attr_or_inode(ino)
             || self.peek_dirty_attr(ino).is_some()
         {
@@ -2516,8 +2517,19 @@ impl StudioVfs {
     /// in-memory attribute immediately after a successful write should prefer
     /// [`peek_dirty_attr`](Self::peek_dirty_attr) to avoid a metadata round-trip.
     pub fn getattr(&self, ino: Ino) -> VfsResult<InodeAttr> {
-        let attr = self.getattr_unchecked(ino)?;
+        if self.is_synthesized_ignored_ino(ino) {
+            let ignored = self.visible_ignored_entry_snapshot(ino)?;
+            self.enforce_access(ino, AccessLevel::ReadOnly)?;
+            return Ok(ignored.attr);
+        }
+        let mut attr = self.getattr_unchecked(ino)?;
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
+        if attr.parent == studiofs_meta::ROOT_INO
+            && attr.kind == FileType::Directory
+            && self.trash_root_ino()? == Some(ino)
+        {
+            attr = self.normalize_trash_root_attr(attr);
+        }
         Ok(attr)
     }
 
@@ -2532,9 +2544,21 @@ impl StudioVfs {
     }
 
     pub(super) async fn getattr_async(&self, ino: Ino) -> VfsResult<InodeAttr> {
-        let attr = self.getattr_async_unchecked(ino).await?;
+        if self.is_synthesized_ignored_ino(ino) {
+            let ignored = self.visible_ignored_entry_snapshot(ino)?;
+            self.enforce_access_async(ino, AccessLevel::ReadOnly)
+                .await?;
+            return Ok(ignored.attr);
+        }
+        let mut attr = self.getattr_async_unchecked(ino).await?;
         self.enforce_access_async(ino, AccessLevel::ReadOnly)
             .await?;
+        if attr.parent == studiofs_meta::ROOT_INO
+            && attr.kind == FileType::Directory
+            && self.trash_root_ino()? == Some(ino)
+        {
+            attr = self.normalize_trash_root_attr(attr);
+        }
         Ok(attr)
     }
 }

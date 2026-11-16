@@ -772,7 +772,7 @@ fn janitor_read_only_session_validates_binding_and_lock() {
         .get_counter(NEXT_EVENT_SEQ)
         .expect("read local event sequence");
     local_writer
-        .set_counter(NEXT_EVENT_SEQ, next_event_seq + 1)
+        .set_counter(NEXT_EVENT_SEQ, next_event_seq.max(1) + 1)
         .expect("mark local event unsynced");
     drop(local_writer);
     let local_before_janitor = std::fs::read(&db_b).expect("read unsynced local metadata");
@@ -783,6 +783,60 @@ fn janitor_read_only_session_validates_binding_and_lock() {
 
     let local_bytes_after = std::fs::read(&db_a).expect("read local metadata after janitor");
     assert_eq!(local_bytes_before, local_bytes_after);
+}
+
+/// A client that synced but never wrote a local event has no `NEXT_EVENT_SEQ`
+/// (exclusive end 1) while its acknowledged cursor is persisted as 1.
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn janitor_accepts_synced_client_without_local_events() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+
+    let dir = studiofs_test_support::workspace_target_tempdir("test-");
+    let db = dir.path().join("meta.redb");
+    let volume = PgTestVolume::new(&dsn, "pg-janitor-empty-local-log");
+    let info = volume.format_info();
+    seed_local(&db, &info);
+    let local = RedbMetaEngine::open(&db).expect("open local metadata");
+    local
+        .set_counter(NEXT_EVENT_SEQ, 0)
+        .expect("model an empty local event log");
+    local
+        .set_counter(LOCAL_PG_FLUSHED_EVENT_SEQ, 1)
+        .expect("model the persisted empty-log cursor");
+    drop(local);
+
+    run_async(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect to test postgres");
+        let connection_task = tokio::spawn(connection);
+        client
+            .execute(
+                "INSERT INTO snapshot_reachability_bootstrap (vol, initialized_version) VALUES ($1, 0)",
+                &[&volume.volume_id],
+            )
+            .await
+            .expect("initialize snapshot reachability");
+        connection_task.abort();
+        Ok::<(), MetaError>(())
+    })
+    .expect("initialize janitor metadata fixture");
+
+    let mut session = crate::JanitorMetadataSession::open(&db).expect("open janitor session");
+    assert!(
+        session
+            .try_acquire_global_janitor_lock()
+            .expect("acquire janitor lock")
+    );
+    session
+        .validate_protection()
+        .expect("an empty, fully acknowledged local event log is safe");
+    session
+        .release_global_janitor_lock()
+        .expect("release janitor lock");
 }
 
 #[test]
@@ -1182,15 +1236,17 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
         })
         .expect("connect to isolated schema")
     };
-    let query_i64 = |statement: &'static str| {
+    let query_i64 = |statement: &'static str, args: &'static [i32]| {
         let dsn = isolated_dsn.clone();
         run_async(async move {
             let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
                 .await
                 .map_err(|error| MetaError::Storage(pg_err(error)))?;
             let task = tokio::spawn(connection);
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                args.iter().map(|arg| arg as _).collect();
             let value: i64 = client
-                .query_one(statement, &[])
+                .query_one(statement, &params)
                 .await
                 .map_err(|error| MetaError::Storage(pg_err(error)))?
                 .get(0);
@@ -1229,7 +1285,8 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
         assert!(sql(studiofs_pg_schema_sql().to_owned()).is_err());
         assert_eq!(
             query_i64(
-                "SELECT count(*) FROM pg_class WHERE relname = 'snapshot_payload_gc_candidates' AND relnamespace = current_schema()::regnamespace"
+                "SELECT count(*) FROM pg_class WHERE relname = 'snapshot_payload_gc_candidates' AND relnamespace = current_schema()::regnamespace",
+                &[]
             ),
             0
         );
@@ -1249,18 +1306,20 @@ fn janitor_refuses_missing_interrupted_drifted_or_unsupported_gc_schema() {
         sql(studiofs_pg_schema_sql().to_owned()).expect("second application");
         verdict().expect("re-applied schema is accepted");
         assert_eq!(
-            query_i64("SELECT count(*) FROM snapshot_payload_gc_candidates"),
+            query_i64("SELECT count(*) FROM snapshot_payload_gc_candidates", &[]),
             1
         );
         assert_eq!(
             query_i64(
-                "SELECT count(*) FROM snapshot_payload_sweep_checkpoints WHERE after_key IS NOT NULL"
+                "SELECT count(*) FROM snapshot_payload_sweep_checkpoints WHERE after_key IS NOT NULL",
+                &[]
             ),
             1
         );
         assert_eq!(
             query_i64(
-                "SELECT count(*)::BIGINT FROM studiofs_schema_components WHERE component = 'payload_gc' AND version = 1"
+                "SELECT count(*)::BIGINT FROM studiofs_schema_components WHERE component = 'payload_gc' AND version = $1",
+                &[PAYLOAD_GC_SCHEMA_VERSION]
             ),
             1
         );

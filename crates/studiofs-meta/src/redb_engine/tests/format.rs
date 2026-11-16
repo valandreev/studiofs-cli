@@ -27,6 +27,15 @@ fn check_redb_fixture(version: &str, expected_writer_marker: Option<&[u8]>) {
     studiofs_test_support::copy_file_contents(&fixture_path, &database_path)
         .unwrap_or_else(|err| panic!("failed to copy fixture {}: {err}", fixture_path.display()));
 
+    // Fixtures store format 5; only the explicit stopped-cache upgrade accepts them.
+    {
+        let upgrading = RedbMetaEngine::open_for_format_upgrade(&database_path).unwrap();
+        let mut shared = upgrading.format_info_for_upgrade().unwrap();
+        assert_eq!(shared.format_version, 5);
+        shared.format_version = CURRENT_FORMAT_VERSION;
+        upgrading.upgrade_local_format5(&shared).unwrap();
+    }
+
     let probed = RedbMetaEngine::read_format_info_readonly(&database_path).unwrap();
     // Every metadata fixture derives from the original 4.1 volume, so the
     // identity is the same for each redb version.
@@ -241,7 +250,7 @@ fn legacy_pg_sync_format_requires_recreate_or_discover() {
         err,
         MetaError::UnsupportedFormatVersion {
             found: 4,
-            expected: 5
+            expected: CURRENT_FORMAT_VERSION
         }
     ));
     let message = err.to_string();
@@ -269,7 +278,7 @@ fn incompatible_redb_open_rejects_before_creating_schema_tables() {
         result,
         Err(MetaError::UnsupportedFormatVersion {
             found: 4,
-            expected: 5
+            expected: CURRENT_FORMAT_VERSION
         })
     ));
 

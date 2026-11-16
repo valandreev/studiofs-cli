@@ -71,6 +71,11 @@ jobs:
               --scenario mounted-sync-safety-two-client-acceptance
               --scenario mounted-random-write-packing
               --scenario mounted-posix-acl-xattr-rejection
+              --scenario mounted-recoverable-trash-two-client
+              --scenario mounted-recoverable-trash-durability
+              --scenario mounted-recoverable-trash-s3-crash-replay
+              --scenario mounted-recoverable-trash-cold-bootstrap
+              --scenario mounted-recoverable-trash-janitor-gc
             )
           fi
 

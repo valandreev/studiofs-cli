@@ -28,6 +28,11 @@ The PostgreSQL lifecycle contract is defined separately in
 catch-up is not a foreground data-plane prerequisite: local `redb` serving,
 remote replay, and read/write authority have separate contracts.
 
+The planned 0.2.3 recoverable-trash extension is defined by the
+[interview contract](superpowers/specs/2026-11-12-recoverable-trash-design.md).
+It must preserve these local-first durability/publication boundaries and retain
+unpublished offline data. The version bump does not enable that extension.
+
 ## Linux access-time contract
 
 Linux FUSE file reads and directory reads (`readdir`/`readdirplus`) do not

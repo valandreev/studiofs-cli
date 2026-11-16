@@ -1498,6 +1498,155 @@ fn self_batch_nonregular_attr_retains_late_inode_context_dependency() {
 }
 
 #[test]
+fn self_ack_after_restart_skips_only_a_retired_terminal_receipt_record() {
+    use crate::trash::{RETAINED_RECEIPT_XATTR, RetainedEntry, RetainedEntryState};
+    let receipt = ROOT_INO + 20;
+    let record = |state, revision| MetaEvent::SetXattr {
+        ino: receipt,
+        name: RETAINED_RECEIPT_XATTR.to_vec(),
+        value: serde_json::to_vec(&RetainedEntry {
+            version: 1,
+            revision,
+            receipt,
+            inode: ROOT_INO + 21,
+            original_parent: ROOT_INO,
+            original_name: b"source".to_vec(),
+            deleted_at_unix_secs: 1,
+            state,
+        })
+        .unwrap(),
+        flags: 0,
+    };
+    let rename = MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"restored".to_vec(),
+    };
+    let losing = record(
+        RetainedEntryState::Restored {
+            parent: ROOT_INO,
+            name: b"restored".to_vec(),
+        },
+        1,
+    );
+    let winner = record(
+        RetainedEntryState::PurgeRequested {
+            reason: crate::trash::RetainedPurgeReason::User,
+        },
+        1,
+    );
+    let dir = studiofs_test_support::workspace_target_tempdir("self-ack-lost-receipt-");
+    let engine = RedbMetaEngine::open(dir.path().join("meta.redb")).unwrap();
+    let lost = |local: &[MetaEvent]| {
+        let txn = engine.begin_write_txn().unwrap();
+        crate::pg_engine::retained::lost_terminal_records_in_txn(&txn, local).unwrap()
+    };
+    // No shared outcome in base yet: an unclassified or rejected loser is unproven.
+    assert!(lost(&[losing.clone(), rename.clone()]).is_empty());
+    // The winner was replayed into base before this self batch.
+    engine
+        .apply_replica_events_to_base(std::slice::from_ref(&winner))
+        .unwrap();
+    let local = [losing.clone(), rename.clone()];
+    let proven = lost(&local);
+    assert_eq!(proven, std::collections::BTreeSet::from([0]));
+    // The published remainder omitted the retired loser; after a restart the
+    // in-memory retirement is gone, so only the base proof passes the loser.
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix_omitting(
+            &local,
+            std::slice::from_ref(&rename),
+            &proven,
+            None
+        )
+        .unwrap(),
+        Some(2)
+    );
+    // A record equal to the shared winner is the winner, never omissible.
+    assert!(lost(&[winner, rename.clone()]).is_empty());
+    // A loser at the end of the prefix stays pending past the match.
+    let at_end = [rename.clone(), losing.clone()];
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix_omitting(
+            &at_end,
+            std::slice::from_ref(&rename),
+            &lost(&at_end),
+            None
+        )
+        .unwrap(),
+        Some(1)
+    );
+    // A published terminal record is still consumed in order.
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(
+            &[losing.clone(), rename.clone()],
+            &[losing, rename.clone()],
+            None
+        )
+        .unwrap(),
+        Some(2)
+    );
+    // Admission is never terminal, so its omission is a real mismatch.
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(
+            &[record(RetainedEntryState::Retained, 0), rename.clone()],
+            &[rename],
+            None
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn self_ack_after_restart_keeps_an_unproven_terminal_receipt_record() {
+    use crate::trash::{RETAINED_RECEIPT_XATTR, RetainedEntry, RetainedEntryState};
+    let receipt = ROOT_INO + 20;
+    let losing = MetaEvent::SetXattr {
+        ino: receipt,
+        name: RETAINED_RECEIPT_XATTR.to_vec(),
+        value: serde_json::to_vec(&RetainedEntry {
+            version: 1,
+            revision: 1,
+            receipt,
+            inode: ROOT_INO + 21,
+            original_parent: ROOT_INO,
+            original_name: b"source".to_vec(),
+            deleted_at_unix_secs: 1,
+            state: RetainedEntryState::PurgeRequested {
+                reason: crate::trash::RetainedPurgeReason::User,
+            },
+        })
+        .unwrap(),
+        flags: 0,
+    };
+    let rename = MetaEvent::RemoveEntry {
+        parent: ROOT_INO,
+        name: b"restored".to_vec(),
+    };
+    // A rejected (oversized) or unclassified terminal record has no durable
+    // proof that it lost, so a restart must not let the cursor pass it.
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(
+            &[losing.clone(), rename.clone()],
+            std::slice::from_ref(&rename),
+            None
+        )
+        .unwrap(),
+        None
+    );
+    // At the end of the prefix the record stays pending past the match.
+    assert_eq!(
+        RemoteApplyCoordinator::matching_local_prefix(
+            &[rename.clone(), losing],
+            std::slice::from_ref(&rename),
+            None
+        )
+        .unwrap(),
+        Some(1)
+    );
+}
+
+#[test]
 fn publication_projection_computes_inode_context_once() {
     use crate::pg_engine::remote_apply::LOCAL_PROJECTION_WORK;
     let events = vec![
@@ -5497,6 +5646,342 @@ fn hidden_uploading_rename_survives_recent_flush_reconciliation() {
     );
     pg.unlink(ROOT_INO, b"PPTC241.TMP")
         .expect("unlink successful rename destination");
+}
+
+#[test]
+fn repair_snapshot_and_pending_replay_keeps_uploading_renamed_entry_lifecycle_and_visibility() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+    let setup_start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup start");
+    let receipt = pg
+        .create_dir(ROOT_INO, b"receipt", 0, 0, 0o755)
+        .expect("create receipt dir");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
+    let setup_events = pg
+        .local
+        .read_events_range(setup_start, setup_end)
+        .expect("setup events");
+    let projected_setup = RemoteApplyCoordinator::project_local_batch(&setup_events);
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("ack setup flush");
+    apply_visible_self_batch(&pg, &projected_setup.events).expect("self replay setup");
+    remote
+        .local
+        .apply_replica_events_to_base(&projected_setup.events)
+        .expect("remote base setup");
+    remote
+        .local
+        .apply_replica_serving_state(&projected_setup.events)
+        .expect("remote serving setup");
+    let pre_crash_remote_snapshot = remote
+        .local
+        .export_remote_snapshot()
+        .expect("export pre-crash remote snapshot");
+
+    // Pre-crash writes while S3 is paused: Uploading file renamed into receipt/data.
+    let file = pg
+        .create_file(ROOT_INO, b"offline.bin", 0, 0, 0o644)
+        .expect("create offline file");
+    set_file_state(&pg, file.ino, 32, 1);
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_404, 32))
+        .expect("stage slice");
+    pg.rename_atomic(ROOT_INO, b"offline.bin", receipt.ino, b"data", false, false)
+        .expect("retain rename into receipt/data");
+
+    assert_eq!(
+        pg.lookup(receipt.ino, b"data")
+            .expect("pre-crash lookup")
+            .ino,
+        file.ino
+    );
+    assert_eq!(
+        pg.local
+            .get_inode_lifecycle(file.ino)
+            .expect("pre-crash lifecycle")
+            .expect("pre-crash lifecycle row")
+            .state,
+        InodeLifecycleState::LocalOnly
+    );
+
+    // Repair reopen imports PG snapshot (clearing INODE_LIFECYCLE_TABLE) and replays pending local log.
+    pg.local
+        .import_remote_snapshot_preserving_local_event_log(&pre_crash_remote_snapshot)
+        .expect("import pre-crash remote snapshot preserving local event log");
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending state from local log");
+
+    let replayed_lifecycle = pg
+        .local
+        .get_inode_lifecycle(file.ino)
+        .expect("load lifecycle after pending replay")
+        .expect("replayed uploading file must restore its INODE_LIFECYCLE_TABLE row");
+    assert_eq!(replayed_lifecycle.state, InodeLifecycleState::LocalOnly);
+    assert_eq!(
+        replayed_lifecycle.retention,
+        PayloadRetentionClass::PinnedUnpublished
+    );
+
+    // Subsequent flush hides the Uploading SetAttr while committing RenameEntry to base,
+    // making receipt/data a non-overlay base dentry with base_attr == None.
+    let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+    let pending_events = pg
+        .local
+        .read_events_range(setup_end, end)
+        .expect("pending events");
+    let projected = RemoteApplyCoordinator::project_local_batch(&pending_events);
+    assert!(
+        !projected
+            .events
+            .iter()
+            .any(|event| matches!(event, MetaEvent::SetAttr { attr } if attr.ino == file.ino)),
+        "uploading inode must stay hidden from remote base"
+    );
+    pg.mark_local_event_ranges_published(&[LocalEventRange {
+        start: setup_end,
+        end,
+    }])
+    .expect("mark pending range published");
+    apply_self_replay(
+        &pg,
+        projected.events,
+        setup_end,
+        end,
+        pg.local_overlay_conflicts().expect("overlay"),
+    );
+
+    assert_eq!(
+        pg.lookup(receipt.ino, b"data")
+            .expect("receipt/data must stay visible when base dentry matches serving")
+            .ino,
+        file.ino
+    );
+    assert!(
+        pg.readdir(receipt.ino)
+            .expect("readdir receipt")
+            .iter()
+            .any(|entry| entry.name == b"data" && entry.ino == file.ino),
+        "readdir(receipt) must expose retained data entry"
+    );
+    pg.rename_atomic(
+        receipt.ino,
+        b"data",
+        ROOT_INO,
+        b"restored.bin",
+        false,
+        false,
+    )
+    .expect("restore rename from receipt/data must succeed");
+    assert_eq!(
+        pg.lookup(ROOT_INO, b"restored.bin")
+            .expect("lookup restored file")
+            .ino,
+        file.ino
+    );
+}
+
+#[test]
+fn pending_replay_preserves_deleted_before_publish_lifecycle_and_deferred_cleanup() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+    let setup_start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup start");
+    pg.create_dir(ROOT_INO, b"setup", 0, 0, 0o755)
+        .expect("create setup dir");
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
+    let setup_events = pg
+        .local
+        .read_events_range(setup_start, setup_end)
+        .expect("setup events");
+    let projected_setup = RemoteApplyCoordinator::project_local_batch(&setup_events);
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("ack setup flush");
+    apply_visible_self_batch(&pg, &projected_setup.events).expect("self replay setup");
+    remote
+        .local
+        .apply_replica_events_to_base(&projected_setup.events)
+        .expect("remote base setup");
+    remote
+        .local
+        .apply_replica_serving_state(&projected_setup.events)
+        .expect("remote serving setup");
+    let pre_crash_remote_snapshot = remote
+        .local
+        .export_remote_snapshot()
+        .expect("export pre-crash remote snapshot");
+
+    let file = pg
+        .create_file(ROOT_INO, b"unpublished-delete.bin", 0, 0, 0o644)
+        .expect("create file");
+    set_file_state(&pg, file.ino, 64, 1);
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_405, 64))
+        .expect("stage payload");
+    mark_overlay_objects_uploaded(&pg, file.ino, 1, &[77_405]);
+    pg.unlink(ROOT_INO, b"unpublished-delete.bin")
+        .expect("unlink before publish");
+
+    let before_replay = pg
+        .local
+        .get_inode_lifecycle(file.ino)
+        .expect("load lifecycle before replay")
+        .expect("deleted-before-publish row");
+    assert_eq!(
+        before_replay.state,
+        InodeLifecycleState::DeletedBeforePublish
+    );
+    assert_eq!(before_replay.deferred_cleanup_object_ids, vec![77_405]);
+
+    pg.local
+        .import_remote_snapshot_preserving_local_event_log(&pre_crash_remote_snapshot)
+        .expect("import pre-crash remote snapshot preserving local event log");
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending state from local log");
+
+    let after_replay = pg
+        .local
+        .get_inode_lifecycle(file.ino)
+        .expect("load lifecycle after replay")
+        .expect(
+            "deleted-before-publish row must survive repair snapshot import and pending replay",
+        );
+    assert_eq!(
+        after_replay.state,
+        InodeLifecycleState::DeletedBeforePublish
+    );
+    assert_eq!(after_replay.deferred_cleanup_object_ids, vec![77_405]);
+}
+
+#[test]
+fn pending_replay_preserves_deleted_before_publish_for_published_file_edited_before_unlink() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+    let setup_start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup start");
+    let file = create_published_small_file(&pg, ROOT_INO, b"published-then-dirtied.bin", 77_406);
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
+    let setup_events = pg
+        .local
+        .read_events_range(setup_start, setup_end)
+        .expect("setup events");
+    let projected_setup = RemoteApplyCoordinator::project_local_batch(&setup_events);
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("ack setup flush");
+    apply_visible_self_batch(&pg, &projected_setup.events).expect("self replay setup");
+    remote
+        .local
+        .apply_replica_events_to_base(&projected_setup.events)
+        .expect("remote base setup");
+    remote
+        .local
+        .apply_replica_serving_state(&projected_setup.events)
+        .expect("remote serving setup");
+    let pre_crash_remote_snapshot = remote
+        .local
+        .export_remote_snapshot()
+        .expect("export pre-crash remote snapshot");
+
+    set_file_state(&pg, file.ino, 128, 2);
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_407, 128))
+        .expect("stage local dirty slice");
+    mark_overlay_objects_uploaded(&pg, file.ino, 2, &[77_407]);
+    pg.unlink(ROOT_INO, b"published-then-dirtied.bin")
+        .expect("unlink dirtied published file before publish");
+
+    let before_replay = pg
+        .local
+        .get_inode_lifecycle(file.ino)
+        .expect("load lifecycle before replay")
+        .expect("deleted-before-publish row");
+    assert_eq!(
+        before_replay.state,
+        InodeLifecycleState::DeletedBeforePublish
+    );
+    assert!(before_replay.has_published_base);
+    assert_eq!(before_replay.deferred_cleanup_object_ids, vec![77_407]);
+
+    pg.local
+        .import_remote_snapshot_preserving_local_event_log(&pre_crash_remote_snapshot)
+        .expect("import pre-crash remote snapshot preserving local event log");
+    pg.restore_pending_state_from_local_log()
+        .expect("restore pending state from local log");
+
+    let after_replay = pg
+        .local
+        .get_inode_lifecycle(file.ino)
+        .expect("load lifecycle after replay")
+        .expect("deleted-before-publish row must survive repair import and pending replay");
+    assert_eq!(
+        after_replay.state,
+        InodeLifecycleState::DeletedBeforePublish
+    );
+    assert!(after_replay.has_published_base);
+    assert_eq!(after_replay.deferred_cleanup_object_ids, vec![77_407]);
+}
+
+#[test]
+fn catch_up_checkpoint_preserve_local_state_keeps_deleted_before_publish_and_hides_inode() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+    let setup_start = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup start");
+    let file = create_published_small_file(&pg, ROOT_INO, b"catchup-deleted.bin", 77_408);
+    let setup_end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
+    let setup_events = pg
+        .local
+        .read_events_range(setup_start, setup_end)
+        .expect("setup events");
+    let projected_setup = RemoteApplyCoordinator::project_local_batch(&setup_events);
+    pg.persist_flushed_event_seq(setup_end)
+        .expect("ack setup flush");
+    apply_visible_self_batch(&pg, &projected_setup.events).expect("self replay setup");
+    remote
+        .local
+        .apply_replica_events_to_base(&projected_setup.events)
+        .expect("remote base setup");
+    remote
+        .local
+        .apply_replica_serving_state(&projected_setup.events)
+        .expect("remote serving setup");
+    let checkpoint = remote
+        .local
+        .begin_serving_checkpoint_snapshot()
+        .expect("begin checkpoint snapshot")
+        .export_serving_checkpoint()
+        .expect("export remote serving checkpoint");
+
+    set_file_state(&pg, file.ino, 128, 2);
+    pg.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(77_409, 128))
+        .expect("stage local dirty slice");
+    mark_overlay_objects_uploaded(&pg, file.ino, 2, &[77_409]);
+    pg.unlink(ROOT_INO, b"catchup-deleted.bin")
+        .expect("unlink before publish");
+
+    pg.import_serving_checkpoint_locked(
+        StartupSnapshotImportMode::PreserveLocalState,
+        &checkpoint,
+        1,
+    )
+    .expect("catch-up checkpoint import preserving local state");
+
+    let after_catchup = pg
+        .local
+        .get_inode_lifecycle(file.ino)
+        .expect("load lifecycle after catch-up")
+        .expect("deleted-before-publish row must survive catch-up checkpoint import");
+    assert_eq!(
+        after_catchup.state,
+        InodeLifecycleState::DeletedBeforePublish
+    );
+    assert!(after_catchup.has_published_base);
+    assert_eq!(after_catchup.deferred_cleanup_object_ids, vec![77_409]);
+    assert!(matches!(
+        pg.get_attr(file.ino),
+        Err(MetaError::InodeNotFound(ino)) if ino == file.ino
+    ));
+    assert!(matches!(
+        pg.lookup(ROOT_INO, b"catchup-deleted.bin"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
 }
 
 #[test]
@@ -12092,5 +12577,116 @@ fn self_replay_announces_a_hidden_name_restored_by_an_unreplayed_prefix() {
         created.ino,
         &second,
         &journaled_invalidation_intents(&second),
+    );
+}
+
+#[test]
+fn restore_payload_fork_hides_old_committed_identity_until_fresh_publication() {
+    let mut old = InodeAttr::new_file(42, ROOT_INO, 0, 0, 0o600);
+    old.size = 7;
+    old.committed_size = 7;
+    old.content_epoch = 1;
+    old.committed_content_epoch = 1;
+    old.upload_state = UploadState::Ready;
+    let mut fork = old.clone();
+    fork.content_epoch = 2;
+    fork.committed_size = 0;
+    fork.committed_content_epoch = 0;
+    fork.upload_state = UploadState::Updating;
+    let entry = DirEntryValue {
+        ino: 42,
+        kind: FileType::RegularFile,
+    };
+    let events = vec![
+        MetaEvent::SetAttr { attr: old },
+        MetaEvent::SetAttr { attr: fork },
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"restored".to_vec(),
+            entry,
+        },
+    ];
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    assert!(
+        !projected
+            .events
+            .iter()
+            .any(|event| matches!(event, MetaEvent::AddEntry { .. })),
+        "an earlier committed generation does not publish a fresh restore payload"
+    );
+}
+
+#[test]
+fn discarded_restore_stage_overlay_never_projects_shared_payload_reference() {
+    let mut stage = InodeAttr::new_file(42, ROOT_INO, 0, 0, 0o600);
+    stage.size = 7;
+    stage.content_epoch = 1;
+    let events = vec![
+        MetaEvent::SetAttr { attr: stage },
+        MetaEvent::SetRegularFileOverlaySlices {
+            ino: 42,
+            chunk_slices: vec![(
+                ChunkId(0),
+                vec![SliceRecord::new(
+                    SliceId(1),
+                    SliceOrder(1),
+                    SliceRange::new(0, 7).unwrap(),
+                    PayloadRef::new_full(9001, 7),
+                )],
+            )],
+        },
+        MetaEvent::RemoveAttr { ino: 42 },
+    ];
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    assert!(
+        projected.events.is_empty(),
+        "stage overlay and its removal must stay local"
+    );
+    assert!(!projected.needs_local_replay);
+}
+
+#[test]
+fn restore_keeps_namespace_journal_pending_until_all_fresh_payloads_are_ready() {
+    use crate::trash::{RETAINED_RECEIPT_XATTR, RetainedEntry, RetainedEntryState};
+    let receipt = RetainedEntry {
+        version: 1,
+        revision: 1,
+        receipt: 10,
+        inode: 42,
+        original_parent: ROOT_INO,
+        original_name: b"source".to_vec(),
+        deleted_at_unix_secs: 1,
+        state: RetainedEntryState::Restored {
+            parent: ROOT_INO,
+            name: b"restored".to_vec(),
+        },
+    };
+    let mut fork = InodeAttr::new_file(42, ROOT_INO, 0, 0, 0o600);
+    fork.size = 7;
+    fork.content_epoch = 2;
+    fork.upload_state = UploadState::Updating;
+    let events = vec![
+        MetaEvent::SetXattr {
+            ino: 10,
+            name: RETAINED_RECEIPT_XATTR.to_vec(),
+            value: serde_json::to_vec(&receipt).unwrap(),
+            flags: 0,
+        },
+        MetaEvent::SetAttr { attr: fork },
+        MetaEvent::AddEntry {
+            parent: ROOT_INO,
+            name: b"restored".to_vec(),
+            entry: DirEntryValue {
+                ino: 42,
+                kind: FileType::RegularFile,
+            },
+        },
+        MetaEvent::RemoveAttr { ino: 99 },
+    ];
+    let projected = RemoteApplyCoordinator::project_local_batch(&events);
+    assert!(projected.needs_local_replay);
+    assert!(
+        projected.events.is_empty(),
+        "later cleanup must not acknowledge hidden restore names"
     );
 }

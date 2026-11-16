@@ -123,6 +123,8 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS format_info BYTEA NOT NULL DEFAULT decode('', 'hex');
         ALTER TABLE metadata_state
+            ADD COLUMN IF NOT EXISTS volume_settings BYTEA;
+        ALTER TABLE metadata_state
             ADD COLUMN IF NOT EXISTS checkpoint_publication_state TEXT NOT NULL DEFAULT 'published'
                 CHECK (checkpoint_publication_state IN ('pending', 'published'));
         ALTER TABLE metadata_state
@@ -169,6 +171,20 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             access_level SMALLINT NOT NULL,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (vol, ino, principal)
+        );
+
+        CREATE TABLE IF NOT EXISTS trash_entry_authority (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            receipt BIGINT NOT NULL CHECK (receipt > 1),
+            record BYTEA NOT NULL,
+            PRIMARY KEY (vol, receipt)
+        );
+
+        CREATE TABLE IF NOT EXISTS trash_publication_receipts (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            digest BYTEA NOT NULL CHECK (octet_length(digest) = 32),
+            version BIGINT NOT NULL CHECK (version >= 0),
+            PRIMARY KEY (vol, digest)
         );
 
         CREATE TABLE IF NOT EXISTS file_lock_leases (
@@ -550,6 +566,22 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
             acknowledged_at TIMESTAMPTZ,
             PRIMARY KEY (vol, object_id)
         );
+        CREATE OR REPLACE FUNCTION studiofs_fence_legacy_deletion_claim()
+        RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.state = 'delete_pending' AND NEW.reconcile_owner IS NOT NULL
+               AND (TG_OP = 'INSERT' OR NEW.reconcile_fence IS DISTINCT FROM OLD.reconcile_fence)
+               AND EXISTS (SELECT 1 FROM metadata_state WHERE vol = NEW.vol AND metadata_format_version >= 6)
+               AND current_setting('studiofs.deletion_format', true) IS DISTINCT FROM '6'
+            THEN
+                RAISE EXCEPTION 'deletion claim requires metadata format 6 capability';
+            END IF;
+            RETURN NEW;
+        END $$;
+        DROP TRIGGER IF EXISTS studiofs_legacy_deletion_claim_fence ON snapshot_payload_upload_objects;
+        CREATE TRIGGER studiofs_legacy_deletion_claim_fence
+            BEFORE INSERT OR UPDATE ON snapshot_payload_upload_objects
+            FOR EACH ROW EXECUTE FUNCTION studiofs_fence_legacy_deletion_claim();
 
         CREATE TABLE IF NOT EXISTS snapshot_payload_sweep_checkpoints (
             vol BIGINT PRIMARY KEY REFERENCES volumes(vol) ON DELETE CASCADE,
@@ -878,7 +910,7 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
         -- commits only together with every statement above. It never moves
         -- backwards, so an older binary cannot relabel a newer schema.
         INSERT INTO studiofs_schema_components (component, version)
-            VALUES ('payload_gc', 1)
+            VALUES ('payload_gc', 2)
             ON CONFLICT (component) DO UPDATE
                 SET version = EXCLUDED.version, applied_at = now()
                 WHERE studiofs_schema_components.version < EXCLUDED.version;
@@ -887,7 +919,7 @@ pub fn studiofs_pg_schema_sql() -> &'static str {
 
 /// Version of the payload GC queue, sweep-checkpoint and upload-fence schema
 /// that this binary creates and that the CLI Janitor requires before deleting.
-pub const PAYLOAD_GC_SCHEMA_VERSION: i32 = 1;
+pub const PAYLOAD_GC_SCHEMA_VERSION: i32 = 2;
 
 /// Ensures the canonical Snapshot v2 schema exists for a client or transaction.
 ///

@@ -1249,7 +1249,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
         let mut commit_slices = pending_slices.clone();
         match self.vfs.sync_meta().get_attr(self.ino) {
             Ok(current_attr)
-                if current_attr.content_epoch == content_epoch
+                if current_attr.content_epoch >= content_epoch
                     && current_attr.upload_state == MetaUploadState::Ready
                     && current_attr.committed_content_epoch == current_attr.content_epoch
                     && current_attr.committed_size == current_attr.size
@@ -1258,8 +1258,8 @@ impl<'a> LocalDirtyFlushSession<'a> {
                         .is_some_and(|attr| attr.upload_state != MetaUploadState::Ready) =>
             {
                 // Content epochs are allocated independently by each client.
-                // A peer can therefore publish the same numeric epoch while
-                // this client still owns an accepted payload for that epoch.
+                // A peer can publish the same or a newer numeric epoch while
+                // this client still owns an accepted pending payload.
                 // Rebase the local overlay so the Ready peer snapshot cannot
                 // make the pending payload look stale and discard it.
                 let rebased_epoch = current_attr.content_epoch.saturating_add(1);
@@ -1606,7 +1606,8 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 .flush_barrier_calls
                 .fetch_add(1, Ordering::Relaxed);
         }
-        self.vfs.enforce_access(self.ino, AccessLevel::ReadWrite)?;
+        self.vfs
+            .enforce_access_for_local_drain(self.ino, AccessLevel::ReadWrite)?;
         if self.vfs.ignored_entry_attr(self.ino).is_some() {
             return Ok(());
         }

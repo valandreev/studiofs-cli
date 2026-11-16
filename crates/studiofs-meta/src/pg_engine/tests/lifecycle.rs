@@ -1,4 +1,1732 @@
 use super::*;
+
+fn retained_test_source_fences(
+    engine: &PgMetaEngine,
+    receipt: Ino,
+) -> Vec<crate::trash::RetainedSourceFence> {
+    let mut pending = vec![engine.lookup(receipt, b"data").unwrap().ino];
+    let mut seen = HashSet::new();
+    let mut fences = Vec::new();
+    while let Some(ino) = pending.pop() {
+        if !seen.insert(ino) {
+            continue;
+        }
+        let attr = engine.get_attr(ino).unwrap();
+        fences.push(crate::trash::RetainedSourceFence {
+            ino,
+            ctime: attr.ctime,
+            size: attr.size,
+            content_epoch: attr.content_epoch,
+        });
+        if attr.kind == FileType::Directory {
+            pending.extend(
+                engine
+                    .readdir(ino)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.name != b"." && e.name != b"..")
+                    .map(|e| e.ino),
+            );
+        }
+    }
+    fences
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; durable retained publication retry"]
+fn test_pg_retained_publication_response_loss_retry() {
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-retry");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-retry-");
+    let path = dir.path().join("local");
+    seed_local(&path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: false,
+            pg_pool_size: 4,
+            defer_remote_startup_probes: false,
+        },
+    )
+    .unwrap();
+    engine.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let start = engine
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .unwrap();
+    engine.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+    let store = engine
+        .create_dir(ROOT_INO, b"private", 0, 0, 0o700)
+        .unwrap();
+    let receipt = engine.next_inode().unwrap();
+    engine
+        .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    engine.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+    engine
+        .restore_retained_entry(
+            receipt,
+            ROOT_INO,
+            b"restored",
+            b"stage",
+            &retained_test_source_fences(&engine, receipt),
+        )
+        .unwrap();
+    let events = engine.local.read_events_range(start, u64::MAX).unwrap();
+    let version = engine.push_event_log_batch_locked(&events).unwrap();
+    assert_eq!(
+        engine.push_event_log_batch_locked(&events).unwrap(),
+        version
+    );
+    drop(engine);
+    let reopened = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: false,
+            pg_pool_size: 4,
+            defer_remote_startup_probes: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.push_event_log_batch_locked(&events).unwrap(),
+        version
+    );
+    let before_remove = reopened
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .unwrap();
+    reopened.rmdir(ROOT_INO, b"restored").unwrap();
+    let removal = reopened
+        .local
+        .read_events_range(before_remove, u64::MAX)
+        .unwrap();
+    let removed_version = reopened.push_event_log_batch_locked(&removal).unwrap();
+    assert!(removed_version > version);
+    assert_eq!(
+        reopened.push_event_log_batch_locked(&events).unwrap(),
+        version
+    );
+    assert_eq!(
+        reopened.remote_metadata_head_version().unwrap(),
+        removed_version,
+        "retry must not append old namespace events after later deletion"
+    );
+    let mut changed = events.clone();
+    for event in &mut changed {
+        if let crate::MetaEvent::SetXattr { name, value, .. } = event
+            && name == crate::trash::RETAINED_RECEIPT_XATTR
+        {
+            let mut record: crate::trash::RetainedEntry = serde_json::from_slice(value).unwrap();
+            record.original_name = b"different-identity".to_vec();
+            *value = serde_json::to_vec(&record).unwrap();
+        }
+    }
+    assert!(reopened.push_event_log_batch_locked(&changed).is_err());
+    assert_eq!(
+        reopened.remote_metadata_head_version().unwrap(),
+        removed_version
+    );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; shared receipt proof cannot be erased"]
+fn test_pg_retained_authority_rejects_receipt_removal() {
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings, RETAINED_RECEIPT_XATTR};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-removal");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-removal-");
+    let path = dir.path().join("local");
+    seed_local(&path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: false,
+            pg_pool_size: 4,
+            defer_remote_startup_probes: false,
+        },
+    )
+    .unwrap();
+    engine.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let start = engine
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .unwrap();
+    engine.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+    let store = engine
+        .create_dir(ROOT_INO, b"private", 0, 0, 0o700)
+        .unwrap();
+    let receipt = engine.next_inode().unwrap();
+    engine
+        .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    engine.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+    engine
+        .restore_retained_entry(
+            receipt,
+            ROOT_INO,
+            b"restored",
+            b"stage",
+            &retained_test_source_fences(&engine, receipt),
+        )
+        .unwrap();
+    let events = engine.local.read_events_range(start, u64::MAX).unwrap();
+    engine.push_event_log_batch_locked(&events).unwrap();
+    let volume_id = volume.volume_id;
+    let shared_record = || {
+        run_async(with_pg_test_client(&dsn, |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT record FROM trash_entry_authority WHERE vol=$1 AND receipt=$2",
+                    &[&volume_id, &(receipt as i64)],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok(row.get::<_, Vec<u8>>(0))
+        }))
+        .unwrap()
+    };
+    let record = shared_record();
+
+    // The local guard refuses removing the emptied receipt directory, so the
+    // shared rejection below is defense in depth against forged batches.
+    let receipt_name = receipt.to_string();
+    assert!(matches!(
+        engine.rmdir(store.ino, receipt_name.as_bytes()),
+        Err(MetaError::AccessDenied { .. })
+    ));
+    let before_empty = engine
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .unwrap();
+    let empty = engine.create_dir(store.ino, b"empty", 0, 0, 0o700).unwrap();
+    let created = engine
+        .local
+        .read_events_range(before_empty, u64::MAX)
+        .unwrap();
+    let version = engine.push_event_log_batch_locked(&created).unwrap();
+    let rejected = |batch: &[crate::MetaEvent]| {
+        let error = engine.push_event_log_batch_locked(batch).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("receipt cannot be removed from shared metadata"),
+            "{batch:?}: {error}"
+        );
+        assert_eq!(engine.remote_metadata_head_version().unwrap(), version);
+    };
+    rejected(&[crate::MetaEvent::RemoveXattr {
+        ino: receipt,
+        name: RETAINED_RECEIPT_XATTR.to_vec(),
+    }]);
+    rejected(&[crate::MetaEvent::RemoveAttr { ino: receipt }]);
+    // A directory rename over the empty receipt displaces it.
+    rejected(&[crate::MetaEvent::RenameEntry {
+        parent: store.ino,
+        name: b"empty".to_vec(),
+        new_parent: store.ino,
+        new_name: receipt_name.as_bytes().to_vec(),
+        entry: crate::DirEntryValue {
+            ino: empty.ino,
+            kind: crate::FileType::Directory,
+        },
+        displaced_set_attr: Box::new(None),
+        displaced_remove_attr_ino: Some(receipt),
+        moved_dir_attr: Box::new(None),
+        old_parent_attr: Box::new(None),
+        new_parent_attr: Box::new(None),
+    }]);
+    assert_eq!(shared_record(), record);
+
+    // Retain → restore → rmdir in one batch: the row admitted earlier in the
+    // same transaction must also reject the removal, and nothing commits.
+    let start = engine
+        .local
+        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+        .unwrap();
+    engine.create_dir(ROOT_INO, b"second", 0, 0, 0o700).unwrap();
+    let second = engine.next_inode().unwrap();
+    engine
+        .retain_namespace_entry(ROOT_INO, b"second", store.ino, second)
+        .unwrap();
+    engine.create_dir(second, b"stage", 0, 0, 0o700).unwrap();
+    engine
+        .restore_retained_entry(
+            second,
+            ROOT_INO,
+            b"second-restored",
+            b"stage",
+            &retained_test_source_fences(&engine, second),
+        )
+        .unwrap();
+    let mut batch = engine.local.read_events_range(start, u64::MAX).unwrap();
+    batch.push(crate::MetaEvent::RemoveAttr { ino: second });
+    rejected(&batch);
+    let admitted = run_async(with_pg_test_client(&dsn, |client| async move {
+        client
+            .query_opt(
+                "SELECT 1 FROM trash_entry_authority WHERE vol=$1 AND receipt=$2",
+                &[&volume_id, &(second as i64)],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))
+    }))
+    .unwrap();
+    assert!(
+        admitted.is_none(),
+        "rejected batch must roll back admission"
+    );
+}
+
+fn retained_test_engine(path: &Path) -> Arc<PgMetaEngine> {
+    PgMetaEngine::open_with_options(
+        path,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: false,
+            pg_pool_size: 4,
+            defer_remote_startup_probes: false,
+        },
+    )
+    .unwrap()
+}
+
+fn sync_all_pages(engine: &PgMetaEngine) {
+    let target = engine.remote_metadata_head_version().unwrap();
+    for _ in 0..256 {
+        if engine.local_version.load(Ordering::SeqCst) >= target {
+            break;
+        }
+        engine.sync_metadata().unwrap();
+    }
+    assert!(
+        engine.local_version.load(Ordering::SeqCst) >= target,
+        "failed to catch up to {target}, stopped at {}",
+        engine.local_version.load(Ordering::SeqCst)
+    );
+}
+
+fn publish_and_pull(engine: &PgMetaEngine) {
+    engine.request_eager_flush();
+    engine.flush_due_pending().unwrap();
+    sync_all_pages(engine);
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; acknowledged purge settles through the janitor queue"]
+fn test_pg_retained_purge_settlement_reclaims_through_gc_queue() {
+    use crate::snapshot_ports::{UploadedFragmentLedger, UploadedObjectDeletionClaim};
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings, RetainedPurgeReason};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-settle");
+    let volume_id = volume.volume_id;
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-settle-");
+    let path = dir.path().join("local");
+    seed_local(&path, &volume.format_info());
+    let engine = retained_test_engine(&path);
+    engine.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    const PURGED: u64 = 61_001;
+    const LINKED: u64 = 61_002;
+    const OPENED: u64 = 61_003;
+    let purged = create_published_small_file(&engine, ROOT_INO, b"purged", PURGED);
+    let linked = create_published_small_file(&engine, ROOT_INO, b"linked", LINKED);
+    engine.link(linked.ino, ROOT_INO, b"live-link").unwrap();
+    let opened = create_published_small_file(&engine, ROOT_INO, b"opened", OPENED);
+    let store = engine
+        .create_dir(ROOT_INO, b"private", 0, 0, 0o700)
+        .unwrap();
+    publish_and_pull(&engine);
+    let sql = |statement: &'static str| {
+        run_async(with_pg_test_client(&dsn, move |client| async move {
+            client
+                .query(statement, &[&volume_id])
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))
+        }))
+        .unwrap()
+    };
+    // Confirmed uploads, and a ready snapshot cut that still reaches them.
+    sql(
+        "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) SELECT $1, id, 'published' FROM unnest(ARRAY[61001, 61002, 61003]::BIGINT[]) AS id ON CONFLICT (vol, object_id) DO UPDATE SET state = 'published'",
+    );
+    sql(
+        "INSERT INTO snapshot_catalog (vol, id, origin, cut_version, captured_at, lifecycle) SELECT $1, 'retained-pin', 'manual', version, now(), 'ready' FROM metadata_state WHERE vol = $1",
+    );
+
+    let mut receipts = Vec::new();
+    for name in [&b"purged"[..], b"linked", b"opened"] {
+        let receipt = engine.next_inode().unwrap();
+        engine
+            .retain_namespace_entry(ROOT_INO, name, store.ino, receipt)
+            .unwrap();
+        engine
+            .request_retained_purge(receipt, RetainedPurgeReason::User)
+            .unwrap();
+        receipts.push(receipt);
+    }
+    let [purged_receipt, linked_receipt, opened_receipt] = receipts[..] else {
+        unreachable!()
+    };
+    let now = 1_u64 << 40;
+    // A local purge request alone settles nothing.
+    assert_eq!(
+        engine.run_retained_lifecycle_once(now).unwrap(),
+        Default::default()
+    );
+    for (receipt, ino) in [
+        (purged_receipt, purged.ino),
+        (linked_receipt, linked.ino),
+        (opened_receipt, opened.ino),
+    ] {
+        assert_eq!(engine.lookup(receipt, b"data").unwrap().ino, ino);
+    }
+
+    publish_and_pull(&engine);
+    engine.note_open_handle(opened.ino, true);
+    let sweep = engine.run_retained_lifecycle_once(now).unwrap();
+    assert_eq!((sweep.settled, sweep.deferred), (2, 1));
+    assert!(engine.lookup(purged_receipt, b"data").is_err());
+    assert!(engine.get_attr(purged.ino).is_err());
+    assert_eq!(
+        engine.lookup(ROOT_INO, b"live-link").unwrap().ino,
+        linked.ino
+    );
+    assert_eq!(engine.get_attr(linked.ino).unwrap().nlink, 1);
+    // The open handle keeps its inode, link and content graph.
+    assert_eq!(
+        engine.lookup(opened_receipt, b"data").unwrap().ino,
+        opened.ino
+    );
+    assert_eq!(engine.get_attr(opened.ino).unwrap().size, 64);
+
+    // Crash after the local unlink but before publication, with a purge that
+    // is acknowledged but not yet unlinked (the handle disappears with the process).
+    drop(engine);
+    let engine = retained_test_engine(&path);
+    let sweep = engine.run_retained_lifecycle_once(now).unwrap();
+    assert_eq!((sweep.settled, sweep.deferred), (1, 0));
+    publish_and_pull(&engine);
+    assert_eq!(
+        engine.run_retained_lifecycle_once(now).unwrap(),
+        Default::default()
+    );
+    let head = engine.remote_metadata_head_version().unwrap();
+    publish_and_pull(&engine);
+    assert_eq!(engine.remote_metadata_head_version().unwrap(), head);
+    // `sync_all_pages` skips `sync_metadata` at the head, so its Live
+    // bootstrap never ran; the janitor guard requires the reachability ledger.
+    engine
+        .backfill_current_reference_ledger_if_needed()
+        .unwrap();
+    assert!(
+        engine
+            .snapshot_reachability_bootstrapped
+            .load(Ordering::Acquire),
+        "the current-reference ledger must be bootstrapped before janitor checks"
+    );
+
+    // Each data link was removed in shared metadata exactly once.
+    let removed = sql("SELECT event_type, event_payload FROM event_log WHERE vol = $1 AND event_type = 'remove_entry'")
+        .into_iter()
+        .filter_map(|row| {
+            match crate::events::decode_event_with_type(row.get(0), row.get(1)).unwrap() {
+                crate::MetaEvent::RemoveEntry { parent, name } if name == b"data" => Some(parent),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut expected = vec![purged_receipt, linked_receipt, opened_receipt];
+    let mut removed = removed;
+    removed.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(removed, expected);
+
+    // Receipt tombstones stay: shared rows and local receipt directories.
+    let rows = sql("SELECT receipt FROM trash_entry_authority WHERE vol = $1");
+    assert_eq!(rows.len(), 3);
+    for receipt in &expected {
+        assert!(engine.retained_entry(*receipt).unwrap().is_some());
+        let name = receipt.to_string();
+        assert_eq!(
+            engine.lookup(store.ino, name.as_bytes()).unwrap().ino,
+            *receipt
+        );
+    }
+
+    // Unreferenced objects reach the ordinary janitor queue; the live hard
+    // link keeps its object out of it.
+    let mut queued = sql("SELECT object_id FROM snapshot_payload_gc_candidates WHERE vol = $1")
+        .into_iter()
+        .map(|row| row.get::<_, i64>(0))
+        .collect::<Vec<_>>();
+    queued.sort_unstable();
+    assert_eq!(queued, vec![PURGED as i64, OPENED as i64]);
+    // The ready snapshot cut still pins the purged payload against deletion.
+    assert!(engine.get_global_snapshot_pins().unwrap().contains(&PURGED));
+    assert_eq!(
+        engine
+            .claim_uploaded_object_deletion(PURGED, "retained-settle-test")
+            .unwrap(),
+        UploadedObjectDeletionClaim::Protected
+    );
+    sql("UPDATE snapshot_catalog SET lifecycle = 'deleting' WHERE vol = $1");
+    assert!(matches!(
+        engine
+            .claim_uploaded_object_deletion(PURGED, "retained-settle-test")
+            .unwrap(),
+        UploadedObjectDeletionClaim::Claimed { .. }
+    ));
+    assert_eq!(
+        engine
+            .claim_uploaded_object_deletion(LINKED, "retained-settle-test")
+            .unwrap(),
+        UploadedObjectDeletionClaim::Protected,
+        "a live hard link keeps its object referenced"
+    );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; expiry and offline restore share one terminal authority"]
+fn test_pg_retained_expiry_conflicts_with_offline_restore_like_purge() {
+    use crate::trash::{
+        MetaRetainedStore, MetaVolumeSettings, RetainedEntryState, RetainedPurgeReason,
+    };
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    for expiry_first in [true, false] {
+        let volume = PgTestVolume::new(&dsn, "retained-expiry");
+        let volume_id = volume.volume_id;
+        let dir = studiofs_test_support::workspace_target_tempdir("retained-expiry-");
+        seed_local(&dir.path().join("first"), &volume.format_info());
+        seed_local(&dir.path().join("second"), &volume.format_info());
+        let first = retained_test_engine(&dir.path().join("first"));
+        first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let payload = first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+        let child = first
+            .create_dir(payload.ino, b"accepted-child", 0, 0, 0o700)
+            .unwrap();
+        let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let receipt = first.next_inode().unwrap();
+        let retained = first
+            .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+            .unwrap();
+        publish_and_pull(&first);
+        let second = retained_test_engine(&dir.path().join("second"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while second.retained_entry(receipt).unwrap().is_none() {
+            assert!(Instant::now() < deadline, "peer never observed the receipt");
+            publish_and_pull(&first);
+            second.sync_metadata().unwrap();
+        }
+
+        // Controlled clock: whole days from the initial deletion, inclusive.
+        let expires_at = retained.deleted_at_unix_secs + 7 * 86_400;
+        assert_eq!(
+            second.run_retained_lifecycle_once(expires_at - 1).unwrap(),
+            Default::default()
+        );
+        let staged = first.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+        let staged_child = first
+            .create_dir(staged.ino, b"accepted-child", 0, 0, 0o700)
+            .unwrap();
+        assert_ne!(staged.ino, payload.ino);
+        assert_ne!(staged_child.ino, child.ino);
+        first
+            .restore_retained_entry(
+                receipt,
+                ROOT_INO,
+                b"restored-offline",
+                b"stage",
+                &retained_test_source_fences(&first, receipt),
+            )
+            .unwrap();
+        assert_eq!(
+            second
+                .run_retained_lifecycle_once(expires_at)
+                .unwrap()
+                .expired,
+            1
+        );
+        assert_eq!(
+            second.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::PurgeRequested {
+                reason: RetainedPurgeReason::Expired {
+                    settings_revision: 1
+                }
+            }
+        );
+        // Not yet acknowledged: nothing settles.
+        let sweep = second.run_retained_lifecycle_once(expires_at).unwrap();
+        assert_eq!((sweep.expired, sweep.settled), (0, 0));
+        assert_eq!(second.lookup(receipt, b"data").unwrap().ino, payload.ino);
+
+        let (winner, loser) = if expiry_first {
+            (&second, &first)
+        } else {
+            (&first, &second)
+        };
+        winner.request_eager_flush();
+        winner.flush_due_pending().unwrap();
+        loser.request_eager_flush();
+        // A losing restore has a namespace remainder; a losing expiry is the whole batch.
+        assert_eq!(loser.flush_due_pending().is_err(), expiry_first);
+        first.sync_metadata().unwrap();
+        second.sync_metadata().unwrap();
+        let shared = run_async(with_pg_test_client(&dsn, |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT record FROM trash_entry_authority WHERE vol=$1 AND receipt=$2",
+                    &[&volume_id, &(receipt as i64)],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok(row.get::<_, Vec<u8>>(0))
+        }))
+        .unwrap();
+        let shared = RedbMetaEngine::decode_retained_entry(receipt, &shared).unwrap();
+        assert_eq!(
+            matches!(
+                shared.state,
+                RetainedEntryState::PurgeRequested {
+                    reason: RetainedPurgeReason::Expired {
+                        settings_revision: 1
+                    }
+                }
+            ),
+            expiry_first
+        );
+
+        let sweep = second.run_retained_lifecycle_once(expires_at).unwrap();
+        assert_eq!(
+            (sweep.expired, sweep.settled),
+            (0, usize::from(expiry_first))
+        );
+        // The restoring client never settles: restore already unlinked its data tree.
+        assert_eq!(
+            first.run_retained_lifecycle_once(expires_at).unwrap(),
+            Default::default()
+        );
+        assert_eq!(
+            first.lookup(ROOT_INO, b"restored-offline").unwrap().ino,
+            payload.ino
+        );
+        assert_eq!(
+            first.lookup(payload.ino, b"accepted-child").unwrap().ino,
+            child.ino
+        );
+        if expiry_first {
+            assert!(second.lookup(receipt, b"data").is_err());
+            publish_and_pull(&second);
+            first.sync_metadata().unwrap();
+            first.request_eager_flush();
+            first.flush_due_pending().unwrap();
+            second.sync_metadata().unwrap();
+            assert_eq!(
+                first.replication_backlog().pending_ops,
+                0,
+                "losing restore must leave no unpublished ops after flush and sync"
+            );
+            let first_restored = first.lookup(ROOT_INO, b"restored-offline").unwrap();
+            let second_restored = second.lookup(ROOT_INO, b"restored-offline").unwrap();
+            assert_eq!(first_restored.ino, payload.ino);
+            assert_eq!(second_restored.ino, payload.ino);
+            assert_eq!(
+                first
+                    .lookup(first_restored.ino, b"accepted-child")
+                    .unwrap()
+                    .ino,
+                child.ino
+            );
+            assert_eq!(
+                second
+                    .lookup(second_restored.ino, b"accepted-child")
+                    .unwrap()
+                    .ino,
+                child.ino
+            );
+            assert!(second.get_attr(payload.ino).is_ok());
+            assert!(first.get_attr(payload.ino).is_ok());
+        } else {
+            assert_eq!(
+                second.lookup(ROOT_INO, b"restored-offline").unwrap().ino,
+                payload.ino
+            );
+            assert_eq!(
+                second.lookup(payload.ino, b"accepted-child").unwrap().ino,
+                child.ino
+            );
+            assert!(second.get_attr(payload.ino).is_ok());
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; identical peer expiry must publish the pulling client's own batch"]
+fn test_pg_retained_identical_peer_expiry_publishes_own_batch() {
+    use crate::trash::{
+        MetaRetainedStore, MetaVolumeSettings, RetainedEntryState, RetainedPurgeReason,
+    };
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    for pull_before_flush in [true, false] {
+        let volume = PgTestVolume::new(&dsn, "retained-peer-expiry");
+        let volume_id = volume.volume_id;
+        let dir = studiofs_test_support::workspace_target_tempdir("retained-peer-expiry-");
+        seed_local(&dir.path().join("first"), &volume.format_info());
+        seed_local(&dir.path().join("second"), &volume.format_info());
+        let first = retained_test_engine(&dir.path().join("first"));
+        first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+        let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let receipt = first.next_inode().unwrap();
+        let retained = first
+            .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+            .unwrap();
+        publish_and_pull(&first);
+        let second = retained_test_engine(&dir.path().join("second"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while second.retained_entry(receipt).unwrap().is_none() {
+            assert!(Instant::now() < deadline, "peer never observed the receipt");
+            publish_and_pull(&first);
+            second.sync_metadata().unwrap();
+        }
+
+        // Both clients queue byte-identical expiry proposals at the same instant.
+        let expires_at = retained.deleted_at_unix_secs + 7 * 86_400;
+        assert_eq!(
+            first
+                .run_retained_lifecycle_once(expires_at)
+                .unwrap()
+                .expired,
+            1
+        );
+        assert_eq!(
+            second
+                .run_retained_lifecycle_once(expires_at)
+                .unwrap()
+                .expired,
+            1
+        );
+        first.request_eager_flush();
+        first.flush_due_pending().unwrap();
+        if pull_before_flush {
+            second.sync_metadata().unwrap();
+        }
+        second.request_eager_flush();
+        second.flush_due_pending().unwrap();
+        assert_eq!(
+            second.replication_backlog().pending_ops,
+            0,
+            "identical peer expiry must drain its journal (pull_before_flush={pull_before_flush})"
+        );
+        let second_client = second.current_client_id().unwrap();
+        let own_batches = run_async(with_pg_test_client(&dsn, move |client| async move {
+            client
+                .query_one(
+                    "SELECT count(*) FROM event_log WHERE vol=$1 AND client_id=$2",
+                    &[&volume_id, &second_client],
+                )
+                .await
+                .map(|row| row.get::<_, i64>(0))
+                .map_err(|error| MetaError::Storage(error.to_string()))
+        }))
+        .unwrap();
+        assert!(
+            own_batches > 0,
+            "the peer's own expiry must reach event_log (pull_before_flush={pull_before_flush})"
+        );
+        let local = second.retained_entry(receipt).unwrap().unwrap();
+        assert_eq!(
+            local.state,
+            RetainedEntryState::PurgeRequested {
+                reason: RetainedPurgeReason::Expired {
+                    settings_revision: 1
+                }
+            }
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; expiry judged under a superseded shared period is retired, not published"]
+fn test_pg_retained_stale_expiry_after_period_raise_is_retired() {
+    use crate::trash::{
+        MetaRetainedStore, MetaVolumeSettings, RetainedEntryState, RetainedPurgeReason,
+    };
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    for sync_before_flush in [false, true] {
+        let volume = PgTestVolume::new(&dsn, "retained-stale-expiry");
+        let dir = studiofs_test_support::workspace_target_tempdir("retained-stale-expiry-");
+        let second_path = dir.path().join("second");
+        seed_local(&dir.path().join("first"), &volume.format_info());
+        seed_local(&second_path, &volume.format_info());
+        let first = retained_test_engine(&dir.path().join("first"));
+        first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let payload = first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+        let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let receipt = first.next_inode().unwrap();
+        let retained = first
+            .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+            .unwrap();
+        publish_and_pull(&first);
+        let second = retained_test_engine(&second_path);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while second.retained_entry(receipt).unwrap().is_none() {
+            assert!(Instant::now() < deadline, "peer never observed the receipt");
+            publish_and_pull(&first);
+            second.sync_metadata().unwrap();
+        }
+
+        // B judges the entry expired under the 7-day period but has not flushed.
+        let expires_at = retained.deleted_at_unix_secs + 7 * 86_400;
+        assert_eq!(
+            second
+                .run_retained_lifecycle_once(expires_at)
+                .unwrap()
+                .expired,
+            1
+        );
+        // A raises the shared period before B's stale proposal reaches commit.
+        let revision = first.volume_settings().unwrap().revision;
+        first
+            .compare_and_set_trash_days(revision, 30)
+            .unwrap()
+            .unwrap();
+        if sync_before_flush {
+            second.sync_metadata().unwrap();
+        }
+        second.request_eager_flush();
+        // The commit rejects the stale proposal. A fully retired batch may return
+        // Ok through the cursor-recovery path, so the assertions below check state.
+        let _ = second.flush_due_pending();
+        assert_eq!(
+            second.replication_backlog().pending_ops,
+            0,
+            "stale proposal must be retired (sync_before_flush={sync_before_flush})"
+        );
+        assert_eq!(
+            second.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::Retained
+        );
+        assert_eq!(second.lookup(receipt, b"data").unwrap().ino, payload.ino);
+
+        // The retired proposal stays retired across restart.
+        drop(second);
+        let second = reopen_pg_engine_with_retry(&second_path);
+        assert_eq!(second.replication_backlog().pending_ops, 0);
+        assert_eq!(
+            second.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::Retained
+        );
+        first.sync_metadata().unwrap();
+        assert_eq!(
+            first.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::Retained
+        );
+
+        // Not due under the raised period yet; due after 30 days, and that works.
+        second.sync_metadata().unwrap();
+        assert_eq!(
+            second.run_retained_lifecycle_once(expires_at).unwrap(),
+            Default::default()
+        );
+        let due = retained.deleted_at_unix_secs + 30 * 86_400;
+        assert_eq!(second.run_retained_lifecycle_once(due).unwrap().expired, 1);
+        second.request_eager_flush();
+        second.flush_due_pending().unwrap();
+        assert_eq!(second.replication_backlog().pending_ops, 0);
+        first.sync_metadata().unwrap();
+        assert_eq!(
+            first.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::PurgeRequested {
+                reason: RetainedPurgeReason::Expired {
+                    settings_revision: 2
+                }
+            }
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; a stale expiry abandoned in the revert window must not publish after a period ABA"]
+fn test_pg_retained_abandoned_expiry_never_publishes_after_restore_and_period_aba() {
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings, RetainedEntryState};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    // (restart, flush_before_restore). Restart replays the pending proposal, so a
+    // local restore is refused until a flush heals it; without restart, the
+    // restore runs inside the window between revert and retirement.
+    for (restart, flush_before_restore) in [(false, false), (false, true), (true, true)] {
+        let volume = PgTestVolume::new(&dsn, "retained-abandoned-expiry");
+        let dir = studiofs_test_support::workspace_target_tempdir("retained-abandoned-expiry-");
+        let second_path = dir.path().join("second");
+        seed_local(&dir.path().join("first"), &volume.format_info());
+        seed_local(&second_path, &volume.format_info());
+        let first = retained_test_engine(&dir.path().join("first"));
+        let judged = first
+            .compare_and_set_trash_days(0, 7)
+            .unwrap()
+            .unwrap()
+            .revision;
+        first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+        let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let receipt = first.next_inode().unwrap();
+        let retained = first
+            .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+            .unwrap();
+        publish_and_pull(&first);
+        let second = retained_test_engine(&second_path);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while second.retained_entry(receipt).unwrap().is_none() {
+            assert!(Instant::now() < deadline, "peer never observed the receipt");
+            publish_and_pull(&first);
+            second.sync_metadata().unwrap();
+        }
+
+        // Expiry judged at revision `judged` is queued.
+        let expires_at = retained.deleted_at_unix_secs + 7 * 86_400;
+        assert_eq!(
+            second
+                .run_retained_lifecycle_once(expires_at)
+                .unwrap()
+                .expired,
+            1
+        );
+        // Window: the overlay revert became durable, the retirement did not.
+        second
+            .local
+            .discard_stale_retained_expiry(receipt, judged)
+            .unwrap();
+        let second = if restart {
+            drop(second);
+            let reopened = reopen_pg_engine_with_retry(&second_path);
+            // Replay re-applies the still-pending proposal over the reverted overlay.
+            assert!(matches!(
+                reopened.retained_entry(receipt).unwrap().unwrap().state,
+                RetainedEntryState::PurgeRequested { .. }
+            ));
+            reopened
+        } else {
+            second
+        };
+
+        // ABA: 7 -> 30 -> 7. The period matches the judged one again; the revision does not.
+        let raised = first
+            .compare_and_set_trash_days(judged, 30)
+            .unwrap()
+            .unwrap();
+        let revision = first
+            .compare_and_set_trash_days(raised.revision, 7)
+            .unwrap()
+            .unwrap()
+            .revision;
+        assert_eq!(revision, 3);
+
+        if flush_before_restore {
+            // Split: the stale proposal is rejected, reverted and retired first.
+            second.request_eager_flush();
+            let _ = second.flush_due_pending();
+        }
+        second.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+        second
+            .restore_retained_entry(
+                receipt,
+                ROOT_INO,
+                b"restored",
+                b"stage",
+                &retained_test_source_fences(&second, receipt),
+            )
+            .unwrap();
+        // Combined: the stale proposal shares a batch with the restore and must not win.
+        for _ in 0..2 {
+            second.request_eager_flush();
+            let _ = second.flush_due_pending();
+        }
+        assert_eq!(
+            second.replication_backlog().pending_ops,
+            0,
+            "stale expiry must not keep the journal pending (restart={restart}, flush_before_restore={flush_before_restore})"
+        );
+        first.sync_metadata().unwrap();
+        let shared = first.retained_entry(receipt).unwrap().unwrap();
+        assert!(
+            matches!(shared.state, RetainedEntryState::Restored { .. }),
+            "the accepted restore must win over the abandoned expiry (restart={restart}, flush_before_restore={flush_before_restore}): {:?}",
+            shared.state
+        );
+        assert_eq!(
+            first.lookup(ROOT_INO, b"restored").unwrap().ino,
+            shared.inode
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; load-seeded authority must equal published authority"]
+fn test_pg_retained_seeded_authority_matches_publication() {
+    use crate::trash::{
+        MetaRetainedStore, MetaVolumeSettings, RETAINED_RECEIPT_XATTR, RetainedEntry,
+        RetainedEntryState, RetainedPurgeReason, VolumeSettings,
+    };
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-seed");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-seed-");
+    let path = dir.path().join("local");
+    seed_local(&path, &volume.format_info());
+    let engine = PgMetaEngine::open_with_options(
+        &path,
+        PgOpenOptions {
+            background_poll: false,
+            fresh_client: false,
+            pg_pool_size: 4,
+            defer_remote_startup_probes: false,
+        },
+    )
+    .unwrap();
+    engine.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let next_seq = || {
+        engine
+            .local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+            .unwrap()
+    };
+    let start = next_seq();
+    engine.create_dir(ROOT_INO, b"kept", 0, 0, 0o700).unwrap();
+    engine.create_dir(ROOT_INO, b"done", 0, 0, 0o700).unwrap();
+    let store = engine
+        .create_dir(ROOT_INO, b"private", 0, 0, 0o700)
+        .unwrap();
+    let kept = engine.next_inode().unwrap();
+    engine
+        .retain_namespace_entry(ROOT_INO, b"kept", store.ino, kept)
+        .unwrap();
+    let done = engine.next_inode().unwrap();
+    let admitted = engine
+        .retain_namespace_entry(ROOT_INO, b"done", store.ino, done)
+        .unwrap();
+    engine.create_dir(done, b"stage", 0, 0, 0o700).unwrap();
+    engine
+        .restore_retained_entry(
+            done,
+            ROOT_INO,
+            b"restored",
+            b"stage",
+            &retained_test_source_fences(&engine, done),
+        )
+        .unwrap();
+    let events = engine.local.read_events_range(start, u64::MAX).unwrap();
+    let head = engine.push_event_log_batch_locked(&events).unwrap();
+
+    let volume_id = volume.volume_id;
+    let projection = || {
+        run_async(with_pg_test_client(&dsn, |client| async move {
+            let rows = client
+                .query(
+                    "SELECT receipt, record FROM trash_entry_authority WHERE vol=$1 ORDER BY receipt",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok(rows
+                .iter()
+                .map(|row| (row.get::<_, i64>(0), row.get::<_, Vec<u8>>(1)))
+                .collect::<Vec<_>>())
+        }))
+        .unwrap()
+    };
+    let published = projection();
+    assert_eq!(published.len(), 2);
+    let log = run_async(with_pg_test_client(&dsn, |client| async move {
+        let rows = client
+            .query(
+                "SELECT batch_version, event_type, event_payload FROM event_log WHERE vol=$1 ORDER BY batch_version, seq_id",
+                &[&volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1), row.get::<_, Vec<u8>>(2)))
+            .collect::<Vec<_>>())
+    }))
+    .unwrap();
+    let reseed = |checkpoint: Vec<u8>, cut: i64, log: Vec<(i64, String, Vec<u8>)>| {
+        run_async(with_pg_test_client(&dsn, |mut client| async move {
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            tx.execute(
+                "DELETE FROM trash_entry_authority WHERE vol=$1",
+                &[&volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+            tx.execute(
+                "UPDATE metadata_state SET volume_settings=NULL WHERE vol=$1",
+                &[&volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+            let events = log
+                .iter()
+                .map(|(version, kind, payload)| (*version, kind.as_str(), payload.as_slice()))
+                .collect::<Vec<_>>();
+            super::retained::seed_retained_authority(&tx, volume_id, &checkpoint, cut, &events)
+                .await?;
+            tx.commit()
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))
+        }))
+    };
+    let shared_settings = || {
+        run_async(with_pg_test_client(&dsn, |client| async move {
+            let bytes: Option<Vec<u8>> = client
+                .query_one(
+                    "SELECT volume_settings FROM metadata_state WHERE vol=$1",
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?
+                .get(0);
+            Ok(bytes.map(|bytes| serde_json::from_slice::<VolumeSettings>(&bytes).unwrap()))
+        }))
+        .unwrap()
+    };
+    let settings = engine.volume_settings().unwrap();
+    assert_eq!(settings.trash.days(), 7);
+    assert_eq!(shared_settings(), Some(settings));
+    // Checkpoint at head (thin-checkpoint load) and pure log replay agree,
+    // for the receipt projection and for the trash-days CAS row.
+    let checkpoint = engine.local.export_serving_checkpoint_bytes().unwrap();
+    reseed(checkpoint, head, Vec::new()).unwrap();
+    assert_eq!(projection(), published);
+    assert_eq!(shared_settings(), Some(settings));
+    let empty_checkpoint = vec![0; 6];
+    reseed(empty_checkpoint.clone(), 0, log.clone()).unwrap();
+    assert_eq!(projection(), published);
+    assert_eq!(shared_settings(), Some(settings));
+    // A terminal record without its admission is rejected and rolls back.
+    let terminal_only = log
+        .iter()
+        .filter(|(_, _, payload)| {
+            matches!(
+                crate::events::decode_event(payload),
+                Ok(crate::MetaEvent::SetXattr { ino, name, value, .. })
+                    if ino == done && name == RETAINED_RECEIPT_XATTR
+                        && !value.windows(8).any(|w| w == b"Retained")
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_only.len(), 1);
+    assert!(reseed(empty_checkpoint, 0, terminal_only).is_err());
+    assert_eq!(projection(), published);
+
+    // The seeded projection fences publication exactly like the published one.
+    let purge = RetainedEntry {
+        state: RetainedEntryState::PurgeRequested {
+            reason: RetainedPurgeReason::User,
+        },
+        revision: 1,
+        ..admitted.clone()
+    };
+    let receipt_event = |entry: &RetainedEntry| crate::MetaEvent::SetXattr {
+        ino: done,
+        name: RETAINED_RECEIPT_XATTR.to_vec(),
+        value: serde_json::to_vec(entry).unwrap(),
+        flags: 0,
+    };
+    for conflicting in [receipt_event(&purge), receipt_event(&admitted)] {
+        assert!(
+            engine
+                .push_event_log_batch_locked(std::slice::from_ref(&conflicting))
+                .is_err(),
+            "{conflicting:?} must not publish over the seeded terminal record"
+        );
+        assert_eq!(engine.remote_metadata_head_version().unwrap(), head);
+    }
+    let before_restore = next_seq();
+    engine.create_dir(kept, b"stage", 0, 0, 0o700).unwrap();
+    engine
+        .restore_retained_entry(
+            kept,
+            ROOT_INO,
+            b"kept-back",
+            b"stage",
+            &retained_test_source_fences(&engine, kept),
+        )
+        .unwrap();
+    let restore = engine
+        .local
+        .read_events_range(before_restore, u64::MAX)
+        .unwrap();
+    assert!(engine.push_event_log_batch_locked(&restore).unwrap() > head);
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; real retained transition publication in both orders"]
+fn test_pg_retained_restore_purge_conflict_preserves_local_loser() {
+    use crate::trash::{
+        MetaRetainedStore, MetaVolumeSettings, RetainedEntryState, RetainedPurgeReason,
+    };
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    for purge_first in [true, false] {
+        let volume = PgTestVolume::new(&dsn, "retained-conflict");
+        let dir = studiofs_test_support::workspace_target_tempdir("retained-pg-");
+        let first_path = dir.path().join("first");
+        let second_path = dir.path().join("second");
+        seed_local(&first_path, &volume.format_info());
+        seed_local(&second_path, &volume.format_info());
+        let first = PgMetaEngine::open_with_options(
+            &first_path,
+            PgOpenOptions {
+                background_poll: false,
+                fresh_client: false,
+                pg_pool_size: 4,
+                defer_remote_startup_probes: false,
+            },
+        )
+        .unwrap();
+        first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let payload = first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+        let child = first
+            .create_dir(payload.ino, b"accepted-child", 0, 0, 0o700)
+            .unwrap();
+        let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let receipt = first.next_inode().unwrap();
+        first
+            .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+            .unwrap();
+        first.request_eager_flush();
+        first.flush_due_pending().unwrap();
+        first.sync_metadata().unwrap();
+        let second = PgMetaEngine::open_with_options(
+            &second_path,
+            PgOpenOptions {
+                background_poll: false,
+                fresh_client: false,
+                pg_pool_size: 4,
+                defer_remote_startup_probes: false,
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            first.request_eager_flush();
+            first.flush_due_pending().unwrap();
+            first.sync_metadata().unwrap();
+            second.sync_metadata().unwrap();
+            if second.retained_entry(receipt).unwrap().is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "peer never observed the retained receipt"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            second.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::Retained
+        ));
+        let first_seq = first
+            .local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+            .unwrap();
+        let second_seq = second
+            .local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+            .unwrap();
+        let staged = first.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+        let staged_child = first
+            .create_dir(staged.ino, b"accepted-child", 0, 0, 0o700)
+            .unwrap();
+        assert_ne!(staged.ino, payload.ino);
+        assert_ne!(staged_child.ino, child.ino);
+        first
+            .restore_retained_entry(
+                receipt,
+                ROOT_INO,
+                b"restored-offline",
+                b"stage",
+                &[
+                    first.get_attr(payload.ino).unwrap(),
+                    first.get_attr(child.ino).unwrap(),
+                ]
+                .map(|attr| crate::trash::RetainedSourceFence {
+                    ino: attr.ino,
+                    ctime: attr.ctime,
+                    size: attr.size,
+                    content_epoch: attr.content_epoch,
+                }),
+            )
+            .unwrap();
+        second
+            .request_retained_purge(receipt, RetainedPurgeReason::User)
+            .unwrap();
+        let accepted_restore = first.retained_entry(receipt).unwrap().unwrap();
+        let accepted_purge = second.retained_entry(receipt).unwrap().unwrap();
+        let restore_events = first.local.read_events_range(first_seq, u64::MAX).unwrap();
+        let purge_events = second
+            .local
+            .read_events_range(second_seq, u64::MAX)
+            .unwrap();
+        let winner_version = if purge_first {
+            let version = second.push_event_log_batch_locked(&purge_events).unwrap();
+            assert!(first.push_event_log_batch_locked(&restore_events).is_err());
+            version
+        } else {
+            let version = first.push_event_log_batch_locked(&restore_events).unwrap();
+            assert!(second.push_event_log_batch_locked(&purge_events).is_err());
+            version
+        };
+        let volume_id = volume.volume_id;
+        let (record, version) = run_async(with_pg_test_client(&dsn, |client| async move {
+            let row = client.query_one("SELECT a.record,ms.version FROM trash_entry_authority a JOIN metadata_state ms USING(vol) WHERE a.vol=$1 AND a.receipt=$2", &[&volume_id, &(receipt as i64)]).await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok((row.get::<_, Vec<u8>>(0), row.get::<_, i64>(1)))
+        })).unwrap();
+        assert_eq!(
+            version, winner_version,
+            "rejected transition must roll back the version bump and event inserts"
+        );
+        let record = RedbMetaEngine::decode_retained_entry(receipt, &record).unwrap();
+        assert_eq!(
+            matches!(record.state, RetainedEntryState::PurgeRequested { .. }),
+            purge_first
+        );
+        assert_eq!(
+            first.lookup(ROOT_INO, b"restored-offline").unwrap().ino,
+            payload.ino
+        );
+        assert_eq!(
+            first.lookup(payload.ino, b"accepted-child").unwrap().ino,
+            child.ino
+        );
+        assert_eq!(
+            first.local.read_events_range(first_seq, u64::MAX).unwrap(),
+            restore_events
+        );
+        // A local or published purge request still owns its physical data link.
+        assert_eq!(second.lookup(receipt, b"data").unwrap().ino, payload.ino);
+        if purge_first {
+            second.sync_metadata().unwrap();
+            assert_eq!(
+                second
+                    .mutate(|local| local.settle_retained_purge(receipt, |_| false))
+                    .unwrap(),
+                crate::redb_engine::RetainedSettlement::Settled
+            );
+            second.request_eager_flush();
+            second.flush_due_pending().unwrap();
+            assert!(second.get_attr(payload.ino).is_err());
+            assert!(second.get_attr(child.ino).is_err());
+        }
+        let purge_events = second
+            .local
+            .read_events_range(second_seq, u64::MAX)
+            .unwrap();
+        // Pull the winner over the accepted local transition before reopening.
+        // A rejected publication must not let foreign replay erase local recovery.
+        first.sync_metadata().unwrap();
+        second.sync_metadata().unwrap();
+        assert_eq!(
+            first.retained_entry(receipt).unwrap(),
+            Some(accepted_restore.clone())
+        );
+        assert_eq!(
+            second.retained_entry(receipt).unwrap(),
+            Some(accepted_purge.clone())
+        );
+        assert_eq!(
+            first.lookup(ROOT_INO, b"restored-offline").unwrap().ino,
+            payload.ino
+        );
+        assert_eq!(
+            first.local.read_events_range(first_seq, u64::MAX).unwrap(),
+            restore_events
+        );
+        // Restart with the accepted reconstruction still unpublished, after
+        // actual foreign RemoveAttr/RemoveEntry settlement has been applied.
+        drop(first);
+        let first = PgMetaEngine::open_with_options(
+            &first_path,
+            PgOpenOptions {
+                background_poll: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first.lookup(ROOT_INO, b"restored-offline").unwrap().ino,
+            payload.ino
+        );
+        assert_eq!(
+            first.lookup(payload.ino, b"accepted-child").unwrap().ino,
+            child.ino
+        );
+        // Only the losing terminal receipt record is dropped from publication;
+        // the rest of the accepted local journal must not stay blocked behind it.
+        let loser = if purge_first { &first } else { &second };
+        loser.request_eager_flush();
+        // A losing restore has a namespace remainder, so its first attempt reports
+        // the conflict; a losing purge is the whole batch and retires cleanly.
+        assert_eq!(
+            loser.flush_due_pending().is_err(),
+            purge_first,
+            "only a loser with a publishable remainder reports the conflict"
+        );
+        loser.request_eager_flush();
+        loser.flush_due_pending().unwrap();
+        second.sync_metadata().unwrap();
+        assert_eq!(
+            second.lookup(ROOT_INO, b"restored-offline").unwrap().ino,
+            payload.ino,
+            "the accepted restore namespace change is republished in both orders"
+        );
+        let shared = run_async(with_pg_test_client(&dsn, |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT record FROM trash_entry_authority WHERE vol=$1 AND receipt=$2",
+                    &[&volume_id, &(receipt as i64)],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok(row.get::<_, Vec<u8>>(0))
+        }))
+        .unwrap();
+        assert_eq!(
+            RedbMetaEngine::decode_retained_entry(receipt, &shared).unwrap(),
+            record,
+            "shared receipt authority is never overwritten by the loser"
+        );
+        // A losing terminal record is final: after reopen nothing republishes
+        // the accepted journal, and the durable cursor passes the loser.
+        let shared_log_position = || {
+            run_async(with_pg_test_client(&dsn, |client| async move {
+                let row = client
+                    .query_one(
+                        "SELECT (SELECT version FROM metadata_state WHERE vol=$1), (SELECT count(*) FROM event_log WHERE vol=$1)",
+                        &[&volume_id],
+                    )
+                    .await
+                    .map_err(|error| MetaError::Storage(error.to_string()))?;
+                Ok((row.get::<_, i64>(0), row.get::<_, i64>(1)))
+            }))
+            .unwrap()
+        };
+        let position_before_reopen = shared_log_position();
+        drop(first);
+        drop(second);
+        let reopened = PgMetaEngine::open_with_options(
+            &first_path,
+            PgOpenOptions {
+                background_poll: false,
+                fresh_client: false,
+                pg_pool_size: 4,
+                defer_remote_startup_probes: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.lookup(ROOT_INO, b"restored-offline").unwrap().ino,
+            payload.ino
+        );
+        assert_eq!(
+            reopened.lookup(payload.ino, b"accepted-child").unwrap().ino,
+            child.ino
+        );
+        assert_eq!(
+            reopened.retained_entry(receipt).unwrap(),
+            Some(accepted_restore)
+        );
+        assert_eq!(
+            reopened
+                .local
+                .read_events_range(first_seq, u64::MAX)
+                .unwrap(),
+            restore_events
+        );
+        let reopened_purge = PgMetaEngine::open_with_options(
+            &second_path,
+            PgOpenOptions {
+                background_poll: false,
+                fresh_client: false,
+                pg_pool_size: 4,
+                defer_remote_startup_probes: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reopened_purge.retained_entry(receipt).unwrap(),
+            Some(accepted_purge)
+        );
+        // In both orders the accepted restore's namespace move is published, so
+        // the receipt keeps no data link and nothing is lost to the purge.
+        assert_eq!(
+            reopened_purge
+                .lookup(ROOT_INO, b"restored-offline")
+                .unwrap()
+                .ino,
+            payload.ino
+        );
+        assert!(reopened_purge.lookup(receipt, b"data").is_err());
+        assert_eq!(
+            reopened_purge
+                .local
+                .read_events_range(second_seq, u64::MAX)
+                .unwrap(),
+            purge_events
+        );
+        for engine in [&reopened, &reopened_purge] {
+            for _ in 0..2 {
+                engine.request_eager_flush();
+                engine.flush_due_pending().unwrap();
+                engine.sync_metadata().unwrap();
+            }
+        }
+        assert_eq!(
+            shared_log_position(),
+            position_before_reopen,
+            "a retired loser must not republish its already-published journal"
+        );
+        for engine in [&reopened, &reopened_purge] {
+            let next_seq = engine
+                .local
+                .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+                .unwrap();
+            assert_eq!(engine.flushed_event_seq.load(Ordering::SeqCst), next_seq);
+            engine.prune_local_event_log_once().unwrap();
+            assert_eq!(engine.local.first_event_seq().unwrap(), None);
+        }
+
+        // A client bootstrapped from the LOSER's serving checkpoint (whose
+        // overlay still holds its retired record) must hold the winner in base.
+        let (head, _) = position_before_reopen;
+        let loser = if purge_first {
+            &reopened
+        } else {
+            &reopened_purge
+        };
+        let checkpoint = loser.local.export_serving_checkpoint_bytes().unwrap();
+        let cold_path = dir.path().join("cold");
+        let cold_seed = RedbMetaEngine::open(&cold_path).unwrap();
+        cold_seed
+            .initialize_discovered_postgres_checkpoint(&volume.format_info(), &checkpoint, head)
+            .unwrap();
+        drop(cold_seed);
+        let cold = PgMetaEngine::open_with_options(
+            &cold_path,
+            PgOpenOptions {
+                background_poll: false,
+                fresh_client: false,
+                pg_pool_size: 4,
+                defer_remote_startup_probes: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cold.retained_entry(receipt).unwrap(),
+            Some(record.clone()),
+            "a checkpoint-bootstrapped client must hold the shared winner, never the loser"
+        );
+        assert_eq!(
+            cold.lookup(ROOT_INO, b"restored-offline").unwrap().ino,
+            payload.ino
+        );
+        // Discovery leaves the fresh-client gate set; the background poll would
+        // complete it (client slot + allocator) once the target is reached.
+        cold.sync_metadata().unwrap();
+        cold.try_complete_catchup_sync().unwrap();
+        assert!(cold.pg_sync_status().allows_new_mutations());
+        // Its own later publication self-acks normally: exactly one new batch,
+        // no receipt record republished, and the winner stays everywhere.
+        let cold_seq = cold
+            .local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+            .unwrap();
+        cold.create_dir(ROOT_INO, b"after-bootstrap", 0, 0, 0o700)
+            .unwrap();
+        for _ in 0..2 {
+            cold.request_eager_flush();
+            cold.flush_due_pending().unwrap();
+            cold.sync_metadata().unwrap();
+        }
+        assert_eq!(
+            cold.flushed_event_seq.load(Ordering::SeqCst),
+            cold.local
+                .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+                .unwrap()
+        );
+        assert!(cold_seq < cold.flushed_event_seq.load(Ordering::SeqCst));
+        let receipt_rows_after = run_async(with_pg_test_client(&dsn, |client| async move {
+            let rows = client
+                .query(
+                    "SELECT batch_version, event_type, event_payload FROM event_log WHERE vol=$1 AND batch_version>$2",
+                    &[&volume_id, &head],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok(rows
+                .iter()
+                .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1), row.get::<_, Vec<u8>>(2)))
+                .collect::<Vec<_>>())
+        }))
+        .unwrap();
+        assert!(
+            receipt_rows_after
+                .iter()
+                .all(|(version, _, _)| *version == head + 1),
+            "only the cold client's own batch is published after the cut"
+        );
+        assert!(
+            receipt_rows_after
+                .iter()
+                .all(|(_, kind, payload)| !matches!(
+                    crate::events::decode_event_with_type(kind, payload),
+                    Ok(crate::MetaEvent::SetXattr { name, .. })
+                        if name == crate::trash::RETAINED_RECEIPT_XATTR
+                )),
+            "no receipt record is republished after bootstrap"
+        );
+        assert_eq!(shared_log_position().0, head + 1);
+        assert_eq!(cold.retained_entry(receipt).unwrap(), Some(record.clone()));
+        let shared = run_async(with_pg_test_client(&dsn, |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT record FROM trash_entry_authority WHERE vol=$1 AND receipt=$2",
+                    &[&volume_id, &(receipt as i64)],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))?;
+            Ok(row.get::<_, Vec<u8>>(0))
+        }))
+        .unwrap();
+        assert_eq!(
+            RedbMetaEngine::decode_retained_entry(receipt, &shared).unwrap(),
+            record
+        );
+        // The loser replays the cold batch and still never republishes.
+        loser.sync_metadata().unwrap();
+        loser.request_eager_flush();
+        loser.flush_due_pending().unwrap();
+        assert_eq!(shared_log_position().0, head + 1);
+        assert!(loser.lookup(ROOT_INO, b"after-bootstrap").is_ok());
+        // Acknowledged restore has no permanent immunity from later peer deletion.
+        reopened_purge
+            .rmdir(payload.ino, b"accepted-child")
+            .unwrap();
+        reopened_purge.rmdir(ROOT_INO, b"restored-offline").unwrap();
+        reopened_purge.request_eager_flush();
+        reopened_purge.flush_due_pending().unwrap();
+        reopened.sync_metadata().unwrap();
+        assert!(reopened.lookup(ROOT_INO, b"restored-offline").is_err());
+        assert!(reopened.get_attr(payload.ino).is_err());
+    }
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn test_format6_upgrade_fences_old_publication_and_deletion_claims() {
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "format6-upgrade");
+    let mut legacy = volume.format_info();
+    legacy.format_version = 5;
+    let bytes = serde_json::to_vec(&legacy).unwrap();
+    let volume_id = volume.volume_id;
+    let volume_uuid = volume.uuid.clone();
+    let lock_dsn = dsn.clone();
+    run_async(with_pg_test_client(&dsn, |mut client| async move {
+        client.execute("UPDATE metadata_state SET metadata_format_version=5, format_info=$2 WHERE vol=$1", &[&volume_id, &bytes]).await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let (locker, connection) = crate::connect_studiofs_postgres(&lock_dsn).await?;
+        let connection_task = tokio::spawn(async move { let _ = connection.await; });
+        let janitor_key = super::super::janitor::pg_janitor_lock_key(volume_id);
+        locker.query_one("SELECT pg_advisory_lock($1)", &[&janitor_key]).await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        assert!(super::super::format_upgrade::upgrade_shared_format5(&mut client, volume_id, &volume_uuid).await.is_err());
+        locker.query_one("SELECT pg_advisory_unlock($1)", &[&janitor_key]).await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        drop(locker);
+        connection_task.abort();
+        let _ = connection_task.await;
+        // A claim made by old code before the transition must block it, even
+        // when its lease expired; an S3 request may still be in flight.
+        client.execute("INSERT INTO snapshot_payload_upload_objects(vol,object_id,state,reconcile_owner,reconcile_lease_expires_at,reconcile_fence) VALUES($1,7001,'delete_pending','old-owner',now()-interval '1 hour',1)", &[&volume_id]).await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        assert!(super::super::format_upgrade::upgrade_shared_format5(&mut client, volume_id, &volume_uuid).await.is_err());
+        let row = client.query_one("SELECT metadata_format_version FROM metadata_state WHERE vol=$1", &[&volume_id]).await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        assert_eq!(row.get::<_, i16>(0), 5);
+        client.execute("UPDATE snapshot_payload_upload_objects SET reconcile_owner=NULL WHERE vol=$1", &[&volume_id]).await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        super::super::format_upgrade::upgrade_shared_format5(&mut client, volume_id, &volume_uuid).await?;
+        super::super::format_upgrade::upgrade_shared_format5(&mut client, volume_id, &volume_uuid).await?;
+        assert!(client.query_opt(sql::BUMP_METADATA_VERSION, &[&volume_id, &5_i16, &0_i64]).await
+            .map_err(|error| MetaError::Storage(error.to_string()))?.is_none());
+        assert!(client.execute("UPDATE snapshot_payload_upload_objects SET reconcile_owner='old-owner',reconcile_fence=2 WHERE vol=$1 AND object_id=7001", &[&volume_id]).await.is_err());
+        let tx = client.transaction().await.map_err(|error| MetaError::Storage(error.to_string()))?;
+        tx.query_one(super::super::janitor::CLAIM_PUBLICATION_FENCE_SQL, &[&volume_id]).await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        assert_eq!(tx.execute("UPDATE snapshot_payload_upload_objects SET reconcile_owner='new-owner',reconcile_fence=2 WHERE vol=$1 AND object_id=7001", &[&volume_id]).await
+            .map_err(|error| MetaError::Storage(error.to_string()))?, 1);
+        tx.rollback().await.map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok(())
+    })).unwrap();
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn test_pg_volume_settings_authoritative_cas_converges_two_clients() {
+    use crate::trash::MetaVolumeSettings;
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required; no silent skip");
+    let dir = studiofs_test_support::workspace_target_tempdir("pg-trash-settings-");
+    let volume = PgTestVolume::new(&dsn, "pg-trash-settings");
+    let first_path = dir.path().join("first.redb");
+    let second_path = dir.path().join("second.redb");
+    seed_local(&first_path, &volume.format_info());
+    seed_local(&second_path, &volume.format_info());
+    let first = PgMetaEngine::open(&first_path).unwrap();
+    let second = PgMetaEngine::open(&second_path).unwrap();
+    // Client two reaches PG first despite both callers observing revision zero.
+    let winner = second.compare_and_set_trash_days(0, 30).unwrap().unwrap();
+    assert!(first.compare_and_set_trash_days(0, 7).unwrap().is_none());
+    let disabled = first
+        .compare_and_set_trash_days(winner.revision, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(disabled.trash.existing_entry_days(), 30);
+    let (payloads, revisions) = run_async(with_pg_test_client(&dsn, |client| async move {
+        let rows = client.query(
+            "SELECT event_payload, batch_version FROM event_log WHERE vol=$1 AND event_type='set_volume_settings' ORDER BY batch_version",
+            &[&volume.volume_id],
+        ).await.map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok((rows.iter().map(|row| row.get::<_, Vec<u8>>(0)).collect::<Vec<_>>(),
+            rows.iter().map(|row| row.get::<_, i64>(1)).collect::<Vec<_>>()))
+    })).unwrap();
+    assert_eq!(payloads.len(), 2);
+    assert!(revisions[0] < revisions[1]);
+    let events = payloads
+        .iter()
+        .map(|bytes| crate::events::decode_event(bytes).unwrap())
+        .collect::<Vec<_>>();
+    second.sync_metadata().unwrap();
+    first.sync_metadata().unwrap();
+    assert_eq!(second.volume_settings().unwrap(), disabled);
+    assert_eq!(first.volume_settings().unwrap(), disabled);
+    first.write_checkpoint_with_lease().unwrap();
+    let third_path = dir.path().join("third.redb");
+    seed_local(&third_path, &volume.format_info());
+    let third = PgMetaEngine::open(&third_path).unwrap();
+    third.sync_metadata().unwrap();
+    assert_eq!(third.volume_settings().unwrap(), disabled);
+    assert!(
+        first.push_event_log_batch_locked(&events).is_err(),
+        "local journal cannot bypass global CAS"
+    );
+}
 use crate::engine::{
     CheckpointDescriptorFailure, MetaAcl, MetaError, MetadataCheckpointRefreshReason,
     PgSyncFailure, PgSyncPageDiagnostics,
@@ -7332,4 +9060,2918 @@ fn command_pool_discards_client_after_application_error() {
         1,
         "the next command should reconnect after the failed client is discarded"
     );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; restore must not republish ancestor authority"]
+fn retained_restore_does_not_republish_ancestor_authority() {
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "restore-ancestor-authority");
+    let dir = studiofs_test_support::workspace_target_tempdir("restore-ancestor-");
+    let a_path = dir.path().join("a");
+    let b_path = dir.path().join("b");
+    seed_local(&a_path, &volume.format_info());
+    seed_local(&b_path, &volume.format_info());
+    let a = retained_test_engine(&a_path);
+    a.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let ancestor = a.create_dir(ROOT_INO, b"ancestor", 0, 0, 0o755).unwrap();
+    let dest = a.create_dir(ancestor.ino, b"dest", 0, 0, 0o755).unwrap();
+    let source = a.create_dir(dest.ino, b"source", 0, 0, 0o755).unwrap();
+    a.set_acl_rule(ancestor.ino, "alice", AccessLevel::ReadWrite)
+        .unwrap();
+    a.set_acl_rule(source.ino, "alice", AccessLevel::ReadOnly)
+        .unwrap();
+    let private = a.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = a.next_inode().unwrap();
+    a.retain_namespace_entry(dest.ino, b"source", private.ino, receipt)
+        .unwrap();
+    publish_and_pull(&a);
+    let b = retained_test_engine(&b_path);
+    b.sync_metadata().unwrap();
+    a.create_dir(receipt, b"stage", 0, 0, 0o755).unwrap();
+    a.restore_retained_entry(
+        receipt,
+        dest.ino,
+        b"restored",
+        b"stage",
+        &retained_test_source_fences(&a, receipt),
+    )
+    .unwrap();
+    b.set_acl_rule(ancestor.ino, "alice", AccessLevel::ReadOnly)
+        .unwrap();
+    let mut changed = b.get_attr(ancestor.ino).unwrap();
+    changed.mode = 0o500;
+    b.set_attr(&changed).unwrap();
+    b.rename(ROOT_INO, b"ancestor", ROOT_INO, b"moved").unwrap();
+    publish_and_pull(&b);
+    a.sync_metadata().unwrap();
+    assert_eq!(
+        a.get_acl_rule(ancestor.ino, "alice").unwrap(),
+        Some(AccessLevel::ReadOnly)
+    );
+    assert_eq!(a.get_attr(ancestor.ino).unwrap().mode, 0o500);
+    assert!(a.lookup(ROOT_INO, b"ancestor").is_err());
+    publish_and_pull(&a);
+    b.sync_metadata().unwrap();
+    assert!(b.lookup(ROOT_INO, b"ancestor").is_err());
+    assert_eq!(b.lookup(ROOT_INO, b"moved").unwrap().ino, ancestor.ino);
+    assert_eq!(
+        b.get_acl_rule(ancestor.ino, "alice").unwrap(),
+        Some(AccessLevel::ReadOnly)
+    );
+    assert_eq!(b.get_attr(ancestor.ino).unwrap().mode, 0o500);
+    assert_eq!(b.lookup(dest.ino, b"restored").unwrap().ino, source.ino);
+    assert_eq!(
+        b.get_acl_rule(source.ino, "alice").unwrap(),
+        Some(AccessLevel::ReadOnly)
+    );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; rename and restore must not clobber concurrent parent attrs or ACLs"]
+fn rename_and_restore_do_not_republish_stale_parent_attrs_or_acl() {
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "rename-restore-parent-acl");
+    let dir = studiofs_test_support::workspace_target_tempdir("rename-parent-acl-");
+    let a_path = dir.path().join("a");
+    let b_path = dir.path().join("b");
+    seed_local(&a_path, &volume.format_info());
+    seed_local(&b_path, &volume.format_info());
+    let a = retained_test_engine(&a_path);
+    a.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let src_dir = a.create_dir(ROOT_INO, b"src_dir", 0, 0, 0o755).unwrap();
+    let moved_dir = a
+        .create_dir(src_dir.ino, b"moved_dir", 0, 0, 0o755)
+        .unwrap();
+    let dest = a.create_dir(ROOT_INO, b"dest", 0, 0, 0o755).unwrap();
+    let source = a.create_dir(dest.ino, b"source", 0, 0, 0o755).unwrap();
+    a.set_acl_rule(src_dir.ino, "alice", AccessLevel::ReadWrite)
+        .unwrap();
+    a.set_acl_rule(dest.ino, "alice", AccessLevel::ReadWrite)
+        .unwrap();
+    let private = a.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = a.next_inode().unwrap();
+    a.retain_namespace_entry(dest.ino, b"source", private.ino, receipt)
+        .unwrap();
+    publish_and_pull(&a);
+    let b = retained_test_engine(&b_path);
+    b.sync_metadata().unwrap();
+
+    // Peer A performs an ordinary cross-parent directory rename AND a retained directory restore locally.
+    a.rename(src_dir.ino, b"moved_dir", dest.ino, b"moved_dir")
+        .unwrap();
+    a.create_dir(receipt, b"stage", 0, 0, 0o755).unwrap();
+    a.restore_retained_entry(
+        receipt,
+        dest.ino,
+        b"restored",
+        b"stage",
+        &retained_test_source_fences(&a, receipt),
+    )
+    .unwrap();
+
+    // Concurrently Peer B updates ACL rules and attrs (mode/uid/gid/win_attrs) on both parents and publishes.
+    for parent_ino in [src_dir.ino, dest.ino] {
+        b.set_acl_rule(parent_ino, "alice", AccessLevel::ReadOnly)
+            .unwrap();
+        let mut attr = b.get_attr(parent_ino).unwrap();
+        attr.mode = 0o500;
+        attr.uid = 2001;
+        attr.gid = 2002;
+        attr.win_attrs = 4;
+        b.set_attr(&attr).unwrap();
+    }
+    publish_and_pull(&b);
+
+    // Peer A pulls B's authority changes while holding its pending rename + restore.
+    a.sync_metadata().unwrap();
+    for (label, ino, expected_nlink) in [
+        ("src_dir (after A sync)", src_dir.ino, 2),
+        ("dest (after A sync)", dest.ino, 4),
+    ] {
+        assert_eq!(
+            a.get_acl_rule(ino, "alice").unwrap(),
+            Some(AccessLevel::ReadOnly),
+            "{label} must preserve concurrent ACL rule"
+        );
+        let attr = a.get_attr(ino).unwrap();
+        assert_eq!(attr.mode, 0o500, "{label} mode");
+        assert_eq!(attr.uid, 2001, "{label} uid");
+        assert_eq!(attr.gid, 2002, "{label} gid");
+        assert_eq!(attr.win_attrs, 4, "{label} win_attrs");
+        assert_eq!(attr.nlink, expected_nlink, "{label} nlink");
+    }
+
+    // Peer A publishes its rename + restore and both peers converge.
+    publish_and_pull(&a);
+    b.sync_metadata().unwrap();
+    for (peer_name, engine) in [("a", &a), ("b", &b)] {
+        for (parent_name, ino, expected_nlink) in
+            [("src_dir", src_dir.ino, 2), ("dest", dest.ino, 4)]
+        {
+            assert_eq!(
+                engine.get_acl_rule(ino, "alice").unwrap(),
+                Some(AccessLevel::ReadOnly),
+                "{peer_name}/{parent_name} must preserve ACL rule after publish"
+            );
+            let attr = engine.get_attr(ino).unwrap();
+            assert_eq!(attr.mode, 0o500, "{peer_name}/{parent_name} mode");
+            assert_eq!(attr.uid, 2001, "{peer_name}/{parent_name} uid");
+            assert_eq!(attr.gid, 2002, "{peer_name}/{parent_name} gid");
+            assert_eq!(attr.win_attrs, 4, "{peer_name}/{parent_name} win_attrs");
+            assert_eq!(
+                attr.nlink, expected_nlink,
+                "{peer_name}/{parent_name} nlink"
+            );
+        }
+        assert_eq!(
+            engine.lookup(dest.ino, b"moved_dir").unwrap().ino,
+            moved_dir.ino
+        );
+        assert_eq!(
+            engine.lookup(dest.ino, b"restored").unwrap().ino,
+            source.ino
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; competing restores must not create directory aliases"]
+fn retained_competing_restores_keep_only_winner_destination_after_restart() {
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-two-restores");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-two-restores-");
+    let a_path = dir.path().join("a");
+    let b_path = dir.path().join("b");
+    seed_local(&a_path, &volume.format_info());
+    seed_local(&b_path, &volume.format_info());
+    let a = retained_test_engine(&a_path);
+    a.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let source = a.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+    let child = a.create_dir(source.ino, b"child", 0, 0, 0o700).unwrap();
+    let file = a.create_file(source.ino, b"file", 0, 0, 0o600).unwrap();
+    let mut ready = file.clone();
+    ready.content_epoch = 1;
+    a.set_attr(&ready).unwrap();
+    assert!(
+        a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap()
+    );
+    a.link(file.ino, ROOT_INO, b"outside").unwrap();
+    let winner_parent = a
+        .create_dir(ROOT_INO, b"winner-parent", 0, 0, 0o700)
+        .unwrap();
+    let loser_parent = a
+        .create_dir(ROOT_INO, b"loser-parent", 0, 0, 0o700)
+        .unwrap();
+    let store = a.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = a.next_inode().unwrap();
+    a.retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    publish_and_pull(&a);
+    let b = retained_test_engine(&b_path);
+    b.sync_metadata().unwrap();
+    for (engine, parent, name) in [
+        (&a, winner_parent.ino, b"winner".as_slice()),
+        (&b, loser_parent.ino, b"loser".as_slice()),
+    ] {
+        let stage = engine.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+        engine.create_dir(stage.ino, b"child", 0, 0, 0o700).unwrap();
+        engine.create_file(stage.ino, b"file", 0, 0, 0o600).unwrap();
+        let restored = engine
+            .restore_retained_entry(
+                receipt,
+                parent,
+                name,
+                b"stage",
+                &retained_test_source_fences(engine, receipt),
+            )
+            .unwrap();
+        for (ino, epoch) in restored.upload_epochs {
+            assert!(
+                engine
+                    .publish_regular_file_overlay_to_base_if_matches(ino, epoch)
+                    .unwrap()
+            );
+        }
+    }
+    // A real hardlink accepted after the restore transaction must remain publishable.
+    b.link(file.ino, ROOT_INO, b"later-link").unwrap();
+    assert_eq!(b.get_attr(file.ino).unwrap().nlink, 3, "accepted link");
+    publish_and_pull(&a);
+    b.request_eager_flush();
+    assert!(b.flush_due_pending().is_err());
+    b.sync_metadata().unwrap();
+    assert_eq!(
+        b.get_attr(file.ino).unwrap().nlink,
+        3,
+        "after winner foreign apply"
+    );
+    drop(b);
+    let b = reopen_pg_engine_with_retry(&b_path);
+    assert_eq!(b.get_attr(file.ino).unwrap().nlink, 3, "after reopen");
+    publish_and_pull(&b);
+    assert_eq!(
+        b.get_attr(file.ino).unwrap().nlink,
+        3,
+        "after self publication"
+    );
+    assert_eq!(
+        b.replication_backlog().pending_ops,
+        0,
+        "loser remainder completely published"
+    );
+    a.sync_metadata().unwrap();
+    for engine in [&a, &b] {
+        assert!(
+            engine.lookup(loser_parent.ino, b"loser").is_err(),
+            "losing restore left a directory alias"
+        );
+        assert_eq!(
+            engine.lookup(winner_parent.ino, b"winner").unwrap().ino,
+            source.ino
+        );
+        assert_eq!(engine.lookup(source.ino, b"child").unwrap().ino, child.ino);
+        assert_eq!(
+            engine.get_attr(source.ino).unwrap().parent,
+            winner_parent.ino
+        );
+        assert_eq!(engine.lookup(ROOT_INO, b"outside").unwrap().ino, file.ino);
+        assert_eq!(
+            engine.lookup(ROOT_INO, b"later-link").unwrap().ino,
+            file.ino
+        );
+        assert_eq!(
+            engine.get_attr(file.ino).unwrap().nlink,
+            3,
+            "converged peer hardlink count"
+        );
+        assert_eq!(engine.get_attr(loser_parent.ino).unwrap().nlink, 2);
+    }
+    assert_eq!(b.replication_backlog().pending_ops, 0);
+}
+
+fn stage_exact_small_payload(engine: &PgMetaEngine, ino: Ino, object_id: u64, size: u32) {
+    use crate::schema::{ChunkId, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord};
+    set_file_state(engine, ino, u64::from(size), 1);
+    let mut slice = SliceRecord::new(
+        SliceId(0),
+        SliceOrder(0),
+        SliceRange::new(0, size).expect("slice range"),
+        PayloadRef::new_partial(object_id, size),
+    );
+    slice.payload_state = PayloadRefState::LocalOnly;
+    engine
+        .flush_regular_file_overlay_slices(ino, &[(ChunkId(0), vec![slice])])
+        .expect("stage exact payload slice");
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; split restore batches must self-ack across pages and restart"]
+fn retained_restore_split_batches_self_ack_and_restart_convergence() {
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings};
+    use std::sync::atomic::AtomicUsize;
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let _byte_limit = set_test_env(PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR, "640");
+    let volume = PgTestVolume::new(&dsn, "retained-split-restart");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-split-restart-");
+    let a_path = dir.path().join("a");
+    let b_path = dir.path().join("b");
+    seed_local(&a_path, &volume.format_info());
+    seed_local(&b_path, &volume.format_info());
+
+    let a = retained_test_engine(&a_path);
+    a.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let dest = a.create_dir(ROOT_INO, b"dest", 0, 0, 0o755).unwrap();
+    let source = a.create_dir(ROOT_INO, b"source", 0, 0, 0o755).unwrap();
+    let child = a.create_dir(source.ino, b"child", 0, 0, 0o755).unwrap();
+    let file = create_published_small_file(&a, source.ino, b"file", 91_001);
+    a.link(file.ino, ROOT_INO, b"outside").unwrap();
+    let store = a.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = a.next_inode().unwrap();
+    a.retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    publish_and_pull(&a);
+
+    let b = retained_test_engine(&b_path);
+    sync_all_pages(&b);
+    let version_before_restore = a.local_version.load(Ordering::SeqCst);
+
+    let stage = a.create_dir(receipt, b"stage", 0, 0, 0o755).unwrap();
+    let stage_child = a.create_dir(stage.ino, b"child", 0, 0, 0o755).unwrap();
+    let stage_file = a.create_file(stage.ino, b"file", 0, 0, 0o644).unwrap();
+    stage_exact_small_payload(&a, stage_file.ino, 92_001, 64);
+    let _ = stage_child;
+    let restored = a
+        .restore_retained_entry(
+            receipt,
+            dest.ino,
+            b"restored",
+            b"stage",
+            &retained_test_source_fences(&a, receipt),
+        )
+        .unwrap();
+    assert_eq!(restored.upload_epochs.len(), 1);
+    let (&restored_file_ino, &restored_epoch) = restored.upload_epochs.iter().next().unwrap();
+    assert_eq!(restored_file_ino, file.ino);
+    mark_overlay_objects_uploaded(&a, file.ino, restored_epoch, &[92_001]);
+    assert!(
+        a.publish_regular_file_overlay_to_base_if_matches(file.ino, restored_epoch)
+            .unwrap()
+    );
+    a.link(file.ino, ROOT_INO, b"later-link").unwrap();
+    let after_dir = a.create_dir(dest.ino, b"after-dir", 0, 0, 0o755).unwrap();
+    a.set_acl_rule(dest.ino, "alice", AccessLevel::ReadWrite)
+        .unwrap();
+    a.set_acl_rule(source.ino, "bob", AccessLevel::ReadOnly)
+        .unwrap();
+
+    // Inject a crash on A right after the first replay page commits during flush catch-up.
+    let committed_pages = Arc::new(AtomicUsize::new(0));
+    a.set_catch_up_fault_hook(Arc::new({
+        let committed_pages = Arc::clone(&committed_pages);
+        move |point| match point {
+            CatchUpFaultPoint::AfterLocalCommit { .. } => {
+                committed_pages.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            CatchUpFaultPoint::BeforePageFetch { .. }
+                if committed_pages.load(Ordering::SeqCst) >= 1 =>
+            {
+                Err(MetaError::Storage("injected mid-split crash".to_string()))
+            }
+            _ => Ok(()),
+        }
+    }));
+
+    a.request_eager_flush();
+    a.flush_due_pending()
+        .expect("push split batches and commit page 1");
+    assert_eq!(committed_pages.load(Ordering::SeqCst), 1);
+    let err = a
+        .sync_metadata()
+        .expect_err("mid-split catch-up should fail at injected page 2 fetch");
+    assert!(err.to_string().contains("injected mid-split crash"));
+
+    let batch_count_after_push = run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT COUNT(DISTINCT batch_version)::BIGINT FROM event_log WHERE vol = $1 AND batch_version > $2",
+                    &[&volume_id, &version_before_restore],
+                )
+                .await
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Ok::<i64, MetaError>(row.get(0))
+        }
+    }))
+    .unwrap();
+    assert!(
+        batch_count_after_push >= 3,
+        "small byte limit must split restore publication into multiple PG batches, got {batch_count_after_push}"
+    );
+
+    // Simulate process restart between page 1 and remaining pages of self-batches.
+    drop(a);
+    let a = retained_test_engine(&a_path);
+    sync_all_pages(&a);
+    let a_head = a.local_version.load(Ordering::SeqCst);
+    assert_eq!(
+        a.replication_backlog().pending_ops,
+        0,
+        "restarted peer must finish self-ack across split batches without re-flushing"
+    );
+    assert_eq!(
+        a.flushed_event_seq.load(Ordering::SeqCst),
+        a.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+        "durable flushed_event_seq must advance to next_event_seq after split recovery"
+    );
+    a.request_eager_flush();
+    a.flush_due_pending().unwrap();
+    assert_eq!(a.local_version.load(Ordering::SeqCst), a_head);
+
+    sync_all_pages(&b);
+    assert_eq!(b.local_version.load(Ordering::SeqCst), a_head);
+    assert_eq!(b.replication_backlog().pending_ops, 0);
+
+    // Reopen A a second time to verify no dormant un-acknowledged range triggers re-publication.
+    drop(a);
+    let a = retained_test_engine(&a_path);
+    assert_eq!(a.replication_backlog().pending_ops, 0);
+    a.request_eager_flush();
+    a.flush_due_pending().unwrap();
+    assert_eq!(a.local_version.load(Ordering::SeqCst), a_head);
+
+    for (name, engine) in [("a", &a), ("b", &b)] {
+        assert_eq!(
+            engine.lookup(dest.ino, b"restored").unwrap().ino,
+            source.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(source.ino, b"child").unwrap().ino,
+            child.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(source.ino, b"file").unwrap().ino,
+            file.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(dest.ino, b"after-dir").unwrap().ino,
+            after_dir.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(ROOT_INO, b"later-link").unwrap().ino,
+            file.ino,
+            "{name}"
+        );
+        assert_eq!(engine.get_attr(file.ino).unwrap().nlink, 3, "{name} nlink");
+        assert_eq!(
+            lookup_object_ids(engine, file.ino, 64).unwrap(),
+            vec![92_001],
+            "{name} payload"
+        );
+        assert_eq!(
+            engine.get_acl_rule(dest.ino, "alice").unwrap(),
+            Some(AccessLevel::ReadWrite),
+            "{name} dest acl"
+        );
+        assert_eq!(
+            engine.get_acl_rule(source.ino, "bob").unwrap(),
+            Some(AccessLevel::ReadOnly),
+            "{name} source acl"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; losing restore remainder split across multiple batches must converge"]
+fn retained_competing_restore_losing_remainder_split_batches_converge() {
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings};
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let _byte_limit = set_test_env(PG_SYNC_MAX_RESPONSE_BYTES_PER_PAGE_ENV_VAR, "640");
+    let volume = PgTestVolume::new(&dsn, "retained-loser-split");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-loser-split-");
+    let a_path = dir.path().join("a");
+    let b_path = dir.path().join("b");
+    seed_local(&a_path, &volume.format_info());
+    seed_local(&b_path, &volume.format_info());
+
+    let a = retained_test_engine(&a_path);
+    a.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let winner_parent = a
+        .create_dir(ROOT_INO, b"winner-parent", 0, 0, 0o755)
+        .unwrap();
+    let loser_parent = a
+        .create_dir(ROOT_INO, b"loser-parent", 0, 0, 0o755)
+        .unwrap();
+    let source = a.create_dir(ROOT_INO, b"source", 0, 0, 0o755).unwrap();
+    let child = a.create_dir(source.ino, b"child", 0, 0, 0o755).unwrap();
+    let file = create_published_small_file(&a, source.ino, b"file", 91_001);
+    a.link(file.ino, ROOT_INO, b"outside").unwrap();
+    let store = a.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = a.next_inode().unwrap();
+    a.retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    publish_and_pull(&a);
+
+    let b = retained_test_engine(&b_path);
+    sync_all_pages(&b);
+
+    for (engine, parent, name, fresh_obj) in [
+        (&a, winner_parent.ino, b"winner".as_slice(), 92_001_u64),
+        (&b, loser_parent.ino, b"loser".as_slice(), 93_001_u64),
+    ] {
+        let stage = engine.create_dir(receipt, b"stage", 0, 0, 0o755).unwrap();
+        engine.create_dir(stage.ino, b"child", 0, 0, 0o755).unwrap();
+        let stage_file = engine.create_file(stage.ino, b"file", 0, 0, 0o644).unwrap();
+        stage_exact_small_payload(engine, stage_file.ino, fresh_obj, 64);
+        let restored = engine
+            .restore_retained_entry(
+                receipt,
+                parent,
+                name,
+                b"stage",
+                &retained_test_source_fences(engine, receipt),
+            )
+            .unwrap();
+        for (ino, epoch) in restored.upload_epochs {
+            mark_overlay_objects_uploaded(engine, ino, epoch, &[fresh_obj]);
+            assert!(
+                engine
+                    .publish_regular_file_overlay_to_base_if_matches(ino, epoch)
+                    .unwrap()
+            );
+        }
+    }
+
+    // Add post-restore mutations on loser B before conflict resolution.
+    b.link(file.ino, ROOT_INO, b"later-link").unwrap();
+    let after_dir = b
+        .create_dir(loser_parent.ino, b"after-dir", 0, 0, 0o755)
+        .unwrap();
+    b.set_acl_rule(loser_parent.ino, "alice", AccessLevel::ReadOnly)
+        .unwrap();
+    b.set_acl_rule(source.ino, "bob", AccessLevel::ReadWrite)
+        .unwrap();
+
+    publish_and_pull(&a);
+    let version_after_winner = a.local_version.load(Ordering::SeqCst);
+
+    // B loses the shared receipt, reconciles locally, pulls winner, and flushes remainder across split batches.
+    b.request_eager_flush();
+    assert!(b.flush_due_pending().is_err());
+    sync_all_pages(&b);
+    publish_and_pull(&b);
+
+    let loser_batch_count = run_async(with_pg_test_client(&dsn, {
+        let volume_id = volume.volume_id;
+        move |client| async move {
+            let row = client
+                .query_one(
+                    "SELECT COUNT(DISTINCT batch_version)::BIGINT FROM event_log WHERE vol = $1 AND batch_version > $2",
+                    &[&volume_id, &version_after_winner],
+                )
+                .await
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Ok::<i64, MetaError>(row.get(0))
+        }
+    }))
+    .unwrap();
+    assert!(
+        loser_batch_count >= 3,
+        "losing restore remainder must split across multiple PG batches, got {loser_batch_count}"
+    );
+
+    sync_all_pages(&a);
+    drop(b);
+    let b = retained_test_engine(&b_path);
+    assert_eq!(b.replication_backlog().pending_ops, 0);
+    assert_eq!(
+        b.flushed_event_seq.load(Ordering::SeqCst),
+        b.local.get_counter(NEXT_EVENT_SEQ).unwrap()
+    );
+
+    for (name, engine) in [("a", &a), ("b", &b)] {
+        assert!(
+            engine.lookup(loser_parent.ino, b"loser").is_err(),
+            "{name} loser alias gone"
+        );
+        assert_eq!(
+            engine.lookup(winner_parent.ino, b"winner").unwrap().ino,
+            source.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(source.ino, b"child").unwrap().ino,
+            child.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(loser_parent.ino, b"after-dir").unwrap().ino,
+            after_dir.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(ROOT_INO, b"later-link").unwrap().ino,
+            file.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.get_attr(source.ino).unwrap().parent,
+            winner_parent.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.get_attr(loser_parent.ino).unwrap().nlink,
+            3,
+            "{name} loser_parent nlink"
+        );
+        assert_eq!(
+            engine.get_attr(file.ino).unwrap().nlink,
+            3,
+            "{name} file nlink"
+        );
+        assert_eq!(
+            engine.get_acl_rule(loser_parent.ino, "alice").unwrap(),
+            Some(AccessLevel::ReadOnly),
+            "{name} loser_parent acl"
+        );
+        assert_eq!(
+            engine.get_acl_rule(source.ino, "bob").unwrap(),
+            Some(AccessLevel::ReadWrite),
+            "{name} source acl"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; crash between losing reconcile and range completion retries and converges"]
+fn retained_competing_restore_crash_between_reconcile_and_range_completion_retries_and_converges() {
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings};
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-reconcile-crash");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-reconcile-crash-");
+    let a_path = dir.path().join("a");
+    let b_path = dir.path().join("b");
+    seed_local(&a_path, &volume.format_info());
+    seed_local(&b_path, &volume.format_info());
+
+    let a = retained_test_engine(&a_path);
+    a.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let winner_parent = a
+        .create_dir(ROOT_INO, b"winner-parent", 0, 0, 0o755)
+        .unwrap();
+    let loser_parent = a
+        .create_dir(ROOT_INO, b"loser-parent", 0, 0, 0o755)
+        .unwrap();
+    let source = a.create_dir(ROOT_INO, b"source", 0, 0, 0o755).unwrap();
+    let file = create_published_small_file(&a, source.ino, b"file", 91_001);
+    a.link(file.ino, ROOT_INO, b"outside").unwrap();
+    let store = a.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = a.next_inode().unwrap();
+    a.retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    publish_and_pull(&a);
+
+    let b = retained_test_engine(&b_path);
+    sync_all_pages(&b);
+
+    for (engine, parent, name, fresh_obj) in [
+        (&a, winner_parent.ino, b"winner".as_slice(), 92_001_u64),
+        (&b, loser_parent.ino, b"loser".as_slice(), 93_001_u64),
+    ] {
+        let stage = engine.create_dir(receipt, b"stage", 0, 0, 0o755).unwrap();
+        let stage_file = engine.create_file(stage.ino, b"file", 0, 0, 0o644).unwrap();
+        stage_exact_small_payload(engine, stage_file.ino, fresh_obj, 64);
+        let restored = engine
+            .restore_retained_entry(
+                receipt,
+                parent,
+                name,
+                b"stage",
+                &retained_test_source_fences(engine, receipt),
+            )
+            .unwrap();
+        for (ino, epoch) in restored.upload_epochs {
+            mark_overlay_objects_uploaded(engine, ino, epoch, &[fresh_obj]);
+            assert!(
+                engine
+                    .publish_regular_file_overlay_to_base_if_matches(ino, epoch)
+                    .unwrap()
+            );
+        }
+    }
+
+    b.link(file.ino, ROOT_INO, b"later-link").unwrap();
+    let after_dir = b
+        .create_dir(loser_parent.ino, b"after-dir", 0, 0, 0o755)
+        .unwrap();
+    b.set_acl_rule(loser_parent.ino, "alice", AccessLevel::ReadOnly)
+        .unwrap();
+
+    // A wins the shared receipt and publishes.
+    publish_and_pull(&a);
+
+    // Simulate B running `losing_retained_terminal_records` (which commits `reconcile_losing_retained_restore`
+    // in redb) and crashing immediately BEFORE `complete_local_event_ranges` runs.
+    let flushed = b.flushed_event_seq.load(Ordering::SeqCst);
+    let next = b.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let pending = b.local.read_events_range(flushed, next).unwrap();
+    let (losing, _) = b
+        .losing_retained_terminal_records(
+            &pending,
+            &[LocalEventRange {
+                start: flushed.max(1),
+                end: next,
+            }],
+        )
+        .unwrap();
+    assert_eq!(losing.len(), 1);
+    drop(b);
+
+    // Reopen B, verify idempotence of a second classification pass and restart convergence.
+    let b = retained_test_engine(&b_path);
+    assert_eq!(b.get_attr(loser_parent.ino).unwrap().nlink, 3);
+    let reopened_flushed = b.flushed_event_seq.load(Ordering::SeqCst);
+    let reopened_next = b.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let pending_after_reopen = b
+        .local
+        .read_events_range(reopened_flushed, reopened_next)
+        .unwrap();
+    let (losing_retry, _) = b
+        .losing_retained_terminal_records(
+            &pending_after_reopen,
+            &[LocalEventRange {
+                start: reopened_flushed.max(1),
+                end: reopened_next,
+            }],
+        )
+        .unwrap();
+    assert!(
+        losing_retry.is_empty(),
+        "already-reconciled losing terminal record must be idempotent across restarts"
+    );
+    assert_eq!(b.get_attr(loser_parent.ino).unwrap().nlink, 3);
+
+    sync_all_pages(&b);
+    publish_and_pull(&b);
+    sync_all_pages(&a);
+
+    drop(a);
+    drop(b);
+    let a = retained_test_engine(&a_path);
+    let b = retained_test_engine(&b_path);
+    for (name, engine) in [("a", &a), ("b", &b)] {
+        assert_eq!(engine.replication_backlog().pending_ops, 0, "{name}");
+        assert_eq!(
+            engine.flushed_event_seq.load(Ordering::SeqCst),
+            engine.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+            "{name} cursor"
+        );
+        assert!(engine.lookup(loser_parent.ino, b"loser").is_err(), "{name}");
+        assert_eq!(
+            engine.lookup(winner_parent.ino, b"winner").unwrap().ino,
+            source.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(loser_parent.ino, b"after-dir").unwrap().ino,
+            after_dir.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(ROOT_INO, b"later-link").unwrap().ino,
+            file.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.get_attr(loser_parent.ino).unwrap().nlink,
+            3,
+            "{name}"
+        );
+        assert_eq!(engine.get_attr(file.ino).unwrap().nlink, 3, "{name}");
+        assert_eq!(
+            lookup_object_ids(engine, file.ino, 64).unwrap(),
+            vec![92_001],
+            "{name}"
+        );
+        assert_eq!(
+            engine.get_acl_rule(loser_parent.ino, "alice").unwrap(),
+            Some(AccessLevel::ReadOnly),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; competing nonempty restores preserve winner bytes and dest/ancestor ACLs & attrs"]
+fn retained_competing_restores_nonempty_payload_with_concurrent_dest_and_ancestor_acl_attr_mutations()
+ {
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings};
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-nonempty-acl");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-nonempty-acl-");
+    let a_path = dir.path().join("a");
+    let b_path = dir.path().join("b");
+    seed_local(&a_path, &volume.format_info());
+    seed_local(&b_path, &volume.format_info());
+
+    let a = retained_test_engine(&a_path);
+    a.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let dest_a_anc = a.create_dir(ROOT_INO, b"dest-a-anc", 0, 0, 0o750).unwrap();
+    a.set_acl_rule(dest_a_anc.ino, "alice", AccessLevel::ReadWrite)
+        .unwrap();
+    let dest_a = a
+        .create_dir(dest_a_anc.ino, b"dest-a", 0, 0, 0o755)
+        .unwrap();
+    let dest_b_anc = a.create_dir(ROOT_INO, b"dest-b-anc", 0, 0, 0o750).unwrap();
+    a.set_acl_rule(dest_b_anc.ino, "bob", AccessLevel::ReadOnly)
+        .unwrap();
+    let dest_b = a
+        .create_dir(dest_b_anc.ino, b"dest-b", 0, 0, 0o755)
+        .unwrap();
+
+    let source = a.create_dir(ROOT_INO, b"source", 0, 0, 0o755).unwrap();
+    let child = a.create_dir(source.ino, b"child", 0, 0, 0o755).unwrap();
+    let file_a = create_published_small_file(&a, source.ino, b"file-a", 91_001);
+    let file_b = create_published_small_file(&a, child.ino, b"file-b", 91_002);
+    a.link(file_a.ino, ROOT_INO, b"outside").unwrap();
+    let store = a.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = a.next_inode().unwrap();
+    a.retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    publish_and_pull(&a);
+
+    let b = retained_test_engine(&b_path);
+    sync_all_pages(&b);
+
+    // Concurrent destination and ancestor ACL/attr mutations on A alongside A's restore.
+    let mut anc_a_attr = a.get_attr(dest_a_anc.ino).unwrap();
+    anc_a_attr.mode = 0o755;
+    a.set_attr(&anc_a_attr).unwrap();
+    a.set_acl_rule(dest_a_anc.ino, "carol", AccessLevel::ReadWrite)
+        .unwrap();
+    let mut dest_a_attr = a.get_attr(dest_a.ino).unwrap();
+    dest_a_attr.mode = 0o700;
+    a.set_attr(&dest_a_attr).unwrap();
+    a.set_acl_rule(dest_a.ino, "dave", AccessLevel::ReadOnly)
+        .unwrap();
+
+    let a_stage = a.create_dir(receipt, b"stage", 0, 0, 0o755).unwrap();
+    let a_stage_child = a.create_dir(a_stage.ino, b"child", 0, 0, 0o755).unwrap();
+    let a_stage_fa = a.create_file(a_stage.ino, b"file-a", 0, 0, 0o644).unwrap();
+    let a_stage_fb = a
+        .create_file(a_stage_child.ino, b"file-b", 0, 0, 0o644)
+        .unwrap();
+    stage_exact_small_payload(&a, a_stage_fa.ino, 92_001, 64);
+    stage_exact_small_payload(&a, a_stage_fb.ino, 92_002, 64);
+    let a_restored = a
+        .restore_retained_entry(
+            receipt,
+            dest_a.ino,
+            b"restored-a",
+            b"stage",
+            &retained_test_source_fences(&a, receipt),
+        )
+        .unwrap();
+    assert_eq!(a_restored.upload_epochs.len(), 2);
+    for (ino, obj_id) in [(file_a.ino, 92_001_u64), (file_b.ino, 92_002_u64)] {
+        let epoch = a_restored.upload_epochs[&ino];
+        mark_overlay_objects_uploaded(&a, ino, epoch, &[obj_id]);
+        assert!(
+            a.publish_regular_file_overlay_to_base_if_matches(ino, epoch)
+                .unwrap()
+        );
+    }
+    a.set_acl_rule(source.ino, "eve", AccessLevel::ReadWrite)
+        .unwrap();
+
+    // Concurrent destination and ancestor ACL/attr mutations on B alongside B's competing restore.
+    let mut anc_b_attr = b.get_attr(dest_b_anc.ino).unwrap();
+    anc_b_attr.mode = 0o711;
+    b.set_attr(&anc_b_attr).unwrap();
+    b.set_acl_rule(dest_b_anc.ino, "frank", AccessLevel::ReadWrite)
+        .unwrap();
+    let mut dest_b_attr = b.get_attr(dest_b.ino).unwrap();
+    dest_b_attr.mode = 0o751;
+    b.set_attr(&dest_b_attr).unwrap();
+    b.set_acl_rule(dest_b.ino, "grace", AccessLevel::ReadOnly)
+        .unwrap();
+
+    let b_stage = b.create_dir(receipt, b"stage", 0, 0, 0o755).unwrap();
+    let b_stage_child = b.create_dir(b_stage.ino, b"child", 0, 0, 0o755).unwrap();
+    let b_stage_fa = b.create_file(b_stage.ino, b"file-a", 0, 0, 0o644).unwrap();
+    let b_stage_fb = b
+        .create_file(b_stage_child.ino, b"file-b", 0, 0, 0o644)
+        .unwrap();
+    stage_exact_small_payload(&b, b_stage_fa.ino, 93_001, 64);
+    stage_exact_small_payload(&b, b_stage_fb.ino, 93_002, 64);
+    let b_restored = b
+        .restore_retained_entry(
+            receipt,
+            dest_b.ino,
+            b"restored-b",
+            b"stage",
+            &retained_test_source_fences(&b, receipt),
+        )
+        .unwrap();
+    assert_eq!(b_restored.upload_epochs.len(), 2);
+    for (ino, obj_id) in [(file_a.ino, 93_001_u64), (file_b.ino, 93_002_u64)] {
+        let epoch = b_restored.upload_epochs[&ino];
+        mark_overlay_objects_uploaded(&b, ino, epoch, &[obj_id]);
+        assert!(
+            b.publish_regular_file_overlay_to_base_if_matches(ino, epoch)
+                .unwrap()
+        );
+    }
+    let b_after = b.create_dir(dest_b.ino, b"b-after", 0, 0, 0o755).unwrap();
+    b.link(file_a.ino, ROOT_INO, b"b-link").unwrap();
+    b.set_acl_rule(source.ino, "heidi", AccessLevel::ReadOnly)
+        .unwrap();
+
+    // A publishes first and wins the receipt; B reconciles, syncs, publishes remainder, and both restart.
+    publish_and_pull(&a);
+    b.request_eager_flush();
+    assert!(b.flush_due_pending().is_err());
+    sync_all_pages(&b);
+    publish_and_pull(&b);
+    sync_all_pages(&a);
+
+    drop(a);
+    drop(b);
+    let a = retained_test_engine(&a_path);
+    let b = retained_test_engine(&b_path);
+    for (name, engine) in [("a", &a), ("b", &b)] {
+        assert_eq!(engine.replication_backlog().pending_ops, 0, "{name}");
+        assert_eq!(
+            engine.flushed_event_seq.load(Ordering::SeqCst),
+            engine.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+            "{name} cursor"
+        );
+        assert!(engine.lookup(dest_b.ino, b"restored-b").is_err(), "{name}");
+        assert_eq!(
+            engine.lookup(dest_a.ino, b"restored-a").unwrap().ino,
+            source.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(source.ino, b"child").unwrap().ino,
+            child.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(source.ino, b"file-a").unwrap().ino,
+            file_a.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(child.ino, b"file-b").unwrap().ino,
+            file_b.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(dest_b.ino, b"b-after").unwrap().ino,
+            b_after.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(ROOT_INO, b"b-link").unwrap().ino,
+            file_a.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.get_attr(file_a.ino).unwrap().nlink,
+            3,
+            "{name} file_a nlink"
+        );
+        assert_eq!(
+            engine.get_attr(dest_a.ino).unwrap().nlink,
+            3,
+            "{name} dest_a nlink"
+        );
+        assert_eq!(
+            engine.get_attr(dest_b.ino).unwrap().nlink,
+            3,
+            "{name} dest_b nlink"
+        );
+
+        // Nonempty winner bytes survive on both files.
+        assert_eq!(
+            lookup_object_ids(engine, file_a.ino, 64).unwrap(),
+            vec![92_001],
+            "{name} file_a payload"
+        );
+        assert_eq!(
+            lookup_object_ids(engine, file_b.ino, 64).unwrap(),
+            vec![92_002],
+            "{name} file_b payload"
+        );
+
+        // Destination and ancestor modes + ACLs remain intact on both peers.
+        assert_eq!(
+            engine.get_attr(dest_a_anc.ino).unwrap().mode,
+            0o755,
+            "{name} dest_a_anc mode"
+        );
+        assert_eq!(
+            engine.get_acl_rule(dest_a_anc.ino, "alice").unwrap(),
+            Some(AccessLevel::ReadWrite),
+            "{name}"
+        );
+        assert_eq!(
+            engine.get_acl_rule(dest_a_anc.ino, "carol").unwrap(),
+            Some(AccessLevel::ReadWrite),
+            "{name}"
+        );
+        assert_eq!(
+            engine.get_attr(dest_a.ino).unwrap().mode,
+            0o700,
+            "{name} dest_a mode"
+        );
+        assert_eq!(
+            engine.get_acl_rule(dest_a.ino, "dave").unwrap(),
+            Some(AccessLevel::ReadOnly),
+            "{name}"
+        );
+
+        assert_eq!(
+            engine.get_attr(dest_b_anc.ino).unwrap().mode,
+            0o711,
+            "{name} dest_b_anc mode"
+        );
+        assert_eq!(
+            engine.get_acl_rule(dest_b_anc.ino, "bob").unwrap(),
+            Some(AccessLevel::ReadOnly),
+            "{name}"
+        );
+        assert_eq!(
+            engine.get_acl_rule(dest_b_anc.ino, "frank").unwrap(),
+            Some(AccessLevel::ReadWrite),
+            "{name}"
+        );
+        assert_eq!(
+            engine.get_attr(dest_b.ino).unwrap().mode,
+            0o751,
+            "{name} dest_b mode"
+        );
+        assert_eq!(
+            engine.get_acl_rule(dest_b.ino, "grace").unwrap(),
+            Some(AccessLevel::ReadOnly),
+            "{name}"
+        );
+
+        assert_eq!(
+            engine.get_acl_rule(source.ino, "eve").unwrap(),
+            Some(AccessLevel::ReadWrite),
+            "{name}"
+        );
+        assert_eq!(
+            engine.get_acl_rule(source.ino, "heidi").unwrap(),
+            Some(AccessLevel::ReadOnly),
+            "{name}"
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RetainedWinnerEpochSource {
+    EventTail,
+    Checkpoint,
+}
+
+fn retained_losing_restore_post_restore_write_survives_winner_apply(
+    publish_later_write: bool,
+    suffix: &str,
+    write_on_winner: bool,
+    size_only: bool,
+    winner_epoch_source: Option<RetainedWinnerEpochSource>,
+) {
+    use crate::engine::MetaEngine;
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings};
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let _page_limit = winner_epoch_source
+        .is_some()
+        .then(|| set_test_env(PG_SYNC_MAX_BATCHES_PER_PAGE_ENV_VAR, "1"));
+    let volume = PgTestVolume::new(&dsn, suffix);
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-losing-write-");
+    let a_path = dir.path().join("a");
+    let b_path = dir.path().join("b");
+    seed_local(&a_path, &volume.format_info());
+    seed_local(&b_path, &volume.format_info());
+
+    let a = retained_test_engine(&a_path);
+    a.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let winner_parent = a
+        .create_dir(ROOT_INO, b"winner-parent", 0, 0, 0o755)
+        .unwrap();
+    let loser_parent = a
+        .create_dir(ROOT_INO, b"loser-parent", 0, 0, 0o755)
+        .unwrap();
+    let source = a.create_dir(ROOT_INO, b"source", 0, 0, 0o755).unwrap();
+    let graph_size = u64::from(crate::schema::DEFAULT_CHUNK_SIZE) + 64;
+    let stage_graph = |engine: &PgMetaEngine, ino, object| {
+        set_file_state(engine, ino, graph_size, 1);
+        let chunks = [(0, crate::schema::DEFAULT_CHUNK_SIZE), (1, 64)].map(|(chunk, size)| {
+            (
+                crate::schema::ChunkId(chunk),
+                vec![crate::schema::SliceRecord::new(
+                    crate::schema::SliceId(0),
+                    crate::schema::SliceOrder(0),
+                    crate::schema::SliceRange::new(0, size).unwrap(),
+                    PayloadRef::new_partial(object + chunk, size),
+                )],
+            )
+        });
+        engine
+            .flush_regular_file_overlay_slices(ino, &chunks)
+            .unwrap();
+    };
+    let file = a.create_file(source.ino, b"file", 0, 0, 0o644).unwrap();
+    stage_graph(&a, file.ino, 91_001);
+    mark_overlay_objects_uploaded(&a, file.ino, 1, &[91_001, 91_002]);
+    assert!(
+        a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+            .unwrap()
+    );
+    a.link(file.ino, ROOT_INO, b"outside").unwrap();
+    let store = a.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = a.next_inode().unwrap();
+    a.retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    publish_and_pull(&a);
+
+    let b = retained_test_engine(&b_path);
+    sync_all_pages(&b);
+    let mut restore_epochs = Vec::new();
+    for (engine, parent, name, object_id, is_winner) in [
+        (
+            &a,
+            winner_parent.ino,
+            b"winner".as_slice(),
+            92_001_u64,
+            true,
+        ),
+        (&b, loser_parent.ino, b"loser".as_slice(), 93_001_u64, false),
+    ] {
+        let stage = engine.create_dir(receipt, b"stage", 0, 0, 0o755).unwrap();
+        let stage_file = engine.create_file(stage.ino, b"file", 0, 0, 0o644).unwrap();
+        stage_graph(engine, stage_file.ino, object_id);
+        if write_on_winner && !is_winner {
+            // Equivalent overlapping slices make the pristine restore a real compaction candidate.
+            let overlap = crate::schema::SliceRecord::new(
+                crate::schema::SliceId(0),
+                crate::schema::SliceOrder(0),
+                crate::schema::SliceRange::new(0, 16).unwrap(),
+                PayloadRef::new_partial(object_id, 16),
+            );
+            engine
+                .flush_regular_file_overlay_slices(
+                    stage_file.ino,
+                    &[(crate::schema::ChunkId(0), vec![overlap])],
+                )
+                .unwrap();
+        }
+        let restored = engine
+            .restore_retained_entry(
+                receipt,
+                parent,
+                name,
+                b"stage",
+                &retained_test_source_fences(engine, receipt),
+            )
+            .unwrap();
+        assert_eq!(restored.upload_epochs.len(), 1);
+        let (&ino, &epoch) = restored.upload_epochs.iter().next().unwrap();
+        assert_eq!(ino, file.ino);
+        if write_on_winner && !is_winner {
+            assert!(engine.compact_fragmented_regular_file_chunks(32).unwrap() > 0);
+        }
+        if is_winner || write_on_winner {
+            mark_overlay_objects_uploaded(engine, ino, epoch, &[object_id, object_id + 1]);
+            assert!(
+                engine
+                    .publish_regular_file_overlay_to_base_if_matches(ino, epoch)
+                    .unwrap()
+            );
+        }
+        if !is_winner {
+            restore_epochs.push(epoch);
+        }
+    }
+
+    if winner_epoch_source.is_some() {
+        let mut attr = a.get_attr(file.ino).unwrap();
+        attr.content_epoch += 1;
+        attr.upload_state = UploadState::Updating;
+        let patch = crate::schema::SliceRecord::new(
+            crate::schema::SliceId(0),
+            crate::schema::SliceOrder(0),
+            crate::schema::SliceRange::new(24, 40).unwrap(),
+            PayloadRef::new_partial(95_001, 16),
+        );
+        a.flush_regular_file_overlay_slices_with_attr(
+            file.ino,
+            &[(crate::schema::ChunkId(0), vec![patch])],
+            Some(&attr),
+        )
+        .unwrap();
+        mark_overlay_objects_uploaded(&a, file.ino, attr.content_epoch, &[95_001]);
+        assert!(
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, attr.content_epoch)
+                .unwrap()
+        );
+    }
+    let later_object = 94_001;
+    let writer = if write_on_winner { &a } else { &b };
+    let mut written_attr = writer.get_attr(file.ino).unwrap();
+    if write_on_winner {
+        written_attr.content_epoch += 1;
+        written_attr.upload_state = UploadState::Updating;
+    }
+    let patch = crate::schema::SliceRecord::new(
+        crate::schema::SliceId(0),
+        crate::schema::SliceOrder(0),
+        crate::schema::SliceRange::new(24, 40).unwrap(),
+        PayloadRef::new_partial(later_object, 16),
+    );
+    if size_only {
+        written_attr.size += 1;
+        writer.set_attr(&written_attr).unwrap();
+    } else {
+        writer
+            .flush_regular_file_overlay_slices_with_attr(
+                file.ino,
+                &[(crate::schema::ChunkId(0), vec![patch])],
+                Some(&written_attr),
+            )
+            .unwrap();
+    }
+    if publish_later_write {
+        mark_overlay_objects_uploaded(
+            writer,
+            file.ino,
+            written_attr.content_epoch,
+            &[later_object],
+        );
+    }
+    if !write_on_winner {
+        assert_eq!(written_attr.content_epoch, restore_epochs[0]);
+        assert_eq!(written_attr.committed_content_epoch, 0);
+        if publish_later_write {
+            mark_overlay_objects_uploaded(&b, file.ino, restore_epochs[0], &[93_001, 93_002]);
+        }
+    }
+    if publish_later_write {
+        assert!(
+            writer
+                .publish_regular_file_overlay_to_base_if_matches(
+                    file.ino,
+                    written_attr.content_epoch
+                )
+                .unwrap()
+        );
+    }
+
+    // A wins the receipt; B's accepted write is later than B's restore fork.
+    publish_and_pull(&a);
+    if matches!(
+        winner_epoch_source,
+        Some(RetainedWinnerEpochSource::Checkpoint)
+    ) {
+        a.flush_metadata().unwrap();
+    }
+    if let Some(source) = winner_epoch_source {
+        let descriptor = a.snapshot_backend().read_bootstrap_checkpoint().unwrap();
+        match source {
+            RetainedWinnerEpochSource::EventTail => {
+                assert!(descriptor.checkpoint_version < descriptor.remote_head_version);
+            }
+            RetainedWinnerEpochSource::Checkpoint => {
+                assert_eq!(
+                    descriptor.checkpoint_version,
+                    descriptor.remote_head_version
+                );
+                let checkpoint = descriptor.validate_and_decode().unwrap();
+                let (_, bytes) = checkpoint
+                    .inodes
+                    .iter()
+                    .find(|(ino, _)| *ino == file.ino)
+                    .unwrap();
+                let attr: InodeAttr = postcard::from_bytes(bytes).unwrap();
+                assert_eq!(attr.content_epoch, restore_epochs[0] + 1);
+            }
+        }
+    }
+    let flushed = b.flushed_event_seq.load(Ordering::SeqCst);
+    let next = b.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let pending = b.local.read_events_range(flushed, next).unwrap();
+    let (losing, _) = b
+        .losing_retained_terminal_records(
+            &pending,
+            &[LocalEventRange {
+                start: flushed.max(1),
+                end: next,
+            }],
+        )
+        .unwrap();
+    assert_eq!(losing.len(), 1, "actual losing restore classification");
+    drop(b);
+    let b = retained_test_engine(&b_path);
+    sync_all_pages(&b);
+    let unchanged_object = if write_on_winner { 92_001 } else { 93_001 };
+    let expected_objects = if size_only {
+        vec![unchanged_object, unchanged_object + 1]
+    } else {
+        vec![
+            unchanged_object,
+            later_object,
+            unchanged_object,
+            unchanged_object + 1,
+        ]
+    };
+    assert_eq!(
+        lookup_object_ids(&b, file.ino, graph_size).unwrap(),
+        expected_objects,
+        "loser's local serving view after winner apply"
+    );
+    let references = b.local.get_local_referenced_object_ids().unwrap();
+    assert!(
+        expected_objects
+            .iter()
+            .all(|object| references.contains(object))
+    );
+    if size_only {
+        assert_eq!(b.get_attr(file.ino).unwrap().size, graph_size + 1);
+        assert_eq!(b.lookup(ROOT_INO, b"outside").unwrap().ino, file.ino);
+        assert_eq!(
+            b.lookup(winner_parent.ino, b"winner").unwrap().ino,
+            source.ino
+        );
+        assert!(b.lookup(loser_parent.ino, b"loser").is_err());
+        // Bare metadata set_attr has no VFS sparse-hole journal; this case ends at local replay.
+        return;
+    }
+    if !write_on_winner {
+        let pending = b.get_attr(file.ino).unwrap();
+        assert!(pending.content_epoch > restore_epochs[0]);
+        if winner_epoch_source.is_some() {
+            assert!(
+                pending.content_epoch > a.get_attr(file.ino).unwrap().content_epoch,
+                "accepted B content must have an epoch above the already-published winner"
+            );
+        }
+        assert_ne!(pending.upload_state, UploadState::Ready);
+        assert_eq!(pending.committed_content_epoch, 0);
+        assert_eq!(pending.committed_size, 0);
+        let lifecycle = b.local.get_inode_lifecycle(file.ino).unwrap().unwrap();
+        assert_eq!(lifecycle.local_content_epoch, pending.content_epoch);
+        assert!(lifecycle.local_view_differs_from_published());
+        if !publish_later_write {
+            assert!(
+                !b.publish_regular_file_overlay_to_base_if_matches(file.ino, pending.content_epoch)
+                    .unwrap()
+            );
+            let mut object_ids = expected_objects.clone();
+            object_ids.sort_unstable();
+            object_ids.dedup();
+            mark_overlay_objects_uploaded(&b, file.ino, pending.content_epoch, &object_ids);
+        }
+        assert!(
+            b.publish_regular_file_overlay_to_base_if_matches(file.ino, pending.content_epoch)
+                .unwrap()
+        );
+    }
+    publish_and_pull(&b);
+    sync_all_pages(&a);
+    drop(a);
+    drop(b);
+    let a = retained_test_engine(&a_path);
+    let b = retained_test_engine(&b_path);
+
+    for (name, engine) in [("a", &a), ("b", &b)] {
+        assert_eq!(
+            engine.lookup(ROOT_INO, b"outside").unwrap().ino,
+            file.ino,
+            "{name}"
+        );
+        assert_eq!(
+            engine.lookup(winner_parent.ino, b"winner").unwrap().ino,
+            source.ino,
+            "{name} winner namespace"
+        );
+        assert!(
+            engine.lookup(loser_parent.ino, b"loser").is_err(),
+            "{name} loser namespace"
+        );
+        assert_eq!(
+            engine.get_attr(file.ino).unwrap().nlink,
+            2,
+            "{name} hardlink identity"
+        );
+        assert_eq!(
+            lookup_object_ids(engine, file.ino, graph_size).unwrap(),
+            expected_objects,
+            "{name} accepted post-restore bytes"
+        );
+        let attr = engine.get_attr(file.ino).unwrap();
+        assert_eq!(attr.upload_state, UploadState::Ready, "{name} upload state");
+        assert_eq!(
+            attr.size,
+            graph_size + u64::from(size_only),
+            "{name} accepted size"
+        );
+        assert_eq!(attr.committed_size, attr.size, "{name} committed size");
+        assert_eq!(
+            attr.committed_content_epoch, attr.content_epoch,
+            "{name} committed epoch"
+        );
+    }
+    assert_eq!(b.replication_backlog().pending_ops, 0);
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; accepted overlay write after losing restore must survive winner apply"]
+fn retained_losing_restore_unpublished_post_restore_write_survives_winner_apply() {
+    retained_losing_restore_post_restore_write_survives_winner_apply(
+        false,
+        "retained-losing-unpublished-write",
+        false,
+        false,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; accepted published write after losing restore must survive winner apply"]
+fn retained_losing_restore_published_post_restore_write_survives_winner_apply() {
+    retained_losing_restore_post_restore_write_survives_winner_apply(
+        true,
+        "retained-losing-published-write",
+        false,
+        false,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; a pristine losing restore must not supersede winner writes"]
+fn retained_losing_restore_pristine_fork_preserves_later_winner_write() {
+    retained_losing_restore_post_restore_write_survives_winner_apply(
+        true,
+        "retained-losing-pristine-control",
+        true,
+        false,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; a size-only accepted extension is not a pristine restore"]
+fn retained_losing_restore_size_only_extension_survives_local_winner_replay() {
+    retained_losing_restore_post_restore_write_survives_winner_apply(
+        false,
+        "retained-losing-size-only-extension",
+        false,
+        true,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; accepted loser content must advance past the winner's later epoch"]
+fn retained_losing_restore_published_write_advances_past_later_winner_epoch() {
+    retained_losing_restore_post_restore_write_survives_winner_apply(
+        true,
+        "retained-losing-winner-epoch",
+        false,
+        false,
+        Some(RetainedWinnerEpochSource::EventTail),
+    );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; epoch rebasing must include the validated shared checkpoint"]
+fn retained_losing_restore_published_write_advances_past_checkpointed_winner_epoch() {
+    retained_losing_restore_post_restore_write_survives_winner_apply(
+        true,
+        "retained-losing-checkpoint-winner-epoch",
+        false,
+        false,
+        Some(RetainedWinnerEpochSource::Checkpoint),
+    );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; durable child purge versus peer restore in both orders"]
+fn test_pg_retained_child_purge_versus_peer_restore_never_deletes_live_child() {
+    use crate::trash::{
+        MetaRetainedStore, MetaVolumeSettings, RetainedChildPurgeOutcome, RetainedEntryState,
+    };
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    for restore_first in [true, false] {
+        let volume = PgTestVolume::new(&dsn, "retained-child-purge");
+        let dir = studiofs_test_support::workspace_target_tempdir("retained-child-purge-");
+        seed_local(&dir.path().join("first"), &volume.format_info());
+        seed_local(&dir.path().join("second"), &volume.format_info());
+        let first = retained_test_engine(&dir.path().join("first"));
+        first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let payload = first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+        let kept = first.create_dir(payload.ino, b"kept", 0, 0, 0o700).unwrap();
+        let doomed = first
+            .create_dir(payload.ino, b"doomed", 0, 0, 0o700)
+            .unwrap();
+        let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let receipt = first.next_inode().unwrap();
+        first
+            .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+            .unwrap();
+        publish_and_pull(&first);
+        let second = retained_test_engine(&dir.path().join("second"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while second.retained_entry(receipt).unwrap().is_none() {
+            assert!(Instant::now() < deadline, "peer never observed the receipt");
+            publish_and_pull(&first);
+            second.sync_metadata().unwrap();
+        }
+        let restore_on_second = |names: &[&[u8]]| {
+            let staged = second.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+            for name in names {
+                second.create_dir(staged.ino, name, 0, 0, 0o700).unwrap();
+            }
+            second
+                .restore_retained_entry(
+                    receipt,
+                    ROOT_INO,
+                    b"restored",
+                    b"stage",
+                    &retained_test_source_fences(&second, receipt),
+                )
+                .unwrap();
+        };
+
+        if restore_first {
+            // Peer restore wins; the offline child purge must lose without
+            // deleting the now-live child anywhere.
+            restore_on_second(&[b"kept", b"doomed"]);
+            publish_and_pull(&second);
+            assert!(matches!(
+                first
+                    .purge_retained_child(receipt, payload.ino, b"doomed", doomed.ino, true)
+                    .unwrap(),
+                RetainedChildPurgeOutcome::Removed(_)
+            ));
+            assert!(first.lookup(payload.ino, b"doomed").is_err());
+            first.request_eager_flush();
+            let _ = first.flush_due_pending();
+            publish_and_pull(&first);
+            second.sync_metadata().unwrap();
+            for engine in [&first, &second] {
+                assert!(matches!(
+                    engine.retained_entry(receipt).unwrap().unwrap().state,
+                    RetainedEntryState::Restored { .. }
+                ));
+                assert_eq!(
+                    engine.lookup(ROOT_INO, b"restored").unwrap().ino,
+                    payload.ino
+                );
+                assert_eq!(
+                    engine.lookup(payload.ino, b"doomed").unwrap().ino,
+                    doomed.ino,
+                    "a losing child purge must never delete a restored live child"
+                );
+                assert_eq!(engine.lookup(payload.ino, b"kept").unwrap().ino, kept.ino);
+            }
+            assert!(
+                first.flushed_event_seq.load(Ordering::SeqCst)
+                    >= first
+                        .local
+                        .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+                        .unwrap(),
+                "the losing child purge must retire instead of blocking the journal"
+            );
+        } else {
+            // The child purge wins while the receipt is still retained; the peer
+            // sees it gone and restores only the remaining tree.
+            assert!(matches!(
+                first
+                    .purge_retained_child(receipt, payload.ino, b"doomed", doomed.ino, true)
+                    .unwrap(),
+                RetainedChildPurgeOutcome::Removed(_)
+            ));
+            publish_and_pull(&first);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while second.lookup(payload.ino, b"doomed").is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "peer never observed the child purge"
+                );
+                sync_all_pages(&second);
+            }
+            assert!(second.get_attr(doomed.ino).is_err());
+            restore_on_second(&[b"kept"]);
+            publish_and_pull(&second);
+            sync_all_pages(&first);
+            for engine in [&first, &second] {
+                assert!(matches!(
+                    engine.retained_entry(receipt).unwrap().unwrap().state,
+                    RetainedEntryState::Restored { .. }
+                ));
+                assert_eq!(
+                    engine.lookup(ROOT_INO, b"restored").unwrap().ino,
+                    payload.ino
+                );
+                assert_eq!(engine.lookup(payload.ino, b"kept").unwrap().ino, kept.ino);
+                assert!(engine.lookup(payload.ino, b"doomed").is_err());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; a published-but-unacknowledged child purge must survive a later losing child purge"]
+fn test_pg_retained_losing_child_purge_keeps_published_unacked_span() {
+    retained_losing_child_purge_keeps_published_unacked_span(false);
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; after a restart, foreign apply self-acks the published purge and then retires the loser"]
+fn test_pg_retained_losing_child_purge_restart_foreign_apply_keeps_published_span() {
+    retained_losing_child_purge_keeps_published_unacked_span(true);
+}
+
+/// With `restart_before_send`, the process restarts after child purge 2 but
+/// before it is sent, so foreign apply (not the flush classifier) handles it.
+fn retained_losing_child_purge_keeps_published_unacked_span(restart_before_send: bool) {
+    use crate::trash::{
+        MetaRetainedStore, MetaVolumeSettings, RetainedChildPurgeOutcome, RetainedEntryState,
+    };
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-child-purge-unacked");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-child-purge-unacked-");
+    let first_path = dir.path().join("first");
+    seed_local(&first_path, &volume.format_info());
+    seed_local(&dir.path().join("second"), &volume.format_info());
+    let first = retained_test_engine(&first_path);
+    first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let payload = first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+    let kept = first.create_dir(payload.ino, b"kept", 0, 0, 0o700).unwrap();
+    let published = first
+        .create_dir(payload.ino, b"published", 0, 0, 0o700)
+        .unwrap();
+    let losing = first
+        .create_dir(payload.ino, b"losing", 0, 0, 0o700)
+        .unwrap();
+    let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = first.next_inode().unwrap();
+    first
+        .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    publish_and_pull(&first);
+    let second = retained_test_engine(&dir.path().join("second"));
+    sync_all_pages(&second);
+    assert!(second.retained_entry(receipt).unwrap().is_some());
+
+    // Child purge 1 reaches PG, but its self batch is not replayed yet.
+    assert!(matches!(
+        first
+            .purge_retained_child(receipt, payload.ino, b"published", published.ino, true)
+            .unwrap(),
+        RetainedChildPurgeOutcome::Removed(_)
+    ));
+    let batch = first.claim_pending_batch(true).expect("claim child purge");
+    first
+        .flush_pending_claimed_batch_with_restore(batch)
+        .unwrap();
+    let next_seq = || {
+        first
+            .local
+            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+            .unwrap()
+    };
+    assert!(
+        first.flushed_event_seq.load(Ordering::SeqCst) < next_seq(),
+        "fixture must leave the published child purge unacknowledged"
+    );
+
+    // The peer observes it and restores the remaining tree.
+    sync_all_pages(&second);
+    assert!(second.lookup(payload.ino, b"published").is_err());
+    let staged = second.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+    for name in [&b"kept"[..], b"losing"] {
+        second.create_dir(staged.ino, name, 0, 0, 0o700).unwrap();
+    }
+    second
+        .restore_retained_entry(
+            receipt,
+            ROOT_INO,
+            b"restored",
+            b"stage",
+            &retained_test_source_fences(&second, receipt),
+        )
+        .unwrap();
+    publish_and_pull(&second);
+
+    // Child purge 2 loses at its fence; only its own span may retire.
+    assert!(matches!(
+        first
+            .purge_retained_child(receipt, payload.ino, b"losing", losing.ino, true)
+            .unwrap(),
+        RetainedChildPurgeOutcome::Removed(_)
+    ));
+    let first = if restart_before_send {
+        // Restart with an empty in-memory published ledger, then pull: PG order
+        // replays the self batch (acknowledging span 1) before the peer restore,
+        // whose foreign apply must retire only span 2.
+        drop(first);
+        let first = retained_test_engine(&first_path);
+        sync_all_pages(&first);
+        first
+    } else {
+        // Push before any replay, so the flush classifier (not foreign apply) handles
+        // the loss, then crash before the recovery pull: the in-memory published
+        // ledger is gone and only the journal can prove the first span's ownership.
+        let batch = first.claim_pending_batch(true).expect("claim losing purge");
+        assert!(
+            first.flush_pending_claimed_batch(batch).is_err(),
+            "the fence must conflict with the peer's restore"
+        );
+        first
+    };
+    // The already-committed span stays byte-identical so its self batch still
+    // matches; only the losing span retires.
+    let journal = first.local.read_events_range(1, u64::MAX).unwrap();
+    let span_children: Vec<Ino> = (0..journal.len())
+        .filter_map(|index| RedbMetaEngine::child_purge_event_span(&journal, index))
+        .map(|span| span.child_ino)
+        .collect();
+    assert_eq!(
+        span_children,
+        vec![published.ino],
+        "reconcile must retire only the losing span, never the published one"
+    );
+    drop(first);
+    let first = retained_test_engine(&first_path);
+    for _ in 0..4 {
+        publish_and_pull(&first);
+    }
+    second.sync_metadata().unwrap();
+
+    let check = |first: &PgMetaEngine| {
+        assert!(
+            first.flushed_event_seq.load(Ordering::SeqCst)
+                >= first
+                    .local
+                    .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
+                    .unwrap(),
+            "the published child purge must self-acknowledge and the loser retire"
+        );
+        for engine in [first, &*second] {
+            assert!(matches!(
+                engine.retained_entry(receipt).unwrap().unwrap().state,
+                RetainedEntryState::Restored { .. }
+            ));
+            assert_eq!(
+                engine.lookup(ROOT_INO, b"restored").unwrap().ino,
+                payload.ino
+            );
+            assert_eq!(engine.lookup(payload.ino, b"kept").unwrap().ino, kept.ino);
+            assert_eq!(
+                engine.lookup(payload.ino, b"losing").unwrap().ino,
+                losing.ino,
+                "a losing child purge must never delete a restored live child"
+            );
+            assert!(engine.lookup(payload.ino, b"published").is_err());
+        }
+    };
+    check(&first);
+    drop(first);
+    let first = retained_test_engine(&first_path);
+    sync_all_pages(&first);
+    check(&first);
+}
+
+/// How the source handle opened before Move to Trash is finalized around the
+/// child purge classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrphanFinalizeOrder {
+    /// Last close before the losing purge is classified.
+    CloseBefore,
+    /// Last close after loser reconcile.
+    CloseAfter,
+    /// Process restart (deferred-delete replay) before classification.
+    RestartBefore,
+    /// No peer restore: the purge wins and restart replay finalizes it.
+    WinnerRestart,
+    /// No peer restore: the purge wins and the running lifecycle sweep
+    /// finalizes it once acknowledged and closed, without a restart.
+    WinnerSweep,
+}
+
+fn pg_event_touches_ino(dsn: &str, volume_id: i64, ino: Ino) -> bool {
+    run_async(with_pg_test_client(dsn, move |client| async move {
+        client
+            .query(
+                "SELECT event_type, event_payload FROM event_log WHERE vol = $1",
+                &[&volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))
+    }))
+    .unwrap()
+    .into_iter()
+    .any(|row| {
+        matches!(
+            crate::events::decode_event_with_type(row.get(0), row.get(1)).unwrap(),
+            crate::MetaEvent::RemoveAttr { ino: removed }
+                | crate::MetaEvent::RemoveRegularFileGraph { ino: removed }
+                if removed == ino
+        )
+    })
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; an orphan close must never finalize a child that a losing purge revived"]
+fn test_pg_retained_open_child_purge_orphan_finalize_respects_live_binding() {
+    use crate::engine::{MetaRecovery, OrphanInodeFinalization};
+    use crate::snapshot_ports::{UploadedFragmentLedger, UploadedObjectDeletionClaim};
+    use crate::trash::{
+        MetaRetainedStore, MetaVolumeSettings, RetainedChildPurgeOutcome, RetainedEntryState,
+    };
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    for (order, object_id) in [
+        (OrphanFinalizeOrder::CloseBefore, 62_001_u64),
+        (OrphanFinalizeOrder::CloseAfter, 62_002),
+        (OrphanFinalizeOrder::RestartBefore, 62_003),
+        (OrphanFinalizeOrder::WinnerRestart, 62_004),
+        (OrphanFinalizeOrder::WinnerSweep, 62_005),
+    ] {
+        let volume = PgTestVolume::new(&dsn, "retained-orphan-close");
+        let volume_id = volume.volume_id;
+        let dir = studiofs_test_support::workspace_target_tempdir("retained-orphan-close-");
+        let first_path = dir.path().join("first");
+        seed_local(&first_path, &volume.format_info());
+        seed_local(&dir.path().join("second"), &volume.format_info());
+        let first = retained_test_engine(&first_path);
+        first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let payload = first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+        let child = create_published_small_file(&first, payload.ino, b"open", object_id);
+        let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let receipt = first.next_inode().unwrap();
+        first
+            .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+            .unwrap();
+        publish_and_pull(&first);
+        // The peer's restore adopts its eager stage copy, so these are the live bytes.
+        let restored_object = object_id + 100;
+        run_async(with_pg_test_client(&dsn, move |client| async move {
+            client
+                .execute(
+                    "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, $2, 'published') ON CONFLICT (vol, object_id) DO UPDATE SET state = 'published'",
+                    &[&volume_id, &(restored_object as i64)],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))
+        }))
+        .unwrap();
+        let second = retained_test_engine(&dir.path().join("second"));
+        sync_all_pages(&second);
+        assert!(second.retained_entry(receipt).unwrap().is_some());
+        if !matches!(
+            order,
+            OrphanFinalizeOrder::WinnerRestart | OrphanFinalizeOrder::WinnerSweep
+        ) {
+            let staged = second.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+            let copy = second
+                .create_file(staged.ino, b"open", 0, 0, 0o644)
+                .unwrap();
+            set_file_state(&second, copy.ino, 64, 1);
+            // A complete eager copy covers exactly the file size.
+            let copy_slices: Vec<_> = fixture_payload_slices(
+                0,
+                Some(&PayloadRef::new_partial(restored_object, 64)),
+                PayloadRefState::LocalOnly,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|(chunk, slices)| {
+                let data: Vec<_> = slices.into_iter().filter(|s| s.payload.is_some()).collect();
+                (chunk, data)
+            })
+            .collect();
+            second
+                .flush_regular_file_overlay_slices(copy.ino, &copy_slices)
+                .unwrap();
+            second
+                .restore_retained_entry(
+                    receipt,
+                    ROOT_INO,
+                    b"restored",
+                    b"stage",
+                    &retained_test_source_fences(&second, receipt),
+                )
+                .unwrap();
+            let epoch = second.get_attr(child.ino).unwrap().content_epoch;
+            mark_overlay_objects_uploaded(&second, child.ino, epoch, &[restored_object]);
+            assert!(
+                second
+                    .publish_regular_file_overlay_to_base_if_matches(child.ino, epoch)
+                    .unwrap()
+            );
+            publish_and_pull(&second);
+        }
+
+        // The source handle opened before Move to Trash keeps the purged inode orphaned.
+        assert!(matches!(
+            first
+                .purge_retained_child(receipt, payload.ino, b"open", child.ino, false)
+                .unwrap(),
+            RetainedChildPurgeOutcome::Removed(_)
+        ));
+        assert_eq!(first.get_attr(child.ino).unwrap().nlink, 0);
+        let first = match order {
+            OrphanFinalizeOrder::CloseBefore
+            | OrphanFinalizeOrder::WinnerRestart
+            | OrphanFinalizeOrder::WinnerSweep => {
+                assert_eq!(
+                    first.finalize_orphan_inode(child.ino, 1).unwrap(),
+                    OrphanInodeFinalization::Deferred,
+                    "{order:?}: an unacknowledged retained child purge must not finalize"
+                );
+                first
+            }
+            OrphanFinalizeOrder::RestartBefore => {
+                drop(first);
+                let first = retained_test_engine(&first_path);
+                first.recover_undo_logs().unwrap();
+                assert_eq!(first.get_attr(child.ino).unwrap().nlink, 0);
+                first
+            }
+            OrphanFinalizeOrder::CloseAfter => first,
+        };
+        first.request_eager_flush();
+        let _ = first.flush_due_pending();
+        for _ in 0..3 {
+            publish_and_pull(&first);
+        }
+        match order {
+            OrphanFinalizeOrder::CloseAfter => assert_eq!(
+                first.finalize_orphan_inode(child.ino, 1).unwrap(),
+                OrphanInodeFinalization::Live,
+                "a reconciled losing purge leaves a live binding"
+            ),
+            OrphanFinalizeOrder::WinnerSweep => {
+                let now = 1_u64 << 40;
+                // A still-open source handle keeps the orphan for its own last close.
+                first.note_open_handle(child.ino, true);
+                assert_eq!(
+                    first
+                        .run_retained_lifecycle_once(now)
+                        .unwrap()
+                        .orphans_finalized,
+                    0
+                );
+                assert_eq!(first.get_attr(child.ino).unwrap().nlink, 0);
+                first.note_open_handle(child.ino, false);
+                assert_eq!(
+                    first
+                        .run_retained_lifecycle_once(now)
+                        .unwrap()
+                        .orphans_finalized,
+                    1,
+                    "the running sweep finalizes an acknowledged winner without a restart"
+                );
+                assert!(first.get_attr(child.ino).is_err());
+                for _ in 0..2 {
+                    publish_and_pull(&first);
+                }
+                assert!(pg_event_touches_ino(&dsn, volume_id, child.ino));
+                assert!(
+                    first
+                        .get_pending_deletions()
+                        .unwrap()
+                        .iter()
+                        .any(|(id, _)| *id == object_id)
+                );
+                assert_eq!(
+                    first
+                        .run_retained_lifecycle_once(now)
+                        .unwrap()
+                        .orphans_finalized,
+                    0
+                );
+                continue;
+            }
+            OrphanFinalizeOrder::WinnerRestart => {
+                drop(first);
+                let reopened = retained_test_engine(&first_path);
+                reopened.recover_undo_logs().unwrap();
+                assert!(
+                    reopened.get_attr(child.ino).is_err(),
+                    "an acknowledged winning purge finalizes on restart replay"
+                );
+                for _ in 0..2 {
+                    publish_and_pull(&reopened);
+                }
+                assert!(
+                    pg_event_touches_ino(&dsn, volume_id, child.ino),
+                    "the winner's orphan finalization reaches shared metadata"
+                );
+                assert!(
+                    reopened
+                        .get_pending_deletions()
+                        .unwrap()
+                        .iter()
+                        .any(|(id, _)| *id == object_id)
+                );
+                continue;
+            }
+            _ => {}
+        }
+        for _ in 0..2 {
+            publish_and_pull(&first);
+        }
+        sync_all_pages(&second);
+
+        let check = |first: &PgMetaEngine| {
+            assert!(
+                first.flushed_event_seq.load(Ordering::SeqCst)
+                    >= first.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+                "{order:?}: the losing purge must retire and the journal drain"
+            );
+            for engine in [first, &*second] {
+                assert!(matches!(
+                    engine.retained_entry(receipt).unwrap().unwrap().state,
+                    RetainedEntryState::Restored { .. }
+                ));
+                assert_eq!(
+                    engine.lookup(payload.ino, b"open").unwrap().ino,
+                    child.ino,
+                    "{order:?}: the restored child must stay bound"
+                );
+                let attr = engine.get_attr(child.ino).unwrap();
+                assert_eq!((attr.nlink, attr.size), (1, 64), "{order:?}");
+                assert_eq!(
+                    lookup_first_object_id(engine, child.ino).unwrap(),
+                    Some(restored_object),
+                    "{order:?}: the restored child keeps its bytes"
+                );
+            }
+            assert!(
+                !first
+                    .get_pending_deletions()
+                    .unwrap()
+                    .iter()
+                    .any(|(id, _)| *id == restored_object),
+                "{order:?}: a live object must not be queued for deletion"
+            );
+        };
+        check(&first);
+        assert!(
+            !pg_event_touches_ino(&dsn, volume_id, child.ino),
+            "{order:?}: no orphan finalization may reach shared metadata"
+        );
+        assert_eq!(
+            first
+                .claim_uploaded_object_deletion(restored_object, "retained-orphan-close")
+                .unwrap(),
+            UploadedObjectDeletionClaim::Protected,
+            "{order:?}: the restored child's current reference protects its object"
+        );
+        drop(first);
+        let first = retained_test_engine(&first_path);
+        first.recover_undo_logs().unwrap();
+        sync_all_pages(&first);
+        check(&first);
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; a local restore must not hide an unacknowledged child purge from the orphan guard"]
+fn test_pg_retained_child_purge_then_local_restore_defers_orphan_finalize() {
+    use crate::engine::{MetaRecovery, OrphanInodeFinalization};
+    use crate::snapshot_ports::{UploadedFragmentLedger, UploadedObjectDeletionClaim};
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings, RetainedChildPurgeOutcome};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    // `true`: a source handle stays open and its last close finalizes; `false`:
+    // no handle, so the running lifecycle sweep finalizes.
+    for (open_handle, object_id) in [(true, 64_001_u64), (false, 64_002)] {
+        let volume = PgTestVolume::new(&dsn, "retained-purge-local-restore");
+        let volume_id = volume.volume_id;
+        let dir = studiofs_test_support::workspace_target_tempdir("retained-purge-local-restore-");
+        let first_path = dir.path().join("first");
+        seed_local(&first_path, &volume.format_info());
+        seed_local(&dir.path().join("second"), &volume.format_info());
+        let first = retained_test_engine(&first_path);
+        first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        let payload = first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+        let child = create_published_small_file(&first, payload.ino, b"open", object_id);
+        let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+        let receipt = first.next_inode().unwrap();
+        first
+            .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+            .unwrap();
+        publish_and_pull(&first);
+        let restored_object = object_id + 100;
+        run_async(with_pg_test_client(&dsn, move |client| async move {
+            client
+                .execute(
+                    "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state) VALUES ($1, $2, 'published') ON CONFLICT (vol, object_id) DO UPDATE SET state = 'published'",
+                    &[&volume_id, &(restored_object as i64)],
+                )
+                .await
+                .map_err(|error| MetaError::Storage(error.to_string()))
+        }))
+        .unwrap();
+        // B restores R first and publishes: its restore wins.
+        let second = retained_test_engine(&dir.path().join("second"));
+        sync_all_pages(&second);
+        let staged = second.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+        let copy = second
+            .create_file(staged.ino, b"open", 0, 0, 0o644)
+            .unwrap();
+        set_file_state(&second, copy.ino, 64, 1);
+        let copy_slices: Vec<_> = fixture_payload_slices(
+            0,
+            Some(&PayloadRef::new_partial(restored_object, 64)),
+            PayloadRefState::LocalOnly,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(chunk, slices)| {
+            let data: Vec<_> = slices.into_iter().filter(|s| s.payload.is_some()).collect();
+            (chunk, data)
+        })
+        .collect();
+        second
+            .flush_regular_file_overlay_slices(copy.ino, &copy_slices)
+            .unwrap();
+        second
+            .restore_retained_entry(
+                receipt,
+                ROOT_INO,
+                b"restored",
+                b"stage",
+                &retained_test_source_fences(&second, receipt),
+            )
+            .unwrap();
+        let epoch = second.get_attr(child.ino).unwrap().content_epoch;
+        mark_overlay_objects_uploaded(&second, child.ino, epoch, &[restored_object]);
+        assert!(
+            second
+                .publish_regular_file_overlay_to_base_if_matches(child.ino, epoch)
+                .unwrap()
+        );
+        publish_and_pull(&second);
+
+        // A (offline from B's restore) purges the child, then restores R locally:
+        // the purged child's old parent leaves the receipt subtree.
+        assert!(matches!(
+            first
+                .purge_retained_child(receipt, payload.ino, b"open", child.ino, false)
+                .unwrap(),
+            RetainedChildPurgeOutcome::Removed(_)
+        ));
+        first.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+        first
+            .restore_retained_entry(
+                receipt,
+                ROOT_INO,
+                b"mine",
+                b"stage",
+                &retained_test_source_fences(&first, receipt),
+            )
+            .unwrap();
+        assert_ne!(
+            first.get_attr(payload.ino).unwrap().parent,
+            receipt,
+            "the local restore moved the purge parent out of the receipt"
+        );
+        if open_handle {
+            assert_eq!(
+                first.finalize_orphan_inode(child.ino, 1).unwrap(),
+                OrphanInodeFinalization::Deferred,
+                "last close: an unacknowledged child purge must defer after a local restore"
+            );
+        } else {
+            assert_eq!(
+                first
+                    .run_retained_lifecycle_once(1_u64 << 40)
+                    .unwrap()
+                    .orphans_finalized,
+                0,
+                "sweep: an unacknowledged child purge must defer after a local restore"
+            );
+        }
+        assert!(first.local.get_attr(child.ino).is_ok());
+
+        first.request_eager_flush();
+        let _ = first.flush_due_pending();
+        for _ in 0..3 {
+            publish_and_pull(&first);
+        }
+        if open_handle {
+            let _ = first.finalize_orphan_inode(child.ino, 1).unwrap();
+        } else {
+            let _ = first.run_retained_lifecycle_once(1_u64 << 40).unwrap();
+        }
+        for _ in 0..2 {
+            publish_and_pull(&first);
+        }
+        sync_all_pages(&second);
+        assert!(
+            !pg_event_touches_ino(&dsn, volume_id, child.ino),
+            "open_handle={open_handle}: no orphan finalization may reach shared metadata"
+        );
+        assert_eq!(
+            second.lookup(payload.ino, b"open").unwrap().ino,
+            child.ino,
+            "open_handle={open_handle}: B's restored child stays bound"
+        );
+        let attr = second.get_attr(child.ino).unwrap();
+        assert_eq!((attr.nlink, attr.size), (1, 64));
+        assert_eq!(
+            lookup_first_object_id(&second, child.ino).unwrap(),
+            Some(restored_object)
+        );
+        assert_eq!(
+            first
+                .claim_uploaded_object_deletion(restored_object, "retained-purge-local-restore")
+                .unwrap(),
+            UploadedObjectDeletionClaim::Protected,
+            "open_handle={open_handle}: B's current reference protects its bytes"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; one failing deferred orphan must not stop the sweep for the others"]
+fn test_pg_retained_lifecycle_sweep_continues_past_failing_orphan() {
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings, RetainedChildPurgeOutcome};
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-sweep-poison");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-sweep-poison-");
+    let path = dir.path().join("first");
+    seed_local(&path, &volume.format_info());
+    let first = retained_test_engine(&path);
+    first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let payload = first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+    let poison = create_published_small_file(&first, payload.ino, b"poison", 65_001);
+    let healthy = create_published_small_file(&first, payload.ino, b"healthy", 65_002);
+    let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = first.next_inode().unwrap();
+    first
+        .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    publish_and_pull(&first);
+    for (name, ino) in [(&b"poison"[..], poison.ino), (&b"healthy"[..], healthy.ino)] {
+        assert!(matches!(
+            first
+                .purge_retained_child(receipt, payload.ino, name, ino, false)
+                .unwrap(),
+            RetainedChildPurgeOutcome::Removed(_)
+        ));
+    }
+    first.request_eager_flush();
+    let _ = first.flush_due_pending();
+    for _ in 0..3 {
+        publish_and_pull(&first);
+    }
+    first.local.corrupt_inode_row_for_test(poison.ino);
+    let sweep = first.run_retained_lifecycle_once(1_u64 << 40).unwrap();
+    assert_eq!(
+        (sweep.orphans_finalized, sweep.orphan_finalize_errors),
+        (1, 1),
+        "the healthy acknowledged orphan finalizes despite the failing one"
+    );
+    assert!(first.get_attr(healthy.ino).is_err());
+    let remaining: Vec<_> = crate::engine::MetaRecovery::list_deferred_deletes(&*first.local)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.ino)
+        .collect();
+    assert_eq!(
+        remaining,
+        vec![poison.ino],
+        "the failing record is kept, nothing deleted"
+    );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; an accepted SetAttr before a losing child purge must stay visible"]
+fn test_pg_retained_losing_child_purge_keeps_pre_purge_set_attr_visible() {
+    use crate::trash::{
+        MetaRetainedStore, MetaVolumeSettings, RetainedChildPurgeOutcome, RetainedEntryState,
+    };
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-child-purge-setattr");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-child-purge-setattr-");
+    let first_path = dir.path().join("first");
+    seed_local(&first_path, &volume.format_info());
+    seed_local(&dir.path().join("second"), &volume.format_info());
+    let first = retained_test_engine(&first_path);
+    first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let payload = first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+    let doomed = first
+        .create_dir(payload.ino, b"doomed", 0, 0, 0o700)
+        .unwrap();
+    let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = first.next_inode().unwrap();
+    first
+        .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    publish_and_pull(&first);
+    let second = retained_test_engine(&dir.path().join("second"));
+    sync_all_pages(&second);
+    assert!(second.retained_entry(receipt).unwrap().is_some());
+    let staged = second.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+    second
+        .create_dir(staged.ino, b"doomed", 0, 0, 0o700)
+        .unwrap();
+    second
+        .restore_retained_entry(
+            receipt,
+            ROOT_INO,
+            b"restored",
+            b"stage",
+            &retained_test_source_fences(&second, receipt),
+        )
+        .unwrap();
+    publish_and_pull(&second);
+
+    // An accepted, unpublished chmod precedes the losing child purge.
+    let mut attr = first.get_attr(doomed.ino).unwrap();
+    attr.mode = (attr.mode & !0o7777) | 0o750;
+    first.set_attr(&attr).unwrap();
+    assert!(matches!(
+        first
+            .purge_retained_child(receipt, payload.ino, b"doomed", doomed.ino, true)
+            .unwrap(),
+        RetainedChildPurgeOutcome::Removed(_)
+    ));
+    first.request_eager_flush();
+    let _ = first.flush_due_pending();
+    // The loser retired; the earlier chmod is the child's local overlay again.
+    let local = first.local.get_attr(doomed.ino).unwrap();
+    assert_eq!(
+        local.mode & 0o7777,
+        0o750,
+        "the pre-purge SetAttr must not be lost"
+    );
+    assert_eq!(
+        first.local.lookup(payload.ino, b"doomed").unwrap().ino,
+        doomed.ino,
+        "a losing child purge must not hide the restored child locally"
+    );
+    for _ in 0..3 {
+        publish_and_pull(&first);
+    }
+    sync_all_pages(&second);
+    assert!(
+        first.flushed_event_seq.load(Ordering::SeqCst)
+            >= first.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+        "the journal must drain"
+    );
+    for engine in [&first, &second] {
+        assert!(matches!(
+            engine.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::Restored { .. }
+        ));
+        assert_eq!(
+            engine.lookup(payload.ino, b"doomed").unwrap().ino,
+            doomed.ino
+        );
+        assert_eq!(engine.get_attr(doomed.ino).unwrap().mode & 0o7777, 0o750);
+    }
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; a losing closed-file purge keeps its local graph and accepted overlay bytes"]
+fn test_pg_retained_losing_file_purge_keeps_local_graph_and_overlay() {
+    use crate::engine::{MetaRecovery, OrphanInodeFinalization};
+    use crate::trash::{
+        MetaRetainedStore, MetaVolumeSettings, RetainedChildPurgeOutcome, RetainedEntryState,
+    };
+    const BASE: u64 = 63_001;
+    const PREWRITE: u64 = 63_002;
+    const RESTORED: u64 = 63_003;
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-file-purge-overlay");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-file-purge-overlay-");
+    let first_path = dir.path().join("first");
+    seed_local(&first_path, &volume.format_info());
+    seed_local(&dir.path().join("second"), &volume.format_info());
+    let first = retained_test_engine(&first_path);
+    first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let payload = first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+    let child = create_published_small_file(&first, payload.ino, b"file", BASE);
+    let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = first.next_inode().unwrap();
+    first
+        .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    publish_and_pull(&first);
+
+    let second = retained_test_engine(&dir.path().join("second"));
+    sync_all_pages(&second);
+    let staged = second.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+    let copy = second
+        .create_file(staged.ino, b"file", 0, 0, 0o644)
+        .unwrap();
+    set_file_state(&second, copy.ino, 64, 1);
+    let exact = |object_id: u64| -> Vec<(ChunkId, Vec<SliceRecord>)> {
+        fixture_payload_slices(
+            0,
+            Some(&PayloadRef::new_partial(object_id, 64)),
+            PayloadRefState::LocalOnly,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(chunk, slices)| {
+            let data: Vec<_> = slices.into_iter().filter(|s| s.payload.is_some()).collect();
+            (chunk, data)
+        })
+        .collect()
+    };
+    second
+        .flush_regular_file_overlay_slices(copy.ino, &exact(RESTORED))
+        .unwrap();
+    second
+        .restore_retained_entry(
+            receipt,
+            ROOT_INO,
+            b"restored",
+            b"stage",
+            &retained_test_source_fences(&second, receipt),
+        )
+        .unwrap();
+    let epoch = second.get_attr(child.ino).unwrap().content_epoch;
+    mark_overlay_objects_uploaded(&second, child.ino, epoch, &[RESTORED]);
+    assert!(
+        second
+            .publish_regular_file_overlay_to_base_if_matches(child.ino, epoch)
+            .unwrap()
+    );
+    publish_and_pull(&second);
+
+    // An accepted, uploaded but unpublished overwrite precedes the closed-file purge.
+    set_file_state(&first, child.ino, 64, 2);
+    first
+        .flush_regular_file_overlay_slices(child.ino, &exact(PREWRITE))
+        .unwrap();
+    mark_overlay_objects_uploaded(&first, child.ino, 2, &[PREWRITE]);
+    assert!(matches!(
+        first
+            .purge_retained_child(receipt, payload.ino, b"file", child.ino, false)
+            .unwrap(),
+        RetainedChildPurgeOutcome::Removed(_)
+    ));
+    // The VFS no-handle path finalizes through the same guard.
+    assert_eq!(
+        first.finalize_orphan_inode(child.ino, 1).unwrap(),
+        OrphanInodeFinalization::Deferred,
+        "a closed-file purge must keep its graph until shared authority settles it"
+    );
+    first.request_eager_flush();
+    let _ = first.flush_due_pending();
+    // Before any pull: the loser is reconciled and the accepted bytes are local again.
+    assert_eq!(
+        first.local.lookup(payload.ino, b"file").unwrap().ino,
+        child.ino,
+        "a losing file purge must not hide the restored child"
+    );
+    assert_eq!(
+        lookup_first_object_id(&first, child.ino).unwrap(),
+        Some(PREWRITE),
+        "the accepted overwrite must stay in the local graph"
+    );
+    let pending = |engine: &PgMetaEngine| {
+        engine
+            .get_pending_deletions()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !pending(&first).contains(&PREWRITE),
+        "GC must not be offered the kept overlay object"
+    );
+    // The uploader then publishes the accepted overlay, as it would after any write.
+    let epoch = first.get_attr(child.ino).unwrap().content_epoch;
+    assert!(
+        first
+            .publish_regular_file_overlay_to_base_if_matches(child.ino, epoch)
+            .unwrap(),
+        "the kept overlay must still be publishable"
+    );
+    for _ in 0..3 {
+        publish_and_pull(&first);
+    }
+    sync_all_pages(&second);
+    assert!(
+        first.flushed_event_seq.load(Ordering::SeqCst)
+            >= first.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+        "the journal must drain"
+    );
+    let first_object = lookup_first_object_id(&first, child.ino).unwrap();
+    for engine in [&first, &second] {
+        assert!(matches!(
+            engine.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::Restored { .. }
+        ));
+        assert_eq!(engine.lookup(payload.ino, b"file").unwrap().ino, child.ino);
+        assert_eq!(engine.get_attr(child.ino).unwrap().nlink, 1);
+        assert_eq!(
+            lookup_first_object_id(engine, child.ino).unwrap(),
+            first_object,
+            "both clients converge on the same bytes"
+        );
+    }
+    assert!(
+        !pending(&first).contains(&first_object.unwrap()),
+        "the converged object must not be queued for deletion"
+    );
+    assert!(!pg_event_touches_ino(&dsn, volume.volume_id, child.ino));
+    assert_eq!(first_object, Some(PREWRITE), "the accepted overwrite wins");
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; a losing purge restores names bound by an earlier local rename or add"]
+fn test_pg_retained_losing_child_purge_restores_pre_purge_rename_and_add() {
+    use crate::trash::{
+        MetaRetainedStore, MetaVolumeSettings, RetainedChildPurgeOutcome, RetainedEntryState,
+    };
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-child-purge-rename");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-child-purge-rename-");
+    let first_path = dir.path().join("first");
+    seed_local(&first_path, &volume.format_info());
+    seed_local(&dir.path().join("second"), &volume.format_info());
+    let first = retained_test_engine(&first_path);
+    first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let payload = first.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+    let moved = first.create_dir(payload.ino, b"a", 0, 0, 0o700).unwrap();
+    let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = first.next_inode().unwrap();
+    first
+        .retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+    publish_and_pull(&first);
+    let second = retained_test_engine(&dir.path().join("second"));
+    sync_all_pages(&second);
+    let staged = second.create_dir(receipt, b"stage", 0, 0, 0o700).unwrap();
+    second.create_dir(staged.ino, b"a", 0, 0, 0o700).unwrap();
+    second
+        .restore_retained_entry(
+            receipt,
+            ROOT_INO,
+            b"restored",
+            b"stage",
+            &retained_test_source_fences(&second, receipt),
+        )
+        .unwrap();
+    publish_and_pull(&second);
+
+    // Accepted local namespace changes precede the losing purges.
+    first.rename(payload.ino, b"a", payload.ino, b"b").unwrap();
+    let added = first.create_dir(payload.ino, b"new", 0, 0, 0o700).unwrap();
+    for (name, ino) in [(&b"b"[..], moved.ino), (b"new", added.ino)] {
+        assert!(matches!(
+            first
+                .purge_retained_child(receipt, payload.ino, name, ino, true)
+                .unwrap(),
+            RetainedChildPurgeOutcome::Removed(_)
+        ));
+    }
+    first.request_eager_flush();
+    let _ = first.flush_due_pending();
+    let local = &first.local;
+    assert_eq!(
+        local.lookup(payload.ino, b"b").unwrap().ino,
+        moved.ino,
+        "the renamed child must be restored at its new name"
+    );
+    assert!(
+        local.lookup(payload.ino, b"a").is_err(),
+        "the old name stays renamed away"
+    );
+    assert_eq!(
+        local.lookup(payload.ino, b"new").unwrap().ino,
+        added.ino,
+        "the locally added child must be restored"
+    );
+    for _ in 0..3 {
+        publish_and_pull(&first);
+    }
+    sync_all_pages(&second);
+    assert!(
+        first.flushed_event_seq.load(Ordering::SeqCst)
+            >= first.local.get_counter(NEXT_EVENT_SEQ).unwrap(),
+        "the journal must drain"
+    );
+    for engine in [&first, &second] {
+        assert!(matches!(
+            engine.retained_entry(receipt).unwrap().unwrap().state,
+            RetainedEntryState::Restored { .. }
+        ));
+        assert_eq!(engine.lookup(payload.ino, b"b").unwrap().ino, moved.ino);
+        assert!(engine.lookup(payload.ino, b"a").is_err());
+        assert_eq!(engine.lookup(payload.ino, b"new").unwrap().ino, added.ino);
+    }
+}
+
+#[test]
+fn retained_child_purge_seq_survives_repair_checkpoint_import_and_defers_orphan_finalize() {
+    use crate::engine::{MetaRecovery, OrphanInodeFinalization};
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings, RetainedChildPurgeOutcome};
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.local.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+    let payload = pg.create_dir(ROOT_INO, b"source", 0, 0, 0o700).unwrap();
+    let child = create_published_small_file(&pg, payload.ino, b"open", 66_001);
+    let store = pg.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let receipt = pg.next_inode().unwrap();
+    pg.retain_namespace_entry(ROOT_INO, b"source", store.ino, receipt)
+        .unwrap();
+
+    // Simulate everything through the retention having been published and checkpointed.
+    let checkpoint = pg
+        .local
+        .begin_serving_checkpoint_snapshot()
+        .unwrap()
+        .export_serving_checkpoint()
+        .unwrap();
+    let flushed = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.persist_flushed_event_seq(flushed).unwrap();
+
+    // Unacknowledged child purge keeps a deferred delete and raises LOCAL_RETAINED_CHILD_PURGE_SEQ.
+    assert!(matches!(
+        pg.purge_retained_child(receipt, payload.ino, b"open", child.ino, false)
+            .unwrap(),
+        RetainedChildPurgeOutcome::Removed(_)
+    ));
+
+    // Repair-style snapshot import keeps the local event journal and deferred deletes,
+    // and replays unacked events back into serving state.
+    pg.import_serving_checkpoint_locked(
+        StartupSnapshotImportMode::ReplaceLocalStatePreservingEventLog,
+        &checkpoint,
+        0,
+    )
+    .unwrap();
+    pg.restore_pending_state_from_local_log().unwrap();
+
+    // Guarded finalization with UnackedChildPurges must defer rather than dropping child payload.
+    assert_eq!(
+        pg.finalize_orphan_inode(child.ino, 1).unwrap(),
+        OrphanInodeFinalization::Deferred,
+        "repair checkpoint import + replay must preserve LOCAL_RETAINED_CHILD_PURGE_SEQ so guarded finalize defers"
+    );
+    assert_ne!(
+        pg.local
+            .get_counter(crate::schema::counters::LOCAL_RETAINED_CHILD_PURGE_SEQ)
+            .unwrap(),
+        0,
+        "LOCAL_RETAINED_CHILD_PURGE_SEQ must survive ReplaceLocalStatePreservingEventLog"
+    );
+    assert_eq!(
+        lookup_first_object_id(&pg, child.ino).unwrap(),
+        Some(66_001),
+        "child payload must stay intact while its purge span is unacknowledged"
+    );
+    assert!(
+        MetaRecovery::list_deferred_deletes(&*pg.local)
+            .unwrap()
+            .iter()
+            .any(|record| record.ino == child.ino),
+        "deferred delete record must remain for the next sweep"
+    );
+    let remote_snapshot = pg.local.export_remote_snapshot().unwrap();
+    assert!(
+        !remote_snapshot
+            .counters
+            .iter()
+            .any(|(name, _)| name == crate::schema::counters::LOCAL_RETAINED_CHILD_PURGE_SEQ),
+        "client-local purge sequence counter must not be exported in remote checkpoints"
+    );
+}
+
+#[test]
+#[ignore = "requires PostgreSQL; >batch failing/Deferred low inodes must not starve healthy high inodes"]
+fn test_pg_retained_lifecycle_sweep_advances_past_deferred_and_failing_low_inodes() {
+    use crate::engine::MetaRecovery;
+    use crate::trash::{MetaRetainedStore, MetaVolumeSettings, RetainedChildPurgeOutcome};
+
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required");
+    let volume = PgTestVolume::new(&dsn, "retained-sweep-fairness");
+    let dir = studiofs_test_support::workspace_target_tempdir("retained-sweep-fairness-");
+    let path = dir.path().join("first");
+    seed_local(&path, &volume.format_info());
+    let first = retained_test_engine(&path);
+    first.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+
+    // Allocate 1,020 low inodes first so all synthetic poison and unacked deferred
+    // inodes stay strictly below `healthy.ino`.
+    let poison_inos = first.next_inode_ids(1_020).unwrap();
+    let unacked_dir = first
+        .create_dir(ROOT_INO, b"unacked-source", 0, 0, 0o700)
+        .unwrap();
+    let mut unacked_files = Vec::new();
+    for idx in 0..10 {
+        let name = format!("unacked-{idx}");
+        let file = create_published_small_file(
+            &first,
+            unacked_dir.ino,
+            name.as_bytes(),
+            65_100 + idx as u64,
+        );
+        unacked_files.push((name, file));
+    }
+    let healthy_dir = first
+        .create_dir(ROOT_INO, b"healthy-source", 0, 0, 0o700)
+        .unwrap();
+    let healthy = create_published_small_file(&first, healthy_dir.ino, b"healthy", 65_200);
+    assert!(poison_inos.iter().all(|&ino| ino < healthy.ino));
+    assert!(unacked_files.iter().all(|(_, f)| f.ino < healthy.ino));
+
+    let store = first.create_dir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
+    let r_unacked = first.next_inode().unwrap();
+    first
+        .retain_namespace_entry(ROOT_INO, b"unacked-source", store.ino, r_unacked)
+        .unwrap();
+    let r_healthy = first.next_inode().unwrap();
+    first
+        .retain_namespace_entry(ROOT_INO, b"healthy-source", store.ino, r_healthy)
+        .unwrap();
+    publish_and_pull(&first);
+
+    // Purge `healthy` and acknowledge its purge in PG so it is ready to finalize.
+    assert!(matches!(
+        first
+            .purge_retained_child(r_healthy, healthy_dir.ino, b"healthy", healthy.ino, false)
+            .unwrap(),
+        RetainedChildPurgeOutcome::Removed(_)
+    ));
+    first.request_eager_flush();
+    let _ = first.flush_due_pending();
+    for _ in 0..3 {
+        publish_and_pull(&first);
+    }
+
+    // Purge the 10 low `unacked` files locally without publishing so their guard stays Deferred.
+    for (name, file) in &unacked_files {
+        assert!(matches!(
+            first
+                .purge_retained_child(r_unacked, unacked_dir.ino, name.as_bytes(), file.ino, false)
+                .unwrap(),
+            RetainedChildPurgeOutcome::Removed(_)
+        ));
+    }
+    first
+        .local
+        .insert_failing_deferred_deletes_for_test(&poison_inos);
+
+    // Total deferred records below `healthy` = 1,020 failing + 10 Deferred = 1,030 > batch (1,024).
+    let sweep1 = first.run_retained_lifecycle_once(1_u64 << 40).unwrap();
+    assert_eq!(sweep1.orphans_finalized, 0);
+    assert_eq!(sweep1.orphan_finalize_errors, 1_020);
+    assert!(
+        first.get_attr(healthy.ino).is_ok(),
+        "healthy inode sits past the first batch"
+    );
+
+    // Pass 2 must resume past pass 1's cursor, finalize `healthy`, keep bounded work,
+    // and never prematurely drop the unacked Deferred purges.
+    let sweep2 = first.run_retained_lifecycle_once(1_u64 << 40).unwrap();
+    assert_eq!(
+        sweep2.orphans_finalized, 1,
+        "second sweep must advance past >batch failing/Deferred low inodes and finalize healthy high inode"
+    );
+    assert_eq!(
+        sweep2.orphan_finalize_errors, 1_017,
+        "second sweep must cap total visited candidates to ORPHAN_FINALIZE_BATCH (6 unacked + 1 healthy + 1017 poison = 1024)"
+    );
+    assert!(
+        first.get_attr(healthy.ino).is_err(),
+        "acknowledged healthy orphan must be finalized"
+    );
+    let remaining: Vec<_> = MetaRecovery::list_deferred_deletes(&*first.local)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.ino)
+        .collect();
+    assert!(!remaining.contains(&healthy.ino));
+    assert_eq!(
+        remaining.len(),
+        1_030,
+        "failing and unacknowledged Deferred records stay protected"
+    );
+    for (_, file) in &unacked_files {
+        let attr = first
+            .local
+            .get_attr(file.ino)
+            .expect("unacked deferred orphan must keep its inode until finalized");
+        assert_eq!(attr.nlink, 0);
+        assert!(
+            lookup_first_object_id(&first, file.ino).unwrap().is_some(),
+            "unacked deferred orphan {} must keep its payload",
+            file.ino
+        );
+    }
+}
+
+#[test]
+fn deferred_orphan_sweep_batch_wraps_and_respects_concurrent_open_handle_recheck() {
+    use crate::engine::MetaRecovery;
+
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    // 5 failing low inodes + 1 healthy high inode (5 is > batch_limit=3).
+    pg.local
+        .insert_failing_deferred_deletes_for_test(&[100, 101, 102, 103, 104]);
+    let dir = pg.create_dir(ROOT_INO, b"src", 0, 0, 0o755).unwrap();
+    let open_high = create_published_small_file(&pg, dir.ino, b"open_high", 66_100);
+    let healthy_high = create_published_small_file(&pg, dir.ino, b"healthy_high", 66_101);
+    pg.unlink_open_handle(dir.ino, b"open_high").unwrap();
+    pg.unlink_open_handle(dir.ino, b"healthy_high").unwrap();
+    // Mark `open_high` as open so the sweep must neither batch it nor finalize it.
+    pg.note_open_handle(open_high.ino, true);
+    // Simulate PG having already acknowledged local deletes so healthy_high is eligible.
+    let seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.persist_flushed_event_seq(seq).unwrap();
+
+    // Pass 1 (batch_limit = 3): visits [100, 101, 102] only (bounded work = 3).
+    let mut sweep1 = crate::pg_engine::retained::RetainedLifecycleSweep::default();
+    let visited1 = pg
+        .finalize_deferred_orphans_batch(1_000, 3, &mut sweep1)
+        .unwrap();
+    assert_eq!(visited1, 3);
+    assert_eq!(
+        (sweep1.orphans_finalized, sweep1.orphan_finalize_errors),
+        (0, 3)
+    );
+    assert!(pg.local.get_attr(healthy_high.ino).is_ok());
+
+    // Pass 2 (batch_limit = 3): resumes after 102 -> visits [103, 104, healthy_high] (skipping open_high).
+    let mut sweep2 = crate::pg_engine::retained::RetainedLifecycleSweep::default();
+    let visited2 = pg
+        .finalize_deferred_orphans_batch(1_000, 3, &mut sweep2)
+        .unwrap();
+    assert_eq!(visited2, 3);
+    assert_eq!(
+        (sweep2.orphans_finalized, sweep2.orphan_finalize_errors),
+        (1, 2)
+    );
+    assert!(pg.local.get_attr(healthy_high.ino).is_err());
+
+    // Add one more low healthy inode and test two concurrent sweeps sharing the cursor.
+    let wrap_healthy = create_published_small_file(&pg, dir.ino, b"wrap_healthy", 66_102);
+    pg.unlink_open_handle(dir.ino, b"wrap_healthy").unwrap();
+    let seq = pg.local.get_counter(NEXT_EVENT_SEQ).unwrap();
+    pg.persist_flushed_event_seq(seq).unwrap();
+
+    let (t1, t2) = std::thread::scope(|scope| {
+        let h1 = scope.spawn(|| {
+            let mut sweep = crate::pg_engine::retained::RetainedLifecycleSweep::default();
+            let visited = pg
+                .finalize_deferred_orphans_batch(1_000, 3, &mut sweep)
+                .unwrap();
+            (visited, sweep)
+        });
+        let h2 = scope.spawn(|| {
+            let mut sweep = crate::pg_engine::retained::RetainedLifecycleSweep::default();
+            let visited = pg
+                .finalize_deferred_orphans_batch(1_000, 3, &mut sweep)
+                .unwrap();
+            (visited, sweep)
+        });
+        (h1.join().unwrap(), h2.join().unwrap())
+    });
+    assert!(t1.0 <= 3 && t2.0 <= 3);
+    assert_eq!(
+        t1.1.orphans_finalized + t2.1.orphans_finalized,
+        1,
+        "exactly one concurrent sweep finalizes wrap_healthy"
+    );
+    assert!(pg.local.get_attr(wrap_healthy.ino).is_err());
+
+    let remaining: Vec<_> = MetaRecovery::list_deferred_deletes(&*pg.local)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.ino)
+        .collect();
+    assert!(remaining.contains(&open_high.ino));
+    pg.note_open_handle(open_high.ino, false);
 }

@@ -43,7 +43,7 @@ pub const DEFAULT_BLOCK_SIZE: u32 = 4 * BYTES_PER_MIB;
 /// changing it requires a metadata-format migration.
 pub const DEFAULT_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
 /// Current on-disk metadata and PostgreSQL sync format version.
-pub const CURRENT_FORMAT_VERSION: u16 = 5;
+pub const CURRENT_FORMAT_VERSION: u16 = 6;
 /// Supported encryption format version for remote payload envelopes.
 pub const CURRENT_ENCRYPTION_FORMAT_VERSION: u16 = 1;
 /// Initial active key identifier for formatted encrypted volumes.
@@ -1988,6 +1988,8 @@ pub mod counters {
     pub const NEXT_EVENT_SEQ: &str = "nextEventSeq";
     /// First local event sequence not yet acknowledged as complete by PostgreSQL replication.
     pub const LOCAL_PG_FLUSHED_EVENT_SEQ: &str = "pgLastFlushedLocalEventSeq";
+    /// Local event sequence of the latest `purge_retained_child` fence.
+    pub const LOCAL_RETAINED_CHILD_PURGE_SEQ: &str = "localRetainedChildPurgeSeq";
     /// Inclusive acknowledged/pruned-through frontier; gaps may have no corresponding event row.
     pub const LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ: &str = "localEventLogPrunedThroughSeq";
     /// Version of the dentry authority summary that covers the pruned local event prefix.

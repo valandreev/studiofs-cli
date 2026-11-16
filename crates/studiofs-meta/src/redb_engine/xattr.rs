@@ -8,6 +8,20 @@ impl RedbMetaEngine {
         Self::set_inode_in_txn(txn, &attr)?;
         Self::append_event_in_txn(txn, &crate::events::MetaEvent::SetAttr { attr })
     }
+
+    /// Receipt records change only through the retained-store transactions;
+    /// a user write could forge one or erase a peer's terminal proof.
+    pub(super) fn reject_reserved_xattr(ino: Ino, name: &[u8]) -> MetaResult<()> {
+        if name != crate::trash::RETAINED_RECEIPT_XATTR {
+            return Ok(());
+        }
+        Err(MetaError::AccessDenied {
+            ino,
+            principal: "reserved-xattr".to_string(),
+            required: AccessLevel::ReadWrite,
+            actual: AccessLevel::ReadOnly,
+        })
+    }
 }
 
 impl MetaXattr for RedbMetaEngine {
@@ -22,6 +36,7 @@ impl MetaXattr for RedbMetaEngine {
     }
 
     fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()> {
+        Self::reject_reserved_xattr(ino, name)?;
         let current = self.get_xattr(ino, name)?;
         let txn = self.begin_write_txn()?;
         {
@@ -57,6 +72,7 @@ impl MetaXattr for RedbMetaEngine {
     }
 
     fn remove_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()> {
+        Self::reject_reserved_xattr(ino, name)?;
         if self.get_xattr(ino, name)?.is_none() {
             return Err(MetaError::EntryNotFound {
                 parent: ino,

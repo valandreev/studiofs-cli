@@ -6,6 +6,17 @@ The canonical PostgreSQL lifecycle, replay, and authority contract is
 [pg-sync-contract.md](./pg-sync-contract.md).
 Terms such as `base` and `overlay` below are metadata-internal names.
 
+The planned recoverable-trash metadata and GC obligations are recorded in the
+[0.2.3 interview contract](superpowers/specs/2026-11-12-recoverable-trash-design.md).
+They are not yet implemented: retained data requires enforced client
+compatibility, current original-parent permission checks, and protection of
+live, open, snapshot and unpublished payload references through existing GC.
+The versioned shared whole-day TTL defaults to zero (disabled) at creation and
+must be changeable afterward through the CLI. Zero stops new retention while
+existing entries expire under the last positive TTL; shortening a positive TTL
+can immediately make entries eligible for background expiry. This needs a new
+mutable shared setting, not machine-local settings or immutable FormatInfo.
+
 `studiofs-meta` exposes synchronous metadata operations through `MetaEngine`.
 `studiofs-vfs` consumes metadata through a typed async boundary:
 - `SyncMetaEngineAdapter<M>` (bridges any sync metadata principal via blocking execution)

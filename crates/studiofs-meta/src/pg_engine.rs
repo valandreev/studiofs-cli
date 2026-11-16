@@ -111,6 +111,8 @@ fn resolve_pg_pool_size(configured: usize) -> MetaResult<usize> {
 pub(crate) const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
 pub(crate) const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
 const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
+/// Per-volume restore-stage owner tag; a replace that wiped it would orphan old stages.
+pub const LOCAL_PG_RETAINED_RESTORE_OWNER_COUNTER: &str = "retainedRestoreOwner";
 const LOCAL_EVENT_LOG_PRUNE_BATCH_ROWS: usize = 256;
 const LOCAL_EVENT_LOG_PRUNE_MAX_BATCHES_PER_POLL: usize = 16;
 pub(crate) const LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER: &str =
@@ -154,7 +156,9 @@ pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
         crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ
             | crate::schema::counters::LOCAL_EVENT_LOG_PRUNED_THROUGH_SEQ
             | crate::schema::counters::LOCAL_DENTRY_MUTATION_BASELINE_VERSION
+            | crate::schema::counters::LOCAL_RETAINED_CHILD_PURGE_SEQ
             | LOCAL_PG_CLIENT_SLOT_COUNTER
+            | LOCAL_PG_RETAINED_RESTORE_OWNER_COUNTER
             | LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER
             | LOCAL_PG_REPAIR_SELF_REPLAY_END_COUNTER
             | LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER
@@ -255,6 +259,10 @@ pub struct PgMetaEngine {
     file_lock_cache: Mutex<HashMap<Ino, FileLockLease>>,
     held_file_locks: Mutex<HashMap<Ino, HeldFileLockLease>>,
     active_open_inodes: Mutex<HashMap<Ino, u32>>,
+    /// Every VFS open handle (reads too); retained purge settlement defers on these.
+    open_handle_inodes: Mutex<HashMap<Ino, u32>>,
+    /// Process-local cursor for fair wrap-around over deferred orphan finalization.
+    retained_orphan_cursor: AtomicU64,
     #[cfg(test)]
     snapshot_import_after_active_open_capture_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
@@ -493,6 +501,7 @@ mod janitor;
 pub(crate) use janitor::PgJanitorSession;
 #[cfg(test)]
 pub(crate) use janitor::pg_janitor_lock_key;
+mod format_upgrade;
 #[path = "pg_engine/lifecycle.rs"]
 mod lifecycle;
 #[path = "pg_engine/local_state.rs"]
@@ -515,6 +524,7 @@ mod remote_apply;
 mod replication_api;
 #[path = "pg_engine/replication_flush.rs"]
 mod replication_flush;
+mod retained;
 #[path = "pg_engine/runtime.rs"]
 mod runtime;
 /// Canonical PostgreSQL schema definition and provisioning helper.
@@ -533,6 +543,8 @@ mod snapshot_policy;
 pub(crate) mod snapshot_reachability;
 #[path = "pg_engine/sql.rs"]
 mod sql;
+mod volume_settings;
+pub use format_upgrade::upgrade_shared_format5;
 use janitor::PgJanitorLock;
 #[cfg(test)]
 use remote_apply::DecodedReplayBatch;
@@ -540,6 +552,8 @@ use remote_apply::{
     OverlayConflictSets, RecentFlush, RemoteApplyCoordinator, RemoteReplayApplyContext,
     RemoteReplayApplyOutcome, RemoteReplayExecution,
 };
+pub use retained::{RetainedLifecycleSweep, seed_retained_authority};
+pub use volume_settings::set_shared_trash_days;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetadataSyncSource {
@@ -1651,6 +1665,8 @@ impl PgMetaEngine {
             file_lock_cache: Mutex::new(HashMap::new()),
             held_file_locks: Mutex::new(HashMap::new()),
             active_open_inodes: Mutex::new(HashMap::new()),
+            open_handle_inodes: Mutex::new(HashMap::new()),
+            retained_orphan_cursor: AtomicU64::new(0),
             #[cfg(test)]
             snapshot_import_after_active_open_capture_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1958,6 +1974,15 @@ impl PgMetaEngine {
             self.signal_poll_wakeup();
         }
         Ok(result)
+    }
+
+    /// Returns the active process-local open-handle registration count for `ino`.
+    pub fn open_handle_registration_count(&self, ino: Ino) -> u32 {
+        self.open_handle_inodes
+            .lock()
+            .ok()
+            .and_then(|handles| handles.get(&ino).copied())
+            .unwrap_or(0)
     }
 }
 

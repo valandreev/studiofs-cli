@@ -228,7 +228,7 @@ impl PgMetaEngine {
         })
     }
 
-    fn selected_local_event_seq(
+    pub(super) fn selected_local_event_seq(
         ranges: &[LocalEventRange],
         mut selected_index: usize,
     ) -> Option<u64> {
@@ -1172,17 +1172,19 @@ impl PgMetaEngine {
         }
     }
 
-    fn flush_pending_claimed_batch(
+    pub(super) fn flush_pending_claimed_batch(
         &self,
         batch: ClaimedPendingBatch,
     ) -> MetaResult<Option<RecentFlush>> {
-        let events = self
-            .local
-            .read_events_range(batch.event_start, batch.event_end)?;
+        // A restored claim can start below a cursor that a retired record advanced.
+        let event_start = batch
+            .event_start
+            .max(self.flushed_event_seq.load(Ordering::SeqCst));
+        let events = self.local.read_events_range(event_start, batch.event_end)?;
         if events.is_empty() {
             return Ok(None);
         }
-        let selected = self.select_unprocessed_local_events(batch.event_start, &events)?;
+        let selected = self.select_unprocessed_local_events(event_start, &events)?;
         if selected.events.is_empty() {
             self.recompute_pending_state_from_local_log()?;
             return Ok(None);
@@ -1255,7 +1257,45 @@ impl PgMetaEngine {
                 }])?;
                 return Err(error);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                // A losing offline terminal receipt record is final. Retire only
+                // that record so the durable cursor can pass it once the rest of
+                // the accepted local journal is acknowledged.
+                let (losing, stale_expiries) = self
+                    .losing_retained_terminal_records(selected.events.as_ref(), &selected.ranges)
+                    .unwrap_or_else(|classify_error| {
+                        warn!(
+                            volume_id = self.volume_id,
+                            error = %classify_error,
+                            "could not classify retained receipt conflicts; keeping the local journal pending"
+                        );
+                        (Vec::new(), Vec::new())
+                    });
+                // Revert the stale overlay, then retire its journal range. A crash in
+                // between leaves the proposal pending; it replays and shared commit
+                // rejects it again, since a rejected revision never becomes current.
+                for (receipt, settings_revision) in stale_expiries {
+                    self.local
+                        .discard_stale_retained_expiry(receipt, settings_revision)?;
+                }
+                let losing = losing
+                    .into_iter()
+                    .filter_map(|index| Self::selected_local_event_seq(&selected.ranges, index))
+                    .map(|start| LocalEventRange {
+                        start,
+                        end: start.saturating_add(1),
+                    })
+                    .collect::<Vec<_>>();
+                if !losing.is_empty() {
+                    warn!(
+                        volume_id = self.volume_id,
+                        retired = losing.len(),
+                        "retained receipt lost its shared terminal transition; publishing the remaining local journal"
+                    );
+                    self.complete_local_event_ranges(&losing)?;
+                }
+                return Err(error);
+            }
         };
         // A hidden suffix after the projected prefix was not published. Leave it
         // selectable so the next batch starts at the self-ack boundary.

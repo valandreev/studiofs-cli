@@ -289,6 +289,8 @@ pub(crate) struct ServingCheckpoint {
     /// Appended in format version 2; peers that created an alias may still
     /// publish events naming it after this checkpoint's cut.
     pub(crate) directory_aliases: Vec<(u64, u64)>,
+    /// Shared mutable settings, appended in checkpoint format version 3.
+    pub(crate) volume_settings: crate::trash::VolumeSettings,
 }
 
 /// Format version 1 layout: the version 2 fields without directory aliases.
@@ -304,7 +306,7 @@ struct ServingCheckpointV1 {
 
 impl ServingCheckpoint {
     /// The persisted checkpoint format version.
-    pub(crate) const FORMAT_VERSION: i16 = 2;
+    pub(crate) const FORMAT_VERSION: i16 = 3;
     /// The serving-state schema version.
     pub(crate) const SCHEMA_VERSION: i16 = 1;
 
@@ -319,14 +321,15 @@ impl ServingCheckpoint {
     /// version 1; a present version 2 alias suffix must decode completely.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
         let (v1, suffix) = postcard::take_from_bytes::<ServingCheckpointV1>(bytes)?;
-        let directory_aliases = if suffix.is_empty() {
-            Vec::new()
+        let (directory_aliases, suffix) = if suffix.is_empty() {
+            (Vec::new(), suffix)
         } else {
-            let (aliases, remainder) = postcard::take_from_bytes(suffix)?;
-            if !remainder.is_empty() {
-                return Err(postcard::Error::DeserializeBadEncoding);
-            }
-            aliases
+            postcard::take_from_bytes(suffix)?
+        };
+        let volume_settings = if suffix.is_empty() {
+            crate::trash::VolumeSettings::default()
+        } else {
+            postcard::from_bytes(suffix)?
         };
         Ok(Self {
             inodes: v1.inodes,
@@ -336,6 +339,7 @@ impl ServingCheckpoint {
             xattrs: v1.xattrs,
             acl_rules: v1.acl_rules,
             directory_aliases,
+            volume_settings,
         })
     }
 }
@@ -1048,28 +1052,48 @@ mod tests {
     }
 
     #[test]
-    fn serving_checkpoint_decodes_both_format_versions() {
-        let checkpoint = ServingCheckpoint {
+    fn serving_checkpoint_decodes_all_format_versions() {
+        let mut checkpoint = ServingCheckpoint {
             inodes: vec![(1, vec![7])],
             dentries: vec![(vec![1, 2], vec![3])],
             directory_aliases: vec![(40, 30)],
             ..ServingCheckpoint::default()
         };
-        let v2 = postcard::to_stdvec(&checkpoint).unwrap();
+        checkpoint.volume_settings.revision = 1;
+        checkpoint.volume_settings.trash.set_days(7);
+        let v3 = postcard::to_stdvec(&checkpoint).unwrap();
+        assert_eq!(ServingCheckpoint::decode(&v3).unwrap(), checkpoint);
+        let v2 = postcard::to_stdvec(&(
+            &checkpoint.inodes,
+            &checkpoint.dentries,
+            &checkpoint.regular_file_base,
+            &checkpoint.symlinks,
+            &checkpoint.xattrs,
+            &checkpoint.acl_rules,
+            &checkpoint.directory_aliases,
+        ))
+        .unwrap();
+        checkpoint.volume_settings = Default::default();
         assert_eq!(ServingCheckpoint::decode(&v2).unwrap(), checkpoint);
-
+        let v1 = postcard::to_stdvec(&(
+            &checkpoint.inodes,
+            &checkpoint.dentries,
+            &checkpoint.regular_file_base,
+            &checkpoint.symlinks,
+            &checkpoint.xattrs,
+            &checkpoint.acl_rules,
+        ))
+        .unwrap();
         let without_aliases = ServingCheckpoint {
             directory_aliases: Vec::new(),
             ..checkpoint
         };
-        let mut v1 = postcard::to_stdvec(&without_aliases).unwrap();
-        // Version 1 bytes end before the alias vector's length prefix.
-        assert_eq!(v1.pop(), Some(0));
         assert_eq!(ServingCheckpoint::decode(&v1).unwrap(), without_aliases);
         assert!(ServingCheckpoint::decode(&v1[..v1.len() - 1]).is_err());
         assert!(ServingCheckpoint::supports_format_version(1));
         assert!(ServingCheckpoint::supports_format_version(2));
-        assert!(!ServingCheckpoint::supports_format_version(3));
+        assert!(ServingCheckpoint::supports_format_version(3));
+        assert!(!ServingCheckpoint::supports_format_version(4));
     }
     use super::*;
     use chrono::{NaiveDate, TimeZone, Utc};

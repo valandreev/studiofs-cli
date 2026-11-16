@@ -241,13 +241,10 @@ impl JanitorMetadataSession {
             .local
             .get_counter(crate::pg_engine::LOCAL_PG_VERSION_COUNTER)
             .map_err(backend_unavailable)?;
-        let next_event_seq = self
+        // Normalized positions: an absent `NEXT_EVENT_SEQ` is the empty log (end 1).
+        let (local_event_end, durable_cursor) = self
             .local
-            .get_counter(crate::schema::counters::NEXT_EVENT_SEQ)
-            .map_err(backend_unavailable)?;
-        let flushed_event_seq = self
-            .local
-            .get_counter(crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ)
+            .local_outbound_ack_positions()
             .map_err(backend_unavailable)?;
         if self
             .local
@@ -259,7 +256,7 @@ impl JanitorMetadataSession {
                 .get_counter(crate::pg_engine::LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER)
                 .map_err(backend_unavailable)?
                 != 0
-            || next_event_seq != flushed_event_seq
+            || local_event_end != durable_cursor
             || !self
                 .local
                 .pending_local_upload_ledger(1)

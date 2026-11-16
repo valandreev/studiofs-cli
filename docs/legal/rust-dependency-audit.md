@@ -1,5 +1,25 @@
 # Rust dependency license audit for v0.2.0
 
+## RUSTSEC-2026-0538 quinn-udp renewal, 2026-11-16
+
+The reviewed inventory is renewed for `quinn-udp 0.5.14 -> 0.5.16`. The new
+archive SHA-256 is
+`af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016`; its
+manifest still declares `MIT OR Apache-2.0`, and its `LICENSE-APACHE` and
+`LICENSE-MIT` are byte-identical to 0.5.14. No policy exception or notice
+supplement is needed. The update drops the now-unused `windows-sys 0.60.2`,
+`windows-targets 0.53.5` and eight `windows_* 0.53.1` identities, and the
+inventory records the reassigned dependency edges and the current 0.2.3
+workspace versions. Counts are now 651 lock entries: 639 registry and 12
+workspace packages; product scopes are Windows 333, Linux 372, macOS 365.
+The LF-normalized lockfile SHA-256 is
+`c093264bdfc51835f763806f207e4363364d3f857bd2f93e7d3c88745c35c90a`;
+the renewed inventory SHA-256 is
+`4bdcdf545e3d7fb62ed0c99cb90ec8fce74eb19150b2ece918caf7f0768b1a9a`.
+Reproduction used `cargo metadata --locked --format-version 1` saved as
+`target/quinn-udp/metadata.json`, then the inventory generator with that
+explicit `--metadata` path.
+
 ## SFS-884 Linux event-loop scope renewal, 2026-10-27
 
 After isolating the Linux KSNI tray, `winit` is needed only by Windows/macOS.

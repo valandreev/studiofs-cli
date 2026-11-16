@@ -566,6 +566,7 @@ impl VfsBootstrap {
             zeroio_runtime_state_dir: resources.zeroio_runtime_state_dir,
             landing_zone: resources.landing_zone,
             landing_zone_recovery_gate: tokio::sync::Mutex::new(()),
+            retained_restore_gate: tokio::sync::Mutex::new(()),
             handle_table: HandleTable::new(),
             os_cache: Arc::new(Mutex::new(OsCacheState::default())),
             coherence_health: Arc::new(Mutex::new(CoherenceHealthTracker::new(
@@ -609,6 +610,8 @@ impl VfsBootstrap {
             fail_landing_zone_replay_after: std::sync::atomic::AtomicUsize::new(usize::MAX),
             #[cfg(test)]
             supersede_window_hook: Mutex::new(None),
+            #[cfg(test)]
+            retained_restore_hook: Mutex::new(None),
         })
     }
 

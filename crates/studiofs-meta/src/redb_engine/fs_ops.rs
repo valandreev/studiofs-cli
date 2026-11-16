@@ -457,6 +457,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         {
             return Ok(NamespaceDeleteResult::TargetChanged);
         }
+        RedbMetaEngine::reject_receipt_removal_in_txn(self.txn, entry.ino)?;
         if spec.allows_directory_target() {
             self.execute_rmdir(spec, entry)
         } else {
@@ -957,193 +958,18 @@ impl MetaFsOps for RedbMetaEngine {
         retain_displaced_inode: bool,
     ) -> MetaResult<RenameAtomicResult> {
         let txn = self.begin_write_txn()?;
-        let src_entry = Self::lookup_merged_in_write_txn(&txn, parent, name)?.ok_or_else(|| {
-            MetaError::EntryNotFound {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            }
-        })?;
-        let dst_entry_opt = Self::lookup_merged_in_write_txn(&txn, new_parent, new_name)?;
-        if !replace_if_exists && dst_entry_opt.is_some() {
-            return Err(MetaError::EntryExists {
-                parent: new_parent,
-                name: String::from_utf8_lossy(new_name).to_string(),
-            });
-        }
-        if dst_entry_opt
-            .as_ref()
-            .is_some_and(|dst| dst.ino == src_entry.ino)
-        {
-            return Ok(RenameAtomicResult {
-                moved_ino: src_entry.ino,
-                namespace_changed: false,
-                displaced: None,
-            });
-        }
-        if let Some(dst_entry) = &dst_entry_opt
-            && dst_entry.kind == FileType::Directory
-        {
-            Self::ensure_directory_empty_in_write_txn(&txn, dst_entry.ino)?;
-        }
-
-        let moved_dir_seed = if src_entry.kind == FileType::Directory {
-            Some(Self::get_attr_merged_in_write_txn(&txn, src_entry.ino)?)
-        } else {
-            None
-        };
-        let old_parent_seed = if parent != new_parent {
-            Some(Self::get_attr_merged_in_write_txn(&txn, parent)?)
-        } else {
-            None
-        };
-        let displaces_dir = dst_entry_opt
-            .as_ref()
-            .is_some_and(|dst| dst.kind == FileType::Directory);
-        let mut new_parent_attr = Self::get_attr_merged_in_write_txn(&txn, new_parent)?;
-        let mut displaced = None;
-        let mut displaced_set_attr = None;
-        let mut displaced_remove_attr_ino = None;
-        let mut moved_dir_attr = moved_dir_seed;
-        let mut old_parent_attr = old_parent_seed;
-        {
-            Self::remove_dentry_overlay_in_txn(&txn, parent, name)?;
-            if let Some(dst_entry) = &dst_entry_opt {
-                let mut attr = Self::get_attr_merged_in_write_txn(&txn, dst_entry.ino)?;
-                if dst_entry.kind == FileType::Directory {
-                    attr.nlink = 0;
-                    Self::remove_inode_overlay_in_txn(&txn, dst_entry.ino)?;
-                    Self::clear_inode_overlay_aux_in_txn(&txn, dst_entry.ino)?;
-                    displaced_remove_attr_ino = Some(dst_entry.ino);
-                } else {
-                    attr.nlink = attr.nlink.saturating_sub(1);
-                    attr.touch_ctime();
-                    if attr.nlink == 0 && !retain_displaced_inode {
-                        Self::remove_inode_overlay_in_txn(&txn, dst_entry.ino)?;
-                        Self::clear_inode_overlay_aux_in_txn_with_options(
-                            &txn,
-                            dst_entry.ino,
-                            attr.kind != FileType::RegularFile,
-                        )?;
-                        displaced_remove_attr_ino = Some(dst_entry.ino);
-                    } else {
-                        Self::set_inode_in_txn(&txn, &attr)?;
-                        if attr.nlink == 0 {
-                            NamespaceDeleteTxn::new(&txn).record_deferred_delete(
-                                &NamespaceDeleteSpec::new_unlink_open_handle(new_parent, new_name),
-                                attr.ino,
-                            )?;
-                        }
-                        if attr.nlink == 0 && attr.committed_content_epoch == 0 {
-                            // Peers never saw a published body; retire it there like unlink.
-                            displaced_remove_attr_ino = Some(dst_entry.ino);
-                        } else {
-                            displaced_set_attr = Some(attr.clone());
-                        }
-                    }
-                }
-                Self::remove_dentry_overlay_in_txn(&txn, new_parent, new_name)?;
-                displaced = Some(attr);
-            }
-
-            Self::set_dentry_in_txn(&txn, new_parent, new_name, &src_entry)?;
-
-            if src_entry.kind == FileType::Directory
-                && let Some(mut attr) = moved_dir_attr.take()
-            {
-                if parent != new_parent {
-                    attr.parent = new_parent;
-                }
-                attr.touch_ctime();
-                Self::set_inode_in_txn(&txn, &attr)?;
-                moved_dir_attr = Some(attr);
-            }
-            if let Some(mut attr) = old_parent_attr.take() {
-                if src_entry.kind == FileType::Directory {
-                    attr.nlink = attr.nlink.saturating_sub(1);
-                }
-                attr.touch_mtime();
-                Self::set_inode_in_txn(&txn, &attr)?;
-                old_parent_attr = Some(attr);
-            }
-            if src_entry.kind == FileType::Directory && parent != new_parent {
-                new_parent_attr.nlink += 1;
-            }
-            // The displaced directory's ".." link to new_parent goes with it.
-            if displaces_dir {
-                new_parent_attr.nlink = new_parent_attr.nlink.saturating_sub(1);
-            }
-            new_parent_attr.touch_mtime();
-            Self::set_inode_in_txn(&txn, &new_parent_attr)?;
-
-            // An empty draft's own names stay out of PG, so its RenameEntry is
-            // projected away; journal a replaced file's removal on its own.
-            if src_entry.kind == FileType::RegularFile
-                && dst_entry_opt
-                    .as_ref()
-                    .is_some_and(|dst| dst.kind != FileType::Directory)
-                && Self::get_attr_merged_in_write_txn(&txn, src_entry.ino)?
-                    .is_unpublished_empty_draft()
-            {
-                Self::append_event_in_txn(
-                    &txn,
-                    &crate::events::MetaEvent::RemoveEntry {
-                        parent: new_parent,
-                        name: new_name.to_vec(),
-                    },
-                )?;
-                if let Some(attr) = displaced_set_attr.take() {
-                    Self::append_event_in_txn(&txn, &crate::events::MetaEvent::SetAttr { attr })?;
-                }
-                if let Some(ino) = displaced_remove_attr_ino.take() {
-                    Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveAttr { ino })?;
-                }
-                // The hidden RenameEntry cannot carry the parent's removal times.
-                Self::append_event_in_txn(
-                    &txn,
-                    &crate::events::MetaEvent::SetAttr {
-                        attr: new_parent_attr.clone(),
-                    },
-                )?;
-            }
-
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::RenameEntry {
-                    parent,
-                    name: name.to_vec(),
-                    new_parent,
-                    new_name: new_name.to_vec(),
-                    entry: src_entry.clone(),
-                    displaced_set_attr: Box::new(displaced_set_attr),
-                    displaced_remove_attr_ino,
-                    moved_dir_attr: Box::new(moved_dir_attr),
-                    old_parent_attr: Box::new(old_parent_attr),
-                    new_parent_attr: Box::new(Some(new_parent_attr)),
-                },
-            )?;
-            if src_entry.kind != FileType::Directory {
-                let mut attr = Self::get_attr_merged_in_write_txn(&txn, src_entry.ino)?;
-                attr.touch_ctime();
-                Self::set_inode_in_txn(&txn, &attr)?;
-                Self::append_event_in_txn(&txn, &crate::events::MetaEvent::SetAttr { attr })?;
-            }
-        }
-        if src_entry.kind == FileType::RegularFile {
-            Self::refresh_pending_regular_file_recovery_metadata_in_txn(&txn, src_entry.ino)?;
-        }
-        if let Some(displaced) = dst_entry_opt.as_ref()
-            && displaced.kind == FileType::RegularFile
-            && displaced.ino != src_entry.ino
-        {
-            Self::refresh_pending_regular_file_recovery_metadata_in_txn(&txn, displaced.ino)?;
-        }
+        let result = Self::rename_in_txn(
+            &txn,
+            parent,
+            name,
+            new_parent,
+            new_name,
+            replace_if_exists,
+            retain_displaced_inode,
+        )?;
         txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(RenameAtomicResult {
-            moved_ino: src_entry.ino,
-            namespace_changed: true,
-            displaced,
-        })
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        Ok(result)
     }
 
     // --- Hardlinks -------------------------------------------------------
@@ -1326,5 +1152,204 @@ impl MetaFsOps for RedbMetaEngine {
             NamespaceDeleteResult::TargetChanged => Ok(None),
             NamespaceDeleteResult::File(_) => unreachable!("rmdir must only remove directories"),
         }
+    }
+}
+
+impl RedbMetaEngine {
+    pub(super) fn rename_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        replace_if_exists: bool,
+        retain_displaced_inode: bool,
+    ) -> MetaResult<RenameAtomicResult> {
+        let src_entry = Self::lookup_merged_in_write_txn(txn, parent, name)?.ok_or_else(|| {
+            MetaError::EntryNotFound {
+                parent,
+                name: String::from_utf8_lossy(name).to_string(),
+            }
+        })?;
+        let dst_entry_opt = Self::lookup_merged_in_write_txn(txn, new_parent, new_name)?;
+        if !replace_if_exists && dst_entry_opt.is_some() {
+            return Err(MetaError::EntryExists {
+                parent: new_parent,
+                name: String::from_utf8_lossy(new_name).to_string(),
+            });
+        }
+        if dst_entry_opt
+            .as_ref()
+            .is_some_and(|dst| dst.ino == src_entry.ino)
+        {
+            return Ok(RenameAtomicResult {
+                moved_ino: src_entry.ino,
+                namespace_changed: false,
+                displaced: None,
+            });
+        }
+        if let Some(dst_entry) = &dst_entry_opt {
+            Self::reject_receipt_removal_in_txn(txn, dst_entry.ino)?;
+            if dst_entry.kind == FileType::Directory {
+                Self::ensure_directory_empty_in_write_txn(txn, dst_entry.ino)?;
+            }
+        }
+
+        let moved_dir_seed = if src_entry.kind == FileType::Directory {
+            Some(Self::get_attr_merged_in_write_txn(txn, src_entry.ino)?)
+        } else {
+            None
+        };
+        let old_parent_seed = if parent != new_parent {
+            Some(Self::get_attr_merged_in_write_txn(txn, parent)?)
+        } else {
+            None
+        };
+        let displaces_dir = dst_entry_opt
+            .as_ref()
+            .is_some_and(|dst| dst.kind == FileType::Directory);
+        let mut new_parent_attr = Self::get_attr_merged_in_write_txn(txn, new_parent)?;
+        let mut displaced = None;
+        let mut displaced_set_attr = None;
+        let mut displaced_remove_attr_ino = None;
+        let mut moved_dir_attr = moved_dir_seed;
+        let mut old_parent_attr = old_parent_seed;
+        {
+            Self::remove_dentry_overlay_in_txn(txn, parent, name)?;
+            if let Some(dst_entry) = &dst_entry_opt {
+                let mut attr = Self::get_attr_merged_in_write_txn(txn, dst_entry.ino)?;
+                if dst_entry.kind == FileType::Directory {
+                    attr.nlink = 0;
+                    Self::remove_inode_overlay_in_txn(txn, dst_entry.ino)?;
+                    Self::clear_inode_overlay_aux_in_txn(txn, dst_entry.ino)?;
+                    displaced_remove_attr_ino = Some(dst_entry.ino);
+                } else {
+                    attr.nlink = attr.nlink.saturating_sub(1);
+                    attr.touch_ctime();
+                    if attr.nlink == 0 && !retain_displaced_inode {
+                        Self::remove_inode_overlay_in_txn(txn, dst_entry.ino)?;
+                        Self::clear_inode_overlay_aux_in_txn_with_options(
+                            txn,
+                            dst_entry.ino,
+                            attr.kind != FileType::RegularFile,
+                        )?;
+                        displaced_remove_attr_ino = Some(dst_entry.ino);
+                    } else {
+                        Self::set_inode_in_txn(txn, &attr)?;
+                        if attr.nlink == 0 {
+                            NamespaceDeleteTxn::new(txn).record_deferred_delete(
+                                &NamespaceDeleteSpec::new_unlink_open_handle(new_parent, new_name),
+                                attr.ino,
+                            )?;
+                        }
+                        if attr.nlink == 0 && attr.committed_content_epoch == 0 {
+                            // Peers never saw a published body; retire it there like unlink.
+                            displaced_remove_attr_ino = Some(dst_entry.ino);
+                        } else {
+                            displaced_set_attr = Some(attr.clone());
+                        }
+                    }
+                }
+                Self::remove_dentry_overlay_in_txn(txn, new_parent, new_name)?;
+                displaced = Some(attr);
+            }
+
+            Self::set_dentry_in_txn(txn, new_parent, new_name, &src_entry)?;
+
+            if src_entry.kind == FileType::Directory
+                && let Some(mut attr) = moved_dir_attr.take()
+            {
+                if parent != new_parent {
+                    attr.parent = new_parent;
+                }
+                attr.touch_ctime();
+                Self::set_inode_in_txn(txn, &attr)?;
+                moved_dir_attr = Some(attr);
+            }
+            if let Some(mut attr) = old_parent_attr.take() {
+                if src_entry.kind == FileType::Directory {
+                    attr.nlink = attr.nlink.saturating_sub(1);
+                }
+                attr.touch_mtime();
+                Self::set_inode_in_txn(txn, &attr)?;
+                old_parent_attr = Some(attr);
+            }
+            if src_entry.kind == FileType::Directory && parent != new_parent {
+                new_parent_attr.nlink += 1;
+            }
+            // The displaced directory's ".." link to new_parent goes with it.
+            if displaces_dir {
+                new_parent_attr.nlink = new_parent_attr.nlink.saturating_sub(1);
+            }
+            new_parent_attr.touch_mtime();
+            Self::set_inode_in_txn(txn, &new_parent_attr)?;
+
+            // An empty draft's own names stay out of PG, so its RenameEntry is
+            // projected away; journal a replaced file's removal on its own.
+            if src_entry.kind == FileType::RegularFile
+                && dst_entry_opt
+                    .as_ref()
+                    .is_some_and(|dst| dst.kind != FileType::Directory)
+                && Self::get_attr_merged_in_write_txn(txn, src_entry.ino)?
+                    .is_unpublished_empty_draft()
+            {
+                Self::append_event_in_txn(
+                    txn,
+                    &crate::events::MetaEvent::RemoveEntry {
+                        parent: new_parent,
+                        name: new_name.to_vec(),
+                    },
+                )?;
+                if let Some(attr) = displaced_set_attr.take() {
+                    Self::append_event_in_txn(txn, &crate::events::MetaEvent::SetAttr { attr })?;
+                }
+                if let Some(ino) = displaced_remove_attr_ino.take() {
+                    Self::append_event_in_txn(txn, &crate::events::MetaEvent::RemoveAttr { ino })?;
+                }
+                // The hidden RenameEntry cannot carry the parent's removal times.
+                Self::append_event_in_txn(
+                    txn,
+                    &crate::events::MetaEvent::SetAttr {
+                        attr: new_parent_attr.clone(),
+                    },
+                )?;
+            }
+
+            Self::append_event_in_txn(
+                txn,
+                &crate::events::MetaEvent::RenameEntry {
+                    parent,
+                    name: name.to_vec(),
+                    new_parent,
+                    new_name: new_name.to_vec(),
+                    entry: src_entry.clone(),
+                    displaced_set_attr: Box::new(displaced_set_attr),
+                    displaced_remove_attr_ino,
+                    moved_dir_attr: Box::new(moved_dir_attr),
+                    old_parent_attr: Box::new(old_parent_attr),
+                    new_parent_attr: Box::new(Some(new_parent_attr)),
+                },
+            )?;
+            if src_entry.kind != FileType::Directory {
+                let mut attr = Self::get_attr_merged_in_write_txn(txn, src_entry.ino)?;
+                attr.touch_ctime();
+                Self::set_inode_in_txn(txn, &attr)?;
+                Self::append_event_in_txn(txn, &crate::events::MetaEvent::SetAttr { attr })?;
+            }
+        }
+        if src_entry.kind == FileType::RegularFile {
+            Self::refresh_pending_regular_file_recovery_metadata_in_txn(txn, src_entry.ino)?;
+        }
+        if let Some(displaced) = dst_entry_opt.as_ref()
+            && displaced.kind == FileType::RegularFile
+            && displaced.ino != src_entry.ino
+        {
+            Self::refresh_pending_regular_file_recovery_metadata_in_txn(txn, displaced.ino)?;
+        }
+        Ok(RenameAtomicResult {
+            moved_ino: src_entry.ino,
+            namespace_changed: true,
+            displaced,
+        })
     }
 }

@@ -1439,8 +1439,11 @@ impl FsKitDispatcher {
         };
         match self.adapter.lookup(header.nodeid, &name) {
             Ok(attr) => {
-                let _ = request
-                    .reply_struct(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
+                let _ = request.reply_struct(entry_from_stat(
+                    attr.ino,
+                    self.adapter.attr_to_stat(&attr),
+                    self.adapter.entry_ttl(attr.ino),
+                ));
             }
             Err(errno) => {
                 let _ = request.reply_error(errno);
@@ -1458,9 +1461,10 @@ impl FsKitDispatcher {
     }
 
     fn getattr(&self, request: FsKitRequest) {
-        match self.adapter.getattr(request.header().nodeid) {
+        let ino = request.header().nodeid;
+        match self.adapter.getattr(ino) {
             Ok(stat) => {
-                let _ = request.reply_struct(attr_out_from_stat(stat));
+                let _ = request.reply_struct(attr_out_from_stat(stat, self.adapter.entry_ttl(ino)));
             }
             Err(errno) => {
                 let _ = request.reply_error(errno);
@@ -1749,8 +1753,11 @@ impl FsKitDispatcher {
             input.mode as libc::mode_t,
         ) {
             Ok(attr) => {
-                let _ = request
-                    .reply_struct(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
+                let _ = request.reply_struct(entry_from_stat(
+                    attr.ino,
+                    self.adapter.attr_to_stat(&attr),
+                    self.adapter.entry_ttl(attr.ino),
+                ));
             }
             Err(errno) => {
                 let _ = request.reply_error(errno);
@@ -1784,8 +1791,11 @@ impl FsKitDispatcher {
             input.mode as libc::mode_t,
         ) {
             Ok(attr) => {
-                let _ = request
-                    .reply_struct(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
+                let _ = request.reply_struct(entry_from_stat(
+                    attr.ino,
+                    self.adapter.attr_to_stat(&attr),
+                    self.adapter.entry_ttl(attr.ino),
+                ));
             }
             Err(errno) => {
                 let _ = request.reply_error(errno);
@@ -1875,8 +1885,11 @@ impl FsKitDispatcher {
         spawn_blocking_reply_task(&self.runtime_handle, task_guard, move || {
             match adapter.link(input.oldnodeid, parent, &name) {
                 Ok(attr) => {
-                    let _ = request
-                        .reply_struct(entry_from_stat(attr.ino, adapter.attr_to_stat(&attr)));
+                    let _ = request.reply_struct(entry_from_stat(
+                        attr.ino,
+                        adapter.attr_to_stat(&attr),
+                        adapter.entry_ttl(attr.ino),
+                    ));
                 }
                 Err(errno) => {
                     let _ = request.reply_error(errno);
@@ -1925,8 +1938,11 @@ impl FsKitDispatcher {
                 .await
             {
                 Ok(attr) => {
-                    let _ = request
-                        .reply_struct(entry_from_stat(attr.ino, adapter.attr_to_stat(&attr)));
+                    let _ = request.reply_struct(entry_from_stat(
+                        attr.ino,
+                        adapter.attr_to_stat(&attr),
+                        adapter.entry_ttl(attr.ino),
+                    ));
                 }
                 Err(errno) => {
                     let _ = request.reply_error(errno);
@@ -1963,8 +1979,11 @@ impl FsKitDispatcher {
         ) {
             Ok((attr, open)) => {
                 let file_handle = open.file_handle();
-                let entry =
-                    encode_copy(entry_from_stat(attr.ino, self.adapter.attr_to_stat(&attr)));
+                let entry = encode_copy(entry_from_stat(
+                    attr.ino,
+                    self.adapter.attr_to_stat(&attr),
+                    self.adapter.entry_ttl(attr.ino),
+                ));
                 let open = encode_copy(FuseOpenOut {
                     fh: file_handle,
                     open_flags: fskit_open_flags(open),
@@ -2063,7 +2082,10 @@ impl FsKitDispatcher {
             (input.valid & FATTR_FLAGS != 0).then_some(input.flags),
         ) {
             Ok(stat) => {
-                let _ = request.reply_struct(attr_out_from_stat(stat));
+                let _ = request.reply_struct(attr_out_from_stat(
+                    stat,
+                    self.adapter.entry_ttl(header.nodeid),
+                ));
             }
             Err(errno) => {
                 let _ = request.reply_error(errno);
@@ -2397,21 +2419,26 @@ fn fskit_open_flags(open: low_level::OpenReply) -> u32 {
         })
 }
 
-fn entry_from_stat(ino: u64, stat: libc::stat) -> FuseEntryOut {
+fn entry_valid_seconds(ttl_seconds: f64) -> u64 {
+    if ttl_seconds <= 0.0 { 0 } else { 1 }
+}
+
+fn entry_from_stat(ino: u64, stat: libc::stat, ttl_seconds: f64) -> FuseEntryOut {
+    let valid = entry_valid_seconds(ttl_seconds);
     FuseEntryOut {
         nodeid: ino,
         generation: 0,
-        entry_valid: 1,
-        attr_valid: 1,
+        entry_valid: valid,
+        attr_valid: valid,
         entry_valid_nsec: 0,
         attr_valid_nsec: 0,
         attr: attr_from_stat(stat),
     }
 }
 
-fn attr_out_from_stat(stat: libc::stat) -> FuseAttrOut {
+fn attr_out_from_stat(stat: libc::stat, ttl_seconds: f64) -> FuseAttrOut {
     FuseAttrOut {
-        attr_valid: 1,
+        attr_valid: entry_valid_seconds(ttl_seconds),
         attr_valid_nsec: 0,
         dummy: 0,
         attr: attr_from_stat(stat),

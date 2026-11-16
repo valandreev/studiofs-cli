@@ -34,6 +34,77 @@ fn read_only_error(ino: Ino) -> MetaError {
     }
 }
 
+impl<M: ?Sized + MetaEngine> crate::trash::MetaVolumeSettings for ReadOnlyMetaEngine<M> {
+    fn volume_settings(&self) -> MetaResult<crate::trash::VolumeSettings> {
+        self.inner
+            .retained_store()
+            .map(|store| store.volume_settings())
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+    fn compare_and_set_trash_days(
+        &self,
+        _expected_revision: u64,
+        _days: u32,
+    ) -> MetaResult<Option<crate::trash::VolumeSettings>> {
+        Err(read_only_error(ROOT_INO))
+    }
+}
+
+impl<M: ?Sized + MetaEngine> crate::trash::MetaRetainedStore for ReadOnlyMetaEngine<M> {
+    fn protect_retained_file_payload(
+        &self,
+        receipt: Ino,
+        _source: crate::trash::RetainedSourceFence,
+        _stage: &[u8],
+    ) -> MetaResult<InodeAttr> {
+        Err(read_only_error(receipt))
+    }
+    fn retained_entry(&self, receipt: Ino) -> MetaResult<Option<crate::trash::RetainedEntry>> {
+        self.inner
+            .retained_store()
+            .map(|store| store.retained_entry(receipt))
+            .transpose()
+            .map(Option::flatten)
+    }
+    fn retain_namespace_entry(
+        &self,
+        parent: Ino,
+        _name: &[u8],
+        _store: Ino,
+        _receipt: Ino,
+    ) -> MetaResult<crate::trash::RetainedEntry> {
+        Err(read_only_error(parent))
+    }
+    fn restore_retained_entry(
+        &self,
+        receipt: Ino,
+        _parent: Ino,
+        _name: &[u8],
+        _stage: &[u8],
+        _sources: &[crate::trash::RetainedSourceFence],
+    ) -> MetaResult<crate::trash::RetainedRestoreResult> {
+        Err(read_only_error(receipt))
+    }
+    fn request_retained_purge(
+        &self,
+        receipt: Ino,
+        _reason: crate::trash::RetainedPurgeReason,
+    ) -> MetaResult<crate::trash::RetainedEntry> {
+        Err(read_only_error(receipt))
+    }
+    fn purge_retained_child(
+        &self,
+        receipt: Ino,
+        _parent_source_ino: Ino,
+        _name: &[u8],
+        _expected_ino: Ino,
+        _is_dir: bool,
+    ) -> MetaResult<crate::trash::RetainedChildPurgeOutcome> {
+        Err(read_only_error(receipt))
+    }
+}
+
 impl<M> MetaEngineCore for ReadOnlyMetaEngine<M>
 where
     M: ?Sized + MetaEngine,
@@ -476,6 +547,14 @@ where
     fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>> {
         self.inner.list_deferred_deletes()
     }
+
+    fn finalize_orphan_inode(
+        &self,
+        ino: Ino,
+        _deletion_timestamp: i64,
+    ) -> MetaResult<OrphanInodeFinalization> {
+        Err(read_only_error(ino))
+    }
 }
 
 impl<M> MetaSymlink for ReadOnlyMetaEngine<M>
@@ -679,6 +758,11 @@ impl<M> MetaEngine for ReadOnlyMetaEngine<M>
 where
     M: ?Sized + MetaEngine,
 {
+    fn retained_store(&self) -> Option<&dyn crate::trash::MetaRetainedStore> {
+        self.inner
+            .retained_store()
+            .map(|_| self as &dyn crate::trash::MetaRetainedStore)
+    }
     fn apply_regular_file_overlay_batch(
         &self,
         _mutations: &[RegularFileOverlayMutation],

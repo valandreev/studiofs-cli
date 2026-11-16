@@ -903,7 +903,7 @@ impl RedbMetaEngine {
     }
 
     /// Unfiltered merged children of `parent` and its overlay dentry keys.
-    fn merged_children_in_write_txn(
+    pub(super) fn merged_children_in_write_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
     ) -> MetaResult<(Vec<DirEntry>, HashSet<Vec<u8>>)> {
@@ -1727,21 +1727,6 @@ impl RedbMetaEngine {
         ino: Ino,
     ) -> MetaResult<()> {
         Self::set_undo_log_phase_for_in_txn(txn, kind, ino, UndoLogPhase::Completed)?;
-        Ok(())
-    }
-
-    pub(super) fn set_undo_log_phase_for(
-        &self,
-        kind: UndoLogKind,
-        ino: Ino,
-        phase: UndoLogPhase,
-    ) -> MetaResult<()> {
-        let txn = self.begin_write_txn()?;
-        {
-            Self::set_undo_log_phase_for_in_txn(&txn, kind, ino, phase)?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 

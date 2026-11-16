@@ -30,6 +30,8 @@ pub use self::layout::RedbSnapshot;
 use self::layout::*;
 
 mod fs_ops;
+mod retained;
+pub(crate) use retained::{RetainedSettlement, UnackedChildPurges};
 
 impl From<redb::StorageError> for MetaError {
     fn from(error: redb::StorageError) -> Self {
@@ -1088,12 +1090,27 @@ impl RedbMetaEngine {
         Self::open_with_relaxed_interval(
             path,
             Duration::from_millis(REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS),
+            false,
+        )
+    }
+
+    /// Own an existing stopped cache for explicit format-5 completion only.
+    /// Normal mount startup must continue to use `open` and reject format 5.
+    pub fn open_for_format_upgrade(path: impl AsRef<Path>) -> MetaResult<Self> {
+        if !path.as_ref().is_file() {
+            return Err(MetaError::NotFormatted);
+        }
+        Self::open_with_relaxed_interval(
+            path,
+            Duration::from_millis(REDB_VOLATILE_DURABILITY_BARRIER_INTERVAL_MS),
+            true,
         )
     }
 
     fn open_with_relaxed_interval(
         path: impl AsRef<Path>,
         durability_interval: Duration,
+        format_upgrade: bool,
     ) -> MetaResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -1108,9 +1125,14 @@ impl RedbMetaEngine {
             let txn = db
                 .begin_read()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            match Self::read_format_info_from_read_txn(&txn) {
+            let format = if format_upgrade {
+                Self::read_format_info_for_upgrade_from_read_txn(&txn)
+            } else {
+                Self::read_format_info_from_read_txn(&txn)
+            };
+            match format {
                 Ok(format_info) => Some(format_info),
-                Err(MetaError::NotFormatted) => None,
+                Err(MetaError::NotFormatted) if !format_upgrade => None,
                 Err(error) => return Err(error),
             }
         };
@@ -1185,12 +1207,20 @@ impl RedbMetaEngine {
             #[cfg(test)]
             allocator_state_write_hook: Mutex::new(None),
         };
-        engine.ensure_dentry_by_inode_indexes()?;
-        let _ = engine.recover_undo_logs()?;
+        if !format_upgrade {
+            engine.ensure_dentry_by_inode_indexes()?;
+            // A PostgreSQL-backed cache defers an unacknowledged retained child purge.
+            let replicated = persisted_format.as_ref().is_some_and(|format| {
+                format.metadata.backend == crate::schema::MetadataBackend::Postgres
+            });
+            let _ = engine.recover_undo_logs_guarded(replicated)?;
+        }
 
         match persisted_format {
             Some(format_info) => {
-                engine.ensure_inode_lifecycle_table()?;
+                if !format_upgrade {
+                    engine.ensure_inode_lifecycle_table()?;
+                }
                 debug!(
                     "format version {} is up to date",
                     format_info.format_version
@@ -1301,7 +1331,8 @@ impl RedbMetaEngine {
         path: impl AsRef<Path>,
         interval: Duration,
     ) -> Self {
-        Self::open_with_relaxed_interval(path, interval).expect("open relaxed redb test engine")
+        Self::open_with_relaxed_interval(path, interval, false)
+            .expect("open relaxed redb test engine")
     }
 
     #[cfg(test)]
@@ -1357,6 +1388,7 @@ mod chunk_state;
 mod format;
 mod gc;
 mod inodes;
+mod volume_settings;
 pub(crate) use inodes::PendingRecoveryDentry;
 mod namespace;
 mod namespace_merge;
@@ -1368,6 +1400,45 @@ pub(crate) use replication::ReplayLocalJournal;
 pub(crate) use replication::take_pending_serving_replays;
 #[cfg(test)]
 pub(crate) use tests::take_case_fallback_merged_scans;
+#[cfg(test)]
+impl RedbMetaEngine {
+    /// Overwrites an inode's local row with undecodable bytes (poison-entry tests).
+    pub(crate) fn corrupt_inode_row_for_test(&self, ino: Ino) {
+        let txn = self.begin_write_txn().expect("begin write");
+        txn.open_table(layout::INODES_TABLE)
+            .expect("open inodes")
+            .insert(ino, &[0xff_u8, 0xff, 0xff][..])
+            .expect("corrupt inode row");
+        txn.commit().expect("commit corruption");
+    }
+
+    /// Inserts synthetic failing deferred-delete entries for sweep fairness tests.
+    pub(crate) fn insert_failing_deferred_deletes_for_test(&self, inos: &[Ino]) {
+        let txn = self.begin_write_txn().expect("begin write");
+        {
+            let mut deferred = txn
+                .open_table(layout::DEFERRED_DELETES_TABLE)
+                .expect("open deferred deletes");
+            let mut inodes = txn.open_table(layout::INODES_TABLE).expect("open inodes");
+            for &ino in inos {
+                let record = DeferredDeleteRecord {
+                    ino,
+                    parent: ROOT_INO,
+                    name: format!("poison-{ino}").into_bytes(),
+                    created_at: 0,
+                };
+                let bytes = encode(&record).expect("encode deferred");
+                deferred
+                    .insert(ino, bytes.as_slice())
+                    .expect("insert deferred");
+                inodes
+                    .insert(ino, &[0xff_u8, 0xff, 0xff][..])
+                    .expect("insert corrupt inode");
+            }
+        }
+        txn.commit().expect("commit failing deferred deletes");
+    }
+}
 mod snapshots;
 mod symlink;
 mod txn;

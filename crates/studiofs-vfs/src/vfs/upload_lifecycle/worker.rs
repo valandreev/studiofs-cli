@@ -4526,6 +4526,121 @@ mod tests {
         });
     }
 
+    #[test]
+    fn process_upload_retained_restore_cancels_already_dequeued_upload() {
+        use studiofs_meta::trash::MetaVolumeSettings;
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, meta) =
+            make_unstarted_test_vfs(&tmp, "retained-restore-already-dequeued-worker");
+
+        rt.block_on(async {
+            meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+            let store = vfs.mkdir(1, b"private", 0, 0, 0o700).expect("mkdir store");
+            let file = vfs
+                .create(1, b"source.bin", 0, 0, 0o644)
+                .expect("create source");
+            vfs.write(file.ino, 0, b"BEFORE")
+                .await
+                .expect("write local payload");
+            vfs.fsync(file.ino, false)
+                .await
+                .expect("stage upload payload");
+            let old_epoch = meta.get_attr(file.ino).unwrap().content_epoch;
+            let old_objects = meta.get_regular_file_overlay_object_ids(file.ino).unwrap();
+            assert_eq!(old_objects.len(), 1);
+            vfs.queue_epoch_finalization(file.ino, old_epoch);
+            let sticky_ino = file.ino;
+            let hook_vfs = Arc::clone(&vfs);
+            *vfs.retained_restore_hook.lock() = Some(Arc::new(move |_vfs, stage| {
+                let hook_vfs = Arc::clone(&hook_vfs);
+                Box::pin(async move {
+                    if stage == crate::vfs::RetainedRestoreStage::CopyRead {
+                        hook_vfs.mark_upload_sticky_error(
+                            sticky_ino,
+                            &VfsError::Other("pre-restore upload error".to_string()),
+                        );
+                    }
+                })
+            }));
+
+            let receipt = meta.next_inode().unwrap();
+            meta.retain_namespace_entry(1, b"source.bin", store.ino, receipt)
+                .unwrap();
+
+            let ops = vfs
+                .cached_store()
+                .claim_pending_uploads(8, Duration::ZERO, &HashSet::new());
+            assert_eq!(ops.len(), 1);
+            let op = ops.into_iter().next().unwrap();
+            assert_eq!(op.ino, file.ino);
+            assert_eq!(op.object_id, old_objects[0]);
+
+            let read_entered = Arc::new(tokio::sync::Notify::new());
+            let release_read = Arc::new(tokio::sync::Notify::new());
+            let processor = UploadProcessor {
+                coordinator: VfsCachedStorePort { vfs: vfs.clone() },
+                local_payloads: GatedVfsUploadLocalPayloadPort {
+                    inner: VfsUploadLocalPayloadPort { vfs: vfs.clone() },
+                    read_entered: read_entered.clone(),
+                    release_read: release_read.clone(),
+                },
+                meta: VfsUploadMetaPort { vfs: vfs.clone() },
+                remote: FakeRemote::default(),
+                shutdown: VfsUploadShutdownPort { vfs: vfs.clone() },
+                policy: VfsUploadPolicyPort { vfs: vfs.clone() },
+                block_size: vfs.block_size,
+                upload_requeue_base: Duration::ZERO,
+                upload_requeue_max: Duration::ZERO,
+            };
+            let upload = tokio::spawn(async move { processor.process_upload(op).await });
+            tokio::time::timeout(Duration::from_secs(2), read_entered.notified())
+                .await
+                .expect("worker dequeued upload and reached local payload read");
+
+            vfs.restore_retained_entry(meta.as_ref(), receipt, 1, b"restored.bin")
+                .await
+                .expect("restore while pre-restore upload is dequeued");
+            *vfs.retained_restore_hook.lock() = None;
+            release_read.notify_one();
+
+            let outcome = tokio::time::timeout(Duration::from_secs(2), upload)
+                .await
+                .expect("in-flight upload exits after restore cancellation")
+                .expect("upload task");
+            assert_eq!(outcome, UploadOutcome::Shutdown);
+
+            let new_epoch = meta.get_attr(file.ino).unwrap().content_epoch;
+            let new_objects = meta.get_regular_file_overlay_object_ids(file.ino).unwrap();
+            assert_eq!(new_objects.len(), 1);
+            assert_ne!(new_objects[0], old_objects[0]);
+
+            let retired = vfs.cached_store().retired_uploads();
+            let retired_for_ino = retired
+                .get(&file.ino)
+                .expect("cancelled dequeued upload must be retired for sweep");
+            assert!(retired_for_ino.contains(&old_objects[0]));
+            assert!(vfs.has_local_payload(old_objects[0]));
+            assert!(vfs.ensure_no_upload_sticky_error(file.ino).is_ok());
+            assert!(
+                !vfs.state
+                    .upload
+                    .pending_epoch_finalizations
+                    .lock()
+                    .iter()
+                    .any(|(ino, pending_epoch)| *ino == file.ino && *pending_epoch < new_epoch)
+            );
+            assert_eq!(
+                vfs.pending_uploads_for_inode(file.ino),
+                vec![(0, new_objects[0], new_epoch)]
+            );
+            assert_eq!(
+                vfs.live_extent_records_for_inode(file.ino),
+                vec![(0, new_objects[0], new_epoch)]
+            );
+            vfs.shutdown(Duration::ZERO).await.unwrap();
+        });
+    }
+
     #[tokio::test]
     async fn process_upload_cancels_deleted_inodes_before_reading() {
         let (processor, coordinator, local_payloads, _meta, _remote, shutdown, _policy) =
@@ -4869,6 +4984,34 @@ mod tests {
         assert_eq!(requeued.len(), 1);
         assert_eq!(requeued[0].object_id, op.object_id);
         assert_eq!(requeued[0].content_epoch, current_epoch);
+    }
+
+    #[tokio::test]
+    async fn process_upload_keeps_live_extent_when_attr_epoch_advances() {
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        let current_epoch = op.content_epoch + 1;
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, current_epoch)));
+        policy
+            .live_extent_epochs
+            .lock()
+            .insert((op.ino, op.object_id), op.content_epoch);
+
+        let outcome = processor.process_upload(op.clone()).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(coordinator.cancelled.lock().is_empty());
+        assert!(local_payloads.removed.lock().is_empty());
+        assert!(local_payloads.upload_stage_removed.lock().is_empty());
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 0);
+        let requeued = coordinator.requeued.lock();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(requeued[0].object_id, op.object_id);
+        assert_eq!(requeued[0].content_epoch, op.content_epoch);
     }
 
     #[tokio::test]
