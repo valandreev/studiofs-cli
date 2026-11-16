@@ -227,17 +227,20 @@ cargo test -p studiofs --bin studiofs sfs978_ -- --nocapture
 
 The disposable acceptance tests start their own PostgreSQL 18/RustFS Compose
 project using `docker/compose.e2e.yml`, fresh named volumes and a loopback port
-window probed free for each run. They never select credentials or endpoints from `.env`. Build the actual
-CLI first, then run the focused selection serially (the same commands work in
-PowerShell):
+window probed free for each run. They never select credentials or endpoints from `.env`.
+Run the focused selection serially (the same commands work in PowerShell):
 
 ```sh
 cargo build -p studiofs --bin studiofs
 cargo test -p studiofs --bin studiofs live_cli_disposable_ -- --ignored --nocapture --test-threads=1
 ```
 
-Docker Compose must be available and able to pull/start the repository's images.
-An unavailable Docker daemon is a failure, not a skipped pass. Per-run diagnostics
+For the workspace command `cargo test --workspace --all-targets -- --ignored
+--nocapture --test-threads=1`, Cargo builds the standalone CLI because integration
+test targets are selected. The ignored tests locate it from their harness path in
+either `deps` or `build`, so that command needs no separate build step. Docker Compose
+must be available and able to pull/start the repository's images. An unavailable
+Docker daemon is a failure, not a skipped pass. Per-run diagnostics
 are retained under `target/janitor-adversarial/`; teardown removes only that
 run's containers and named volumes. These tests mutate only their disposable
 stack. Existing opt-in provider verification remains separately selectable with

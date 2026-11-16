@@ -1167,6 +1167,39 @@ mod tests {
     mod adversarial;
     mod adversarial_live;
 
+    /// Resolve the standalone CLI next to the active Cargo profile.
+    /// Bin unit-test harnesses can live under either `deps` or `build`.
+    fn cli_binary() -> anyhow::Result<std::path::PathBuf> {
+        let test_exe = std::env::current_exe()?;
+        let profile_dir = test_exe
+            .ancestors()
+            .find(
+                |path| matches!(path.file_name(), Some(name) if name == "deps" || name == "build"),
+            )
+            .and_then(std::path::Path::parent)
+            .ok_or_else(|| {
+                anyhow::anyhow!("cannot find Cargo profile directory from {test_exe:?}")
+            })?;
+        let binary = profile_dir.join(if cfg!(windows) {
+            "studiofs.exe"
+        } else {
+            "studiofs"
+        });
+        anyhow::ensure!(
+            binary.is_file(),
+            "standalone CLI is missing at {}; run cargo test with --workspace --all-targets to build it",
+            binary.display()
+        );
+        Ok(binary)
+    }
+
+    #[test]
+    #[ignore = "requires --workspace --all-targets to build the standalone CLI"]
+    fn cli_binary_is_built_for_the_current_test_profile() {
+        let binary = cli_binary().expect("standalone CLI should be available to the test harness");
+        assert!(binary.is_file(), "{}", binary.display());
+    }
+
     /// Returns once S3 dates every key in the past by this host's clock. With a
     /// zero grace window the janitor skips a future-dated object as unknown age,
     /// and the S3 server clock may run ahead of this host. HEAD dates have second
@@ -4887,18 +4920,7 @@ mod tests {
             .await?
             .get(0);
 
-        let mut binary = std::env::current_exe()?;
-        binary.pop();
-        binary.pop();
-        binary.push(if cfg!(windows) {
-            "studiofs.exe"
-        } else {
-            "studiofs"
-        });
-        anyhow::ensure!(
-            binary.is_file(),
-            "build the studiofs CLI binary before this ignored test"
-        );
+        let binary = cli_binary()?;
         let output = std::process::Command::new(&binary)
             .args([
                 "janitor",

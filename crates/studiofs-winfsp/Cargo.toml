@@ -8,15 +8,6 @@ license.workspace = true
 [lints]
 workspace = true
 
-[dependencies]
-studiofs-vfs.workspace = true
-studiofs-meta.workspace = true
-tokio.workspace = true
-futures.workspace = true
-tracing.workspace = true
-thiserror.workspace = true
-parking_lot.workspace = true
-
 [dev-dependencies]
 studiofs-data.workspace = true
 tempfile.workspace = true
@@ -25,6 +16,13 @@ dotenvy.workspace = true
 studiofs-test-support.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+studiofs-vfs.workspace = true
+studiofs-meta.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
 winfsp = { version = "0.12", features = ["windows-62", "notify", "async-io"] }
 winfsp-sys = "0.12"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Threading"] }

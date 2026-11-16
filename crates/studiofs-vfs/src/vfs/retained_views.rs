@@ -26,9 +26,15 @@ pub enum NativeTrashProfile {
     #[default]
     Windows,
     /// Linux Freedesktop `.Trash-<uid>/{files,info}` with `.trashinfo` records.
-    Linux { uid: u32 },
+    Linux {
+        /// User ID in the `.Trash-<uid>` directory name.
+        uid: u32,
+    },
     /// macOS `.Trashes/<uid>` user trash container.
-    MacOs { uid: u32 },
+    MacOs {
+        /// User ID in the `.Trashes/<uid>` directory path.
+        uid: u32,
+    },
 }
 
 impl NativeTrashProfile {

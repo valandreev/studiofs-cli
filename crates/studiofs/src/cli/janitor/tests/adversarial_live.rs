@@ -117,18 +117,7 @@ impl DisposableStack {
     }
 
     fn command(&self, args: &[String], client_root: &Path) -> anyhow::Result<Command> {
-        let mut binary = std::env::current_exe()?;
-        binary.pop();
-        binary.pop();
-        binary.push(if cfg!(windows) {
-            "studiofs.exe"
-        } else {
-            "studiofs"
-        });
-        anyhow::ensure!(
-            binary.is_file(),
-            "build the studiofs CLI binary before this ignored test"
-        );
+        let binary = super::cli_binary()?;
         Ok(Self::command_for(&binary, args, client_root))
     }
 

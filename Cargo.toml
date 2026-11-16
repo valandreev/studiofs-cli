@@ -20,7 +20,6 @@ version = "0.2.3"
 edition = "2024"
 rust-version = "1.95"
 license = "GPL-3.0-only"
-repository = "https://github.com/valandreev/studiofs-cli"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
@@ -91,7 +90,6 @@ tempfile = "3"
 home = "0.5"
 dotenvy = "0.15"
 url = "2"
-unicode-normalization = "0.1"
 sysinfo = "0.37"
 smallvec = "1"
 rand = { version = "0.9", features = ["os_rng"] }
@@ -107,5 +105,4 @@ studiofs-linux-fuse = { path = "crates/studiofs-linux-fuse" }
 studiofs-macfuse = { path = "crates/studiofs-macfuse" }
 studiofs-winfsp = { path = "crates/studiofs-winfsp" }
 studiofs-e2e = { path = "crates/studiofs-e2e" }
-studiofs-scenario = { path = "crates/studiofs-scenario" }
 studiofs-test-support = { path = "crates/studiofs-test-support" }

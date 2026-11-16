@@ -921,11 +921,11 @@ impl FileSessionState {
             transitions: counters.transitions.load(Ordering::Relaxed),
             wait_reasons: Vec::new(),
         };
-        for idx in 0..FileSessionOperation::COUNT {
+        for (idx, wait_reason) in counters.wait_reasons.iter().enumerate() {
             let Some(op) = FileSessionOperation::from_index(idx) else {
                 continue;
             };
-            let count = counters.wait_reasons[idx].load(Ordering::Relaxed);
+            let count = wait_reason.load(Ordering::Relaxed);
             stats.wait_reasons.push((op.as_str().to_string(), count));
         }
         stats

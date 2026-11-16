@@ -129,6 +129,7 @@ impl StudioVfs {
             .then(|| ignored.attr.clone())
     }
 
+    /// Returns whether `ino` identifies a synthesized ignored entry, excluding the runtime stats file.
     pub fn is_synthesized_ignored_ino(&self, ino: Ino) -> bool {
         ino >= super::FIRST_IGNORED_INO && !self.is_runtime_stats_file_ino(ino)
     }
