@@ -335,12 +335,19 @@ async fn seed_protection_matrix(
         ).await?;
     }
 
+    // Leased rows model a format-6 claimer, which the legacy-claim fence admits.
+    client
+        .batch_execute("SELECT set_config('studiofs.deletion_format', '6', false)")
+        .await?;
     for (offset, lease) in [(11_i64, "5 minutes"), (12, "-5 minutes")] {
         client.execute(
             "INSERT INTO snapshot_payload_upload_objects (vol, object_id, state, reconcile_owner, reconcile_lease_expires_at, created_at) VALUES ($1, $2, 'delete_pending', 'fixture-reconciler', clock_timestamp() + $3::text::interval, clock_timestamp() - interval '1 hour')",
             &[&volume_id, &(i64::try_from(base)? + offset), &lease],
         ).await?;
     }
+    client
+        .batch_execute("RESET studiofs.deletion_format")
+        .await?;
 
     for (offset, lifecycle) in [
         (3_i64, "creating"),
