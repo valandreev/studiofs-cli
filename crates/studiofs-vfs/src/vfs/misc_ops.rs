@@ -13,7 +13,7 @@ impl StudioVfs {
             }
             return Err(err);
         }
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             return Ok(None);
         }
         Ok(self.sync_meta().get_xattr(ino, name)?)
@@ -27,7 +27,7 @@ impl StudioVfs {
             }
             return Err(err);
         }
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             return Ok(None);
         }
         Ok(self.sync_meta().get_xattr_size(ino, name)?)
@@ -37,7 +37,7 @@ impl StudioVfs {
     pub fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> VfsResult<()> {
         let operation = self.try_mutating_operation_admission()?;
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             if ignored.view.is_some() {
                 return Err(VfsError::OperationNotSupported);
@@ -59,7 +59,7 @@ impl StudioVfs {
     pub fn remove_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<()> {
         let operation = self.try_mutating_operation_admission()?;
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             if ignored.view.is_some() {
                 return Err(VfsError::OperationNotSupported);
@@ -123,7 +123,7 @@ impl StudioVfs {
             }
             return Err(err);
         }
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             return Ok(Vec::new());
         }
         Ok(self.sync_meta().list_xattrs(ino)?)

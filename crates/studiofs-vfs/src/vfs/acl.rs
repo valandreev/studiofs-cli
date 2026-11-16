@@ -128,7 +128,7 @@ impl StudioVfs {
 
     /// Computes effective access for an inode by walking up namespace ACL rules and caching the result.
     pub(super) fn effective_access_level(&self, ino: Ino) -> VfsResult<AccessLevel> {
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let ignored = self
                 .ignored_entry(ino)
                 .ok_or(VfsError::Meta(MetaError::InodeNotFound(ino)))?;
@@ -292,7 +292,7 @@ impl StudioVfs {
         self.enforce_metadata_serving_lifecycle()?;
         self.enforce_snapshot_mount_fence(ino)?;
         self.reject_private_store_ino(ino)?;
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let actual = self.effective_access_level_for_ignored_async(ino).await?;
             return self.finish_enforce_access(ino, required, actual);
         }

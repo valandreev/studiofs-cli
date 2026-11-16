@@ -2517,7 +2517,7 @@ impl StudioVfs {
     /// in-memory attribute immediately after a successful write should prefer
     /// [`peek_dirty_attr`](Self::peek_dirty_attr) to avoid a metadata round-trip.
     pub fn getattr(&self, ino: Ino) -> VfsResult<InodeAttr> {
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             self.enforce_access(ino, AccessLevel::ReadOnly)?;
             return Ok(ignored.attr);
@@ -2544,7 +2544,7 @@ impl StudioVfs {
     }
 
     pub(super) async fn getattr_async(&self, ino: Ino) -> VfsResult<InodeAttr> {
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             self.enforce_access_async(ino, AccessLevel::ReadOnly)
                 .await?;

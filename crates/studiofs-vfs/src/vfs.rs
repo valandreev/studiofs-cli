@@ -10685,7 +10685,7 @@ impl StudioVfs {
         if check_authority && Self::write_access_requested(flags, trunc) {
             self.enforce_no_known_foreign_hard_lock(ino)?;
         }
-        if ino >= FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             if trunc && ignored.view.is_some() {
                 return Err(VfsError::OperationNotSupported);

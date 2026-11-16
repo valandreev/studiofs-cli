@@ -1551,7 +1551,7 @@ impl StudioVfs {
             return Err(Self::runtime_stats_access_denied_error());
         }
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             if ignored.view.is_some() {
                 if (self.is_trash_container_ignored_ino(ino) && args.size.is_none())
@@ -1666,7 +1666,7 @@ impl StudioVfs {
             return Err(Self::runtime_stats_access_denied_error());
         }
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             if ignored.view.is_some() {
                 if (self.is_trash_container_ignored_ino(ino) && args.size.is_none())
@@ -2974,7 +2974,7 @@ impl StudioVfs {
                 })
                 .collect());
         }
-        if ino >= super::FIRST_IGNORED_INO
+        if self.is_synthesized_ignored_ino(ino)
             && let Some(listing) = self.trash_subtree_listing(ino)?
         {
             return Ok(listing
@@ -3006,7 +3006,7 @@ impl StudioVfs {
                 })
                 .collect());
         }
-        if ino >= super::FIRST_IGNORED_INO
+        if self.is_synthesized_ignored_ino(ino)
             && let Some(listing) = self.trash_subtree_listing(ino)?
         {
             return Ok(listing
@@ -3690,7 +3690,7 @@ impl StudioVfs {
     pub fn readlink(&self, ino: Ino) -> VfsResult<Vec<u8>> {
         self.reject_private_store_ino(ino)?;
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             if ignored.attr.kind == FileType::Symlink {
                 if let Some(source_ino) = self.retained_view_source_ino(&ignored)? {

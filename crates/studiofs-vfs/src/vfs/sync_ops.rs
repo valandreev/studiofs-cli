@@ -1481,7 +1481,7 @@ impl StudioVfs {
             .enter_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<ExplicitFlushOutcome> = async {
-            if ino >= super::FIRST_IGNORED_INO {
+            if self.is_synthesized_ignored_ino(ino) {
                 let _ignored = self.visible_ignored_entry_snapshot(ino)?;
                 self.enforce_access(ino, AccessLevel::ReadOnly)?;
                 return Ok(ExplicitFlushOutcome::default());
@@ -1526,7 +1526,7 @@ impl StudioVfs {
         let Some(open_file) = self.handle_table.get(fh) else {
             return Ok(ExplicitFlushOutcome::default());
         };
-        if open_file.ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(open_file.ino) {
             let _ignored = self.visible_ignored_entry_snapshot(open_file.ino)?;
             self.enforce_access(open_file.ino, AccessLevel::ReadOnly)?;
             return Ok(ExplicitFlushOutcome::default());
@@ -1662,7 +1662,7 @@ impl StudioVfs {
             .await;
         let result: VfsResult<FsyncOutcome> = async {
             self.enforce_access(ino, AccessLevel::ReadOnly)?;
-            if ino >= super::FIRST_IGNORED_INO {
+            if self.is_synthesized_ignored_ino(ino) {
                 let _ignored = self.visible_ignored_entry_snapshot(ino)?;
                 return Ok(FsyncOutcome::default());
             }
@@ -1709,7 +1709,7 @@ impl StudioVfs {
     /// Get the last attributes retained by an open file handle.
     pub fn get_open_file_attr(&self, fh: u64) -> Option<InodeAttr> {
         let open_file = self.handle_table.get(fh)?;
-        if open_file.ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(open_file.ino) {
             let ignored = self.visible_ignored_entry_snapshot(open_file.ino).ok()?;
             self.enforce_access(open_file.ino, AccessLevel::ReadOnly)
                 .ok()?;
@@ -1855,7 +1855,7 @@ impl StudioVfs {
         let mut drain_after_write = false;
         let result = async {
             self.enforce_write_access_for_handle(fh, ino)?;
-            if ino >= super::FIRST_IGNORED_INO {
+            if self.is_synthesized_ignored_ino(ino) {
                 return self.write_ignored_entry(ino, offset, data.len());
             }
             if data.is_empty() {
@@ -2089,7 +2089,7 @@ impl StudioVfs {
         // ── Buffer phase (fast: ~0.1 ms) ────────────────────────────────
         let result = async {
             self.enforce_write_access_for_handle(fh, ino)?;
-            if ino >= super::FIRST_IGNORED_INO {
+            if self.is_synthesized_ignored_ino(ino) {
                 return self.write_ignored_entry(ino, offset, data.len());
             }
             if data.is_empty() {

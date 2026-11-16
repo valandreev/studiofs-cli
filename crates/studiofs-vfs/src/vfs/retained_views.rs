@@ -139,7 +139,7 @@ impl StudioVfs {
     /// bypass cached directory snapshots (trash containers, generated records, and
     /// retained views).
     pub fn should_bypass_bridge_entry_cache(&self, ino: Ino) -> bool {
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             return !self.is_runtime_stats_file_ino(ino);
         }
         ino != 0

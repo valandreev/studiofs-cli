@@ -43,7 +43,7 @@ impl StudioVfs {
 
     async fn read_ordered(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             let end = (offset + size as u64).min(ignored.attr.size);
             let len = end.saturating_sub(offset) as usize;
@@ -164,7 +164,7 @@ impl StudioVfs {
                 "debug target read_into_impl access granted"
             );
         }
-        if ino >= super::FIRST_IGNORED_INO {
+        if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             let end = offset
                 .saturating_add(buffer.len() as u64)
@@ -470,7 +470,7 @@ impl StudioVfs {
                 data.len(),
                 self.access_tracker,
             );
-            if ino >= super::FIRST_IGNORED_INO {
+            if self.is_synthesized_ignored_ino(ino) {
                 return self.write_ignored_entry(ino, offset, data.len());
             }
             if data.is_empty() {
