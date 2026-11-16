@@ -3103,6 +3103,58 @@ mod tests {
         );
     }
 
+    /// A flush through an unlinked handle rewrites `nlink=1`; the guard must
+    /// still finalize it, while a hard link or a receipt payload stays live.
+    #[test]
+    fn orphan_guard_decides_liveness_from_bindings_not_nlink() {
+        use crate::engine::OrphanInodeFinalization;
+        let temp = studiofs_test_support::workspace_target_tempdir("retained-orphan-binding-");
+        let engine = engine(&temp.path().join("db"));
+        engine.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+
+        let orphan = engine
+            .create_file(ROOT_INO, b"orphan", 0, 0, 0o644)
+            .unwrap();
+        engine.unlink(ROOT_INO, b"orphan").unwrap();
+        engine
+            .flush_regular_file_overlay_slices_with_attr(orphan.ino, &[], Some(&orphan))
+            .unwrap();
+        assert_eq!(engine.get_attr(orphan.ino).unwrap().nlink, 1);
+        assert!(matches!(
+            engine
+                .finalize_orphan_inode_guarded(orphan.ino, 1, None)
+                .unwrap(),
+            OrphanInodeFinalization::Removed { .. }
+        ));
+        assert!(engine.get_attr(orphan.ino).is_err());
+
+        let linked = engine.create_file(ROOT_INO, b"a", 0, 0, 0o644).unwrap();
+        engine.link(linked.ino, ROOT_INO, b"b").unwrap();
+        engine.unlink(ROOT_INO, b"a").unwrap();
+        assert_eq!(
+            engine
+                .finalize_orphan_inode_guarded(linked.ino, 1, None)
+                .unwrap(),
+            OrphanInodeFinalization::Live
+        );
+
+        let kept = engine.create_file(ROOT_INO, b"kept", 0, 0, 0o644).unwrap();
+        let store = engine
+            .create_dir(ROOT_INO, b"private", 0, 0, 0o700)
+            .unwrap();
+        let receipt = engine.next_inode().unwrap();
+        engine
+            .retain_namespace_entry(ROOT_INO, b"kept", store.ino, receipt)
+            .unwrap();
+        assert_eq!(engine.lookup(receipt, b"data").unwrap().ino, kept.ino);
+        assert_eq!(
+            engine
+                .finalize_orphan_inode_guarded(kept.ino, 1, None)
+                .unwrap(),
+            OrphanInodeFinalization::Live
+        );
+    }
+
     /// PG classifies a losing child purge only from its exact journal span, so
     /// every delete shape the purge can emit must be recognized end to end.
     #[test]

@@ -1186,8 +1186,10 @@ impl RedbMetaEngine {
             .get(ino)?
             .map(|value| decode::<DeferredDeleteRecord>(value.value()))
             .transpose()?;
+        // Liveness is a visible namespace binding, never `nlink`: a flush through
+        // an unlinked open handle rewrites its stale `nlink=1` snapshot.
         let live = match Self::get_attr_merged_in_write_txn(&txn, ino) {
-            Ok(attr) => attr.nlink > 0,
+            Ok(_) => Self::has_visible_binding_in_write_txn(&txn, ino)?,
             // Already finalized (a sweep and a last close may both try).
             Err(MetaError::InodeNotFound(_)) if deferred.is_none() => {
                 return Ok(OrphanInodeFinalization::Removed {
@@ -1255,6 +1257,25 @@ impl RedbMetaEngine {
             removed_ids,
             freed_bytes,
         })
+    }
+
+    /// The by-inode indexes can hold a base candidate the overlay replaced, so
+    /// each candidate is confirmed by an exact merged lookup.
+    fn has_visible_binding_in_write_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<bool> {
+        for index in [DENTRIES_BY_INODE_TABLE, BASE_DENTRIES_BY_INODE_TABLE] {
+            for key in Self::dentry_keys_for_inode_in_write_index(txn, index, ino)? {
+                let (parent, name) = decode_dentry_key(&key)?;
+                if Self::lookup_merged_exact_in_write_txn(txn, parent, name)?
+                    .is_some_and(|entry| entry.ino == ino)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn remove_deferred_delete_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {

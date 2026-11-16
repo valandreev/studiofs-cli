@@ -17734,8 +17734,9 @@ fn orphan_deleted_inode_cleanup_batches_pending_deletions_for_multiple_objects()
         .expect("create test file");
     let mut file_attr = meta.get_attr(attr.ino).expect("load test attr");
     file_attr.size = u64::from(DEFAULT_BLOCK_SIZE) * 2;
-    // An orphan has no remaining link; a linked inode is kept by the guard.
-    file_attr.nlink = 0;
+    // An orphan has no namespace binding; a bound inode is kept by the guard.
+    meta.unlink(1, b"orphan-deleted-inode-batch-cleanup.bin")
+        .expect("unlink test file");
     meta.set_attr(&file_attr).expect("set test file size");
     meta.stage_payload_slice(
         attr.ino,
