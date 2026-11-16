@@ -376,7 +376,7 @@ pub enum MetaError {
 
     /// A persisted local or PostgreSQL metadata format is unsupported by this binary.
     #[error(
-        "unsupported metadata/PG sync format version: found {found}, expected {expected}; use a matching StudioFS binary. For format 5 to 6, stop mounts and janitors and run `studiofs upgrade NAME` on each cache; preserve accepted local data and never reinitialize it"
+        "unsupported metadata/PG sync format version: found {found}, expected {expected}; use a matching StudioFS binary. For format 5 to 6, stop mounts and janitors and run `studiofs upgrade NAME` on each cache; preserve accepted local data and never reinitialize it. If the stored state is older than format 5, recreate the incompatible metadata or volume, then run `studiofs discover` for a fresh client"
     )]
     UnsupportedFormatVersion {
         /// Version stored in local or PostgreSQL metadata.
