@@ -87,6 +87,7 @@ pub use metrics::{
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
+    VolumeCapacity,
 };
 /// Public namespace helpers used by bridge and diagnostics integrations.
 pub use namespace::{

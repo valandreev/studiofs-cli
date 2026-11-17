@@ -115,8 +115,14 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
 
     fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot {
         let health = self.health_snapshot();
+        // An unreadable quota is reported as absent, so leave a trace that
+        // tells it apart from an unlimited volume.
+        let logical_quota = self.vfs.logical_quota_status().unwrap_or_else(|error| {
+            tracing::warn!(%error, "logical quota status unavailable for diagnostics");
+            None
+        });
         DiagnosticsRuntimeSnapshot {
-            logical_quota: self.vfs.logical_quota_status().ok().flatten(),
+            logical_quota,
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,
             process: self.process_sampler.lock().sample(),

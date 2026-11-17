@@ -1464,7 +1464,7 @@ pub(super) struct NamespaceState {
     /// Local dirty attribute snapshots awaiting persistence.
     pub(super) dirty_attrs: OrderedMutex<std::collections::HashMap<Ino, InodeAttr>>,
     /// Growth in flight before publication to dirty attributes or durable metadata.
-    pub(super) quota_reservations: parking_lot::Mutex<Vec<(Ino, u64)>>,
+    pub(super) quota_reservations: parking_lot::Mutex<Vec<super::statfs::PendingGrowth>>,
     /// Global namespace epoch to invalidate stale dentry/path cache entries.
     pub(super) namespace_epoch: AtomicU64,
     /// Aggregate attribute generation used by bridge-side enumeration caches.

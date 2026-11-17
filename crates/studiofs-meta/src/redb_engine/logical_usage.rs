@@ -1,8 +1,13 @@
 use super::*;
 
-// Inodes start at ROOT_INO (1). Key zero stores the sum at the same revision.
+/// Charged logical bytes per inode, plus their sum under [`TOTAL_KEY`].
 pub(super) const LOGICAL_USAGE: TableDefinition<u64, u128> =
     TableDefinition::new("local_logical_usage");
+
+/// Row holding the sum of all charges at the same revision. Inode numbers
+/// start at `ROOT_INO` (1), so this key never collides with an inode.
+const TOTAL_KEY: u64 = 0;
+const _: () = assert!(TOTAL_KEY < ROOT_INO);
 
 /// Logical bytes one resolved inode contributes to the quota.
 pub(super) fn charged_size(attr: &InodeAttr) -> u64 {
@@ -25,7 +30,7 @@ pub(super) fn logical_usage_in_read_txn(
         Err(e) => return Err(MetaError::Storage(e.to_string())),
     };
     if let Some(index) = index
-        && let Some(mut total) = index.get(0)?.map(|v| v.value())
+        && let Some(mut total) = index.get(TOTAL_KEY)?.map(|v| v.value())
     {
         for (&ino, &end) in pending {
             let durable = index.get(ino)?.map_or(0, |v| v.value());
@@ -70,11 +75,11 @@ pub(super) fn record_inode_size(txn: &WriteTransaction, ino: Ino, size: u64) -> 
     let mut index = txn
         .open_table(LOGICAL_USAGE)
         .map_err(|e| MetaError::Storage(e.to_string()))?;
-    let Some(mut total) = index.get(0)?.map(|v| v.value()) else {
+    let Some(mut total) = index.get(TOTAL_KEY)?.map(|v| v.value()) else {
         return Ok(());
     };
     if adjust_charge(&mut index, &mut total, ino, u128::from(size))? {
-        index.insert(0, total)?;
+        index.insert(TOTAL_KEY, total)?;
     }
     Ok(())
 }
@@ -106,7 +111,7 @@ impl RedbWriteTransaction<'_> {
         let mut index = self
             .open_table(LOGICAL_USAGE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let previous = index.get(0)?.map(|v| v.value());
+        let previous = index.get(TOTAL_KEY)?.map(|v| v.value());
         let changed = self.invalidations.borrow().affected_inodes();
         if previous.is_some() && changed.as_ref().is_some_and(HashSet::is_empty) {
             return Ok(());
@@ -147,7 +152,7 @@ impl RedbWriteTransaction<'_> {
             };
             adjust_charge(&mut index, &mut total, ino, size)?;
         }
-        index.insert(0, total)?;
+        index.insert(TOTAL_KEY, total)?;
         Ok(())
     }
 }

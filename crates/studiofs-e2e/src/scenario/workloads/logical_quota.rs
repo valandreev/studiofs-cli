@@ -1,11 +1,16 @@
 //! Mounted logical quota enforcement and recovery.
 
 use super::*;
+use crate::infra::{CommandExecutor, CommandSpec, SystemCommandExecutor};
 
 pub(in crate::scenario) struct LogicalQuota;
 const NAME: &str = "mounted-logical-quota";
 const LIMIT: Duration = Duration::from_secs(45);
 const QUOTA_BYTES: u64 = 64 * 1024 * 1024;
+/// Bound for each client's runtime snapshot to report the expected usage,
+/// covering PostgreSQL restart and peer replication after the offline phase.
+const USAGE_CONVERGENCE_LIMIT: Duration = Duration::from_secs(90);
+const CLIENTS: [&str; 2] = ["client-a", "client-b"];
 
 impl Scenario for LogicalQuota {
     fn definition(&self) -> ScenarioDefinition {
@@ -52,11 +57,21 @@ impl Scenario for LogicalQuota {
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError> {
         let report: serde_json::Value =
             serde_json::from_slice(&fs::read(context.scenario_dir.join("capacity.json"))?)?;
-        if report["total_bytes"] != QUOTA_BYTES
-            || report["free_at_limit"] != 0
-            || report["converged_used_bytes"] != QUOTA_BYTES / 2 * 3
-        {
+        if report["total_bytes"] != QUOTA_BYTES || report["free_at_limit"] != 0 {
             return Err(io::Error::other("unexpected mounted quota capacity").into());
+        }
+        // Each client's own runtime snapshot must show the soft overshoot.
+        for client in CLIENTS {
+            let quota = &report["converged_quota"][client];
+            if quota["limit_bytes"] != QUOTA_BYTES
+                || quota["used_bytes"] != QUOTA_BYTES / 2 * 3
+                || quota["free_bytes"] != 0
+            {
+                return Err(io::Error::other(format!(
+                    "unexpected converged quota on {client}: {quota}"
+                ))
+                .into());
+            }
         }
         Ok(vec![format!("artifacts/scenarios/{NAME}/capacity.json")])
     }
@@ -78,7 +93,6 @@ fn probe(
     })?;
     let a = controller.client_at(0)?.clone();
     let b = controller.client_at(1)?.clone();
-    use crate::infra::{CommandExecutor, CommandSpec, SystemCommandExecutor};
     let quota = CommandSpec {
         program: binary.to_string_lossy().into_owned(),
         args: vec!["quota".into(), a.volume_name.clone(), "64M".into()],
@@ -93,13 +107,14 @@ fn probe(
         return Err(io::Error::other("setting the scenario volume quota failed").into());
     }
     controller.mount_all()?;
-    let wait_usage = |client: &str, expected: u64| -> Result<(), ScenarioError> {
-        let deadline = Instant::now() + Duration::from_secs(90);
+    // Returns the client's observed quota status once it reports `expected`.
+    let wait_usage = |client: &str, expected: u64| -> Result<serde_json::Value, ScenarioError> {
+        let deadline = Instant::now() + USAGE_CONVERGENCE_LIMIT;
         loop {
-            let snapshot = controller.runtime_snapshot(client)?;
-            let quota = &snapshot["logical_quota"];
+            let mut snapshot = controller.runtime_snapshot(client)?;
+            let quota = snapshot["logical_quota"].take();
             if quota["used_bytes"] == expected && quota["limit_bytes"] == QUOTA_BYTES {
-                return Ok(());
+                return Ok(quota);
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::other(format!(
@@ -110,7 +125,7 @@ fn probe(
             thread::sleep(Duration::from_millis(200));
         }
     };
-    for client in ["client-a", "client-b"] {
+    for client in CLIENTS {
         wait_usage(client, 0)?;
     }
     let path = a.mount_point.join("quota.bin");
@@ -155,7 +170,7 @@ fn probe(
             file.sync_all()?;
             Ok((total, free))
         })?;
-    for client in ["client-a", "client-b"] {
+    for client in CLIENTS {
         wait_usage(client, 0)?;
     }
     let a = controller.client_at(0)?.mount_point.clone();
@@ -170,7 +185,7 @@ fn probe(
         })?;
         super::recoverable_trash::expect_payload(&peer.join(name), b"x")?;
     }
-    for client in ["client-a", "client-b"] {
+    for client in CLIENTS {
         wait_usage(client, 2)?;
     }
     const EOF: u64 = QUOTA_BYTES / 4 * 3;
@@ -193,8 +208,9 @@ fn probe(
     let restart = compose.start_service(POSTGRES_SERVICE_NAME, &SystemCommandExecutor);
     writes?;
     restart?;
-    for client in ["client-a", "client-b"] {
-        wait_usage(client, 2 * EOF)?;
+    let mut converged_quota = serde_json::Map::new();
+    for client in CLIENTS {
+        converged_quota.insert(client.into(), wait_usage(client, 2 * EOF)?);
     }
     for path in [a.join("right"), b.join("left")] {
         run_bounded_mounted_io("read converged peer data above quota", LIMIT, move || {
@@ -210,9 +226,11 @@ fn probe(
     }
     fs::write(
         context.scenario_dir.join("capacity.json"),
-        serde_json::to_vec(
-            &serde_json::json!({"total_bytes":total,"free_at_limit":free,"converged_used_bytes":2*EOF}),
-        )?,
+        serde_json::to_vec(&serde_json::json!({
+            "total_bytes": total,
+            "free_at_limit": free,
+            "converged_quota": converged_quota,
+        }))?,
     )?;
     Ok(())
 }

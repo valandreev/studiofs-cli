@@ -1,14 +1,26 @@
 use super::{StatFs, StudioVfs, VfsResult};
 
+/// Reported capacity of a volume without a logical quota.
+const UNLIMITED_CAPACITY_BYTES: u64 = 1 << 50;
+
+/// Growth admitted against the quota but not yet visible in dirty attrs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PendingGrowth {
+    pub(super) ino: super::Ino,
+    /// Logical EOF the admitted operation may extend the inode to.
+    pub(super) projected_eof: u64,
+}
+
+/// Releases its [`PendingGrowth`] when the admitted operation finishes.
 pub(super) struct GrowthReservation<'a> {
-    pending: &'a parking_lot::Mutex<Vec<(super::Ino, u64)>>,
-    entry: (super::Ino, u64),
+    pending: &'a parking_lot::Mutex<Vec<PendingGrowth>>,
+    growth: PendingGrowth,
 }
 
 impl Drop for GrowthReservation<'_> {
     fn drop(&mut self) {
         let mut pending = self.pending.lock();
-        if let Some(index) = pending.iter().position(|entry| *entry == self.entry) {
+        if let Some(index) = pending.iter().position(|growth| *growth == self.growth) {
             pending.swap_remove(index);
         }
     }
@@ -24,16 +36,16 @@ impl StudioVfs {
             .and_then(|settings| settings.logical_quota_bytes))
     }
 
-    fn logical_quota_usage(&self, pending: &[(super::Ino, u64)]) -> VfsResult<u128> {
+    fn logical_quota_usage(&self, pending: &[PendingGrowth]) -> VfsResult<u128> {
         let mut volatile = std::collections::HashMap::new();
         for (&ino, attr) in self.state.namespace.dirty_attrs.lock().iter() {
             if attr.kind == super::FileType::RegularFile {
                 volatile.insert(ino, attr.size);
             }
         }
-        for &(ino, size) in pending {
-            let eof = volatile.entry(ino).or_default();
-            *eof = (*eof).max(size);
+        for growth in pending {
+            let eof = volatile.entry(growth.ino).or_default();
+            *eof = (*eof).max(growth.projected_eof);
         }
         Ok(self.sync_meta().logical_usage(&volatile)?)
     }
@@ -54,7 +66,11 @@ impl StudioVfs {
         };
         let reservations = &self.state.namespace.quota_reservations;
         let mut pending = reservations.lock();
-        pending.push((ino, end));
+        let growth = PendingGrowth {
+            ino,
+            projected_eof: end,
+        };
+        pending.push(growth);
         let check = self.logical_quota_usage(&pending).and_then(|used| {
             if used > u128::from(limit) {
                 Err(super::VfsError::Io(std::io::ErrorKind::StorageFull.into()))
@@ -68,7 +84,7 @@ impl StudioVfs {
         }
         Ok(Some(GrowthReservation {
             pending: reservations,
-            entry: (ino, end),
+            growth,
         }))
     }
 
@@ -88,22 +104,35 @@ impl StudioVfs {
         }))
     }
 
+    /// Exact capacity in bytes: the logical quota when configured, otherwise
+    /// a virtual 1 PiB less referenced payload space.
+    pub fn capacity_bytes(&self) -> VfsResult<super::VolumeCapacity> {
+        self.enforce_metadata_serving_lifecycle()?;
+        if let Some(quota) = self.logical_quota_status()? {
+            return Ok(super::VolumeCapacity {
+                total_bytes: quota.limit_bytes,
+                free_bytes: quota.free_bytes,
+            });
+        }
+        let used = self
+            .sync_meta()
+            .get_counter(studiofs_meta::types::counters::USED_SPACE)?;
+        Ok(super::VolumeCapacity {
+            total_bytes: UNLIMITED_CAPACITY_BYTES,
+            free_bytes: UNLIMITED_CAPACITY_BYTES.saturating_sub(used),
+        })
+    }
+
     /// Get capacity in filesystem blocks and the local inode count.
     pub fn statfs(&self) -> VfsResult<StatFs> {
-        use studiofs_meta::types::counters;
-
-        self.enforce_metadata_serving_lifecycle()?;
-        let meta = self.sync_meta();
-        let used_inodes = meta.get_counter(counters::TOTAL_INODES)?;
+        let capacity = self.capacity_bytes()?;
+        let used_inodes = self
+            .sync_meta()
+            .get_counter(studiofs_meta::types::counters::TOTAL_INODES)?;
         let frsize = self.block_size.max(1);
         let bsize = u64::from(frsize);
-        let (total_blocks, free_blocks) = if let Some(quota) = self.logical_quota_status()? {
-            (quota.limit_bytes / bsize, quota.free_bytes / bsize)
-        } else {
-            let total = (1u64 << 50) / bsize;
-            let used = meta.get_counter(counters::USED_SPACE)? / bsize;
-            (total, total.saturating_sub(used))
-        };
+        let total_blocks = capacity.total_bytes / bsize;
+        let free_blocks = capacity.free_bytes / bsize;
 
         Ok(StatFs {
             blocks: total_blocks,

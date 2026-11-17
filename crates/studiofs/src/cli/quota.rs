@@ -1,9 +1,7 @@
 //! Shared logical byte quota configuration and status.
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use clap::Args;
-use std::time::Duration;
-use studiofs_meta::trash::VolumeSettings;
 
 #[derive(Args, Debug)]
 pub struct QuotaArgs {
@@ -17,29 +15,12 @@ pub struct QuotaArgs {
 impl QuotaArgs {
     pub fn dispatch(self) -> anyhow::Result<()> {
         let limit = self.limit.as_deref().map(parse_limit).transpose()?;
-        let format = super::trash::local_format_info(&self.name)?;
-        let pg = format
-            .metadata
-            .postgres
-            .as_ref()
-            .context("This volume has no PostgreSQL authority binding")?;
-        let volume = pg.volume_id;
-        let uuid = format.uuid;
         let name = self.name;
-        let runtime = tokio::runtime::Runtime::new()?;
-        let settings = runtime.block_on(async {
-            tokio::time::timeout(Duration::from_secs(30), super::init::with_postgres_client(&pg.url, |mut client| async move {
-                let row = client.query_one("SELECT uuid, volume_settings FROM volumes v JOIN metadata_state ms ON ms.vol=v.vol WHERE v.vol=$1", &[&volume]).await?;
-                if row.get::<_, String>(0) != uuid { bail!("shared volume identity mismatch"); }
-                let bytes: Option<Vec<u8>> = row.get(1);
-                let current = bytes.map(|b| serde_json::from_slice::<VolumeSettings>(&b)).transpose()?.unwrap_or_default();
-                let Some(limit) = limit else { return Ok(current); };
-                let client_id = format!("cli-quota-{}", uuid::Uuid::new_v4());
-                let now_ms = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis())?;
-                studiofs_meta::pg_engine::set_shared_logical_quota_bytes(&mut client, volume, Some(current.revision), limit, &client_id, now_ms).await?.context("volume settings changed concurrently; retry the command")
-            })).await
-        }).context("PostgreSQL did not answer in time; nothing is confirmed, retry the command")?
-          .context("Could not reach the shared volume settings; check PostgreSQL connectivity and retry")?;
+        let settings = super::volume_settings::read_or_update_shared_settings(
+            &name,
+            limit.map(super::volume_settings::SettingsUpdate::LogicalQuota),
+            "Could not reach the shared volume settings; check PostgreSQL connectivity and retry",
+        )?;
         match settings.logical_quota_bytes {
             Some(bytes) => println!("Volume '{name}': logical quota is {bytes} bytes."),
             None => println!("Volume '{name}': logical quota is unlimited."),

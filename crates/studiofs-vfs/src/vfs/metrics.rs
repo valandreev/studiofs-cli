@@ -676,6 +676,15 @@ mod quota_bytes_wire {
     }
 }
 
+/// Exact volume capacity in bytes, shared by every platform bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeCapacity {
+    /// Configured logical quota, or the virtual 1 PiB when unlimited.
+    pub total_bytes: u64,
+    /// Bytes available for further growth, saturated at zero.
+    pub free_bytes: u64,
+}
+
 /// Filesystem statistics returned by `statfs()`.
 #[derive(Debug, Clone)]
 pub struct StatFs {

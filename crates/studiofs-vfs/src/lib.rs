@@ -79,6 +79,6 @@ pub use vfs::{
     VfsWritePathTuningStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry,
     VfsZeroIoHealthSignal, VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot,
-    VfsZeroIoStartupReplaySnapshot, is_hidden_platform_root_metadata_name,
+    VfsZeroIoStartupReplaySnapshot, VolumeCapacity, is_hidden_platform_root_metadata_name,
     read_runtime_stats_buffer,
 };

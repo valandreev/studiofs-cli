@@ -45,6 +45,7 @@ pub mod umeta;
 pub mod umount;
 pub mod upgrade;
 pub mod utils;
+mod volume_settings;
 #[cfg(windows)]
 pub mod winfsp_bootstrap;
 

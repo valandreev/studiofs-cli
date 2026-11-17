@@ -29199,10 +29199,20 @@ fn logical_quota_rejects_sparse_growth_but_allows_non_growing_operations() {
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "logical-quota-sparse");
     let unlimited = vfs.statfs().unwrap();
     assert_eq!(unlimited.blocks * u64::from(unlimited.frsize), 1u64 << 50);
+    assert_eq!(vfs.capacity_bytes().unwrap().total_bytes, 1u64 << 50);
     meta.compare_and_set_logical_quota_bytes(0, Some(8))
         .unwrap()
         .expect("set quota");
     let file = vfs.create(ROOT_INO, b"quota.bin", 0, 0, 0o644).unwrap();
+    vfs.setattr(file.ino, SetattrArgs::size_only(3)).unwrap();
+    // Byte-level capacity is exact even below one reporting block.
+    assert_eq!(
+        vfs.capacity_bytes().unwrap(),
+        VolumeCapacity {
+            total_bytes: 8,
+            free_bytes: 5
+        }
+    );
 
     vfs.setattr(file.ino, SetattrArgs::size_only(8))
         .expect("sparse growth up to quota");
