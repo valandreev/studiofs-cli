@@ -18,13 +18,18 @@ pub struct PayloadThrottle {
 impl PayloadThrottle {
     pub fn new(upload_mbps: u64, download_mbps: u64) -> Self {
         let throttle = Self::default();
-        throttle.set_limits(upload_mbps, download_mbps);
+        throttle.set_limits(Some(upload_mbps), Some(download_mbps));
         throttle
     }
 
-    pub fn set_limits(&self, upload_mbps: u64, download_mbps: u64) {
-        self.upload.set_limit(upload_mbps);
-        self.download.set_limit(download_mbps);
+    /// Update only the provided directions, so partial updates never overwrite each other.
+    pub fn set_limits(&self, upload_mbps: Option<u64>, download_mbps: Option<u64>) {
+        if let Some(mbps) = upload_mbps {
+            self.upload.set_limit(mbps);
+        }
+        if let Some(mbps) = download_mbps {
+            self.download.set_limit(mbps);
+        }
     }
 
     pub fn cancel(&self) {
@@ -101,12 +106,12 @@ impl Direction {
         cancelled: &AtomicBool,
         cancellation_changed: &Notify,
     ) -> bool {
-        // Unlimited mode is a pure fast path: it never waits and never reports cancellation.
-        if bytes == 0 || self.limit() == 0 {
-            return true;
-        }
         if cancelled.load(Ordering::Acquire) {
             return false;
+        }
+        // Unlimited mode never waits.
+        if bytes == 0 || self.limit() == 0 {
+            return true;
         }
         let started = Instant::now();
         let ticket_id = {
@@ -321,7 +326,7 @@ mod tests {
         let task = tokio::spawn(async move { waiting.acquire_upload(125_000).await });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(500)).await;
-        throttle.set_limits(2, 0);
+        throttle.set_limits(Some(2), Some(0));
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(250)).await;
         tokio::task::yield_now().await;

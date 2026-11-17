@@ -742,7 +742,7 @@ impl DataStore {
     }
 
     /// Install the mount-wide aggregate payload transfer limits.
-    pub fn set_payload_limits(&self, upload_mbps: u64, download_mbps: u64) {
+    pub fn set_payload_limits(&self, upload_mbps: Option<u64>, download_mbps: Option<u64>) {
         self.payload_throttle.set_limits(upload_mbps, download_mbps);
     }
 
@@ -2450,7 +2450,7 @@ mod tests {
             .await
             .unwrap();
         let bytes = prepared.encrypted.len();
-        store.set_payload_limits(1, 0);
+        store.set_payload_limits(Some(1), Some(0));
         let start = tokio::time::Instant::now();
         store.acquire_upload_budget(&prepared).await.unwrap();
         let admitted = tokio::time::Instant::now();
@@ -2470,7 +2470,7 @@ mod tests {
         let key = "unit-volume/objects/aa/bb/large-limited-read";
         let plaintext = Bytes::from(vec![0x5a; 128 * 1024]);
         store.put_by_key(key, plaintext.clone()).await.unwrap();
-        store.set_payload_limits(0, 1);
+        store.set_payload_limits(Some(0), Some(1));
 
         let store = Arc::new(store);
         let reader = store.clone();
@@ -2506,7 +2506,7 @@ mod tests {
             .put_by_key(key, Bytes::from(vec![0x5a; 128 * 1024]))
             .await
             .unwrap();
-        store.set_payload_limits(0, 1);
+        store.set_payload_limits(Some(0), Some(1));
 
         let store = Arc::new(store);
         let reader = store.clone();

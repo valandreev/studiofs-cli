@@ -1851,7 +1851,7 @@ mod tests {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (scheduler, _raw, _cached_store, _config) =
             make_encrypted_fetch_scheduler(&tmp, "prefetch-budget-skip");
-        scheduler.data_store.set_payload_limits(0, 1);
+        scheduler.data_store.set_payload_limits(Some(0), Some(1));
         let mut permits = Vec::new();
         while let Some(permit) = scheduler.aimd.try_acquire() {
             permits.push(permit);
@@ -1877,7 +1877,7 @@ mod tests {
         let key = fragment_key(&config, object_id, 0);
         let expected = Bytes::from(vec![0x5a; 1024 * 1024]);
         put_encrypted_fragment(&scheduler, &raw, &key, expected.clone()).await;
-        scheduler.data_store.set_payload_limits(0, 1);
+        scheduler.data_store.set_payload_limits(Some(0), Some(1));
         Arc::get_mut(&mut scheduler)
             .expect("test owns the scheduler")
             .request_timeout = Duration::from_secs(1);
@@ -1900,7 +1900,7 @@ mod tests {
         let key = fragment_key(&config, object_id, 0);
         let expected = Bytes::from(vec![0x5a; 300 * 1024]);
         put_encrypted_fragment(&scheduler, &raw, &key, expected.clone()).await;
-        scheduler.data_store.set_payload_limits(0, 1);
+        scheduler.data_store.set_payload_limits(Some(0), Some(1));
         Arc::get_mut(&mut scheduler)
             .expect("test owns the scheduler")
             .request_timeout = Duration::from_secs(1);

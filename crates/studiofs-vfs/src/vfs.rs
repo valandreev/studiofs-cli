@@ -7404,7 +7404,7 @@ impl StudioVfs {
     }
 
     /// Change aggregate remote object payload limits for this mount.
-    pub fn set_payload_limits(&self, upload_mbps: u64, download_mbps: u64) {
+    pub fn set_payload_limits(&self, upload_mbps: Option<u64>, download_mbps: Option<u64>) {
         self.data_write
             .set_payload_limits(upload_mbps, download_mbps);
     }

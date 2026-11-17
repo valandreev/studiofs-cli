@@ -142,10 +142,8 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
                 && download_mbps.is_none_or(|value| value <= 1_000_000),
             "payload limits must be between 0 and 1000000 Mbps"
         );
-        let (current_upload, current_download, _, _) = self.vfs.payload_limit_status();
-        let upload = upload_mbps.unwrap_or(current_upload);
-        let download = download_mbps.unwrap_or(current_download);
-        self.vfs.set_payload_limits(upload, download);
+        self.vfs.set_payload_limits(upload_mbps, download_mbps);
+        let (upload, download, _, _) = self.vfs.payload_limit_status();
         Ok((upload, download))
     }
 
