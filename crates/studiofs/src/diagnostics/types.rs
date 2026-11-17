@@ -161,6 +161,15 @@ pub(crate) trait DiagnosticsDataSource: Send + Sync + 'static {
     }
     fn health_snapshot(&self) -> DiagnosticsHealthSnapshot;
     fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot;
+    fn set_payload_limits(
+        &self,
+        _upload_mbps: Option<u64>,
+        _download_mbps: Option<u64>,
+    ) -> Result<(u64, u64)> {
+        Err(anyhow!(
+            "payload limit control is unavailable for this diagnostics session"
+        ))
+    }
     fn recent_events(&self, limit: usize) -> Vec<DiagnosticsRecentEvent>;
     fn environment_fingerprint(
         &self,

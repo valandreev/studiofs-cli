@@ -9,6 +9,7 @@ pub mod envelope;
 /// OpenDAL-backed object listing and mutation used by the standalone janitor.
 pub mod janitor;
 pub mod object;
+pub mod payload_throttle;
 pub mod snapshot_key;
 pub mod store;
 

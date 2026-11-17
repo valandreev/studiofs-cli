@@ -51,7 +51,8 @@ Priority for each setting:
 3. Built-in default (`cache-size=100GB`)
 4. For `mount-point`, no implicit default is used; `cache-dir` still falls back to `<meta-dir>/cache` when neither CLI nor config provides a value.
 
-For the public runtime IO knobs (`--read-buffer`, `--readahead`, `--prefetch`)
+For the public runtime IO knobs (`--read-buffer`, `--readahead`, `--prefetch`,
+`--upload-limit`, `--download-limit`)
 the effective precedence is:
 
 1. CLI flag
@@ -163,6 +164,8 @@ studiofs mount <name> [<mount-point>] \
   [--read-buffer <e.g. 4GB>] \
   [--readahead <blocks>] \
   [--prefetch <count>] \
+  [--upload-limit <Mbps>] \
+  [--download-limit <Mbps>] \
   [--principal <name>] \
   [--foreground] \
   [--detach | -d]
@@ -284,7 +287,8 @@ Remove-ItemProperty -Path 'HKLM:\SOFTWARE\WinFsp' -Name 'MountUseMountmgrFromFSD
 ### `settings`
 
 ```bash
-studiofs settings [--mount-point <path>] [--cache-dir <path>] [--cache-size <e.g. 200GB>] [--read-buffer <e.g. 4GB>] [--readahead <blocks>] [--prefetch <count>]
+studiofs settings [--mount-point <path>] [--cache-dir <path>] [--cache-size <e.g. 200GB>] [--read-buffer <e.g. 4GB>] [--readahead <blocks>] [--prefetch <count>] \
+  [--upload-limit <Mbps>] [--download-limit <Mbps>]
 ```
 
 Stores global defaults in `config.toml` for future `studiofs mount` runs.
@@ -297,6 +301,7 @@ Notes:
 - `studiofs settings --cache-dir` creates the cache directory if needed.
 - `studiofs settings` with no options prints current defaults and leaves the file unchanged.
 - `studiofs settings` persists the small public runtime IO defaults without turning the full internal `settings.vfs` structure into a user-facing product surface.
+- When either payload limit is supplied, `settings` also updates every discovered local mount. A mount that is not running uses the saved value on its next start.
 - Supported transitional `STUDIOFS_*` environment variables still override persisted runtime defaults for a single mount process before explicit CLI flags are applied.
 - Internal cache thresholds are derived from cache budget and are not configurable through `studiofs settings`.
 
@@ -643,8 +648,37 @@ Operator stance:
 | `--read-buffer` | `300MB` | Foreground read-buffer budget |
 | `--readahead` | `64` | Sequential readahead width in 4 MiB blocks |
 | `--prefetch` | `16` | Background prefetch batch concurrency budget |
+| `--upload-limit` | `0` | Aggregate encoded object upload limit in Mbps; `0` means unlimited |
+| `--download-limit` | `0` | Aggregate encoded object download limit in Mbps; `0` means unlimited |
 | `--principal` / `STUDIOFS_PRINCIPAL` | `*` | Principal used for ACL checks |
 | `STUDIOFS_CLIENT_ROOT` | `~/.studiofs` | Local per-client metadata, mount records, logs, investigations, and default cache root |
+
+Payload limits apply to encoded object request bodies and are shared by all
+background transfer workers in one mount. Mbps uses decimal units:
+`1 Mbps = 125,000 bytes/second`. Each mount has its own aggregate budget.
+`0` disables the limit and preserves the original unlimited transfer path.
+Before each upload attempt, the complete encrypted object is charged to the shared
+budget. Full downloads charge the measured encrypted body after GET; range reads
+charge the requested range plus the fixed encrypted header allowance. This is an
+accounting limit and may differ from wire bytes due to protocol overhead or range
+coalescing. Budget waits are excluded from network request timeouts. Each admitted request uses the original transfer path, so short-term
+bursts can reach one object per concurrent transfer; the limit controls the
+accounted average exactly: a charged interval is encrypted bytes divided by
+`125,000 * Mbps` seconds. Actual throughput may be lower because network and
+scheduler delays add time; requests are not packet-paced. Values range from 0
+to 1,000,000 Mbps.
+The settings command applies changes through the authenticated diagnostics
+controller lease, overriding even an explicit mount-time limit. Finite changes
+wake budget waiters. Requests already in flight finish without being repaced.
+If all discovered mounts reject the update, the command returns an error and
+clearly reports that the TOML defaults were saved.
+
+Upload limits reduce how quickly the background queue drains. If uploads arrive
+faster than the configured rate, the pending upload backlog can grow and use
+available local cache space; the limit does not block local writes by itself.
+Runtime status reports each direction's configured Mbps limit and cumulative
+throttle wait time so operators can compare transfer pressure with backlog and
+cache headroom.
 
 For cold sequential reads, leave `--read-buffer` at `300MB` or higher unless
 memory is constrained. The runtime derives the foreground fetch AIMD ceiling
@@ -692,6 +726,8 @@ For the public IO knobs, the env mapping is:
 | `--read-buffer` | `STUDIOFS_READ_BUFFER_MB` |
 | `--readahead` | `STUDIOFS_READAHEAD_WIDTH` |
 | `--prefetch` | `STUDIOFS_PREFETCH_CONCURRENCY` |
+| `--upload-limit` | `STUDIOFS_UPLOAD_LIMIT` |
+| `--download-limit` | `STUDIOFS_DOWNLOAD_LIMIT` |
 
 Important families supported in code:
 

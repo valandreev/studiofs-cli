@@ -101,6 +101,16 @@ fn format_ms(value: f64) -> String {
     format!("{value:.3}ms")
 }
 
+fn format_payload_limit_status(upload: &studiofs_vfs::VfsUploadStats) -> String {
+    format!(
+        "Payload limits upload/download Mbps: {}/{}; throttle wait upload/download: {}/{}",
+        upload.upload_limit_mbps,
+        upload.download_limit_mbps,
+        format_ms(upload.upload_throttle_wait_nanos as f64 / 1_000_000.0),
+        format_ms(upload.download_throttle_wait_nanos as f64 / 1_000_000.0)
+    )
+}
+
 fn format_duration_us(value: u64) -> String {
     format_ms(value as f64 / 1_000.0)
 }
@@ -527,6 +537,7 @@ fn print_mounted_write_path_fallback(
     }
     println!("  Backend tag:               {}", snapshot.backend_tag);
     println!("  Uptime:                    {:.1}s", snapshot.uptime_secs);
+    println!("  {}", format_payload_limit_status(&snapshot.upload));
     println!(
         "  flush barrier calls:       {} ({:.2}/s)",
         snapshot.flush_barrier_calls, snapshot.flush_barrier_calls_per_sec
@@ -679,13 +690,14 @@ pub fn run(
                     "  Warning:    metadata DB is locked; showing mounted process diagnostics"
                 );
                 print_pg_sync_diagnostics(&pg_sync);
+                let cache_root = cache_dir
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| meta_dir.join("cache"));
+                let mounted_write_path = read_write_path_observability_from_cache_root(&cache_root);
                 if verbosity.is_verbose() {
-                    let cache_root = cache_dir
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| meta_dir.join("cache"));
-                    print_mounted_write_path_fallback(
-                        read_write_path_observability_from_cache_root(&cache_root),
-                    );
+                    print_mounted_write_path_fallback(mounted_write_path);
+                } else if let Some((_, snapshot)) = &mounted_write_path {
+                    println!("\n  {}", format_payload_limit_status(&snapshot.upload));
                 }
                 return Ok(());
             }
@@ -1091,6 +1103,7 @@ pub fn run(
                 format_bytes(snapshot.upload.encrypted_bytes_written),
                 snapshot.upload.encrypted_object_write_failures
             );
+            println!("  {}", format_payload_limit_status(&snapshot.upload));
             println!(
                 "  fetch stages avg/max ms s3_get {}/{} decode {}/{} assemble_copy {}/{} cache_put {}/{} total {}/{}",
                 format_ms(snapshot.fetch.s3_get_avg_ms),
@@ -1303,6 +1316,21 @@ mod tests {
         assert_eq!(
             format_staged_upload_cache_pressure_line(&snapshot),
             "  Staged current/peak/upload/cache pressure: 512B/1.0KiB/2.0KiB/4.0KiB"
+        );
+    }
+
+    #[test]
+    fn mounted_status_formats_payload_limit_fallback() {
+        let upload = studiofs_vfs::VfsUploadStats {
+            upload_limit_mbps: 17,
+            download_limit_mbps: 29,
+            upload_throttle_wait_nanos: 1_500_000,
+            download_throttle_wait_nanos: 2_500_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_payload_limit_status(&upload),
+            "Payload limits upload/download Mbps: 17/29; throttle wait upload/download: 1.500ms/2.500ms"
         );
     }
 

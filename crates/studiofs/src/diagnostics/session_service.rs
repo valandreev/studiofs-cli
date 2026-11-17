@@ -23,6 +23,7 @@ pub(super) enum DiagnosticsServiceError {
     Workflow { code: &'static str, message: String },
     ProfilingStart(ProfilingWindowStartError),
     ProfilingStop(anyhow::Error),
+    PayloadLimitUpdate(anyhow::Error),
 }
 
 impl DiagnosticsServiceError {
@@ -66,6 +67,10 @@ impl DiagnosticsServiceError {
             },
             Self::ProfilingStop(error) => DiagnosticsResponse::Error {
                 code: "profiling_stop_failed".to_string(),
+                message: error.to_string(),
+            },
+            Self::PayloadLimitUpdate(error) => DiagnosticsResponse::Error {
+                code: "payload_limit_update_failed".to_string(),
                 message: error.to_string(),
             },
         }
@@ -327,6 +332,22 @@ impl<'a> DiagnosticsSessionService<'a> {
             .leases
             .renew(lease_id, ttl_ms)
             .map_err(DiagnosticsServiceError::LeaseInvalid)
+    }
+
+    pub(super) fn set_payload_limits(
+        &self,
+        lease_id: &str,
+        upload_mbps: Option<u64>,
+        download_mbps: Option<u64>,
+    ) -> DiagnosticsServiceResult<(u64, u64)> {
+        self.deps
+            .leases
+            .require_current(lease_id)
+            .map_err(DiagnosticsServiceError::LeaseInvalid)?;
+        self.deps
+            .source
+            .set_payload_limits(upload_mbps, download_mbps)
+            .map_err(DiagnosticsServiceError::PayloadLimitUpdate)
     }
 
     pub(super) fn create_case(
@@ -806,6 +827,20 @@ pub(super) fn dispatch_protocol(
             auth_token,
             || service.renew_controller(&lease_id, ttl_ms),
             |lease| DiagnosticsResponse::ControllerLease { lease },
+        ),
+        DiagnosticsRequest::SetPayloadLimits {
+            auth_token: provided,
+            lease_id,
+            upload_mbps,
+            download_mbps,
+        } => authorized_response(
+            &provided,
+            auth_token,
+            || service.set_payload_limits(&lease_id, upload_mbps, download_mbps),
+            |(upload_mbps, download_mbps)| DiagnosticsResponse::PayloadLimits {
+                upload_mbps,
+                download_mbps,
+            },
         ),
         DiagnosticsRequest::CreateCase {
             auth_token: provided,

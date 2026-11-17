@@ -219,6 +219,10 @@ pub(super) fn write_path_sync_trigger(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VfsConfig {
+    /// Maximum aggregate background upload rate in megabits per second; zero is unlimited.
+    pub upload_limit: u64,
+    /// Maximum aggregate object download rate in megabits per second; zero is unlimited.
+    pub download_limit: u64,
     /// Background janitor cycle interval.
     pub janitor_interval_secs: u64,
     /// Janitor grace window for newer objects.
@@ -404,6 +408,10 @@ pub struct VfsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VfsConfigRaw {
+    /// Optional aggregate background upload limit in megabits per second; zero is unlimited.
+    pub upload_limit: Option<u64>,
+    /// Optional aggregate object download limit in megabits per second; zero is unlimited.
+    pub download_limit: Option<u64>,
     /// Optional override for background janitor interval in seconds.
     pub janitor_interval_secs: Option<u64>,
     /// Optional override for janitor skip-newer-than window in seconds.
@@ -638,6 +646,8 @@ impl VfsConfigRaw {
             };
         }
         overlay!(
+            upload_limit,
+            download_limit,
             janitor_interval_secs,
             janitor_skip_newer_secs,
             janitor_max_deletes,
@@ -728,6 +738,13 @@ fn normalize_vfs_config(
     mut cfg: VfsConfig,
     cache_runtime_overrides: CacheRuntimeTuningOverrides,
 ) -> VfsResult<VfsConfigValidated> {
+    if cfg.upload_limit > 1_000_000 || cfg.download_limit > 1_000_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "payload limits must be between 0 and 1000000 Mbps",
+        )
+        .into());
+    }
     cfg.janitor_interval_secs = cfg.janitor_interval_secs.max(1);
     cfg.janitor_max_deletes = cfg.janitor_max_deletes.max(1);
     cfg.metadata_invalidation_sync_interval_ms = cfg.metadata_invalidation_sync_interval_ms.max(1);
@@ -806,6 +823,8 @@ fn normalize_writer_page_size(size: usize) -> usize {
 impl From<VfsConfig> for VfsConfigRaw {
     fn from(cfg: VfsConfig) -> Self {
         Self {
+            upload_limit: Some(cfg.upload_limit),
+            download_limit: Some(cfg.download_limit),
             janitor_interval_secs: Some(cfg.janitor_interval_secs),
             janitor_skip_newer_secs: Some(cfg.janitor_skip_newer_secs),
             janitor_max_deletes: Some(cfg.janitor_max_deletes),
@@ -889,6 +908,8 @@ impl From<VfsConfig> for VfsConfigRaw {
 impl Default for VfsConfig {
     fn default() -> Self {
         Self {
+            upload_limit: 0,
+            download_limit: 0,
             janitor_interval_secs: DEFAULT_JANITOR_INTERVAL.as_secs(),
             janitor_skip_newer_secs: DEFAULT_JANITOR_SKIP_NEWER_THAN.as_secs(),
             janitor_max_deletes: DEFAULT_JANITOR_MAX_DELETES_PER_RUN,
@@ -973,6 +994,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vfs_config_raw_validate_rejects_excessive_payload_limit() {
+        assert!(
+            VfsConfigRaw {
+                upload_limit: Some(1_000_001),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            VfsConfigRaw {
+                download_limit: Some(1_000_001),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
     fn vfs_config_default_starts_uploads_without_delay() {
         assert_eq!(VfsConfig::default().upload_delay_ms, 0);
     }
@@ -1020,6 +1061,8 @@ mod tests {
             defaults.upload_requeue_max_ms
         );
         assert_eq!(validated.upload_max_attempts, defaults.upload_max_attempts);
+        assert_eq!(validated.upload_limit, 0);
+        assert_eq!(validated.download_limit, 0);
         assert_eq!(
             validated.upload_request_timeout_secs,
             defaults.upload_request_timeout_secs
@@ -1036,6 +1079,8 @@ mod tests {
             read_buffer_mb: Some(8192),
             upload_cache_io_slots: Some(11),
             writer_page_size: Some(64 * 1024),
+            upload_limit: Some(17),
+            download_limit: Some(29),
             principal: Some("dev-user".to_string()),
             ..Default::default()
         }
@@ -1045,6 +1090,8 @@ mod tests {
         assert_eq!(validated.read_buffer_mb, 8192);
         assert_eq!(validated.upload_cache_io_slots, 11);
         assert_eq!(validated.writer_page_size, Some(64 * 1024));
+        assert_eq!(validated.upload_limit, 17);
+        assert_eq!(validated.download_limit, 29);
         assert_eq!(validated.principal, "dev-user");
     }
 

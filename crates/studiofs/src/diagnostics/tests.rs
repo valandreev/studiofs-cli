@@ -82,6 +82,7 @@ struct StaticDiagnosticsSource {
     recent_events: Vec<DiagnosticsRecentEvent>,
     fingerprint: EnvironmentFingerprint,
     reset_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    payload_limits: std::sync::Arc<std::sync::Mutex<(u64, u64)>>,
 }
 
 impl DiagnosticsDataSource for StaticDiagnosticsSource {
@@ -95,6 +96,21 @@ impl DiagnosticsDataSource for StaticDiagnosticsSource {
 
     fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot {
         DiagnosticsRuntimeSnapshot::from_health(self.health.clone())
+    }
+
+    fn set_payload_limits(
+        &self,
+        upload_mbps: Option<u64>,
+        download_mbps: Option<u64>,
+    ) -> Result<(u64, u64)> {
+        let mut limits = self.payload_limits.lock().expect("payload limit mutex");
+        if let Some(upload_mbps) = upload_mbps {
+            limits.0 = upload_mbps;
+        }
+        if let Some(download_mbps) = download_mbps {
+            limits.1 = download_mbps;
+        }
+        Ok(*limits)
     }
 
     fn recent_events(&self, limit: usize) -> Vec<DiagnosticsRecentEvent> {
@@ -280,6 +296,7 @@ fn static_source() -> StaticDiagnosticsSource {
             },
         },
         reset_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        payload_limits: std::sync::Arc::new(std::sync::Mutex::new((5, 200))),
     }
 }
 
@@ -3036,4 +3053,105 @@ fn client_accepts_large_response_frames() {
         Ok::<(), anyhow::Error>(())
     })
     .expect("large response exchange succeeds");
+}
+
+#[test]
+fn payload_limit_updates_require_auth_and_lease_over_ipc() {
+    async fn roundtrip(
+        request: DiagnosticsRequest,
+        source: Arc<dyn DiagnosticsDataSource>,
+        leases: Arc<ControllerLeaseManager>,
+    ) -> anyhow::Result<DiagnosticsResponse> {
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .map_err(anyhow::Error::from)?;
+        let server_task = tokio::spawn(handle_client(
+            server,
+            "secret".to_string(),
+            source,
+            leases,
+            None,
+            None,
+            permit,
+        ));
+        let response = send_request(client, request).await?;
+        server_task.await.map_err(anyhow::Error::from)??;
+        Ok(response)
+    }
+
+    let source = Arc::new(static_source());
+    let limits = Arc::clone(&source.payload_limits);
+    let leases = Arc::new(ControllerLeaseManager::default());
+    crate::runtime_bridge::block_on(async move {
+        let lease = match roundtrip(
+            DiagnosticsRequest::AcquireController {
+                auth_token: "secret".to_string(),
+                client_name: "settings-test".to_string(),
+                ttl_ms: Some(10_000),
+            },
+            source.clone(),
+            leases.clone(),
+        )
+        .await?
+        {
+            DiagnosticsResponse::ControllerLease { lease } => lease,
+            other => anyhow::bail!("expected controller lease, got {other:?}"),
+        };
+
+        let update = roundtrip(
+            DiagnosticsRequest::SetPayloadLimits {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                upload_mbps: Some(17),
+                download_mbps: None,
+            },
+            source.clone(),
+            leases.clone(),
+        )
+        .await?;
+        assert!(matches!(
+            update,
+            DiagnosticsResponse::PayloadLimits {
+                upload_mbps: 17,
+                download_mbps: 200
+            }
+        ));
+
+        let unauthorized = roundtrip(
+            DiagnosticsRequest::SetPayloadLimits {
+                auth_token: "wrong-token".to_string(),
+                lease_id: lease.lease_id.clone(),
+                upload_mbps: None,
+                download_mbps: Some(9),
+            },
+            source.clone(),
+            leases.clone(),
+        )
+        .await?;
+        assert!(matches!(
+            unauthorized,
+            DiagnosticsResponse::Error { code, .. } if code == "unauthorized"
+        ));
+
+        let invalid_lease = roundtrip(
+            DiagnosticsRequest::SetPayloadLimits {
+                auth_token: "secret".to_string(),
+                lease_id: "stale-lease".to_string(),
+                upload_mbps: None,
+                download_mbps: Some(9),
+            },
+            source,
+            leases,
+        )
+        .await?;
+        assert!(matches!(
+            invalid_lease,
+            DiagnosticsResponse::Error { code, .. } if code == "lease_invalid"
+        ));
+        assert_eq!(*limits.lock().expect("payload limit mutex"), (17, 200));
+        Ok::<(), anyhow::Error>(())
+    })
+    .expect("payload limit IPC updates enforce auth and lease");
 }

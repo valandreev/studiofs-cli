@@ -7334,6 +7334,12 @@ impl StudioVfs {
         let completed_uploads_per_sec = Self::per_second(completed_uploads, elapsed);
         let completed_upload_bytes_per_sec = Self::per_second(completed_upload_bytes, elapsed);
         let upload_metrics = &self.upload_scheduler.metrics;
+        let (
+            upload_limit_mbps,
+            download_limit_mbps,
+            upload_throttle_wait_nanos,
+            download_throttle_wait_nanos,
+        ) = self.payload_limit_status();
 
         VfsUploadStats {
             pending_uploads: pending.count,
@@ -7357,6 +7363,10 @@ impl StudioVfs {
             encrypted_bytes_written: upload_metrics
                 .encrypted_bytes_written
                 .load(Ordering::Relaxed),
+            upload_limit_mbps,
+            download_limit_mbps,
+            upload_throttle_wait_nanos,
+            download_throttle_wait_nanos,
             encrypted_object_write_failures: upload_metrics
                 .encrypted_object_write_failures
                 .load(Ordering::Relaxed),
@@ -7391,6 +7401,17 @@ impl StudioVfs {
             upload_ingress_capacity: cache_metrics.upload_queue.ingress_capacity,
             upload_ingress_coalesced: cache_metrics.upload_queue.ingress_coalesced,
         }
+    }
+
+    /// Change aggregate remote object payload limits for this mount.
+    pub fn set_payload_limits(&self, upload_mbps: u64, download_mbps: u64) {
+        self.data_write
+            .set_payload_limits(upload_mbps, download_mbps);
+    }
+
+    /// Return payload limits and cumulative throttle wait in nanoseconds.
+    pub fn payload_limit_status(&self) -> (u64, u64, u64, u64) {
+        self.data_write.payload_limit_status()
     }
 
     /// Return file-session statistics for open handles and handles lifecycle.

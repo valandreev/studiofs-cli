@@ -48,6 +48,12 @@ pub(super) enum DiagnosticsRequest {
         lease_id: String,
         ttl_ms: Option<u64>,
     },
+    SetPayloadLimits {
+        auth_token: String,
+        lease_id: String,
+        upload_mbps: Option<u64>,
+        download_mbps: Option<u64>,
+    },
     CreateCase {
         auth_token: String,
         lease_id: String,
@@ -180,6 +186,10 @@ pub(super) enum DiagnosticsResponse {
     },
     ControllerLease {
         lease: ControllerLease,
+    },
+    PayloadLimits {
+        upload_mbps: u64,
+        download_mbps: u64,
     },
     InvestigationCase {
         case: Box<InvestigationCase>,

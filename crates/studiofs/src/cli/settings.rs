@@ -1,6 +1,7 @@
 //! `studiofs settings` — configure global defaults for mounts.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -30,7 +31,7 @@ Examples:
     studiofs settings --mount-point /mnt/studio
     studiofs settings --cache-dir ~/.cache/studiofs --cache-size 1TB
     studiofs settings --allow-other          (Linux; --allow-other=false resets)
-    studiofs settings --read-buffer 4GB --readahead 256 --prefetch 192")]
+    studiofs settings --read-buffer 4GB --readahead 256 --prefetch 192 --upload-limit 100 --download-limit 200")]
 pub struct SettingsArgs {
     /// Default mount point used by `studiofs mount` when omitted.
     #[arg(long)]
@@ -100,6 +101,17 @@ fn read_studiofs_config_from_path(path: &Path) -> anyhow::Result<StudioFsConfig>
 fn load_studiofs_config_from_path(path: &Path) -> anyhow::Result<StudioFsConfig> {
     let mut config = read_studiofs_config_from_path(path)?;
     strip_removed_public_settings(&mut config);
+    anyhow::ensure!(
+        config
+            .vfs
+            .upload_limit
+            .is_none_or(|value| value <= 1_000_000)
+            && config
+                .vfs
+                .download_limit
+                .is_none_or(|value| value <= 1_000_000),
+        "payload limits must be between 0 and 1000000 Mbps"
+    );
     Ok(config)
 }
 
@@ -138,7 +150,13 @@ fn ensure_mount_point_exists(mount_point: &str) -> anyhow::Result<()> {
 }
 
 pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
-    run_with_config_path(args, &config_toml_path()?)
+    let upload = args.runtime_tuning.upload_limit;
+    let download = args.runtime_tuning.download_limit;
+    run_with_config_path(args, &config_toml_path()?)?;
+    if upload.is_some() || download.is_some() {
+        push_payload_limits_to_running_mounts(upload, download)?;
+    }
+    Ok(())
 }
 
 fn run_with_config_path(args: SettingsArgs, config_path: &Path) -> anyhow::Result<()> {
@@ -228,10 +246,93 @@ fn run_with_config_path(args: SettingsArgs, config_path: &Path) -> anyhow::Resul
     Ok(())
 }
 
+fn push_payload_limits_to_running_mounts(
+    upload_mbps: Option<u64>,
+    download_mbps: Option<u64>,
+) -> anyhow::Result<()> {
+    let sessions = match crate::diagnostics::discover_local_sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            anyhow::bail!("Settings saved to TOML, but running-mount discovery failed: {error}");
+        }
+    };
+    if sessions.is_empty() {
+        println!(
+            "  Live payload limits: no running mounts discovered; saved limits apply to the next mount"
+        );
+        return Ok(());
+    }
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            anyhow::bail!("Settings saved to TOML, but diagnostics runtime failed: {error}");
+        }
+    };
+    let (updated, failed) = runtime.block_on(async {
+        let mut updated = 0usize;
+        let mut failed = 0usize;
+        for discovery in sessions {
+            let mount_point = discovery.mount_point.clone();
+            let client = crate::diagnostics::LocalDiagnosticsClient::new(discovery);
+            let result = async {
+                let lease = client
+                    .acquire_controller("studiofs settings", Duration::from_secs(1))
+                    .await?;
+                client
+                    .set_payload_limits(&lease.lease_id, upload_mbps, download_mbps)
+                    .await
+            }
+            .await;
+            match result {
+                Ok((upload, download)) => {
+                    updated += 1;
+                    println!("  Live payload limits updated on {mount_point}: upload={upload} Mbps, download={download} Mbps");
+                }
+                Err(error) => {
+                    failed += 1;
+                    println!("  (warning) live payload limit update failed on {mount_point}: {error}");
+                }
+            }
+        }
+        (updated, failed)
+    });
+    println!("  Live payload limits: {updated} mount(s) updated, {failed} failed");
+    check_live_update_outcome(updated, failed)
+}
+
+fn check_live_update_outcome(updated: usize, failed: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        updated > 0 || failed == 0,
+        "Settings saved to TOML, but all live mount updates failed"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::error::ErrorKind;
+
+    #[test]
+    fn payload_limit_live_outcome_reports_all_failed_with_saved_toml() {
+        assert!(check_live_update_outcome(0, 0).is_ok());
+        assert!(check_live_update_outcome(1, 1).is_ok());
+        let error = check_live_update_outcome(0, 2).unwrap_err().to_string();
+        assert!(error.contains("saved to TOML"));
+        assert!(error.contains("all live mount updates failed"));
+    }
+
+    #[test]
+    fn payload_limit_rejects_excessive_cli_and_toml_values() {
+        assert!(crate::cli::parse_for_test(&["settings", "--upload-limit", "1000001"]).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[vfs]\nupload_limit = 1000001\n").unwrap();
+        assert!(load_studiofs_config_from_path(&path).is_err());
+    }
 
     #[test]
     fn settings_parses_mount_point() {
@@ -278,8 +379,35 @@ mod tests {
             "256",
             "--prefetch",
             "192",
+            "--upload-limit",
+            "17",
+            "--download-limit",
+            "29",
         ])
         .expect("new public runtime tuning flags should parse");
+    }
+
+    #[test]
+    fn settings_persists_payload_limits_in_toml() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let config_path = temp.path().join("config.toml");
+
+        run_with_config_path(
+            SettingsArgs {
+                runtime_tuning: PublicRuntimeTuningArgs {
+                    upload_limit: Some(17),
+                    download_limit: Some(29),
+                    ..PublicRuntimeTuningArgs::default()
+                },
+                ..SettingsArgs::default()
+            },
+            &config_path,
+        )
+        .expect("persist payload limits");
+
+        let saved = load_studiofs_config_from_path(&config_path).expect("load config");
+        assert_eq!(saved.vfs.upload_limit, Some(17));
+        assert_eq!(saved.vfs.download_limit, Some(29));
     }
 
     #[test]

@@ -132,6 +132,23 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
         }
     }
 
+    fn set_payload_limits(
+        &self,
+        upload_mbps: Option<u64>,
+        download_mbps: Option<u64>,
+    ) -> Result<(u64, u64)> {
+        anyhow::ensure!(
+            upload_mbps.is_none_or(|value| value <= 1_000_000)
+                && download_mbps.is_none_or(|value| value <= 1_000_000),
+            "payload limits must be between 0 and 1000000 Mbps"
+        );
+        let (current_upload, current_download, _, _) = self.vfs.payload_limit_status();
+        let upload = upload_mbps.unwrap_or(current_upload);
+        let download = download_mbps.unwrap_or(current_download);
+        self.vfs.set_payload_limits(upload, download);
+        Ok((upload, download))
+    }
+
     fn recent_events(&self, limit: usize) -> Vec<DiagnosticsRecentEvent> {
         self.vfs
             .recent_runtime_events(limit)
