@@ -508,6 +508,9 @@ impl StudioVfs {
                 let _admission = self.state.writer_stack.supersede_admission(ino);
                 let mut dirty = self.state.namespace.dirty_attrs.lock();
                 if dirty.get(&ino) == Some(&submitted) {
+                    let restored_size = previous_dirty
+                        .as_ref()
+                        .map_or(base_attr.size, |previous| previous.size);
                     match previous_dirty {
                         Some(previous) => {
                             dirty.insert(ino, previous);
@@ -516,7 +519,7 @@ impl StudioVfs {
                             dirty.remove(&ino);
                         }
                     }
-                    self.update_pending_incarnation_size(ino, base_attr.size);
+                    self.update_pending_incarnation_size(ino, restored_size);
                 }
                 drop(dirty);
                 drop(_admission);

@@ -1316,11 +1316,7 @@ impl RedbMetaEngine {
         super::logical_usage::record_inode_size(
             txn,
             attr.ino,
-            if attr.kind == FileType::RegularFile {
-                attr.size
-            } else {
-                0
-            },
+            super::logical_usage::charged_size(attr),
         )
     }
 

@@ -53,6 +53,14 @@
 //! only for its own bookkeeping. These gates are outside `LockTier` and
 //! `LockOrderGuard`.
 //!
+//! `NamespaceState::quota_reservations` serializes logical quota admission
+//! on one client. It is taken only when a quota is configured, before
+//! `dirty_attrs` and local metadata read transactions, and it is held across
+//! those reads so that admission and reservation stay atomic across inodes.
+//! No path may acquire it while holding `dirty_attrs`, a writer lock, or a
+//! supersede gate; a dropped reservation reacquires it alone. It is outside
+//! `LockTier` and `LockOrderGuard`.
+//!
 //! `StudioVfs::retained_restore_gate` is an async `tokio::sync::Mutex` and the
 //! outermost lock of a retained restore. The restore awaits it before any
 //! other lock and holds it across its check, the awaited payload copy, and the

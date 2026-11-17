@@ -47,16 +47,20 @@ impl StudioVfs {
         if end <= current {
             return Ok(None);
         }
+        // Unlimited volumes skip the client-wide reservation lock. A quota
+        // enabled concurrently applies to growth admitted after it is read.
+        let Some(limit) = self.logical_quota_limit()? else {
+            return Ok(None);
+        };
         let reservations = &self.state.namespace.quota_reservations;
         let mut pending = reservations.lock();
         pending.push((ino, end));
-        let check = self.logical_quota_limit().and_then(|limit| {
-            if let Some(limit) = limit
-                && self.logical_quota_usage(&pending)? > u128::from(limit)
-            {
-                return Err(super::VfsError::Io(std::io::ErrorKind::StorageFull.into()));
+        let check = self.logical_quota_usage(&pending).and_then(|used| {
+            if used > u128::from(limit) {
+                Err(super::VfsError::Io(std::io::ErrorKind::StorageFull.into()))
+            } else {
+                Ok(())
             }
-            Ok(())
         });
         if let Err(error) = check {
             pending.pop();

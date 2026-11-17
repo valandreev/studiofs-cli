@@ -1464,15 +1464,7 @@ impl RedbMetaEngine {
 impl MetaInodes for RedbMetaEngine {
     fn logical_usage(&self, pending: &std::collections::HashMap<Ino, u64>) -> MetaResult<u128> {
         let txn = self.begin_read_txn()?;
-        let index = txn
-            .open_table(super::logical_usage::LOGICAL_USAGE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let mut total = index.get(0)?.map_or(0, |v| v.value());
-        for (&ino, &end) in pending {
-            let durable = index.get(ino)?.map_or(0, |v| v.value());
-            total += u128::from(end).saturating_sub(durable);
-        }
-        Ok(total)
+        super::logical_usage::logical_usage_in_read_txn(&txn, pending)
     }
 
     fn get_counter(&self, name: &str) -> MetaResult<u64> {

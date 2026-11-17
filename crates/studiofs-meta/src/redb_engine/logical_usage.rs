@@ -4,6 +4,67 @@ use super::*;
 pub(super) const LOGICAL_USAGE: TableDefinition<u64, u128> =
     TableDefinition::new("local_logical_usage");
 
+/// Logical bytes one resolved inode contributes to the quota.
+pub(super) fn charged_size(attr: &InodeAttr) -> u64 {
+    if attr.kind == FileType::RegularFile {
+        attr.size
+    } else {
+        0
+    }
+}
+
+/// Usage from the derived index, or from a scan of the durable view when the
+/// index predates this binary and no write transaction has rebuilt it yet.
+pub(super) fn logical_usage_in_read_txn(
+    txn: &ReadTransaction,
+    pending: &HashMap<Ino, u64>,
+) -> MetaResult<u128> {
+    let index = match txn.open_table(LOGICAL_USAGE) {
+        Ok(index) => Some(index),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(MetaError::Storage(e.to_string())),
+    };
+    if let Some(index) = index
+        && let Some(mut total) = index.get(0)?.map(|v| v.value())
+    {
+        for (&ino, &end) in pending {
+            let durable = index.get(ino)?.map_or(0, |v| v.value());
+            total += u128::from(end).saturating_sub(durable);
+        }
+        return Ok(total);
+    }
+    let local = txn
+        .open_table(INODES_TABLE)
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+    let base = txn
+        .open_table(BASE_INODES_TABLE)
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+    let tombstones = txn
+        .open_table(INODE_TOMBSTONES_TABLE)
+        .map_err(|e| MetaError::Storage(e.to_string()))?;
+    let mut inodes = HashSet::new();
+    for item in local.iter()?.chain(base.iter()?) {
+        inodes.insert(item?.0.value());
+    }
+    inodes.extend(pending.keys().copied());
+    let mut total = 0u128;
+    for ino in inodes {
+        let durable = match RedbMetaEngine::resolve_attr_from_opened_tables(
+            &base,
+            &local,
+            &tombstones,
+            ino,
+            true,
+        ) {
+            Ok(attr) => charged_size(&attr),
+            Err(MetaError::InodeNotFound(_)) => 0,
+            Err(e) => return Err(e),
+        };
+        total += u128::from(durable.max(pending.get(&ino).copied().unwrap_or_default()));
+    }
+    Ok(total)
+}
+
 /// Mutations of local writer metadata can intentionally suppress cache invalidation.
 pub(super) fn record_inode_size(txn: &WriteTransaction, ino: Ino, size: u64) -> MetaResult<()> {
     let mut index = txn
@@ -80,8 +141,8 @@ impl RedbWriteTransaction<'_> {
                 ino,
                 true,
             ) {
-                Ok(attr) if attr.kind == FileType::RegularFile => u128::from(attr.size),
-                Ok(_) | Err(MetaError::InodeNotFound(_)) => 0,
+                Ok(attr) => u128::from(charged_size(&attr)),
+                Err(MetaError::InodeNotFound(_)) => 0,
                 Err(e) => return Err(e),
             };
             adjust_charge(&mut index, &mut total, ino, size)?;
@@ -111,6 +172,20 @@ mod tests {
             let txn = db.begin_write().unwrap();
             txn.delete_table(LOGICAL_USAGE).unwrap();
             txn.commit().unwrap();
+        }
+        {
+            // A read before any rebuild must scan rather than report zero.
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_read().unwrap();
+            assert_eq!(
+                logical_usage_in_read_txn(&txn, &HashMap::new()).unwrap(),
+                123
+            );
+            assert_eq!(
+                logical_usage_in_read_txn(&txn, &HashMap::from([(file.ino, 130), (u64::MAX, 7)]))
+                    .unwrap(),
+                137
+            );
         }
         let engine = RedbMetaEngine::open(&path).unwrap();
         assert_eq!(engine.logical_usage(&HashMap::new()).unwrap(), 123);
