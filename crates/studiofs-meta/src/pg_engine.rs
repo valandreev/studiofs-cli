@@ -555,7 +555,8 @@ use remote_apply::{
 };
 pub use retained::{RetainedLifecycleSweep, seed_retained_authority};
 pub use volume_settings::{
-    S3VolumeSettingsUpdate, set_shared_trash_days, update_shared_s3_settings,
+    S3VolumeSettingsUpdate, set_shared_logical_quota_bytes, set_shared_trash_days,
+    update_shared_s3_settings,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]

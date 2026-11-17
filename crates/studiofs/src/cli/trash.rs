@@ -2,7 +2,6 @@
 
 use anyhow::{Context, bail};
 use clap::Args;
-use std::time::Duration;
 use studiofs_meta::trash::VolumeSettings;
 use studiofs_meta::{FormatInfo, RedbMetaEngine};
 
@@ -33,46 +32,12 @@ pub struct TrashDaysArgs {
 
 impl TrashDaysArgs {
     pub fn dispatch(self) -> anyhow::Result<()> {
-        let format = local_format_info(&self.name)?;
-        let pg = format
-            .metadata
-            .postgres
-            .as_ref()
-            .context("This volume has no PostgreSQL authority binding")?;
-        let (volume, uuid, days) = (pg.volume_id, format.uuid.clone(), self.days);
-        let runtime = tokio::runtime::Runtime::new()?;
-        let settings = runtime
-            .block_on(async { tokio::time::timeout(
-                Duration::from_secs(30),
-                super::init::with_postgres_client(&pg.url, |mut client| async move {
-                    let row = client
-                        .query_one("SELECT uuid, volume_settings FROM volumes v JOIN metadata_state ms ON ms.vol=v.vol WHERE v.vol=$1", &[&volume])
-                        .await?;
-                    if row.get::<_, String>(0) != uuid {
-                        bail!("shared volume identity mismatch");
-                    }
-                    let Some(days) = days else {
-                        let bytes: Option<Vec<u8>> = row.get(1);
-                        return Ok(bytes
-                            .map(|bytes| serde_json::from_slice::<VolumeSettings>(&bytes))
-                            .transpose()?
-                            .unwrap_or_default());
-                    };
-                    let now_ms = i64::try_from(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)?
-                            .as_millis(),
-                    )?;
-                    let client_id = format!("cli-trash-days-{}", uuid::Uuid::new_v4());
-                    studiofs_meta::pg_engine::set_shared_trash_days(
-                        &mut client, volume, None, days, &client_id, now_ms,
-                    )
-                    .await?
-                    .context("unconditional settings update returned no result")
-                })
-            ).await })
-            .context("PostgreSQL did not answer in time; nothing is confirmed, retry the command")?
-            .context("Could not reach the shared volume settings. Check PostgreSQL connectivity and that every cache uses format 6, then retry.")?;
+        let settings = super::volume_settings::read_or_update_shared_settings(
+            &self.name,
+            self.days
+                .map(super::volume_settings::SettingsUpdate::TrashDays),
+            "Could not reach the shared volume settings. Check PostgreSQL connectivity and that every cache uses format 6, then retry.",
+        )?;
         print_settings(&self.name, settings);
         Ok(())
     }

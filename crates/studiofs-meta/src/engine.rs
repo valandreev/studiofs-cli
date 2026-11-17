@@ -1400,6 +1400,18 @@ pub trait MetaFormat: Send + Sync {
 
 /// Capability trait for inode attributes, counters, and lifecycle metadata.
 pub trait MetaInodes: Send + Sync {
+    /// Logical file usage including any larger, locally accepted EOF for each inode.
+    fn logical_usage(&self, pending: &std::collections::HashMap<Ino, u64>) -> MetaResult<u128> {
+        let mut pending = pending.clone();
+        let mut total = 0u128;
+        for attr in self.list_inode_attrs()? {
+            if attr.kind == FileType::RegularFile {
+                total += u128::from(attr.size.max(pending.remove(&attr.ino).unwrap_or_default()));
+            }
+        }
+        Ok(total + pending.into_values().map(u128::from).sum::<u128>())
+    }
+
     /// Get a counter value, returns 0 if not set.
     fn get_counter(&self, name: &str) -> MetaResult<u64>;
 

@@ -638,6 +638,53 @@ impl RuntimeStatsParseError {
     }
 }
 
+/// Exact capacity reported by the local client's logical quota.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LogicalQuotaStatus {
+    /// Configured maximum logical bytes.
+    pub limit_bytes: u64,
+    /// Locally charged bytes including outstanding growth. Values above u64 use decimal strings on the diagnostics wire.
+    #[serde(with = "quota_bytes_wire")]
+    pub used_bytes: u128,
+    /// Capacity available for additional local growth.
+    pub free_bytes: u64,
+}
+
+mod quota_bytes_wire {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+        match u64::try_from(*bytes) {
+            Ok(value) => serializer.serialize_u64(value),
+            Err(_) => serializer.collect_str(bytes),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<u128, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Bytes {
+            Number(u64),
+            Decimal(String),
+        }
+        match Bytes::deserialize(deserializer)? {
+            Bytes::Number(n) => Ok(n.into()),
+            Bytes::Decimal(s) => s.parse().map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+/// Exact volume capacity in bytes, shared by every platform bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeCapacity {
+    /// Configured logical quota, or the virtual 1 PiB when unlimited.
+    pub total_bytes: u64,
+    /// Bytes available for further growth, saturated at zero.
+    pub free_bytes: u64,
+}
+
 /// Filesystem statistics returned by `statfs()`.
 #[derive(Debug, Clone)]
 pub struct StatFs {

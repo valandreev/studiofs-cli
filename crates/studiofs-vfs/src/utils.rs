@@ -91,24 +91,25 @@ pub fn parse_size_bytes(raw: &str) -> Option<u64> {
     if s.is_empty() {
         return None;
     }
-    let (num_part, multiplier) = if let Some(v) = s.strip_suffix("EB") {
-        (v, 1024u128 * 1024 * 1024 * 1024 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("PB") {
-        (v, 1024u128 * 1024 * 1024 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("TB") {
-        (v, 1024u128 * 1024 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("GB") {
-        (v, 1024u128 * 1024 * 1024)
-    } else if let Some(v) = s.strip_suffix("MB") {
-        (v, 1024u128 * 1024)
-    } else if let Some(v) = s.strip_suffix("KB") {
-        (v, 1024u128)
-    } else if let Some(v) = s.strip_suffix("B") {
-        (v, 1u128)
-    } else {
-        (s.as_str(), 1u128)
+    let unit_start = s
+        .find(|ch: char| ch.is_ascii_alphabetic())
+        .unwrap_or(s.len());
+    let (number, unit) = s.split_at(unit_start);
+    let power = match unit {
+        "" | "B" => 0,
+        "K" | "KB" => 1,
+        "M" | "MB" => 2,
+        "G" | "GB" => 3,
+        "T" | "TB" => 4,
+        "P" | "PB" => 5,
+        "E" | "EB" => 6,
+        _ => return None,
     };
-    let num_part = num_part.trim();
+    let multiplier = 1024u128.pow(power);
+    let num_part = number.trim();
+    if !num_part.bytes().any(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
     let (int_part, frac_part) = match num_part.split_once('.') {
         Some((int_part, frac_part)) => (int_part, frac_part),
         None => (num_part, ""),

@@ -1313,7 +1313,11 @@ impl RedbMetaEngine {
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         inodes.insert(attr.ino, data.as_slice())?;
-        Ok(())
+        super::logical_usage::record_inode_size(
+            txn,
+            attr.ino,
+            super::logical_usage::charged_size(attr),
+        )
     }
 
     pub(super) fn remove_inode_overlay_in_txn(
@@ -1340,7 +1344,7 @@ impl RedbMetaEngine {
         } else {
             tombstones.remove(ino)?;
         }
-        Ok(())
+        super::logical_usage::record_inode_size(txn, ino, 0)
     }
 
     /// Writes the active serving dentry for overlay and mirror updates.

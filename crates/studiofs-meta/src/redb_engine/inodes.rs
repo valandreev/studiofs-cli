@@ -1462,6 +1462,11 @@ impl RedbMetaEngine {
 }
 
 impl MetaInodes for RedbMetaEngine {
+    fn logical_usage(&self, pending: &std::collections::HashMap<Ino, u64>) -> MetaResult<u128> {
+        let txn = self.begin_read_txn()?;
+        super::logical_usage::logical_usage_in_read_txn(&txn, pending)
+    }
+
     fn get_counter(&self, name: &str) -> MetaResult<u64> {
         let txn = self.begin_read_txn()?;
         Self::read_counter_from_read_txn(&txn, name)

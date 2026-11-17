@@ -354,6 +354,7 @@ impl<M: ?Sized + MetaFormat> MetaFormat for RuntimeMetaHandle<M> {
 }
 
 impl<M: ?Sized + MetaInodes> MetaInodes for RuntimeMetaHandle<M> {
+    forward_method!(fn logical_usage(&self, pending: &std::collections::HashMap<Ino, u64>) -> MetaResult<u128>);
     forward_method!(fn get_counter(&self, name: &str) -> MetaResult<u64>);
     forward_method!(fn incr_counter(&self, name: &str, delta: u64) -> MetaResult<u64>);
     forward_method!(fn decr_counter(&self, name: &str, delta: u64) -> MetaResult<u64>);

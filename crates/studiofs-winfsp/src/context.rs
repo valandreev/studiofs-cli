@@ -2546,9 +2546,9 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
-        let st = self.vfs.statfs().map_err(vfs_to_winfsp_err)?;
-        out_volume_info.total_size = st.blocks * st.bsize as u64;
-        out_volume_info.free_size = st.bfree * st.bsize as u64;
+        let capacity = self.vfs.capacity_bytes().map_err(vfs_to_winfsp_err)?;
+        out_volume_info.total_size = capacity.total_bytes;
+        out_volume_info.free_size = capacity.free_bytes;
 
         out_volume_info.set_volume_label(&self.volume_label);
         Ok(())

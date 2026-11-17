@@ -32,12 +32,11 @@ uuid.workspace = true
 chrono.workspace = true
 ctrlc = { version = "3", features = ["termination"] }
 
+fs2 = "0.4"
+
 [dev-dependencies]
 syn = { version = "2", features = ["full"] }
 studiofs-test-support.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-fs2 = "0.4"

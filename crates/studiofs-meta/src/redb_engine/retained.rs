@@ -132,7 +132,9 @@ impl RedbMetaEngine {
         let staged_attr = Self::get_attr_merged_in_write_txn(txn, staged_ino)?;
         if staged_ino == source.ino
             || staged_attr.kind != FileType::RegularFile
-            || staged_attr.size != attr.size
+            // Older restore stages recorded an EOF. New stages retain zero EOF;
+            // the gap-free slice coverage below must still match the fenced source.
+            || (staged_attr.size != 0 && staged_attr.size != attr.size)
             || Self::has_regular_file_chunk_rows_in_write_txn(
                 txn,
                 REGULAR_FILE_BASE_TABLE,

@@ -29,6 +29,7 @@ pub mod benchmark_profile_stub;
 pub mod mount_profile_types;
 pub mod operator_test;
 pub mod perf;
+pub mod quota;
 pub mod runtime_tuning;
 pub mod settings;
 pub mod smount;
@@ -44,6 +45,7 @@ pub mod umeta;
 pub mod umount;
 pub mod upgrade;
 pub mod utils;
+mod volume_settings;
 #[cfg(windows)]
 pub mod winfsp_bootstrap;
 
@@ -162,6 +164,8 @@ enum Commands {
     Upgrade(upgrade::UpgradeArgs),
     /// Show or change the shared trash retention period in whole days
     TrashDays(trash::TrashDaysArgs),
+    /// Show or change the shared logical byte quota
+    Quota(quota::QuotaArgs),
     /// Update mutable shared S3 volume settings
     Umeta(umeta::UmetaArgs),
     Discover(discovery::DiscoverArgs),
@@ -189,6 +193,7 @@ impl Commands {
             Self::Init(args) => args.dispatch(),
             Self::Upgrade(args) => args.dispatch(),
             Self::TrashDays(args) => args.dispatch(),
+            Self::Quota(args) => args.dispatch(),
             Self::Umeta(args) => args.dispatch(),
             Self::Discover(args) => args.dispatch(),
             Self::Mount(args) => args.dispatch_with_auto_tray(),

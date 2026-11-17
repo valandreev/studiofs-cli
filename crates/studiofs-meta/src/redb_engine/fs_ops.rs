@@ -280,7 +280,11 @@ impl<'a> NamespaceCreateTxn<'a> {
         inodes
             .insert(attr.ino, attr_data.as_slice())
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
+        super::logical_usage::record_inode_size(
+            self.txn,
+            attr.ino,
+            super::logical_usage::charged_size(attr),
+        )
     }
 
     pub(super) fn clear_inode_tombstone(&self, ino: Ino) -> MetaResult<()> {

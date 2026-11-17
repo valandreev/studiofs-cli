@@ -114,6 +114,65 @@ impl MetaVolumeSettings for PgMetaEngine {
         }
         Ok(accepted)
     }
+
+    fn compare_and_set_logical_quota_bytes(
+        &self,
+        expected_revision: u64,
+        bytes: Option<u64>,
+    ) -> MetaResult<Option<VolumeSettings>> {
+        let pool = self.command_pool.clone();
+        let timeout = self.command_timeout;
+        let volume = self.volume_id;
+        let client_id = self.current_client_id()?;
+        let now_ms = PgMetaEngine::now_millis();
+        let accepted = self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                pool,
+                timeout,
+                "update volume quota",
+                move |client| {
+                    Box::pin(async move {
+                        set_shared_logical_quota_bytes(
+                            client,
+                            volume,
+                            Some(expected_revision),
+                            bytes,
+                            &client_id,
+                            now_ms,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await
+        })?;
+        if let Some(settings) = accepted {
+            let events = [MetaEvent::SetVolumeSettings { settings }];
+            self.local.apply_replica_events_to_base(&events)?;
+            self.local.apply_replica_serving_state(&events)?;
+        }
+        Ok(accepted)
+    }
+}
+
+/// Update the shared logical byte limit and publish its settings revision atomically.
+pub async fn set_shared_logical_quota_bytes(
+    client: &mut tokio_postgres::Client,
+    volume: i64,
+    expected_revision: Option<u64>,
+    bytes: Option<u64>,
+    client_id: &str,
+    now_ms: i64,
+) -> MetaResult<Option<VolumeSettings>> {
+    update_volume_settings(
+        client,
+        volume,
+        expected_revision,
+        client_id,
+        now_ms,
+        |settings| settings.logical_quota_bytes = bytes,
+    )
+    .await
 }
 
 /// Authoritative online trash-days update, shared by mounted engines and CLI.
@@ -128,12 +187,31 @@ pub async fn set_shared_trash_days(
     client_id: &str,
     now_ms: i64,
 ) -> MetaResult<Option<VolumeSettings>> {
+    update_volume_settings(
+        client,
+        volume,
+        expected_revision,
+        client_id,
+        now_ms,
+        |settings| settings.trash.set_days(days),
+    )
+    .await
+}
+
+async fn update_volume_settings(
+    client: &mut tokio_postgres::Client,
+    volume: i64,
+    expected_revision: Option<u64>,
+    client_id: &str,
+    now_ms: i64,
+    update: impl FnOnce(&mut VolumeSettings),
+) -> MetaResult<Option<VolumeSettings>> {
     let tx = client
         .transaction()
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("begin volume settings", error))?;
     let accepted =
-        set_shared_trash_days_in_tx(&tx, volume, expected_revision, days, client_id, now_ms)
+        update_volume_settings_in_tx(&tx, volume, expected_revision, client_id, now_ms, update)
             .await?;
     if accepted.is_some() {
         tx.commit()
@@ -143,13 +221,13 @@ pub async fn set_shared_trash_days(
     Ok(accepted)
 }
 
-async fn set_shared_trash_days_in_tx(
+async fn update_volume_settings_in_tx(
     tx: &tokio_postgres::Transaction<'_>,
     volume: i64,
     expected_revision: Option<u64>,
-    days: u32,
     client_id: &str,
     now_ms: i64,
+    update: impl FnOnce(&mut VolumeSettings),
 ) -> MetaResult<Option<VolumeSettings>> {
     let row = tx
         .query_one(
@@ -173,7 +251,7 @@ async fn set_shared_trash_days_in_tx(
         .revision
         .checked_add(1)
         .ok_or_else(|| MetaError::Storage("volume settings revision overflow".into()))?;
-    settings.trash.set_days(days);
+    update(&mut settings);
     let event = MetaEvent::SetVolumeSettings { settings };
     let payload = crate::events::encode_event(&event)?;
     let payload_bytes = i64::try_from(payload.len())
@@ -277,11 +355,11 @@ pub async fn update_shared_s3_settings(
     .await
     .map_err(|error| PgMetaEngine::classify_pg_error("store shared S3 settings", error))?;
     if let Some(days) = update.trash_days {
-        set_shared_trash_days_in_tx(&tx, volume, None, days, client_id, now_ms)
-            .await?
-            .ok_or_else(|| {
-                MetaError::Storage("shared trash settings update was rejected".into())
-            })?;
+        update_volume_settings_in_tx(&tx, volume, None, client_id, now_ms, |settings| {
+            settings.trash.set_days(days)
+        })
+        .await?
+        .ok_or_else(|| MetaError::Storage("shared trash settings update was rejected".into()))?;
     }
     tx.commit()
         .await

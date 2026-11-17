@@ -16,6 +16,7 @@ use studiofs_meta::schema::{
     MetadataConfig, PayloadRefState, PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder,
     SliceRange, SliceRecord, TimeSpec, counters::NEXT_EVENT_SEQ,
 };
+use studiofs_meta::trash::MetaVolumeSettings;
 use studiofs_meta::{
     FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, MetaGc, MetaNamespace,
     MetaRecovery, MetaReplication, RedbMetaEngine,
@@ -29192,6 +29193,229 @@ fn retained_restore_concurrent_same_receipt_never_recopies_over_newer_writes() {
     });
 }
 
+#[test]
+fn logical_quota_rejects_sparse_growth_but_allows_non_growing_operations() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "logical-quota-sparse");
+    let unlimited = vfs.statfs().unwrap();
+    assert_eq!(unlimited.blocks * u64::from(unlimited.frsize), 1u64 << 50);
+    assert_eq!(vfs.capacity_bytes().unwrap().total_bytes, 1u64 << 50);
+    meta.compare_and_set_logical_quota_bytes(0, Some(8))
+        .unwrap()
+        .expect("set quota");
+    let file = vfs.create(ROOT_INO, b"quota.bin", 0, 0, 0o644).unwrap();
+    vfs.setattr(file.ino, SetattrArgs::size_only(3)).unwrap();
+    // Byte-level capacity is exact even below one reporting block.
+    assert_eq!(
+        vfs.capacity_bytes().unwrap(),
+        VolumeCapacity {
+            total_bytes: 8,
+            free_bytes: 5
+        }
+    );
+
+    vfs.setattr(file.ino, SetattrArgs::size_only(8))
+        .expect("sparse growth up to quota");
+    assert!(vfs.setattr(file.ino, SetattrArgs::size_only(9)).is_err());
+    assert_eq!(meta.get_attr(file.ino).unwrap().size, 8);
+
+    let fh = vfs.open_file(file.ino, OpenFlags::RDWR, false).unwrap();
+    rt.block_on(vfs.write_fh(fh, file.ino, 0, b"12345678"))
+        .expect("overwrite within quota");
+    vfs.setattr(file.ino, SetattrArgs::size_only(4))
+        .expect("shrink under quota");
+    assert_eq!(meta.get_attr(file.ino).unwrap().size, 4);
+    meta.compare_and_set_logical_quota_bytes(1, Some(0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(vfs.statfs().unwrap().blocks, 0);
+    assert!(vfs.setattr(file.ino, SetattrArgs::size_only(5)).is_err());
+    meta.compare_and_set_logical_quota_bytes(2, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(vfs.statfs().unwrap().blocks, unlimited.blocks);
+    vfs.setattr(file.ino, SetattrArgs::size_only(5)).unwrap();
+}
+
+#[test]
+fn logical_quota_lowered_below_usage_rejects_only_further_growth() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "logical-quota-lowered");
+    let file = vfs.create(ROOT_INO, b"quota.bin", 0, 0, 0o644).unwrap();
+    vfs.setattr(file.ino, SetattrArgs::size_only(12)).unwrap();
+    let settings = meta.volume_settings().unwrap();
+    meta.compare_and_set_logical_quota_bytes(settings.revision, Some(8))
+        .unwrap()
+        .expect("lower quota below current usage");
+
+    assert!(vfs.setattr(file.ino, SetattrArgs::size_only(13)).is_err());
+    assert_eq!(meta.get_attr(file.ino).unwrap().size, 12);
+    vfs.setattr(file.ino, SetattrArgs::size_only(4))
+        .expect("shrink remains allowed");
+}
+
+#[test]
+fn logical_quota_failed_growth_releases_only_its_reservation() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("quota-rollback-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "quota-rollback");
+    let block = u64::from(vfs.block_size());
+    meta.compare_and_set_logical_quota_bytes(0, Some(2 * block))
+        .unwrap()
+        .unwrap();
+    let first = vfs.create(ROOT_INO, b"first", 0, 0, 0o600).unwrap();
+    let other = vfs.create(ROOT_INO, b"other", 0, 0, 0o600).unwrap();
+    let fh = vfs.open_file(first.ino, OpenFlags::RDWR, false).unwrap();
+    rt.block_on(vfs.write_fh(fh, first.ino, 0, b"x")).unwrap();
+    assert_eq!(vfs.statfs().unwrap().bavail, 1);
+    vfs.arm_fail_next_size_change_setattr_before_flush_for_test();
+    vfs.setattr(other.ino, SetattrArgs::size_only(block))
+        .unwrap_err();
+    let quota = vfs.logical_quota_status().unwrap().unwrap();
+    assert_eq!((quota.used_bytes, quota.free_bytes), (1, 2 * block - 1));
+    vfs.setattr(other.ino, SetattrArgs::size_only(quota.free_bytes))
+        .unwrap();
+    assert_eq!(vfs.statfs().unwrap().bfree, 0);
+}
+
+#[test]
+fn logical_quota_charges_hardlinks_and_open_orphans_once() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("quota-links-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "quota-links");
+    meta.compare_and_set_logical_quota_bytes(0, Some(8))
+        .unwrap()
+        .unwrap();
+    let file = vfs.create(ROOT_INO, b"a", 0, 0, 0o600).unwrap();
+    let handle = vfs.open_file(file.ino, OpenFlags::RDWR, false).unwrap();
+    rt.block_on(vfs.write_fh(handle, file.ino, 0, b"12345678"))
+        .unwrap();
+    vfs.link(file.ino, ROOT_INO, b"alias").unwrap();
+    let usage = || vfs.logical_quota_status().unwrap().unwrap().used_bytes;
+    assert_eq!(usage(), 8);
+    vfs.unlink(ROOT_INO, b"a").unwrap();
+    vfs.unlink(ROOT_INO, b"alias").unwrap();
+    assert_eq!(usage(), 8);
+    let err = rt
+        .block_on(vfs.write_fh(handle, file.ino, 8, b"x"))
+        .unwrap_err();
+    assert_eq!(
+        crate::classify_vfs_error(&err),
+        crate::BridgeVfsErrorKind::StorageFull
+    );
+    rt.block_on(vfs.release_fh(handle)).unwrap();
+    assert_eq!(usage(), 0);
+}
+
+#[test]
+fn logical_quota_survives_restart_and_peer_overshoot() {
+    let a = studiofs_test_support::workspace_target_tempdir("quota-a-");
+    let b = studiofs_test_support::workspace_target_tempdir("quota-b-");
+    let (ra, va, ma) = make_unstarted_test_vfs(&a, "shared-quota");
+    let (rb, vb, mb) = make_unstarted_test_vfs(&b, "shared-quota");
+    let policy = ma
+        .compare_and_set_logical_quota_bytes(0, Some(10))
+        .unwrap()
+        .unwrap();
+    mb.apply_replica_serving_state(&[studiofs_meta::MetaEvent::SetVolumeSettings {
+        settings: policy,
+    }])
+    .unwrap();
+    let fa = va.create(ROOT_INO, b"a", 0, 0, 0o600).unwrap();
+    // Separate clients receive disjoint inode ranges from the shared allocator.
+    mb.set_counter(studiofs_meta::types::counters::NEXT_INODE, fa.ino + 100)
+        .unwrap();
+    let fb = vb.create(ROOT_INO, b"b", 0, 0, 0o600).unwrap();
+    assert_ne!(fa.ino, fb.ino);
+    for (rt, vfs, ino) in [(&ra, &va, fa.ino), (&rb, &vb, fb.ino)] {
+        rt.block_on(async {
+            vfs.write(ino, 0, b"12345678").await.unwrap();
+            vfs.fsync(ino, false).await.unwrap();
+        });
+    }
+    let aa = ma.get_attr(fa.ino).unwrap();
+    let ab = mb.get_attr(fb.ino).unwrap();
+    assert_eq!(va.logical_quota_status().unwrap().unwrap().free_bytes, 2);
+    assert_eq!(vb.logical_quota_status().unwrap().unwrap().free_bytes, 2);
+    for (target, peer, name) in [(&ma, ab, b"b"), (&mb, aa, b"a")] {
+        let entry = studiofs_meta::schema::DirEntryValue {
+            ino: peer.ino,
+            kind: peer.kind,
+        };
+        let events = [
+            studiofs_meta::MetaEvent::SetAttr { attr: peer },
+            studiofs_meta::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: name.to_vec(),
+                entry,
+            },
+        ];
+        target.apply_replica_events_to_base(&events).unwrap();
+        target.apply_replica_serving_state(&events).unwrap();
+        target.apply_replica_serving_state(&events).unwrap();
+    }
+    for (vfs, ino) in [(&va, fa.ino), (&vb, fb.ino)] {
+        let quota = vfs.logical_quota_status().unwrap().unwrap();
+        assert_eq!((quota.used_bytes, quota.free_bytes), (16, 0));
+        let error = vfs.setattr(ino, SetattrArgs::size_only(9)).unwrap_err();
+        assert_eq!(
+            crate::classify_vfs_error(&error),
+            crate::BridgeVfsErrorKind::StorageFull
+        );
+    }
+    ra.block_on(va.shutdown(Duration::ZERO)).unwrap();
+    drop((va, ma, ra));
+    let (_rt, reopened, meta) = reopen_existing_test_vfs(&a);
+    assert_eq!(
+        (
+            meta.get_attr(fa.ino).map(|a| a.size).ok(),
+            meta.get_attr(fb.ino).map(|a| a.size).ok()
+        ),
+        (Some(8), Some(8))
+    );
+    assert_eq!(
+        reopened.logical_quota_status().unwrap().unwrap().used_bytes,
+        16
+    );
+    reopened.setattr(fa.ino, SetattrArgs::size_only(1)).unwrap();
+    assert_eq!(
+        reopened.logical_quota_status().unwrap().unwrap().free_bytes,
+        1
+    );
+}
+
+#[test]
+fn logical_quota_is_enforced_across_concurrent_handles() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "logical-quota-concurrent");
+    meta.compare_and_set_logical_quota_bytes(0, Some(8))
+        .unwrap()
+        .expect("set quota");
+    let first = vfs.create(ROOT_INO, b"first.bin", 0, 0, 0o644).unwrap();
+    let second = vfs.create(ROOT_INO, b"second.bin", 0, 0, 0o644).unwrap();
+    let start = Arc::new(std::sync::Barrier::new(3));
+    let outcomes = [first.ino, second.ino].map(|ino| {
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let rt = rt.clone();
+        let vfs = vfs.clone();
+        let start = start.clone();
+        thread::spawn(move || {
+            start.wait();
+            rt.block_on(vfs.write_fh(fh, ino, 0, b"12345678")).is_ok()
+        })
+    });
+    start.wait();
+    let accepted = outcomes
+        .into_iter()
+        .map(|join| join.join().expect("growth thread"))
+        .filter(|accepted| *accepted)
+        .count();
+    assert_eq!(
+        accepted, 1,
+        "only one handle may reserve the remaining quota"
+    );
+    let used = vfs.logical_quota_status().unwrap().unwrap().used_bytes;
+    assert_eq!(used, 8);
+}
+
 /// Builds a retained receipt plus one leftover stage per `(name, bytes)` pair,
 /// the way a restore that crashed mid-copy leaves them.
 async fn retained_restore_receipt_with_leftover_stages(
@@ -29295,6 +29519,9 @@ fn retained_restore_keeps_outside_hardlink_at_committed_nlink() {
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "retained-outside-link");
     rt.block_on(async {
         meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+        meta.compare_and_set_logical_quota_bytes(1, Some(7))
+            .unwrap()
+            .unwrap();
         let store = vfs.mkdir(ROOT_INO, b"private", 0, 0, 0o700).unwrap();
         let file = vfs.create(ROOT_INO, b"source.bin", 0, 0, 0o644).unwrap();
         vfs.write(file.ino, 0, b"payload").await.unwrap();
@@ -29304,6 +29531,7 @@ fn retained_restore_keeps_outside_hardlink_at_committed_nlink() {
         let receipt = meta.next_inode().unwrap();
         meta.retain_namespace_entry(ROOT_INO, b"source.bin", store.ino, receipt)
             .unwrap();
+        assert_eq!(vfs.logical_quota_status().unwrap().unwrap().used_bytes, 7);
         let restored = vfs
             .restore_retained_entry(meta.as_ref(), receipt, ROOT_INO, b"restored.bin")
             .await
@@ -29312,6 +29540,7 @@ fn retained_restore_keeps_outside_hardlink_at_committed_nlink() {
             restored.state,
             RetainedEntryState::Restored { .. }
         ));
+        assert_eq!(vfs.logical_quota_status().unwrap().unwrap().used_bytes, 7);
         // The namespace move preserves both links to the same inode.
         let survivor = vfs.lookup(ROOT_INO, b"outside.bin").unwrap();
         assert_eq!(survivor.ino, file.ino);

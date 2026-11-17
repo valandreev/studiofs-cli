@@ -241,16 +241,6 @@ const INVALIDATION_DROPOUT_BASELINE_FILE: &str = "baseline.txt";
 const INVALIDATION_DROPOUT_TARGET_FILE: &str = "fallback-target.txt";
 const INVALIDATION_DROPOUT_DELETE_TARGET: &str = "delete-target.txt";
 
-#[cfg(test)]
-/// Scenario identifier for test helper that expects validation failures.
-pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
-#[cfg(test)]
-/// Scenario identifier for test helper that expects validation failures with cleanup failures.
-pub(crate) const TEST_FAILING_VALIDATE_AND_CLEANUP: &str = "__test-failing-validate-and-cleanup";
-#[cfg(test)]
-/// Scenario identifier for test helper that expects passing validation.
-pub(crate) const TEST_PASSING: &str = "__test-passing";
-
 use super::types::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioError};
 
 mod actions;
@@ -258,6 +248,7 @@ mod advanced_mounted;
 mod assertions;
 mod concurrent_mkdir;
 mod faults;
+mod logical_quota;
 mod macos_mmap_exec;
 mod namespace_collision;
 mod posix_acl_xattr;
@@ -282,6 +273,7 @@ pub(super) use advanced_mounted::*;
 pub(super) use assertions::*;
 pub(super) use concurrent_mkdir::ConcurrentMkdirMerge;
 pub(super) use faults::*;
+pub(super) use logical_quota::LogicalQuota;
 pub(super) use macos_mmap_exec::MacosMmapExec;
 pub(super) use namespace_collision::*;
 pub(super) use posix_acl_xattr::PosixAclXattrRejection;
@@ -293,7 +285,11 @@ pub(super) use smoke_outage::*;
 pub(super) use snapshot_v2::*;
 pub(super) use sync_safety::*;
 #[cfg(test)]
-pub(super) use test_fixtures::*;
+pub(crate) use test_fixtures::{
+    TEST_FAILING_VALIDATE, TEST_FAILING_VALIDATE_AND_CLEANUP, TEST_PASSING,
+};
+#[cfg(test)]
+pub(super) use test_fixtures::{TestFailingScenario, TestPassingScenario};
 pub(super) use worker_concurrency::WorkerConcurrency;
 
 #[cfg(test)]

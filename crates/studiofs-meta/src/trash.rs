@@ -93,12 +93,34 @@ impl TryFrom<TrashPolicyFields> for TrashPolicy {
 }
 
 /// Mutable shared volume settings, separate from immutable storage identity.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 pub struct VolumeSettings {
     /// Monotonic revision used for atomic compare-and-set updates.
+    #[serde(alias = "quota_v1_revision")]
     pub revision: u64,
     /// Retention admission and expiry policy.
     pub trash: TrashPolicy,
+    /// Optional logical capacity limit; `None` means unlimited.
+    #[serde(default)]
+    pub logical_quota_bytes: Option<u64>,
+}
+
+impl Serialize for VolumeSettings {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        // A quota-unaware settings writer requires "revision". Fail its read
+        // before it can serialize the settings again and drop the quota.
+        let revision_key = if serializer.is_human_readable() && self.logical_quota_bytes.is_some() {
+            "quota_v1_revision"
+        } else {
+            "revision"
+        };
+        let mut state = serializer.serialize_struct("VolumeSettings", 3)?;
+        state.serialize_field(revision_key, &self.revision)?;
+        state.serialize_field("trash", &self.trash)?;
+        state.serialize_field("logical_quota_bytes", &self.logical_quota_bytes)?;
+        state.end()
+    }
 }
 
 impl VolumeSettings {
@@ -125,6 +147,13 @@ pub trait MetaVolumeSettings: Send + Sync {
         &self,
         expected_revision: u64,
         days: u32,
+    ) -> crate::MetaResult<Option<VolumeSettings>>;
+
+    /// Atomically update the logical quota if the serving revision still matches.
+    fn compare_and_set_logical_quota_bytes(
+        &self,
+        expected_revision: u64,
+        bytes: Option<u64>,
     ) -> crate::MetaResult<Option<VolumeSettings>>;
 }
 
