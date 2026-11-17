@@ -4917,6 +4917,8 @@ dependencies = [
 name = "studiofs-data"
 version = "0.2.3"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "aws-sdk-s3",
  "aws-smithy-http-client",
  "bitflags 2.11.0",
@@ -4927,6 +4929,8 @@ dependencies = [
  "hkdf",
  "http 1.4.0",
  "opendal",
+ "reqsign",
+ "reqwest 0.12.28",
  "sha2 0.10.9",
  "studiofs-meta",
  "thiserror 2.0.18",

@@ -275,6 +275,7 @@ pub struct PgMetaEngine {
     background_workers: PgBackgroundWorkers,
     /// Wakes VFS metadata invalidation after PG metadata NOTIFY syncs local state.
     metadata_invalidation_notify: Arc<tokio::sync::Notify>,
+    shared_s3_credentials_observer: Mutex<Option<crate::engine::SharedS3CredentialsObserver>>,
     metadata_notify_received: AtomicU64,
     metadata_notify_reconnects: AtomicU64,
     metadata_fallback_poll_discoveries: AtomicU64,
@@ -553,7 +554,9 @@ use remote_apply::{
     RemoteReplayApplyOutcome, RemoteReplayExecution,
 };
 pub use retained::{RetainedLifecycleSweep, seed_retained_authority};
-pub use volume_settings::set_shared_trash_days;
+pub use volume_settings::{
+    S3VolumeSettingsUpdate, set_shared_trash_days, update_shared_s3_settings,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetadataSyncSource {
@@ -605,6 +608,96 @@ impl Drop for AllocatorBootstrapAttemptGuard<'_> {
                 .transition_pg_sync_lifecycle(PgSyncLifecycle::Degraded);
         }
     }
+}
+
+impl PgMetaEngine {
+    pub(super) fn refresh_shared_s3_format_info(&self) -> MetaResult<()> {
+        let current = self.local.get_format_info()?;
+        let command_pool = Arc::clone(&self.command_pool);
+        let command_timeout = self.command_timeout;
+        let volume_id = self.volume_id;
+        let shared = self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                command_pool,
+                command_timeout,
+                "read shared format info",
+                move |client| {
+                    Box::pin(async move {
+                        let row = client
+                            .query_one(
+                                "SELECT v.uuid, ms.format_info FROM volumes v JOIN metadata_state ms ON ms.vol=v.vol WHERE v.vol=$1",
+                                &[&volume_id],
+                            )
+                            .await
+                            .map_err(|error| Self::classify_pg_error("read shared format info", error))?;
+                        let uuid: String = row.get(0);
+                        let bytes: Vec<u8> = row.get(1);
+                        decode_shared_format_info(&uuid, &bytes)
+                    })
+                },
+            )
+            .await
+        })?;
+        // No checkpoint has published a shared format yet; keep the local settings.
+        let Some(shared) = shared else {
+            return Ok(());
+        };
+        if shared.uuid != current.uuid || shared.name != current.name {
+            return Err(MetaError::Storage("shared volume identity mismatch".into()));
+        }
+        crate::ensure_supported_format_version(&shared)?;
+        let mut updated = current.clone();
+        updated.endpoint = shared.endpoint;
+        updated.bucket = shared.bucket;
+        updated.access_key = shared.access_key;
+        updated.secret_key = shared.secret_key;
+        updated.region = shared.region;
+        if updated.endpoint != current.endpoint
+            || updated.bucket != current.bucket
+            || updated.access_key != current.access_key
+            || updated.secret_key != current.secret_key
+            || updated.region != current.region
+        {
+            self.local.set_format_info(&updated)?;
+            if (updated.access_key != current.access_key
+                || updated.secret_key != current.secret_key)
+                && let Some(observer) = self
+                    .shared_s3_credentials_observer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+            {
+                observer(&updated.access_key, &updated.secret_key);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Decode a shared `metadata_state.format_info` value; empty means no checkpoint published it yet.
+fn decode_shared_format_info(uuid: &str, bytes: &[u8]) -> MetaResult<Option<FormatInfo>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let info = crate::decode_format_info(bytes)?;
+    if uuid != info.uuid {
+        return Err(MetaError::Storage("shared volume identity mismatch".into()));
+    }
+    Ok(Some(info))
+}
+
+/// Read authoritative volume format metadata from PostgreSQL and verify its embedded UUID.
+/// Returns `None` while no checkpoint has published a shared format.
+pub fn read_shared_volume_format_info(
+    postgres_url: &str,
+    volume_id: i64,
+) -> MetaResult<Option<FormatInfo>> {
+    PgMetaEngine::read_shared_format_info(
+        postgres_url,
+        volume_id,
+        PgMetaEngine::default_connect_timeout(),
+        PgMetaEngine::default_command_timeout(),
+    )
 }
 
 #[cfg(test)]
@@ -1324,6 +1417,55 @@ impl PgMetaEngine {
         })
     }
 
+    pub(crate) fn read_shared_format_info(
+        postgres_url: &str,
+        volume_id: i64,
+        connect_timeout: Duration,
+        command_timeout: Duration,
+    ) -> MetaResult<Option<FormatInfo>> {
+        let postgres_url = postgres_url.to_string();
+        Self::run_async_once(async move {
+            let (client, connection) =
+                tokio::time::timeout(connect_timeout, connect_studiofs_postgres(&postgres_url))
+                    .await
+                    .map_err(|_| {
+                        Self::pg_timeout_error(
+                            PgTimeoutContext::Connection("read shared format info"),
+                            connect_timeout,
+                        )
+                    })?
+                    .map_err(|_| {
+                        MetaError::RemoteUnavailable(
+                            "shared format refresh could not connect".to_string(),
+                        )
+                    })?;
+            let connection_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let timed_result = tokio::time::timeout(command_timeout, async move {
+                let row = client
+                    .query_one(
+                        "SELECT v.uuid, ms.format_info FROM volumes v JOIN metadata_state ms ON ms.vol=v.vol WHERE v.vol=$1",
+                        &[&volume_id],
+                    )
+                    .await
+                    .map_err(|error| Self::classify_pg_error("read shared format info", error))?;
+                let uuid: String = row.get(0);
+                let bytes: Vec<u8> = row.get(1);
+                decode_shared_format_info(&uuid, &bytes)
+            })
+            .await;
+            connection_task.abort();
+            let _ = connection_task.await;
+            timed_result.map_err(|_| {
+                Self::pg_timeout_error(
+                    PgTimeoutContext::Command("read shared format info"),
+                    command_timeout,
+                )
+            })?
+        })
+    }
+
     /// Ensure the remote format and volume identity are validated before a
     /// remote replication operation.
     fn ensure_remote_format_validated(&self) -> MetaResult<()> {
@@ -1497,7 +1639,7 @@ impl PgMetaEngine {
         }
         local.set_remote_namespace_visibility_filter(true)?;
 
-        let pg = info.metadata.postgres.ok_or_else(|| {
+        let pg = info.metadata.postgres.as_ref().ok_or_else(|| {
             MetaError::Storage("missing metadata.postgres config for Postgres backend".to_string())
         })?;
         if pg.url.trim().is_empty() {
@@ -1583,6 +1725,7 @@ impl PgMetaEngine {
             }
         };
         let remote_format_validated = !defer_remote_startup_probes && !remote_transport_unavailable;
+        // Shared S3 settings are refreshed by the background metadata poll.
         let remote_identity_validated = false;
         let persisted_client_slot = Self::load_persisted_client_slot(&local)?;
 
@@ -1678,6 +1821,7 @@ impl PgMetaEngine {
             lock_worker_start_lock: Mutex::new(()),
             background_workers: PgBackgroundWorkers::new(),
             metadata_invalidation_notify,
+            shared_s3_credentials_observer: Mutex::new(None),
             metadata_notify_received: AtomicU64::new(0),
             metadata_notify_reconnects: AtomicU64::new(0),
             metadata_fallback_poll_discoveries: AtomicU64::new(0),

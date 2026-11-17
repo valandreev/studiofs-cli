@@ -1727,6 +1727,185 @@ fn test_pg_volume_settings_authoritative_cas_converges_two_clients() {
         "local journal cannot bypass global CAS"
     );
 }
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn test_pg_umeta_updates_requested_fields_atomically_and_refreshes_existing_cache() {
+    use crate::engine::MetaEngine;
+    let dsn = pg_dsn().expect("STUDIOFS_TEST_PG_DSN is required; no silent skip");
+    let dir = studiofs_test_support::workspace_target_tempdir("pg-umeta-");
+    let volume = PgTestVolume::new(&dsn, "pg-umeta");
+    let original = volume.format_info();
+    let volume_id = volume.volume_id;
+    let expected_uuid = original.uuid.clone();
+    let first_expected_uuid = expected_uuid.clone();
+    let local_path = dir.path().join("existing.redb");
+    seed_local(&local_path, &original);
+    let updated = run_async(with_pg_test_client(&dsn, |mut client| async move {
+        crate::pg_engine::update_shared_s3_settings(
+            &mut client,
+            volume_id,
+            &first_expected_uuid,
+            crate::pg_engine::S3VolumeSettingsUpdate {
+                endpoint: Some("https://rotated.example.test"),
+                bucket: Some("new-bucket"),
+                access_key: Some("rotated-access"),
+                secret_key: Some("rotated-secret"),
+                region: Some("eu-central-1"),
+                trash_days: Some(11),
+            },
+            "test-umeta",
+            1,
+        )
+        .await
+    }))
+    .expect("atomic shared S3/trash update");
+    assert_eq!(updated.endpoint, "https://rotated.example.test");
+    assert_eq!(updated.bucket, "new-bucket");
+    assert_eq!(updated.access_key, "rotated-access");
+    assert_eq!(updated.secret_key, "rotated-secret");
+    assert_eq!(updated.region, "eu-central-1");
+    assert_eq!(updated.format_version, original.format_version);
+    assert_eq!(updated.name, original.name);
+    assert_eq!(updated.data_prefix, original.data_prefix);
+    assert_eq!(updated.uuid, original.uuid);
+    assert_eq!(updated.encryption, original.encryption);
+    assert_eq!(updated.block_size, original.block_size);
+    assert_eq!(updated.metadata.backend, original.metadata.backend);
+    assert!(updated.metadata.remote.is_none());
+    let original_pg = original
+        .metadata
+        .postgres
+        .as_ref()
+        .expect("original PostgreSQL format");
+    assert!(
+        updated.metadata.postgres.as_ref().is_some_and(|pg| {
+            pg.volume_id == original_pg.volume_id && pg.url == original_pg.url
+        })
+    );
+
+    let mut expected_only_access_key = serde_json::to_value(&updated).expect("encode format");
+    expected_only_access_key["access_key"] = serde_json::Value::String("only-access".into());
+    let access_key_only = run_async(with_pg_test_client(&dsn, |mut client| async move {
+        crate::pg_engine::update_shared_s3_settings(
+            &mut client,
+            volume_id,
+            &expected_uuid,
+            crate::pg_engine::S3VolumeSettingsUpdate {
+                access_key: Some("only-access"),
+                ..Default::default()
+            },
+            "test-umeta-fields",
+            2,
+        )
+        .await
+    }))
+    .expect("update only the requested access key");
+    assert!(
+        serde_json::to_value(access_key_only).expect("encode changed format")
+            == expected_only_access_key,
+        "an access-key-only update must preserve every other format field"
+    );
+
+    let local = PgMetaEngine::open_with_options(
+        &local_path,
+        PgOpenOptions {
+            background_poll: false,
+            defer_remote_startup_probes: true,
+            ..Default::default()
+        },
+    )
+    .expect("reopen existing cache");
+    let observed_credentials = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed = observed_credentials.clone();
+    local.register_shared_s3_credentials_observer(std::sync::Arc::new(move |access, secret| {
+        *observed.lock().unwrap() = Some((access.to_owned(), secret.to_owned()));
+    }));
+    assert_eq!(
+        *observed_credentials.lock().unwrap(),
+        Some((original.access_key.clone(), original.secret_key.clone())),
+        "observer registration seeds the existing local credential pair"
+    );
+    assert_eq!(
+        local
+            .get_format_info()
+            .expect("read cached format")
+            .access_key,
+        original.access_key,
+        "reopening local metadata must not synchronously probe PostgreSQL for S3 settings"
+    );
+    let shared_format = crate::pg_engine::read_shared_volume_format_info(&dsn, volume_id)
+        .expect("read shared format through the janitor/snapshot helper")
+        .expect("shared format is published");
+    assert_eq!(shared_format.uuid, original.uuid);
+    assert_eq!(shared_format.access_key, "only-access");
+    local
+        .refresh_shared_s3_format_info()
+        .expect("background poll refreshes shared S3 settings");
+    assert_eq!(
+        *observed_credentials.lock().unwrap(),
+        Some(("only-access".into(), "rotated-secret".into())),
+        "successful local format refresh publishes the changed credential pair"
+    );
+    let refreshed = local
+        .get_format_info()
+        .expect("read refreshed local format");
+    assert_eq!(refreshed.access_key, "only-access");
+    assert_eq!(refreshed.secret_key, "rotated-secret");
+    assert_eq!(refreshed.endpoint, "https://rotated.example.test");
+
+    // Publishing the checkpoint from this existing cache must keep shared config.
+    local
+        .write_checkpoint_with_lease()
+        .expect("publish checkpoint");
+    let stale_format_bytes = serde_json::to_vec(&original).expect("encode stale format");
+    let stale_snapshot = Vec::<u8>::new();
+    let stale_checksum = vec![0_u8; 32];
+    let current_format_version = CURRENT_FORMAT_VERSION as i16;
+    run_async(with_pg_test_client(&dsn, |client| async move {
+        let published = client
+            .query_opt(
+                super::sql::UPSERT_METADATA_CHECKPOINT,
+                &[
+                    &volume_id,
+                    &current_format_version,
+                    &0_i64,
+                    &0_i64,
+                    &0_i64,
+                    &stale_snapshot,
+                    &stale_checksum,
+                    &stale_format_bytes,
+                ],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        assert!(
+            published.is_some(),
+            "stale fixture checkpoint should be accepted"
+        );
+        Ok(())
+    }))
+    .expect("publish deliberately stale checkpoint metadata");
+    let remote = run_async(with_pg_test_client(&dsn, |client| async move {
+        let row = client
+            .query_one(
+                "SELECT format_info, volume_settings FROM metadata_state WHERE vol=$1",
+                &[&volume_id],
+            )
+            .await
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        let info: crate::FormatInfo = crate::decode_format_info(&row.get::<_, Vec<u8>>(0))?;
+        let settings_bytes: Vec<u8> = row.get(1);
+        let settings: crate::trash::VolumeSettings = serde_json::from_slice(&settings_bytes)
+            .map_err(|error| MetaError::Serialization(error.to_string()))?;
+        Ok((info, settings))
+    }))
+    .expect("read shared state after checkpoint");
+    assert_eq!(remote.0.secret_key, "rotated-secret");
+    assert_eq!(remote.0.access_key, "only-access");
+    assert_eq!(remote.1.trash.days(), 11);
+    assert_eq!(remote.1.revision, 1);
+}
 use crate::engine::{
     CheckpointDescriptorFailure, MetaAcl, MetaError, MetadataCheckpointRefreshReason,
     PgSyncFailure, PgSyncPageDiagnostics,
@@ -6937,6 +7116,8 @@ fn checkpoint_freshness_sql_uses_persisted_scalar_bookkeeping() {
     assert!(bump.contains("checkpoint_total_event_bytes"));
 
     let checkpoint = super::sql::UPSERT_METADATA_CHECKPOINT;
+    assert!(checkpoint.contains("THEN EXCLUDED.format_info"));
+    assert!(checkpoint.contains("ELSE metadata_state.format_info"));
     assert!(
         checkpoint.contains("checkpoint_total_event_bytes = EXCLUDED.checkpoint_total_event_bytes")
     );

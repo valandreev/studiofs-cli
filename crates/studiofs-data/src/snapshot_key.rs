@@ -393,6 +393,7 @@ mod tests {
             data_prefix: "tenant/demo/".to_owned(),
             volume_uuid: UUID_A.to_owned(),
             crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x42; 32])),
+            rotating_credentials: None,
         };
         let operator = opendal::Operator::new(Memory::default())
             .expect("memory operator")

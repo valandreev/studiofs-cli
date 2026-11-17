@@ -597,6 +597,7 @@ impl PgMetaEngine {
             .spawn(move || {
                 let _cancellation = super::runtime::WorkerRemoteCancellationScope::enter();
                 let mut last_retained_sweep: Option<Instant> = None;
+                let mut s3_refresh_failed = false;
                 loop {
                     if shutdown.load(Ordering::Acquire) {
                         break;
@@ -650,6 +651,24 @@ impl PgMetaEngine {
                         engine.sync_metadata_with_source(MetadataSyncSource::FallbackPoll)
                     };
                     if let Ok(initial_changed) = sync_result {
+                        match engine.refresh_shared_s3_format_info() {
+                            Ok(()) => s3_refresh_failed = false,
+                            Err(error) if !s3_refresh_failed => {
+                                warn!(
+                                    error = %error,
+                                    volume_id = engine.volume_id,
+                                    "shared S3 settings refresh deferred until a later metadata poll"
+                                );
+                                s3_refresh_failed = true;
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    error = %error,
+                                    volume_id = engine.volume_id,
+                                    "shared S3 settings refresh remains deferred"
+                                );
+                            }
+                        }
                         if matches!(
                             engine.current_pg_sync_lifecycle(),
                             PgSyncLifecycle::TargetReached

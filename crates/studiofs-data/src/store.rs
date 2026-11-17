@@ -4,10 +4,12 @@ use crate::crypto::{self, ObjectCipher, VolumeMasterKey};
 use crate::envelope::{SFEC_HEADER_FIXED_LEN, SfecError, SfecHeader, SfecHeaderLayout};
 use crate::object::{ObjectHeader, validate_object_payload_size};
 use crate::snapshot_key::{SnapshotArtifactKey, SnapshotArtifactPrefix};
+use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Buffer, EntryMode, Operator, services::S3};
+use reqsign::{AwsCredential, AwsCredentialLoad};
 use std::collections::HashSet;
 use std::fmt;
 use std::net::Ipv6Addr;
@@ -138,6 +140,66 @@ pub struct DataStoreConfig {
     pub volume_uuid: String,
     /// Transparent remote-object encryption settings.
     pub crypto: DataStoreCryptoConfig,
+    /// Optional shared credential source used by a live mount and its profile clones.
+    pub rotating_credentials: Option<Arc<S3CredentialHolder>>,
+}
+
+/// Atomically replaceable S3 access/secret key pair for a running mount.
+pub struct S3CredentialHolder {
+    pair: Mutex<(String, String)>,
+}
+
+impl fmt::Debug for S3CredentialHolder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3CredentialHolder")
+            .field("credentials", &"<redacted>")
+            .finish()
+    }
+}
+
+impl S3CredentialHolder {
+    pub fn new(access_key: String, secret_key: String) -> Arc<Self> {
+        Arc::new(Self {
+            pair: Mutex::new((access_key, secret_key)),
+        })
+    }
+
+    /// Replace both credentials together so a request never signs with a mixed pair.
+    pub fn replace(&self, access_key: String, secret_key: String) {
+        let mut pair = self
+            .pair
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pair.0 = access_key;
+        pair.1 = secret_key;
+    }
+
+    fn snapshot(&self) -> (String, String) {
+        self.pair
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+struct RotatingCredentialLoader {
+    holder: Arc<S3CredentialHolder>,
+}
+
+#[async_trait]
+impl AwsCredentialLoad for RotatingCredentialLoader {
+    async fn load_credential(
+        &self,
+        _client: reqwest::Client,
+    ) -> anyhow::Result<Option<AwsCredential>> {
+        let (access_key_id, secret_access_key) = self.holder.snapshot();
+        Ok(Some(AwsCredential {
+            access_key_id,
+            secret_access_key,
+            session_token: None,
+            expires_in: None,
+        }))
+    }
 }
 
 /// Encryption settings used by [`DataStore`] for remote payload objects.
@@ -198,6 +260,7 @@ impl fmt::Debug for DataStoreConfig {
             .field("data_prefix", &self.data_prefix)
             .field("volume_uuid", &self.volume_uuid)
             .field("crypto", &self.crypto)
+            .field("rotating_credentials", &self.rotating_credentials.is_some())
             .finish()
     }
 }
@@ -230,6 +293,7 @@ impl From<&FormatInfo> for DataStoreConfig {
             data_prefix: normalize_data_prefix(&info.name, &info.data_prefix),
             volume_uuid: info.uuid.clone(),
             crypto: DataStoreCryptoConfig::from(&info.encryption),
+            rotating_credentials: None,
         }
     }
 }
@@ -478,10 +542,17 @@ impl DataStore {
         let mut builder = S3::default()
             .endpoint(&config.endpoint)
             .bucket(&config.bucket)
-            .access_key_id(&config.access_key)
-            .secret_access_key(&config.secret_key)
             .disable_config_load()
             .disable_ec2_metadata();
+        if let Some(holder) = &config.rotating_credentials {
+            builder = builder.customized_credential_load(Box::new(RotatingCredentialLoader {
+                holder: holder.clone(),
+            }));
+        } else {
+            builder = builder
+                .access_key_id(&config.access_key)
+                .secret_access_key(&config.secret_key);
+        }
 
         // For IP-based endpoints, ensure we use path-style (default in OpenDAL).
         // Virtual-host style (bucket.host) doesn't work with IP addresses.
@@ -1097,8 +1168,130 @@ mod tests {
         Access, Layer, LayeredAccess, OpList, OpRead, OpWrite, RpDelete, RpList, RpRead, RpWrite,
     };
     use opendal::services::Memory;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::thread;
     use studiofs_meta::EncryptionConfig;
+
+    #[tokio::test]
+    async fn rotating_loader_reads_current_atomic_pair_without_expiry_cache() {
+        let holder = S3CredentialHolder::new("old-access".into(), "old-secret".into());
+        let loader = RotatingCredentialLoader {
+            holder: holder.clone(),
+        };
+        let client = reqwest::Client::new();
+        let initial = loader
+            .load_credential(client.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.access_key_id, "old-access");
+        assert_eq!(initial.secret_access_key, "old-secret");
+
+        assert_eq!(initial.expires_in, None);
+
+        holder.replace("new-access".into(), "new-secret".into());
+        let rotated = loader
+            .load_credential(client.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rotated.access_key_id, "new-access");
+        assert_eq!(rotated.secret_access_key, "new-secret");
+        assert_eq!(rotated.expires_in, None);
+    }
+
+    #[test]
+    fn credential_holder_replaces_pair_atomically_and_redacts_debug() {
+        let holder = S3CredentialHolder::new("access-a".into(), "secret-a".into());
+        let debug = format!("{holder:?}");
+        assert!(!debug.contains("access-a"));
+        assert!(!debug.contains("secret-a"));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer_holder = holder.clone();
+        let writer_barrier = barrier.clone();
+        let writer = thread::spawn(move || {
+            writer_barrier.wait();
+            for index in 0..2_000 {
+                let suffix = if index % 2 == 0 { "a" } else { "b" };
+                writer_holder.replace(format!("access-{suffix}"), format!("secret-{suffix}"));
+            }
+        });
+        barrier.wait();
+        for _ in 0..2_000 {
+            let (access, secret) = holder.snapshot();
+            assert!(
+                (access == "access-a" && secret == "secret-a")
+                    || (access == "access-b" && secret == "secret-b")
+            );
+        }
+        writer.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn datastore_signs_with_replaced_credentials_without_rebuild() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                loop {
+                    let read = stream.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                let authorization = request
+                    .lines()
+                    .find(|line| line.starts_with("authorization:"))
+                    .unwrap()
+                    .to_owned();
+                sender.send(authorization).unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+        });
+
+        let mut config = encrypted_test_config();
+        config.endpoint = endpoint;
+        let holder = S3CredentialHolder::new("old-access".into(), "old-secret".into());
+        config.rotating_credentials = Some(holder.clone());
+        let debug_config = format!("{config:?}");
+        assert!(!debug_config.contains("old-secret"));
+        assert!(!debug_config.contains("new-secret"));
+        let store = DataStore::new(&config).unwrap();
+        assert!(!store.exists("unit-volume/objects/item").await.unwrap());
+        holder.replace("new-access".into(), "new-secret".into());
+        assert!(!store.exists("unit-volume/objects/item").await.unwrap());
+        server.join().unwrap();
+
+        let first = receiver.recv().unwrap();
+        let second = receiver.recv().unwrap();
+        assert!(
+            first.contains("credential=old-access/"),
+            "first request signs with initial access key"
+        );
+        assert!(
+            second.contains("credential=new-access/"),
+            "same DataStore signs with replaced access key"
+        );
+        assert!(!format!("{first} {second}").contains("old-secret"));
+        assert!(!format!("{first} {second}").contains("new-secret"));
+    }
 
     #[derive(Debug, Clone)]
     struct FullPayloadLayer {
@@ -1747,6 +1940,7 @@ mod tests {
             data_prefix: "unit-volume/objects/".into(),
             volume_uuid: "1a4c0fe2-8550-4892-952c-5ec26c0e0d8d".into(),
             crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0x42; 32])),
+            rotating_credentials: None,
         }
     }
 

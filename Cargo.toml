@@ -29,6 +29,9 @@ dbg_macro = "warn"
 todo = "warn"
 
 [workspace.dependencies]
+async-trait = "0.1"
+reqsign = { version = "=0.16.5", default-features = false, features = ["services-aws"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Security floors for tokio, tokio-postgres, rustls and webpki-roots follow the
 # SFS-882 advisory fixes; Cargo.lock pins the reviewed resolution.
 # Async

@@ -115,7 +115,11 @@ macro_rules! checkpoint_upsert {
         checkpoint_total_event_bytes = EXCLUDED.checkpoint_total_event_bytes,
         snapshot = EXCLUDED.snapshot,
         checkpoint_sha256 = EXCLUDED.checkpoint_sha256,
-        format_info = EXCLUDED.format_info,
+        format_info = CASE
+            WHEN COALESCE(octet_length(metadata_state.format_info), 0) = 0
+            THEN EXCLUDED.format_info
+            ELSE metadata_state.format_info
+        END,
         checkpoint_publication_state = EXCLUDED.checkpoint_publication_state,
         checkpoint_generation = metadata_state.checkpoint_generation + 1,
         checkpoint_updated_at = now(),

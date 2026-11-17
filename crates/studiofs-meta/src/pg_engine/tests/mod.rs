@@ -580,6 +580,7 @@ fn unit_pg_engine_from_local(local: Arc<RedbMetaEngine>) -> PgMetaEngine {
         lock_worker_start_lock: Mutex::new(()),
         background_workers: PgBackgroundWorkers::new(),
         metadata_invalidation_notify,
+        shared_s3_credentials_observer: Mutex::new(None),
         metadata_notify_received: AtomicU64::new(0),
         metadata_notify_reconnects: AtomicU64::new(0),
         metadata_fallback_poll_discoveries: AtomicU64::new(0),

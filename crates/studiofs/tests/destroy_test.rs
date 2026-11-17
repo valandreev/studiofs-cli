@@ -261,6 +261,7 @@ fn make_datastore(env: &TestEnv, name: &str, uuid: &str) -> DataStore {
         data_prefix: format!("{name}/objects/"),
         volume_uuid: uuid.to_string(),
         crypto: DataStoreCryptoConfig::from(EncryptionConfig::new([0xA5; ENCRYPTION_KEY_LENGTH])),
+        rotating_credentials: None,
     };
     DataStore::new(&cfg).expect("create datastore")
 }

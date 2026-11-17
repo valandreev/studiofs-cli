@@ -1331,7 +1331,18 @@ impl MountPlan {
         debug_assert_eq!(self.read_only_mount, read_only_mount);
 
         let prepared_foreground = (|| -> anyhow::Result<PreparedForegroundRuntime> {
-            let data_config = DataStoreConfig::from(&format_info);
+            let mut data_config = DataStoreConfig::from(&format_info);
+            let credentials = studiofs_data::S3CredentialHolder::new(
+                format_info.access_key.clone(),
+                format_info.secret_key.clone(),
+            );
+            let observed = credentials.clone();
+            source_meta.register_shared_s3_credentials_observer(Arc::new(
+                move |access_key, secret_key| {
+                    observed.replace(access_key.to_owned(), secret_key.to_owned());
+                },
+            ));
+            data_config.rotating_credentials = Some(credentials);
             let memory_cache_budget_bytes = initial_cache_bytes();
             let snapshot_owner = self
                 .command

@@ -1567,7 +1567,8 @@ pub fn resolve_chunk_slice_spans(
 
 /// Volume format information - stored in FORMAT_INFO table.
 ///
-/// Created at volume initialization, immutable thereafter.
+/// Shared volume format metadata. Identity, encryption, and block size are
+/// immutable; S3 connection settings can be updated with `studiofs umeta`.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FormatInfo {

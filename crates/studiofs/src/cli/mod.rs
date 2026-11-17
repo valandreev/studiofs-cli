@@ -40,6 +40,7 @@ pub use self::benchmark_profile_stub as benchmark_profile;
 pub mod benchmark_profile_common;
 pub mod benchmark_profile_types;
 pub mod trash;
+pub mod umeta;
 pub mod umount;
 pub mod upgrade;
 pub mod utils;
@@ -161,6 +162,8 @@ enum Commands {
     Upgrade(upgrade::UpgradeArgs),
     /// Show or change the shared trash retention period in whole days
     TrashDays(trash::TrashDaysArgs),
+    /// Update mutable shared S3 volume settings
+    Umeta(umeta::UmetaArgs),
     Discover(discovery::DiscoverArgs),
     Mount(mount::MountArgs),
     Smount(smount::SmountArgs),
@@ -186,6 +189,7 @@ impl Commands {
             Self::Init(args) => args.dispatch(),
             Self::Upgrade(args) => args.dispatch(),
             Self::TrashDays(args) => args.dispatch(),
+            Self::Umeta(args) => args.dispatch(),
             Self::Discover(args) => args.dispatch(),
             Self::Mount(args) => args.dispatch_with_auto_tray(),
             Self::Smount(args) => args.dispatch(),
