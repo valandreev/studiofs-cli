@@ -3,6 +3,7 @@
 use crate::crypto::{self, ObjectCipher, VolumeMasterKey};
 use crate::envelope::{SFEC_HEADER_FIXED_LEN, SfecError, SfecHeader, SfecHeaderLayout};
 use crate::object::{ObjectHeader, validate_object_payload_size};
+use crate::payload_throttle::PayloadThrottle;
 use crate::snapshot_key::{SnapshotArtifactKey, SnapshotArtifactPrefix};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -65,6 +66,10 @@ pub enum DataError {
         /// Requested exclusive end offset.
         end: u64,
     },
+
+    /// Payload transfer was stopped by mount shutdown.
+    #[error("payload transfer cancelled by shutdown")]
+    TransferCancelled,
 }
 
 impl DataError {
@@ -84,6 +89,7 @@ impl DataError {
             | Self::InvalidObjectKey(_)
             | Self::InvalidRange { .. }
             | Self::CryptoWorkerJoin(_) => false,
+            Self::TransferCancelled => false,
         }
     }
 }
@@ -107,6 +113,13 @@ pub struct RemoteObjectWriteStats {
     pub plaintext_bytes: u64,
     /// Ciphertext SFEC bytes written to the remote object store.
     pub encrypted_bytes: u64,
+}
+
+/// Encrypted payload prepared before upload throttling and request timeouts.
+#[derive(Clone)]
+pub struct PreparedPayload {
+    encrypted: Buffer,
+    plaintext_len: usize,
 }
 
 /// Byte accounting for an encrypted remote read.
@@ -467,6 +480,7 @@ pub struct DataStore {
     crypto: DataStoreCryptoRuntime,
     config: DataStoreConfig,
     profile: IoProfile,
+    payload_throttle: Arc<PayloadThrottle>,
 }
 
 fn is_ip_endpoint(endpoint: &str) -> bool {
@@ -523,9 +537,19 @@ impl DataStore {
 
     /// Create a DataStore with a specific I/O profile.
     pub fn with_profile(config: &DataStoreConfig, profile: IoProfile) -> DataResult<Self> {
+        Self::with_profile_and_throttle(config, profile, Arc::new(PayloadThrottle::default()))
+    }
+
+    /// Create a profile store sharing one mount's payload transfer limiter.
+    pub fn with_profile_and_throttle(
+        config: &DataStoreConfig,
+        profile: IoProfile,
+        payload_throttle: Arc<PayloadThrottle>,
+    ) -> DataResult<Self> {
         Self::with_profile_and_crypto(
             config,
             profile,
+            payload_throttle,
             config.crypto.to_runtime(&config.volume_uuid)?,
         )
     }
@@ -533,6 +557,7 @@ impl DataStore {
     fn with_profile_and_crypto(
         config: &DataStoreConfig,
         profile: IoProfile,
+        payload_throttle: Arc<PayloadThrottle>,
         crypto: DataStoreCryptoRuntime,
     ) -> DataResult<Self> {
         let mut config = config.clone();
@@ -668,6 +693,7 @@ impl DataStore {
             crypto,
             config,
             profile,
+            payload_throttle,
         })
     }
 
@@ -683,6 +709,7 @@ impl DataStore {
             crypto: config.crypto.to_runtime(&config.volume_uuid)?,
             config,
             profile: IoProfile::Default,
+            payload_throttle: Arc::new(PayloadThrottle::default()),
         })
     }
 
@@ -692,18 +719,76 @@ impl DataStore {
     /// timeouts and a dedicated concurrency limit so that background uploads
     /// can never starve read requests.
     pub fn clone_for_reads(&self) -> DataResult<Self> {
-        let mut store =
-            Self::with_profile_and_crypto(&self.config, IoProfile::Read, self.crypto.clone())?;
+        let mut store = Self::with_profile_and_crypto(
+            &self.config,
+            IoProfile::Read,
+            self.payload_throttle.clone(),
+            self.crypto.clone(),
+        )?;
         store.volume_uuid = self.volume_uuid.clone();
         Ok(store)
     }
 
     /// Create a write-optimised clone with its own connection pool.
     pub fn clone_for_writes(&self) -> DataResult<Self> {
-        let mut store =
-            Self::with_profile_and_crypto(&self.config, IoProfile::Write, self.crypto.clone())?;
+        let mut store = Self::with_profile_and_crypto(
+            &self.config,
+            IoProfile::Write,
+            self.payload_throttle.clone(),
+            self.crypto.clone(),
+        )?;
         store.volume_uuid = self.volume_uuid.clone();
         Ok(store)
+    }
+
+    /// Install the mount-wide aggregate payload transfer limits.
+    pub fn set_payload_limits(&self, upload_mbps: Option<u64>, download_mbps: Option<u64>) {
+        self.payload_throttle.set_limits(upload_mbps, download_mbps);
+    }
+
+    /// Cancel limiter waits when the owning mount shuts down.
+    pub fn cancel_payload_transfers(&self) {
+        self.payload_throttle.cancel();
+    }
+
+    /// Return configured limits and cumulative throttle wait in nanoseconds.
+    pub fn payload_limit_status(&self) -> (u64, u64, u64, u64) {
+        let (upload, download) = self.payload_throttle.limits();
+        let (upload_wait, download_wait) = self.payload_throttle.wait_nanos();
+        (upload, download, upload_wait, download_wait)
+    }
+
+    /// Charge the frame header and requested encrypted range before request admission.
+    pub async fn acquire_download_range_budget(
+        &self,
+        range: &Range<u64>,
+        foreground: bool,
+    ) -> DataResult<()> {
+        let bytes = usize::try_from(range.end.saturating_sub(range.start))
+            .unwrap_or(usize::MAX)
+            .saturating_add(SFEC_HEADER_FIXED_LEN);
+        if !self
+            .payload_throttle
+            .acquire_download(bytes, foreground)
+            .await
+        {
+            return Err(DataError::TransferCancelled);
+        }
+        Ok(())
+    }
+
+    /// Charge bytes measured from a completed full-object GET.
+    pub async fn charge_download_bytes(&self, bytes: u64, foreground: bool) -> DataResult<()> {
+        let bytes = usize::try_from(bytes)
+            .map_err(|_| DataError::Storage("object is too large to charge".into()))?;
+        if !self
+            .payload_throttle
+            .acquire_download(bytes, foreground)
+            .await
+        {
+            return Err(DataError::TransferCancelled);
+        }
+        Ok(())
     }
 
     /// The I/O profile this store was created with.
@@ -771,9 +856,41 @@ impl DataStore {
         key: &str,
         data: impl Into<Buffer>,
     ) -> DataResult<RemoteObjectWriteStats> {
-        let data: Buffer = data.into();
+        let prepared = self.prepare_payload(key, data.into()).await?;
+        self.acquire_upload_budget(&prepared).await?;
+        self.put_prepared_by_key(key, prepared).await
+    }
+
+    /// Encrypt an object before the request timeout and upload AIMD permit begin.
+    pub async fn prepare_payload(&self, key: &str, data: Buffer) -> DataResult<PreparedPayload> {
         let plaintext_len = data.len();
         let encrypted = self.encrypt_payload(key, data).await?;
+        Ok(PreparedPayload {
+            encrypted,
+            plaintext_len,
+        })
+    }
+
+    /// Charge one prepared object's full encrypted size before its network request.
+    pub async fn acquire_upload_budget(&self, prepared: &PreparedPayload) -> DataResult<()> {
+        if !self
+            .payload_throttle
+            .acquire_upload(prepared.encrypted.len())
+            .await
+        {
+            return Err(DataError::TransferCancelled);
+        }
+        Ok(())
+    }
+
+    /// Send a previously prepared object without waiting for its transfer budget.
+    pub async fn put_prepared_by_key(
+        &self,
+        key: &str,
+        prepared: PreparedPayload,
+    ) -> DataResult<RemoteObjectWriteStats> {
+        let plaintext_len = prepared.plaintext_len;
+        let encrypted = prepared.encrypted;
         let encrypted_len = encrypted.len();
         debug!(
             key,
@@ -812,9 +929,11 @@ impl DataStore {
         key: &str,
     ) -> DataResult<(Buffer, RemoteObjectReadStats)> {
         debug!("downloading by key: {key}");
-        let data = self.op.read(key).await?;
-        let encrypted_len = data.len();
-        let plaintext = self.decrypt_payload(key, data).await?;
+        let encrypted = self.op.read(key).await?;
+        let encrypted_len = encrypted.len();
+        self.charge_download_bytes(encrypted_len as u64, true)
+            .await?;
+        let plaintext = self.decrypt_payload(key, encrypted).await?;
         let plaintext_len = plaintext.len();
         Ok((
             plaintext,
@@ -2319,6 +2438,86 @@ mod tests {
         assert_eq!(downloaded.to_bytes(), plaintext);
         assert_eq!(read_stats.encrypted_bytes, remote_bytes.len() as u64);
         assert_eq!(read_stats.plaintext_bytes, write_stats.plaintext_bytes);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepared_upload_budget_is_charged_once() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
+        let key = "unit-volume/objects/aa/bb/prepared-limit";
+        let prepared = store
+            .prepare_payload(key, Buffer::from(vec![0x5a; 125_000]))
+            .await
+            .unwrap();
+        let bytes = prepared.encrypted.len();
+        store.set_payload_limits(Some(1), Some(0));
+        let start = tokio::time::Instant::now();
+        store.acquire_upload_budget(&prepared).await.unwrap();
+        let admitted = tokio::time::Instant::now();
+        store.put_prepared_by_key(key, prepared).await.unwrap();
+        assert!(admitted - start >= Duration::from_secs_f64(bytes as f64 / 125_000.0));
+        assert_eq!(
+            tokio::time::Instant::now(),
+            admitted,
+            "sending must not charge a second budget"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn limited_large_download_charges_complete_encrypted_object() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
+        let key = "unit-volume/objects/aa/bb/large-limited-read";
+        let plaintext = Bytes::from(vec![0x5a; 128 * 1024]);
+        store.put_by_key(key, plaintext.clone()).await.unwrap();
+        store.set_payload_limits(Some(0), Some(1));
+
+        let store = Arc::new(store);
+        let reader = store.clone();
+        let task = tokio::spawn(async move { reader.get_by_key_with_stats(key).await });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "the object must wait for its full budget"
+        );
+        tokio::time::advance(Duration::from_millis(530)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "the complete encrypted size must be charged before the GET"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+
+        let (downloaded, stats) = task.await.unwrap().unwrap();
+        assert_eq!(downloaded.to_bytes(), plaintext);
+        assert!(stats.encrypted_bytes > 128 * 1024);
+        assert!(store.payload_limit_status().3 >= 1_000_000_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_a_waiting_download_reader() {
+        let raw = Operator::new(Memory::default()).unwrap().finish();
+        let store = DataStore::with_operator_for_test(&encrypted_test_config(), raw).unwrap();
+        let key = "unit-volume/objects/aa/bb/cancel-limited-read";
+        store
+            .put_by_key(key, Bytes::from(vec![0x5a; 128 * 1024]))
+            .await
+            .unwrap();
+        store.set_payload_limits(Some(0), Some(1));
+
+        let store = Arc::new(store);
+        let reader = store.clone();
+        let task = tokio::spawn(async move { reader.get_by_key_with_stats(key).await });
+        tokio::task::yield_now().await;
+        store.cancel_payload_transfers();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(DataError::TransferCancelled)
+        ));
     }
 
     #[tokio::test]

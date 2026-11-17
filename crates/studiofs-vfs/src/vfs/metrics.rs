@@ -1888,6 +1888,14 @@ pub struct VfsUploadStats {
     pub encrypted_objects_written: u64,
     /// Number of encrypted remote bytes written.
     pub encrypted_bytes_written: u64,
+    /// Configured aggregate upload limit in Mbps; zero is unlimited.
+    pub upload_limit_mbps: u64,
+    /// Configured aggregate download limit in Mbps; zero is unlimited.
+    pub download_limit_mbps: u64,
+    /// Cumulative upload throttle wait in nanoseconds.
+    pub upload_throttle_wait_nanos: u64,
+    /// Cumulative download throttle wait in nanoseconds.
+    pub download_throttle_wait_nanos: u64,
     /// Number of encryption/config failures before remote write.
     pub encrypted_object_write_failures: u64,
     /// Number of upload requeue operations.

@@ -18,6 +18,14 @@ pub(crate) struct PublicRuntimeTuningArgs {
     /// Prefetch concurrency budget.
     #[arg(long, value_name = "COUNT", value_parser = parse_prefetch_concurrency)]
     pub(crate) prefetch: Option<usize>,
+
+    /// Aggregate background upload limit in Mbps; zero disables the limit.
+    #[arg(long, value_name = "MBPS", value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
+    pub(crate) upload_limit: Option<u64>,
+
+    /// Aggregate object download limit in Mbps; zero disables the limit.
+    #[arg(long, value_name = "MBPS", value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
+    pub(crate) download_limit: Option<u64>,
 }
 
 impl PublicRuntimeTuningArgs {
@@ -31,15 +39,25 @@ impl PublicRuntimeTuningArgs {
         if let Some(value) = self.prefetch {
             config.prefetch_concurrency = Some(value);
         }
+        if let Some(value) = self.upload_limit {
+            config.upload_limit = Some(value);
+        }
+        if let Some(value) = self.download_limit {
+            config.download_limit = Some(value);
+        }
         Ok(())
     }
 
     pub(crate) fn has_any(&self) -> bool {
-        self.read_buffer.is_some() || self.readahead.is_some() || self.prefetch.is_some()
+        self.read_buffer.is_some()
+            || self.readahead.is_some()
+            || self.prefetch.is_some()
+            || self.upload_limit.is_some()
+            || self.download_limit.is_some()
     }
 }
 
-pub(crate) fn runtime_tuning_summary_lines(config: &VfsConfigRaw) -> [String; 3] {
+pub(crate) fn runtime_tuning_summary_lines(config: &VfsConfigRaw) -> [String; 5] {
     let defaults = VfsConfig::default();
     [
         format!(
@@ -65,6 +83,14 @@ pub(crate) fn runtime_tuning_summary_lines(config: &VfsConfigRaw) -> [String; 3]
                 .prefetch_concurrency
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| format!("default ({})", defaults.prefetch_concurrency))
+        ),
+        format!(
+            "  upload-limit: {} Mbps",
+            config.upload_limit.unwrap_or(defaults.upload_limit)
+        ),
+        format!(
+            "  download-limit: {} Mbps",
+            config.download_limit.unwrap_or(defaults.download_limit)
         ),
     ]
 }

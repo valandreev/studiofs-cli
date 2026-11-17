@@ -11,7 +11,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use studiofs_data::store::{DataError, DataStore, RemoteObjectWriteStats};
+use studiofs_data::store::{DataError, DataStore, PreparedPayload, RemoteObjectWriteStats};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
@@ -105,21 +105,54 @@ pub enum UploadError {
 
 /// Remote object write port used by the upload scheduler.
 pub trait UploadObjectStore: Send + Sync + 'static {
+    /// Payload prepared before throttling, AIMD admission, and request timeout.
+    type Prepared: Clone + Send + 'static;
+
+    /// Prepare the encrypted object without starting the remote request.
+    fn prepare_upload<'a>(
+        &'a self,
+        key: &'a str,
+        payload: Buffer,
+    ) -> impl Future<Output = Result<Self::Prepared, DataError>> + Send + 'a;
+
+    /// Wait for the complete object budget before acquiring an AIMD slot.
+    fn acquire_upload_budget<'a>(
+        &'a self,
+        prepared: &'a Self::Prepared,
+    ) -> impl Future<Output = Result<(), DataError>> + Send + 'a;
+
     /// Upload already-serialized STFS object bytes to a remote storage key.
     fn put_by_key<'a>(
         &'a self,
         key: &'a str,
-        payload: Buffer,
+        payload: Self::Prepared,
     ) -> impl Future<Output = Result<RemoteObjectWriteStats, DataError>> + Send + 'a;
 }
 
 impl UploadObjectStore for DataStore {
-    fn put_by_key<'a>(
+    type Prepared = PreparedPayload;
+
+    fn prepare_upload<'a>(
         &'a self,
         key: &'a str,
         payload: Buffer,
+    ) -> impl Future<Output = Result<Self::Prepared, DataError>> + Send + 'a {
+        DataStore::prepare_payload(self, key, payload)
+    }
+
+    fn acquire_upload_budget<'a>(
+        &'a self,
+        prepared: &'a Self::Prepared,
+    ) -> impl Future<Output = Result<(), DataError>> + Send + 'a {
+        DataStore::acquire_upload_budget(self, prepared)
+    }
+
+    fn put_by_key<'a>(
+        &'a self,
+        key: &'a str,
+        payload: Self::Prepared,
     ) -> impl Future<Output = Result<RemoteObjectWriteStats, DataError>> + Send + 'a {
-        DataStore::put_by_key_with_stats(self, key, payload)
+        DataStore::put_prepared_by_key(self, key, payload)
     }
 }
 
@@ -198,6 +231,17 @@ where
         let mut last_err: Option<DataError> = None;
         let overall_start = Instant::now();
         let mut attempts_made = 0;
+        let prepared = self
+            .data_store
+            .prepare_upload(key, payload.clone())
+            .await
+            .map_err(|source| {
+                classify_data_error(&self.metrics, &source);
+                UploadError::Exhausted {
+                    attempts: 0,
+                    source,
+                }
+            })?;
 
         for attempt in 0..self.max_attempts {
             if cancel_token.is_cancelled() {
@@ -205,12 +249,19 @@ where
             }
             attempts_made = attempt + 1;
             self.metrics.attempts.fetch_add(1, Ordering::Relaxed);
+            tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => return Err(UploadError::Cancelled),
+                result = self.data_store.acquire_upload_budget(&prepared) => {
+                    result.map_err(|source| UploadError::Exhausted { attempts: attempts_made, source })?;
+                }
+            }
             let permit = self.aimd.acquire().await;
             let req_start = Instant::now();
             let put_result = run_with_timeout_or_cancel(
                 cancel_token,
                 self.request_timeout,
-                self.data_store.put_by_key(key, payload.clone()),
+                self.data_store.put_by_key(key, prepared.clone()),
             )
             .await;
             let req_ms = req_start.elapsed().as_millis();
@@ -429,6 +480,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
     use studiofs_data::envelope::SFEC_MAGIC;
     use studiofs_data::object::{MAGIC as STFS_MAGIC, create_object_buffer};
     use studiofs_data::{
@@ -533,10 +585,29 @@ mod tests {
     #[derive(Default)]
     struct RetryOnceUploadStore {
         attempts: AtomicU64,
+        budget_delay: Duration,
+        prepare_error: bool,
         payloads: Mutex<Vec<(String, Bytes)>>,
     }
 
     impl UploadObjectStore for RetryOnceUploadStore {
+        type Prepared = Buffer;
+
+        async fn prepare_upload(&self, _key: &str, payload: Buffer) -> Result<Buffer, DataError> {
+            if self.prepare_error {
+                Err(DataError::InvalidCryptoConfig(
+                    studiofs_meta::EncryptionContractError::Disabled,
+                ))
+            } else {
+                Ok(payload)
+            }
+        }
+
+        async fn acquire_upload_budget(&self, _prepared: &Buffer) -> Result<(), DataError> {
+            tokio::time::sleep(self.budget_delay).await;
+            Ok(())
+        }
+
         async fn put_by_key(
             &self,
             key: &str,
@@ -557,11 +628,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn prepare_upload_error_updates_crypto_failure_metric() {
+        let store = Arc::new(RetryOnceUploadStore {
+            prepare_error: true,
+            ..Default::default()
+        });
+        let scheduler =
+            UploadScheduler::new(store, AimdConfig::upload_default(), &upload_test_config());
+        assert!(
+            scheduler
+                .put(
+                    "bad-config",
+                    Buffer::from("payload"),
+                    &CancellationToken::new()
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            scheduler
+                .metrics
+                .encrypted_object_write_failures
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_budget_wait_is_outside_request_timeout() {
+        let store = Arc::new(RetryOnceUploadStore {
+            attempts: AtomicU64::new(1),
+            budget_delay: Duration::from_secs(10),
+            ..Default::default()
+        });
+        let scheduler =
+            UploadScheduler::new(store, AimdConfig::upload_default(), &upload_test_config());
+        scheduler
+            .put(
+                "budget-timeout",
+                Buffer::from("payload"),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("ten-second budget wait must not consume five-second request timeout");
+        assert_eq!(scheduler.metrics.timeout_err.load(Ordering::Relaxed), 0);
+    }
+
     struct NonRetryableUploadStore {
         attempts: AtomicU64,
     }
 
     impl UploadObjectStore for NonRetryableUploadStore {
+        type Prepared = Buffer;
+
+        async fn prepare_upload(&self, _key: &str, payload: Buffer) -> Result<Buffer, DataError> {
+            Ok(payload)
+        }
+
+        async fn acquire_upload_budget(&self, _prepared: &Buffer) -> Result<(), DataError> {
+            Ok(())
+        }
+
         async fn put_by_key(
             &self,
             _key: &str,

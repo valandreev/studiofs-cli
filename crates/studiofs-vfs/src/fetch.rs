@@ -1035,6 +1035,17 @@ impl FetchScheduler {
 
         for attempt in 0..max_attempts {
             attempts_made = attempt + 1;
+            if matches!(class, FetchClass::Foreground)
+                && let Some(range) = &payload_range
+            {
+                self.data_store
+                    .acquire_download_range_budget(range, true)
+                    .await
+                    .map_err(|source| FetchError::Exhausted {
+                        attempts: attempts_made,
+                        source,
+                    })?;
+            }
             // Acquire an AIMD permit — blocks until the concurrency window
             // allows another in-flight request.
             let wait_start = Instant::now();
@@ -1067,6 +1078,18 @@ impl FetchScheduler {
                 self.qos.acquire_fetch().await.map_err(|e| {
                     FetchError::CacheAccess(format!("fetch qos permit failed: {e}"))
                 })?;
+            // Prefetch budget is charged only after it has been admitted.
+            if matches!(class, FetchClass::Prefetch)
+                && let Some(range) = &payload_range
+            {
+                self.data_store
+                    .acquire_download_range_budget(range, false)
+                    .await
+                    .map_err(|source| FetchError::Exhausted {
+                        attempts: attempts_made,
+                        source,
+                    })?;
+            }
             let wait_ms = duration_to_millis_u64(wait_start.elapsed());
             if wait_ms > 100 {
                 debug!(
@@ -1077,22 +1100,27 @@ impl FetchScheduler {
                 );
             }
 
-            // Hard timeout per request — prevents runaway waits from
-            // blocking WinFSP/FUSE dispatch threads indefinitely.
             let req_start = Instant::now();
-            let get_result = tokio::time::timeout(self.request_timeout, async {
-                match &payload_range {
-                    Some(range) => self
-                        .data_store
-                        .get_payload_range_by_key_with_stats(key, range.clone())
-                        .await
-                        .map(|(payload, stats)| (opendal::Buffer::from(payload), stats)),
-                    // Regular full fetch: bound encrypted body to fragment+envelope geometry.
-                    // Snapshot artifacts use the generic full-read API elsewhere.
-                    None => self.data_store.get_payload_by_key_with_stats(key).await,
+            let get_result = match &payload_range {
+                Some(range) => tokio::time::timeout(
+                    self.request_timeout,
+                    self.data_store
+                        .get_payload_range_by_key_with_stats(key, range.clone()),
+                )
+                .await
+                .map(|result| {
+                    result.map(|(payload, stats)| (opendal::Buffer::from(payload), stats))
+                }),
+                // Regular full fetch: bound encrypted body to fragment+envelope geometry.
+                // Snapshot artifacts use the generic full-read API elsewhere.
+                None => {
+                    tokio::time::timeout(
+                        self.request_timeout,
+                        self.data_store.get_payload_by_key_with_stats(key),
+                    )
+                    .await
                 }
-            })
-            .await;
+            };
             let req_elapsed = req_start.elapsed();
             let req_ms = duration_to_millis_u64(req_elapsed);
 
@@ -1100,6 +1128,19 @@ impl FetchScheduler {
                 Ok(Ok((compressed, read_stats))) => {
                     self.record_s3_get(req_elapsed);
                     permit.success();
+                    if payload_range.is_none() {
+                        drop(_fetch_qos);
+                        self.data_store
+                            .charge_download_bytes(
+                                read_stats.encrypted_bytes,
+                                matches!(class, FetchClass::Foreground),
+                            )
+                            .await
+                            .map_err(|source| FetchError::Exhausted {
+                                attempts: attempts_made,
+                                source,
+                            })?;
+                    }
                     self.metrics.s3_fetches.fetch_add(1, Ordering::Relaxed);
                     self.metrics
                         .bytes_downloaded
@@ -1803,6 +1844,90 @@ mod tests {
             expected
         );
         assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn skipped_prefetch_does_not_charge_download_budget() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (scheduler, _raw, _cached_store, _config) =
+            make_encrypted_fetch_scheduler(&tmp, "prefetch-budget-skip");
+        scheduler.data_store.set_payload_limits(Some(0), Some(1));
+        let mut permits = Vec::new();
+        while let Some(permit) = scheduler.aimd.try_acquire() {
+            permits.push(permit);
+        }
+        assert!(!scheduler.prefetch_admission_open());
+
+        assert!(matches!(
+            scheduler
+                .fetch_block_prefetch(0x3535, &["unreached".to_string()])
+                .await,
+            Err(FetchError::PrefetchSkipped)
+        ));
+        assert_eq!(scheduler.data_store.payload_limit_status().3, 0);
+        drop(permits);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_download_budget_wait_is_outside_fetch_request_timeout() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (mut scheduler, raw, _cached_store, config) =
+            make_encrypted_fetch_scheduler(&tmp, "full-download-budget-timeout");
+        let object_id = 0x3536;
+        let key = fragment_key(&config, object_id, 0);
+        let expected = Bytes::from(vec![0x5a; 1024 * 1024]);
+        put_encrypted_fragment(&scheduler, &raw, &key, expected.clone()).await;
+        scheduler.data_store.set_payload_limits(Some(0), Some(1));
+        Arc::get_mut(&mut scheduler)
+            .expect("test owns the scheduler")
+            .request_timeout = Duration::from_secs(1);
+
+        let fetched = scheduler
+            .fetch_block(object_id, std::slice::from_ref(&key))
+            .await
+            .expect("post-GET budget wait is outside the request timeout");
+
+        assert_eq!(fetched, expected);
+        assert!(scheduler.data_store.payload_limit_status().3 >= 8_000_000_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn foreground_range_budget_waits_before_aimd_and_request_timeout() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (mut scheduler, raw, _cached_store, config) =
+            make_encrypted_fetch_scheduler(&tmp, "range-download-budget-timeout");
+        let object_id = 0x3537;
+        let key = fragment_key(&config, object_id, 0);
+        let expected = Bytes::from(vec![0x5a; 300 * 1024]);
+        put_encrypted_fragment(&scheduler, &raw, &key, expected.clone()).await;
+        scheduler.data_store.set_payload_limits(Some(0), Some(1));
+        Arc::get_mut(&mut scheduler)
+            .expect("test owns the scheduler")
+            .request_timeout = Duration::from_secs(1);
+
+        let reader = scheduler.clone();
+        let task = tokio::spawn(async move {
+            reader
+                .fetch_block_range_after_local_miss(object_id, &[key], 0..256 * 1024)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            scheduler.aimd.in_flight(),
+            0,
+            "budget wait must precede AIMD"
+        );
+        assert!(
+            !task.is_finished(),
+            "the foreground range should be waiting"
+        );
+        tokio::time::advance(Duration::from_secs(3)).await;
+        // The budget wait is over; on a paused clock, idle waits on blocking decrypt
+        // auto-advance into the 1 s request timeout, so finish the request on real time.
+        tokio::time::resume();
+
+        assert_eq!(task.await.unwrap().unwrap(), expected.slice(..256 * 1024));
+        assert!(scheduler.data_store.payload_limit_status().3 >= 2_000_000_000);
     }
 
     #[tokio::test]

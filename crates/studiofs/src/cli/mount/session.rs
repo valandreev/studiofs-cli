@@ -733,6 +733,8 @@ where
     );
     set_u64!("STUDIOFS_READ_BUFFER_MB", read_buffer_mb);
     set_usize!("STUDIOFS_PREFETCH_CONCURRENCY", prefetch_concurrency);
+    set_u64!("STUDIOFS_UPLOAD_LIMIT", upload_limit);
+    set_u64!("STUDIOFS_DOWNLOAD_LIMIT", download_limit);
     if let Some(value) = parse_env_u32_with(&read_var, "STUDIOFS_READAHEAD_WIDTH") {
         config.readahead_width = Some(value);
     }
@@ -3291,6 +3293,8 @@ mod tests {
                 read_buffer_mb: Some(1024),
                 readahead_width: Some(64),
                 prefetch_concurrency: Some(32),
+                upload_limit: Some(3),
+                download_limit: Some(4),
                 ..VfsConfigRaw::default()
             },
             None,
@@ -3298,6 +3302,8 @@ mod tests {
                 read_buffer: Some("4GB".to_string()),
                 readahead: Some(256),
                 prefetch: Some(192),
+                upload_limit: Some(17),
+                download_limit: Some(29),
             },
             |mut config| {
                 config.read_buffer_mb = Some(2048);
@@ -3311,6 +3317,8 @@ mod tests {
         assert_eq!(resolved.vfs_config.read_buffer_mb, 4096);
         assert_eq!(resolved.vfs_config.readahead_width, 256);
         assert_eq!(resolved.vfs_config.prefetch_concurrency, 192);
+        assert_eq!(resolved.vfs_config.upload_limit, 17);
+        assert_eq!(resolved.vfs_config.download_limit, 29);
     }
 
     #[test]

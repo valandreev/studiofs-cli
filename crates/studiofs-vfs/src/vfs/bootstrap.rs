@@ -345,12 +345,20 @@ impl VfsBootstrapResources {
             super::prefetch::PREFETCH_INGRESS_CAPACITY,
         );
 
+        let payload_throttle = Arc::new(studiofs_data::payload_throttle::PayloadThrottle::new(
+            config.upload_limit,
+            config.download_limit,
+        ));
         let data_read = Arc::new(
-            DataStore::with_profile(data_config, IoProfile::Read)
-                .map_err(|e| VfsError::Other(format!("failed to create read data store: {e}")))?,
+            DataStore::with_profile_and_throttle(
+                data_config,
+                IoProfile::Read,
+                payload_throttle.clone(),
+            )
+            .map_err(|e| VfsError::Other(format!("failed to create read data store: {e}")))?,
         );
         let data_write = Arc::new(
-            DataStore::with_profile(data_config, IoProfile::Write)
+            DataStore::with_profile_and_throttle(data_config, IoProfile::Write, payload_throttle)
                 .map_err(|e| VfsError::Other(format!("failed to create write data store: {e}")))?,
         );
 

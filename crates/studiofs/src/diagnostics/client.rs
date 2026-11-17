@@ -185,6 +185,30 @@ impl LocalDiagnosticsClient {
         }
     }
 
+    pub(crate) async fn set_payload_limits(
+        &self,
+        lease_id: &str,
+        upload_mbps: Option<u64>,
+        download_mbps: Option<u64>,
+    ) -> Result<(u64, u64)> {
+        match self
+            .send(DiagnosticsRequest::SetPayloadLimits {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                upload_mbps,
+                download_mbps,
+            })
+            .await?
+        {
+            DiagnosticsResponse::PayloadLimits {
+                upload_mbps,
+                download_mbps,
+            } => Ok((upload_mbps, download_mbps)),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
     pub(crate) async fn materialize_report(
         &self,
         lease_id: &str,
