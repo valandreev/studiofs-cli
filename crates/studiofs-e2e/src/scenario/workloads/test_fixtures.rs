@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// Scenario identifier for test helper that expects validation failures.
+pub(crate) const TEST_FAILING_VALIDATE: &str = "__test-failing-validate";
+/// Scenario identifier for test helper that expects validation failures with cleanup failures.
+pub(crate) const TEST_FAILING_VALIDATE_AND_CLEANUP: &str = "__test-failing-validate-and-cleanup";
+/// Scenario identifier for test helper that expects passing validation.
+pub(crate) const TEST_PASSING: &str = "__test-passing";
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::scenario) struct TestFailingScenario {
     pub(in crate::scenario) cleanup_fails: bool,
