@@ -14348,7 +14348,7 @@ fn test_release_fh_reports_sticky_error_after_persisting_current_changes() {
 #[test]
 fn test_release_fh_with_outcome_materializes_pending_inode_dirty_state_on_last_close() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-close-ownership");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "release-outcome-close-ownership");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs.create(1, b"release-outcome.txt", 0, 0, 0o644).unwrap();
@@ -17995,7 +17995,7 @@ fn orphan_cleanup_clears_dirty_writer_stack_state_for_deleted_inode() {
 #[test]
 fn test_flush_fh_with_outcome_materializes_pending_inode_dirty_state() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-handle-outcome");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "flush-handle-outcome");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -18089,7 +18089,7 @@ fn test_flush_fh_clean_skip_waits_for_deferred_release_but_not_file_session_gate
 #[test]
 fn test_flush_with_outcome_materializes_pending_inode_dirty_state() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-inode-outcome");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "flush-inode-outcome");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -18128,7 +18128,7 @@ fn test_flush_with_outcome_materializes_pending_inode_dirty_state() {
 #[test]
 fn test_fsync_with_outcome_materializes_pending_inode_dirty_state() {
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-clean-data");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "fsync-outcome-clean-data");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
