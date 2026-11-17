@@ -260,6 +260,7 @@ impl fmt::Debug for DataStoreConfig {
             .field("data_prefix", &self.data_prefix)
             .field("volume_uuid", &self.volume_uuid)
             .field("crypto", &self.crypto)
+            .field("rotating_credentials", &self.rotating_credentials.is_some())
             .finish()
     }
 }

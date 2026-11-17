@@ -120,12 +120,12 @@ impl UmetaArgs {
             ("secret key", self.secret_key.as_deref()),
             ("endpoint", endpoint.as_deref()),
         ] {
-            if value.is_some_and(str::is_empty) {
+            if value.is_some_and(|value| value.trim().is_empty()) {
                 bail!("{field} must not be empty");
             }
         }
         let region = self.region.as_deref().map(|region| {
-            if region.is_empty() {
+            if region.trim().is_empty() {
                 "us-east-1"
             } else {
                 region
@@ -315,6 +315,14 @@ mod tests {
                 "volume",
                 "--secret-key",
                 "",
+            ],
+            [
+                "umeta",
+                "--meta",
+                "postgres://db",
+                "volume",
+                "--access-key",
+                "   ",
             ],
         ] {
             let parsed = parse_for_test(&args).expect("arguments should parse");
