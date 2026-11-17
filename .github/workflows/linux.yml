@@ -322,6 +322,9 @@ jobs:
       image: rockylinux:9
       # Reap orphaned zombies; the default PID 1 does not, which breaks process-group kill tests.
       options: --init
+      # Newer rockylinux:9 images ship without PATH; GITHUB_PATH additions would then replace it.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     timeout-minutes: 60
     steps:
       - name: Install Rocky packages
