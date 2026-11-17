@@ -1835,7 +1835,8 @@ fn test_pg_umeta_updates_requested_fields_atomically_and_refreshes_existing_cach
         "reopening local metadata must not synchronously probe PostgreSQL for S3 settings"
     );
     let shared_format = crate::pg_engine::read_shared_volume_format_info(&dsn, volume_id)
-        .expect("read shared format through the janitor/snapshot helper");
+        .expect("read shared format through the janitor/snapshot helper")
+        .expect("shared format is published");
     assert_eq!(shared_format.uuid, original.uuid);
     assert_eq!(shared_format.access_key, "only-access");
     local

@@ -255,13 +255,16 @@ fn resolve_volume(client_root: &Path, volume_name: &str) -> Result<ResolvedVolum
     let volume_id = postgres.volume_id;
     let shared = studiofs_meta::pg_engine::read_shared_volume_format_info(&postgres_url, volume_id)
         .map_err(|error| snapshot_context_error(&path, error))?;
-    if shared.uuid != info.uuid || shared.name != info.name {
-        return Err(snapshot_context_error(
-            &path,
-            "shared volume identity does not match local metadata",
-        ));
+    // Without a published shared format the local S3 settings are the newest ones.
+    if let Some(shared) = shared {
+        if shared.uuid != info.uuid || shared.name != info.name {
+            return Err(snapshot_context_error(
+                &path,
+                "shared volume identity does not match local metadata",
+            ));
+        }
+        apply_shared_s3_settings(&mut info, shared, preserve_mounted_endpoint);
     }
-    apply_shared_s3_settings(&mut info, shared, preserve_mounted_endpoint);
     let hint = SnapshotVolumeIdentityHint::new(volume_id, info.name.clone(), info.uuid.clone())
         .map_err(|error| {
             snapshot_context_error(&path, format!("local volume identity is invalid: {error}"))

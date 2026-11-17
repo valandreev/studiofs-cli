@@ -54,7 +54,10 @@ using the old pair until connectivity returns and a poll succeeds.
 Changing the endpoint, bucket, or region takes effect after remounting because
 those values configure the S3 client itself. The credential rotation applies
 to live and snapshot mounts running the upgraded binary; standalone janitor and
-snapshot commands load their S3 settings when they start.
+snapshot commands load their S3 settings when they start. After an endpoint or
+bucket change, `janitor` refuses to delete anything until this computer's local
+metadata has the new values: mount the volume once and let it complete a
+PostgreSQL poll.
 
 Each command updates all named fields together and leaves unnamed settings,
 volume identity, encryption, and block size unchanged. The confirmation lists

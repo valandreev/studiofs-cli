@@ -632,16 +632,16 @@ impl PgMetaEngine {
                             .map_err(|error| Self::classify_pg_error("read shared format info", error))?;
                         let uuid: String = row.get(0);
                         let bytes: Vec<u8> = row.get(1);
-                        let info = crate::decode_format_info(&bytes)?;
-                        if uuid != info.uuid {
-                            return Err(MetaError::Storage("shared volume identity mismatch".into()));
-                        }
-                        Ok(info)
+                        decode_shared_format_info(&uuid, &bytes)
                     })
                 },
             )
             .await
         })?;
+        // No checkpoint has published a shared format yet; keep the local settings.
+        let Some(shared) = shared else {
+            return Ok(());
+        };
         if shared.uuid != current.uuid || shared.name != current.name {
             return Err(MetaError::Storage("shared volume identity mismatch".into()));
         }
@@ -674,11 +674,24 @@ impl PgMetaEngine {
     }
 }
 
+/// Decode a shared `metadata_state.format_info` value; empty means no checkpoint published it yet.
+fn decode_shared_format_info(uuid: &str, bytes: &[u8]) -> MetaResult<Option<FormatInfo>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let info = crate::decode_format_info(bytes)?;
+    if uuid != info.uuid {
+        return Err(MetaError::Storage("shared volume identity mismatch".into()));
+    }
+    Ok(Some(info))
+}
+
 /// Read authoritative volume format metadata from PostgreSQL and verify its embedded UUID.
+/// Returns `None` while no checkpoint has published a shared format.
 pub fn read_shared_volume_format_info(
     postgres_url: &str,
     volume_id: i64,
-) -> MetaResult<FormatInfo> {
+) -> MetaResult<Option<FormatInfo>> {
     PgMetaEngine::read_shared_format_info(
         postgres_url,
         volume_id,
@@ -1409,7 +1422,7 @@ impl PgMetaEngine {
         volume_id: i64,
         connect_timeout: Duration,
         command_timeout: Duration,
-    ) -> MetaResult<FormatInfo> {
+    ) -> MetaResult<Option<FormatInfo>> {
         let postgres_url = postgres_url.to_string();
         Self::run_async_once(async move {
             let (client, connection) =
@@ -1439,11 +1452,7 @@ impl PgMetaEngine {
                     .map_err(|error| Self::classify_pg_error("read shared format info", error))?;
                 let uuid: String = row.get(0);
                 let bytes: Vec<u8> = row.get(1);
-                let info = crate::decode_format_info(&bytes)?;
-                if uuid != info.uuid {
-                    return Err(MetaError::Storage("shared volume identity mismatch".into()));
-                }
-                Ok(info)
+                decode_shared_format_info(&uuid, &bytes)
             })
             .await;
             connection_task.abort();
