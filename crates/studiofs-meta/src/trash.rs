@@ -99,6 +99,9 @@ pub struct VolumeSettings {
     pub revision: u64,
     /// Retention admission and expiry policy.
     pub trash: TrashPolicy,
+    /// Optional logical capacity limit; `None` means unlimited.
+    #[serde(default)]
+    pub logical_quota_bytes: Option<u64>,
 }
 
 impl VolumeSettings {
@@ -125,6 +128,13 @@ pub trait MetaVolumeSettings: Send + Sync {
         &self,
         expected_revision: u64,
         days: u32,
+    ) -> crate::MetaResult<Option<VolumeSettings>>;
+
+    /// Atomically update the logical quota if the serving revision still matches.
+    fn compare_and_set_logical_quota_bytes(
+        &self,
+        expected_revision: u64,
+        bytes: Option<u64>,
     ) -> crate::MetaResult<Option<VolumeSettings>>;
 }
 

@@ -23,6 +23,7 @@ const TAG_REMOVE_PENDING_DELETION: u8 = 15;
 // Tags 16 and 17 belonged to retired snapshot events and remain reserved.
 const TAG_REMOVE_LOCAL_ENTRY: u8 = 18;
 const TAG_SET_VOLUME_SETTINGS: u8 = 19;
+const TAG_SET_VOLUME_SETTINGS_V2: u8 = 20;
 
 // These tag values are part of the persisted format: append new values, never
 // reorder or reuse an existing value.
@@ -222,7 +223,7 @@ impl MetaEvent {
 
     fn wire_tag(&self) -> u8 {
         match self {
-            Self::SetVolumeSettings { .. } => TAG_SET_VOLUME_SETTINGS,
+            Self::SetVolumeSettings { .. } => TAG_SET_VOLUME_SETTINGS_V2,
             Self::SetAttr { .. } => TAG_SET_ATTR,
             Self::RemoveAttr { .. } => TAG_REMOVE_ATTR,
             Self::AddEntry { .. } => TAG_ADD_ENTRY,
@@ -372,7 +373,7 @@ pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResu
 
 fn wire_tag_for_kind(kind: &str) -> Option<u8> {
     match kind {
-        "set_volume_settings" => Some(TAG_SET_VOLUME_SETTINGS),
+        "set_volume_settings" => Some(TAG_SET_VOLUME_SETTINGS_V2),
         "set_attr" => Some(TAG_SET_ATTR),
         "remove_attr" => Some(TAG_REMOVE_ATTR),
         "add_entry" => Some(TAG_ADD_ENTRY),
@@ -467,7 +468,7 @@ fn decode_event_payload<T: DeserializeOwned>(tag: u8, payload: &[u8]) -> MetaRes
 
 fn decode_tagged_event(tag: u8, payload: &[u8]) -> MetaResult<MetaEvent> {
     match tag {
-        TAG_SET_VOLUME_SETTINGS => Ok(MetaEvent::SetVolumeSettings {
+        TAG_SET_VOLUME_SETTINGS | TAG_SET_VOLUME_SETTINGS_V2 => Ok(MetaEvent::SetVolumeSettings {
             settings: decode_event_payload(tag, payload)?,
         }),
         TAG_SET_ATTR => Ok(MetaEvent::SetAttr {

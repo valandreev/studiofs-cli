@@ -99,6 +99,47 @@ impl MetaVolumeSettings for RedbMetaEngine {
             .map_err(|error| MetaError::Storage(error.to_string()))?;
         Ok(Some(settings))
     }
+
+    fn compare_and_set_logical_quota_bytes(
+        &self,
+        expected_revision: u64,
+        bytes: Option<u64>,
+    ) -> MetaResult<Option<VolumeSettings>> {
+        let txn = self.begin_write_txn()?;
+        let mut settings = {
+            let table = txn
+                .open_table(SETTINGS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            if let Some(format) = table.get("format")? {
+                crate::decode_format_info(format.value())?;
+            }
+            table
+                .get(VOLUME_SETTINGS_KEY)?
+                .map(|entry| {
+                    serde_json::from_slice::<VolumeSettings>(entry.value())
+                        .map_err(|e| MetaError::Serialization(e.to_string()))
+                })
+                .transpose()?
+                .unwrap_or_default()
+        };
+        if settings.revision != expected_revision {
+            return Ok(None);
+        }
+        settings.revision = settings
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| MetaError::Storage("volume settings revision overflow".into()))?;
+        settings.logical_quota_bytes = bytes;
+        let encoded =
+            serde_json::to_vec(&settings).map_err(|e| MetaError::Serialization(e.to_string()))?;
+        txn.open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .insert(VOLUME_SETTINGS_KEY, encoded.as_slice())?;
+        Self::append_event_in_txn(&txn, &crate::MetaEvent::SetVolumeSettings { settings })?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(Some(settings))
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +229,30 @@ mod tests {
         let bootstrapped = RedbMetaEngine::open(temp.path().join("bootstrap.redb")).unwrap();
         bootstrapped.import_remote_snapshot(&snapshot).unwrap();
         assert_eq!(bootstrapped.volume_settings().unwrap(), expected);
+    }
+
+    #[test]
+    fn logical_quota_settings_cas_roundtrips_and_rejects_stale_revision() {
+        let temp = studiofs_test_support::workspace_target_tempdir("logical-quota-settings-");
+        let engine = RedbMetaEngine::open(temp.path().join("meta.redb")).unwrap();
+        let accepted = engine
+            .compare_and_set_logical_quota_bytes(0, Some(4096))
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.logical_quota_bytes, Some(4096));
+        assert_eq!(accepted.revision, 1);
+        assert_eq!(
+            engine.compare_and_set_logical_quota_bytes(0, None).unwrap(),
+            None
+        );
+        let replay = engine.read_events_range(0, u64::MAX).unwrap();
+        assert_eq!(
+            replay,
+            vec![crate::MetaEvent::SetVolumeSettings { settings: accepted }]
+        );
+        drop(engine);
+        let reopened = RedbMetaEngine::open(temp.path().join("meta.redb")).unwrap();
+        assert_eq!(reopened.volume_settings().unwrap(), accepted);
     }
 
     #[test]

@@ -49,6 +49,13 @@ impl<M: ?Sized + MetaEngine> crate::trash::MetaVolumeSettings for ReadOnlyMetaEn
     ) -> MetaResult<Option<crate::trash::VolumeSettings>> {
         Err(read_only_error(ROOT_INO))
     }
+    fn compare_and_set_logical_quota_bytes(
+        &self,
+        _expected_revision: u64,
+        _bytes: Option<u64>,
+    ) -> MetaResult<Option<crate::trash::VolumeSettings>> {
+        Err(read_only_error(ROOT_INO))
+    }
 }
 
 impl<M: ?Sized + MetaEngine> crate::trash::MetaRetainedStore for ReadOnlyMetaEngine<M> {
