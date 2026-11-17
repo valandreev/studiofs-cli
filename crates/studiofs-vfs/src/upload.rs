@@ -446,6 +446,7 @@ mod tests {
             bucket: "unit-test".into(),
             access_key: "access".into(),
             secret_key: "secret".into(),
+            rotating_credentials: None,
             region: "us-east-1".into(),
             volume_name: "unit-volume".into(),
             data_prefix: "unit-volume/objects/".into(),
