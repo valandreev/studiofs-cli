@@ -567,6 +567,20 @@ impl MetaAcl for PgMetaEngine {
 }
 
 impl MetaEngine for PgMetaEngine {
+    fn register_shared_s3_credentials_observer(
+        &self,
+        observer: crate::engine::SharedS3CredentialsObserver,
+    ) {
+        let mut registered = self
+            .shared_s3_credentials_observer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Ok(format) = self.local.get_format_info() {
+            observer(&format.access_key, &format.secret_key);
+        }
+        *registered = Some(observer);
+    }
+
     fn retained_store(&self) -> Option<&dyn crate::trash::MetaRetainedStore> {
         Some(self)
     }

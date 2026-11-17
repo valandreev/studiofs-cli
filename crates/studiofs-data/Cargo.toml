@@ -12,6 +12,10 @@ test-utils = []
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+reqsign.workspace = true
+reqwest.workspace = true
 studiofs-meta.workspace = true
 opendal.workspace = true
 http.workspace = true

@@ -71,6 +71,7 @@ fn test_config() -> DataStoreConfig {
         crypto: DataStoreCryptoConfig::from(studiofs_meta::EncryptionConfig::new(
             [0x42; studiofs_meta::ENCRYPTION_KEY_LENGTH],
         )),
+        rotating_credentials: None,
     }
 }
 

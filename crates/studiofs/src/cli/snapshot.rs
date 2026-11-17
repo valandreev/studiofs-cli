@@ -225,7 +225,9 @@ fn resolve_volume(client_root: &Path, volume_name: &str) -> Result<ResolvedVolum
             "no local metadata found for snapshot volume '{volume_name}'; initialize or discover this PostgreSQL-backed volume first; usage: studiofs snapshot <VOLUME_NAME> [OPTIONS] <COMMAND>"
         ));
     }
-    let info = match mounted_format_info(volume_name)? {
+    let mounted = mounted_format_info(volume_name)?;
+    let preserve_mounted_endpoint = mounted.is_some();
+    let mut info = match mounted {
         Some(info) => info,
         None => RedbMetaEngine::read_format_info_readonly(&path).map_err(|error| {
             snapshot_context_error(
@@ -249,12 +251,22 @@ fn resolve_volume(client_root: &Path, volume_name: &str) -> Result<ResolvedVolum
     let postgres = info.metadata.postgres.as_ref().ok_or_else(|| {
         snapshot_context_error(&path, "PostgreSQL connection metadata is missing")
     })?;
-    let hint =
-        SnapshotVolumeIdentityHint::new(postgres.volume_id, info.name.clone(), info.uuid.clone())
-            .map_err(|error| {
+    let postgres_url = postgres.url.clone();
+    let volume_id = postgres.volume_id;
+    let shared = studiofs_meta::pg_engine::read_shared_volume_format_info(&postgres_url, volume_id)
+        .map_err(|error| snapshot_context_error(&path, error))?;
+    if shared.uuid != info.uuid || shared.name != info.name {
+        return Err(snapshot_context_error(
+            &path,
+            "shared volume identity does not match local metadata",
+        ));
+    }
+    apply_shared_s3_settings(&mut info, shared, preserve_mounted_endpoint);
+    let hint = SnapshotVolumeIdentityHint::new(volume_id, info.name.clone(), info.uuid.clone())
+        .map_err(|error| {
             snapshot_context_error(&path, format!("local volume identity is invalid: {error}"))
         })?;
-    let engine = PgMetaEngine::open_snapshot_backend(&postgres.url, postgres.volume_id)
+    let engine = PgMetaEngine::open_snapshot_backend(&postgres_url, volume_id)
         .map_err(|error| snapshot_context_error(&path, error))?;
     let context = engine
         .validate_snapshot_volume_context(&hint)
@@ -270,6 +282,16 @@ fn resolve_volume(client_root: &Path, volume_name: &str) -> Result<ResolvedVolum
         engine,
         context,
     })
+}
+
+fn apply_shared_s3_settings(info: &mut FormatInfo, shared: FormatInfo, preserve_endpoint: bool) {
+    if !preserve_endpoint {
+        info.endpoint = shared.endpoint;
+    }
+    info.bucket = shared.bucket;
+    info.access_key = shared.access_key;
+    info.secret_key = shared.secret_key;
+    info.region = shared.region;
 }
 
 pub(super) fn mounted_format_info(volume_name: &str) -> Result<Option<FormatInfo>> {
@@ -659,9 +681,63 @@ fn snapshot_context_error(path: &Path, error: impl std::fmt::Display) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::super::parse_for_test;
-    use super::{SnapshotCommand, format_catalog_error, format_duration, resolve_volume};
+    use super::{
+        SnapshotCommand, apply_shared_s3_settings, format_catalog_error, format_duration,
+        resolve_volume,
+    };
     use std::fs;
     use std::time::Duration;
+    use studiofs_meta::{
+        CURRENT_FORMAT_VERSION, EncryptionConfig, FormatInfo, MetadataBackend, MetadataConfig,
+        PostgresConfig,
+    };
+
+    fn snapshot_format(endpoint: &str, bucket: &str) -> FormatInfo {
+        FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
+            name: "volume".into(),
+            uuid: "uuid".into(),
+            endpoint: endpoint.into(),
+            bucket: bucket.into(),
+            access_key: "access".into(),
+            secret_key: "secret".into(),
+            region: "region".into(),
+            data_prefix: "volume/objects/".into(),
+            metadata: MetadataConfig {
+                backend: MetadataBackend::Postgres,
+                remote: None,
+                postgres: Some(PostgresConfig {
+                    url: "postgres://localhost/db".into(),
+                    volume_id: 1,
+                }),
+            },
+            encryption: EncryptionConfig::new([0; 32]),
+            block_size: 4096,
+        }
+    }
+
+    #[test]
+    fn snapshot_refresh_preserves_mounted_endpoint_but_uses_shared_other_s3_fields() {
+        let mut mounted = snapshot_format("http://local-endpoint", "old-bucket");
+        let mut shared = snapshot_format("https://shared", "new-bucket");
+        shared.access_key = "new-access".into();
+        shared.secret_key = "new-secret".into();
+        shared.region = "eu-central-1".into();
+        apply_shared_s3_settings(&mut mounted, shared, true);
+        assert_eq!(mounted.endpoint, "http://local-endpoint");
+        assert_eq!(mounted.bucket, "new-bucket");
+        assert_eq!(mounted.access_key, "new-access");
+        assert_eq!(mounted.secret_key, "new-secret");
+        assert_eq!(mounted.region, "eu-central-1");
+
+        let mut unmounted = snapshot_format("http://stale-local", "old-bucket");
+        apply_shared_s3_settings(
+            &mut unmounted,
+            snapshot_format("https://shared", "new-bucket"),
+            false,
+        );
+        assert_eq!(unmounted.endpoint, "https://shared");
+    }
 
     #[test]
     fn invalid_volume_names_fail_before_reading_metadata() {

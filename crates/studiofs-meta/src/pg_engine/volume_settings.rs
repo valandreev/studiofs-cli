@@ -2,6 +2,23 @@ use super::*;
 use crate::MetaEvent;
 use crate::trash::{MetaVolumeSettings, VolumeSettings};
 
+#[derive(Default)]
+/// Optional mutable S3 and trash values applied in one shared metadata transaction.
+pub struct S3VolumeSettingsUpdate<'a> {
+    /// Replacement S3 endpoint.
+    pub endpoint: Option<&'a str>,
+    /// Replacement object-storage bucket.
+    pub bucket: Option<&'a str>,
+    /// Replacement S3 access key.
+    pub access_key: Option<&'a str>,
+    /// Replacement S3 secret key.
+    pub secret_key: Option<&'a str>,
+    /// Replacement S3 region.
+    pub region: Option<&'a str>,
+    /// Replacement trash retention in whole days.
+    pub trash_days: Option<u32>,
+}
+
 impl crate::trash::MetaRetainedStore for PgMetaEngine {
     fn protect_retained_file_payload(
         &self,
@@ -115,6 +132,25 @@ pub async fn set_shared_trash_days(
         .transaction()
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("begin volume settings", error))?;
+    let accepted =
+        set_shared_trash_days_in_tx(&tx, volume, expected_revision, days, client_id, now_ms)
+            .await?;
+    if accepted.is_some() {
+        tx.commit()
+            .await
+            .map_err(|error| PgMetaEngine::classify_pg_error("commit volume settings", error))?;
+    }
+    Ok(accepted)
+}
+
+async fn set_shared_trash_days_in_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    volume: i64,
+    expected_revision: Option<u64>,
+    days: u32,
+    client_id: &str,
+    now_ms: i64,
+) -> MetaResult<Option<VolumeSettings>> {
     let row = tx
         .query_one(
             "SELECT metadata_format_version, volume_settings FROM metadata_state WHERE vol=$1 FOR UPDATE",
@@ -182,8 +218,73 @@ pub async fn set_shared_trash_days(
     )
     .await
     .map_err(|error| PgMetaEngine::classify_pg_error("notify volume settings", error))?;
+    Ok(Some(settings))
+}
+
+/// Atomically updates mutable object-store settings and, when requested, trash
+/// retention. Immutable volume identity and encryption fields come from the
+/// locked shared FormatInfo and are never supplied by the caller.
+pub async fn update_shared_s3_settings(
+    client: &mut tokio_postgres::Client,
+    volume: i64,
+    expected_uuid: &str,
+    update: S3VolumeSettingsUpdate<'_>,
+    client_id: &str,
+    now_ms: i64,
+) -> MetaResult<crate::FormatInfo> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|error| PgMetaEngine::classify_pg_error("begin shared volume update", error))?;
+    let row = tx
+        .query_one(
+            "SELECT ms.metadata_format_version, ms.format_info, v.uuid FROM metadata_state ms JOIN volumes v ON v.vol=ms.vol WHERE ms.vol=$1 FOR UPDATE OF ms",
+            &[&volume],
+        )
+        .await
+        .map_err(|error| PgMetaEngine::classify_pg_error("lock shared volume update", error))?;
+    crate::ensure_supported_pg_sync_format_version(row.get(0))?;
+    let uuid: String = row.get(2);
+    if uuid != expected_uuid {
+        return Err(MetaError::Storage("shared volume identity mismatch".into()));
+    }
+    let current: Vec<u8> = row.get(1);
+    let mut format = crate::decode_format_info(&current)?;
+    if format.uuid != expected_uuid {
+        return Err(MetaError::Storage("shared format identity mismatch".into()));
+    }
+    if let Some(value) = update.endpoint {
+        format.endpoint = value.to_string();
+    }
+    if let Some(value) = update.bucket {
+        format.bucket = value.to_string();
+    }
+    if let Some(value) = update.access_key {
+        format.access_key = value.to_string();
+    }
+    if let Some(value) = update.secret_key {
+        format.secret_key = value.to_string();
+    }
+    if let Some(value) = update.region {
+        format.region = value.to_string();
+    }
+    let format_bytes =
+        serde_json::to_vec(&format).map_err(|error| MetaError::Serialization(error.to_string()))?;
+    tx.execute(
+        "UPDATE metadata_state SET format_info=$2 WHERE vol=$1",
+        &[&volume, &format_bytes],
+    )
+    .await
+    .map_err(|error| PgMetaEngine::classify_pg_error("store shared S3 settings", error))?;
+    if let Some(days) = update.trash_days {
+        set_shared_trash_days_in_tx(&tx, volume, None, days, client_id, now_ms)
+            .await?
+            .ok_or_else(|| {
+                MetaError::Storage("shared trash settings update was rejected".into())
+            })?;
+    }
     tx.commit()
         .await
-        .map_err(|error| PgMetaEngine::classify_pg_error("commit volume settings", error))?;
-    Ok(Some(settings))
+        .map_err(|error| PgMetaEngine::classify_pg_error("commit shared volume update", error))?;
+    Ok(format)
 }

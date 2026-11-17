@@ -13,6 +13,6 @@ pub mod snapshot_key;
 pub mod store;
 
 pub use store::{
-    DataStore, DataStoreConfig, DataStoreCryptoConfig, IoProfile, normalize_s3_endpoint_transport,
-    validate_s3_endpoint_transport,
+    DataStore, DataStoreConfig, DataStoreCryptoConfig, IoProfile, S3CredentialHolder,
+    normalize_s3_endpoint_transport, validate_s3_endpoint_transport,
 };

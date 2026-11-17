@@ -27,6 +27,41 @@ Older janitors fail closed throughout that database, including volumes still
 using format 5. Use a compatible updated janitor for every volume in that
 database. This command upgrades compatibility; it does not enable retention.
 
+## Update shared S3 settings: `umeta`
+
+Use `umeta` to change the endpoint, bucket, access key, secret key, region, or
+trash retention saved in PostgreSQL. Supply at least one setting. Connect with
+an explicit metadata DSN and disk name, or use `--disk` to read the DSN from
+this computer's local volume metadata:
+
+```bash
+studiofs umeta --meta '<PostgreSQL DSN>' myvolume --endpoint https://s3.example.com
+studiofs umeta --disk myvolume --bucket new-bucket --region eu-central-1
+studiofs umeta --disk myvolume --access-key "$S3_ACCESS_KEY" --secret-key "$S3_SECRET_KEY"
+studiofs umeta --disk myvolume --trash-days 7
+```
+
+Upgrade every client and stop any older binaries before running `umeta`; an
+older mounted client can publish stale settings back to PostgreSQL at a
+checkpoint. Upgraded mounts can remain running for an access-key or secret-key
+rotation. Rotate the access key and secret key in the same command. Each mount
+applies the new pair after its next successful PostgreSQL metadata poll (every
+2 seconds by default; configure the interval with
+`STUDIOFS_PG_SYNC_POLL_SECS`). Keep the old pair valid until every mount has
+completed a successful poll. A mount that cannot reach PostgreSQL continues
+using the old pair until connectivity returns and a poll succeeds.
+
+Changing the endpoint, bucket, or region takes effect after remounting because
+those values configure the S3 client itself. The credential rotation applies
+to live and snapshot mounts running the upgraded binary; standalone janitor and
+snapshot commands load their S3 settings when they start.
+
+Each command updates all named fields together and leaves unnamed settings,
+volume identity, encryption, and block size unchanged. The confirmation lists
+field names only. S3 credentials are still stored in shared PostgreSQL and
+local metadata as volume configuration; see [Credentials, encryption and
+access](26-credentials-encryption-and-access.md).
+
 ## Trash retention: `trash-days`
 
 Trash retention is a shared, per-volume setting in whole days. It defaults to 0,

@@ -110,6 +110,7 @@ impl InitRunRequest {
                 crypto: DataStoreCryptoConfig::from(EncryptionConfig::new(
                     [0; ENCRYPTION_KEY_LENGTH],
                 )),
+                rotating_credentials: None,
             },
             postgres_dsn: args.meta,
             deprecated_metadata: DeprecatedMetadataArgs {

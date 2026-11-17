@@ -3,8 +3,24 @@
 use anyhow::{Context, bail};
 use clap::Args;
 use std::time::Duration;
-use studiofs_meta::RedbMetaEngine;
 use studiofs_meta::trash::VolumeSettings;
+use studiofs_meta::{FormatInfo, RedbMetaEngine};
+
+pub(super) fn local_format_info(name: &str) -> anyhow::Result<FormatInfo> {
+    let path = super::utils::get_default_meta_dir(name)?.join(format!("{name}.db"));
+    if !path.is_file() {
+        bail!("Local volume metadata is missing; discover the volume first.");
+    }
+    let format = match super::snapshot::mounted_format_info(name)? {
+        Some(format) => format,
+        None => RedbMetaEngine::read_format_info_readonly(&path)
+            .context("Local volume metadata is unreadable or needs `studiofs upgrade`")?,
+    };
+    if format.name != name {
+        bail!("Local volume name does not match its header; nothing was changed.");
+    }
+    Ok(format)
+}
 
 #[derive(Args, Debug)]
 pub struct TrashDaysArgs {
@@ -17,19 +33,7 @@ pub struct TrashDaysArgs {
 
 impl TrashDaysArgs {
     pub fn dispatch(self) -> anyhow::Result<()> {
-        let path =
-            super::utils::get_default_meta_dir(&self.name)?.join(format!("{}.db", self.name));
-        if !path.is_file() {
-            bail!("Local volume metadata is missing; discover the volume first.");
-        }
-        let format = match super::snapshot::mounted_format_info(&self.name)? {
-            Some(format) => format,
-            None => RedbMetaEngine::read_format_info_readonly(&path)
-                .context("Local volume metadata is unreadable or needs `studiofs upgrade`")?,
-        };
-        if format.name != self.name {
-            bail!("Local volume name does not match its header; nothing was changed.");
-        }
+        let format = local_format_info(&self.name)?;
         let pg = format
             .metadata
             .postgres

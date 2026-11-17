@@ -138,7 +138,7 @@ pub struct JanitorMetadataSession {
 impl JanitorMetadataSession {
     /// Opens local metadata read-only and prepares the required PostgreSQL gate.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, JanitorMetadataError> {
-        let format_info = RedbMetaEngine::read_format_info_readonly(path.as_ref())
+        let mut format_info = RedbMetaEngine::read_format_info_readonly(path.as_ref())
             .map_err(backend_unavailable)?;
         crate::ensure_supported_format_version(&format_info).map_err(|_| {
             JanitorMetadataError::UnsafeToDelete("local volume format is unsupported")
@@ -152,6 +152,19 @@ impl JanitorMetadataSession {
             .ok_or(JanitorMetadataError::UnsafeToDelete(
                 "PostgreSQL metadata is required for destructive janitor work",
             ))?;
+        let shared =
+            crate::pg_engine::read_shared_volume_format_info(&config.url, config.volume_id)
+                .map_err(backend_unavailable)?;
+        if shared.uuid != format_info.uuid || shared.name != format_info.name {
+            return Err(JanitorMetadataError::UnsafeToDelete(
+                "shared volume identity does not match local metadata",
+            ));
+        }
+        format_info.endpoint = shared.endpoint;
+        format_info.bucket = shared.bucket;
+        format_info.access_key = shared.access_key;
+        format_info.secret_key = shared.secret_key;
+        format_info.region = shared.region;
         let postgres =
             crate::pg_engine::PgJanitorSession::new(config.url.clone(), config.volume_id);
         Ok(Self {

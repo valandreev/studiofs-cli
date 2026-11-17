@@ -35,6 +35,18 @@ Encryption of remote contents does not cover all StudioFS data:
 
 ## Protecting connections
 
+To rotate a shared S3 endpoint or credential without recreating the volume,
+use [`studiofs umeta`](27-maintenance-and-removing-a-volume.md#update-shared-s3-settings-umeta).
+Upgrade every client binary and stop older clients before running `umeta`.
+Rotate the access key and secret key in the same command. Upgraded mounts apply
+the pair after their next successful PostgreSQL metadata poll (every 2 seconds
+by default; configure the interval with `STUDIOFS_PG_SYNC_POLL_SECS`). Keep the
+old pair valid until every mount has completed a successful poll; a mount that
+cannot reach PostgreSQL keeps using the old pair until it reconnects. Endpoint,
+bucket, and region changes require remounting. See [Maintenance and removing a
+volume](27-maintenance-and-removing-a-volume.md#update-shared-s3-settings-umeta)
+for the full sequence.
+
 Encryption of S3 objects and encryption of a network connection serve different purposes. Use `https://` for a production S3 endpoint. StudioFS also accepts an explicitly specified `http://` address, but use it only for a connection on a trusted local network. If clients connect over the internet, configure TLS on a reverse proxy and use `https://`.
 
 For PostgreSQL, pay attention to the `sslmode` parameter in the connection string:

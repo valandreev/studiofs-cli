@@ -2106,6 +2106,9 @@ pub trait MetaReplication: Send + Sync {
     }
 }
 
+/// Consumer for credentials refreshed from shared volume metadata.
+pub type SharedS3CredentialsObserver = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 /// Public aggregate contract for consumers.
 pub trait MetaEngine:
     MetaEngineCore
@@ -2122,6 +2125,10 @@ pub trait MetaEngine:
     + MetaReplication
     + crate::snapshot_ports::UploadedFragmentLedger
 {
+    /// Register a process-local consumer for shared S3 credential rotations.
+    /// The current local pair is delivered immediately to close the poll race.
+    fn register_shared_s3_credentials_observer(&self, _observer: SharedS3CredentialsObserver) {}
+
     /// Local retained-store capability, absent for engines without this lifecycle.
     fn retained_store(&self) -> Option<&dyn crate::trash::MetaRetainedStore> {
         None
