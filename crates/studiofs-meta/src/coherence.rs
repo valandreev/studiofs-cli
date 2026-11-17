@@ -60,6 +60,26 @@ pub(crate) struct PendingInvalidations {
 }
 
 impl PendingInvalidations {
+    /// Returns inode IDs whose durable logical lengths may have changed.
+    /// `None` means the journal was suppressed, reset, or overflowed and the
+    /// caller must rebuild from a complete snapshot.
+    pub(crate) fn affected_inodes(&self) -> Option<HashSet<Ino>> {
+        if matches!(self.intents.first(), Some(InvalidationIntent::Reset)) {
+            return None;
+        }
+        Some(
+            self.intents
+                .iter()
+                .filter_map(|intent| match intent {
+                    InvalidationIntent::Attributes { ino }
+                    | InvalidationIntent::Content { ino } => Some(*ino),
+                    InvalidationIntent::Entry { ino: Some(ino), .. } => Some(*ino),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
     /// Records that an intent journaled into this scope announces a
     /// serving correction rather than cleanup of an exempt inode.
     pub(crate) fn note_serving_correction(&mut self) {

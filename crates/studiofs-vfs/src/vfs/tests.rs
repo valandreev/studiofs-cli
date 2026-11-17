@@ -16,6 +16,7 @@ use studiofs_meta::schema::{
     MetadataConfig, PayloadRefState, PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder,
     SliceRange, SliceRecord, TimeSpec, counters::NEXT_EVENT_SEQ,
 };
+use studiofs_meta::trash::MetaVolumeSettings;
 use studiofs_meta::{
     FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, MetaGc, MetaNamespace,
     MetaRecovery, MetaReplication, RedbMetaEngine,
@@ -29190,6 +29191,77 @@ fn retained_restore_concurrent_same_receipt_never_recopies_over_newer_writes() {
         assert!(meta.get_attr(file.ino).is_ok());
         vfs.shutdown(Duration::ZERO).await.unwrap();
     });
+}
+
+#[test]
+fn logical_quota_rejects_sparse_growth_but_allows_non_growing_operations() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "logical-quota-sparse");
+    meta.compare_and_set_logical_quota_bytes(0, Some(8))
+        .unwrap()
+        .expect("set quota");
+    let file = vfs.create(ROOT_INO, b"quota.bin", 0, 0, 0o644).unwrap();
+
+    vfs.setattr(file.ino, SetattrArgs::size_only(8))
+        .expect("sparse growth up to quota");
+    assert!(vfs.setattr(file.ino, SetattrArgs::size_only(9)).is_err());
+    assert_eq!(meta.get_attr(file.ino).unwrap().size, 8);
+
+    let fh = vfs.open_file(file.ino, OpenFlags::RDWR, false).unwrap();
+    rt.block_on(vfs.write_fh(fh, file.ino, 0, b"12345678"))
+        .expect("overwrite within quota");
+    vfs.setattr(file.ino, SetattrArgs::size_only(4))
+        .expect("shrink under quota");
+    assert_eq!(meta.get_attr(file.ino).unwrap().size, 4);
+}
+
+#[test]
+fn logical_quota_lowered_below_usage_rejects_only_further_growth() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "logical-quota-lowered");
+    let file = vfs.create(ROOT_INO, b"quota.bin", 0, 0, 0o644).unwrap();
+    vfs.setattr(file.ino, SetattrArgs::size_only(12)).unwrap();
+    let settings = meta.volume_settings().unwrap();
+    meta.compare_and_set_logical_quota_bytes(settings.revision, Some(8))
+        .unwrap()
+        .expect("lower quota below current usage");
+
+    assert!(vfs.setattr(file.ino, SetattrArgs::size_only(13)).is_err());
+    assert_eq!(meta.get_attr(file.ino).unwrap().size, 12);
+    vfs.setattr(file.ino, SetattrArgs::size_only(4))
+        .expect("shrink remains allowed");
+}
+
+#[test]
+fn logical_quota_is_enforced_across_concurrent_handles() {
+    let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "logical-quota-concurrent");
+    meta.compare_and_set_logical_quota_bytes(0, Some(8))
+        .unwrap()
+        .expect("set quota");
+    let first = vfs.create(ROOT_INO, b"first.bin", 0, 0, 0o644).unwrap();
+    let second = vfs.create(ROOT_INO, b"second.bin", 0, 0, 0o644).unwrap();
+    let start = Arc::new(std::sync::Barrier::new(3));
+    let outcomes = [first.ino, second.ino].map(|ino| {
+        let vfs = vfs.clone();
+        let start = start.clone();
+        thread::spawn(move || {
+            start.wait();
+            vfs.setattr(ino, SetattrArgs::size_only(8)).is_ok()
+        })
+    });
+    start.wait();
+    let accepted = outcomes
+        .into_iter()
+        .map(|join| join.join().expect("growth thread"))
+        .filter(|accepted| *accepted)
+        .count();
+    assert_eq!(
+        accepted, 1,
+        "only one handle may reserve the remaining quota"
+    );
+    let used = meta.get_attr(first.ino).unwrap().size + meta.get_attr(second.ino).unwrap().size;
+    assert_eq!(used, 8);
 }
 
 /// Builds a retained receipt plus one leftover stage per `(name, bytes)` pair,

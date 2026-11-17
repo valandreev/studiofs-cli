@@ -1463,6 +1463,8 @@ pub(super) struct NamespaceState {
     pub(super) attr_read_cache: OrderedMutex<AttrReadCache>,
     /// Local dirty attribute snapshots awaiting persistence.
     pub(super) dirty_attrs: OrderedMutex<std::collections::HashMap<Ino, InodeAttr>>,
+    /// Growth in flight before publication to dirty attributes or durable metadata.
+    pub(super) quota_reservations: parking_lot::Mutex<Vec<(Ino, u64)>>,
     /// Global namespace epoch to invalidate stale dentry/path cache entries.
     pub(super) namespace_epoch: AtomicU64,
     /// Aggregate attribute generation used by bridge-side enumeration caches.
@@ -1497,6 +1499,7 @@ impl NamespaceState {
                 LockTier::Namespace,
             ),
             dirty_attrs: OrderedMutex::new(std::collections::HashMap::new(), LockTier::Namespace),
+            quota_reservations: Default::default(),
             namespace_epoch: AtomicU64::new(0),
             attribute_generation: AtomicU64::new(0),
             directory_generations: OrderedMutex::new(

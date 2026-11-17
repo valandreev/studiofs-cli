@@ -478,6 +478,11 @@ impl StudioVfs {
             }
 
             let mut base_attr = self.getattr_async(ino).await?;
+            let _quota = self.reserve_logical_growth(
+                ino,
+                base_attr.size,
+                offset.saturating_add(data.len() as u64),
+            )?;
             self.refresh_inode_incarnation_state_from_attr(ino, &base_attr);
             self.begin_pending_incarnation(ino, &mut base_attr);
             {

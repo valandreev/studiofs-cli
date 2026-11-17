@@ -2282,6 +2282,11 @@ impl StudioVfs {
                     attr
                 }
             };
+            let _quota = self.reserve_logical_growth(
+                ino,
+                base_attr.size,
+                offset.saturating_add(data.len() as u64),
+            )?;
             let starts_writer_only_empty_draft =
                 base_attr.is_unpublished_empty_draft() && !data.is_empty();
             let writer_only_restore_attr =

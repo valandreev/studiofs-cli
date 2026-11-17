@@ -1862,6 +1862,11 @@ impl StudioVfs {
 
                 self.getattr_async(ino).await?
             };
+            let _quota = self.reserve_logical_growth(
+                ino,
+                old_attr.size,
+                args.size.unwrap_or(old_attr.size),
+            )?;
             let defer_growth_for_active_dirty_writer =
                 defer_strict_flush_for_growth && has_active_dirty_writer;
             let mut attr = old_attr.clone();

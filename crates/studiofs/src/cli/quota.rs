@@ -9,7 +9,7 @@ use studiofs_meta::trash::VolumeSettings;
 pub struct QuotaArgs {
     /// Locally discovered volume; it may be mounted.
     pub name: String,
-    /// Maximum logical file bytes, or `unlimited` to remove the limit. Omit to show status.
+    /// Maximum logical size (e.g. 100M, 100MB, 1.5G), or unlimited. Units use powers of 1024. Omit to show status.
     #[arg(value_parser = validate_limit)]
     pub limit: Option<String>,
 }
@@ -56,10 +56,9 @@ fn parse_limit(value: &str) -> anyhow::Result<Option<u64>> {
     if value == "unlimited" {
         return Ok(None);
     }
-    value
-        .parse::<u64>()
+    studiofs_vfs::parse_size_bytes(value)
         .map(Some)
-        .context("quota must be a nonnegative whole number of bytes or `unlimited`")
+        .context("expected a size such as 100M, 100GB, a byte count, or unlimited")
 }
 
 fn validate_limit(value: &str) -> Result<String, String> {
@@ -78,7 +77,17 @@ mod tests {
         assert!(parse_for_test(&["quota", "volume", "0"]).is_ok());
         assert!(parse_for_test(&["quota", "volume", "18446744073709551615"]).is_ok());
         assert!(parse_for_test(&["quota", "volume", "unlimited"]).is_ok());
-        for invalid in ["-1", "1.5", "18446744073709551616", "1GiB", ""] {
+        for (short, long, bytes) in [
+            ("100M", "100MB", 100 << 20),
+            ("100G", "100GB", 100 << 30),
+            ("1.5k", "1.5KB", 1536),
+        ] {
+            for size in [short, long] {
+                assert!(parse_for_test(&["quota", "volume", size]).is_ok());
+                assert_eq!(super::parse_limit(size).unwrap(), Some(bytes));
+            }
+        }
+        for invalid in ["-1", "M", ".", "1.5.0G", "18446744073709551616", "1GiB", ""] {
             assert!(
                 parse_for_test(&["quota", "volume", invalid]).is_err(),
                 "{invalid:?} must be rejected"
