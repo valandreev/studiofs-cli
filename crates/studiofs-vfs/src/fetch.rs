@@ -1922,6 +1922,9 @@ mod tests {
             "the foreground range should be waiting"
         );
         tokio::time::advance(Duration::from_secs(3)).await;
+        // The budget wait is over; on a paused clock, idle waits on blocking decrypt
+        // auto-advance into the 1 s request timeout, so finish the request on real time.
+        tokio::time::resume();
 
         assert_eq!(task.await.unwrap().unwrap(), expected.slice(..256 * 1024));
         assert!(scheduler.data_store.payload_limit_status().3 >= 2_000_000_000);
