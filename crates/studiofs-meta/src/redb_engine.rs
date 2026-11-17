@@ -30,6 +30,7 @@ pub use self::layout::RedbSnapshot;
 use self::layout::*;
 
 mod fs_ops;
+mod logical_usage;
 mod retained;
 pub(crate) use retained::{RetainedSettlement, UnackedChildPurges};
 
@@ -843,7 +844,8 @@ impl RedbWriteTransaction<'_> {
         result
     }
 
-    pub(crate) fn commit(self) -> Result<(), redb::CommitError> {
+    pub(crate) fn commit(self) -> MetaResult<()> {
+        self.update_logical_usage()?;
         let Self {
             txn,
             _db,
@@ -859,7 +861,9 @@ impl RedbWriteTransaction<'_> {
         } = self;
         let commit_started = Instant::now();
         MetadataWriteMetrics::observe(&write_metrics.mutation, commit_started - mutation_started);
-        let result = txn.commit();
+        let result = txn
+            .commit()
+            .map_err(|error| MetaError::Storage(error.to_string()));
         if result.is_ok()
             && let Some(runtime) = relaxed_durability
             && !runtime.state.force_immediate.load(Ordering::Acquire)

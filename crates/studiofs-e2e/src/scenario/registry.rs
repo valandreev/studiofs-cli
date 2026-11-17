@@ -57,6 +57,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             RecoverableTrashDurability::S3OutageCrashReplay.definition(),
             RecoverableTrashDurability::ColdBootstrap.definition(),
             RecoverableTrashJanitor.definition(),
+            LogicalQuota.definition(),
         ]
     })
 }
@@ -65,6 +66,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
 pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
     match name {
         "mounted-recoverable-trash-two-client" => Some(Box::new(RecoverableTrash)),
+        "mounted-logical-quota" => Some(Box::new(LogicalQuota)),
         "mounted-recoverable-trash-durability" => {
             Some(Box::new(RecoverableTrashDurability::OfflineCrashReplay))
         }
@@ -189,5 +191,20 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         #[cfg(test)]
         TEST_PASSING => Some(Box::new(TestPassingScenario)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{available_scenarios, resolve_scenario};
+
+    #[test]
+    fn logical_quota_is_registered_and_resolvable() {
+        assert!(
+            available_scenarios()
+                .iter()
+                .any(|scenario| scenario.name == "mounted-logical-quota")
+        );
+        assert!(resolve_scenario("mounted-logical-quota").is_some());
     }
 }

@@ -215,6 +215,10 @@ where
         self.inner.list_inode_lifecycles()
     }
 
+    fn logical_usage(&self, pending: &std::collections::HashMap<Ino, u64>) -> MetaResult<u128> {
+        self.inner.logical_usage(pending)
+    }
+
     fn list_inode_ids_after(&self, after: Option<Ino>, limit: usize) -> MetaResult<Vec<Ino>> {
         self.inner.list_inode_ids_after(after, limit)
     }

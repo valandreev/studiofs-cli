@@ -478,33 +478,51 @@ impl StudioVfs {
             }
 
             let mut base_attr = self.getattr_async(ino).await?;
-            let _quota = self.reserve_logical_growth(
-                ino,
-                base_attr.size,
-                offset.saturating_add(data.len() as u64),
-            )?;
+            let end = offset
+                .checked_add(data.len() as u64)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            let _quota = self.reserve_logical_growth(ino, base_attr.size, end)?;
             self.refresh_inode_incarnation_state_from_attr(ino, &base_attr);
             self.begin_pending_incarnation(ino, &mut base_attr);
-            {
+            let (previous_dirty, submitted) = {
                 // The newer-epoch dirty attr is what keeps a later Ready attr
                 // from superseding these bytes before they are materialized.
                 let _supersede_admission = self.state.writer_stack.supersede_admission(ino);
                 let mut dirty = self.state.namespace.dirty_attrs.lock();
+                let previous = dirty.get(&ino).cloned();
                 let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
                 attr.content_epoch = base_attr.content_epoch;
-                let new_size = offset.saturating_add(data.len() as u64);
-                if new_size > attr.size {
-                    attr.size = new_size;
-                }
+                attr.size = attr.size.max(end);
                 attr.touch_mtime();
                 attr.touch_ctime();
                 self.update_pending_incarnation_size(ino, attr.size);
-            }
+                (previous, attr.clone())
+            };
             self.invalidate_attr_read_cache([ino]);
 
             let writes = [(offset, Bytes::copy_from_slice(data))];
-            self.materialize_buffered_writes_direct(ino, &writes, local_sync_policy)
-                .await?;
+            if let Err(error) = self
+                .materialize_buffered_writes_direct(ino, &writes, local_sync_policy)
+                .await
+            {
+                let _admission = self.state.writer_stack.supersede_admission(ino);
+                let mut dirty = self.state.namespace.dirty_attrs.lock();
+                if dirty.get(&ino) == Some(&submitted) {
+                    match previous_dirty {
+                        Some(previous) => {
+                            dirty.insert(ino, previous);
+                        }
+                        None => {
+                            dirty.remove(&ino);
+                        }
+                    }
+                    self.update_pending_incarnation_size(ino, base_attr.size);
+                }
+                drop(dirty);
+                drop(_admission);
+                self.invalidate_attr_read_cache([ino]);
+                return Err(error);
+            }
             Ok(data.len() as u32)
         }
         .await;
@@ -1048,7 +1066,7 @@ impl StudioVfs {
                     .map_err(std::io::Error::other)?;
             }
             let mut attr = self.sync_meta().get_attr(dst_ino)?;
-            attr.size = offset + u64::from(len);
+            // The source owns the logical EOF. Private stage slices carry only payload.
             attr.content_epoch = 1;
             self.sync_meta()
                 .flush_regular_file_overlay_slices_with_attr(

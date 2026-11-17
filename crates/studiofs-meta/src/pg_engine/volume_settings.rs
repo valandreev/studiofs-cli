@@ -164,66 +164,15 @@ pub async fn set_shared_logical_quota_bytes(
     client_id: &str,
     now_ms: i64,
 ) -> MetaResult<Option<VolumeSettings>> {
-    let tx = client
-        .transaction()
-        .await
-        .map_err(|e| PgMetaEngine::classify_pg_error("begin volume quota", e))?;
-    let row = tx.query_one("SELECT metadata_format_version, volume_settings FROM metadata_state WHERE vol=$1 FOR UPDATE", &[&volume]).await.map_err(|e| PgMetaEngine::classify_pg_error("lock volume quota", e))?;
-    crate::ensure_supported_pg_sync_format_version(row.get(0))?;
-    let encoded: Option<Vec<u8>> = row.get(1);
-    let mut settings = encoded
-        .as_deref()
-        .map(serde_json::from_slice::<VolumeSettings>)
-        .transpose()
-        .map_err(|e| MetaError::Serialization(e.to_string()))?
-        .unwrap_or_default();
-    if expected_revision.is_some_and(|revision| revision != settings.revision) {
-        return Ok(None);
-    }
-    settings.revision = settings
-        .revision
-        .checked_add(1)
-        .ok_or_else(|| MetaError::Storage("volume settings revision overflow".into()))?;
-    settings.logical_quota_bytes = bytes;
-    let event = MetaEvent::SetVolumeSettings { settings };
-    let payload = crate::events::encode_event(&event)?;
-    let payload_bytes = i64::try_from(payload.len())
-        .map_err(|_| MetaError::Storage("volume settings payload too large".into()))?;
-    let format = i16::try_from(CURRENT_FORMAT_VERSION)
-        .map_err(|_| MetaError::Storage("metadata format exceeds SMALLINT".into()))?;
-    let row = tx
-        .query_one(
-            sql::BUMP_METADATA_VERSION,
-            &[&volume, &format, &payload_bytes],
-        )
-        .await
-        .map_err(|e| PgMetaEngine::classify_pg_error("order volume quota", e))?;
-    let version: i64 = row.get(0);
-    tx.execute(
-        sql::INSERT_EVENT_LOG_BATCH,
-        &[
-            &volume,
-            &version,
-            &client_id,
-            &now_ms,
-            &vec![event.kind()],
-            &vec![payload],
-        ],
+    update_volume_settings(
+        client,
+        volume,
+        expected_revision,
+        client_id,
+        now_ms,
+        |settings| settings.logical_quota_bytes = bytes,
     )
     .await
-    .map_err(|e| PgMetaEngine::classify_pg_error("publish volume quota", e))?;
-    let settings_bytes =
-        serde_json::to_vec(&settings).map_err(|e| MetaError::Serialization(e.to_string()))?;
-    tx.execute(
-        "UPDATE metadata_state SET volume_settings=$2 WHERE vol=$1",
-        &[&volume, &settings_bytes],
-    )
-    .await
-    .map_err(|e| PgMetaEngine::classify_pg_error("store volume quota", e))?;
-    tx.commit()
-        .await
-        .map_err(|e| PgMetaEngine::classify_pg_error("commit volume quota", e))?;
-    Ok(Some(settings))
 }
 
 /// Authoritative online trash-days update, shared by mounted engines and CLI.
@@ -238,12 +187,31 @@ pub async fn set_shared_trash_days(
     client_id: &str,
     now_ms: i64,
 ) -> MetaResult<Option<VolumeSettings>> {
+    update_volume_settings(
+        client,
+        volume,
+        expected_revision,
+        client_id,
+        now_ms,
+        |settings| settings.trash.set_days(days),
+    )
+    .await
+}
+
+async fn update_volume_settings(
+    client: &mut tokio_postgres::Client,
+    volume: i64,
+    expected_revision: Option<u64>,
+    client_id: &str,
+    now_ms: i64,
+    update: impl FnOnce(&mut VolumeSettings),
+) -> MetaResult<Option<VolumeSettings>> {
     let tx = client
         .transaction()
         .await
         .map_err(|error| PgMetaEngine::classify_pg_error("begin volume settings", error))?;
     let accepted =
-        set_shared_trash_days_in_tx(&tx, volume, expected_revision, days, client_id, now_ms)
+        update_volume_settings_in_tx(&tx, volume, expected_revision, client_id, now_ms, update)
             .await?;
     if accepted.is_some() {
         tx.commit()
@@ -253,15 +221,13 @@ pub async fn set_shared_trash_days(
     Ok(accepted)
 }
 
-/// Authoritative online logical-quota update using the shared settings row lock
-/// and ordered tag-19 event, matching the trash-days CAS authority path.
-async fn set_shared_trash_days_in_tx(
+async fn update_volume_settings_in_tx(
     tx: &tokio_postgres::Transaction<'_>,
     volume: i64,
     expected_revision: Option<u64>,
-    days: u32,
     client_id: &str,
     now_ms: i64,
+    update: impl FnOnce(&mut VolumeSettings),
 ) -> MetaResult<Option<VolumeSettings>> {
     let row = tx
         .query_one(
@@ -285,7 +251,7 @@ async fn set_shared_trash_days_in_tx(
         .revision
         .checked_add(1)
         .ok_or_else(|| MetaError::Storage("volume settings revision overflow".into()))?;
-    settings.trash.set_days(days);
+    update(&mut settings);
     let event = MetaEvent::SetVolumeSettings { settings };
     let payload = crate::events::encode_event(&event)?;
     let payload_bytes = i64::try_from(payload.len())
@@ -389,11 +355,11 @@ pub async fn update_shared_s3_settings(
     .await
     .map_err(|error| PgMetaEngine::classify_pg_error("store shared S3 settings", error))?;
     if let Some(days) = update.trash_days {
-        set_shared_trash_days_in_tx(&tx, volume, None, days, client_id, now_ms)
-            .await?
-            .ok_or_else(|| {
-                MetaError::Storage("shared trash settings update was rejected".into())
-            })?;
+        update_volume_settings_in_tx(&tx, volume, None, client_id, now_ms, |settings| {
+            settings.trash.set_days(days)
+        })
+        .await?
+        .ok_or_else(|| MetaError::Storage("shared trash settings update was rejected".into()))?;
     }
     tx.commit()
         .await

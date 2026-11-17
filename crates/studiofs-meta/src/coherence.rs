@@ -61,7 +61,7 @@ pub(crate) struct PendingInvalidations {
 
 impl PendingInvalidations {
     /// Returns inode IDs whose durable logical lengths may have changed.
-    /// `None` means the journal was suppressed, reset, or overflowed and the
+    /// `None` means the journal was reset or overflowed and the
     /// caller must rebuild from a complete snapshot.
     pub(crate) fn affected_inodes(&self) -> Option<HashSet<Ino>> {
         if matches!(self.intents.first(), Some(InvalidationIntent::Reset)) {

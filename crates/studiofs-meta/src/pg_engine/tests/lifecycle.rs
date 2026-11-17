@@ -1722,6 +1722,25 @@ fn test_pg_volume_settings_authoritative_cas_converges_two_clients() {
     let third = PgMetaEngine::open(&third_path).unwrap();
     third.sync_metadata().unwrap();
     assert_eq!(third.volume_settings().unwrap(), disabled);
+    let limited = first
+        .compare_and_set_logical_quota_bytes(disabled.revision, Some(1024))
+        .unwrap()
+        .unwrap();
+    assert!(
+        second
+            .compare_and_set_logical_quota_bytes(disabled.revision, None)
+            .unwrap()
+            .is_none()
+    );
+    second.sync_metadata().unwrap();
+    assert_eq!(second.volume_settings().unwrap(), limited);
+    let retained = second
+        .compare_and_set_trash_days(limited.revision, 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.logical_quota_bytes, Some(1024));
+    third.sync_metadata().unwrap();
+    assert_eq!(third.volume_settings().unwrap(), retained);
     assert!(
         first.push_event_log_batch_locked(&events).is_err(),
         "local journal cannot bypass global CAS"

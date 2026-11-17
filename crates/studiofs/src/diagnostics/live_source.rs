@@ -116,6 +116,7 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
     fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot {
         let health = self.health_snapshot();
         DiagnosticsRuntimeSnapshot {
+            logical_quota: self.vfs.logical_quota_status().ok().flatten(),
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,
             process: self.process_sampler.lock().sample(),

@@ -45,9 +45,10 @@ After failed writer materialization, a strict local barrier retries the retained
 slices using their original object IDs; it reports exhaustion until persistence
 succeeds, even when no new writer bytes or object IDs are needed.
 
-This disk-full mapping does not add quota handling: `FilesystemQuotaExceeded`
-(`EDQUOT` on POSIX) keeps its existing fallback mapping and must remain distinct
-from `ENOSPC` if quota reporting is added. Metadata failures represented by
+Local logical-volume quota admission returns the disk-full category: POSIX callers
+receive `ENOSPC` and WinFSP callers receive `STATUS_DISK_FULL`. Native
+`FilesystemQuotaExceeded` errors retain their existing fallback mapping.
+Metadata failures represented by
 `MetaError::Storage(String)` also keep `GenericFailure`; the redb I/O cause is
 converted to text before reaching this bridge. Metadata disk-full reporting
 requires retaining that typed cause, rather than interpreting storage-error text.

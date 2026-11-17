@@ -2,6 +2,14 @@
 
 SFS-1058 defines an optional maximum for logical file data in one volume. It is an admission limit for each client's locally authoritative view, not a strict cluster-wide cap or an S3 spending limit. A client may accept writes while disconnected, and two clients can each admit growth using stale peer usage; after replication their aggregate logical usage can exceed the configured maximum. Writes must not wait for PostgreSQL or S3 to decide admission.
 
+## Using a quota
+
+Run `studiofs quota my-volume 100G` to set the limit, `studiofs quota my-volume` to read the shared policy, or `studiofs quota my-volume unlimited` to remove it. Short and long size suffixes use powers of 1024: `100G` and `100GB` both mean 107374182400 bytes. The administrative command requires the volume's PostgreSQL settings write privileges. It checks volume identity and the settings revision. A concurrent change requires a retry.
+
+Use `studiofs status my-volume` to see exact local logical usage, capacity and free space for a configured volume. A mounted client reports its applied policy and accepted writes. Different clients can report different numbers during replication lag.
+
+Upgrade all writing clients before enabling a quota. Unlimited settings retain the historical tag-19 encoding. A configured limit uses tag 20 and a versioned JSON revision key, so an older settings writer fails when decoding it. An offline older client can continue working from its pre-upgrade view until it reconnects.
+
 ## What is charged
 
 Charge the logical length of each live regular-file inode once. A sparse file is charged by its logical length, including holes, rather than allocated blocks. Extending a file charges only the positive difference between its previous logical length and the new length; overwriting bytes within its existing length adds no charge. Truncation releases the removed logical length. Directories and symlinks do not consume this file-data quota.

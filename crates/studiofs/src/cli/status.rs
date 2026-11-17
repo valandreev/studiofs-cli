@@ -127,19 +127,15 @@ fn format_version(value: Option<u64>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn mounted_pg_sync_diagnostics(volume_name: &str) -> Option<PgSyncDiagnostics> {
+fn mounted_runtime_snapshot(
+    volume_name: &str,
+) -> Option<crate::diagnostics::DiagnosticsRuntimeSnapshot> {
     let discovery = crate::diagnostics::discover_local_sessions()
         .ok()?
         .into_iter()
         .find(|session| session.volume == volume_name)?;
     let client = crate::diagnostics::LocalDiagnosticsClient::new(discovery);
-    crate::runtime_bridge::block_on(async move {
-        client
-            .runtime_snapshot()
-            .await
-            .map(|snapshot| snapshot.synchronization.state.pg_sync)
-    })
-    .ok()
+    crate::runtime_bridge::block_on(async move { client.runtime_snapshot().await }).ok()
 }
 
 fn format_page(page: Option<&PgSyncPageDiagnostics>) -> String {
@@ -677,7 +673,7 @@ pub fn run(
     let engine = match studiofs_meta::open_meta_engine(&db_path) {
         Ok(engine) => engine,
         Err(error) => {
-            if let Some(pg_sync) = mounted_pg_sync_diagnostics(name) {
+            if let Some(snapshot) = mounted_runtime_snapshot(name) {
                 eprintln!(
                     "warning: failed to open volume metadata at '{}': {error}",
                     db_path.display()
@@ -689,7 +685,13 @@ pub fn run(
                 println!(
                     "  Warning:    metadata DB is locked; showing mounted process diagnostics"
                 );
-                print_pg_sync_diagnostics(&pg_sync);
+                if let Some(quota) = snapshot.logical_quota {
+                    println!(
+                        "  Logical quota: {} used / {} total / {} free bytes",
+                        quota.used_bytes, quota.limit_bytes, quota.free_bytes
+                    );
+                }
+                print_pg_sync_diagnostics(&snapshot.synchronization.state.pg_sync);
                 let cache_root = cache_dir
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| meta_dir.join("cache"));
@@ -796,6 +798,13 @@ pub fn run(
     println!("  Next inode: {}", next_inode);
     println!("  Next inode/object ID: {}", next_inode);
 
+    if let Some(store) = engine.retained_store()
+        && let Some(limit) = store.volume_settings()?.logical_quota_bytes
+    {
+        let used = engine.logical_usage(&Default::default())?;
+        let free = u128::from(limit).saturating_sub(used);
+        println!("  Logical quota: {used} used / {limit} total / {free} free bytes");
+    }
     println!("\n  Used space: {}", format_bytes(used_space));
 
     println!("\n  Metadata:   {:?}", db_path);

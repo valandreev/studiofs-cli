@@ -223,6 +223,9 @@ impl MetaEvent {
 
     fn wire_tag(&self) -> u8 {
         match self {
+            Self::SetVolumeSettings { settings } if settings.logical_quota_bytes.is_none() => {
+                TAG_SET_VOLUME_SETTINGS
+            }
             Self::SetVolumeSettings { .. } => TAG_SET_VOLUME_SETTINGS_V2,
             Self::SetAttr { .. } => TAG_SET_ATTR,
             Self::RemoveAttr { .. } => TAG_REMOVE_ATTR,
@@ -287,6 +290,9 @@ impl MetaEvent {
 pub fn encode_event(event: &MetaEvent) -> MetaResult<Vec<u8>> {
     let tag = event.wire_tag();
     match event {
+        MetaEvent::SetVolumeSettings { settings } if tag == TAG_SET_VOLUME_SETTINGS => {
+            encode_event_envelope(tag, &(settings.revision, settings.trash))
+        }
         MetaEvent::SetVolumeSettings { settings } => encode_event_envelope(tag, settings),
         MetaEvent::SetAttr { attr } => encode_event_envelope(tag, attr),
         MetaEvent::RemoveAttr { ino } => encode_event_envelope(tag, ino),
@@ -363,7 +369,9 @@ pub(crate) fn decode_event_with_type(event_type: &str, bytes: &[u8]) -> MetaResu
         MetaError::Serialization(format!("unknown PostgreSQL MetaEvent type `{event_type}`"))
     })?;
     let (tag, payload) = decode_event_wire_parts(bytes)?;
-    if tag != expected_tag {
+    if tag != expected_tag
+        && !(tag == TAG_SET_VOLUME_SETTINGS && expected_tag == TAG_SET_VOLUME_SETTINGS_V2)
+    {
         return Err(MetaError::Serialization(format!(
             "PostgreSQL MetaEvent type `{event_type}` does not match decoded wire tag {tag}"
         )));
@@ -468,7 +476,17 @@ fn decode_event_payload<T: DeserializeOwned>(tag: u8, payload: &[u8]) -> MetaRes
 
 fn decode_tagged_event(tag: u8, payload: &[u8]) -> MetaResult<MetaEvent> {
     match tag {
-        TAG_SET_VOLUME_SETTINGS | TAG_SET_VOLUME_SETTINGS_V2 => Ok(MetaEvent::SetVolumeSettings {
+        TAG_SET_VOLUME_SETTINGS => {
+            let (revision, trash) = decode_event_payload(tag, payload)?;
+            Ok(MetaEvent::SetVolumeSettings {
+                settings: crate::trash::VolumeSettings {
+                    revision,
+                    trash,
+                    logical_quota_bytes: None,
+                },
+            })
+        }
+        TAG_SET_VOLUME_SETTINGS_V2 => Ok(MetaEvent::SetVolumeSettings {
             settings: decode_event_payload(tag, payload)?,
         }),
         TAG_SET_ATTR => Ok(MetaEvent::SetAttr {
@@ -589,6 +607,11 @@ mod tests {
         let event = MetaEvent::SetVolumeSettings { settings };
         let encoded = encode_event(&event).unwrap();
         assert_eq!(encoded[8], 19);
+        let legacy = encode_event_envelope(19, &(settings.revision, settings.trash)).unwrap();
+        assert_eq!(
+            decode_event_with_type("set_volume_settings", &legacy).unwrap(),
+            event
+        );
         assert_eq!(decode_event(&encoded).unwrap(), event);
         assert_eq!(
             decode_event_with_type("set_volume_settings", &encoded).unwrap(),
@@ -601,6 +624,36 @@ mod tests {
             Err(MetaError::Serialization(_))
         ));
     }
+    #[test]
+    fn quota_settings_reject_legacy_rewrites_and_roundtrip_tag20() {
+        #[derive(serde::Deserialize)]
+        struct Legacy {
+            revision: u64,
+            trash: crate::trash::TrashPolicy,
+        }
+        let mut settings = crate::trash::VolumeSettings::default();
+        let legacy: Legacy =
+            serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(
+            (legacy.revision, legacy.trash),
+            (settings.revision, settings.trash)
+        );
+        settings.logical_quota_bytes = Some(0);
+        let json = serde_json::to_vec(&settings).unwrap();
+        assert!(serde_json::from_slice::<Legacy>(&json).is_err());
+        assert_eq!(
+            serde_json::from_slice::<crate::trash::VolumeSettings>(&json).unwrap(),
+            settings
+        );
+        let event = MetaEvent::SetVolumeSettings { settings };
+        let encoded = encode_event(&event).unwrap();
+        assert_eq!(encoded[8], 20);
+        assert_eq!(
+            decode_event_with_type("set_volume_settings", &encoded).unwrap(),
+            event
+        );
+    }
+
     use crate::types::{
         AccessLevel, ChunkId, FileType, PayloadRef, SliceId, SliceOrder, SliceRange, SliceRecord,
         UploadState,

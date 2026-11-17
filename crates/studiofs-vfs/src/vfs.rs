@@ -67,7 +67,7 @@ pub use file_session::{OpenFile, OpenFlags, VfsFileSessionStats};
 pub use locking::LockKind;
 /// Re-exported VFS observability snapshot and metrics types.
 pub use metrics::{
-    RUNTIME_STATS_SCHEMA_VERSION, RUNTIME_STATS_SECTIONS, RuntimeLatencyBucket,
+    LogicalQuotaStatus, RUNTIME_STATS_SCHEMA_VERSION, RUNTIME_STATS_SECTIONS, RuntimeLatencyBucket,
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
     RuntimeStatsSnapshot, StatFs, VfsAttrReadCacheSnapshot, VfsCachePipelineMaterializeStats,
     VfsCachePipelineStats, VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,

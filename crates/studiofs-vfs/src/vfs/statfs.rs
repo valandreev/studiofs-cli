@@ -35,16 +35,7 @@ impl StudioVfs {
             let eof = volatile.entry(ino).or_default();
             *eof = (*eof).max(size);
         }
-        let mut usage = 0u128;
-        for attr in self.sync_meta().list_inode_attrs()? {
-            if attr.kind == super::FileType::RegularFile {
-                usage += u128::from(
-                    attr.size
-                        .max(volatile.remove(&attr.ino).unwrap_or_default()),
-                );
-            }
-        }
-        Ok(usage + volatile.into_values().map(u128::from).sum::<u128>())
+        Ok(self.sync_meta().logical_usage(&volatile)?)
     }
 
     pub(super) fn reserve_logical_growth(
@@ -77,10 +68,23 @@ impl StudioVfs {
         }))
     }
 
-    /// Get filesystem statistics.
-    ///
-    /// Returns real inode count and used space from redb counters.
-    /// Total capacity is virtual (1 PB) since the backing store is cloud.
+    /// Exact local quota capacity, including accepted growth awaiting persistence.
+    pub fn logical_quota_status(&self) -> VfsResult<Option<super::LogicalQuotaStatus>> {
+        self.enforce_metadata_serving_lifecycle()?;
+        let Some(limit_bytes) = self.logical_quota_limit()? else {
+            return Ok(None);
+        };
+        let pending = self.state.namespace.quota_reservations.lock();
+        let used_bytes = self.logical_quota_usage(&pending)?;
+        let free_bytes = u128::from(limit_bytes).saturating_sub(used_bytes) as u64;
+        Ok(Some(super::LogicalQuotaStatus {
+            limit_bytes,
+            used_bytes,
+            free_bytes,
+        }))
+    }
+
+    /// Get capacity in filesystem blocks and the local inode count.
     pub fn statfs(&self) -> VfsResult<StatFs> {
         use studiofs_meta::types::counters;
 
@@ -89,11 +93,8 @@ impl StudioVfs {
         let used_inodes = meta.get_counter(counters::TOTAL_INODES)?;
         let frsize = self.block_size.max(1);
         let bsize = u64::from(frsize);
-        let (total_blocks, free_blocks) = if let Some(limit) = self.logical_quota_limit()? {
-            let pending = self.state.namespace.quota_reservations.lock();
-            let used = self.logical_quota_usage(&pending)?;
-            let free = u128::from(limit).saturating_sub(used) as u64;
-            (limit / bsize, free / bsize)
+        let (total_blocks, free_blocks) = if let Some(quota) = self.logical_quota_status()? {
+            (quota.limit_bytes / bsize, quota.free_bytes / bsize)
         } else {
             let total = (1u64 << 50) / bsize;
             let used = meta.get_counter(counters::USED_SPACE)? / bsize;

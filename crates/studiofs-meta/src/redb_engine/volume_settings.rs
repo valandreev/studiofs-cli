@@ -27,6 +27,9 @@ impl RedbMetaEngine {
         if !current.is_superseded_by(settings)? {
             return Ok(());
         }
+        if current.logical_quota_bytes.is_none() && settings.logical_quota_bytes.is_some() {
+            txn.invalidate(InvalidationIntent::Reset);
+        }
         let bytes = serde_json::to_vec(settings)
             .map_err(|error| MetaError::Serialization(error.to_string()))?;
         table.insert(key, bytes.as_slice())?;
@@ -56,54 +59,25 @@ impl MetaVolumeSettings for RedbMetaEngine {
         expected_revision: u64,
         days: u32,
     ) -> MetaResult<Option<VolumeSettings>> {
-        let txn = self.begin_write_txn()?;
-        {
-            let table = txn
-                .open_table(SETTINGS_TABLE)
-                .map_err(|error| MetaError::Storage(error.to_string()))?;
-            if let Some(format) = table.get("format")? {
-                crate::decode_format_info(format.value())?;
-            }
-        }
-        let mut settings = {
-            let table = txn
-                .open_table(SETTINGS_TABLE)
-                .map_err(|error| MetaError::Storage(error.to_string()))?;
-            table
-                .get(VOLUME_SETTINGS_KEY)?
-                .map(|entry| {
-                    serde_json::from_slice::<VolumeSettings>(entry.value())
-                        .map_err(|error| MetaError::Serialization(error.to_string()))
-                })
-                .transpose()?
-                .unwrap_or_default()
-        };
-        if settings.revision != expected_revision {
-            return Ok(None);
-        }
-        settings.revision = settings
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| MetaError::Storage("volume settings revision overflow".into()))?;
-        settings.trash.set_days(days);
-        let bytes = serde_json::to_vec(&settings)
-            .map_err(|error| MetaError::Serialization(error.to_string()))?;
-        {
-            let mut table = txn
-                .open_table(SETTINGS_TABLE)
-                .map_err(|error| MetaError::Storage(error.to_string()))?;
-            table.insert(VOLUME_SETTINGS_KEY, bytes.as_slice())?;
-        }
-        Self::append_event_in_txn(&txn, &crate::MetaEvent::SetVolumeSettings { settings })?;
-        txn.commit()
-            .map_err(|error| MetaError::Storage(error.to_string()))?;
-        Ok(Some(settings))
+        self.update_settings(expected_revision, |settings| settings.trash.set_days(days))
     }
 
     fn compare_and_set_logical_quota_bytes(
         &self,
         expected_revision: u64,
         bytes: Option<u64>,
+    ) -> MetaResult<Option<VolumeSettings>> {
+        self.update_settings(expected_revision, |settings| {
+            settings.logical_quota_bytes = bytes
+        })
+    }
+}
+
+impl RedbMetaEngine {
+    fn update_settings(
+        &self,
+        expected_revision: u64,
+        update: impl FnOnce(&mut VolumeSettings),
     ) -> MetaResult<Option<VolumeSettings>> {
         let txn = self.begin_write_txn()?;
         let mut settings = {
@@ -115,6 +89,7 @@ impl MetaVolumeSettings for RedbMetaEngine {
             }
             table
                 .get(VOLUME_SETTINGS_KEY)?
+                .or(table.get(BASE_VOLUME_SETTINGS_KEY)?)
                 .map(|entry| {
                     serde_json::from_slice::<VolumeSettings>(entry.value())
                         .map_err(|e| MetaError::Serialization(e.to_string()))
@@ -129,7 +104,11 @@ impl MetaVolumeSettings for RedbMetaEngine {
             .revision
             .checked_add(1)
             .ok_or_else(|| MetaError::Storage("volume settings revision overflow".into()))?;
-        settings.logical_quota_bytes = bytes;
+        let previous_limit = settings.logical_quota_bytes;
+        update(&mut settings);
+        if previous_limit.is_none() && settings.logical_quota_bytes.is_some() {
+            txn.invalidate(InvalidationIntent::Reset);
+        }
         let encoded =
             serde_json::to_vec(&settings).map_err(|e| MetaError::Serialization(e.to_string()))?;
         txn.open_table(SETTINGS_TABLE)
