@@ -253,7 +253,7 @@ where
                 biased;
                 _ = cancel_token.cancelled() => return Err(UploadError::Cancelled),
                 result = self.data_store.acquire_upload_budget(&prepared) => {
-                    result.map_err(|source| UploadError::Exhausted { attempts: attempt, source })?;
+                    result.map_err(|source| UploadError::Exhausted { attempts: attempts_made, source })?;
                 }
             }
             let permit = self.aimd.acquire().await;

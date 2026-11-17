@@ -767,11 +767,10 @@ impl DataStore {
         let bytes = usize::try_from(range.end.saturating_sub(range.start))
             .unwrap_or(usize::MAX)
             .saturating_add(SFEC_HEADER_FIXED_LEN);
-        if self.payload_throttle.limits().1 > 0
-            && !self
-                .payload_throttle
-                .acquire_download(bytes, foreground)
-                .await
+        if !self
+            .payload_throttle
+            .acquire_download(bytes, foreground)
+            .await
         {
             return Err(DataError::TransferCancelled);
         }
@@ -782,11 +781,10 @@ impl DataStore {
     pub async fn charge_download_bytes(&self, bytes: u64, foreground: bool) -> DataResult<()> {
         let bytes = usize::try_from(bytes)
             .map_err(|_| DataError::Storage("object is too large to charge".into()))?;
-        if self.payload_throttle.limits().1 > 0
-            && !self
-                .payload_throttle
-                .acquire_download(bytes, foreground)
-                .await
+        if !self
+            .payload_throttle
+            .acquire_download(bytes, foreground)
+            .await
         {
             return Err(DataError::TransferCancelled);
         }
@@ -875,11 +873,10 @@ impl DataStore {
 
     /// Charge one prepared object's full encrypted size before its network request.
     pub async fn acquire_upload_budget(&self, prepared: &PreparedPayload) -> DataResult<()> {
-        if self.payload_throttle.limits().0 > 0
-            && !self
-                .payload_throttle
-                .acquire_upload(prepared.encrypted.len())
-                .await
+        if !self
+            .payload_throttle
+            .acquire_upload(prepared.encrypted.len())
+            .await
         {
             return Err(DataError::TransferCancelled);
         }

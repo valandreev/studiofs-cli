@@ -101,11 +101,12 @@ impl Direction {
         cancelled: &AtomicBool,
         cancellation_changed: &Notify,
     ) -> bool {
+        // Unlimited mode is a pure fast path: it never waits and never reports cancellation.
+        if bytes == 0 || self.limit() == 0 {
+            return true;
+        }
         if cancelled.load(Ordering::Acquire) {
             return false;
-        }
-        if bytes == 0 || self.limit() == 0 {
-            return !cancelled.load(Ordering::Acquire);
         }
         let started = Instant::now();
         let ticket_id = {
@@ -122,12 +123,15 @@ impl Direction {
                     .position(|(_, is_foreground)| !is_foreground);
                 let index = insert.unwrap_or(queue.waiters.len());
                 queue.waiters.insert(index, (id, true));
-                self.changed.notify_waiters();
             } else {
                 queue.waiters.push_back((id, false));
             }
             id
         };
+        if foreground {
+            // Wake queued waiters after the guard is released so they re-check their position.
+            self.changed.notify_waiters();
+        }
         let ticket = WaitTicket {
             direction: self,
             id: ticket_id,
@@ -184,7 +188,8 @@ impl Direction {
             remaining = (remaining
                 - now.duration_since(last_update).as_secs_f64() * last_rate as f64 * 125_000.0)
                 .max(0.0);
-            if remaining == 0.0 {
+            // Sub-byte remainders would round to a zero sleep and spin.
+            if remaining < 1.0 {
                 self.record_wait(started);
                 return true;
             }
@@ -222,6 +227,7 @@ impl WaitTicket<'_> {
         if let Some(index) = queue.waiters.iter().position(|(id, _)| *id == self.id) {
             queue.waiters.remove(index);
         }
+        drop(queue);
         self.direction.changed.notify_waiters();
     }
 }
