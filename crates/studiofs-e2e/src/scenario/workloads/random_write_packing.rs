@@ -120,6 +120,8 @@ fn measure(
                 .open(mount.join("random.bin"))?;
             file.set_len(FILE_BYTES as u64)?;
             let mut expected = vec![0; FILE_BYTES];
+            // Per 4 KiB block: (last write sequence, byte written before it) for mismatch triage.
+            let mut history = vec![(0_u64, 0_u8); FILE_BYTES / WRITE_BYTES];
             let mut state = 900_u64;
             let mut writes = 0_u64;
             let mut upload_during_writes = false;
@@ -133,8 +135,9 @@ fn measure(
                 let payload = [state as u8; WRITE_BYTES];
                 file.seek(SeekFrom::Start(offset as u64))?;
                 file.write_all(&payload)?;
-                expected[offset..offset + WRITE_BYTES].copy_from_slice(&payload);
                 writes += 1;
+                history[offset / WRITE_BYTES] = (writes, expected[offset]);
+                expected[offset..offset + WRITE_BYTES].copy_from_slice(&payload);
                 if last_sample.elapsed() >= SAMPLE_INTERVAL {
                     last_sample = Instant::now();
                     let text = fs::read_to_string(mount.join(".studiofs-runtime-stats"))?;
@@ -170,11 +173,13 @@ fn measure(
             file.seek(SeekFrom::Start(0))?;
             let mut actual = Vec::new();
             file.read_to_end(&mut actual)?;
+            let mismatch = readback_mismatch(&expected, &actual, &history, writes);
+            let after_readback = fs::read_to_string(mount.join(".studiofs-runtime-stats"))?;
             Ok(
-                json!({"writes": writes, "file_bytes": FILE_BYTES, "write_bytes": WRITE_BYTES,
+                json!({"readback_mismatch": mismatch,"writes": writes, "file_bytes": FILE_BYTES, "write_bytes": WRITE_BYTES,
             "fsync_ms": fsync_ms, "fsync_commit_ms": fsync_commit_ms,
             "upload_during_writes": upload_during_writes, "first_upload_ms": first_upload_ms,
-            "readback_matches": actual == expected, "upload_samples": samples, "before_fsync": before_fsync, "after_fsync": after_fsync}),
+            "readback_matches": actual == expected, "upload_samples": samples, "before_fsync": before_fsync, "after_fsync": after_fsync, "after_readback": after_readback}),
             )
         },
     )?;
@@ -187,6 +192,40 @@ fn measure(
         serde_json::to_vec_pretty(&summary)?,
     )?;
     Ok(())
+}
+
+/// Locates readback corruption without changing acceptance: which blocks differ and how.
+fn readback_mismatch(
+    expected: &[u8],
+    actual: &[u8],
+    history: &[(u64, u8)],
+    writes: u64,
+) -> serde_json::Value {
+    let mut blocks = 0_u64;
+    let mut samples = Vec::new();
+    for (index, want) in expected.chunks(WRITE_BYTES).enumerate() {
+        let start = index * WRITE_BYTES;
+        let got = actual.get(start..).unwrap_or_default();
+        let got = &got[..got.len().min(WRITE_BYTES)];
+        if got == want {
+            continue;
+        }
+        blocks += 1;
+        if samples.len() < 16 {
+            let differing = want.iter().zip(got).filter(|(a, b)| a != b).count()
+                + WRITE_BYTES.saturating_sub(got.len());
+            let first = want.iter().zip(got).position(|(a, b)| a != b);
+            let (last_write, previous) = history[index];
+            samples.push(json!({
+                "offset": start, "expected": want[0], "actual_first": got.first(),
+                "actual_uniform": got.windows(2).all(|pair| pair[0] == pair[1]),
+                "actual_len": got.len(), "differing_bytes": differing,
+                "first_differing_byte": first, "last_write_seq": last_write,
+                "writes_after_last": writes - last_write, "previous_byte": previous,
+            }));
+        }
+    }
+    json!({"actual_len": actual.len(), "mismatching_blocks": blocks, "samples": samples})
 }
 
 /// Cumulative local metadata commit time; the delta across fsync covers its final overlay commit.
