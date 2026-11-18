@@ -122,11 +122,6 @@ impl Scenario for RecoverableTrashJanitor {
     }
 
     fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
-        if !cfg!(target_os = "linux") {
-            return Err(
-                io::Error::new(io::ErrorKind::Unsupported, "Linux GIO/FUSE required").into(),
-            );
-        }
         let config = context
             .client_controller_config
             .clone()
@@ -217,6 +212,9 @@ impl Scenario for RecoverableTrashJanitor {
 
     fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
         Ok(())
+    }
+    fn unsupported_platform(&self) -> Option<&'static str> {
+        (!cfg!(target_os = "linux")).then_some("Linux GIO/FUSE required")
     }
 }
 
@@ -1443,14 +1441,10 @@ mod tests {
             scenario_dir: temp.path().join("scenario"),
             client_controller_config: None,
         };
-        if cfg!(target_os = "linux") {
-            assert!(matches!(
-                RecoverableTrashJanitor.run(&context),
-                Err(ScenarioError::MissingComposeInfrastructure)
-            ));
-        } else {
-            assert!(RecoverableTrashJanitor.run(&context).is_err());
-        }
+        assert!(matches!(
+            RecoverableTrashJanitor.run(&context),
+            Err(ScenarioError::MissingComposeInfrastructure)
+        ));
     }
 
     #[test]

@@ -65,6 +65,10 @@ impl Scenario for PosixAclXattrRejection {
     fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
         Ok(())
     }
+
+    fn unsupported_platform(&self) -> Option<&'static str> {
+        (!cfg!(target_os = "linux")).then_some("POSIX ACL xattrs need Linux FUSE")
+    }
 }
 
 /// Each recorded mounted result must match what a filesystem without ACL support returns.

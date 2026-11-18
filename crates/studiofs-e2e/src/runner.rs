@@ -2336,6 +2336,26 @@ fn run_scenario_body(
     progress: ScenarioProgress,
 ) -> Result<Vec<String>, RunnerError> {
     let definition = scenario.definition();
+    if let Some(reason) = scenario.unsupported_platform() {
+        for path in [events_path, operation_log] {
+            record_event_with_detail(
+                path,
+                run_id,
+                Some(definition.name),
+                "platform",
+                "skipped",
+                reason.to_string(),
+            )?;
+        }
+        emit_progress(
+            run_id,
+            definition.name,
+            Some(progress),
+            "platform_skip",
+            ProgressStatus::Passed,
+        );
+        return Ok(Vec::new());
+    }
     run_hook(
         events_path,
         operation_log,
@@ -2975,6 +2995,7 @@ mod tests {
     struct FailingValidateScenario {
         calls: RefCell<Vec<&'static str>>,
         cleaned: Cell<bool>,
+        unsupported: Option<&'static str>,
     }
 
     impl FailingValidateScenario {
@@ -2982,6 +3003,7 @@ mod tests {
             Self {
                 calls: RefCell::new(Vec::new()),
                 cleaned: Cell::new(false),
+                unsupported: None,
             }
         }
     }
@@ -3020,6 +3042,10 @@ mod tests {
             self.cleaned.set(true);
             Ok(())
         }
+
+        fn unsupported_platform(&self) -> Option<&'static str> {
+            self.unsupported
+        }
     }
 
     #[test]
@@ -3050,6 +3076,38 @@ mod tests {
         assert_eq!(
             scenario.calls.borrow().as_slice(),
             ["setup", "run", "validate", "cleanup"]
+        );
+    }
+
+    #[test]
+    fn scenario_lifecycle_passes_unsupported_platform_without_hooks() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let events_path = temp.path().join("events.ndjson");
+        let context = ScenarioContext {
+            run_id: "run-1".to_string(),
+            seed: 1,
+            sandbox: temp.path().to_path_buf(),
+            scenario_dir: temp.path().join("scenario"),
+            client_controller_config: None,
+        };
+        let mut scenario = FailingValidateScenario::new();
+        scenario.unsupported = Some("needs another OS");
+
+        let outcome = run_scenario_lifecycle(
+            &events_path,
+            "run-1",
+            &scenario,
+            &context,
+            ScenarioProgress { index: 1, total: 1 },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.outcome.status, ScenarioStatus::Passed);
+        assert_eq!(scenario.calls.borrow().as_slice(), ["cleanup"]);
+        assert!(
+            fs::read_to_string(&events_path)
+                .unwrap()
+                .contains("needs another OS")
         );
     }
 

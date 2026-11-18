@@ -65,6 +65,10 @@ impl Scenario for MacosMmapExec {
     fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
         Ok(())
     }
+
+    fn unsupported_platform(&self) -> Option<&'static str> {
+        (!cfg!(target_os = "macos")).then_some("macFUSE page-ins need macOS")
+    }
 }
 
 fn acceptance_failures(summary: &serde_json::Value) -> Vec<String> {

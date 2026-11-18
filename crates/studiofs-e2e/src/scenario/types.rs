@@ -276,4 +276,8 @@ pub trait Scenario {
     fn validate(&self, context: &ScenarioContext) -> Result<Vec<String>, ScenarioError>;
     /// Cleans scenario state and unmounts clients.
     fn cleanup(&self, context: &ScenarioContext) -> Result<(), ScenarioError>;
+    /// Why this host platform cannot run the scenario; the runner then passes it without hooks.
+    fn unsupported_platform(&self) -> Option<&'static str> {
+        None
+    }
 }
