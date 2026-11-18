@@ -1254,3 +1254,39 @@ fn linux_gvfs_expunge_refusals_keep_receipts_and_retry_is_not_found() {
     assert!(vfs.lookup(trashes.ino, b"expunged").is_err());
     assert!(vfs.lookup(user.ino, b"expunged").is_err());
 }
+
+/// gio/nautilus touch the Linux trash containers; the synthesized attrs have no
+/// inode row, so an attr-only setattr must not queue a metadata commit for them.
+#[test]
+fn linux_trash_container_attr_only_setattr_stays_local() {
+    use super::super::{NativeTrashProfile, SetattrArgs};
+    use studiofs_meta::TimeSpec;
+
+    let tmp = studiofs_test_support::workspace_target_tempdir("retained-linux-container-setattr-");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "retained-linux-container-setattr");
+    vfs.set_native_trash_profile(NativeTrashProfile::Linux { uid: 1000 });
+    meta.compare_and_set_trash_days(0, 7).unwrap().unwrap();
+
+    let trash_root = vfs.lookup(ROOT_INO, b".Trash-1000").unwrap();
+    let files_dir = vfs.lookup(trash_root.ino, b"files").unwrap();
+    let info_dir = vfs.lookup(trash_root.ino, b"info").unwrap();
+    for ino in [trash_root.ino, files_dir.ino, info_dir.ino] {
+        vfs.setattr_attr_only_deferred_metadata(
+            ino,
+            SetattrArgs {
+                mtime: TimeSpec::Now,
+                ..Default::default()
+            },
+            rt.handle(),
+        )
+        .unwrap();
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "trash container {ino} must not keep a dirty attr"
+        );
+        assert!(
+            !vfs.has_deferred_namespace_metadata(ino),
+            "trash container {ino} must not queue deferred metadata"
+        );
+    }
+}

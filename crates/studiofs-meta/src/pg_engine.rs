@@ -118,6 +118,13 @@ const LOCAL_EVENT_LOG_PRUNE_MAX_BATCHES_PER_POLL: usize = 16;
 pub(crate) const LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER: &str =
     "pgRedbRepairLocalGraphRecoveryPending";
 pub(crate) const LOCAL_PG_REPAIR_SELF_REPLAY_END_COUNTER: &str = "pgRedbRepairSelfReplayEnd";
+const OFFLINE_AUTHORITY_INELIGIBLE: u8 = 0;
+const OFFLINE_AUTHORITY_ELIGIBLE: u8 = 1;
+const OFFLINE_AUTHORITY_GRANTED: u8 = 2;
+/// Set by every open of this binary, which makes local events durable before
+/// publishing them. A legacy image without it may predate its own published
+/// events after an unclean shutdown.
+pub(crate) const LOCAL_PG_PUBLICATION_FENCE_COUNTER: &str = "pgPublicationDurabilityFence";
 pub(crate) const LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER: &str = "pgFreshClientPending";
 const LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER: &str = "pgInodeActiveRangeStart";
 const LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER: &str = "pgInodeActiveRangeEnd";
@@ -150,6 +157,13 @@ pub(super) enum StartupSnapshotImportMode {
     PreserveLocalState,
 }
 
+/// Whether a recovered (unclean) redb image is still this client's local
+/// authority: the publication fence was active and no graph repair was pending.
+pub(crate) fn local_graph_survives_unclean_shutdown(local: &RedbMetaEngine) -> MetaResult<bool> {
+    Ok(local.get_counter(LOCAL_PG_PUBLICATION_FENCE_COUNTER)? != 0
+        && local.get_counter(LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)? == 0)
+}
+
 pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
     matches!(
         name,
@@ -161,6 +175,7 @@ pub(crate) fn is_local_pg_snapshot_state_counter(name: &str) -> bool {
             | LOCAL_PG_RETAINED_RESTORE_OWNER_COUNTER
             | LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER
             | LOCAL_PG_REPAIR_SELF_REPLAY_END_COUNTER
+            | LOCAL_PG_PUBLICATION_FENCE_COUNTER
             | LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER
             | LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER
             | LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER
@@ -298,6 +313,11 @@ pub struct PgMetaEngine {
     /// Whether the PostgreSQL volume UUID was validated for this runtime. A
     /// local-first startup keeps this pending until a later remote probe.
     remote_identity_validated: AtomicBool,
+    /// `OFFLINE_AUTHORITY_*`: an established client that restarts while
+    /// PostgreSQL is unreachable keeps local write authority, like a mounted
+    /// client that loses PostgreSQL. Publication and replay still wait for the
+    /// identity probe, whose first PostgreSQL answer ends the grant for good.
+    offline_write_authority: AtomicU8,
     /// Whether the last startup or remote command failed due to PostgreSQL
     /// transport unavailability or a timeout.
     remote_transport_unavailable: AtomicBool,
@@ -935,7 +955,9 @@ impl PgMetaEngine {
     pub(super) fn refresh_pg_sync_lifecycle_for_allocator(&self) {
         self.update_pg_sync_lifecycle(|current| {
             let authority_available = self.metadata_authority_status().allows_new_mutations();
-            let identity_validated = self.remote_identity_validated.load(Ordering::Acquire);
+            let identity_validated = self.remote_identity_validated.load(Ordering::Acquire)
+                || self.offline_write_authority.load(Ordering::Acquire)
+                    == OFFLINE_AUTHORITY_GRANTED;
             match (current, authority_available, identity_validated) {
                 (PgSyncLifecycle::LocalReady, true, true)
                 | (PgSyncLifecycle::TargetReached, true, true)
@@ -1523,6 +1545,8 @@ impl PgMetaEngine {
 
         self.remote_transport_unavailable
             .store(false, Ordering::Release);
+        self.offline_write_authority
+            .store(OFFLINE_AUTHORITY_INELIGIBLE, Ordering::Release);
         if local_info.uuid != remote_uuid {
             return Err(MetaError::UuidMismatch {
                 local: local_info.uuid,
@@ -1600,6 +1624,19 @@ impl PgMetaEngine {
                 }
                 self.remote_transport_unavailable
                     .store(error.is_reachability_error(), Ordering::Release);
+                if error.is_reachability_error()
+                    && self
+                        .offline_write_authority
+                        .compare_exchange(
+                            OFFLINE_AUTHORITY_ELIGIBLE,
+                            OFFLINE_AUTHORITY_GRANTED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                {
+                    self.refresh_pg_sync_lifecycle_for_allocator();
+                }
                 self.record_pg_sync_failure(error);
                 if matches!(
                     error,
@@ -1639,6 +1676,8 @@ impl PgMetaEngine {
             local.set_counter(LOCAL_PG_NAMESPACE_VERSION_COUNTER, 0)?;
         }
         local.set_remote_namespace_visibility_filter(true)?;
+        // Every publication from this engine is fenced (`push_projected_event_log_batch_locked`).
+        local.set_counter(LOCAL_PG_PUBLICATION_FENCE_COUNTER, 1)?;
 
         let pg = info.metadata.postgres.as_ref().ok_or_else(|| {
             MetaError::Storage("missing metadata.postgres config for Postgres backend".to_string())
@@ -1729,6 +1768,16 @@ impl PgMetaEngine {
         // Shared S3 settings are refreshed by the background metadata poll.
         let remote_identity_validated = false;
         let persisted_client_slot = Self::load_persisted_client_slot(&local)?;
+        let offline_write_authority = if persisted_client_slot.is_none()
+            || fresh_client_pending
+            || repair_local_graph_recovery_pending
+        {
+            OFFLINE_AUTHORITY_INELIGIBLE
+        } else if remote_transport_unavailable {
+            OFFLINE_AUTHORITY_GRANTED
+        } else {
+            OFFLINE_AUTHORITY_ELIGIBLE
+        };
 
         let client_slot = match persisted_client_slot {
             Some(slot) => Some(slot),
@@ -1835,6 +1884,7 @@ impl PgMetaEngine {
             metadata_source_connected: AtomicBool::new(false),
             remote_format_validated: AtomicBool::new(remote_format_validated),
             remote_identity_validated: AtomicBool::new(remote_identity_validated),
+            offline_write_authority: AtomicU8::new(offline_write_authority),
             remote_transport_unavailable: AtomicBool::new(remote_transport_unavailable),
             remote_validation_lock: Mutex::new(()),
         });

@@ -24898,10 +24898,27 @@ fn last_handle_release_interrupts_deferred_materialization_linger() {
         .await
         .expect("write small callback");
 
-        tokio::time::timeout(Duration::from_millis(500), vfs.release_fh(fh))
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !vfs.state.deferred_materialize_inflight.is_lingering(ino) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("materializer should enter the tail coalescing window");
+
+        // Release commits locally, so its duration cannot prove the interrupt.
+        tokio::time::timeout(Duration::from_secs(30), vfs.release_fh(fh))
             .await
-            .expect("last-handle release must wake a lingering materializer")
+            .expect("last-handle release should finish")
             .expect("release accepted write");
+        assert_eq!(
+            vfs.state
+                .metrics
+                .deferred_materialize_linger_interrupts
+                .load(AtomicOrdering::Relaxed),
+            1,
+            "last-handle release must wake the lingering materializer"
+        );
         assert_eq!(vfs.open_count(ino), 0);
         assert_eq!(vfs.state.writer_stack.dirty_bytes_for_inode(ino), 0);
 

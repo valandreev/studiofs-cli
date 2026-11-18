@@ -1616,6 +1616,11 @@ impl StudioVfs {
         })?;
         let _cleanup = cleanup.with_permit(permit);
         let attr = self.setattr_attr_only_deferred_local(ino, args.clone())?;
+        // Synthesized entries and trash containers were answered locally; queuing
+        // their projected attr would commit it to a missing or real inode row.
+        if self.is_synthesized_ignored_ino(ino) || self.is_trash_container_ino(ino)? {
+            return Ok(attr);
+        }
         self.enqueue_deferred_namespace_op(
             None,
             attr.clone(),

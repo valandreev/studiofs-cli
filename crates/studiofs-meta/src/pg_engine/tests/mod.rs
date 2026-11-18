@@ -593,6 +593,7 @@ fn unit_pg_engine_from_local(local: Arc<RedbMetaEngine>) -> PgMetaEngine {
         metadata_source_connected: AtomicBool::new(false),
         remote_format_validated: AtomicBool::new(false),
         remote_identity_validated: AtomicBool::new(true),
+        offline_write_authority: AtomicU8::new(0),
         remote_transport_unavailable: AtomicBool::new(false),
         remote_validation_lock: Mutex::new(()),
     }
