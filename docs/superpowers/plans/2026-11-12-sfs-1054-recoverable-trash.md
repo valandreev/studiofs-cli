@@ -27,6 +27,7 @@ WinFSP tests can mount a fresh local redb VFS without using a user volume via
 - [x] (2026-11-16) Pre-macOS item 1: mounted original inode and outside hard link.
 - [x] (2026-11-16) Item 2: mounted S3-outage crash replay and cold bootstrap GREEN;
   PG-down + S3-down repair refusal stays an intentional, documented limit.
+  (2026-11-18) Lifted by the publication fence, ADR 0013: the scenario passes.
 - [x] (2026-11-16) Item 3: mounted janitor GC GREEN (runs 7, 8), reviewed.
 - [x] (2026-11-16) Item 4: desktop GVFS `trash:///` GREEN (runs 5, 6), reviewed.
 - [x] (2026-11-16) Item 5: bilingual guides, platform contract, validation
@@ -6448,7 +6449,7 @@ Mounted acceptance evidence from earlier checkpoints was not re-run in item 5:
   - Restore stages leak after a full `ReplaceLocalState`.
   - Restore keeps atime and mtime, but not ctime or xattrs.
   - The PG-down + S3-down repair refusal: `mounted-recoverable-trash-durability`
-    is an expected RED.
+    is an expected RED. (2026-11-18: superseded by ADR 0013; it now passes.)
 - Not run: workspace or full ignored suites.
 
 ### Item-5 docs review fixes (2026-11-16)

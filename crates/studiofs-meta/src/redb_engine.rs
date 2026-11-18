@@ -1361,7 +1361,7 @@ impl RedbMetaEngine {
     }
 
     #[cfg(test)]
-    fn fail_next_barrier_for_test(&self) {
+    pub(crate) fn fail_next_barrier_for_test(&self) {
         if let Some(runtime) = &self.relaxed_durability {
             runtime
                 .state

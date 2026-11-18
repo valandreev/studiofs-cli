@@ -591,6 +591,10 @@ impl PgMetaEngine {
             self.sync_max_response_bytes_per_page,
             oversized_event_index,
         )?;
+        // Publication fence: an unclean shutdown keeps only durable commits, so
+        // make the published journal durable first. A recovered image then
+        // holds every event peers can see and stays this client's authority.
+        self.local.sync_local_metadata()?;
         let command_pool = self.command_pool.clone();
         let volume_id = self.volume_id;
         let now_ms = Self::now_millis();

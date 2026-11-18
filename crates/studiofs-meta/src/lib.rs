@@ -276,9 +276,7 @@ pub fn open_meta_engine_with_options(
                 let info = redb.get_format_info()?;
                 ensure_supported_format_version(&info)?;
                 if info.metadata.backend == MetadataBackend::Postgres {
-                    redb.set_counter(pg_engine::LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)?;
-                    redb.set_counter(pg_engine::LOCAL_PG_VERSION_COUNTER, 0)?;
-                    redb.set_counter(pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER, 0)?;
+                    mark_unclean_pg_local_graph(&redb)?;
                 }
                 info
                 // redb dropped here — releases file lock
@@ -301,6 +299,26 @@ pub fn open_meta_engine_with_options(
         }
         Err(err) => Err(err),
     }
+}
+
+/// Decide whether an unclean redb image needs the PostgreSQL graph repair.
+///
+/// redb recovers the last durable commit, a consistent prefix of local history.
+/// That prefix stays authoritative when the publication fence was active and no
+/// graph repair was in progress: every event this client published was durable
+/// before publication, so the image is not older than this client's shared
+/// history and serves (and later flushes) its unpublished journal like a clean
+/// reopen. Otherwise the image may predate published local events, and repair
+/// rebuilds it from PostgreSQL before any local authority is trusted.
+fn mark_unclean_pg_local_graph(redb: &RedbMetaEngine) -> MetaResult<()> {
+    if pg_engine::local_graph_survives_unclean_shutdown(redb)? {
+        tracing::info!("redb recovered a fenced local graph; keeping local authority");
+        return Ok(());
+    }
+    redb.set_counter(pg_engine::LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER, 1)?;
+    redb.set_counter(pg_engine::LOCAL_PG_VERSION_COUNTER, 0)?;
+    redb.set_counter(pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER, 0)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -579,6 +597,54 @@ mod tests {
             3,
             "repair reset must keep the stable client identity for self-batch detection"
         );
+    }
+
+    fn unclean_pg_image(name: &str, fence: u64, repair: u64) -> (impl Sized, RedbMetaEngine) {
+        let dir = studiofs_test_support::workspace_target_tempdir("test-");
+        let redb = RedbMetaEngine::open(dir.path().join(name)).expect("open redb");
+        redb.set_counter(crate::pg_engine::LOCAL_PG_PUBLICATION_FENCE_COUNTER, fence)
+            .expect("seed publication fence");
+        redb.set_counter(
+            crate::pg_engine::LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER,
+            repair,
+        )
+        .expect("seed repair marker");
+        redb.set_counter(crate::pg_engine::LOCAL_PG_VERSION_COUNTER, 42)
+            .expect("seed pg replay position");
+        redb.set_counter(crate::pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER, 41)
+            .expect("seed pg namespace position");
+        (dir, redb)
+    }
+
+    fn repair_state(redb: &RedbMetaEngine) -> (u64, u64, u64) {
+        (
+            redb.get_counter(crate::pg_engine::LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER)
+                .unwrap(),
+            redb.get_counter(crate::pg_engine::LOCAL_PG_VERSION_COUNTER)
+                .unwrap(),
+            redb.get_counter(crate::pg_engine::LOCAL_PG_NAMESPACE_VERSION_COUNTER)
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn fenced_unclean_pg_image_keeps_local_graph_without_postgres_repair() {
+        let (_dir, redb) = unclean_pg_image("fenced.db", 1, 0);
+        mark_unclean_pg_local_graph(&redb).expect("classify unclean image");
+        assert_eq!(
+            repair_state(&redb),
+            (0, 42, 41),
+            "a fenced image must reopen from its own cursors, not wait for PostgreSQL"
+        );
+    }
+
+    #[test]
+    fn unfenced_or_repairing_unclean_pg_image_still_requires_repair() {
+        for (name, fence, repair) in [("legacy.db", 0, 0), ("repairing.db", 1, 1)] {
+            let (_dir, redb) = unclean_pg_image(name, fence, repair);
+            mark_unclean_pg_local_graph(&redb).expect("classify unclean image");
+            assert_eq!(repair_state(&redb), (1, 0, 0), "{name}");
+        }
     }
 
     #[test]

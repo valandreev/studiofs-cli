@@ -1498,20 +1498,26 @@ services. Run each name separately with the command above:
   to increase from zero. This is a cold bootstrap test, not a crash test.
 - `mounted-recoverable-trash-durability` stops its owned PostgreSQL and S3
   before creating locally fsynced payloads and GIO receipts, proves pending
-  journal state and peer absence, kills the writer, and attempts an offline
-  reopen of the same metadata/cache. This currently exposes the existing
-  PostgreSQL requirement of redb graph repair after an unclean shutdown.
-- `mounted-recoverable-trash-s3-crash-replay` keeps PostgreSQL available for
-  graph repair while its owned S3 remains stopped. It checks no receipt event
-  reached shared authority before the kill, then exact retained bytes and
-  receipts after reopening. Its restore phase currently exposes a base
-  `receipt/data` binding hidden by the namespace visibility filter after repair;
-  the underlying attr/lifecycle cause is still under diagnosis. Retained reads do not
-  establish successful restore or later peer publication.
+  journal state and peer absence, kills the writer, and reopens the same
+  metadata/cache while both services are still down. The reopened mount must
+  be writable: it restores a file and a directory from trash offline, then the
+  services return and a peer and a cold client read the published result.
+- `mounted-recoverable-trash-s3-crash-replay` keeps PostgreSQL available while
+  its owned S3 remains stopped. It checks no receipt event reached shared
+  authority before the kill, then exact retained bytes, receipts and the
+  restore after reopening.
 
-The latter two probes are retained failing regressions, not accepted durability
-coverage. See the living recoverable-trash ExecPlan for exact run artifacts and
-the outstanding repair boundaries. None changes host networking or host trash.
+Both rely on the publication fence (ADR 0013): an unclean image written with
+the fence keeps its own graph instead of the PostgreSQL graph repair, and an
+established client restarted offline keeps write authority. None changes host
+networking or host trash. Focused unit coverage:
+
+```sh
+cargo test -p studiofs-meta --lib unclean_pg_image
+cargo test -p studiofs-meta --lib publication_requires_a_durable_local_journal
+cargo test -p studiofs-meta --lib reopened_offline
+cargo test -p studiofs-meta --lib deferred_mount_reopen
+```
 
 SFS-438 mounted runner lifecycle smoke for local operator validation:
 

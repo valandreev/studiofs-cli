@@ -122,6 +122,109 @@ fn sfs623_recovery_trusted_state_allocates_offline_after_reopen() {
 }
 
 #[test]
+fn publication_requires_a_durable_local_journal() {
+    let (_dir, pg) = temp_pg_engine_for_unit();
+    pg.remote_format_validated.store(true, Ordering::Release);
+    pg.local.fail_next_barrier_for_test();
+
+    let error = pg
+        .push_event_log_batch_locked(&[MetaEvent::RemoveAttr { ino: 42 }])
+        .expect_err("publication must not run past a failed local barrier");
+    assert!(
+        error
+            .to_string()
+            .contains("simulated metadata barrier failure"),
+        "the fence must run before PostgreSQL is contacted: {error}"
+    );
+}
+
+fn reopen_offline(path: &std::path::Path) -> Arc<PgMetaEngine> {
+    PgMetaEngine::open_with_options(
+        path,
+        PgOpenOptions {
+            background_poll: false,
+            ..Default::default()
+        },
+    )
+    .expect("reopen PgMetaEngine with PostgreSQL unavailable")
+}
+
+#[test]
+fn established_client_reopened_offline_keeps_write_authority() {
+    let (dir, pg) = temp_pg_engine_for_unit();
+    pg.next_inode().expect("allocate before restart");
+    // An established client has replayed shared history, so startup imports nothing.
+    pg.local
+        .set_counter(LOCAL_PG_VERSION_COUNTER, 1)
+        .expect("seed replay position");
+    drop(pg);
+
+    let reopened = reopen_offline(&dir.path().join("meta.redb"));
+    let status = reopened.pg_sync_status();
+    assert_eq!(status.lifecycle, PgSyncLifecycle::Live);
+    assert!(
+        status.allows_new_mutations(),
+        "an offline restart keeps the authority a mounted client keeps when PostgreSQL drops"
+    );
+    assert!(
+        !reopened.remote_identity_validated.load(Ordering::Acquire),
+        "publication and replay still wait for the PostgreSQL identity probe"
+    );
+}
+
+#[test]
+fn deferred_mount_reopen_gains_offline_authority_only_after_postgres_is_unreachable() {
+    let (dir, pg) = temp_pg_engine_for_unit();
+    pg.next_inode().expect("allocate before restart");
+    drop(pg);
+
+    let reopened = PgMetaEngine::open_with_options(
+        dir.path().join("meta.redb"),
+        PgOpenOptions {
+            background_poll: false,
+            defer_remote_startup_probes: true,
+            ..Default::default()
+        },
+    )
+    .expect("deferred reopen");
+    assert!(
+        !reopened.pg_sync_status().allows_new_mutations(),
+        "no authority before PostgreSQL reachability is known"
+    );
+
+    assert!(reopened.ensure_remote_format_validated().is_err());
+    let status = reopened.pg_sync_status();
+    assert_eq!(status.lifecycle, PgSyncLifecycle::Live);
+    assert!(status.allows_new_mutations());
+}
+
+#[test]
+fn fresh_or_repairing_client_reopened_offline_stays_read_only() {
+    for counter in [
+        LOCAL_PG_FRESH_CLIENT_PENDING_COUNTER,
+        LOCAL_PG_REPAIR_LOCAL_GRAPH_RECOVERY_COUNTER,
+    ] {
+        let (dir, pg) = temp_pg_engine_for_unit();
+        pg.local.set_counter(counter, 1).expect("seed startup gate");
+        drop(pg);
+
+        let reopened = PgMetaEngine::open_with_options(
+            dir.path().join("meta.redb"),
+            PgOpenOptions {
+                background_poll: false,
+                ..Default::default()
+            },
+        );
+        if let Ok(reopened) = reopened {
+            assert!(
+                !reopened.pg_sync_status().allows_new_mutations(),
+                "{counter} must keep an offline reopen read-only"
+            );
+        }
+    }
+}
+
+#[test]
 fn allocator_refill_does_not_hold_runtime_lock_during_local_persistence() {
     let (_dir, pg) = temp_pg_engine_for_unit();
     let pg = Arc::new(pg);

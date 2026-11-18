@@ -1003,8 +1003,8 @@ reopen restores, then peer and cold-client reads),
 and `mounted-recoverable-trash-janitor-gc` (purged payloads are reclaimed only by
 `studiofs janitor`; snapshot pins, outside hard links and a peer restore that
 wins over an offline purge stay protected). `mounted-recoverable-trash-durability`
-(PostgreSQL and S3 both down before a crash) is registered but expected to fail:
-repair startup intentionally refuses to serve without a shared snapshot.
+(PostgreSQL and S3 both down before a crash) reopens the killed writer offline
+and restores from trash before the services return; see ADR 0013.
 
 Directory Clear on WinFSP behaves like a local disk. Windows deletes a recycled directory child by child (each child is an
 independent open, delete disposition, and close; the `$R` root is deleted last).

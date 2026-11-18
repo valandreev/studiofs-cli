@@ -487,6 +487,18 @@ rows that can be proven obsolete from the serving inode and published payload
 graph before its reachability scan. This recovery path does not reopen the
 flushed event cursor or prune local events.
 
+Graph repair is needed only when the recovered image may predate this client's
+own published history. Publication is fenced: before a flush opens its
+PostgreSQL transaction it makes every earlier volatile redb commit durable, so
+each published event, its allocator state and its receipts are in the durable
+image. Every `PgMetaEngine` open sets the local-only
+`pgPublicationDurabilityFence` counter. An unclean image that has this counter
+and no pending repair marker keeps its graph and cursors and reopens like a
+clean one, without PostgreSQL. A batch whose acknowledgement was lost replays
+as a self batch and matches the durable journal. An image without the counter
+(from an older binary) or with a repair already pending still sets the repair
+marker (see [ADR 0013](adr/0013-fenced-local-graph-survives-unclean-shutdown.md)).
+
 ## Read/Write Authority
 
 Local serving readiness and write authority are orthogonal:
@@ -505,6 +517,13 @@ offline behavior. An existing client with trusted durable allocator authority
 may retain its separately defined local-first write behavior while PostgreSQL
 is temporarily unavailable; that exception must not allow a fresh client to
 skip its startup target.
+
+The exception covers a restart. An established client (persisted client slot,
+no fresh-client or graph-repair marker) that reopens while PostgreSQL is
+unreachable becomes `live` once startup or a remote operation sees the
+reachability failure. The grant ends for good the first time PostgreSQL answers
+the identity probe. Publication and replay still require that probe, so a UUID
+mismatch keeps the offline mutations local instead of publishing them.
 
 ## Local-Only Destruction Boundary
 
