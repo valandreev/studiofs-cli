@@ -1,4 +1,5 @@
-//! Replay-time resolution of directories created concurrently under one name.
+//! Replay-time resolution of directories created concurrently under one name
+//! and of renames ordered after their inode was removed.
 //!
 //! Peers create names during sync windows without seeing each other. Every
 //! client replays the shared log in one global order and these rules read only
@@ -32,10 +33,12 @@ impl RedbMetaEngine {
                 .map_err(|error| MetaError::Storage(error.to_string()))?,
             dentries: HashMap::new(),
             removed_aliases_of: HashSet::new(),
+            attrs: HashMap::new(),
+            retired_renames: HashSet::new(),
         };
         let mut canonical: Option<Vec<MetaEvent>> = None;
         for (index, event) in events.iter().enumerate() {
-            let rewritten = merge.rewrite(txn, &mut aliases, event)?;
+            let rewritten = merge.rewrite(txn, &mut aliases, event, events.get(index + 1))?;
             let effective = match &rewritten {
                 Rewrite::Keep => Some(event),
                 Rewrite::Drop => None,
@@ -74,6 +77,10 @@ struct BatchMerge {
     dentries: HashMap<(Ino, Vec<u8>), Option<DirEntryValue>>,
     /// Canonical directories whose alias was removed earlier in this batch.
     removed_aliases_of: HashSet<Ino>,
+    /// Inode attrs set (`true`) or removed (`false`) earlier in this batch.
+    attrs: HashMap<Ino, bool>,
+    /// Regular-file inodes whose rename this batch dropped as retired.
+    retired_renames: HashSet<Ino>,
 }
 
 impl BatchMerge {
@@ -82,7 +89,23 @@ impl BatchMerge {
         txn: &RedbWriteTransaction<'_>,
         aliases: &mut redb::Table<'_, u64, u64>,
         event: &MetaEvent,
+        next: Option<&MetaEvent>,
     ) -> MetaResult<Rewrite> {
+        if self.renames_retired_inode(txn, aliases, event, next)? {
+            return Ok(Rewrite::Drop);
+        }
+        match event {
+            MetaEvent::SetAttr { attr } if self.retired_renames.contains(&attr.ino) => {
+                return Ok(Rewrite::Drop);
+            }
+            MetaEvent::SetAttr { attr } => {
+                self.attrs.insert(attr.ino, true);
+            }
+            MetaEvent::RemoveAttr { ino } => {
+                self.attrs.insert(*ino, false);
+            }
+            _ => {}
+        }
         Ok(match event {
             MetaEvent::AddEntry {
                 parent,
@@ -213,6 +236,48 @@ impl BatchMerge {
             }
             _ => Rewrite::Keep,
         })
+    }
+
+    /// `rename_atomic` follows a regular file's `RenameEntry` with its `SetAttr`.
+    /// When that attr claims a published body but neither the source name nor
+    /// any attr of the inode remains, the rename was ordered after the inode's
+    /// `RemoveAttr`, which discarded that body. Binding the destination would
+    /// resurrect it without content, so the earlier removal wins and both events
+    /// drop. A still-uploading inode publishes its rename without that attr.
+    fn renames_retired_inode(
+        &mut self,
+        txn: &RedbWriteTransaction<'_>,
+        aliases: &redb::Table<'_, u64, u64>,
+        event: &MetaEvent,
+        next: Option<&MetaEvent>,
+    ) -> MetaResult<bool> {
+        let MetaEvent::RenameEntry {
+            parent,
+            name,
+            entry,
+            ..
+        } = event
+        else {
+            return Ok(false);
+        };
+        let claims_published_body = matches!(next, Some(MetaEvent::SetAttr { attr })
+            if attr.ino == entry.ino && attr.committed_content_epoch > 0);
+        if entry.kind != FileType::RegularFile || !claims_published_body {
+            return Ok(false);
+        }
+        let source = self.dentry(txn, self.resolve(aliases, *parent)?, name)?;
+        if source.is_some_and(|source| source.ino == entry.ino) {
+            return Ok(false);
+        }
+        let has_attr = match self.attrs.get(&entry.ino) {
+            Some(live) => *live,
+            None => RedbMetaEngine::get_base_attr_in_write_txn(txn, entry.ino)?.is_some(),
+        };
+        if has_attr {
+            return Ok(false);
+        }
+        self.retired_renames.insert(entry.ino);
+        Ok(true)
     }
 
     fn observe_dentry_effect(&mut self, event: &MetaEvent) {
