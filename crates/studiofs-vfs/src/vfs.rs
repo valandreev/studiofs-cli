@@ -3693,6 +3693,8 @@ struct DeferredInodeTaskState {
     task_lock: Arc<tokio::sync::Semaphore>,
     interrupt_waiters: AtomicUsize,
     linger_wake: tokio::sync::Notify,
+    #[cfg(test)]
+    lingering: std::sync::atomic::AtomicBool,
 }
 
 impl DeferredInodeTaskState {
@@ -3701,6 +3703,8 @@ impl DeferredInodeTaskState {
             task_lock: Arc::new(tokio::sync::Semaphore::new(1)),
             interrupt_waiters: AtomicUsize::new(0),
             linger_wake: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            lingering: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -3709,6 +3713,15 @@ impl DeferredInodeTaskState {
     }
 
     async fn wait_linger_or_interrupt(&self, duration: Duration) -> bool {
+        #[cfg(test)]
+        self.lingering.store(true, Ordering::Release);
+        let interrupted = self.wait_linger_or_interrupt_inner(duration).await;
+        #[cfg(test)]
+        self.lingering.store(false, Ordering::Release);
+        interrupted
+    }
+
+    async fn wait_linger_or_interrupt_inner(&self, duration: Duration) -> bool {
         let sleep = tokio::time::sleep(duration);
         tokio::pin!(sleep);
         loop {
@@ -3847,6 +3860,14 @@ impl DeferredInodeGate {
 
     fn contains(&self, ino: Ino) -> bool {
         self.entries.lock().contains_key(&ino)
+    }
+
+    #[cfg(test)]
+    fn is_lingering(&self, ino: Ino) -> bool {
+        self.entries
+            .lock()
+            .get(&ino)
+            .is_some_and(|task_state| task_state.lingering.load(Ordering::Acquire))
     }
 
     /// Ask the current task for `ino` to stop lingering without waiting for it.
