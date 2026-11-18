@@ -73,7 +73,8 @@ studiofs init <name> \
   --access-key <s3-access-key> \
   --secret-key <s3-secret-key> \
   --meta <postgres-server-dsn> \
-  [--region <region>]
+  [--region <region>] \
+  [--trash-days <days>]
 ```
 
 Important:
@@ -83,6 +84,8 @@ Important:
 - `init` no longer performs conditional-write CAS checks (`If-Match` / `If-None-Match`) during initialization.
 - The current CLI does not expose a public block-size flag on `init`; newly
   initialized volumes report the canonical 4 MiB block size.
+- `--trash-days` sets how many whole days native Move to Trash entries are
+  kept; `0` (default) disables trash. Change it later with `studiofs trash-days`.
 
 ### Transparent encryption at rest
 
@@ -119,6 +122,24 @@ Loopback-only development/test example:
 ```bash
 studiofs init projectfs --endpoint http://127.0.0.1:9000 --bucket studiofs-test --access-key studiofs --secret-key studiofs123 --meta "postgres://studiofs:studiofs@127.0.0.1:5432?sslmode=disable"
 ```
+
+### `upgrade`
+
+Upgrades a stopped, locally discovered format 5 volume cache to format 6.
+
+```bash
+studiofs upgrade <name>
+```
+
+Notes:
+- Unmount the volume and stop its janitors first; `upgrade` refuses an active
+  local mount and holds the exclusive local `redb` lock for the whole command.
+- It upgrades the shared PostgreSQL schema and volume format, then completes
+  the local metadata upgrade. Both steps are retryable: after a timeout or a
+  local failure, keep the cache and rerun the same command; do not
+  reinitialize or clear it.
+- Repeat `upgrade` on every other client cache before remounting it, and use an
+  updated janitor: the upgraded `payload_gc` schema fences older janitors.
 
 ### `discover`
 
@@ -304,6 +325,60 @@ Notes:
 - When either payload limit is supplied, `settings` also updates every discovered local mount. A mount that is not running uses the saved value on its next start.
 - Supported transitional `STUDIOFS_*` environment variables still override persisted runtime defaults for a single mount process before explicit CLI flags are applied.
 - Internal cache thresholds are derived from cache budget and are not configurable through `studiofs settings`.
+
+### `trash-days`
+
+```bash
+studiofs trash-days <name> [<days>]
+```
+
+Shows or changes the shared retention period for native Move to Trash entries.
+
+Notes:
+- The volume must be discovered locally; it may be mounted.
+- `<days>` is a whole non-negative number. `0` stops new retention; entries
+  already in trash still expire on their previous schedule.
+- Omit `<days>` to print the current shared setting.
+- The setting is stored in PostgreSQL; mounted clients apply it after
+  replication. Every cache must use format 6 (see `upgrade`).
+
+### `quota`
+
+```bash
+studiofs quota <name> [<limit>|unlimited]
+```
+
+Shows or changes the shared logical byte quota of a volume.
+
+Notes:
+- The volume must be discovered locally; it may be mounted.
+- `<limit>` uses the shared size syntax (`100M`, `100GB`, `1.5G`, or a plain
+  byte count, binary units); `unlimited` removes the quota.
+- Omit the limit to print the current quota.
+- Mounted clients apply the change after replication. Usage accounting and
+  admission are local-first, so clients may temporarily overshoot the shared
+  limit.
+
+### `umeta`
+
+```bash
+studiofs umeta --meta <postgres-server-dsn> <name> [update flags]
+studiofs umeta --disk <name> [update flags]
+```
+
+Updates mutable S3 settings stored in shared PostgreSQL volume metadata.
+
+Update flags (at least one is required): `--endpoint`, `--bucket`,
+`--access-key`, `--secret-key`, `--region`, `--trash-days`.
+
+Notes:
+- `--meta` looks the volume up by name in shared metadata; `--disk` reuses the
+  PostgreSQL connection of an existing locally discovered volume (an optional
+  positional name must match it).
+- Empty endpoint, bucket, or key values are rejected; an empty `--region`
+  resets it to `us-east-1`.
+- Running upgraded mounts pick up access/secret key changes after their next
+  successful metadata poll; endpoint, bucket, and region changes need a remount.
 
 ### `umount`
 

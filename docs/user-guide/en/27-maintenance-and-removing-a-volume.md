@@ -85,6 +85,32 @@ What is kept, who can restore or clear an item, and how each operating system
 shows the trash are described in
 [chapter 23](23-deleting-files-there-is-no-magic-trash-can.md).
 
+## Volume size limit: `quota`
+
+A quota is an optional, shared limit on the logical size of all files in a
+volume. Show or change it on any computer where the volume is discovered; the
+volume may stay mounted, but PostgreSQL must be reachable:
+
+```bash
+studiofs quota myvolume              # show the current limit
+studiofs quota myvolume 500G         # limit the volume to 500 GiB
+studiofs quota myvolume unlimited    # remove the limit
+```
+
+Sizes use powers of 1024: `500G` and `500GB` mean the same. Update every
+computer that writes to the volume before setting a limit. Mounted clients
+apply the change after replication; `studiofs status myvolume` shows this
+computer's usage, limit and free space.
+
+A file counts at its logical length, including sparse holes; trashed files
+count until they are purged or expire. Directories, symlinks and snapshot
+history do not count, so the quota does not predict your S3 bill. A write that
+would exceed the limit fails with a "disk full" error. Each computer checks the
+limit against what it knows locally, so two computers writing at the same time,
+or one working offline, can briefly push the volume past the limit. Lowering
+the limit below current usage never deletes data: reading, overwriting within
+existing size and deleting keep working.
+
 ## Checking metadata: `fsck`
 
 `fsck` looks for inconsistencies in the file system structure: directory entries without a corresponding metadata object, objects disconnected from directories, incorrect link counts, and unfinished internal operations. For a PostgreSQL-backed volume, the command first synchronizes local metadata with the server, then builds its report.
