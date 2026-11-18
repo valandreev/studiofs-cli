@@ -44,7 +44,6 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-prost = "0.14"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sysinfo.workspace = true
 url.workspace = true
@@ -60,6 +59,7 @@ objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSColor", "NS
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSGeometry", "NSString"] }
 
 [target.'cfg(unix)'.dependencies]
+prost = "0.14"
 pyroscope = { version = "2", default-features = false, features = ["backend-jemalloc", "backend-pprof-rs"] }
 
 [target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]

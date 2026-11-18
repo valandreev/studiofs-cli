@@ -15,9 +15,11 @@ thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 lru.workspace = true
-libc.workspace = true
 uuid.workspace = true
 redb.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
