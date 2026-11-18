@@ -87,8 +87,14 @@ impl GvfsSession {
         let stderr = String::from_utf8_lossy(&output.stderr);
         // GLib 2.80 can exit 0 while printing `gio: ...: <error>`; stderr is the oracle.
         if !output.status.success() || stderr.contains("gio: ") {
+            // GLib alone only moves to trash; `trash:///` needs the gvfsd-trash backend.
+            let hint = if stderr.contains("Operation not supported") {
+                " (host prerequisite missing: install the `gvfs` package for gvfsd-trash)"
+            } else {
+                ""
+            };
             return Err(io::Error::other(format!(
-                "{label} failed with {}: {}",
+                "{label} failed with {}: {}{hint}",
                 output.status,
                 stderr.trim()
             )));

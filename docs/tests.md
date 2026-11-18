@@ -1655,6 +1655,9 @@ writes `operations.ndjson`, `symlink-attribute-summary.json`, and
 
 Hosted Linux real mounted E2E is operator-run once the target host has
 `/dev/fuse`, `fusermount3`, libfuse3, Docker, PostgreSQL, and RustFS available.
+`mounted-recoverable-trash-two-client` also needs `dbus-run-session` and the
+`gvfs` package (`gvfsd-trash`); without it `gio list trash:///` fails with
+`Operation not supported`.
 See the SFS-610 Linux Platform Release Gate in
 [docs/local-first-validation-matrix.md](local-first-validation-matrix.md#sfs-610-linux-platform-release-gate).
 
