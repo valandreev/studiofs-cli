@@ -8,9 +8,7 @@ license.workspace = true
 [lints]
 workspace = true
 
-[dependencies]
+[target.'cfg(unix)'.dependencies]
 studiofs-meta.workspace = true
 studiofs-vfs.workspace = true
-
-[target.'cfg(unix)'.dependencies]
 libc.workspace = true

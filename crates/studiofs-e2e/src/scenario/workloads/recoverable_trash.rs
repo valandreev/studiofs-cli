@@ -28,11 +28,6 @@ impl Scenario for RecoverableTrash {
     }
 
     fn run(&self, context: &ScenarioContext) -> Result<(), ScenarioError> {
-        if !cfg!(target_os = "linux") {
-            return Err(
-                io::Error::new(io::ErrorKind::Unsupported, "Linux GIO/FUSE required").into(),
-            );
-        }
         let config = context
             .client_controller_config
             .clone()
@@ -73,6 +68,9 @@ impl Scenario for RecoverableTrash {
 
     fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
         Ok(())
+    }
+    fn unsupported_platform(&self) -> Option<&'static str> {
+        (!cfg!(target_os = "linux")).then_some("Linux GIO/FUSE required")
     }
 }
 

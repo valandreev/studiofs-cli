@@ -157,6 +157,8 @@ Key points:
 - Cross-platform mounts: WinFSP on Windows, libfuse3 on Linux, macFUSE on macOS
   (legacy backend by default, opt-in FSKit backend)
 - Background upload, janitor, and metadata sync workers
+- Shared volume settings: trash retention (`trash-days`), logical byte quota
+  (`quota`), and mutable S3 connection settings (`umeta`)
 - Snapshot v2 PostgreSQL control plane with retained, version-bounded sources
 - Snapshot source replay is thin: serving checkpoints and bounded event ranges
   are retained without replicating a full local snapshot through normal metadata
@@ -180,7 +182,7 @@ Install these components separately; StudioFS release archives must not bundle
 their drivers or shared libraries. In particular, macFUSE must be installed by
 the user, without an automatic download or installation by a StudioFS installer.
 See the [platform distribution policy](docs/legal/platform-distribution.md)
-before redistributing a build; 0.2.0 release binaries exclude the experimental
+before redistributing a build; release binaries exclude the experimental
 FSKit/MFMount backend.
 
 Initialize a new volume (Bash example, with local S3-compatible storage and
@@ -222,12 +224,16 @@ studiofs mount myvolume Y:
 | Command | Description |
 |---|---|
 | `init` | Create a new volume and register it in PostgreSQL |
+| `upgrade` | Upgrade the local metadata format of a stopped, discovered volume |
 | `discover` | Bootstrap a new client from an existing PostgreSQL-backed volume |
 | `mount` | Mount a volume as a local filesystem |
 | `smount` | Mount a Ready snapshot as a read-only filesystem |
 | `umount` | Unmount an active mountpoint |
 | `status` | Show volume status, PostgreSQL binding, and local/runtime counters |
 | `settings` | Show or update persistent client settings and runtime tuning |
+| `trash-days` | Show or change the shared trash retention period in whole days |
+| `quota` | Show or change the shared logical byte quota (`unlimited` removes it) |
+| `umeta` | Update mutable shared S3 volume settings (endpoint, bucket, credentials, region, trash days) |
 | `snapshot` | Create, list, inspect, delete, and schedule whole-volume snapshots |
 | `janitor` | Delete unreferenced remote objects in bounded, resumable cycles; `--dry-run` only reports candidates |
 | `fsck` | Check and optionally repair dangling entries, orphan inodes, link counts, and pending/deferred state |
@@ -258,9 +264,10 @@ so a metadata dump cannot recover a destroyed volume.
 
 Run `studiofs --help` or `studiofs <command> --help` for full usage.
 
-CLI size options such as `--cache-size` and `--read-buffer` accept `B`, `KB`,
-`MB`, `GB`, `TB`, `PB`, `EB` suffixes in binary units (`1KB = 1024B`) and
-fractional values such as `1.5GB`. The shared parser truncates fractional bytes;
+CLI size options such as `--cache-size` and `--read-buffer`, and the `quota`
+limit, accept `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `EB` suffixes (or the
+single-letter `K`, `M`, `G`, `T`, `P`, `E` forms) in binary units
+(`1KB = 1K = 1024B`) and fractional values such as `1.5GB`. The shared parser truncates fractional bytes;
 `--read-buffer` then rounds up to whole MiB. The same size syntax applies to
 these mount environment overrides: `STUDIOFS_WRITER_PAGE_SIZE_BYTES`,
 `STUDIOFS_XATTR_MAX_BYTES`, `STUDIOFS_DENTRY_CACHE_BYTES`,

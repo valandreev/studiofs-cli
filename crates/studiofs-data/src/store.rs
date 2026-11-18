@@ -171,6 +171,7 @@ impl fmt::Debug for S3CredentialHolder {
 }
 
 impl S3CredentialHolder {
+    /// Create a shared holder for the initial access/secret key pair.
     pub fn new(access_key: String, secret_key: String) -> Arc<Self> {
         Arc::new(Self {
             pair: Mutex::new((access_key, secret_key)),

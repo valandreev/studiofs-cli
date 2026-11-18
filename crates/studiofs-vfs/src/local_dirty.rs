@@ -197,6 +197,41 @@ impl PendingDirtySlice {
     }
 }
 
+/// Reports whether `selected` commits a slice that overlaps an older slice of
+/// `pending` that the wave leaves behind.
+fn wave_overtakes_retained_slice(
+    pending: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+    selected: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+) -> bool {
+    selected.iter().any(|(chunk_id, chosen)| {
+        let Some(all) = pending.get(chunk_id) else {
+            return false;
+        };
+        let chosen_keys: std::collections::HashSet<_> = chosen
+            .iter()
+            .map(|slice| slice.commit_key(*chunk_id))
+            .collect();
+        let mut retained: Vec<_> = all
+            .iter()
+            .filter(|slice| !chosen_keys.contains(&slice.commit_key(*chunk_id)))
+            .collect();
+        retained.sort_unstable_by_key(|slice| slice.range.start);
+        let max_len = retained
+            .iter()
+            .map(|slice| slice.range.len())
+            .max()
+            .unwrap_or(0);
+        chosen.iter().any(|slice| {
+            let candidates = retained.partition_point(|other| other.range.start < slice.range.end);
+            retained[..candidates]
+                .iter()
+                .rev()
+                .take_while(|other| other.range.start.saturating_add(max_len) > slice.range.start)
+                .any(|other| other.seq < slice.seq && other.range.end > slice.range.start)
+        })
+    })
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct PendingDirtyReadSpan {
     pub(super) start: u64,
@@ -2495,6 +2530,12 @@ impl StudioVfs {
             }
         }
 
+        // A later commit wins reads, so a wave must not leave behind an older
+        // slice that overlaps one it commits. Packed objects span seq ranges and
+        // chunks, so whole-object waves can; commit everything in that case.
+        if wave_overtakes_retained_slice(&pending_slices, &selected) {
+            return pending_slices;
+        }
         for (chunk_id, slices) in &mut selected {
             slices.sort_by_key(|slice| slice.order_key(*chunk_id));
         }

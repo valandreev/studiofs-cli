@@ -12690,3 +12690,78 @@ fn restore_keeps_namespace_journal_pending_until_all_fresh_payloads_are_ready() 
         "later cleanup must not acknowledge hidden restore names"
     );
 }
+
+#[test]
+fn rename_ordered_after_foreign_unlink_does_not_resurrect_bodyless_inode() {
+    // PG order: one client's unlink retires the inode, then another client's
+    // rename of the old name publishes. Every replica, including the renamer
+    // replaying its own batch, must keep the unlink instead of binding the new
+    // name to an inode whose published body the unlink already discarded.
+    let (_a_dir, a) = temp_pg_engine_for_unit();
+    let (_b_dir, b) = temp_pg_engine_for_unit();
+    let (_c_dir, c) = temp_pg_engine_for_unit();
+    let setup_start = a.local.get_counter(NEXT_EVENT_SEQ).expect("setup start");
+    let file = create_published_small_file(&a, ROOT_INO, b"file.txt", 77_100);
+    let setup_end = a.local.get_counter(NEXT_EVENT_SEQ).expect("setup end");
+    a.persist_flushed_event_seq(setup_end)
+        .expect("ack published setup");
+    apply_projected_remote_range(&a, &b, setup_start, setup_end);
+    apply_projected_remote_range(&a, &c, setup_start, setup_end);
+
+    let projected = |pg: &PgMetaEngine, start| {
+        let end = pg.local.get_counter(NEXT_EVENT_SEQ).expect("event end");
+        let events = pg.local.read_events_range(start, end).expect("events");
+        (end, RemoteApplyCoordinator::project_remote_events(&events))
+    };
+    let unlink_start = b.local.get_counter(NEXT_EVENT_SEQ).expect("unlink start");
+    b.unlink(ROOT_INO, b"file.txt").expect("peer unlink");
+    let (_, unlink) = projected(&b, unlink_start);
+    let rename_start = a.local.get_counter(NEXT_EVENT_SEQ).expect("rename start");
+    a.rename(ROOT_INO, b"file.txt", ROOT_INO, b"renamed.txt")
+        .expect("local rename");
+    let (rename_end, rename) = projected(&a, rename_start);
+    assert!(
+        rename
+            .iter()
+            .any(|event| matches!(event, MetaEvent::RenameEntry { .. })),
+        "rename must be remote-visible"
+    );
+
+    let page = |self_rename| {
+        vec![
+            DecodedReplayBatch {
+                batch_version: 2,
+                events: unlink.clone(),
+                is_self_batch: false,
+            },
+            DecodedReplayBatch {
+                batch_version: 3,
+                events: rename.clone(),
+                is_self_batch: self_rename,
+            },
+        ]
+    };
+    apply_decoded_foreign_batches_locked(&c, page(false), None, 1).expect("replica replay");
+    a.mark_local_event_ranges_published(&[LocalEventRange {
+        start: rename_start,
+        end: rename_end,
+    }])
+    .expect("publish rename");
+    let mut renamer_page = page(true);
+    let self_page = renamer_page.split_off(1);
+    // The renamer may replay the unlink before its own batch arrives.
+    apply_decoded_foreign_batches_locked(&a, renamer_page, None, 1).expect("renamer replay");
+    apply_decoded_foreign_batches_locked(&a, self_page, None, 2).expect("renamer self replay");
+
+    for (label, pg) in [("replica", &c), ("renamer", &a)] {
+        assert!(pg.lookup(ROOT_INO, b"file.txt").is_err(), "{label}: source");
+        assert!(
+            pg.lookup(ROOT_INO, b"renamed.txt").is_err(),
+            "{label}: rename after unlink must not bind a retired inode"
+        );
+        assert!(
+            pg.get_attr(file.ino).is_err(),
+            "{label}: retired inode attr"
+        );
+    }
+}

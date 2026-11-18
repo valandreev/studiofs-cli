@@ -56,6 +56,14 @@ fn load_test_env() {
     });
 }
 
+/// The drive comes from the process env or the workspace `.env`; loading `.env`
+/// here keeps the result independent of which test ran first.
+fn test_mount_point() -> String {
+    load_test_env();
+    std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
+        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter")
+}
+
 fn workspace_dotenv_vars() -> &'static std::collections::BTreeMap<String, String> {
     static VARS: OnceLock<std::collections::BTreeMap<String, String>> = OnceLock::new();
     VARS.get_or_init(|| {
@@ -1007,15 +1015,21 @@ Step "cleared"
 /// light trace that barely perturbs timing). Diagnostics only: the default probe run
 /// installs nothing.
 fn install_probe_trace_log() {
+    if let Some(path) = std::env::var_os("STUDIOFS_WINFSP_TRACE_LOG") {
+        install_trace_log_at(std::path::Path::new(&path));
+    }
+}
+
+fn install_trace_log_at(path: &std::path::Path) {
     use std::sync::Mutex;
-    let Some(path) = std::env::var_os("STUDIOFS_WINFSP_TRACE_LOG") else {
-        return;
-    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create WinFSP probe trace directory");
+    }
     let filter = std::env::var("STUDIOFS_WINFSP_TRACE_FILTER").unwrap_or_else(|_| {
         "studiofs_winfsp=debug,studiofs_vfs=debug,studiofs_winfsp::metadata_baseline=trace"
             .to_string()
     });
-    let file = std::fs::File::create(&path).expect("create WinFSP probe trace log");
+    let file = std::fs::File::create(path).expect("create WinFSP probe trace log");
     let subscriber = tracing_subscriber::fmt()
         .with_writer(Mutex::new(file))
         .with_ansi(false)
@@ -1033,8 +1047,7 @@ fn winfsp_native_trash_restore_and_clear_shell_probe() {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
     install_probe_trace_log();
 
-    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
-        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
     assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
     // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
@@ -1157,8 +1170,7 @@ fn winfsp_native_trash_directory_restore_and_clear_shell_probe() {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
     install_probe_trace_log();
 
-    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
-        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
     assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
     // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
@@ -1267,8 +1279,7 @@ fn winfsp_native_trash_directory_partial_clear_shell_probe() {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
     install_probe_trace_log();
 
-    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
-        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
     assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
     // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
@@ -1452,8 +1463,7 @@ fn winfsp_native_trash_directory_collision_shell_probe() {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
     install_probe_trace_log();
 
-    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
-        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
     assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
     // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
@@ -1767,8 +1777,7 @@ fn winfsp_native_trash_remote_only_retry_probe() {
     }
     install_probe_trace_log();
 
-    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
-        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
     assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
     // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
@@ -2127,11 +2136,12 @@ fn mapped_writer_probe(restore: bool) {
         CreateFileMappingW, FILE_MAP_WRITE, FlushViewOfFile, MapViewOfFile, PAGE_READWRITE,
         UnmapViewOfFile,
     };
-    install_probe_trace_log();
+    // The order assertion below needs a trace; default it under `target/` when unset.
     let trace_path = std::env::var_os("STUDIOFS_WINFSP_TRACE_LOG")
-        .expect("set STUDIOFS_WINFSP_TRACE_LOG so cleanup and paging order is observable");
-    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
-        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target/probe-trace/mapped-writer.log"));
+    install_trace_log_at(&trace_path);
+    let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
     assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
     // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
@@ -2258,8 +2268,7 @@ fn mapped_writer_probe(restore: bool) {
 fn winfsp_default_disabled_trash_is_destructive_shell_probe() {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
 
-    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
-        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
     assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
     // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
@@ -2301,8 +2310,7 @@ fn winfsp_default_disabled_trash_is_destructive_shell_probe() {
 fn winfsp_native_trash_retention_shell_probe() {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
 
-    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
-        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
     assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
     // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
@@ -2332,8 +2340,7 @@ fn winfsp_native_trash_retention_shell_probe() {
 fn winfsp_recycle_namespace_feasibility_probe() {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
 
-    let mount_point = std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT")
-        .expect("set STUDIOFS_WINFSP_TEST_MOUNT_POINT to an unused drive letter");
+    let mount_point = test_mount_point();
     let bytes = mount_point.as_bytes();
     assert!(bytes.len() == 2 && bytes[0].is_ascii_uppercase() && bytes[1] == b':');
     // SAFETY: GetLogicalDrives takes no pointers and only queries drive occupancy.
@@ -2350,7 +2357,8 @@ fn winfsp_recycle_namespace_feasibility_probe() {
         "control volume must recycle through the same Shell path"
     );
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
-    let vfs = make_test_vfs(&tmp, "recycle-probe", &rt);
+    // Trash is disabled by default (see the default-disabled probe); recycling needs retention.
+    let vfs = make_trash_enabled_test_vfs(&tmp, "recycle-probe", &rt);
     let event = format!(r"Local\StudioFsRecycleProbe-{}", std::process::id());
     with_winfsp_mount(vfs, rt, mount_point, event, |root| {
         let mounted = shell_recycle_probe(

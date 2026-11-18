@@ -1351,6 +1351,72 @@ mod tests {
     }
 
     #[test]
+    fn opportunistic_pending_slice_commit_never_commits_newer_bytes_before_older_overlap() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-wave-order");
+        let _guard = rt.enter();
+        let ino = rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-wave-order.bin", 0, 0, 0o644)
+                .expect("create file");
+            let fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open file");
+            vfs.write_fh(fh, attr.ino, 0, b"tail")
+                .await
+                .expect("seed open writer tail");
+            attr.ino
+        });
+
+        // A retained mounted run packed one drain like this: an appended 8 KiB slice
+        // (seq 10) in one object, and a later 4 KiB overwrite of its head (seq 20) in
+        // the next object, which also carries the next chunk's oldest bytes (seq 1).
+        let page = 4096u32;
+        let x = 8 * 1024 * 1024;
+        let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE;
+        let created_at = Instant::now();
+        let slice = |start: u32, end: u32, seq: u64, object_id: u64, object_offset: u32| {
+            PendingDirtySlice {
+                range: studiofs_meta::schema::SliceRange::new(start, end).expect("slice range"),
+                block_index: 0,
+                block_offset: 0,
+                seq,
+                object_id: Some(object_id),
+                object_offset,
+                created_at,
+            }
+        };
+        let (older_object, newer_object) = (70_000, 70_001);
+        let persisted = std::collections::BTreeMap::from([
+            (
+                0,
+                vec![
+                    slice(x, x + 2 * page, 10, older_object, 0),
+                    slice(x, x + page, 20, newer_object, 0),
+                ],
+            ),
+            (1, vec![slice(0, chunk_size - page, 1, newer_object, page)]),
+        ]);
+
+        let selected = vfs.select_pending_persisted_local_dirty_slice_commit_wave(
+            ino,
+            persisted,
+            LocalSyncPolicy::Opportunistic,
+        );
+        let selected_objects: std::collections::BTreeSet<_> = selected
+            .values()
+            .flatten()
+            .filter_map(|slice| slice.object_id)
+            .collect();
+
+        assert!(
+            !selected_objects.contains(&newer_object) || selected_objects.contains(&older_object),
+            "a wave that commits the seq-20 overwrite before the seq-10 slice lets the older \
+             bytes win the later commit: {selected_objects:?}"
+        );
+    }
+
+    #[test]
     fn opportunistic_pending_slice_commit_drains_aged_tail_when_upload_pipeline_is_idle() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-idle-tail");

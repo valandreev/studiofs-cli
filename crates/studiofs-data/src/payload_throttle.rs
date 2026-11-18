@@ -1,3 +1,5 @@
+//! Per-direction token-bucket bandwidth throttle for payload object transfers.
+
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -7,6 +9,7 @@ use std::sync::Mutex;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+/// Upload/download bandwidth limiter shared by all payload transfers of a mount.
 #[derive(Default)]
 pub struct PayloadThrottle {
     upload: Direction,
@@ -16,6 +19,7 @@ pub struct PayloadThrottle {
 }
 
 impl PayloadThrottle {
+    /// Create a throttle with the given limits in Mbit/s; `0` means unlimited.
     pub fn new(upload_mbps: u64, download_mbps: u64) -> Self {
         let throttle = Self::default();
         throttle.set_limits(Some(upload_mbps), Some(download_mbps));
@@ -32,6 +36,7 @@ impl PayloadThrottle {
         }
     }
 
+    /// Cancel the throttle and wake every waiter; pending and later acquires return `false`.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.cancellation_changed.notify_waiters();
@@ -39,20 +44,25 @@ impl PayloadThrottle {
         self.download.changed.notify_waiters();
     }
 
+    /// Current `(upload, download)` limits in Mbit/s.
     pub fn limits(&self) -> (u64, u64) {
         (self.upload.limit(), self.download.limit())
     }
 
+    /// Cumulative `(upload, download)` time spent waiting for budget, in nanoseconds.
     pub fn wait_nanos(&self) -> (u64, u64) {
         (self.upload.wait_nanos(), self.download.wait_nanos())
     }
 
+    /// Wait for upload budget for `bytes`; returns `false` if the throttle was cancelled.
     pub async fn acquire_upload(&self, bytes: usize) -> bool {
         self.upload
             .acquire(bytes, false, &self.cancelled, &self.cancellation_changed)
             .await
     }
 
+    /// Wait for download budget for `bytes`, with `foreground` reads served first;
+    /// returns `false` if the throttle was cancelled.
     pub async fn acquire_download(&self, bytes: usize, foreground: bool) -> bool {
         self.download
             .acquire(

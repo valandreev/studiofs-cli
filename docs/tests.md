@@ -482,8 +482,10 @@ A `direct_io` open makes macFUSE fail later page-ins on the vnode, which surface
 file, writes through a mapping of a created handle, and executes a just-copied
 binary twice; each mapping runs in a forked child, and `macos-mmap-exec.json` records
 how each step ended. Mapping a file reopened for write remains a known limitation
-(`docs/platform-bridges.md`), so the scenario does not cover it. It needs macOS and
-reports `Unsupported` elsewhere, so the Linux full E2E target leaves it out.
+(`docs/platform-bridges.md`), so the scenario does not cover it. It needs macOS;
+elsewhere the runner records a `platform` `skipped` event and passes it without
+running hooks, and the Linux full E2E target leaves it out. Scenarios bound to one
+platform declare it through `Scenario::unsupported_platform`.
 
 ```sh
 cargo build -p studiofs -p studiofs-e2e
