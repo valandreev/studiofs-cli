@@ -249,6 +249,24 @@ closes.
 | Logical quota is unchanged by compression | quota regression test (SFS-1093) |
 | Mounted write, cold range read, full read, and policy switch work across clients | `studiofs-e2e` compression scenario on macFUSE and Linux FUSE (SFS-1094) |
 
+## Planned: per-path sync status gate (ADR 0016)
+
+[ADR 0016](adr/0016-per-path-sync-status-and-barrier.md) is implemented in the
+Linear project "[0.3.0] Per-path sync & cache status" after SFS-986. Each
+invariant gets its tests in the owning issue; this table names the evidence
+that must exist before the gate closes.
+
+| Invariant | Evidence (owning issue) |
+|---|---|
+| A path is `synced` only when its content is published with matching epochs and it has no overlay metadata, dirty attributes, or local dirty payloads; unreadable or degraded inputs report `unknown`, never `synced` | classifier unit tests per lifecycle state, metadata-only change, sticky error, and degraded PG; lock-order test (SFS-1097) |
+| Byte counters do not hide pending data; `cached_bytes` is object-granular | cached, evicted, remote-only, and packed-object tests (SFS-1098) |
+| Recursive status is bounded, does not follow symlinks, counts hardlinks once, skips local-only subtrees, and reports a truncated walk as `unknown` | traversal tests (SFS-1099) |
+| A barrier waits only for its snapshot: later writes do not extend it, metadata waits for the watermark, sticky errors end it, and no publication notification is missed | snapshot and wait tests (SFS-1100) |
+| Per-path requests run only in the mounted process, are authenticated, cannot escape the mount, and keep v5 requests working | IPC v6 protocol and compatibility tests (SFS-1101) |
+| CLI output and exit codes are stable; an unmounted volume or a mount lost during a wait never reports success | golden output and exit-code tests (SFS-1102, SFS-1103) |
+| Mounted status and barrier work with live PostgreSQL and S3, including S3 outage and unmount during a wait | `studiofs-e2e` scenario on Linux FUSE and WinFSP, macOS smoke (SFS-1105) |
+| `user.studiofs.*` is read-only, hidden from `listxattr`, and leaves other xattrs and xfstests unchanged | xattr unit tests (SFS-1104); mounted xattr scenario on Linux FUSE and macFUSE and the xfstests xattr subset (SFS-1106) |
+
 ## SFS-356 Encrypted remote object regression gate
 
 Run this gate when encryption-at-rest, `DataStore`, fetch, cache, prefetch,
