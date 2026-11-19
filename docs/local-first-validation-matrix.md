@@ -267,6 +267,20 @@ that must exist before the gate closes.
 | Mounted status and barrier work with live PostgreSQL and S3, including S3 outage and unmount during a wait | `studiofs-e2e` scenario on Linux FUSE and WinFSP, macOS smoke (SFS-1105) |
 | `user.studiofs.*` is read-only, hidden from `listxattr`, and leaves other xattrs and xfstests unchanged | xattr unit tests (SFS-1104); mounted xattr scenario on Linux FUSE and macFUSE and the xfstests xattr subset (SFS-1106) |
 
+## Planned: background local cache scrub gate (ADR 0017)
+
+[ADR 0017](adr/0017-background-local-cache-scrub.md) is implemented in the
+Linear project "[0.2.4]". Each invariant gets its tests in the owning issue;
+this table names the evidence that must exist before the gate closes.
+
+| Invariant | Evidence (owning issue) |
+|---|---|
+| Clean entries carry the XXH64 of their exact cached bytes without new hashing; dirty and legacy entries have none; a rewrite never keeps a stale checksum | index encode/decode, download, upload-transition, and rewrite tests (SFS-1117) |
+| The scrub never evicts Dirty, Pending, Uploading, pinned, or concurrently changed entries | `evict_corrupt` race tests with deterministic synchronization (SFS-1118) |
+| Checksum mismatch, missing file, short file, and read I/O error are evicted and refetched; the cursor survives restart; the task is joined on shutdown; limits hold and foreground local IO is not blocked | scrub worker tests with a fake clock and a held foreground permit (SFS-1119) |
+| Counters and status are additive and keep v5 clients working | `RuntimeSnapshot` serde and status golden tests (SFS-1120) |
+| A damaged cache file heals itself on a mounted volume and a dirty file is untouched | `studiofs-e2e` scrub scenario on macFUSE and Linux FUSE, WinFSP when available (SFS-1120) |
+
 ## SFS-356 Encrypted remote object regression gate
 
 Run this gate when encryption-at-rest, `DataStore`, fetch, cache, prefetch,
