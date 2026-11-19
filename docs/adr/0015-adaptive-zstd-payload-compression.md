@@ -129,6 +129,9 @@ most three object-store reads.
   other shared settings and is changed with
   `studiofs compression <name> [off|zstd[:<level>]]`.
 - New volumes default to `zstd:3`. There is no client-local override.
+- The field is added without a global metadata format bump: settings events
+  get a new wire tag, serving checkpoints a new format version, and the local
+  and PostgreSQL records a default. Older settings decode as `off`.
 - A writer reads the policy from its local metadata view when it prepares an
   upload. Fragments already queued use the policy current at preparation.
 
