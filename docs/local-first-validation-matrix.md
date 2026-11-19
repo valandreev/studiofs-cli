@@ -231,6 +231,24 @@ mandatory workload and must improve at least one warm/reopen-read workload by
 `direct` is the tested operational rollback and requires a remount. Raw
 `/dev/fuse` is no longer a separate runtime profile.
 
+## Planned: payload compression gate (ADR 0015)
+
+[ADR 0015](adr/0015-adaptive-zstd-payload-compression.md) is implemented in the
+Linear project "[0.2.4] Compression". Each invariant gets its tests in the
+owning issue; this table names the evidence that must exist before the gate
+closes.
+
+| Invariant | Evidence (owning issue) |
+|---|---|
+| v2 objects and 1 MiB SFEC frames still round-trip after the frame size becomes per-object | fixed 1 MiB fixture decrypt; 64 KiB full and range decrypt tests (SFS-1086) |
+| STFS v3 geometry is validated before chunk data is used; decompression never exceeds the derived chunk length | v3 encode/decode and rejection tests; v3 baseline fixture (SFS-1087, SFS-1089) |
+| Incompressible data exits at the probe and stays STFS v2 | probe tests; criterion benchmark with at most 3% upload loss against `off` (SFS-1089) |
+| The policy is shared, replicated, and read from the local view at upload preparation | settings serde, revision ordering, CLI CAS, replication tests (SFS-1088, SFS-1091) |
+| The local cache, stage files, and writer state never hold compressed bytes | upload and full-fetch round-trip tests (SFS-1090, SFS-1091) |
+| A small cold read of a compressed object needs at most three reads and does not fetch the whole object | range-read request and byte-count tests (SFS-1092) |
+| Logical quota is unchanged by compression | quota regression test (SFS-1093) |
+| Mounted write, cold range read, full read, and policy switch work across clients | `studiofs-e2e` compression scenario on macFUSE and Linux FUSE (SFS-1094) |
+
 ## SFS-356 Encrypted remote object regression gate
 
 Run this gate when encryption-at-rest, `DataStore`, fetch, cache, prefetch,
