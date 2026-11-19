@@ -1,26 +1,27 @@
 # StudioFS release downloads and builds
 
 Published releases are
+[v0.2.3](https://github.com/valandreev/studiofs-cli/releases/tag/v0.2.3)
+(19 assets, published 2026-11-19),
 [v0.2.2](https://github.com/valandreev/studiofs-cli/releases/tag/v0.2.2)
 (19 assets, published 2026-11-12),
 [v0.2.1](https://github.com/valandreev/studiofs-cli/releases/tag/v0.2.1)
 (19 assets, published 2026-11-08), and
 [v0.2.0](https://github.com/valandreev/studiofs-cli/releases/tag/v0.2.0).
-The current development workspace version is `0.2.3`; the platform instructions
-below describe the published v0.2.2 packages.
+The platform instructions below describe the published v0.2.3 packages.
 
-StudioFS 0.2.2 targets these five native platforms:
+StudioFS 0.2.3 targets these five native platforms:
 
-| v0.2.2 download suffix | Suffix from v0.2.3 | Rust target triple | System | GitHub builder |
+| Download suffix from v0.2.3 | Suffix up to v0.2.2 | Rust target triple | System | GitHub builder |
 | --- | --- | --- | --- | --- |
-| `x86_64-pc-windows-msvc.zip` | `x86_64-pc-windows.zip` | `x86_64-pc-windows-msvc` | Windows x86-64 | `windows-2025` |
-| `aarch64-pc-windows-msvc.zip` | `aarch64-pc-windows.zip` | `aarch64-pc-windows-msvc` | Windows ARM64 | `windows-11-arm` |
-| `x86_64-unknown-linux-gnu.tar.gz` | `x86_64-linux-gnu.tar.gz` | `x86_64-unknown-linux-gnu` | Linux x86-64 | `ubuntu-24.04` |
-| `aarch64-unknown-linux-gnu.tar.gz` | `aarch64-linux-gnu.tar.gz` | `aarch64-unknown-linux-gnu` | Linux ARM64 | `ubuntu-24.04-arm` |
+| `x86_64-pc-windows.zip` | `x86_64-pc-windows-msvc.zip` | `x86_64-pc-windows-msvc` | Windows x86-64 | `windows-2025` |
+| `aarch64-pc-windows.zip` | `aarch64-pc-windows-msvc.zip` | `aarch64-pc-windows-msvc` | Windows ARM64 | `windows-11-arm` |
+| `x86_64-linux-gnu.tar.gz` | `x86_64-unknown-linux-gnu.tar.gz` | `x86_64-unknown-linux-gnu` | Linux x86-64 | `ubuntu-24.04` |
+| `aarch64-linux-gnu.tar.gz` | `aarch64-unknown-linux-gnu.tar.gz` | `aarch64-unknown-linux-gnu` | Linux ARM64 | `ubuntu-24.04-arm` |
 | `aarch64-apple-darwin.tar.gz` | `aarch64-apple-darwin.tar.gz` | `aarch64-apple-darwin` | macOS Apple Silicon | `macos-15` |
 
 Releases up to v0.2.2 name archives `studiofs-<version>-<full target triple>`.
-Starting with the next release (workspace `0.2.3`), `tools/release/package.py`
+Starting with v0.2.3, `tools/release/package.py`
 drops the redundant `-msvc` suffix and `-unknown-` vendor part from archive and
 folder names; `BUILD-INFO.json` still records the full target triple.
 
@@ -106,9 +107,9 @@ avoids building unrelated workspace test/scenario tools. Exact byte reproduction
 also depends on the native toolchain and library versions; this workflow records
 identity and linkage evidence, not a promise of bit-for-bit reproducible builds.
 
-The release's `studiofs-v0.2.2-source.tar.gz` contains the exact tracked project
+The release's `studiofs-v0.2.3-source.tar.gz` contains the exact tracked project
 source and build scripts. GitHub also supplies source archives for the tag.
-`studiofs-v0.2.2-dependency-source.tar.gz` contains `cargo vendor --locked`
+`studiofs-v0.2.3-dependency-source.tar.gz` contains `cargo vendor --locked`
 output for every locked Rust dependency, plus `Cargo.lock` and the Cargo source
 replacement configuration needed to build offline from it. Separately installed
 platform components (WinFsp, macFUSE, libfuse3 and desktop libraries) are not
@@ -117,17 +118,20 @@ the approval of this delivery method.
 
 ## Prepare the next release on GitHub
 
-The current development workspace version is 0.2.3. Tag the exact reviewed commit with
-the matching version after the release workflow has reached the default branch:
-
 The [Release builds workflow](../.github/workflows/release.yml) runs on a pushed
-version tag or manually from Actions. The tag must match the workspace version;
-for the reviewed 0.2.3 workspace, use `v0.2.3`. Push the reviewed source branch first. After
-it is merged, the maintainer can tag that exact approved commit:
+version tag or manually from Actions. The tag must match the workspace version
+in the root `Cargo.toml` (`v<version>`).
+
+1. Merge `docs/release-notes/v<version>.md`. The tag run uses the file from the
+   tagged commit as the draft release body.
+2. Run the workflow manually on the release branch. It runs every license,
+   build, linkage and packaging step and uploads workflow artifacts only, so
+   failures show up before a tag exists.
+3. After the reviewed branch is merged, tag that exact approved commit:
 
 ```bash
-git tag -a v0.2.3 <approved-commit> -m "StudioFS v0.2.3"
-git push origin v0.2.3
+git tag -a v<version> <approved-commit> -m "StudioFS v<version>"
+git push origin v<version>
 ```
 
 Do not retag a published version. Manual runs on a branch create workflow
