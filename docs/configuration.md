@@ -359,6 +359,24 @@ Notes:
   admission are local-first, so clients may temporarily overshoot the shared
   limit.
 
+### `compression` (planned)
+
+```bash
+studiofs compression <name> [off|zstd[:<level>]]
+```
+
+Planned by [ADR 0015](adr/0015-adaptive-zstd-payload-compression.md). Shows or
+changes the shared compression policy for remote payload fragments.
+
+Notes:
+- New volumes default to `zstd:3`; levels are 1 to 19. There is no client-local
+  override.
+- A fast probe stores incompressible fragments raw. The local cache always
+  stays uncompressed.
+- Mounted clients apply the change after replication, to fragments prepared for
+  upload afterwards. Existing objects are not rewritten.
+- Logical quota counts logical bytes regardless of compression.
+
 ### `umeta`
 
 ```bash

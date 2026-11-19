@@ -245,3 +245,17 @@ Fetch order:
 
 Authentication failure is a remote payload integrity failure. It must not fall
 back to plaintext decode or silently treat ciphertext as legacy object bytes.
+
+### Planned: compressed payload fragments
+
+[ADR 0015](adr/0015-adaptive-zstd-payload-compression.md) adds adaptive zstd
+compression between building the STFS object and encrypting it. Compressed
+fragments (STFS v3) are sealed with 64 KiB SFEC frames; uncompressed fragments
+keep 1 MiB frames, and the key-wrap associated data binds the frame size
+recorded in the header. Every plaintext boundary listed above stays
+uncompressed. Cold range reads of compressed fragments keep the same request
+shape: frame 0 carries the STFS header and the chunk seek table, and only the
+frames covering the needed chunks are authenticated and decompressed.
+Compression makes stored fragment size depend on content; this contract
+already leaves file sizes unencrypted, and the ADR records why that is
+accepted. Volumes that must hide compressibility use the `off` policy.

@@ -124,6 +124,12 @@ On read, object decode accepts `opendal::Buffer` directly, parses the fixed head
 This build writes raw (uncompressed) payload objects to minimize CPU overhead.
 LZ4-compressed objects return `LegacyCompressionUnsupported` if read.
 
+Planned: [ADR 0015](adr/0015-adaptive-zstd-payload-compression.md) adds STFS
+version 3 for compressed remote payload fragments: independent 128 KiB zstd
+chunks with a seek table after the header, codec and chunk geometry in the
+reserved bytes, and XXH64 still over the original payload. Uncompressed
+fragments keep version 2. `LEGACY_LZ4_COMPRESSED` stays rejected.
+
 ## Storage I/O Profiles
 
 To prevent background S3 uploads from overwhelming the connection pool and starving foreground reads, `studiofs-data` implements separate connection `IoProfile` pools via OpenDAL layers:
