@@ -13,10 +13,10 @@ raw, so compressible assets pay full S3 storage and WAN transfer.
 Every remote payload fragment is an STFS object (30-byte header plus up to
 4 MiB of payload) sealed in an `SFEC` envelope with 1 MiB XChaCha20-Poly1305
 frames ([encryption-at-rest contract](../encryption-at-rest-contract.md)).
-There is no plaintext remote
-mode. Cold random reads of 256 KiB or less fetch the SFEC prefix, frame 0 (which
-holds the STFS header), and only the frames covering the requested range. That
-path maps payload offsets to SFEC plaintext offsets one to one.
+There is no plaintext remote mode. Cold random reads of 256 KiB or less fetch
+the SFEC prefix, frame 0 (which holds the STFS header), and only the frames
+covering the requested range. That path maps payload offsets to SFEC plaintext
+offsets one to one.
 
 The STFS reader rejects `version > 2` and the legacy LZ4 flag, and parses flags
 with `from_bits_truncate`, so a new flag bit alone would read as a size or
