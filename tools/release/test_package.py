@@ -172,5 +172,13 @@ class ReleasePackageTests(unittest.TestCase):
             self.package()
 
 
+class WorkspaceManifestTests(unittest.TestCase):
+    def test_workspace_manifest_has_packaging_metadata(self) -> None:
+        manifest = package.tomllib.loads((Path(__file__).resolve().parents[2] / "Cargo.toml").read_text(encoding="utf-8"))
+        metadata = manifest["workspace"]["package"]
+        self.assertTrue(metadata["version"])
+        self.assertTrue(metadata["repository"].startswith("https://"))
+
+
 if __name__ == "__main__":
     unittest.main()

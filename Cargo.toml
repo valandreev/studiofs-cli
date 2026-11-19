@@ -20,6 +20,8 @@ version = "0.2.3"
 edition = "2024"
 rust-version = "1.95"
 license = "GPL-3.0-only"
+# Read by tools/release/package.py for packaged documentation links.
+repository = "https://github.com/valandreev/studiofs-cli"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
