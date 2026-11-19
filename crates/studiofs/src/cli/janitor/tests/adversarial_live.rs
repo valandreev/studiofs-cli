@@ -592,10 +592,10 @@ async fn live_cli_disposable_retires_abandoned_upload_but_protects_delayed_publi
         retired.get::<_, String>(0) == "delete_pending" && retired.get::<_, bool>(1),
         "settled unreferenced upload was not queued for deletion"
     );
-    // The CLI uses a whole-second cutoff; age the new candidate past that boundary.
+    // Keep the candidate eligible even when the PostgreSQL clock leads the CLI host.
     client
         .execute(
-            "UPDATE snapshot_payload_gc_candidates SET eligible_at = clock_timestamp() - interval '1 second' WHERE vol = $1 AND object_id = $2",
+            "UPDATE snapshot_payload_gc_candidates SET eligible_at = to_timestamp(1) WHERE vol = $1 AND object_id = $2",
             &[&volume_id, &i64::try_from(abandoned)?],
         )
         .await?;
