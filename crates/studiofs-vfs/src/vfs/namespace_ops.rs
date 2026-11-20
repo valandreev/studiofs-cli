@@ -2902,6 +2902,7 @@ impl StudioVfs {
         let mut confirmed_entry_inos = HashSet::new();
         let mut scratch_entry_inos = HashSet::new();
         let mut attrs_by_ino = HashMap::new();
+        let merges_extra_sources = !deferred_children.is_empty() || !scratch_children.is_empty();
         for (name, attr) in deferred_children {
             if existing_names.contains(&name) {
                 continue;
@@ -2934,8 +2935,11 @@ impl StudioVfs {
             }
         }
         // Keep merged tracked + deferred + scratch entries in a deterministic
-        // byte order so paginated readdir offsets stay stable.
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        // byte order so paginated readdir offsets stay stable. A tracked-only
+        // listing keeps the metadata order.
+        if merges_extra_sources {
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+        }
         if !entries.is_empty() {
             let child_inos = entries
                 .iter()
@@ -3509,25 +3513,29 @@ impl StudioVfs {
         candidate_parent: Ino,
         ancestor_dir: Ino,
     ) -> VfsResult<bool> {
+        const MAX_SCRATCH_ANCESTOR_HOPS: usize = 1024;
         let mut current = candidate_parent;
-        let mut hops = 0usize;
-        while current != 0 && current != super::ROOT_INO && hops < 1024 {
+        for _ in 0..MAX_SCRATCH_ANCESTOR_HOPS {
+            if current == 0 || current == super::ROOT_INO {
+                return Ok(false);
+            }
             if current == ancestor_dir {
                 return Ok(true);
             }
             match self.sync_meta().get_scratch_attr(current) {
-                Ok(attr) => {
-                    if attr.parent == current {
-                        break;
-                    }
-                    current = attr.parent;
-                }
-                Err(MetaError::InodeNotFound(_)) => break,
+                Ok(attr) if attr.parent == current => return Ok(false),
+                Ok(attr) => current = attr.parent,
+                // The walk left the scratch subtree; tracked ancestors cannot
+                // be inside a scratch directory.
+                Err(MetaError::InodeNotFound(_)) => return Ok(false),
                 Err(error) => return Err(VfsError::Meta(error)),
             }
-            hops += 1;
         }
-        Ok(false)
+        // A chain this deep is corrupt or cyclic; refuse rather than allow a
+        // move that could detach a subtree.
+        Err(VfsError::InvalidName(
+            "scratch directory ancestry exceeds the supported depth".to_string(),
+        ))
     }
 
     fn create_with_metadata_flush(
@@ -4710,17 +4718,28 @@ impl StudioVfs {
                 // Replacing a tracked entry with a scratch entry crosses classes.
                 return Err(VfsError::CrossDevice);
             }
-            let existing_scratch_dst = meta.lookup_scratch_entry(new_parent, new_name)?;
-            let keep_displaced_open = existing_scratch_dst.is_some_and(|dst_ino| {
-                dst_ino != src_scratch_ino && self.handle_table.open_count(dst_ino) > 0
-            });
-            if let Some(dst_ino) = existing_scratch_dst
-                && dst_ino != src_scratch_ino
-                && !keep_displaced_open
+            let displaced_scratch_dst = meta
+                .lookup_scratch_entry(new_parent, new_name)?
+                .filter(|dst_ino| *dst_ino != src_scratch_ino);
+            if let Some(dst_ino) = displaced_scratch_dst
+                && self.handle_table.open_count(dst_ino) == 0
             {
                 self.wait_for_deferred_materialization_inflight(dst_ino)
                     .await;
             }
+            // Same as scratch unlink: the Delete session orders the open-count
+            // check against concurrent opens of the displaced inode.
+            let _displaced_delete_session = match displaced_scratch_dst {
+                Some(dst_ino) => Some(
+                    self.state
+                        .file_session
+                        .enter_op(dst_ino, FileSessionOperation::Delete)
+                        .await,
+                ),
+                None => None,
+            };
+            let keep_displaced_open = displaced_scratch_dst
+                .is_some_and(|dst_ino| self.handle_table.open_count(dst_ino) > 0);
             let rename_result = meta.rename_scratch_entry(
                 parent,
                 name,
@@ -4927,29 +4946,17 @@ impl StudioVfs {
             // Demote (tracked -> scratch directory) lands in SFS-1079.
             return Err(VfsError::CrossDevice);
         }
-        let displaced_scratch_target = if let Some(dst_scratch_ino) =
-            meta.lookup_scratch_entry(new_parent, new_name)?
-        {
+        if meta.lookup_scratch_entry(new_parent, new_name)?.is_some() {
             if !replace_if_exists {
                 return Err(VfsError::Meta(MetaError::EntryExists {
                     parent: new_parent,
                     name: String::from_utf8_lossy(new_name).into_owned(),
                 }));
             }
-            let dst_attr = meta.get_scratch_attr(dst_scratch_ino)?;
-            if source_attr.kind == FileType::Directory && dst_attr.kind != FileType::Directory {
-                return Err(VfsError::Meta(MetaError::NotADirectory(dst_scratch_ino)));
-            }
-            if source_attr.kind != FileType::Directory && dst_attr.kind == FileType::Directory {
-                return Err(VfsError::Meta(MetaError::IsADirectory(dst_scratch_ino)));
-            }
-            if dst_attr.kind == FileType::Directory && meta.has_scratch_children(dst_scratch_ino)? {
-                return Err(VfsError::Meta(MetaError::DirNotEmpty(dst_scratch_ino)));
-            }
-            Some(dst_attr)
-        } else {
-            None
-        };
+            // Replacing a scratch entry with a tracked one crosses classes and
+            // cannot commit in one transaction until promote/demote land.
+            return Err(VfsError::CrossDevice);
+        }
         let target_is_trash = target_is_trash
             || (replace_if_exists
                 && (self.is_posix_trash_move_target_dir(new_parent)?
@@ -5034,37 +5041,6 @@ impl StudioVfs {
             meta.rename_atomic(parent, name, new_parent, new_name, replace_if_exists, true)?;
         if !rename_result.namespace_changed {
             return Ok(());
-        }
-        if let Some(displaced_scratch) = displaced_scratch_target {
-            if displaced_scratch.kind == FileType::Directory {
-                let _ = meta.rmdir_scratch_entry(new_parent, new_name);
-                self.state
-                    .namespace
-                    .dirty_attrs
-                    .lock()
-                    .remove(&displaced_scratch.ino);
-                self.bump_directory_generation(displaced_scratch.ino);
-                self.dentry_cache_invalidate_parent(displaced_scratch.ino);
-            } else {
-                let keep_open = self.handle_table.open_count(displaced_scratch.ino) > 0;
-                if !keep_open {
-                    self.wait_for_deferred_materialization_inflight(displaced_scratch.ino)
-                        .await;
-                }
-                if let Ok((_, freed_objects)) =
-                    meta.unlink_scratch_entry(new_parent, new_name, keep_open)
-                {
-                    if keep_open {
-                        self.handle_table.mark_orphan(displaced_scratch.ino);
-                    } else {
-                        self.cleanup_scratch_inode_runtime_and_payloads(
-                            displaced_scratch.ino,
-                            freed_objects,
-                        )
-                        .await;
-                    }
-                }
-            }
         }
         debug!(
             parent,

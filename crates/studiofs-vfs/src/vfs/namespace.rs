@@ -1344,7 +1344,6 @@ impl<'a> NamespaceMutationOps<'a> {
             None,
             false,
         );
-        self.vfs.ignore_rules.bump_dir_rename_epoch();
     }
 
     /// Records a local-only scratch insertion without waking ignore-rule scans.
@@ -1446,7 +1445,6 @@ impl<'a> NamespaceMutationOps<'a> {
             None,
             false,
         );
-        self.vfs.ignore_rules.bump_dir_rename_epoch();
     }
 
     /// Records successful rename/move and updates both old and new parent cache states.

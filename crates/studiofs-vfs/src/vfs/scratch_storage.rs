@@ -1046,6 +1046,27 @@ mod tests {
                 Err(VfsError::CrossDevice)
             ));
 
+            // A tracked entry replacing a scratch destination crosses classes;
+            // both entries stay intact.
+            let scratch_victim = vfs.create(ROOT_INO, b"victim.tmp", 0, 0, 0o644).unwrap();
+            assert!(matches!(
+                vfs.rename(ROOT_INO, b"doc.txt", ROOT_INO, b"victim.tmp", false),
+                Err(VfsError::Meta(MetaError::EntryExists { .. }))
+            ));
+            assert!(matches!(
+                vfs.rename(ROOT_INO, b"doc.txt", ROOT_INO, b"victim.tmp", true),
+                Err(VfsError::CrossDevice)
+            ));
+            assert_eq!(
+                vfs.lookup(ROOT_INO, b"victim.tmp").unwrap().ino,
+                scratch_victim.ino
+            );
+            assert_eq!(
+                vfs.lookup(ROOT_INO, b"doc.txt").unwrap().ino,
+                tracked_file.ino
+            );
+            assert!(meta.lookup(ROOT_INO, b"victim.tmp").is_err());
+
             // Discard paths stay in IgnoredEntryRegistry (not scratch).
             let spotlight = vfs
                 .mkdir(ROOT_INO, b".Spotlight-V100", 0, 0, 0o755)

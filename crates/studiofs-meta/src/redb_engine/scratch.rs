@@ -195,20 +195,16 @@ impl RedbMetaEngine {
         let txn = self.begin_read_txn()?;
         let loaded = ScratchIndex::load_from_read_txn(&txn)?;
         drop(txn);
-        *self
-            .scratch_index
-            .write()
-            .map_err(|_| storage_error("scratch index lock poisoned"))? = loaded;
+        *self.scratch_index_write() = loaded;
         Ok(())
     }
 
-    fn rebuild_scratch_index_under_mutation_lock(&self) {
-        if let Ok(txn) = self.begin_read_txn()
-            && let Ok(loaded) = ScratchIndex::load_from_read_txn(&txn)
-            && let Ok(mut guard) = self.scratch_index.write()
-        {
-            *guard = loaded;
-        }
+    /// The index holds only counters that every mutation keeps consistent
+    /// before it can panic, so a poisoned lock still guards valid state.
+    fn scratch_index_write(&self) -> std::sync::RwLockWriteGuard<'_, ScratchIndex> {
+        self.scratch_index
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn scratch_index_contains_inode(&self, ino: Ino) -> MetaResult<bool> {
@@ -304,12 +300,11 @@ impl RedbMetaEngine {
             }
         }
         // Record in index before commit so concurrent readers never miss a committed row.
-        self.scratch_index
-            .write()
-            .map_err(|_| storage_error("scratch index lock poisoned"))?
-            .note_insert(parent, attr.ino);
+        self.scratch_index_write().note_insert(parent, attr.ino);
         if let Err(error) = txn.commit() {
-            self.rebuild_scratch_index_under_mutation_lock();
+            let mut index = self.scratch_index_write();
+            index.note_remove_dentry(parent);
+            index.note_remove_inode(attr.ino);
             return Err(error);
         }
         Ok(())
@@ -722,10 +717,7 @@ impl RedbMetaEngine {
             }
         };
         txn.commit()?;
-        let mut index = self
-            .scratch_index
-            .write()
-            .map_err(|_| storage_error("scratch index lock poisoned"))?;
+        let mut index = self.scratch_index_write();
         index.note_remove_dentry(parent);
         if let Some(ino) = removed_inode {
             index.note_remove_inode(ino);
@@ -757,10 +749,7 @@ impl RedbMetaEngine {
         };
         txn.commit()?;
         if removed {
-            self.scratch_index
-                .write()
-                .map_err(|_| storage_error("scratch index lock poisoned"))?
-                .note_remove_inode(ino);
+            self.scratch_index_write().note_remove_inode(ino);
         }
         Ok(freed_objects)
     }
@@ -814,10 +803,7 @@ impl RedbMetaEngine {
             attr
         };
         txn.commit()?;
-        let mut index = self
-            .scratch_index
-            .write()
-            .map_err(|_| storage_error("scratch index lock poisoned"))?;
+        let mut index = self.scratch_index_write();
         index.note_remove_dentry(parent);
         index.note_remove_inode(attr.ino);
         Ok(attr)
@@ -953,11 +939,12 @@ impl RedbMetaEngine {
             // Remove displaced scratch dentry & inode (or mark orphan if open).
             let mut removed_object_ids = Vec::new();
             let mut final_displaced = None;
-            if let Some((dst_stored_name, dst_ino)) = dst_opt {
+            if let (Some((dst_stored_name, dst_ino)), Some(mut dst_attr)) =
+                (dst_opt, displaced_attr)
+            {
                 let _ = dentries
                     .remove(encode_dentry_key(new_parent, &dst_stored_name).as_slice())
                     .map_err(storage_error)?;
-                let mut dst_attr = displaced_attr.expect("displaced attr loaded");
                 dst_attr.nlink = if dst_attr.kind == FileType::Directory {
                     0
                 } else {
@@ -1042,19 +1029,15 @@ impl RedbMetaEngine {
         };
 
         if moved_across_parents {
-            self.scratch_index
-                .write()
-                .map_err(|_| storage_error("scratch index lock poisoned"))?
-                .note_increment_parent(new_parent);
+            self.scratch_index_write().note_increment_parent(new_parent);
         }
         if let Err(error) = txn.commit() {
-            self.rebuild_scratch_index_under_mutation_lock();
+            if moved_across_parents {
+                self.scratch_index_write().note_remove_dentry(new_parent);
+            }
             return Err(error);
         }
-        let mut index = self
-            .scratch_index
-            .write()
-            .map_err(|_| storage_error("scratch index lock poisoned"))?;
+        let mut index = self.scratch_index_write();
         if moved_across_parents {
             index.note_remove_dentry(parent);
         }

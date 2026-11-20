@@ -199,8 +199,9 @@ impl IgnoreRules {
         }
     }
 
-    /// Invalidate cached per-directory compiled rules after a directory move,
-    /// removal, or foreign namespace reset.
+    /// Invalidate cached per-directory compiled rules after a local rename or
+    /// a foreign entry change or reset. Removals need no bump: inode numbers
+    /// are never reused, so a removed directory's cache slot is unreachable.
     pub(super) fn bump_dir_rename_epoch(&self) {
         self.dir_rename_epoch.fetch_add(1, Ordering::AcqRel);
     }
