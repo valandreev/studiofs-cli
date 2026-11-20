@@ -10252,6 +10252,9 @@ impl StudioVfs {
                 encrypted_object_read_failures: fetch_encrypted_object_read_failures,
                 malformed_encrypted_objects: fetch_malformed_encrypted_objects,
                 prefetch_skips: fetch_prefetch_skips,
+                cache_scrub_refetch_failures: self
+                    .cache_scrub_refetch_failures
+                    .load(Ordering::Relaxed),
                 readahead_scheduled_blocks,
                 readahead_dropped_blocks,
                 prefetch_ingress_depth,

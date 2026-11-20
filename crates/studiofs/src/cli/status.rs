@@ -1100,6 +1100,10 @@ pub fn run(
                 snapshot.fetch.prefetch_skips
             );
             println!(
+                "  cache scrub refetch failures: {}",
+                snapshot.fetch.cache_scrub_refetch_failures
+            );
+            println!(
                 "  crypto read objects/bytes/failures/malformed: {}/{}/{}/{}",
                 snapshot.fetch.encrypted_objects_read,
                 format_bytes(snapshot.fetch.encrypted_bytes_read),

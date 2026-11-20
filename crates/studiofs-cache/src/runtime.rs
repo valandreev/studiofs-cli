@@ -2771,12 +2771,15 @@ mod tests {
 
         backend.put(1, b"hello", false).unwrap();
         let dirty = backend.index.get_entry(1).unwrap().unwrap();
-        assert_eq!(backend.check_scrub_entry(&dirty).unwrap(), None);
-        assert_eq!(backend.check_scrub_entry(&entry).unwrap(), None);
+        assert_eq!(dirty.lifecycle, LocalPayloadLifecycleState::Dirty);
+        assert_eq!(dirty.xxh64, None);
         backend.put_scrub_refetch(1, b"remote", None).unwrap();
         assert!(backend.index.get_entry(1).unwrap().unwrap() == dirty);
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         std::fs::write(&path, b"HELLO").unwrap();
+        // A scan can still hold the uploaded row after the payload becomes Dirty.
+        assert_eq!(entry.xxh64, Some(hello_xxh64));
+        assert_eq!(backend.check_scrub_entry(&entry).unwrap(), None);
         assert_eq!(
             backend.evict_corrupt(1, &observe()).unwrap(),
             CorruptEvictionOutcome::NotEligible

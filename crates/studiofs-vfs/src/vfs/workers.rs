@@ -3675,6 +3675,130 @@ mod tests {
     }
 
     #[test]
+    fn cache_scrub_paces_checksumless_pages_and_resumes_after_shutdown() {
+        use studiofs_cache::LocalPayloadLayout;
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("cache-scrub-resume");
+        let (_mount_rt, vfs, _) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "cache-scrub-resume");
+        let backend = vfs
+            .local_payload_backend
+            .as_any()
+            .downcast_ref::<studiofs_cache::PersistentLocalPayloadBackend>()
+            .unwrap();
+        let index = backend.scrub_index();
+        for id in 1..=33 {
+            backend.put(id, b"hello", true).unwrap();
+            assert_eq!(index.get_entry(id).unwrap().unwrap().xxh64, None);
+        }
+        let config = CacheScrubConfig {
+            iops: 1,
+            ..vfs.cache_scrub.unwrap()
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let shutdown = CancellationToken::new();
+                let pass = vfs.run_cache_scrub(backend, config, &shutdown);
+                tokio::pin!(pass);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(1500), &mut pass)
+                        .await
+                        .is_err(),
+                    "the second checksumless page must consume another operation"
+                );
+                assert_eq!(index.scrub_cursor().unwrap().last_object_id, None);
+                shutdown.cancel();
+                pass.await.unwrap();
+                let checkpoint = index.scrub_cursor().unwrap();
+                assert_eq!(checkpoint.last_object_id, Some(32));
+                assert_eq!(checkpoint.completed_ms, 0);
+
+                let layout = LocalPayloadLayout::from_cache_root(tmp.path().join("cache"));
+                backend
+                    .put_with_checksum(1, b"hello", true, Some(0x26c7827d889f6da3))
+                    .unwrap();
+                std::fs::write(layout.payload_object_path(1), b"HELLO").unwrap();
+                let permit = vfs.qos.acquire_foreground_local_io(1).await.unwrap();
+                let shutdown = CancellationToken::new();
+                let resumed = vfs.run_cache_scrub(backend, config, &shutdown);
+                tokio::pin!(resumed);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(2500), &mut resumed)
+                        .await
+                        .is_err(),
+                    "checksumless pages must yield to foreground I/O"
+                );
+                drop(permit);
+                tokio::time::timeout(Duration::from_secs(4), resumed)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(backend.get(1).unwrap().as_ref(), b"HELLO");
+                let completed = index.scrub_cursor().unwrap();
+                assert_eq!(completed.started_ms, checkpoint.started_ms);
+                assert_eq!(completed.last_object_id, None);
+                assert_ne!(completed.completed_ms, 0);
+            });
+    }
+
+    #[test]
+    fn cache_scrub_preserves_rewrite_between_detection_and_eviction() {
+        use studiofs_cache::LocalPayloadLayout;
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("cache-scrub-rewrite");
+        let (_mount_rt, vfs, _) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "cache-scrub-rewrite");
+        let backend = vfs
+            .local_payload_backend
+            .as_any()
+            .downcast_ref::<studiofs_cache::PersistentLocalPayloadBackend>()
+            .unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(tmp.path().join("cache"));
+        let checksum = Some(0x26c7827d889f6da3);
+        backend
+            .put_with_checksum(1, b"hello", true, checksum)
+            .unwrap();
+        std::fs::write(layout.payload_object_path(1), b"HELLO").unwrap();
+        let config = CacheScrubConfig {
+            bytes_per_sec: 1,
+            ..vfs.cache_scrub.unwrap()
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let shutdown = CancellationToken::new();
+                let pass = vfs.run_cache_scrub(backend, config, &shutdown);
+                tokio::pin!(pass);
+                // One hash takes five seconds of byte credit, and a recheck takes five more.
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(6), &mut pass)
+                        .await
+                        .is_err()
+                );
+                backend
+                    .put_with_checksum(1, b"hello", true, checksum)
+                    .unwrap();
+                std::fs::write(layout.payload_object_path(1), b"Hallo").unwrap();
+                tokio::time::timeout(Duration::from_secs(6), pass)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(backend.get(1).unwrap().as_ref(), b"Hallo");
+                assert_ne!(
+                    backend.scrub_index().scrub_cursor().unwrap().completed_ms,
+                    0
+                );
+            });
+    }
+
+    #[test]
     fn cache_scrub_repairs_clean_corrupt_missing_and_short_payloads() {
         use opendal::{Operator, services::Memory};
         use studiofs_cache::LocalPayloadLayout;
@@ -3693,6 +3817,7 @@ mod tests {
             )
             .unwrap(),
         );
+        let transit = crate::qos::TransitMemoryBudget::new(64 * 1024 * 1024);
         Arc::get_mut(&mut vfs).unwrap().fetch_scheduler =
             Arc::new(crate::fetch::FetchScheduler::new(
                 data_store.clone(),
@@ -3700,7 +3825,7 @@ mod tests {
                 crate::aimd::AimdConfig::fetch_default(),
                 0,
                 vfs.qos.clone(),
-                crate::qos::TransitMemoryBudget::new(64 * 1024 * 1024),
+                transit.clone(),
                 &config,
             ));
         let layout = LocalPayloadLayout::from_cache_root(tmp.path().join("cache"));
@@ -3754,6 +3879,61 @@ mod tests {
             }
             assert_eq!(backend.get(4).unwrap().as_ref(), b"local only");
             assert_eq!(vfs.cache_scrub_refetch_failures.load(Ordering::Relaxed), 0);
+
+            backend
+                .scrub_index()
+                .save_scrub_cursor(Default::default())
+                .unwrap();
+            std::fs::write(layout.payload_object_path(1), b"HELLO").unwrap();
+            let credit = transit.acquire_foreground(transit.budget_bytes()).await;
+            let fetches = vfs
+                .fetch_scheduler
+                .metrics
+                .s3_fetches
+                .load(Ordering::Relaxed);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                vfs.run_cache_scrub(backend, config, &shutdown),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(backend.scrub_index().get_entry(1).unwrap().is_none());
+            assert_eq!(
+                vfs.fetch_scheduler
+                    .metrics
+                    .s3_fetches
+                    .load(Ordering::Relaxed),
+                fetches
+            );
+            assert_eq!(
+                vfs.fetch_scheduler
+                    .metrics
+                    .prefetch_skips
+                    .load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(vfs.cache_scrub_refetch_failures.load(Ordering::Relaxed), 0);
+            drop(credit);
+
+            backend
+                .scrub_index()
+                .save_scrub_cursor(Default::default())
+                .unwrap();
+            std::fs::write(layout.payload_object_path(2), b"HELLO").unwrap();
+            transit.set_budget_bytes(1);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                vfs.run_cache_scrub(backend, config, &shutdown),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(backend.scrub_index().get_entry(2).unwrap().is_none());
+            assert_eq!(
+                vfs.runtime_stats_snapshot().cache.counters["cache_scrub_refetch_failures"].value,
+                1
+            );
 
             vfs.spawn_cache_scrub_worker();
             assert_eq!(vfs.state.shutdown.background_tasks.lock().len(), 1);
@@ -4745,7 +4925,10 @@ impl StudioVfs {
         config: CacheScrubConfig,
         shutdown: &CancellationToken,
     ) -> Result<(), studiofs_cache::local::LocalPayloadBackendError> {
+        use crate::fetch::FetchError;
         use studiofs_cache::local::{CorruptEvictionOutcome, LocalPayloadBackend, ObservedPayload};
+
+        const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
         let index = backend.scrub_index();
         let mut cursor = run_local_cache_io(|| index.scrub_cursor()).0?;
         let now = tokio::time::Instant::now();
@@ -4766,7 +4949,20 @@ impl StudioVfs {
             cursor.completed_ms = 0;
             run_local_cache_io(|| index.save_scrub_cursor(cursor)).0?;
         }
+        let mut last_checkpoint = tokio::time::Instant::now();
+        let mut saved_object_id = cursor.last_object_id;
         while !shutdown.is_cancelled() {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                _ = async {
+                    let wait = ops.reserve(1, tokio::time::Instant::now());
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                    self.qos.wait_foreground_local_io_idle().await;
+                } => {}
+            }
             let page = run_local_cache_io(|| index.scrub_page(cursor.last_object_id, 32)).0?;
             if page.is_empty() {
                 cursor.last_object_id = None;
@@ -4775,6 +4971,7 @@ impl StudioVfs {
                     .0
                     .map_err(Into::into);
             }
+            let mut checked = false;
             for entry in page {
                 if shutdown.is_cancelled() {
                     break;
@@ -4796,6 +4993,7 @@ impl StudioVfs {
                         _ = pace() => {}
                     }
                     let corruption = run_local_cache_io(|| backend.check_scrub_entry(&entry)).0;
+                    checked = true;
                     match corruption {
                         Ok(Some(kind)) => {
                             let object_id = entry.object_id;
@@ -4816,9 +5014,15 @@ impl StudioVfs {
                                     tokio::select! {
                                         _ = shutdown.cancelled() => break,
                                         result = self.fetch_scheduler.refetch_scrubbed_payload(object_id, &keys) => {
-                                            if result.is_err() {
-                                                self.cache_scrub_refetch_failures.fetch_add(1, Ordering::Relaxed);
-                                                error!(object_id, "cache scrub refetch failed");
+                                            match result {
+                                                Ok(_) => {}
+                                                Err(FetchError::PrefetchSkipped) => {
+                                                    debug!(object_id, "cache scrub refetch deferred by prefetch admission");
+                                                }
+                                                Err(_) => {
+                                                    self.cache_scrub_refetch_failures.fetch_add(1, Ordering::Relaxed);
+                                                    error!(object_id, "cache scrub refetch failed");
+                                                }
                                             }
                                         }
                                     }
@@ -4837,6 +5041,13 @@ impl StudioVfs {
                 }
                 cursor.last_object_id = Some(entry.object_id);
             }
+            if checked || last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
+                run_local_cache_io(|| index.save_scrub_cursor(cursor)).0?;
+                saved_object_id = cursor.last_object_id;
+                last_checkpoint = tokio::time::Instant::now();
+            }
+        }
+        if cursor.last_object_id != saved_object_id {
             run_local_cache_io(|| index.save_scrub_cursor(cursor)).0?;
         }
         Ok(())

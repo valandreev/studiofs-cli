@@ -14,6 +14,7 @@ it with `studiofs mount`.
 - [x] Wire the scrub worker, cursor, rate limits, QoS idle notification, and configuration.
 - [x] Add focused tests for repair, cursor persistence, rate limits, QoS, and shutdown.
 - [x] Pass the required VFS and cache tests, formatting, and Clippy.
+- [x] Address PR review findings and validate page pacing, restart, rewrite, and refetch reporting.
 
 ## Surprises & Discoveries
 
@@ -23,15 +24,17 @@ bytes.
 
 ## Decision Log
 
-Persist the last object ID and the pass timestamps in one cache index
-transaction. Checkpoint after each 32-row page and on a cooperative shutdown.
-A crash can replay the unfinished page. Store completion time so the pass
-interval applies across mount restarts.
+Persist the last object ID and pass timestamps in one cache index transaction.
+Checkpoint after a 32-row page that verified a payload, or after 60 seconds
+of scanning pages without checksums. Save pending progress on cooperative
+shutdown and completion time at the end of each pass. A crash can replay
+progress after the most recent checkpoint.
 
 Track the task through the existing VFS background task owner. Observe the
 foreground semaphore through a notification issued when all permits are
-returned. Reserve bytes and operations before the optimistic read and again
-before a corruption recheck.
+returned. Reserve one operation before each index page read. Reserve bytes and
+operations before the optimistic payload read and again before a corruption
+recheck. Count refetch errors separately from prefetch admission skips.
 
 ## Validation and Acceptance
 
@@ -49,3 +52,7 @@ On Windows, the focused VFS run passed 3 tests and the cache run passed 290
 tests. Clippy passed for all targets of the three changed crates. The VFS
 tests use an in-memory object store. Mounted acceptance and status reporting
 are tracked separately from this worker.
+
+The PR review follow-up reproduced the pacing and skip-accounting failures
+before the fix. The Windows rerun passed 5 scrub tests, 290 cache tests, and
+the focused mount-tuning test. Clippy, formatting, and diff checks passed.
