@@ -23,17 +23,20 @@ impl StudioVfs {
 
     /// Accepts scratch bytes into the mounted writer stack.
     ///
-    /// The caller owns namespace and access checks and schedules ordinary
-    /// writeback through the same flush/release entry points as tracked files.
+    /// The caller owns namespace and access checks. Like an opportunistic
+    /// tracked write, admission applies the dirty-buffer backpressure and the
+    /// accepted bytes start background materialization; flush and release use
+    /// the same entry points as tracked files.
     pub async fn write_scratch(
-        &self,
+        self: &Arc<Self>,
         fh: u64,
         ino: Ino,
         offset: u64,
         data: &[u8],
     ) -> VfsResult<u32> {
         self.enforce_metadata_mutation_authority(ino)?;
-        let _session = self.file_session_cleanup(ino).with_permit(
+        self.maybe_throttle_write_admission(data.len()).await;
+        let session = self.file_session_cleanup(ino).with_permit(
             self.state
                 .file_session
                 .enter_op(ino, FileSessionOperation::Write)
@@ -66,6 +69,10 @@ impl StudioVfs {
                 data,
             )
             .map_err(|error| error.into_vfs_error("scratch writer stack write failed"))?;
+        drop(session);
+        if accepted.accepted_bytes > 0 {
+            self.spawn_deferred_materialization_if_needed(ino);
+        }
         Ok(accepted.accepted_bytes)
     }
 
@@ -168,7 +175,11 @@ mod tests {
             let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs_at(
                 Path::new(&root),
                 VOLUME,
-                VfsConfig::default(),
+                // Keep writeback out of the write-path observations below.
+                VfsConfig {
+                    disable_background_slab_flush: true,
+                    ..VfsConfig::default()
+                },
                 None,
             );
             let settings = meta.volume_settings().unwrap();
@@ -319,6 +330,30 @@ mod tests {
         assert_eq!(
             meta.get_scratch_attr(attr.ino).unwrap().size,
             DATA.len() as u64
+        );
+    }
+
+    #[test]
+    fn scratch_write_schedules_background_materialization() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-writeback-");
+        let (runtime, vfs, _meta) = super::super::tests::make_unstarted_test_vfs(&temp, VOLUME);
+        let attr = vfs
+            .store_scratch_entry(NAME, InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
+            .unwrap();
+        let block = vec![7u8; vfs.block_size as usize];
+        runtime.block_on(async {
+            vfs.write_scratch(0, attr.ino, 0, &block).await.unwrap();
+            // Like a tracked write, accepted bytes start writeback without a flush.
+            vfs.wait_for_deferred_materialization_inflight(attr.ino)
+                .await;
+        });
+        assert_eq!(vfs.state.writer_stack.dirty_bytes_for_inode(attr.ino), 0);
+        assert_eq!(
+            vfs.cached_store
+                .cache_pipeline_metrics()
+                .upload_queue
+                .submitted,
+            0
         );
     }
 
