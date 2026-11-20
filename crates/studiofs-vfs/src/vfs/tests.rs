@@ -3457,6 +3457,8 @@ fn make_test_vfs(
     let (rt, vfs, meta) = make_unstarted_test_vfs(tmp, volume_suffix);
     let _guard = rt.enter();
     vfs.start().expect("start vfs background workers");
+    // Like the mount, wait out the first rule inventory and its one-time cache write.
+    rt.block_on(vfs.wait_for_ignore_rules_bootstrap());
     (rt, vfs, meta)
 }
 
@@ -3468,6 +3470,8 @@ fn make_test_vfs_with_config(
     let (rt, vfs, meta) = make_unstarted_test_vfs_with_config(tmp, volume_suffix, cfg);
     let _guard = rt.enter();
     vfs.start().expect("start vfs background workers");
+    // Like the mount, wait out the first rule inventory and its one-time cache write.
+    rt.block_on(vfs.wait_for_ignore_rules_bootstrap());
     (rt, vfs, meta)
 }
 
