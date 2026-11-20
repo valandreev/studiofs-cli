@@ -1049,3 +1049,46 @@ fn table_removals_of_absent_keys_remain_idempotent() {
         Err(MetaError::EntryNotFound { .. })
     ));
 }
+
+#[test]
+fn ignore_rules_cache_is_local_only_and_survives_reopen() {
+    use crate::MetaReplication;
+
+    let dir = studiofs_test_support::workspace_target_tempdir("ignore-rules-cache-");
+    let path = dir.path().join("test.db");
+    let engine = RedbMetaEngine::open(&path).unwrap();
+    engine.init_root(1000, 1000).unwrap();
+    let seq_before = engine.get_counter(NEXT_EVENT_SEQ).unwrap();
+    let events_before = engine
+        .begin_read_txn()
+        .unwrap()
+        .open_table(EVENT_LOG_TABLE)
+        .unwrap()
+        .len()
+        .unwrap();
+    let _ = engine.take_invalidation_batches();
+    assert_eq!(engine.load_ignore_rules_cache().unwrap(), None);
+
+    engine.store_ignore_rules_cache(b"first").unwrap();
+    engine.store_ignore_rules_cache(b"second").unwrap();
+
+    assert_eq!(engine.get_counter(NEXT_EVENT_SEQ).unwrap(), seq_before);
+    assert_eq!(
+        engine
+            .begin_read_txn()
+            .unwrap()
+            .open_table(EVENT_LOG_TABLE)
+            .unwrap()
+            .len()
+            .unwrap(),
+        events_before
+    );
+    assert!(engine.take_invalidation_batches().is_empty());
+    drop(engine);
+
+    let reopened = RedbMetaEngine::open(&path).unwrap();
+    assert_eq!(
+        reopened.load_ignore_rules_cache().unwrap().as_deref(),
+        Some(b"second".as_slice())
+    );
+}
