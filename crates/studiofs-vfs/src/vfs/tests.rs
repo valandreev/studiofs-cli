@@ -3361,7 +3361,21 @@ fn make_unstarted_test_vfs_with_optional_debug_pending_path_reader(
     cfg: VfsConfig,
     debug_pending_path_suffix_reader: Option<fn() -> Option<DebugPendingPathSuffix>>,
 ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
-    let db_path = tmp.path().join("meta.redb");
+    make_unstarted_test_vfs_at(
+        tmp.path(),
+        volume_suffix,
+        cfg,
+        debug_pending_path_suffix_reader,
+    )
+}
+
+pub(super) fn make_unstarted_test_vfs_at(
+    root: &Path,
+    volume_suffix: &str,
+    cfg: VfsConfig,
+    debug_pending_path_suffix_reader: Option<fn() -> Option<DebugPendingPathSuffix>>,
+) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+    let db_path = root.join("meta.redb");
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
     meta.init_root(0, 0).expect("init root");
 
@@ -3369,7 +3383,7 @@ fn make_unstarted_test_vfs_with_optional_debug_pending_path_reader(
     meta.set_format_info(&format_info).expect("set format info");
     let data_config = DataStoreConfig::from(&format_info);
 
-    let cache_dir = tmp.path().join("cache");
+    let cache_dir = root.join("cache");
     let rt = Arc::new(Runtime::new().expect("runtime"));
     let _guard = rt.enter();
     let cache_dir = cache_dir.to_str().expect("cache dir str");
@@ -3443,6 +3457,8 @@ fn make_test_vfs(
     let (rt, vfs, meta) = make_unstarted_test_vfs(tmp, volume_suffix);
     let _guard = rt.enter();
     vfs.start().expect("start vfs background workers");
+    // Like the mount, wait out the first rule inventory and its one-time cache write.
+    rt.block_on(vfs.wait_for_ignore_rules_bootstrap());
     (rt, vfs, meta)
 }
 
@@ -3454,6 +3470,8 @@ fn make_test_vfs_with_config(
     let (rt, vfs, meta) = make_unstarted_test_vfs_with_config(tmp, volume_suffix, cfg);
     let _guard = rt.enter();
     vfs.start().expect("start vfs background workers");
+    // Like the mount, wait out the first rule inventory and its one-time cache write.
+    rt.block_on(vfs.wait_for_ignore_rules_bootstrap());
     (rt, vfs, meta)
 }
 

@@ -471,6 +471,17 @@ impl LocalPayloadBackendRuntime {
         result
     }
 
+    /// Run physical pressure eviction with a synthetic low-space sample.
+    #[cfg(feature = "test-utils")]
+    pub fn run_low_disk_space_for_test(&self) -> Result<(), LocalPayloadBackendError> {
+        self.run_disk_pressure_maintenance(Instant::now(), |_| {
+            Ok(platform::FilesystemSpace {
+                available_bytes: 0,
+                total_bytes: 1 << 30,
+            })
+        })
+    }
+
     #[cfg(test)]
     fn fail_next_index_write_for_test(&self) {
         self.index.fail_next_write_for_test();

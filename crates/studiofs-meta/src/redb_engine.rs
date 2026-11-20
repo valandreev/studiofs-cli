@@ -1450,6 +1450,28 @@ mod upload_ledger;
 mod xattr;
 
 impl MetaEngineCore for RedbMetaEngine {
+    fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {
+        let txn = self.begin_read_txn()?;
+        let table = match txn.open_table(IGNORE_RULES_CACHE) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(error) => return Err(MetaError::Storage(error.to_string())),
+        };
+        Ok(table
+            .get(0)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .map(|row| row.value().to_vec()))
+    }
+
+    fn store_ignore_rules_cache(&self, snapshot: &[u8]) -> MetaResult<()> {
+        let txn = self.begin_immediate_write_txn()?;
+        txn.open_table(IGNORE_RULES_CACHE)
+            .map_err(|error| MetaError::Storage(error.to_string()))?
+            .insert(0, snapshot)
+            .map_err(|error| MetaError::Storage(error.to_string()))?;
+        txn.commit()
+    }
+
     fn metadata_write_observability(&self) -> MetadataWriteObservability {
         self.write_metrics.snapshot()
     }

@@ -53,6 +53,10 @@
 //! only for its own bookkeeping. These gates are outside `LockTier` and
 //! `LockOrderGuard`.
 //!
+//! The ignore rule snapshot lock and watched-inode mutex are leaves outside
+//! `LockTier`. Callers may hold any tier while taking them, but nothing else is
+//! acquired, awaited, or classified while either is held.
+//!
 //! `NamespaceState::quota_reservations` serializes logical quota admission
 //! on one client. It is taken only when a quota is configured, before
 //! `dirty_attrs` and local metadata read transactions, and it is held across
@@ -81,6 +85,10 @@
 //! cached-store pin accounting. Batch gates are deduplicated and acquired in
 //! ascending stripe order. These auxiliary locks are outside `LockTier` and
 //! `LockOrderGuard`; the ordering is enforced by the call structure.
+//!
+//! Ignore-rule pin accounting takes its own mutex before backend stripe gates
+//! and never takes the cached-store pin mutex. The watched-inode mutex and local
+//! metadata reads are released before entering this pin accounting.
 //!
 //! Writer upload byte accounting acquires
 //! `CachedStore::pending_upload_bytes_by_object` before staged queue submission,

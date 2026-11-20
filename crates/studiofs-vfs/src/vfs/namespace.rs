@@ -1303,6 +1303,12 @@ impl<'a> NamespaceMutationOps<'a> {
             &[parent],
             &[(parent, name, DentryCacheValue::Positive(child))],
         );
+        self.vfs.ignore_rules.note_local_entry(
+            self.vfs.meta.sync_view().as_ref(),
+            name,
+            Some(child),
+            true,
+        );
     }
 
     /// Records ignored insertions where filesystem state is already visible elsewhere.
@@ -1331,6 +1337,12 @@ impl<'a> NamespaceMutationOps<'a> {
             self.started_epoch,
             &[parent],
             &[(parent, name, DentryCacheValue::Negative)],
+        );
+        self.vfs.ignore_rules.note_local_entry(
+            self.vfs.meta.sync_view().as_ref(),
+            name,
+            None,
+            false,
         );
     }
 
@@ -1366,6 +1378,12 @@ impl<'a> NamespaceMutationOps<'a> {
             &[parent],
             &[(parent, name, DentryCacheValue::Negative)],
         );
+        self.vfs.ignore_rules.note_local_entry(
+            self.vfs.meta.sync_view().as_ref(),
+            name,
+            None,
+            false,
+        );
     }
 
     /// Records successful rename/move and updates both old and new parent cache states.
@@ -1391,6 +1409,18 @@ impl<'a> NamespaceMutationOps<'a> {
                 (parent, name, DentryCacheValue::Negative),
                 (new_parent, new_name, DentryCacheValue::Positive(moved_ino)),
             ],
+        );
+        self.vfs.ignore_rules.note_local_entry(
+            self.vfs.meta.sync_view().as_ref(),
+            name,
+            Some(moved_ino),
+            false,
+        );
+        self.vfs.ignore_rules.note_local_entry(
+            self.vfs.meta.sync_view().as_ref(),
+            new_name,
+            Some(moved_ino),
+            true,
         );
     }
 }

@@ -503,6 +503,10 @@ impl VfsBootstrap {
         };
 
         Arc::new(StudioVfs {
+            ignore_rules: super::ignore_rules::IgnoreRules::load(
+                meta.as_ref(),
+                resources.local_payload_backend.clone(),
+            ),
             meta: MetaExecutor::new(meta),
             read_only_mount,
             debug_pending_path_suffix: debug_pending_path_suffix_reader(),

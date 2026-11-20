@@ -5,6 +5,10 @@ use super::*;
 /// Format info: "format" -> JSON bytes
 pub(super) const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
 
+/// Mount-local last-good ignore rule sources, excluded from replication.
+pub(super) const IGNORE_RULES_CACHE: TableDefinition<u8, &[u8]> =
+    TableDefinition::new("ignore_rules_cache");
+
 /// Counters: counter_name -> u64 (as bytes)
 pub(super) const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
 

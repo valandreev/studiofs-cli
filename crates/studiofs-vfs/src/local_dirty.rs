@@ -1545,6 +1545,9 @@ impl<'a> LocalDirtyFlushSession<'a> {
             self.vfs.record_live_extents(&live_extents);
             // submit_uploads_batch pins payloads before the uploader creates
             // stage hardlinks, so cache eviction cannot remove them in between.
+            self.vfs
+                .ignore_rules
+                .pin_objects(self.ino, upload_ops.iter().map(|op| op.3));
             self.vfs.cached_store.submit_uploads_batch(&upload_ops);
             self.vfs.state.file_session.note_background_transition(
                 self.ino,

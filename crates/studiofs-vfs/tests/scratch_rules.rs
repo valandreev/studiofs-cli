@@ -1,3 +1,6 @@
+//! Integration tests for `.studiofsignore` parsing and path classification,
+//! including parity checks that require `git check-ignore`.
+
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;

@@ -313,6 +313,8 @@ impl<M: ?Sized + UploadedFragmentLedger> UploadedFragmentLedger for RuntimeMetaH
 }
 
 impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
+    forward_method!(fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>>);
+    forward_method!(fn store_ignore_rules_cache(&self, snapshot: &[u8]) -> MetaResult<()>);
     forward_method!(fn metadata_write_observability(&self) -> MetadataWriteObservability);
     forward_method!(fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool>);
     forward_method!(fn release_global_janitor_lock(&self) -> MetaResult<()>);

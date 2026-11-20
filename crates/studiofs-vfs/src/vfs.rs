@@ -30,6 +30,7 @@ mod config;
 mod deletion_cleanup;
 mod file_session;
 mod handle_table;
+mod ignore_rules;
 mod ignored_entries;
 mod io_ops;
 #[path = "local_dirty.rs"]
@@ -4187,6 +4188,7 @@ type RetainedRestoreHook = Arc<
 
 /// The core VFS - satisfies filesystem operations using metadata + data + cache.
 pub struct StudioVfs {
+    ignore_rules: ignore_rules::IgnoreRules,
     /// Preferred metadata execution boundary for hot-path call sites.
     meta: MetaExecutor<dyn VfsMeta>,
     /// Whether this VFS is backed by an immutable snapshot artifact.
@@ -5525,6 +5527,11 @@ impl StudioVfs {
         }: StartupChannels,
     ) -> VfsResult<()> {
         self.run_startup_local_metadata_compaction();
+        // After compaction, whose exclusive database lock a rule scan would contend.
+        let vfs = self.clone();
+        self.spawn_background_cleanup_task_on(&tokio::runtime::Handle::current(), async move {
+            vfs.background_ignore_rules().await;
+        });
         self.spawn_landing_zone_recovery_worker();
         self.spawn_aggressive_materialization_worker();
         self.spawn_local_dirty_flush_worker();

@@ -1340,6 +1340,16 @@ impl MetadataReplicationBacklog {
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
 pub trait MetaEngineCore: Send + Sync + MetaInodes {
+    /// Mount-local last-good ignore rule sources, encoded by the VFS.
+    fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Replace the last-good mount-local rule sources without journaling.
+    fn store_ignore_rules_cache(&self, _snapshot: &[u8]) -> MetaResult<()> {
+        Ok(())
+    }
+
     /// Return shared local metadata write timing when the backend exposes it.
     fn metadata_write_observability(&self) -> MetadataWriteObservability {
         MetadataWriteObservability::default()
