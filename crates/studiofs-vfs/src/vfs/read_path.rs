@@ -1450,7 +1450,7 @@ impl<'a> ReadMetadataResolver<'a> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(attr);
         }
-        if let Some(attr) = self.dirty_attr() {
+        if let Some(attr) = self.dirty_attr()? {
             return Ok(attr);
         }
         if let Some(attr) = self.cached_attr()? {
@@ -1533,34 +1533,37 @@ impl<'a> ReadMetadataResolver<'a> {
         self.vfs.ignored_entry_attr(self.ino)
     }
 
-    fn dirty_attr(&self) -> Option<InodeAttr> {
-        let dirty_attr = self
+    fn dirty_attr(&self) -> VfsResult<Option<InodeAttr>> {
+        let Some(dirty_attr) = self
             .vfs
             .state
             .namespace
             .dirty_attrs
             .lock()
             .get(&self.ino)
-            .cloned()?;
+            .cloned()
+        else {
+            return Ok(None);
+        };
 
-        if self.vfs.is_scratch_inode(self.ino).unwrap_or(false)
+        if self.vfs.is_scratch_inode(self.ino)?
             || self.vfs.local_attr_refresh_decision(self.ino, &dirty_attr)
                 == MetadataRefreshDecision::UseLocal
         {
-            return Some(dirty_attr);
+            return Ok(Some(dirty_attr));
         }
 
         let remote_attr = match self.vfs.sync_meta().get_attr(self.ino) {
             Ok(remote_attr) => remote_attr,
             // An unlinked-while-open inode has no authoritative row to refresh from.
-            Err(MetaError::InodeNotFound(_)) => return Some(dirty_attr),
+            Err(MetaError::InodeNotFound(_)) => return Ok(Some(dirty_attr)),
             Err(error) => {
                 warn!(
                     ino = self.ino,
                     error = %error,
                     "failed to refresh drained dirty attr from authoritative metadata"
                 );
-                return Some(dirty_attr);
+                return Ok(Some(dirty_attr));
             }
         };
         if matches!(
@@ -1573,10 +1576,10 @@ impl<'a> ReadMetadataResolver<'a> {
             ),
             SupersedeOutcome::Cleared(_)
         ) {
-            return Some(remote_attr);
+            return Ok(Some(remote_attr));
         }
 
-        Some(dirty_attr)
+        Ok(Some(dirty_attr))
     }
 
     async fn dirty_attr_async(&self) -> VfsResult<Option<InodeAttr>> {

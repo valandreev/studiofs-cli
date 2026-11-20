@@ -1379,7 +1379,10 @@ impl StudioFsContext {
 
     fn heal_directory_orphans_for_delete(&self, dir_ino: Ino) -> winfsp::Result<usize> {
         if self.vfs.is_synthesized_ignored_ino(dir_ino)
-            || self.vfs.is_scratch_inode(dir_ino).unwrap_or(false)
+            || self
+                .vfs
+                .is_scratch_inode(dir_ino)
+                .map_err(vfs_to_winfsp_err)?
         {
             return Ok(0);
         }
