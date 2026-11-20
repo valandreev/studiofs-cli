@@ -141,6 +141,7 @@ pub trait LocalPayloadBackend: Send + Sync {
     ) -> Result<(), LocalPayloadBackendError>;
 
     /// Persists a payload and, for clean entries, its verified XXH64.
+    /// The default implementation records no checksum.
     fn put_with_checksum(
         &self,
         object_id: u64,
@@ -191,12 +192,13 @@ pub trait LocalPayloadBackend: Send + Sync {
     /// Returns an error if the durable lifecycle transition cannot be committed.
     fn mark_uploaded(&self, object_id: u64) -> Result<(), LocalPayloadBackendError>;
 
-    /// Marks an upload complete, recording the checksum if the entry still matches the uploaded bytes.
+    /// Marks an upload complete, recording a verified checksum if the entry identity and length match.
+    /// The default implementation records no checksum.
     fn mark_uploaded_with_checksum(
         &self,
         object_id: u64,
         _dirty_order: u64,
-        _payload: &[u8],
+        _payload_len: u64,
         _xxh64: u64,
     ) -> Result<(), LocalPayloadBackendError> {
         self.mark_uploaded(object_id)

@@ -1197,24 +1197,9 @@ impl LocalPayloadBackendRuntime {
     fn finish_upload(
         &self,
         object_id: u64,
-        uploaded: Option<(u64, &[u8], u64)>,
+        verified: Option<(u64, u64, u64)>,
     ) -> Result<(), LocalPayloadBackendError> {
         let _mutation = self.lock_payload_mutations(&[object_id]);
-        let verified = if let Some((dirty_order, payload, xxh64)) = uploaded {
-            let payload_len = payload.len() as u64;
-            let entry = self.index.get_entry(object_id)?;
-            // Uploads can read from the hot cache or staging, independently of the indexed file.
-            if entry.is_some_and(|entry| {
-                entry.dirty_order == Some(dirty_order) && entry.payload_len == payload_len
-            }) && self.payload_store.get(object_id).as_deref() == Some(payload)
-            {
-                Some((dirty_order, payload_len, xxh64))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         let result = self.index.mark_uploaded_with_xxh64(object_id, verified);
         self.refresh_runtime_pin_bytes(&[object_id]);
         result?;
@@ -1557,10 +1542,10 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         &self,
         object_id: u64,
         dirty_order: u64,
-        payload: &[u8],
+        payload_len: u64,
         xxh64: u64,
     ) -> Result<(), LocalPayloadBackendError> {
-        self.finish_upload(object_id, Some((dirty_order, payload, xxh64)))
+        self.finish_upload(object_id, Some((dirty_order, payload_len, xxh64)))
     }
 
     fn pin(&self, object_id: u64) {
@@ -2607,21 +2592,34 @@ mod tests {
         let order = backend.mark_uploading_with_order(1).unwrap().unwrap();
         assert_eq!(checksum(1), None);
         backend
-            .mark_uploaded_with_checksum(1, order, b"hello", hello_xxh64)
+            .mark_uploaded_with_checksum(1, order, 5, hello_xxh64)
             .unwrap();
         assert_eq!(checksum(1), Some(hello_xxh64));
 
         backend.put(1, b"world", false).unwrap();
         assert_eq!(checksum(1), None);
         backend
-            .mark_uploaded_with_checksum(1, order, b"world", hello_xxh64)
+            .mark_uploaded_with_checksum(1, order, 5, hello_xxh64)
             .unwrap();
         assert_eq!(checksum(1), None);
 
         backend.put(1, b"world", false).unwrap();
         let order = backend.mark_uploading_with_order(1).unwrap().unwrap();
         backend
-            .mark_uploaded_with_checksum(1, order, b"hello", hello_xxh64)
+            .mark_uploaded_with_checksum(1, order, 4, hello_xxh64)
+            .unwrap();
+        assert_eq!(checksum(1), None);
+
+        backend
+            .put_with_checksum(1, b"hello", true, Some(hello_xxh64))
+            .unwrap();
+        assert_eq!(checksum(1), Some(hello_xxh64));
+        backend
+            .put_batch(&[LocalPayloadPut {
+                object_id: 1,
+                data: Bytes::from_static(b"world"),
+                evictable: true,
+            }])
             .unwrap();
         assert_eq!(checksum(1), None);
 

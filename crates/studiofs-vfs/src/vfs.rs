@@ -7242,13 +7242,13 @@ impl StudioVfs {
     async fn payload_store_mark_uploaded_async(
         &self,
         object_id: u64,
-        checksum: Option<(u64, Bytes, u64)>,
+        checksum: Option<(u64, u64, u64)>,
     ) -> VfsResult<()> {
         let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
             match checksum {
-                Some((order, payload, xxh64)) => {
-                    payload_store.mark_uploaded_with_checksum(object_id, order, &payload, xxh64)
+                Some((order, payload_len, xxh64)) => {
+                    payload_store.mark_uploaded_with_checksum(object_id, order, payload_len, xxh64)
                 }
                 None => payload_store.mark_uploaded(object_id),
             }
