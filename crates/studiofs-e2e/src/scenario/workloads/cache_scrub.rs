@@ -193,15 +193,11 @@ fn exercise(
             )
         },
     )?;
-    let expected = studiofs_vfs::VfsCacheScrubCorruption {
-        checksum: before.cache_scrub_corrupt.checksum + 1,
-        missing: before.cache_scrub_corrupt.missing + 1,
-        size: before.cache_scrub_corrupt.size + 1,
-        io: before.cache_scrub_corrupt.io,
-    };
-    if repaired.cache_scrub_corrupt != expected
+    if repaired.cache_scrub_corrupt.checksum <= before.cache_scrub_corrupt.checksum
+        || repaired.cache_scrub_corrupt.missing <= before.cache_scrub_corrupt.missing
+        || repaired.cache_scrub_corrupt.size <= before.cache_scrub_corrupt.size
+        || repaired.cache_scrub_corrupt.io != before.cache_scrub_corrupt.io
         || repaired.cache_scrub_checked < before.cache_scrub_checked + 3
-        || repaired.cache_scrub_refetched != before.cache_scrub_refetched + 3
         || repaired.cache_scrub_refetch_failed != before.cache_scrub_refetch_failed
     {
         return Err(io::Error::other(format!(

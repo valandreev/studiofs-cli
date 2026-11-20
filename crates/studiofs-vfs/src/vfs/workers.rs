@@ -3713,6 +3713,7 @@ mod tests {
                 assert_eq!(index.scrub_cursor().unwrap().last_object_id, None);
                 shutdown.cancel();
                 pass.await.unwrap();
+                assert_eq!(vfs.cache_scrub_snapshot().unwrap().progress, None);
                 let checkpoint = index.scrub_cursor().unwrap();
                 assert_eq!(checkpoint.last_object_id, Some(32));
                 assert_eq!(checkpoint.completed_ms, 0);
@@ -3952,6 +3953,12 @@ mod tests {
             .unwrap()
             .unwrap();
             assert!(backend.scrub_index().get_entry(2).unwrap().is_none());
+            assert_eq!(
+                vfs.cache_scrub_snapshot()
+                    .unwrap()
+                    .cache_scrub_refetch_failed,
+                1
+            );
             assert_eq!(
                 vfs.runtime_stats_snapshot().cache.counters["cache_scrub_refetch_failures"].value,
                 1
@@ -4914,6 +4921,23 @@ impl ScrubBucket {
     }
 }
 
+fn scrub_error_kind(error: &studiofs_cache::local::LocalPayloadBackendError) -> &'static str {
+    use studiofs_cache::local::LocalPayloadBackendError;
+    use studiofs_cache::runtime::CacheIndexError;
+
+    match error {
+        LocalPayloadBackendError::Io(_) => "io",
+        LocalPayloadBackendError::CapacityExhausted { .. } => "capacity_exhausted",
+        LocalPayloadBackendError::Other(source) => match source.downcast_ref::<CacheIndexError>() {
+            Some(CacheIndexError::Io(_)) => "index_io",
+            Some(CacheIndexError::Storage(_)) => "index_storage",
+            Some(CacheIndexError::Corruption(_)) => "index_corruption",
+            Some(CacheIndexError::UnsupportedFormat { .. }) => "index_unsupported_format",
+            None => "backend",
+        },
+    }
+}
+
 impl StudioVfs {
     /// Scrub telemetry is available when the background worker is enabled.
     pub fn cache_scrub_snapshot(&self) -> Option<super::VfsCacheScrubSnapshot> {
@@ -4935,12 +4959,12 @@ impl StudioVfs {
             };
             let shutdown = &vfs.state.shutdown.background_shutdown_token;
             while !shutdown.is_cancelled() {
-                if vfs
-                    .run_cache_scrub(backend, config, shutdown)
-                    .await
-                    .is_err()
-                {
-                    warn!("cache scrub pass interrupted");
+                if let Err(error) = vfs.run_cache_scrub(backend, config, shutdown).await {
+                    vfs.cache_scrub_stats.lock().progress = None;
+                    warn!(
+                        kind = scrub_error_kind(&error),
+                        "cache scrub pass interrupted"
+                    );
                     tokio::select! {
                         _ = shutdown.cancelled() => break,
                         _ = tokio::time::sleep(Duration::from_secs(60)) => {}
@@ -5040,15 +5064,16 @@ impl StudioVfs {
                     let kind = {
                         let mut stats = self.cache_scrub_stats.lock();
                         let corrupt = &mut stats.cache_scrub_corrupt;
-                        let kind = match corruption {
+                        let kind = match &corruption {
                             Ok(ScrubCheck::Checksum) => Some(("checksum", &mut corrupt.checksum)),
                             Ok(ScrubCheck::Missing) => Some(("missing", &mut corrupt.missing)),
                             Ok(ScrubCheck::Size) => Some(("size", &mut corrupt.size)),
                             Ok(ScrubCheck::Io) => Some(("io", &mut corrupt.io)),
                             Ok(ScrubCheck::Clean | ScrubCheck::Skipped) => None,
-                            Err(_) => {
+                            Err(error) => {
                                 warn!(
                                     object_id = entry.object_id,
+                                    kind = scrub_error_kind(error),
                                     "cache scrub verification failed"
                                 );
                                 None
@@ -5115,6 +5140,7 @@ impl StudioVfs {
         if cursor.last_object_id != saved_object_id {
             run_local_cache_io(|| index.save_scrub_cursor(cursor)).0?;
         }
+        self.cache_scrub_stats.lock().progress = None;
         Ok(())
     }
 }

@@ -2389,6 +2389,7 @@ pub struct VfsSyncSafetySnapshot {
 
 /// Mount-local cache scrub counters and durable pass position.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VfsCacheScrubSnapshot {
     pub cache_scrub_checked: u64,
     pub cache_scrub_corrupt: VfsCacheScrubCorruption,
@@ -2400,6 +2401,7 @@ pub struct VfsCacheScrubSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VfsCacheScrubCorruption {
     pub checksum: u64,
     pub missing: u64,
@@ -2435,6 +2437,26 @@ pub struct VfsRuntimeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_scrub_snapshot_defaults_missing_fields() {
+        let snapshot: VfsCacheScrubSnapshot = serde_json::from_value(serde_json::json!({
+            "cache_scrub_checked": 3,
+            "cache_scrub_corrupt": { "checksum": 1 },
+        }))
+        .expect("deserialize partial cache scrub snapshot");
+        assert_eq!(
+            snapshot,
+            VfsCacheScrubSnapshot {
+                cache_scrub_checked: 3,
+                cache_scrub_corrupt: VfsCacheScrubCorruption {
+                    checksum: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        );
+    }
 
     #[test]
     fn sync_safety_snapshot_defaults_unknown_and_serializes_state_names() {
