@@ -4483,6 +4483,20 @@ impl StudioVfs {
             elapsed_ms = rename_started.elapsed().as_millis(),
             "VFS rename calling metadata rename_atomic"
         );
+        // Keep cached bytes resident across the commit and the rule pin handoff.
+        let rule_payloads = if source_attr.kind == FileType::RegularFile
+            && studiofs_meta::fold_dentry_name(new_name).as_ref() == crate::scratch_rules::RULE_FILE
+        {
+            Some(super::io_ops::PayloadPins::new(
+                self.local_payload_backend.as_ref(),
+                meta.get_regular_file_graph_object_usage(source_entry.ino)?
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect(),
+            ))
+        } else {
+            None
+        };
         let rename_result =
             meta.rename_atomic(parent, name, new_parent, new_name, replace_if_exists, true)?;
         if !rename_result.namespace_changed {
@@ -4506,6 +4520,7 @@ impl StudioVfs {
             new_name,
             rename_result.moved_ino,
         );
+        drop(rule_payloads);
         self.bump_acl_namespace_epoch();
 
         if let Some(attr) = &rename_result.displaced {

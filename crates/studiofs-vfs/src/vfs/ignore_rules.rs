@@ -6,6 +6,14 @@ use tokio::sync::{Notify, broadcast, watch};
 
 type RuleSources = BTreeMap<Vec<u8>, Vec<u8>>;
 
+#[derive(Clone, PartialEq, Eq)]
+struct RuleVersion {
+    ino: Ino,
+    content_epoch: u64,
+    size: u64,
+    objects: Vec<(u64, u64)>,
+}
+
 /// Mount bootstrap waits this long for the first discovery and prefetch pass.
 const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(5);
 /// Shared payload read deadline for one refresh, inside the bootstrap budget.
@@ -23,7 +31,23 @@ struct RuleInodes {
     directories: HashSet<Ino>,
 }
 
+#[derive(Default)]
+struct RulePins {
+    objects: HashSet<u64>,
+    revision: u64,
+}
+
+#[cfg(test)]
+type PublicationBarrier = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 pub(super) struct IgnoreRules {
+    backend: Arc<dyn LocalPayloadBackend>,
+    pins: parking_lot::Mutex<RulePins>,
+    #[cfg(test)]
+    before_publish: parking_lot::Mutex<Option<PublicationBarrier>>,
     snapshot: parking_lot::RwLock<Arc<ScratchRules>>,
     sources: RuleSources,
     refresh: Notify,
@@ -33,7 +57,7 @@ pub(super) struct IgnoreRules {
 }
 
 impl IgnoreRules {
-    pub(super) fn load(meta: &dyn VfsMeta) -> Self {
+    pub(super) fn load(meta: &dyn VfsMeta, backend: Arc<dyn LocalPayloadBackend>) -> Self {
         let mut restored = false;
         let sources: RuleSources = match meta.load_ignore_rules_cache() {
             Ok(Some(bytes)) => match postcard::from_bytes(&bytes) {
@@ -58,13 +82,62 @@ impl IgnoreRules {
                 warn!(%error, ?directory, "could not restore local ignore rules");
             }
         }
-        Self {
+        let state = Self {
+            backend,
+            pins: parking_lot::Mutex::default(),
+            #[cfg(test)]
+            before_publish: parking_lot::Mutex::default(),
             snapshot: parking_lot::RwLock::new(Arc::new(rules)),
             sources,
             refresh: Notify::new(),
             watched: Arc::default(),
             changed: broadcast::channel(32).0,
             bootstrap: watch::channel(restored).0,
+        };
+        'sources: for directory in state.sources.keys() {
+            let mut parent = ROOT_INO;
+            let mut watched = vec![parent];
+            for component in directory
+                .split(|byte| *byte == b'/')
+                .filter(|part| !part.is_empty())
+            {
+                let Ok(entry) = meta.lookup(parent, component) else {
+                    continue 'sources;
+                };
+                parent = entry.ino;
+                watched.push(parent);
+            }
+            if let Ok(entry) = meta.lookup(parent, RULE_FILE)
+                && entry.kind == FileType::RegularFile
+            {
+                let mut rule_inodes = state.watched.lock();
+                rule_inodes.files.insert(entry.ino);
+                rule_inodes.directories.extend(watched);
+                drop(rule_inodes);
+                state.pin_inode(meta, entry.ino);
+            }
+        }
+        state
+    }
+
+    fn pin_inode(&self, meta: &dyn VfsMeta, ino: Ino) {
+        match meta.get_regular_file_graph_object_usage(ino) {
+            Ok(objects) => self.pin_objects(ino, objects.into_iter().map(|(id, _)| id)),
+            Err(studiofs_meta::MetaError::InodeNotFound(_)) => {}
+            Err(error) => warn!(%error, ino, "could not pin ignore rule payload"),
+        }
+    }
+
+    pub(crate) fn pin_objects(&self, ino: Ino, objects: impl IntoIterator<Item = u64>) {
+        if !self.watched.lock().files.contains(&ino) {
+            return;
+        }
+        let mut pins = self.pins.lock();
+        pins.revision = pins.revision.wrapping_add(1);
+        for id in objects {
+            if pins.objects.insert(id) {
+                self.backend.pin(id);
+            }
         }
     }
 
@@ -77,8 +150,14 @@ impl IgnoreRules {
 
     /// Request a refresh after a local namespace change binds or unbinds
     /// `name`. `ino` is the inode moved or created, when known.
-    pub(super) fn note_local_entry(&self, name: &[u8], ino: Option<Ino>) {
-        if self.watched.lock().note_entry(name, ino) {
+    pub(super) fn note_local_entry(&self, meta: &dyn VfsMeta, name: &[u8], ino: Option<Ino>) {
+        let relevant = self.watched.lock().note_entry(name, ino);
+        if relevant {
+            if let Some(ino) = ino
+                && studiofs_meta::fold_dentry_name(name).as_ref() == RULE_FILE
+            {
+                self.pin_inode(meta, ino);
+            }
             self.refresh.notify_one();
         }
     }
@@ -86,9 +165,10 @@ impl IgnoreRules {
     /// Request a refresh when a committed batch names a rule file or moves a
     /// directory above one. Other namespace and content churn is ignored so
     /// ordinary commits do not rescan the volume.
-    pub(super) fn note_invalidation(&self, batch: &InvalidationBatch) {
+    pub(super) fn note_invalidation(&self, meta: &dyn VfsMeta, batch: &InvalidationBatch) {
         let mut watched = self.watched.lock();
         let mut relevant = false;
+        let mut files = HashSet::new();
         for intent in &batch.intents {
             relevant |= match intent {
                 InvalidationIntent::Reset => true,
@@ -98,10 +178,31 @@ impl IgnoreRules {
                 }
                 InvalidationIntent::Directory { .. } => false,
             };
+            match intent {
+                InvalidationIntent::Entry { ino: Some(ino), .. }
+                | InvalidationIntent::Content { ino }
+                | InvalidationIntent::Attributes { ino }
+                    if watched.files.contains(ino) =>
+                {
+                    files.insert(*ino);
+                }
+                _ => {}
+            }
         }
         drop(watched);
+        for ino in files {
+            self.pin_inode(meta, ino);
+        }
         if relevant {
             self.refresh.notify_one();
+        }
+    }
+}
+
+impl Drop for IgnoreRules {
+    fn drop(&mut self) {
+        for id in self.pins.get_mut().objects.drain() {
+            self.backend.unpin(id);
         }
     }
 }
@@ -146,12 +247,9 @@ impl StudioVfs {
     pub(super) async fn background_ignore_rules(self: Arc<Self>) {
         let mut sources = self.ignore_rules.sources.clone();
         let mut versions = BTreeMap::new();
-        let mut pinned = HashSet::new();
         let cancellation = &self.state.shutdown.background_shutdown_token;
         loop {
-            let retry = self
-                .refresh_ignore_rules(&mut sources, &mut versions, &mut pinned)
-                .await;
+            let retry = self.refresh_ignore_rules(&mut sources, &mut versions).await;
             self.ignore_rules.bootstrap.send_replace(true);
             tokio::select! {
                 _ = cancellation.cancelled() => break,
@@ -160,9 +258,6 @@ impl StudioVfs {
             }
         }
         self.ignore_rules.bootstrap.send_replace(true);
-        for object_id in pinned {
-            self.local_payload_backend.unpin(object_id);
-        }
     }
 
     async fn read_ignore_rule_payload(&self, ino: Ino, size: u64) -> VfsResult<Vec<u8>> {
@@ -184,11 +279,11 @@ impl StudioVfs {
     async fn refresh_ignore_rules(
         &self,
         sources: &mut RuleSources,
-        versions: &mut BTreeMap<Vec<u8>, (Ino, u64, u64)>,
-        pinned: &mut HashSet<u64>,
+        versions: &mut BTreeMap<Vec<u8>, RuleVersion>,
     ) -> bool {
         let cancellation = self.state.shutdown.background_shutdown_token.clone();
         let watched = Arc::clone(&self.ignore_rules.watched);
+        let pin_revision = self.ignore_rules.pins.lock().revision;
         let scan = self
             .meta
             .run_maintenance(move |meta| {
@@ -245,12 +340,18 @@ impl StudioVfs {
                         Err(MetaError::InodeNotFound(_)) => continue,
                         Err(error) => return Err(error),
                     };
-                    objects.extend(
-                        meta.get_regular_file_graph_object_usage(entry.ino)?
-                            .into_iter()
-                            .map(|(object_id, _)| object_id),
+                    let file_objects = meta.get_regular_file_graph_object_usage(entry.ino)?;
+                    objects.extend(file_objects.iter().map(|(object_id, _)| *object_id));
+                    files.insert(
+                        path,
+                        RuleVersion {
+                            ino: entry.ino,
+                            content_epoch: attr.content_epoch,
+                            size: attr.size,
+                            // A same-size rewrite can share an unpublished content epoch.
+                            objects: file_objects,
+                        },
                     );
-                    files.insert(path, (entry.ino, attr.content_epoch, attr.size));
                 }
                 Ok((files, objects))
             })
@@ -267,15 +368,21 @@ impl StudioVfs {
             return false;
         }
 
-        // Upload ownership uses CachedStore's set. Hold a separate reference
-        // on the backend so upload completion cannot drop the rule file's pin.
-        for object_id in objects.difference(pinned) {
-            self.local_payload_backend.pin(*object_id);
+        {
+            let mut pins = self.ignore_rules.pins.lock();
+            // A namespace or upload submission can pin newer objects during discovery.
+            if pin_revision == pins.revision {
+                for id in pins.objects.difference(&objects) {
+                    self.ignore_rules.backend.unpin(*id);
+                }
+                pins.objects.retain(|id| objects.contains(id));
+            }
+            for id in objects {
+                if pins.objects.insert(id) {
+                    self.ignore_rules.backend.pin(id);
+                }
+            }
         }
-        for object_id in pinned.difference(&objects) {
-            self.local_payload_backend.unpin(*object_id);
-        }
-        *pinned = objects;
 
         let mut next_sources = sources.clone();
         let snapshot = Arc::clone(&self.ignore_rules.snapshot.read());
@@ -291,7 +398,7 @@ impl StudioVfs {
 
         let deadline = tokio::time::Instant::now() + PAYLOAD_READ_BUDGET;
         let mut missing = Vec::new();
-        for (directory, version @ (ino, _, size)) in files {
+        for (directory, version @ RuleVersion { ino, size, .. }) in files {
             if versions.get(&directory) == Some(&version) {
                 continue;
             }
@@ -341,6 +448,19 @@ impl StudioVfs {
                 warn!(%error, "could not persist local ignore rules");
                 return true;
             }
+            #[cfg(test)]
+            {
+                let barrier = self.ignore_rules.before_publish.lock().take();
+                if let Some((entered, resume)) = barrier {
+                    let _ = entered.send(());
+                    if !matches!(
+                        tokio::time::timeout(BOOTSTRAP_BUDGET, resume).await,
+                        Ok(Ok(()))
+                    ) {
+                        return true;
+                    }
+                }
+            }
             *self.ignore_rules.snapshot.write() = Arc::new(next_rules);
             *sources = next_sources;
             if !changed.is_empty() {
@@ -358,6 +478,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::future::Future;
     use std::task::{Context, Waker};
+    use studiofs_meta::{MetaEngineCore, MetaNamespace, MetaPayloadObjects};
 
     fn take_refresh_permit(rules: &IgnoreRules) -> bool {
         let mut notified = std::pin::pin!(rules.refresh.notified());
@@ -367,12 +488,13 @@ mod tests {
             .is_ready()
     }
 
-    async fn write_rule_file(vfs: &StudioVfs, parent: Ino, payload: &[u8]) {
+    async fn write_rule_file(vfs: &StudioVfs, parent: Ino, payload: &[u8]) -> Ino {
         let attr = vfs.create(parent, RULE_FILE, 0, 0, 0o644).unwrap();
         let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
         vfs.write_fh(fh, attr.ino, 0, payload).await.unwrap();
         vfs.flush_fh(fh).await.unwrap();
         vfs.release_fh(fh).await.unwrap();
+        attr.ino
     }
 
     /// Wait on change notifications until `path` has `class`, and return the
@@ -397,7 +519,7 @@ mod tests {
     #[test]
     fn ignore_rules_refresh_only_for_rule_files_and_their_directories() {
         let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-");
-        let (_runtime, vfs, _meta) =
+        let (_runtime, vfs, meta) =
             super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-filter");
         let rules = &vfs.ignore_rules;
         {
@@ -417,27 +539,39 @@ mod tests {
         };
 
         // Children created in a watched directory touch its attributes only.
-        rules.note_invalidation(&batch(vec![
-            entry(2, b"render.exr", Some(11)),
-            InvalidationIntent::Directory { ino: 2 },
-            InvalidationIntent::Attributes { ino: 2 },
-            InvalidationIntent::Content { ino: 11 },
-        ]));
+        rules.note_invalidation(
+            meta.as_ref(),
+            &batch(vec![
+                entry(2, b"render.exr", Some(11)),
+                InvalidationIntent::Directory { ino: 2 },
+                InvalidationIntent::Attributes { ino: 2 },
+                InvalidationIntent::Content { ino: 11 },
+            ]),
+        );
         assert!(!take_refresh_permit(rules));
         rules.note_local_barrier(11);
         assert!(!take_refresh_permit(rules));
 
         rules.note_local_barrier(10);
         assert!(take_refresh_permit(rules));
-        rules.note_invalidation(&batch(vec![InvalidationIntent::Content { ino: 10 }]));
+        rules.note_invalidation(
+            meta.as_ref(),
+            &batch(vec![InvalidationIntent::Content { ino: 10 }]),
+        );
         assert!(take_refresh_permit(rules));
-        rules.note_invalidation(&batch(vec![entry(ROOT_INO, b"shots", Some(2))]));
+        rules.note_invalidation(
+            meta.as_ref(),
+            &batch(vec![entry(ROOT_INO, b"shots", Some(2))]),
+        );
         assert!(take_refresh_permit(rules));
-        rules.note_invalidation(&batch(vec![InvalidationIntent::Reset]));
+        rules.note_invalidation(meta.as_ref(), &batch(vec![InvalidationIntent::Reset]));
         assert!(take_refresh_permit(rules));
 
         // A new rule file, in any case spelling, is watched from its first intent.
-        rules.note_invalidation(&batch(vec![entry(7, b".StudioFSIgnore", Some(12))]));
+        rules.note_invalidation(
+            meta.as_ref(),
+            &batch(vec![entry(7, b".StudioFSIgnore", Some(12))]),
+        );
         assert!(take_refresh_permit(rules));
         rules.note_local_barrier(12);
         assert!(take_refresh_permit(rules));
@@ -477,6 +611,183 @@ mod tests {
             reopened.classify_scratch_path(b"file.tmp", false),
             ScratchClass::Scratch
         );
+    }
+
+    #[test]
+    fn ignore_rules_classify_while_recompile_is_ready_to_publish() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-");
+        let (runtime, vfs, _) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-recompile");
+        let classes = || {
+            [b"a.tmp".as_slice(), b"shots/b.log"].map(|path| vfs.classify_scratch_path(path, false))
+        };
+        runtime.block_on(async {
+            let ino = write_rule_file(&vfs, ROOT_INO, b"*.old\nshots/*.old\n").await;
+            let mut changes = vfs.subscribe_ignore_rules_changes();
+            let worker = tokio::spawn(Arc::clone(&vfs).background_ignore_rules());
+            wait_for_class(&vfs, &mut changes, b"a.old", ScratchClass::Scratch).await;
+
+            let (entered, reached) = tokio::sync::oneshot::channel();
+            let (resume, paused) = tokio::sync::oneshot::channel();
+            *vfs.ignore_rules.before_publish.lock() = Some((entered, paused));
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh(fh, ino, 0, b"*.tmp\nshots/*.log\n")
+                .await
+                .unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+            vfs.release_fh(fh).await.unwrap();
+            tokio::time::timeout(BOOTSTRAP_BUDGET, reached)
+                .await
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(classes(), [ScratchClass::Tracked; 2]);
+            assert_eq!(
+                vfs.classify_scratch_path(b"a.old", false),
+                ScratchClass::Scratch
+            );
+            assert_eq!(
+                vfs.classify_scratch_path(b"shots/b.old", false),
+                ScratchClass::Scratch
+            );
+            resume.send(()).unwrap();
+            tokio::time::timeout(BOOTSTRAP_BUDGET, changes.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(classes(), [ScratchClass::Scratch; 2]);
+            assert_eq!(
+                vfs.classify_scratch_path(b"a.old", false),
+                ScratchClass::Tracked
+            );
+            assert_eq!(
+                vfs.classify_scratch_path(b"shots/b.old", false),
+                ScratchClass::Tracked
+            );
+
+            vfs.state.shutdown.background_shutdown_token.cancel();
+            tokio::time::timeout(BOOTSTRAP_BUDGET, worker)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    fn assert_rule_survives_eviction(vfs: &StudioVfs, object_id: u64) {
+        let backend = &vfs.local_payload_backend;
+        let payload = backend.get(object_id).expect("local rule payload");
+        // Disk pressure only considers downloaded payloads.
+        backend.put(object_id, &payload, true).unwrap();
+        backend
+            .put(u64::MAX - 4, b"downloaded control", true)
+            .unwrap();
+        backend
+            .as_any()
+            .downcast_ref::<studiofs_cache::PersistentLocalPayloadBackend>()
+            .unwrap()
+            .run_low_disk_space_for_test()
+            .unwrap();
+        assert!(
+            !backend.contains(u64::MAX - 4),
+            "disk-pressure eviction must run"
+        );
+        assert!(
+            backend.contains(object_id),
+            "disk-pressure eviction removed the rule"
+        );
+
+        let pressure = vec![0x77; 32 * 1024 * 1024];
+        for id in [u64::MAX - 3, u64::MAX - 2, u64::MAX - 1] {
+            backend.put(id, &pressure, true).unwrap();
+        }
+        assert!(!backend.contains(u64::MAX - 3), "budget eviction must run");
+        assert!(
+            backend.contains(object_id),
+            "budget eviction removed the rule"
+        );
+    }
+
+    #[test]
+    fn ignore_rules_pins_and_classifies_after_process_crash() {
+        use std::process::{Command, Stdio};
+
+        const CHILD_ROOT: &str = "STUDIOFS_IGNORE_RULES_CRASH_TEST_ROOT";
+        let open = |root: &std::path::Path| {
+            super::super::tests::make_unstarted_test_vfs_at(
+                root,
+                "ignore-rules-crash",
+                VfsConfig {
+                    max_dirty_bytes: 8 * 1024 * 1024,
+                    write_eager_flush_batch_bytes: 4 * 1024 * 1024,
+                    ..VfsConfig::default()
+                },
+                None,
+            )
+        };
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let (runtime, vfs, meta) = open(&root);
+            runtime.block_on(async {
+                write_rule_file(&vfs, ROOT_INO, b"*.tmp\n").await;
+                let ino = meta.lookup(ROOT_INO, RULE_FILE).unwrap().ino;
+                let uploads = vfs.pending_uploads_snapshot_for_inode(ino);
+                assert_eq!(uploads.len(), 1);
+                let upload = &uploads[0];
+                vfs.local_payload_backend
+                    .mark_uploaded(upload.object_id)
+                    .unwrap();
+                vfs.cached_store.complete_upload(upload);
+                assert_rule_survives_eviction(&vfs, upload.object_id);
+
+                let mut changes = vfs.subscribe_ignore_rules_changes();
+                let worker = tokio::spawn(Arc::clone(&vfs).background_ignore_rules());
+                wait_for_class(&vfs, &mut changes, b"a.tmp", ScratchClass::Scratch).await;
+                assert!(meta.load_ignore_rules_cache().unwrap().is_some());
+                std::fs::write(root.join("ready"), []).unwrap();
+                // The parent kills this process while its VFS and metadata owners are live.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                worker.abort();
+                let _ = worker.await;
+            });
+            panic!("parent did not terminate crash fixture");
+        }
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-crash-");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "vfs::ignore_rules::tests::ignore_rules_pins_and_classifies_after_process_crash",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, tmp.path())
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ready = loop {
+            if tmp.path().join("ready").is_file() {
+                break true;
+            }
+            if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::park_timeout(Duration::from_millis(10));
+        };
+        let killed = child.kill();
+        let status = child.wait().unwrap();
+        assert!(ready, "crash fixture did not persist rules: {status}");
+        killed.unwrap();
+        assert!(!status.success());
+
+        let (_runtime, vfs, meta) = open(tmp.path());
+        assert_eq!(
+            vfs.classify_scratch_path(b"a.tmp", false),
+            ScratchClass::Scratch
+        );
+        let ino = meta.lookup(ROOT_INO, RULE_FILE).unwrap().ino;
+        let objects = meta.get_regular_file_graph_object_usage(ino).unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_rule_survives_eviction(&vfs, objects[0].0);
     }
 
     /// Local rename and unlink of a rule file, and a move of its directory,
@@ -539,6 +850,47 @@ mod tests {
             reopened.classify_scratch_path(b"file.tmp", false),
             ScratchClass::Tracked
         );
+    }
+
+    #[test]
+    fn ignore_rules_pin_foreign_payload_before_cache_admission() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-");
+        let (runtime, vfs, meta) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-foreign-admission");
+        runtime.block_on(async {
+            let payload = b"*.tmp\n";
+            let ino = vfs.create(ROOT_INO, b"rules.off", 0, 0, 0o644).unwrap().ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh(fh, ino, 0, payload).await.unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+            vfs.release_fh(fh).await.unwrap();
+            let uploads = vfs.pending_uploads_snapshot_for_inode(ino);
+            assert_eq!(uploads.len(), 1);
+            let upload = &uploads[0];
+            vfs.local_payload_backend
+                .mark_uploaded(upload.object_id)
+                .unwrap();
+            vfs.cached_store.complete_upload(upload);
+            vfs.local_payload_backend
+                .remove_batch(&[upload.object_id])
+                .unwrap();
+
+            meta.apply_replica_serving_state(&[studiofs_meta::MetaEvent::AddEntry {
+                parent: ROOT_INO,
+                name: RULE_FILE.to_vec(),
+                entry: studiofs_meta::schema::DirEntryValue {
+                    ino,
+                    kind: FileType::RegularFile,
+                },
+            }])
+            .unwrap();
+            vfs.drain_semantic_invalidations();
+            assert!(!vfs.local_payload_backend.contains(upload.object_id));
+            vfs.local_payload_backend
+                .put(upload.object_id, payload, true)
+                .unwrap();
+            assert!(!vfs.local_payload_backend.is_evictable(upload.object_id));
+        });
     }
 
     /// A peer's removal of a rule file reaches the worker only through the

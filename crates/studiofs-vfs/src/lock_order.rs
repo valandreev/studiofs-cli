@@ -86,6 +86,10 @@
 //! ascending stripe order. These auxiliary locks are outside `LockTier` and
 //! `LockOrderGuard`; the ordering is enforced by the call structure.
 //!
+//! Ignore-rule pin accounting takes its own mutex before backend stripe gates
+//! and never takes the cached-store pin mutex. The watched-inode mutex and local
+//! metadata reads are released before entering this pin accounting.
+//!
 //! Writer upload byte accounting acquires
 //! `CachedStore::pending_upload_bytes_by_object` before staged queue submission,
 //! rebased queue replacement or terminal queue removal, then the queue's

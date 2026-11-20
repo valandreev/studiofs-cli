@@ -34,6 +34,7 @@ smallvec.workspace = true
 lru.workspace = true
 
 [dev-dependencies]
+studiofs-cache = { workspace = true, features = ["test-utils"] }
 static_assertions = "1.1.0"
 studiofs-data = { workspace = true, features = ["test-utils"] }
 studiofs-test-support.workspace = true

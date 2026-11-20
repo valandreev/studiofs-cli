@@ -7,13 +7,24 @@ use super::{
     format_object_fragment_keys, offset_within_block, warn,
 };
 
-// A cancelled restore must release its independent read pins as well.
-struct RetainedReadPins<'a> {
+pub(super) struct PayloadPins<'a> {
     backend: &'a dyn studiofs_cache::local::LocalPayloadBackend,
     ids: HashSet<u64>,
 }
 
-impl Drop for RetainedReadPins<'_> {
+impl<'a> PayloadPins<'a> {
+    pub(super) fn new(
+        backend: &'a dyn studiofs_cache::local::LocalPayloadBackend,
+        ids: HashSet<u64>,
+    ) -> Self {
+        for &id in &ids {
+            backend.pin(id);
+        }
+        Self { backend, ids }
+    }
+}
+
+impl Drop for PayloadPins<'_> {
     fn drop(&mut self) {
         for &id in &self.ids {
             self.backend.unpin(id);
@@ -1021,10 +1032,7 @@ impl StudioVfs {
                 .filter_map(|span| span.payload.map(|payload| payload.object_id))
                 .collect();
             let backend = self.cached_store().local_payload_backend().as_ref();
-            for &id in &ids {
-                backend.pin(id);
-            }
-            let pins = RetainedReadPins { backend, ids };
+            let pins = PayloadPins::new(backend, ids);
             let local = pins
                 .ids
                 .iter()

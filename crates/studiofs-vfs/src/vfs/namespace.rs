@@ -1303,7 +1303,11 @@ impl<'a> NamespaceMutationOps<'a> {
             &[parent],
             &[(parent, name, DentryCacheValue::Positive(child))],
         );
-        self.vfs.ignore_rules.note_local_entry(name, Some(child));
+        self.vfs.ignore_rules.note_local_entry(
+            self.vfs.meta.sync_view().as_ref(),
+            name,
+            Some(child),
+        );
     }
 
     /// Records ignored insertions where filesystem state is already visible elsewhere.
@@ -1333,7 +1337,9 @@ impl<'a> NamespaceMutationOps<'a> {
             &[parent],
             &[(parent, name, DentryCacheValue::Negative)],
         );
-        self.vfs.ignore_rules.note_local_entry(name, None);
+        self.vfs
+            .ignore_rules
+            .note_local_entry(self.vfs.meta.sync_view().as_ref(), name, None);
     }
 
     /// Records a rename that is rejected for destination update but should invalidate source state.
@@ -1368,7 +1374,9 @@ impl<'a> NamespaceMutationOps<'a> {
             &[parent],
             &[(parent, name, DentryCacheValue::Negative)],
         );
-        self.vfs.ignore_rules.note_local_entry(name, None);
+        self.vfs
+            .ignore_rules
+            .note_local_entry(self.vfs.meta.sync_view().as_ref(), name, None);
     }
 
     /// Records successful rename/move and updates both old and new parent cache states.
@@ -1395,12 +1403,16 @@ impl<'a> NamespaceMutationOps<'a> {
                 (new_parent, new_name, DentryCacheValue::Positive(moved_ino)),
             ],
         );
-        self.vfs
-            .ignore_rules
-            .note_local_entry(name, Some(moved_ino));
-        self.vfs
-            .ignore_rules
-            .note_local_entry(new_name, Some(moved_ino));
+        self.vfs.ignore_rules.note_local_entry(
+            self.vfs.meta.sync_view().as_ref(),
+            name,
+            Some(moved_ino),
+        );
+        self.vfs.ignore_rules.note_local_entry(
+            self.vfs.meta.sync_view().as_ref(),
+            new_name,
+            Some(moved_ino),
+        );
     }
 }
 
