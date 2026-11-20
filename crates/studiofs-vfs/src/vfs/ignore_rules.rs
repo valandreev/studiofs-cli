@@ -133,11 +133,17 @@ impl IgnoreRules {
             return;
         }
         let mut pins = self.pins.lock();
-        pins.revision = pins.revision.wrapping_add(1);
+        let mut inserted = false;
         for id in objects {
             if pins.objects.insert(id) {
                 self.backend.pin(id);
+                inserted = true;
             }
+        }
+        // Only a new pin can race a scan's inventory; a repeated pin must not
+        // defer the scan's release of superseded payloads.
+        if inserted {
+            pins.revision = pins.revision.wrapping_add(1);
         }
     }
 
@@ -894,6 +900,23 @@ mod tests {
                 .unwrap();
             assert!(!vfs.local_payload_backend.is_evictable(upload.object_id));
         });
+    }
+
+    #[test]
+    fn ignore_rules_pin_revision_changes_only_with_the_pin_set() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-");
+        let (_runtime, vfs, _) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-revision");
+        let rules = &vfs.ignore_rules;
+        rules.watched.lock().files.insert(10);
+        rules.pin_objects(10, [u64::MAX - 1]);
+        let revision = rules.pins.lock().revision;
+        rules.pin_objects(10, [u64::MAX - 1]);
+        rules.pin_objects(10, []);
+        rules.pin_objects(11, [u64::MAX - 2]);
+        assert_eq!(rules.pins.lock().revision, revision);
+        rules.pin_objects(10, [u64::MAX - 1, u64::MAX - 2]);
+        assert_ne!(rules.pins.lock().revision, revision);
     }
 
     /// A rule file over the size limit is never loaded, so its payload must
