@@ -4487,12 +4487,16 @@ impl StudioVfs {
         let rule_payloads = if source_attr.kind == FileType::RegularFile
             && studiofs_meta::fold_dentry_name(new_name).as_ref() == crate::scratch_rules::RULE_FILE
         {
+            // Retention is best effort; it must not fail the rename itself.
+            let objects = meta
+                .get_regular_file_graph_object_usage(source_entry.ino)
+                .unwrap_or_else(|error| {
+                    warn!(ino = source_entry.ino, error = %error, "could not pin ignore rule payload");
+                    Vec::new()
+                });
             Some(super::io_ops::PayloadPins::new(
                 self.local_payload_backend.as_ref(),
-                meta.get_regular_file_graph_object_usage(source_entry.ino)?
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect(),
+                objects.into_iter().map(|(id, _)| id).collect(),
             ))
         } else {
             None
