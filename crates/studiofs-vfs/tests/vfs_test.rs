@@ -12627,12 +12627,13 @@ async fn create_should_persist_ds_store_as_regular_file() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live S3-backed test env (STUDIOFS_S3_*, endpoint config)"]
-async fn create_should_ignore_appledouble_without_persisting_metadata_or_data() {
+async fn create_should_store_appledouble_as_local_scratch_without_publishing() {
     ensure_bucket().await;
     let tmp = studiofs_test_support::workspace_target_tempdir("test-");
-    let vfs = make_vfs(&tmp, "ignore-appledouble");
+    let vfs = make_vfs(&tmp, "scratch-appledouble");
 
     let attr = vfs.create(1, b"._photo.jpg", 1000, 1000, 0o644).unwrap();
+    assert!(vfs.is_scratch_inode(attr.ino).unwrap());
     let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
     let written = vfs.write(attr.ino, 0, b"appledouble").await.unwrap();
     assert_eq!(written, b"appledouble".len() as u32);
@@ -12644,8 +12645,20 @@ async fn create_should_ignore_appledouble_without_persisting_metadata_or_data() 
     let ingress = vfs.ingress_stats();
     assert_eq!(ingress.dirty_mem_bytes, 0);
     assert!(vfs.meta().lookup(1, b"._photo.jpg").is_err());
-    assert!(vfs.lookup(1, b"._photo.jpg").is_err());
-    assert!(vfs.readdir(1).unwrap().is_empty());
+    assert_eq!(vfs.lookup(1, b"._photo.jpg").unwrap().ino, attr.ino);
+    assert_eq!(
+        vfs.read(attr.ino, 0, b"appledouble".len() as u32)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"appledouble"
+    );
+    assert_eq!(
+        vfs.get_xattr(attr.ino, studiofs_vfs::vfs::SCRATCH_XATTR_NAME)
+            .unwrap()
+            .as_deref(),
+        Some(b"1".as_slice())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12683,7 +12696,7 @@ async fn concurrent_create_should_reuse_single_ignored_file_inode_per_path() {
         let inos = inos.clone();
         tasks.push(thread::spawn(move || {
             barrier.wait();
-            let attr = vfs.create(1, b"._photo.jpg", 1000, 1000, 0o644).unwrap();
+            let attr = vfs.create(1, b".fseventsd", 1000, 1000, 0o644).unwrap();
             inos.lock().push(attr.ino);
         }));
     }

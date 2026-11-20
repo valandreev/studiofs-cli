@@ -841,7 +841,7 @@ fn canonical_hex_sidecar_draft_create_write_read_and_handle_attr_remain_usable()
     });
 
     // Plain ignored file control.
-    let plain = vfs.create(ROOT_INO, b"._DS_Store", 0, 0, 0o644).unwrap();
+    let plain = vfs.create(ROOT_INO, b".fseventsd", 0, 0, 0o644).unwrap();
     let plain_fh = vfs.open_file(plain.ino, OpenFlags::RDWR, false).unwrap();
     rt.block_on(async {
         assert_eq!(
@@ -888,9 +888,14 @@ fn read_uses_single_snapshot_and_absent_ignored_entry_never_zero_fills() {
 
     // Evict sidecar from by_ino while keeping a stale handle, then revoke parent access.
     assert!(vfs.detach_ignored_entry_name(sidecar_attr.ino));
+    let discard_dir = vfs
+        .mkdir(ROOT_INO, b".Spotlight-V100", 0, 0, 0o755)
+        .unwrap();
     for idx in 0..8 {
-        let name = format!("._evict-{idx}");
-        let tmp_entry = vfs.create(ROOT_INO, name.as_bytes(), 0, 0, 0o644).unwrap();
+        let name = format!("evict-{idx}");
+        let tmp_entry = vfs
+            .create(discard_dir.ino, name.as_bytes(), 0, 0, 0o644)
+            .unwrap();
         assert!(vfs.detach_ignored_entry_name(tmp_entry.ino));
     }
     assert!(vfs.ignored_entry(sidecar_attr.ino).is_none());
@@ -1108,7 +1113,7 @@ fn write_fh_with_deferred_materialize_refuses_writable_retained_views() {
         }
 
         // Control: plain ignored file allows deferred writes and updates synthetic size.
-        let plain = vfs.create(ROOT_INO, b"._plain-deferred", 0, 0, 0o644).unwrap();
+        let plain = vfs.create(ROOT_INO, b".fseventsd", 0, 0, 0o644).unwrap();
         let plain_fh = vfs.open_file(plain.ino, OpenFlags::RDWR, false).unwrap();
         assert_eq!(
             vfs.write_fh_with_deferred_materialize(

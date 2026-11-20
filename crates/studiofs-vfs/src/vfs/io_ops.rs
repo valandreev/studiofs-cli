@@ -487,6 +487,25 @@ impl StudioVfs {
             if data.is_empty() {
                 return Ok(0);
             }
+            if self.is_scratch_inode(ino)? {
+                let accepted = self.record_scratch_writer_stack_payload(
+                    0,
+                    ino,
+                    offset,
+                    super::sync_ops::VfsWritePayload::Borrowed(data),
+                )?;
+                let materialized_bytes = self.materialize_writer_stack_for_inode(ino).await?;
+                self.flush_local_dirty_state(ino, local_sync_policy).await?;
+                if local_sync_policy.requires_write_path_durability() {
+                    self.maybe_payload_store_sync_data_async(
+                        materialized_bytes as u64,
+                        local_sync_policy,
+                    )
+                    .await?;
+                    self.sync_metadata_barrier().await?;
+                }
+                return Ok(accepted);
+            }
 
             let mut base_attr = self.getattr_async(ino).await?;
             let end = offset

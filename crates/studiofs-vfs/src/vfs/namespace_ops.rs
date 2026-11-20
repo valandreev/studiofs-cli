@@ -95,6 +95,15 @@ fn handle_backed_growth_may_defer_strict_flush(
     }
 }
 
+struct ScratchCreateSpec<'a> {
+    parent: Ino,
+    name: &'a [u8],
+    kind: FileType,
+    uid: u32,
+    gid: u32,
+    mode: u16,
+}
+
 impl StudioVfs {
     fn observe_metadata_commit<T>(&self, operation: impl FnOnce() -> VfsResult<T>) -> VfsResult<T> {
         let started = Instant::now();
@@ -1621,6 +1630,9 @@ impl StudioVfs {
         if self.is_synthesized_ignored_ino(ino) || self.is_trash_container_ino(ino)? {
             return Ok(attr);
         }
+        if self.is_scratch_inode(ino)? {
+            return self.commit_scratch_attr_only_setattr(ino, attr, &args);
+        }
         self.enqueue_deferred_namespace_op(
             None,
             attr.clone(),
@@ -1724,6 +1736,28 @@ impl StudioVfs {
             }
             return Err(VfsError::OperationNotSupported);
         }
+        if self.is_scratch_inode(ino)? {
+            if args.size.is_some() {
+                if let Some(handle) = fh {
+                    self.enforce_mutating_handle_access(handle, ino)?;
+                }
+                return self.run_sync_future_with_admission(
+                    &operation,
+                    self.setattr_scratch_with_size_change(ino, args, update_mtime),
+                );
+            }
+            let cleanup = self.file_session_cleanup(ino);
+            let permit = self.run_sync_future_with_admission(&operation, async {
+                Ok(self
+                    .state
+                    .file_session
+                    .enter_op(ino, FileSessionOperation::Write)
+                    .await)
+            })?;
+            let _cleanup = cleanup.with_permit(permit);
+            let attr = self.attr_only_setattr_base_attr(ino)?;
+            return self.commit_scratch_attr_only_setattr(ino, attr, &args);
+        }
 
         let attr = self.attr_only_setattr_base_attr(ino)?;
         // Handle-backed growth stays local (create, SetEndOfFile, write); other updates
@@ -1779,6 +1813,78 @@ impl StudioVfs {
         let _cleanup = cleanup.with_permit(permit);
         let attr = self.attr_only_setattr_base_attr(ino)?;
         self.commit_attr_only_setattr(ino, attr, &args)
+    }
+
+    /// Applies non-size attributes to a scratch inode; caller holds its Write session.
+    fn commit_scratch_attr_only_setattr(
+        &self,
+        ino: Ino,
+        mut attr: InodeAttr,
+        args: &SetattrArgs,
+    ) -> VfsResult<InodeAttr> {
+        let mut committed = self.sync_meta().get_scratch_attr(ino)?;
+        if args.apply_attr_only(&mut committed) {
+            committed.touch_ctime();
+            self.sync_meta().set_scratch_attr(&committed)?;
+            if let Some(dirty) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
+                args.apply_attr_only(dirty);
+                dirty.ctime = committed.ctime;
+                attr = dirty.clone();
+            } else {
+                attr = committed;
+            }
+            self.invalidate_attr_read_cache([ino]);
+        }
+        Ok(attr)
+    }
+
+    async fn setattr_scratch_with_size_change(
+        &self,
+        ino: Ino,
+        args: SetattrArgs,
+        update_mtime: bool,
+    ) -> VfsResult<InodeAttr> {
+        self.wait_for_deferred_materialization_inflight(ino).await;
+        let session = self
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Flush)
+            .await;
+        let result: VfsResult<InodeAttr> = async {
+            let _ = self.materialize_writer_stack_for_inode(ino).await?;
+            self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+                .await?;
+            let mut attr = self.sync_meta().get_scratch_attr(ino)?;
+            if attr.kind == FileType::Directory {
+                return Err(VfsError::Meta(MetaError::IsADirectory(ino)));
+            }
+            let new_size = args.size.unwrap_or(attr.size);
+            let old_size = attr.size;
+            let _ = args.apply_attr_only(&mut attr);
+            if new_size != old_size && update_mtime && matches!(args.mtime, TimeSpec::Omit) {
+                attr.touch_mtime();
+            }
+            attr.touch_ctime();
+            if new_size != old_size {
+                self.state.writer_stack.clear_inode(ino);
+                attr.size = new_size;
+                let displaced = self.sync_meta().truncate_scratch(ino, new_size, &attr)?;
+                if !displaced.is_empty()
+                    && let Err(error) = self.payload_store_remove_batch_async(&displaced).await
+                {
+                    warn!(ino, %error, "failed to remove displaced scratch truncate payloads");
+                }
+            } else {
+                self.sync_meta().set_scratch_attr(&attr)?;
+            }
+            self.state.namespace.dirty_attrs.lock().remove(&ino);
+            self.invalidate_attr_read_cache([ino]);
+            Ok(attr)
+        }
+        .await;
+        drop(session);
+        self.state.file_session.gc_if_idle(ino);
+        result
     }
 
     /// Applies non-size attributes; the caller holds the inode's Write session.
@@ -2661,6 +2767,20 @@ impl StudioVfs {
         }
 
         let observed = self.namespace_cache_token_for_parent(parent);
+        if let Some(scratch_ino) = self.sync_meta().lookup_scratch_entry(parent, name)? {
+            self.dentry_cache_insert_observed(
+                parent,
+                name,
+                DentryCacheValue::Positive(scratch_ino),
+                observed,
+            );
+            self.enforce_access(scratch_ino, AccessLevel::ReadOnly)?;
+            return self.getattr_unchecked(scratch_ino);
+        }
+        if self.is_scratch_inode(parent)? {
+            self.dentry_cache_insert_observed(parent, name, DentryCacheValue::Negative, observed);
+            return Err(Self::ignored_entry_not_found(parent, name));
+        }
         trace!(
             target: "studiofs_vfs::metadata_baseline::metadata_lookup",
             "VFS namespace metadata lookup"
@@ -2733,8 +2853,11 @@ impl StudioVfs {
 
         let meta = self.sync_meta();
         let observed = self.namespace_cache_token_for_parent(ino);
+        let is_scratch_dir = self.is_scratch_inode(ino)?;
         // Capture pending names before redb: settlement commits there before retiring them.
-        let deferred_children = {
+        let deferred_children = if is_scratch_dir {
+            Vec::new()
+        } else {
             let inner = self.state.namespace.deferred.inner.lock();
             inner
                 .entries
@@ -2752,7 +2875,12 @@ impl StudioVfs {
             target: "studiofs_vfs::metadata_baseline::readdir",
             "VFS readdir"
         );
-        let mut entries = meta.readdir(ino)?;
+        let mut entries = if is_scratch_dir {
+            Vec::new()
+        } else {
+            meta.readdir(ino)?
+        };
+        let scratch_children = meta.readdir_scratch(ino)?;
         let show_trash_root = if ino == super::ROOT_INO {
             let show = self.trash_root_is_listed()?;
             let profile = self.native_trash_profile();
@@ -2767,16 +2895,19 @@ impl StudioVfs {
             false
         };
 
-        let existing_names = entries
+        let mut existing_names = entries
             .iter()
             .map(|entry| entry.name.clone())
             .collect::<HashSet<_>>();
         let mut confirmed_entry_inos = HashSet::new();
+        let mut scratch_entry_inos = HashSet::new();
         let mut attrs_by_ino = HashMap::new();
+        let merges_extra_sources = !deferred_children.is_empty() || !scratch_children.is_empty();
         for (name, attr) in deferred_children {
             if existing_names.contains(&name) {
                 continue;
             }
+            existing_names.insert(name.clone());
             entries.push(DirEntry {
                 name,
                 ino: attr.ino,
@@ -2784,6 +2915,30 @@ impl StudioVfs {
             });
             confirmed_entry_inos.insert(attr.ino);
             attrs_by_ino.insert(attr.ino, attr);
+        }
+        if !scratch_children.is_empty() {
+            let dirty_attrs = self.state.namespace.dirty_attrs.lock();
+            for (name, attr) in scratch_children {
+                if existing_names.contains(&name) {
+                    continue;
+                }
+                existing_names.insert(name.clone());
+                let effective_attr = dirty_attrs.get(&attr.ino).cloned().unwrap_or(attr);
+                entries.push(DirEntry {
+                    name,
+                    ino: effective_attr.ino,
+                    kind: effective_attr.kind,
+                });
+                scratch_entry_inos.insert(effective_attr.ino);
+                confirmed_entry_inos.insert(effective_attr.ino);
+                attrs_by_ino.insert(effective_attr.ino, effective_attr);
+            }
+        }
+        // Keep merged tracked + deferred + scratch entries in a deterministic
+        // byte order so paginated readdir offsets stay stable. A tracked-only
+        // listing keeps the metadata order.
+        if merges_extra_sources {
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
         }
         if !entries.is_empty() {
             let child_inos = entries
@@ -2937,7 +3092,7 @@ impl StudioVfs {
 
         let file_children: Vec<DirAccessEntry<'_>> = entries
             .iter()
-            .filter(|e| e.kind == FileType::RegularFile)
+            .filter(|e| e.kind == FileType::RegularFile && !scratch_entry_inos.contains(&e.ino))
             .map(|e| DirAccessEntry::new(e.ino, &e.name))
             .collect();
         if !file_children.is_empty() {
@@ -3217,6 +3372,9 @@ impl StudioVfs {
         {
             return Err(VfsError::OperationNotSupported);
         }
+        if self.is_scratch_inode(ino)? || self.is_scratch_inode(new_parent)? {
+            return Err(VfsError::CrossDevice);
+        }
         if self.should_ignore_regular_file_path(new_parent, new_name) {
             let source_attr = self.getattr(ino)?;
             let ignored = self.create_public_ignored_entry(
@@ -3245,6 +3403,16 @@ impl StudioVfs {
         self.wait_for_deferred_namespace_create(ino).await?;
         self.wait_for_deferred_namespace_create(new_parent).await?;
         self.reject_pending_deferred_entry(new_parent, new_name)?;
+        if self
+            .sync_meta()
+            .lookup_scratch_entry(new_parent, new_name)?
+            .is_some()
+        {
+            return Err(VfsError::Meta(MetaError::EntryExists {
+                parent: new_parent,
+                name: String::from_utf8_lossy(new_name).into_owned(),
+            }));
+        }
         let session = self
             .state
             .file_session
@@ -3305,6 +3473,71 @@ impl StudioVfs {
         self.create_with_metadata_flush(parent, name, uid, gid, mode, false)
     }
 
+    fn create_scratch_namespace_entry(
+        &self,
+        operation: &super::misc_ops::MutatingOperationAdmission<'_>,
+        namespace_mutations: &super::namespace::NamespaceMutationOps<'_>,
+        spec: ScratchCreateSpec<'_>,
+    ) -> VfsResult<InodeAttr> {
+        let ScratchCreateSpec {
+            parent,
+            name,
+            kind,
+            uid,
+            gid,
+            mode,
+        } = spec;
+        if self.has_deferred_namespace_metadata(parent) {
+            self.run_sync_future_with_admission(
+                operation,
+                self.drain_deferred_namespace_metadata_for_barrier(),
+            )?;
+        }
+        self.reject_pending_deferred_entry(parent, name)?;
+        let ino = self.reserve_namespace_ino()?;
+        let attr = match kind {
+            FileType::RegularFile => InodeAttr::new_file(ino, parent, uid, gid, mode & 0o7777),
+            FileType::Directory => InodeAttr::new_dir(ino, parent, uid, gid, mode & 0o7777),
+            FileType::Symlink => InodeAttr::new_symlink(ino, parent, uid, gid, 0),
+        };
+        if let Err(error) = self.sync_meta().create_scratch_entry(parent, name, &attr) {
+            self.return_reserved_namespace_ino(ino);
+            return Err(VfsError::Meta(error));
+        }
+        namespace_mutations.record_scratch_insertion(parent, name, attr.ino, std::iter::empty());
+        Ok(attr)
+    }
+
+    fn is_scratch_descendant_of(
+        &self,
+        candidate_parent: Ino,
+        ancestor_dir: Ino,
+    ) -> VfsResult<bool> {
+        const MAX_SCRATCH_ANCESTOR_HOPS: usize = 1024;
+        let mut current = candidate_parent;
+        for _ in 0..MAX_SCRATCH_ANCESTOR_HOPS {
+            if current == 0 || current == super::ROOT_INO {
+                return Ok(false);
+            }
+            if current == ancestor_dir {
+                return Ok(true);
+            }
+            match self.sync_meta().get_scratch_attr(current) {
+                Ok(attr) if attr.parent == current => return Ok(false),
+                Ok(attr) => current = attr.parent,
+                // The walk left the scratch subtree; tracked ancestors cannot
+                // be inside a scratch directory.
+                Err(MetaError::InodeNotFound(_)) => return Ok(false),
+                Err(error) => return Err(VfsError::Meta(error)),
+            }
+        }
+        // A chain this deep is corrupt or cyclic; refuse rather than allow a
+        // move that could detach a subtree.
+        Err(VfsError::InvalidName(
+            "scratch directory ancestry exceeds the supported depth".to_string(),
+        ))
+    }
+
     fn create_with_metadata_flush(
         &self,
         parent: Ino,
@@ -3314,7 +3547,7 @@ impl StudioVfs {
         mode: u16,
         request_eager_flush: bool,
     ) -> VfsResult<InodeAttr> {
-        let _operation = self.try_mutating_operation_admission()?;
+        let operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
@@ -3342,6 +3575,32 @@ impl StudioVfs {
         }
         if self.is_trash_container_ino(parent)? {
             return Err(VfsError::OperationNotSupported);
+        }
+        if self.classify_new_entry(parent, name, false)?
+            == crate::scratch_rules::ScratchClass::Scratch
+        {
+            return self.create_scratch_namespace_entry(
+                &operation,
+                &namespace_mutations,
+                ScratchCreateSpec {
+                    parent,
+                    name,
+                    kind: FileType::RegularFile,
+                    uid,
+                    gid,
+                    mode,
+                },
+            );
+        }
+        if self
+            .sync_meta()
+            .lookup_scratch_entry(parent, name)?
+            .is_some()
+        {
+            return Err(VfsError::Meta(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).into_owned(),
+            }));
         }
         let attr = self.observe_metadata_commit(|| {
             let ino = self.reserve_namespace_ino()?;
@@ -3385,6 +3644,16 @@ impl StudioVfs {
                 })),
             };
         }
+        if self
+            .sync_meta()
+            .lookup_scratch_entry(parent, name)?
+            .is_some()
+        {
+            return Err(VfsError::Meta(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).into_owned(),
+            }));
+        }
         match self.sync_meta().lookup(parent, name) {
             Ok(_) => Err(VfsError::Meta(MetaError::EntryExists {
                 parent,
@@ -3406,7 +3675,7 @@ impl StudioVfs {
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Create);
-        let _operation = self.try_mutating_operation_admission()?;
+        let operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.ensure_no_deferred_namespace_error(parent)?;
@@ -3435,6 +3704,22 @@ impl StudioVfs {
         }
         if self.is_trash_container_ino(parent)? {
             return Err(VfsError::OperationNotSupported);
+        }
+        if self.classify_new_entry(parent, name, false)?
+            == crate::scratch_rules::ScratchClass::Scratch
+        {
+            return self.create_scratch_namespace_entry(
+                &operation,
+                &namespace_mutations,
+                ScratchCreateSpec {
+                    parent,
+                    name,
+                    kind: FileType::RegularFile,
+                    uid,
+                    gid,
+                    mode,
+                },
+            );
         }
         self.reject_existing_deferred_or_persisted_entry(parent, name)?;
         self.ensure_deferred_namespace_admission(
@@ -3511,7 +3796,7 @@ impl StudioVfs {
         mode: u16,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Mkdir);
-        let _operation = self.try_mutating_operation_admission()?;
+        let operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
@@ -3525,6 +3810,32 @@ impl StudioVfs {
                 self.create_public_ignored_entry(parent, name, uid, gid, mode, FileType::Directory);
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
+        }
+        if self.classify_new_entry(parent, name, true)?
+            == crate::scratch_rules::ScratchClass::Scratch
+        {
+            return self.create_scratch_namespace_entry(
+                &operation,
+                &namespace_mutations,
+                ScratchCreateSpec {
+                    parent,
+                    name,
+                    kind: FileType::Directory,
+                    uid,
+                    gid,
+                    mode,
+                },
+            );
+        }
+        if self
+            .sync_meta()
+            .lookup_scratch_entry(parent, name)?
+            .is_some()
+        {
+            return Err(VfsError::Meta(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).into_owned(),
+            }));
         }
         let attr = self.observe_metadata_commit(|| {
             let ino = self.reserve_namespace_ino()?;
@@ -3557,7 +3868,7 @@ impl StudioVfs {
         runtime: &tokio::runtime::Handle,
     ) -> VfsResult<InodeAttr> {
         let _timer = VfsForegroundWriteTimer::new(self, VfsForegroundWriteOp::Mkdir);
-        let _operation = self.try_mutating_operation_admission()?;
+        let operation = self.try_mutating_operation_admission()?;
         let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.ensure_no_deferred_namespace_error(parent)?;
@@ -3572,6 +3883,22 @@ impl StudioVfs {
                 self.create_public_ignored_entry(parent, name, uid, gid, mode, FileType::Directory);
             namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
+        }
+        if self.classify_new_entry(parent, name, true)?
+            == crate::scratch_rules::ScratchClass::Scratch
+        {
+            return self.create_scratch_namespace_entry(
+                &operation,
+                &namespace_mutations,
+                ScratchCreateSpec {
+                    parent,
+                    name,
+                    kind: FileType::Directory,
+                    uid,
+                    gid,
+                    mode,
+                },
+            );
         }
         self.reject_existing_deferred_or_persisted_entry(parent, name)?;
         self.ensure_deferred_namespace_admission(
@@ -3688,6 +4015,36 @@ impl StudioVfs {
         }
         // `create_symlink` only checks committed dentries.
         self.reject_pending_deferred_entry(parent, name)?;
+        if self.classify_new_entry(parent, name, false)?
+            == crate::scratch_rules::ScratchClass::Scratch
+        {
+            let ino = self.reserve_namespace_ino()?;
+            let attr = InodeAttr::new_symlink(ino, parent, uid, gid, target.len());
+            if let Err(error) = self
+                .sync_meta()
+                .create_scratch_symlink(parent, name, target, &attr)
+            {
+                self.return_reserved_namespace_ino(ino);
+                return Err(VfsError::Meta(error));
+            }
+            namespace_mutations.record_scratch_insertion(
+                parent,
+                name,
+                attr.ino,
+                std::iter::empty(),
+            );
+            return Ok(attr);
+        }
+        if self
+            .sync_meta()
+            .lookup_scratch_entry(parent, name)?
+            .is_some()
+        {
+            return Err(VfsError::Meta(MetaError::EntryExists {
+                parent,
+                name: String::from_utf8_lossy(name).into_owned(),
+            }));
+        }
         let attr = self
             .sync_meta()
             .create_symlink(parent, name, target, uid, gid)?;
@@ -3709,6 +4066,9 @@ impl StudioVfs {
                 return Ok(Vec::new());
             }
             return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
+        }
+        if self.is_scratch_inode(ino)? {
+            return Ok(self.sync_meta().get_scratch_symlink_target(ino)?);
         }
         Ok(self.sync_meta().get_symlink_target(ino)?)
     }
@@ -3771,6 +4131,43 @@ impl StudioVfs {
             .file_session
             .enter_op(parent, FileSessionOperation::Delete)
             .await;
+        if let Some(scratch_ino) = meta.lookup_scratch_entry(parent, name)? {
+            let result = async {
+                if self.handle_table.open_count(scratch_ino) == 0 {
+                    self.wait_for_deferred_materialization_inflight(scratch_ino)
+                        .await;
+                }
+                let delete_session = self
+                    .state
+                    .file_session
+                    .enter_op(scratch_ino, FileSessionOperation::Delete)
+                    .await;
+                let inner_result = async {
+                    let keep_open = self.handle_table.open_count(scratch_ino) > 0;
+                    let (unlinked_attr, freed_objects) =
+                        meta.unlink_scratch_entry(parent, name, keep_open)?;
+                    if keep_open {
+                        self.handle_table.mark_orphan(unlinked_attr.ino);
+                    } else {
+                        self.cleanup_scratch_inode_runtime_and_payloads(
+                            unlinked_attr.ino,
+                            freed_objects,
+                        )
+                        .await;
+                    }
+                    namespace_mutations.record_scratch_removal(parent, name, [unlinked_attr.ino]);
+                    Ok(Some(unlinked_attr))
+                }
+                .await;
+                drop(delete_session);
+                self.state.file_session.gc_if_idle(scratch_ino);
+                inner_result
+            }
+            .await;
+            drop(parent_delete_session);
+            self.state.file_session.gc_if_idle(parent);
+            return result;
+        }
         self.wait_for_deferred_namespace_entry(parent, name).await?;
         let initial_target = self.resolve_unlink_target(&meta, parent, name)?;
         let delete_session = self
@@ -3926,6 +4323,24 @@ impl StudioVfs {
             .await;
         let _parent_delete_session = parent_cleanup.with_permit(parent_delete_session);
         let meta = self.sync_meta();
+        if let Some(scratch_ino) = meta.lookup_scratch_entry(parent, name)? {
+            let target_cleanup = self.file_session_cleanup(scratch_ino);
+            let target_namespace_read = self
+                .state
+                .file_session
+                .enter_op(scratch_ino, FileSessionOperation::Read)
+                .await;
+            let _target_namespace_read = target_cleanup.with_permit(target_namespace_read);
+            let removed_attr = meta.rmdir_scratch_entry(parent, name)?;
+            namespace_mutations.record_scratch_removal(parent, name, [removed_attr.ino]);
+            self.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .remove(&removed_attr.ino);
+            self.bump_directory_generation(removed_attr.ino);
+            return Ok(Some(removed_attr));
+        }
         let mut retry_attempts: u16 = 0;
         let mut settle_attempts: u16 = 0;
         let mut rechecked_after_skipped_heal = false;
@@ -3939,7 +4354,9 @@ impl StudioVfs {
                 rechecked_after_skipped_heal = false;
                 last_target_ino = Some(target_ino);
             }
-            if self.has_deferred_namespace_children(target_ino) {
+            if self.has_deferred_namespace_children(target_ino)
+                || meta.has_scratch_children(target_ino)?
+            {
                 return Err(VfsError::Meta(MetaError::DirNotEmpty(target_ino)));
             }
             let rmdir_result = {
@@ -3967,6 +4384,9 @@ impl StudioVfs {
                     continue;
                 }
                 Err(err @ MetaError::DirNotEmpty(dir_ino)) => {
+                    if meta.has_scratch_children(dir_ino)? {
+                        return Err(VfsError::Meta(err));
+                    }
                     let (healed, child_delete_inos, observed_missing_child) =
                         self.heal_dangling_directory_children(dir_ino)?;
                     if healed > 0 {
@@ -4258,6 +4678,107 @@ impl StudioVfs {
             || self.should_ignore_regular_file_path(new_parent, new_name);
         let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
             && self.ignored_directory_has_probable_trash_ancestor(new_parent);
+        if source_ignored.is_none()
+            && let Some(src_scratch_ino) = meta.lookup_scratch_entry(parent, name)?
+        {
+            if target_is_ignored_trash_root
+                || (target_is_ignored && self.should_ignore_directory_path(new_parent, new_name))
+            {
+                return Err(VfsError::OperationNotSupported);
+            }
+            if target_is_ignored {
+                return Err(VfsError::CrossDevice);
+            }
+            let src_attr = meta.get_scratch_attr(src_scratch_ino)?;
+            if src_attr.kind == FileType::Directory
+                && self.is_scratch_descendant_of(new_parent, src_scratch_ino)?
+            {
+                return Err(VfsError::InvalidName(
+                    "cannot move a scratch directory into its own descendant".to_string(),
+                ));
+            }
+            let dst_class = self.classify_new_entry(
+                new_parent,
+                new_name,
+                src_attr.kind == FileType::Directory,
+            )?;
+            if dst_class != crate::scratch_rules::ScratchClass::Scratch {
+                // Promote (scratch -> tracked) lands in SFS-1078.
+                return Err(VfsError::CrossDevice);
+            }
+            self.wait_for_deferred_namespace_entry(new_parent, new_name)
+                .await?;
+            if meta.lookup(new_parent, new_name).is_ok() {
+                if !replace_if_exists {
+                    return Err(VfsError::Meta(MetaError::EntryExists {
+                        parent: new_parent,
+                        name: String::from_utf8_lossy(new_name).into_owned(),
+                    }));
+                }
+                // Replacing a tracked entry with a scratch entry crosses classes.
+                return Err(VfsError::CrossDevice);
+            }
+            let displaced_scratch_dst = meta
+                .lookup_scratch_entry(new_parent, new_name)?
+                .filter(|dst_ino| *dst_ino != src_scratch_ino);
+            if let Some(dst_ino) = displaced_scratch_dst
+                && self.handle_table.open_count(dst_ino) == 0
+            {
+                self.wait_for_deferred_materialization_inflight(dst_ino)
+                    .await;
+            }
+            // Same as scratch unlink: the Delete session orders the open-count
+            // check against concurrent opens of the displaced inode.
+            let _displaced_delete_session = match displaced_scratch_dst {
+                Some(dst_ino) => Some(
+                    self.state
+                        .file_session
+                        .enter_op(dst_ino, FileSessionOperation::Delete)
+                        .await,
+                ),
+                None => None,
+            };
+            let keep_displaced_open = displaced_scratch_dst
+                .is_some_and(|dst_ino| self.handle_table.open_count(dst_ino) > 0);
+            let rename_result = meta.rename_scratch_entry(
+                parent,
+                name,
+                new_parent,
+                new_name,
+                replace_if_exists,
+                keep_displaced_open,
+            )?;
+            if rename_result.namespace_changed {
+                namespace_mutations.record_scratch_rename(
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    rename_result.moved_ino,
+                );
+                self.bump_acl_namespace_epoch();
+                if let Some(displaced) = &rename_result.displaced {
+                    if displaced.kind == FileType::Directory {
+                        self.state
+                            .namespace
+                            .dirty_attrs
+                            .lock()
+                            .remove(&displaced.ino);
+                        self.bump_directory_generation(displaced.ino);
+                        self.dentry_cache_invalidate_parent(displaced.ino);
+                    } else if keep_displaced_open {
+                        self.handle_table.mark_orphan(displaced.ino);
+                    } else {
+                        self.cleanup_scratch_inode_runtime_and_payloads(
+                            displaced.ino,
+                            rename_result.removed_object_ids,
+                        )
+                        .await;
+                    }
+                }
+            }
+            return Ok(());
+        }
         let prevalidated_source_entry = if !replace_if_exists && source_ignored.is_none() {
             self.wait_for_deferred_namespace_entry(parent, name).await?;
             let source_entry = meta.lookup(parent, name)?;
@@ -4421,6 +4942,21 @@ impl StudioVfs {
         );
         self.enforce_no_known_foreign_hard_lock(source_entry.ino)?;
         let source_attr = meta.get_attr(source_entry.ino)?;
+        if self.is_scratch_inode(new_parent)? {
+            // Demote (tracked -> scratch directory) lands in SFS-1079.
+            return Err(VfsError::CrossDevice);
+        }
+        if meta.lookup_scratch_entry(new_parent, new_name)?.is_some() {
+            if !replace_if_exists {
+                return Err(VfsError::Meta(MetaError::EntryExists {
+                    parent: new_parent,
+                    name: String::from_utf8_lossy(new_name).into_owned(),
+                }));
+            }
+            // Replacing a scratch entry with a tracked one crosses classes and
+            // cannot commit in one transaction until promote/demote land.
+            return Err(VfsError::CrossDevice);
+        }
         let target_is_trash = target_is_trash
             || (replace_if_exists
                 && (self.is_posix_trash_move_target_dir(new_parent)?
@@ -5002,7 +5538,7 @@ mod tests {
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs815-missing-source");
 
         assert!(matches!(
-            vfs.rename(ROOT_INO, b"missing", ROOT_INO, b"._destination", false),
+            vfs.rename(ROOT_INO, b"missing", ROOT_INO, b".fseventsd", false),
             Err(VfsError::Meta(MetaError::EntryNotFound { .. }))
         ));
     }
@@ -5012,24 +5548,15 @@ mod tests {
         let tmp = studiofs_test_support::workspace_target_tempdir("sfs815-filtered-");
         let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs815-filtered");
         let source = meta.create_file(ROOT_INO, b"source", 0, 0, 0o644).unwrap();
-        let target = vfs.create_ignored_entry(
-            ROOT_INO,
-            b"._destination",
-            0,
-            0,
-            0o600,
-            FileType::RegularFile,
-        );
+        let target =
+            vfs.create_ignored_entry(ROOT_INO, b".fseventsd", 0, 0, 0o600, FileType::RegularFile);
 
         assert!(matches!(
-            vfs.rename(ROOT_INO, b"source", ROOT_INO, b"._destination", false),
+            vfs.rename(ROOT_INO, b"source", ROOT_INO, b".fseventsd", false),
             Err(VfsError::Meta(MetaError::EntryExists { .. }))
         ));
         assert_eq!(meta.lookup(ROOT_INO, b"source").unwrap().ino, source.ino);
-        assert_eq!(
-            vfs.lookup(ROOT_INO, b"._destination").unwrap().ino,
-            target.ino
-        );
+        assert_eq!(vfs.lookup(ROOT_INO, b".fseventsd").unwrap().ino, target.ino);
     }
 
     /// Period 0 refuses a no-replace move onto an existing trash name and keeps the source.

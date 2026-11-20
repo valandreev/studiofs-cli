@@ -91,6 +91,7 @@ pub fn vfs_err_to_errno(error: &VfsError) -> i32 {
         BridgeVfsErrorKind::InvalidInput => libc::EINVAL,
         BridgeVfsErrorKind::NameTooLong => libc::ENAMETOOLONG,
         BridgeVfsErrorKind::OperationNotSupported => libc::EOPNOTSUPP,
+        BridgeVfsErrorKind::CrossDevice => libc::EXDEV,
         BridgeVfsErrorKind::PermissionDenied => libc::EACCES,
         BridgeVfsErrorKind::MetadataPersistenceDegraded => libc::EIO,
         BridgeVfsErrorKind::Retryable => libc::EAGAIN,
@@ -204,6 +205,11 @@ mod tests {
         assert_eq!(vfs_err_to_errno(&repair), libc::ENOTRECOVERABLE);
         assert_eq!(vfs_err_to_errno(&unavailable), libc::EHOSTUNREACH);
         assert_eq!(vfs_err_to_errno(&timeout), libc::ETIMEDOUT);
+    }
+
+    #[test]
+    fn cross_device_error_maps_to_exdev() {
+        assert_eq!(vfs_err_to_errno(&VfsError::CrossDevice), libc::EXDEV);
     }
 
     #[test]

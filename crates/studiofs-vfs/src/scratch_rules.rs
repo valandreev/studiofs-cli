@@ -80,7 +80,118 @@ struct RuleGroup {
 /// Pattern expressions and source rules for one group, in source order.
 type GroupSource = (Vec<String>, Vec<(usize, ScratchClass)>);
 
+/// Pre-resolved compiled rules for direct children of one tracked directory.
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledDirRules {
+    case_insensitive: bool,
+    ancestor_excluded: bool,
+    /// Applicable rule sets ordered innermost-to-outermost, paired with the
+    /// slash-terminated prefix to prepend to a folded child name (empty when
+    /// the rule file lives in this directory itself).
+    scopes: Vec<(Vec<u8>, Arc<RuleSet>)>,
+}
+
+impl CompiledDirRules {
+    /// Classify a direct child entry name of this directory without re-walking
+    /// ancestor paths or looking up rule-file maps.
+    pub(crate) fn classify_child(&self, name: &[u8], is_dir: bool) -> ScratchClass {
+        let folded = if self.case_insensitive {
+            fold_dentry_name(name)
+        } else {
+            Cow::Borrowed(name)
+        };
+        if folded.is_empty() || folded.as_ref() == RULE_FILE {
+            return ScratchClass::Tracked;
+        }
+        if self.ancestor_excluded {
+            return ScratchClass::Scratch;
+        }
+        let mut relative_buf = Vec::new();
+        for (prefix, set) in &self.scopes {
+            let relative = if prefix.is_empty() {
+                folded.as_ref()
+            } else {
+                relative_buf.clear();
+                relative_buf.reserve(prefix.len() + folded.len());
+                relative_buf.extend_from_slice(prefix);
+                relative_buf.extend_from_slice(folded.as_ref());
+                relative_buf.as_slice()
+            };
+            if let Some(class) = set.matching_class(folded.as_ref(), relative, is_dir) {
+                return class;
+            }
+        }
+        if folded.starts_with(b"._") {
+            ScratchClass::Scratch
+        } else {
+            ScratchClass::Tracked
+        }
+    }
+}
+
 impl ScratchRules {
+    /// Pre-resolve the rule scopes applicable to direct children of `dir_path`
+    /// (empty for the volume root).
+    pub(crate) fn compile_directory(&self, dir_path: &[u8]) -> CompiledDirRules {
+        let dir_path = self.fold(dir_path);
+        let mut ancestor_excluded = false;
+        if !dir_path.is_empty() {
+            for (end, _) in dir_path
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'/')
+            {
+                if basename(&dir_path[..end]) != RULE_FILE
+                    && self.classify_entry(&dir_path[..end], true) == ScratchClass::Scratch
+                {
+                    ancestor_excluded = true;
+                    break;
+                }
+            }
+            if !ancestor_excluded
+                && basename(&dir_path) != RULE_FILE
+                && self.classify_entry(&dir_path, true) == ScratchClass::Scratch
+            {
+                ancestor_excluded = true;
+            }
+        }
+
+        let mut scopes = Vec::new();
+        if !ancestor_excluded {
+            if let Some(set) = self.directories.get(dir_path.as_ref()) {
+                scopes.push((Vec::new(), Arc::clone(set)));
+            }
+            if !dir_path.is_empty() {
+                for (index, _) in dir_path
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter(|(_, byte)| **byte == b'/')
+                {
+                    let scope = &dir_path[..index];
+                    if let Some(set) = self.directories.get(scope) {
+                        let mut prefix = Vec::with_capacity(dir_path.len() - index);
+                        prefix.extend_from_slice(&dir_path[index + 1..]);
+                        prefix.push(b'/');
+                        scopes.push((prefix, Arc::clone(set)));
+                    }
+                }
+                if let Some(set) = self.directories.get(b"".as_slice()) {
+                    let mut prefix = Vec::with_capacity(dir_path.len() + 1);
+                    prefix.extend_from_slice(&dir_path);
+                    prefix.push(b'/');
+                    scopes.push((prefix, Arc::clone(set)));
+                }
+            }
+        }
+
+        CompiledDirRules {
+            case_insensitive: self.case_insensitive,
+            ancestor_excluded,
+            scopes,
+        }
+    }
+
     /// Create an empty rule index. With `case_insensitive`, patterns,
     /// directory keys, and classified paths are compared case-folded.
     pub fn new(case_insensitive: bool) -> Self {

@@ -11,12 +11,39 @@ impl MetaEngineCore for PgMetaEngine {
         self.local.create_scratch_entry(parent, name, attr)
     }
 
+    fn create_scratch_symlink(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        attr: &InodeAttr,
+    ) -> MetaResult<()> {
+        self.local
+            .create_scratch_symlink(parent, name, target, attr)
+    }
+
     fn lookup_scratch_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<Option<Ino>> {
         self.local.lookup_scratch_entry(parent, name)
     }
 
+    fn readdir_scratch(&self, parent: Ino) -> MetaResult<Vec<(Vec<u8>, InodeAttr)>> {
+        self.local.readdir_scratch(parent)
+    }
+
+    fn has_scratch_children(&self, parent: Ino) -> MetaResult<bool> {
+        self.local.has_scratch_children(parent)
+    }
+
     fn get_scratch_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
         self.local.get_scratch_attr(ino)
+    }
+
+    fn set_scratch_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
+        self.local.set_scratch_attr(attr)
+    }
+
+    fn truncate_scratch(&self, ino: Ino, new_size: u64, attr: &InodeAttr) -> MetaResult<Vec<u64>> {
+        self.local.truncate_scratch(ino, new_size, attr)
     }
 
     fn commit_scratch_overlay(
@@ -35,12 +62,81 @@ impl MetaEngineCore for PgMetaEngine {
         self.local.get_scratch_overlay(ino, chunk)
     }
 
+    fn lookup_scratch_slices(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>> {
+        self.local.lookup_scratch_slices(ino, offset, length)
+    }
+
+    fn get_scratch_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>> {
+        self.local.get_scratch_symlink_target(ino)
+    }
+
+    fn unlink_scratch_entry(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        keep_open_inode: bool,
+    ) -> MetaResult<(InodeAttr, Vec<u64>)> {
+        self.local
+            .unlink_scratch_entry(parent, name, keep_open_inode)
+    }
+
+    fn finalize_orphan_scratch_inode(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        self.local.finalize_orphan_scratch_inode(ino)
+    }
+
+    fn rmdir_scratch_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
+        self.local.rmdir_scratch_entry(parent, name)
+    }
+
+    fn rename_scratch_entry(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        replace_if_exists: bool,
+        keep_displaced_open: bool,
+    ) -> MetaResult<crate::engine::ScratchRenameResult> {
+        self.local.rename_scratch_entry(
+            parent,
+            name,
+            new_parent,
+            new_name,
+            replace_if_exists,
+            keep_displaced_open,
+        )
+    }
+
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {
         self.local.set_scratch_xattr(ino, name, value)
     }
 
+    fn set_scratch_xattr_with_flags(
+        &self,
+        ino: Ino,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+    ) -> MetaResult<()> {
+        self.local
+            .set_scratch_xattr_with_flags(ino, name, value, flags)
+    }
+
     fn get_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
         self.local.get_scratch_xattr(ino, name)
+    }
+
+    fn remove_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()> {
+        self.local.remove_scratch_xattr(ino, name)
+    }
+
+    fn list_scratch_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
+        self.local.list_scratch_xattrs(ino)
     }
 
     fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {

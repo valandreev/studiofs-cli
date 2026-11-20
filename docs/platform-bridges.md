@@ -1048,21 +1048,33 @@ restores the exact bytes with original inode identity preserved.
 
 ### macOS metadata file filtering
 
-Finder and related macOS services may also try to create metadata sidecar files
-such as AppleDouble `._*` and root-level system metadata names like
-`.Spotlight-V100`, and `.fseventsd`. StudioFS stores `.DS_Store` as an ordinary
-small file because Finder and `copyfile` require it to survive post-close
-metadata operations during folder copies.
+Finder and related macOS services create metadata sidecar files such as
+AppleDouble `._*` and root-level system metadata names like `.Spotlight-V100`
+and `.fseventsd`. StudioFS stores `.DS_Store` as an ordinary tracked file
+because Finder and `copyfile` require it to survive post-close metadata
+operations during folder copies.
 
-StudioFS drops these names at the VFS layer:
-- `create` / `open` flows succeed locally so Finder does not surface errors
-- ignored files stay ephemeral to the mounting client only
-- root metadata names are absorbed into ephemeral ignored entries; `mkdir`
-  yields an ephemeral directory inode and file/symlink-style creates are also
-  kept local-only
-- any nested activity underneath an ignored metadata directory is blackholed
-- no inode, xattr, cache, or object-store state is persisted for these names
-- these root metadata directories are filtered from `readdir`
+StudioFS separates macOS system metadata into two local-only tiers at the VFS
+layer:
+- **AppleDouble (`._*`) → local scratch layer (default built-in rule):**
+  - routed into mount-local scratch tables (`scratch_*` in local `redb`) and
+    local payload cache instead of the ephemeral discard registry
+  - `create`, `lookup`, `readdir`, `getattr`, `setattr`, `read`, `write`,
+    `xattrs`, `rename` (within scratch), and `unlink` behave like ordinary files
+    so macOS resource forks / Finder metadata round-trip cleanly on the mount
+  - marked by the read-only `user.studiofs.scratch` xattr (`"1"`, omitted from
+    `listxattr`)
+  - emits zero `event_log` rows and queues zero S3 uploads, keeping shared
+    directories clean for peers while remaining locally durable across remounts
+  - can be overridden per directory with `!.studiofsignore` negation rules (for
+    example `!._*`)
+- **Root indexing/event directories (`.Spotlight-V100`, `.fseventsd`) and trash
+  components → ephemeral discard layer:**
+  - `create` / `open` / `mkdir` flows succeed locally as ephemeral synthesized
+    inodes so Finder and macOS daemons do not surface errors
+  - any nested activity underneath an ignored metadata directory is blackholed
+  - no inode, xattr, cache, or object-store state is persisted for these names
+  - these root metadata directories are filtered from `readdir`
 
 StudioFS also enforces a size limit on xattr values to avoid unbounded metadata
 in-memory pressure from very large native `com.apple.*` writes:
@@ -1073,8 +1085,8 @@ in-memory pressure from very large native `com.apple.*` writes:
   compress-on-benefit (RLE + frame), otherwise plain bytes
 - callers still observe plain bytes on `getxattr`; existing plain persisted values remain readable
 
-This keeps shared directories free of macOS-only garbage while preserving normal
-Finder interaction.
+This keeps shared directories free of macOS-only sidecar noise while preserving
+normal Finder interaction and full AppleDouble read/write semantics.
 
 ### macOS file flags
 

@@ -30,6 +30,8 @@ pub enum BridgeVfsErrorKind {
     NameTooLong,
     /// The requested filesystem operation is not supported.
     OperationNotSupported,
+    /// Link or rename crosses incompatible classes (`EXDEV`).
+    CrossDevice,
     /// Access was denied for the requested operation.
     PermissionDenied,
     /// Metadata persistence is degraded and new mutations are blocked.
@@ -83,6 +85,7 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
         }
         VfsError::WouldBlock | VfsError::RemoteContentPending => BridgeVfsErrorKind::Retryable,
         VfsError::OperationNotSupported => BridgeVfsErrorKind::OperationNotSupported,
+        VfsError::CrossDevice => BridgeVfsErrorKind::CrossDevice,
         VfsError::InvalidName(_) => BridgeVfsErrorKind::InvalidInput,
         VfsError::NameTooLong(_) => BridgeVfsErrorKind::NameTooLong,
         VfsError::Fetch(fetch_error) => classify_fetch_error(fetch_error),
@@ -691,6 +694,14 @@ mod tests {
                 ctime_unix_nanos: 0,
                 creation_time_unix_nanos: 0,
             }
+        );
+    }
+
+    #[test]
+    fn classify_vfs_error_preserves_cross_device_category() {
+        assert_eq!(
+            classify_vfs_error(&crate::VfsError::CrossDevice),
+            BridgeVfsErrorKind::CrossDevice
         );
     }
 

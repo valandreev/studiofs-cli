@@ -8481,7 +8481,7 @@ mod tests {
             .mknod(
                 state.mount_caller(),
                 1,
-                b"._synthetic",
+                b".fseventsd",
                 libc::S_IFREG | 0o644,
             )
             .expect("create synthetic inode");

@@ -1036,6 +1036,10 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
         BridgeVfsErrorKind::InvalidInput => winfsp::FspError::from(STATUS_INVALID_PARAMETER),
         BridgeVfsErrorKind::NameTooLong => winfsp::FspError::from(STATUS_OBJECT_NAME_INVALID),
         BridgeVfsErrorKind::OperationNotSupported => winfsp::FspError::from(STATUS_NOT_SUPPORTED),
+        BridgeVfsErrorKind::CrossDevice => {
+            const STATUS_NOT_SAME_DEVICE: NTSTATUS = NTSTATUS(0xC000_00D4_u32 as i32);
+            winfsp::FspError::from(STATUS_NOT_SAME_DEVICE)
+        }
         BridgeVfsErrorKind::PermissionDenied => winfsp::FspError::from(STATUS_ACCESS_DENIED),
         BridgeVfsErrorKind::MetadataPersistenceDegraded => {
             winfsp::FspError::from(STATUS_IO_DEVICE_ERROR)
@@ -1374,7 +1378,12 @@ impl StudioFsContext {
     }
 
     fn heal_directory_orphans_for_delete(&self, dir_ino: Ino) -> winfsp::Result<usize> {
-        if self.vfs.is_synthesized_ignored_ino(dir_ino) {
+        if self.vfs.is_synthesized_ignored_ino(dir_ino)
+            || self
+                .vfs
+                .is_scratch_inode(dir_ino)
+                .map_err(vfs_to_winfsp_err)?
+        {
             return Ok(0);
         }
         let meta = self.vfs.meta();

@@ -53,9 +53,10 @@
 //! only for its own bookkeeping. These gates are outside `LockTier` and
 //! `LockOrderGuard`.
 //!
-//! The ignore rule snapshot lock and watched-inode mutex are leaves outside
-//! `LockTier`. Callers may hold any tier while taking them, but nothing else is
-//! acquired, awaited, or classified while either is held.
+//! The ignore rule snapshot lock, watched-inode mutex, and per-directory
+//! compiled-rule cache mutex are leaves outside `LockTier`. Callers may hold
+//! any tier while taking them, but nothing else is acquired, awaited, or
+//! classified while any of them is held.
 //!
 //! `NamespaceState::quota_reservations` serializes logical quota admission
 //! on one client. It is taken only when a quota is configured, before

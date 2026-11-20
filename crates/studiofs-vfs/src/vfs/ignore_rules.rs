@@ -1,8 +1,14 @@
 use super::*;
-use crate::scratch_rules::{MAX_RULE_BYTES, RULE_FILE, ScratchClass, ScratchRules};
+use crate::scratch_rules::{
+    CompiledDirRules, MAX_RULE_BYTES, RULE_FILE, ScratchClass, ScratchRules,
+};
+use lru::LruCache;
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
 use tokio::sync::{Notify, broadcast, watch};
+
+const DIR_RULE_CACHE_CAPACITY: usize = 4096;
 
 type RuleSources = BTreeMap<Vec<u8>, Vec<u8>>;
 
@@ -46,12 +52,21 @@ type PublicationBarrier = (
     tokio::sync::oneshot::Receiver<()>,
 );
 
+struct CachedDirRules {
+    rule_generation: u64,
+    dir_rename_epoch: u64,
+    compiled: Arc<CompiledDirRules>,
+}
+
 pub(super) struct IgnoreRules {
     backend: Arc<dyn LocalPayloadBackend>,
     pins: parking_lot::Mutex<RulePins>,
     #[cfg(test)]
     before_publish: parking_lot::Mutex<Option<PublicationBarrier>>,
     snapshot: parking_lot::RwLock<Arc<ScratchRules>>,
+    rule_generation: AtomicU64,
+    dir_rename_epoch: AtomicU64,
+    dir_rule_cache: parking_lot::Mutex<LruCache<Ino, CachedDirRules>>,
     sources: RuleSources,
     refresh: Notify,
     watched: Arc<parking_lot::Mutex<RuleInodes>>,
@@ -91,6 +106,11 @@ impl IgnoreRules {
             #[cfg(test)]
             before_publish: parking_lot::Mutex::default(),
             snapshot: parking_lot::RwLock::new(Arc::new(rules)),
+            rule_generation: AtomicU64::new(0),
+            dir_rename_epoch: AtomicU64::new(0),
+            dir_rule_cache: parking_lot::Mutex::new(LruCache::new(
+                NonZeroUsize::new(DIR_RULE_CACHE_CAPACITY).expect("non-zero dir rule cache cap"),
+            )),
             sources,
             refresh: Notify::new(),
             watched: Arc::default(),
@@ -179,14 +199,28 @@ impl IgnoreRules {
         }
     }
 
+    /// Invalidate cached per-directory compiled rules after a local rename or
+    /// a foreign entry change or reset. Removals need no bump: inode numbers
+    /// are never reused, so a removed directory's cache slot is unreachable.
+    pub(super) fn bump_dir_rename_epoch(&self) {
+        self.dir_rename_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Request a refresh when a committed batch names a rule file or moves a
     /// directory above one. Other namespace and content churn is ignored so
     /// ordinary commits do not rescan the volume.
     pub(super) fn note_invalidation(&self, meta: &dyn VfsMeta, batch: &InvalidationBatch) {
         let mut watched = self.watched.lock();
         let mut relevant = false;
+        let mut bump_dir_epoch = false;
         let mut files = HashSet::new();
         for intent in &batch.intents {
+            if matches!(
+                intent,
+                InvalidationIntent::Reset | InvalidationIntent::Entry { .. }
+            ) {
+                bump_dir_epoch = true;
+            }
             relevant |= match intent {
                 InvalidationIntent::Reset => true,
                 // The pre-mutation inode of a foreign removal is also watched
@@ -209,6 +243,9 @@ impl IgnoreRules {
             }
         }
         drop(watched);
+        if bump_dir_epoch {
+            self.bump_dir_rename_epoch();
+        }
         for ino in files {
             self.pin_inode(meta, ino);
         }
@@ -261,6 +298,146 @@ impl StudioVfs {
     pub fn classify_scratch_path(&self, path: &[u8], is_dir: bool) -> ScratchClass {
         let snapshot = Arc::clone(&self.ignore_rules.snapshot.read());
         snapshot.classify(path, is_dir)
+    }
+
+    /// Resolve the canonical volume-relative byte path of a tracked directory.
+    ///
+    /// Returns `Ok(None)` when the directory is no longer bound in metadata.
+    fn resolve_tracked_directory_path(&self, dir_ino: Ino) -> VfsResult<Option<Vec<u8>>> {
+        if dir_ino == ROOT_INO {
+            return Ok(Some(Vec::new()));
+        }
+        let meta = self.sync_meta();
+        let mut components: Vec<Vec<u8>> = Vec::new();
+        let mut current = dir_ino;
+        let mut hops = 0usize;
+        while current != ROOT_INO {
+            if current == 0 || hops >= 1024 {
+                return Ok(None);
+            }
+            // Check pending deferred namespace creates first so uncommitted directories
+            // classify children with their real path before metadata settlement.
+            let deferred_step = {
+                let inner = self.state.namespace.deferred.inner.lock();
+                inner.attrs.get(&current).and_then(|attr| {
+                    let parent = attr.parent;
+                    inner
+                        .entries
+                        .iter()
+                        .find(|(key, ino)| **ino == current && key.parent == parent)
+                        .map(|(key, _)| (parent, key.name.as_ref().to_vec()))
+                })
+            };
+            if let Some((parent, name)) = deferred_step {
+                components.push(name);
+                if parent == current {
+                    return Ok(None);
+                }
+                current = parent;
+                hops += 1;
+                continue;
+            }
+
+            let attr = match meta.get_attr(current) {
+                Ok(attr) => attr,
+                Err(studiofs_meta::MetaError::InodeNotFound(_)) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let parent = attr.parent;
+            if parent == 0 || parent == current {
+                return Ok(None);
+            }
+            let mut resolved_name = None;
+            for (binding_parent, binding_name) in meta.entry_bindings_for_inode(current)? {
+                if binding_parent != parent {
+                    continue;
+                }
+                match meta.lookup(parent, &binding_name) {
+                    Ok(entry) if entry.ino == current => {
+                        resolved_name = Some(binding_name);
+                        break;
+                    }
+                    Ok(_) | Err(studiofs_meta::MetaError::EntryNotFound { .. }) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let Some(name) = resolved_name else {
+                return Ok(None);
+            };
+            components.push(name);
+            current = parent;
+            hops += 1;
+        }
+        components.reverse();
+        let total_len: usize = components
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>()
+            .saturating_add(components.len().saturating_sub(1));
+        let mut path = Vec::with_capacity(total_len);
+        for (idx, component) in components.into_iter().enumerate() {
+            if idx > 0 {
+                path.push(b'/');
+            }
+            path.extend_from_slice(&component);
+        }
+        Ok(Some(path))
+    }
+
+    /// Classify a new entry being created under `parent`.
+    ///
+    /// Scratch directories always produce scratch descendants without rule
+    /// lookup. Tracked parents use a per-directory compiled rule cache keyed by
+    /// `(rule_generation, dir_rename_epoch)`.
+    pub(super) fn classify_new_entry(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        is_dir: bool,
+    ) -> VfsResult<ScratchClass> {
+        if self.is_scratch_inode(parent)? {
+            return Ok(ScratchClass::Scratch);
+        }
+        if studiofs_meta::fold_dentry_name(name).as_ref() == RULE_FILE {
+            return Ok(ScratchClass::Tracked);
+        }
+
+        let rule_gen = self.ignore_rules.rule_generation.load(Ordering::Acquire);
+        let rename_epoch = self.ignore_rules.dir_rename_epoch.load(Ordering::Acquire);
+        let cached = {
+            let mut cache = self.ignore_rules.dir_rule_cache.lock();
+            cache
+                .get(&parent)
+                .filter(|entry| {
+                    entry.rule_generation == rule_gen && entry.dir_rename_epoch == rename_epoch
+                })
+                .map(|entry| Arc::clone(&entry.compiled))
+        };
+        if let Some(compiled) = cached {
+            return Ok(compiled.classify_child(name, is_dir));
+        }
+
+        let observed_rename_epoch = self.ignore_rules.dir_rename_epoch.load(Ordering::Acquire);
+        let dir_path = self.resolve_tracked_directory_path(parent)?;
+        let (snapshot, observed_rule_gen) = {
+            let guard = self.ignore_rules.snapshot.read();
+            let current_rule_gen = self.ignore_rules.rule_generation.load(Ordering::Acquire);
+            (Arc::clone(&guard), current_rule_gen)
+        };
+        let compiled = Arc::new(snapshot.compile_directory(dir_path.as_deref().unwrap_or(b"")));
+        if dir_path.is_some()
+            && self.ignore_rules.dir_rename_epoch.load(Ordering::Acquire) == observed_rename_epoch
+        {
+            self.ignore_rules.dir_rule_cache.lock().put(
+                parent,
+                CachedDirRules {
+                    rule_generation: observed_rule_gen,
+                    dir_rename_epoch: observed_rename_epoch,
+                    compiled: Arc::clone(&compiled),
+                },
+            );
+        }
+        Ok(compiled.classify_child(name, is_dir))
     }
 
     /// Receive volume-relative directories whose rules were replaced or removed.
@@ -509,7 +686,13 @@ impl StudioVfs {
                     }
                 }
             }
-            *self.ignore_rules.snapshot.write() = Arc::new(next_rules);
+            {
+                let mut snapshot_guard = self.ignore_rules.snapshot.write();
+                *snapshot_guard = Arc::new(next_rules);
+                self.ignore_rules
+                    .rule_generation
+                    .fetch_add(1, Ordering::Release);
+            }
             *sources = next_sources;
             if !changed.is_empty() {
                 let _ = self.ignore_rules.changed.send(changed);

@@ -267,7 +267,7 @@ impl<'a> DataReader<'a> {
             .filter_map(|claim| usize::try_from(claim.end.saturating_sub(self.offset)).ok())
             .max()
             .unwrap_or(0);
-        if !self.allow_partial_remote_read {
+        if !self.allow_partial_remote_read && !self.vfs.is_scratch_inode(self.ino)? {
             Self::fetch_missing_remote_blocks(self.vfs, &segments).await?;
         }
         let written = self
@@ -278,6 +278,9 @@ impl<'a> DataReader<'a> {
     }
 
     async fn prefetch_only(&self) -> VfsResult<()> {
+        if self.vfs.is_scratch_inode(self.ino)? {
+            return Ok(());
+        }
         let writer_stack_claims =
             self.vfs
                 .state
@@ -552,9 +555,14 @@ impl<'a> DataReader<'a> {
             if let Some(resolved) = resolved_regular_file_slices {
                 planner.claim_resolved_metadata_in_place(resolved);
             } else {
+                let is_scratch = vfs.is_scratch_inode(ino)?;
                 let meta = vfs.meta.clone();
                 let resolved = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                    engine.lookup_regular_file_slices(ino, offset, length)
+                    if is_scratch {
+                        engine.lookup_scratch_slices(ino, offset, length)
+                    } else {
+                        engine.lookup_regular_file_slices(ino, offset, length)
+                    }
                 })
                 .await?;
                 planner.claim_resolved_metadata_in_place(&resolved);
@@ -1315,6 +1323,11 @@ impl<'a> DataReader<'a> {
         }
 
         if !span_resolved {
+            if vfs.is_scratch_inode(self.ino)? {
+                return Err(VfsError::Io(std::io::Error::other(
+                    "scratch payload missing or truncated in local store",
+                )));
+            }
             if self.allow_partial_remote_read {
                 match vfs
                     .fetch_payload_range_for_ref_after_local_miss(payload, dst.len())
@@ -1437,7 +1450,7 @@ impl<'a> ReadMetadataResolver<'a> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(attr);
         }
-        if let Some(attr) = self.dirty_attr() {
+        if let Some(attr) = self.dirty_attr()? {
             return Ok(attr);
         }
         if let Some(attr) = self.cached_attr()? {
@@ -1520,33 +1533,37 @@ impl<'a> ReadMetadataResolver<'a> {
         self.vfs.ignored_entry_attr(self.ino)
     }
 
-    fn dirty_attr(&self) -> Option<InodeAttr> {
-        let dirty_attr = self
+    fn dirty_attr(&self) -> VfsResult<Option<InodeAttr>> {
+        let Some(dirty_attr) = self
             .vfs
             .state
             .namespace
             .dirty_attrs
             .lock()
             .get(&self.ino)
-            .cloned()?;
+            .cloned()
+        else {
+            return Ok(None);
+        };
 
-        if self.vfs.local_attr_refresh_decision(self.ino, &dirty_attr)
-            == MetadataRefreshDecision::UseLocal
+        if self.vfs.is_scratch_inode(self.ino)?
+            || self.vfs.local_attr_refresh_decision(self.ino, &dirty_attr)
+                == MetadataRefreshDecision::UseLocal
         {
-            return Some(dirty_attr);
+            return Ok(Some(dirty_attr));
         }
 
         let remote_attr = match self.vfs.sync_meta().get_attr(self.ino) {
             Ok(remote_attr) => remote_attr,
             // An unlinked-while-open inode has no authoritative row to refresh from.
-            Err(MetaError::InodeNotFound(_)) => return Some(dirty_attr),
+            Err(MetaError::InodeNotFound(_)) => return Ok(Some(dirty_attr)),
             Err(error) => {
                 warn!(
                     ino = self.ino,
                     error = %error,
                     "failed to refresh drained dirty attr from authoritative metadata"
                 );
-                return Some(dirty_attr);
+                return Ok(Some(dirty_attr));
             }
         };
         if matches!(
@@ -1559,10 +1576,10 @@ impl<'a> ReadMetadataResolver<'a> {
             ),
             SupersedeOutcome::Cleared(_)
         ) {
-            return Some(remote_attr);
+            return Ok(Some(remote_attr));
         }
 
-        Some(dirty_attr)
+        Ok(Some(dirty_attr))
     }
 
     async fn dirty_attr_async(&self) -> VfsResult<Option<InodeAttr>> {
@@ -1578,8 +1595,9 @@ impl<'a> ReadMetadataResolver<'a> {
             return Ok(None);
         };
 
-        if self.vfs.local_attr_refresh_decision(self.ino, &dirty_attr)
-            == MetadataRefreshDecision::UseLocal
+        if self.vfs.is_scratch_inode(self.ino)?
+            || self.vfs.local_attr_refresh_decision(self.ino, &dirty_attr)
+                == MetadataRefreshDecision::UseLocal
         {
             return Ok(Some(dirty_attr));
         }
@@ -1628,8 +1646,9 @@ impl<'a> ReadMetadataResolver<'a> {
             return Ok(None);
         };
 
-        if self.vfs.local_attr_refresh_decision(self.ino, &cached_attr)
-            == MetadataRefreshDecision::UseLocal
+        if self.vfs.is_scratch_inode(self.ino)?
+            || self.vfs.local_attr_refresh_decision(self.ino, &cached_attr)
+                == MetadataRefreshDecision::UseLocal
         {
             return Ok(Some(cached_attr));
         }
@@ -1678,8 +1697,9 @@ impl<'a> ReadMetadataResolver<'a> {
             return Ok(None);
         };
 
-        if self.vfs.local_attr_refresh_decision(self.ino, &cached_attr)
-            == MetadataRefreshDecision::UseLocal
+        if self.vfs.is_scratch_inode(self.ino)?
+            || self.vfs.local_attr_refresh_decision(self.ino, &cached_attr)
+                == MetadataRefreshDecision::UseLocal
         {
             return Ok(Some(cached_attr));
         }
@@ -1790,6 +1810,22 @@ impl<'a> ReadMetadataResolver<'a> {
         if read_len == 0 {
             return Ok(Arc::from(Vec::<ResolvedSliceSpan>::new()));
         }
+        if self.vfs.is_scratch_inode(self.ino)? {
+            let ino = self.ino;
+            let meta = self.vfs.meta.clone();
+            let resolved = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.lookup_scratch_slices(ino, offset, read_len)
+            })
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                    return Err(self.stale_inode_not_found());
+                }
+                Err(err) => return Err(err),
+            };
+            return Ok(Arc::from(resolved));
+        }
         let dirty_attr_cacheable =
             dirty_attr_present && !self.vfs.inode_has_dirty_writer_stack(self.ino);
         if dirty_attr_present && !dirty_attr_cacheable {
@@ -1877,7 +1913,14 @@ impl<'a> ReadMetadataResolver<'a> {
     async fn load_attr_from_meta(&self) -> VfsResult<InodeAttr> {
         let ino = self.ino;
         let meta = self.vfs.meta.clone();
-        let attr = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino)).await
+        let attr = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            match engine.get_scratch_attr(ino) {
+                Ok(attr) => Ok(attr),
+                Err(MetaError::InodeNotFound(_)) => engine.get_attr(ino),
+                Err(err) => Err(err),
+            }
+        })
+        .await
         {
             Ok(attr) => attr,
             Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
@@ -1890,9 +1933,14 @@ impl<'a> ReadMetadataResolver<'a> {
     }
 
     fn load_attr_from_meta_sync(&self) -> VfsResult<InodeAttr> {
-        let attr = match self.vfs.sync_meta().get_attr(self.ino) {
+        let meta = self.vfs.sync_meta();
+        let attr = match meta.get_scratch_attr(self.ino) {
             Ok(attr) => attr,
-            Err(MetaError::InodeNotFound(_)) => return Err(self.stale_inode_not_found()),
+            Err(MetaError::InodeNotFound(_)) => match meta.get_attr(self.ino) {
+                Ok(attr) => attr,
+                Err(MetaError::InodeNotFound(_)) => return Err(self.stale_inode_not_found()),
+                Err(err) => return Err(VfsError::Meta(err)),
+            },
             Err(err) => return Err(VfsError::Meta(err)),
         };
         self.cache_attr(&attr);

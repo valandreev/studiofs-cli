@@ -1645,6 +1645,16 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 .fetch_add(1, Ordering::Relaxed);
         }
         if self.vfs.is_scratch_inode(self.ino)? {
+            self.vfs
+                .enforce_access_for_local_drain(self.ino, AccessLevel::ReadWrite)?;
+            let dirty_attr = self
+                .vfs
+                .state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .get(&self.ino)
+                .cloned();
             let pending_slices = self
                 .vfs
                 .snapshot_pending_persisted_local_dirty_slices(self.ino);
@@ -1673,6 +1683,11 @@ impl<'a> LocalDirtyFlushSession<'a> {
                     .await?;
                 self.vfs
                     .commit_pending_local_dirty_slices(self.ino, &pending_slices);
+                if let Some(attr) = dirty_attr.as_ref() {
+                    self.vfs
+                        .clear_matching_dirty_attr_if_committed(self.ino, attr);
+                }
+                self.vfs.invalidate_attr_read_cache([self.ino]);
             }
             return Ok(());
         }
@@ -3041,6 +3056,22 @@ impl StudioVfs {
         {
             self.recycle_write_buffer(buffer);
         }
+    }
+
+    pub(super) fn take_pending_dirty_slice_object_ids_for_inode(&self, ino: Ino) -> Vec<u64> {
+        self.state
+            .local_dirty
+            .pending_chunk_slices
+            .lock()
+            .get(&ino)
+            .map(|chunks| {
+                chunks
+                    .values()
+                    .flat_map(|slices| slices.iter())
+                    .filter_map(|slice| slice.object_id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn clear_pending_dirty_slices_for_inode(&self, ino: Ino) {

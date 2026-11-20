@@ -151,6 +151,34 @@ that generation before any kernel invalidation is queued.
   startup replay. Publication is a separate control-plane step that flips remote
   visibility at file-version granularity after payload readiness is confirmed.
 
+## Local-Only Scratch Layer
+
+Temporary build artifacts, editor scratch files, and macOS AppleDouble (`._*`)
+sidecars matched by `.studiofsignore` rules (or built-in defaults) live in a
+mount-local scratch layer backed by non-replicated `redb` tables
+(`scratch_inodes`, `scratch_dentries`, `scratch_overlay`, `scratch_xattrs`,
+`scratch_symlinks`) and the local payload cache:
+
+- Entry class (`Tracked` vs `Scratch`) is decided once at `create`, `mkdir`, or
+  `symlink` time using cached per-directory compiled rules and stored with the
+  entry; `lookup` never re-evaluates ignore rules. Every descendant of a scratch
+  directory is scratch.
+- `lookup`, `readdir` (merging tracked and scratch children in deterministic
+  byte order for stable offsets), `getattr`, `setattr`/truncate, `read`
+  (including unflushed writer pages), `write`, `flush`, `fsync`, `release`, and
+  `xattrs` behave like ordinary files, with ACL enforcement inherited from
+  tracked ancestors.
+- Scratch entries expose the read-only virtual xattr `user.studiofs.scratch`
+  (`"1"`, omitted from `listxattr`).
+- Scratch operations emit zero `event_log` rows and zero S3 upload submissions.
+  Payload objects of unlinked scratch files are reclaimed once the last open
+  handle closes; `rmdir` on a tracked directory containing scratch children
+  returns `ENOTEMPTY`.
+- Same-class scratch renames stay scratch, and tracked entries renamed to a
+  matching name inside a tracked parent stay tracked. Hardlinks touching a
+  scratch inode or directory and cross-class renames (until promote/demote land)
+  return `EXDEV`.
+
 ## Mounted Benchmark Engine
 
 - The internal `cli::benchmark_engine` module is the reusable entry point for

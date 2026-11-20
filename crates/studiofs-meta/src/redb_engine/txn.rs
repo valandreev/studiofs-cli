@@ -992,6 +992,9 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         dir: Ino,
     ) -> MetaResult<()> {
+        if Self::has_scratch_children_in_write_txn(txn, dir)? {
+            return Err(MetaError::DirNotEmpty(dir));
+        }
         if !Self::has_entries_merged_in_write_txn(txn, dir)? {
             return Ok(());
         }

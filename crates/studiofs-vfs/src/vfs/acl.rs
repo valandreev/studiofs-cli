@@ -160,7 +160,7 @@ impl StudioVfs {
         Ok(access_level)
     }
 
-    fn effective_access_level_meta<M: ?Sized + AclMeta>(
+    fn effective_access_level_meta<M: ?Sized + AclMeta + studiofs_meta::MetaEngineCore>(
         meta: &M,
         principal: &str,
         ino: Ino,
@@ -174,7 +174,11 @@ impl StudioVfs {
             if let Some(level) = Self::acl_rule_for_inode_meta(meta, principal, current)? {
                 return Ok(level);
             }
-            let attr = meta.get_attr(current)?;
+            let attr = match meta.get_attr(current) {
+                Ok(attr) => attr,
+                Err(MetaError::InodeNotFound(_)) => meta.get_scratch_attr(current)?,
+                Err(error) => return Err(error),
+            };
             if current == ROOT_INO || attr.parent == 0 || attr.parent == current {
                 return Ok(AccessLevel::ReadWrite);
             }

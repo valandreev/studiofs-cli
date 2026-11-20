@@ -14567,7 +14567,10 @@ fn ignored_entry_writes_preserve_synthetic_attr_size() {
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-entry-write-size");
     let _guard = rt.enter();
     rt.block_on(async {
-        let inode_attr = vfs.create(1, b"._DS_Store", 0, 0, 0o644).unwrap();
+        let discard_dir = vfs.mkdir(1, b".Spotlight-V100", 0, 0, 0o755).unwrap();
+        let inode_attr = vfs
+            .create(discard_dir.ino, b"synthetic-inode", 0, 0, 0o644)
+            .unwrap();
         let inode_payload = b"synthetic-inode";
         vfs.write_with_local_sync_policy(
             inode_attr.ino,
@@ -14593,7 +14596,9 @@ fn ignored_entry_writes_preserve_synthetic_attr_size() {
             "ignored-entry reads should observe the updated synthetic file length"
         );
 
-        let handle_attr = vfs.create(1, b"._synthetic", 0, 0, 0o644).unwrap();
+        let handle_attr = vfs
+            .create(discard_dir.ino, b"synthetic-handle", 0, 0, 0o644)
+            .unwrap();
         let handle_payload = b"synthetic-handle";
         let fh = vfs
             .open_file(handle_attr.ino, OpenFlags::RDWR, false)
@@ -26084,7 +26089,7 @@ fn deferred_release_ignored_entry_skips_release_barrier() {
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "ignored-release-skips-barrier");
     let _guard = rt.enter();
     rt.block_on(async {
-        let attr = vfs.create(1, b"._DS_Store", 0, 0, 0o644).unwrap();
+        let attr = vfs.create(1, b".fseventsd", 0, 0, 0o644).unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
 

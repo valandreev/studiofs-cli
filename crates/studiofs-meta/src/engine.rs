@@ -1331,6 +1331,19 @@ impl MetadataReplicationBacklog {
     }
 }
 
+/// Outcome of an atomic local scratch rename.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ScratchRenameResult {
+    /// Inode of the moved scratch entry.
+    pub moved_ino: Ino,
+    /// Whether the scratch namespace actually changed (false for same-name no-op).
+    pub namespace_changed: bool,
+    /// Displaced scratch entry attributes when an existing scratch target was overwritten.
+    pub displaced: Option<InodeAttr>,
+    /// Local payload object IDs freed when a displaced scratch inode was removed immediately.
+    pub removed_object_ids: Vec<u64>,
+}
+
 /// Strict backend contract.
 ///
 /// This trait is intentionally comprehensive: storage backends implement it once,
@@ -1350,14 +1363,50 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         Err(MetaError::Storage("scratch storage is unsupported".into()))
     }
 
-    /// Look up the exact byte name of a local scratch entry.
-    fn lookup_scratch_entry(&self, _parent: Ino, _name: &[u8]) -> MetaResult<Option<Ino>> {
+    /// Create a local scratch symlink inode, target, and directory entry atomically.
+    fn create_scratch_symlink(
+        &self,
+        _parent: Ino,
+        _name: &[u8],
+        _target: &[u8],
+        _attr: &InodeAttr,
+    ) -> MetaResult<()> {
         Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Look up a local scratch entry under `parent` (matching the engine's case policy).
+    fn lookup_scratch_entry(&self, _parent: Ino, _name: &[u8]) -> MetaResult<Option<Ino>> {
+        Ok(None)
+    }
+
+    /// List all local scratch children of `parent`, sorted by byte name.
+    fn readdir_scratch(&self, _parent: Ino) -> MetaResult<Vec<(Vec<u8>, InodeAttr)>> {
+        Ok(Vec::new())
+    }
+
+    /// Report whether `parent` currently has any local scratch children.
+    fn has_scratch_children(&self, _parent: Ino) -> MetaResult<bool> {
+        Ok(false)
     }
 
     /// Read attributes from the local scratch inode table.
     fn get_scratch_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
         Err(MetaError::InodeNotFound(ino))
+    }
+
+    /// Update attributes of an existing local scratch inode without journaling.
+    fn set_scratch_attr(&self, _attr: &InodeAttr) -> MetaResult<()> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Truncate a local scratch regular file and return displaced local payload object IDs.
+    fn truncate_scratch(
+        &self,
+        _ino: Ino,
+        _new_size: u64,
+        _attr: &InodeAttr,
+    ) -> MetaResult<Vec<u64>> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
     }
 
     /// Commit durable scratch slices and return objects no longer referenced.
@@ -1377,6 +1426,57 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         chunk: crate::schema::ChunkId,
     ) -> MetaResult<Option<crate::schema::RegularFileChunkState>> {
         let _ = (ino, chunk);
+        Ok(None)
+    }
+
+    /// Resolve committed local scratch slice spans for a regular-file read range.
+    fn lookup_scratch_slices(
+        &self,
+        ino: Ino,
+        _offset: u64,
+        _length: u64,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>> {
+        Err(MetaError::InodeNotFound(ino))
+    }
+
+    /// Read the symlink target of a local scratch symlink inode.
+    fn get_scratch_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>> {
+        Err(MetaError::InodeNotFound(ino))
+    }
+
+    /// Unlink a non-directory scratch entry.
+    ///
+    /// When `keep_open_inode` is true, the inode row and payload graph stay alive
+    /// with `nlink = 0` until [`Self::finalize_orphan_scratch_inode`] runs.
+    fn unlink_scratch_entry(
+        &self,
+        _parent: Ino,
+        _name: &[u8],
+        _keep_open_inode: bool,
+    ) -> MetaResult<(InodeAttr, Vec<u64>)> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Remove an unlinked (`nlink == 0`) scratch inode and return its freed object IDs.
+    fn finalize_orphan_scratch_inode(&self, _ino: Ino) -> MetaResult<Vec<u64>> {
+        Ok(Vec::new())
+    }
+
+    /// Remove an empty local scratch directory entry and inode.
+    fn rmdir_scratch_entry(&self, _parent: Ino, _name: &[u8]) -> MetaResult<InodeAttr> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Atomically rename a local scratch entry within the scratch layer.
+    fn rename_scratch_entry(
+        &self,
+        _parent: Ino,
+        _name: &[u8],
+        _new_parent: Ino,
+        _new_name: &[u8],
+        _replace_if_exists: bool,
+        _keep_displaced_open: bool,
+    ) -> MetaResult<ScratchRenameResult> {
         Err(MetaError::Storage("scratch storage is unsupported".into()))
     }
 
@@ -1385,9 +1485,30 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         Err(MetaError::Storage("scratch storage is unsupported".into()))
     }
 
+    /// Persist a local scratch extended attribute while honoring `XATTR_CREATE`/`XATTR_REPLACE`.
+    fn set_scratch_xattr_with_flags(
+        &self,
+        _ino: Ino,
+        _name: &[u8],
+        _value: &[u8],
+        _flags: u32,
+    ) -> MetaResult<()> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
     /// Read a local scratch extended attribute.
     fn get_scratch_xattr(&self, _ino: Ino, _name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Remove a local scratch extended attribute.
+    fn remove_scratch_xattr(&self, _ino: Ino, _name: &[u8]) -> MetaResult<()> {
         Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// List extended attribute names stored on a local scratch inode.
+    fn list_scratch_xattrs(&self, _ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
+        Ok(Vec::new())
     }
 
     /// Mount-local last-good ignore rule sources, encoded by the VFS.
