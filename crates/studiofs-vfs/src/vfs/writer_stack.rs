@@ -419,9 +419,7 @@ impl MountedWriterStack {
             .checked_add(data.len() as u64)
             .ok_or(WriterStackError::OffsetOverflow)?;
 
-        if spec.fh != 0 {
-            self.associate_handle(spec.fh, spec.ino);
-        }
+        self.associate_handle(spec.fh, spec.ino);
         let shard_index = Self::inode_shard_index(spec.ino);
         let file = {
             let mut shard = self.shards[shard_index].lock();
