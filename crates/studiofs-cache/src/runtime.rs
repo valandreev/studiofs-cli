@@ -391,6 +391,13 @@ pub struct LocalPayloadBackendRuntime {
     #[cfg(test)]
     payload_gate_probe: Mutex<Option<std::sync::mpsc::SyncSender<bool>>>,
     #[cfg(test)]
+    pause_after_corrupt_check: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
     pause_after_removal_chunk: Mutex<
         Option<(
             std::sync::mpsc::SyncSender<()>,
@@ -606,6 +613,8 @@ impl LocalPayloadBackendRuntime {
             rollback_after_absence: Mutex::new(None),
             #[cfg(test)]
             payload_gate_probe: Mutex::new(None),
+            #[cfg(test)]
+            pause_after_corrupt_check: Mutex::new(None),
             #[cfg(test)]
             pause_after_removal_chunk: Mutex::new(None),
         })
@@ -1264,9 +1273,18 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             )?;
             Ok(len == entry.payload_len && hasher.digest() == expected_checksum)
         })();
-        // A missing file or a read I/O error also confirms corruption.
-        if matches.unwrap_or(false) {
-            return Ok(CorruptEvictionOutcome::NotCorrupt);
+        // A missing file or a read I/O error also confirms corruption (ADR 0017).
+        match matches {
+            Ok(true) => return Ok(CorruptEvictionOutcome::NotCorrupt),
+            Ok(false) => {}
+            Err(error) => {
+                warn!(object_id, %error, "cache scrub confirmed corruption via I/O error");
+            }
+        }
+        #[cfg(test)]
+        if let Some((checked, resume)) = self.pause_after_corrupt_check.lock().take() {
+            let _ = checked.send(());
+            let _ = resume.recv_timeout(Duration::from_secs(5));
         }
         self.remove_payloads_locked(&[object_id])?;
         Ok(CorruptEvictionOutcome::Evicted)
@@ -2652,13 +2670,9 @@ mod tests {
             .unwrap();
         let observed = observe();
         std::fs::write(&path, b"HELLO").unwrap();
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| backend.put_with_checksum(1, b"hello", true, Some(hello_xxh64)))
-                .join()
-                .unwrap()
-                .unwrap();
-        });
+        backend
+            .put_with_checksum(1, b"hello", true, Some(hello_xxh64))
+            .unwrap();
         assert_eq!(
             backend.evict_corrupt(1, &observed).unwrap(),
             CorruptEvictionOutcome::Changed
@@ -2692,6 +2706,51 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"HELLO");
         assert_eq!(backend.storage_stats().dirty_bytes, 5);
+    }
+
+    #[test]
+    fn evict_corrupt_holds_stripe_from_recheck_through_removal() {
+        use std::sync::mpsc::sync_channel;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0xCD; 16],
+        })
+        .unwrap();
+        let path = layout.payload_object_path(1);
+        backend
+            .put_with_checksum(1, b"hello", true, Some(0x26c7827d889f6da3))
+            .unwrap();
+        let observed = ObservedPayload::from(&backend.index.get_entry(1).unwrap().unwrap());
+        std::fs::write(&path, b"HELLO").unwrap();
+
+        let (checked_tx, checked_rx) = sync_channel(1);
+        let (resume_tx, resume_rx) = sync_channel(1);
+        *backend.pause_after_corrupt_check.lock() = Some((checked_tx, resume_rx));
+        std::thread::scope(|scope| {
+            let evict = scope.spawn(|| backend.evict_corrupt(1, &observed));
+            checked_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("evict_corrupt did not reach its post-check pause");
+            let (gate_probe_tx, gate_probe_rx) = sync_channel(1);
+            *backend.payload_gate_probe.lock() = Some(gate_probe_tx);
+            let rewrite = scope.spawn(|| backend.put(1, b"world", true));
+            let blocked = gate_probe_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("rewrite did not attempt its mutation gate");
+            assert!(blocked, "rewrite must wait for evict_corrupt's stripe");
+            let _ = resume_tx.send(());
+            assert_eq!(
+                evict.join().unwrap().unwrap(),
+                CorruptEvictionOutcome::Evicted
+            );
+            rewrite.join().unwrap().unwrap();
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), b"world");
+        assert!(backend.index.get_entry(1).unwrap().is_some());
     }
 
     #[test]
