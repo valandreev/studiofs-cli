@@ -172,6 +172,44 @@ mod tests {
     }
 
     #[test]
+    fn scratch_overwrite_releases_the_displaced_payload() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-overwrite-");
+        let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs(&temp, VOLUME);
+        let attr = vfs
+            .store_scratch_entry(NAME, InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
+            .unwrap();
+        runtime
+            .block_on(vfs.write_scratch_block(attr.ino, 0, Bytes::from_static(DATA)))
+            .unwrap();
+        let first = meta.get_scratch_block(attr.ino, 0).unwrap().unwrap();
+        runtime
+            .block_on(vfs.write_scratch_block(attr.ino, 0, Bytes::from_static(b"second")))
+            .unwrap();
+
+        let second = meta.get_scratch_block(attr.ino, 0).unwrap().unwrap();
+        assert_ne!(first, second);
+        assert!(!vfs.local_payload_backend().contains(first));
+        assert!(
+            !meta
+                .get_local_cache_referenced_object_ids()
+                .unwrap()
+                .contains(&first)
+        );
+        assert_eq!(
+            runtime
+                .block_on(vfs.read_scratch_block(attr.ino, 0))
+                .unwrap()
+                .unwrap(),
+            b"second".as_slice()
+        );
+        // The size only grows; SFS-1077 owns truncation.
+        assert_eq!(
+            meta.get_scratch_attr(attr.ino).unwrap().size,
+            DATA.len() as u64
+        );
+    }
+
+    #[test]
     fn scratch_storage_rejects_writes_below_cached_reserve() {
         let temp = studiofs_test_support::workspace_target_tempdir("scratch-reserve-");
         let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs(&temp, VOLUME);

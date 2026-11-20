@@ -497,3 +497,42 @@ fn scratch_payload_survives_budget_and_physical_pressure() {
     assert!(!backend.is_evictable(2));
     assert_eq!(backend.storage_stats().dirty_bytes, 0);
 }
+
+#[test]
+fn scratch_admission_reads_only_the_cached_reserve_sample() {
+    let (_temp, backend) = backend();
+    let put_scratch = |object_id| {
+        backend.put_scratch_batch(&[LocalPayloadPut {
+            object_id,
+            data: Bytes::from_static(b"scratch"),
+            evictable: false,
+        }])
+    };
+    platform::FILESYSTEM_SPACE_QUERIES.with(|calls| calls.set(0));
+
+    // Without a sample there is no evidence of pressure.
+    put_scratch(1).unwrap();
+    let start = Instant::now();
+    backend
+        .run_disk_pressure_maintenance(start, |_| Ok(space(TOTAL_BYTES / 10, TOTAL_BYTES)))
+        .unwrap();
+    // Available space equal to the reserve is not below it.
+    put_scratch(2).unwrap();
+    backend
+        .run_disk_pressure_maintenance(start + SAMPLE_INTERVAL, |_| {
+            Ok(space(LOW_BYTES, TOTAL_BYTES))
+        })
+        .unwrap();
+    let error = put_scratch(3).unwrap_err();
+    assert!(
+        matches!(&error, LocalPayloadBackendError::Io(io) if io.kind() == io::ErrorKind::StorageFull),
+        "{error:?}"
+    );
+    assert!(!backend.contains(3));
+    assert!(backend.index.get_entry(3).unwrap().is_none());
+    // Tracked writes keep their contract under the same sample.
+    backend.put(4, b"tracked", false).unwrap();
+
+    assert!(backend.contains(1) && backend.contains(2) && backend.contains(4));
+    platform::FILESYSTEM_SPACE_QUERIES.with(|calls| assert_eq!(calls.get(), 0));
+}
