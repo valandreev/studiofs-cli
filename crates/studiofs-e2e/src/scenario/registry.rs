@@ -58,6 +58,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             RecoverableTrashDurability::ColdBootstrap.definition(),
             RecoverableTrashJanitor.definition(),
             LogicalQuota.definition(),
+            MountedCacheScrub.definition(),
         ]
     })
 }
@@ -67,6 +68,7 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
     match name {
         "mounted-recoverable-trash-two-client" => Some(Box::new(RecoverableTrash)),
         "mounted-logical-quota" => Some(Box::new(LogicalQuota)),
+        "mounted-cache-scrub" => Some(Box::new(MountedCacheScrub)),
         "mounted-recoverable-trash-durability" => {
             Some(Box::new(RecoverableTrashDurability::OfflineCrashReplay))
         }

@@ -267,19 +267,19 @@ that must exist before the gate closes.
 | Mounted status and barrier work with live PostgreSQL and S3, including S3 outage and unmount during a wait | `studiofs-e2e` scenario on Linux FUSE and WinFSP, macOS smoke (SFS-1105) |
 | `user.studiofs.*` is read-only, hidden from `listxattr`, and leaves other xattrs and xfstests unchanged | xattr unit tests (SFS-1104); mounted xattr scenario on Linux FUSE and macFUSE and the xfstests xattr subset (SFS-1106) |
 
-## Planned: background local cache scrub gate (ADR 0017)
+## Background local cache scrub gate (ADR 0017)
 
-[ADR 0017](adr/0017-background-local-cache-scrub.md) is implemented in the
-Linear project "[0.2.4]". Each invariant gets its tests in the owning issue;
-this table names the evidence that must exist before the gate closes.
+[ADR 0017](adr/0017-background-local-cache-scrub.md) requires focused cache
+and worker tests plus a live mount on macFUSE and Linux FUSE. Run the same
+mounted scenario on WinFSP when available.
 
 | Invariant | Evidence (owning issue) |
 |---|---|
-| Clean entries carry the XXH64 of their exact cached bytes without new hashing; dirty and legacy entries have none; a rewrite never keeps a stale checksum | index encode/decode, download, upload-transition, and rewrite tests (SFS-1117) |
-| The scrub never evicts Dirty, Pending, Uploading, pinned, or concurrently changed entries | `evict_corrupt` race tests with deterministic synchronization (SFS-1118) |
-| Checksum mismatch, missing file, short file, and read I/O error are evicted and refetched; the cursor survives restart; the task is joined on shutdown; limits hold and foreground local IO is not blocked | scrub worker tests with a fake clock and a held foreground permit (SFS-1119) |
-| Counters and status are additive and keep v5 clients working | `RuntimeSnapshot` serde and status golden tests (SFS-1120) |
-| A damaged cache file heals itself on a mounted volume and a dirty file is untouched | `studiofs-e2e` scrub scenario on macFUSE and Linux FUSE, WinFSP when available (SFS-1120) |
+| Clean entries carry the XXH64 of their exact cached bytes. Dirty and legacy entries have no checksum. Rewrites clear the old checksum. | `entry_checksum_encoding_reads_legacy_rows_without_rewriting_them`, `payload_checksum_follows_upload_identity_and_rewrites`, `process_upload_records_only_matching_whole_payload_checksums` (SFS-1117) |
+| Dirty, Pending, Uploading, pinned, and concurrently changed entries are protected from scrub eviction. | `cargo test -p studiofs-cache --lib evict_corrupt` (SFS-1118) |
+| The worker repairs clean corrupt entries, resumes from a persisted cursor, respects limits and foreground I/O, and joins on shutdown. | `cargo test -p studiofs-cache --lib scrub_cursor` and `cargo test -p studiofs-vfs --lib cache_scrub` (SFS-1119) |
+| Runtime counters and status keep v5 clients working. | `cargo test -p studiofs --bin studiofs cache_scrub` covers `diagnostics_runtime_snapshot_cache_scrub_is_additive_in_v5` and `mounted_status_formats_cache_scrub` (SFS-1120) |
+| The mounted worker repairs a flipped byte, a missing file, and a truncated file. An unpublished payload survives an offline pass. | `studiofs-e2e run --scenario mounted-cache-scrub --studiofs-bin <rebuilt-binary> --infra compose --retain always` on macFUSE and Linux FUSE, plus WinFSP when available (SFS-1120) |
 
 ## SFS-356 Encrypted remote object regression gate
 

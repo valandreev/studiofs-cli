@@ -1230,30 +1230,31 @@ impl LocalPayloadBackendRuntime {
     pub fn check_scrub_entry(
         &self,
         entry: &CacheIndexEntry,
-    ) -> Result<Option<&'static str>, LocalPayloadBackendError> {
+    ) -> Result<ScrubCheck, LocalPayloadBackendError> {
         let Some(checksum) = entry.xxh64 else {
-            return Ok(None);
+            return Ok(ScrubCheck::Skipped);
         };
         let file = {
             // Pin the observed file identity under the stripe. Rewrites install
             // a replacement file, so the hash can run after releasing the stripe.
             let _mutation = self.lock_payload_mutations(&[entry.object_id]);
             let Some(current) = self.index.get_entry(entry.object_id)? else {
-                return Ok(None);
+                return Ok(ScrubCheck::Skipped);
             };
             if current.lifecycle != LocalPayloadLifecycleState::Uploaded
                 || current.upload_state != LocalPayloadUploadState::None
                 || ObservedPayload::from(&current) != ObservedPayload::from(entry)
             {
-                return Ok(None);
+                return Ok(ScrubCheck::Skipped);
             }
             std::fs::File::open(self.layout.payload_object_path(entry.object_id))
         };
         Ok(
             match check_scrub_payload(file, entry.payload_len, checksum) {
-                Ok(kind) => kind,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Some("missing"),
-                Err(_) => Some("read_error"),
+                Ok(None) => ScrubCheck::Clean,
+                Ok(Some(kind)) => kind,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => ScrubCheck::Missing,
+                Err(_) => ScrubCheck::Io,
             },
         )
     }
@@ -1381,21 +1382,32 @@ impl LocalPayloadBackendRuntime {
     }
 }
 
+/// Result of inspecting an observed local payload for a scrub pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubCheck {
+    Skipped,
+    Clean,
+    Checksum,
+    Missing,
+    Size,
+    Io,
+}
+
 fn check_scrub_payload(
     file: io::Result<std::fs::File>,
     payload_len: u64,
     expected_checksum: u64,
-) -> io::Result<Option<&'static str>> {
+) -> io::Result<Option<ScrubCheck>> {
     let file = file?;
     if file.metadata()?.len() != payload_len {
-        return Ok(Some("length"));
+        return Ok(Some(ScrubCheck::Size));
     }
     let mut hasher = Xxh64::new(0);
     let len = io::copy(&mut file.take(payload_len.saturating_add(1)), &mut hasher)?;
     Ok(if len != payload_len {
-        Some("length")
+        Some(ScrubCheck::Size)
     } else if hasher.digest() != expected_checksum {
-        Some("checksum")
+        Some(ScrubCheck::Checksum)
     } else {
         None
     })
@@ -1433,7 +1445,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             Ok(None) => return Ok(CorruptEvictionOutcome::NotCorrupt),
             Ok(Some(_)) => {}
             Err(error) => {
-                warn!(object_id, %error, "cache scrub confirmed corruption via I/O error")
+                tracing::debug!(object_id, kind = ?error.kind(), "cache scrub confirmed unreadable payload")
             }
         }
         #[cfg(test)]
@@ -2745,7 +2757,10 @@ mod tests {
         let entry = backend.index.get_entry(1).unwrap().unwrap();
         let observed = ObservedPayload::from(&entry);
         std::fs::write(&path, b"HELLO").unwrap();
-        assert_eq!(backend.check_scrub_entry(&entry).unwrap(), Some("checksum"));
+        assert_eq!(
+            backend.check_scrub_entry(&entry).unwrap(),
+            ScrubCheck::Checksum
+        );
         backend
             .put_with_checksum(1, b"hello", true, Some(hello_xxh64))
             .unwrap();
@@ -2779,7 +2794,10 @@ mod tests {
         std::fs::write(&path, b"HELLO").unwrap();
         // A scan can still hold the uploaded row after the payload becomes Dirty.
         assert_eq!(entry.xxh64, Some(hello_xxh64));
-        assert_eq!(backend.check_scrub_entry(&entry).unwrap(), None);
+        assert_eq!(
+            backend.check_scrub_entry(&entry).unwrap(),
+            ScrubCheck::Skipped
+        );
         assert_eq!(
             backend.evict_corrupt(1, &observe()).unwrap(),
             CorruptEvictionOutcome::NotEligible

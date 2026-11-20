@@ -40,6 +40,7 @@ const COUNTER_NEXT_DIRTY_SEQ: &str = "next_dirty_seq";
 const COUNTER_NEXT_ACCESS_SEQ: &str = "next_access_seq";
 const SCRUB_LAST_OBJECT: &str = "scrub_last_object_id";
 const SCRUB_STARTED: &str = "scrub_pass_started_ms";
+const SCRUB_LAST_COMPLETED: &str = "scrub_last_completed_ms";
 const SCRUB_COMPLETED: &str = "scrub_pass_completed_ms";
 
 /// Progress of the local payload scrub, stored independently of cache accounting.
@@ -48,6 +49,8 @@ pub struct ScrubCursor {
     pub last_object_id: Option<u64>,
     pub started_ms: u64,
     pub completed_ms: u64,
+    /// Most recent completion, retained when a new pass clears `completed_ms`.
+    pub last_completed_ms: u64,
 }
 
 const LIST_PAGE_SIZE: usize = 4_096;
@@ -300,15 +303,26 @@ impl CacheIndex {
                 .map(|value| value.map(|v| v.value()))
                 .map_err(storage_error)
         };
+        let completed_ms = read(SCRUB_COMPLETED)?.unwrap_or_default();
         Ok(ScrubCursor {
             last_object_id: read(SCRUB_LAST_OBJECT)?,
             started_ms: read(SCRUB_STARTED)?.unwrap_or_default(),
-            completed_ms: read(SCRUB_COMPLETED)?.unwrap_or_default(),
+            completed_ms,
+            last_completed_ms: if completed_ms == 0 {
+                read(SCRUB_LAST_COMPLETED)?.unwrap_or_default()
+            } else {
+                completed_ms
+            },
         })
     }
 
     /// Save the cursor and pass timestamps in the same transaction.
     pub fn save_scrub_cursor(&self, cursor: ScrubCursor) -> Result<(), CacheIndexError> {
+        let last_completed_ms = if cursor.completed_ms == 0 {
+            cursor.last_completed_ms
+        } else {
+            cursor.completed_ms
+        };
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
@@ -324,6 +338,9 @@ impl CacheIndex {
                 .map_err(storage_error)?;
             counters
                 .insert(SCRUB_COMPLETED, cursor.completed_ms)
+                .map_err(storage_error)?;
+            counters
+                .insert(SCRUB_LAST_COMPLETED, last_completed_ms)
                 .map_err(storage_error)?;
         }
         txn.commit().map_err(storage_error)
@@ -1873,6 +1890,7 @@ mod tests {
             last_object_id: Some(u64::MAX),
             started_ms: 42,
             completed_ms: 0,
+            last_completed_ms: 41,
         };
         {
             let index = CacheIndex::open(&path).unwrap();
@@ -1895,6 +1913,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(index.scrub_cursor().unwrap().last_object_id, None);
+        assert_eq!(index.scrub_cursor().unwrap().last_completed_ms, 43);
     }
 
     #[test]

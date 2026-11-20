@@ -552,7 +552,7 @@ impl VfsBootstrap {
                     bytes_per_sec: config.cache_scrub_bytes_per_sec,
                     iops: config.cache_scrub_iops,
                 }),
-            cache_scrub_refetch_failures: Default::default(),
+            cache_scrub_stats: Default::default(),
             publish_visibility_timeout: plan.publish_visibility_timeout,
             readahead: resources.readahead,
             dir_prefetch: resources.dir_prefetch,

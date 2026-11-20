@@ -122,6 +122,7 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             None
         });
         DiagnosticsRuntimeSnapshot {
+            cache_scrub: self.vfs.cache_scrub_snapshot(),
             logical_quota,
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,

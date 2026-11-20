@@ -70,7 +70,8 @@ pub use metrics::{
     LogicalQuotaStatus, RUNTIME_STATS_SCHEMA_VERSION, RUNTIME_STATS_SECTIONS, RuntimeLatencyBucket,
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
     RuntimeStatsSnapshot, StatFs, VfsAttrReadCacheSnapshot, VfsCachePipelineMaterializeStats,
-    VfsCachePipelineStats, VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,
+    VfsCachePipelineStats, VfsCacheScrubCorruption, VfsCacheScrubProgress, VfsCacheScrubSnapshot,
+    VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,
     VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats,
     VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot, VfsFuseIoStats, VfsIngressLane,
     VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsLinuxFuseOpenCacheStats,
@@ -4248,7 +4249,7 @@ pub struct StudioVfs {
     upload_worker_count: usize,
     disable_background_slab_flush: bool,
     cache_scrub: Option<workers::CacheScrubConfig>,
-    cache_scrub_refetch_failures: std::sync::atomic::AtomicU64,
+    cache_scrub_stats: Mutex<VfsCacheScrubSnapshot>,
     publish_visibility_timeout: Duration,
     /// Sequential read-ahead tracker.
     readahead: Arc<ReadAheadTracker>,
@@ -10253,8 +10254,9 @@ impl StudioVfs {
                 malformed_encrypted_objects: fetch_malformed_encrypted_objects,
                 prefetch_skips: fetch_prefetch_skips,
                 cache_scrub_refetch_failures: self
-                    .cache_scrub_refetch_failures
-                    .load(Ordering::Relaxed),
+                    .cache_scrub_stats
+                    .lock()
+                    .cache_scrub_refetch_failed,
                 readahead_scheduled_blocks,
                 readahead_dropped_blocks,
                 prefetch_ingress_depth,

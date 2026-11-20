@@ -1927,14 +1927,16 @@ mod tests {
         drop(permits);
     }
 
-    #[tokio::test(start_paused = true)]
+    // Real time: on a paused clock, idle waits on blocking GET/decrypt auto-advance
+    // into the 1 s request timeout before the post-GET budget wait is reached.
+    #[tokio::test]
     async fn full_download_budget_wait_is_outside_fetch_request_timeout() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (mut scheduler, raw, _cached_store, config) =
             make_encrypted_fetch_scheduler(&tmp, "full-download-budget-timeout");
         let object_id = 0x3536;
         let key = fragment_key(&config, object_id, 0);
-        let expected = Bytes::from(vec![0x5a; 1024 * 1024]);
+        let expected = Bytes::from(vec![0x5a; 256 * 1024]);
         put_encrypted_fragment(&scheduler, &raw, &key, expected.clone()).await;
         scheduler.data_store.set_payload_limits(Some(0), Some(1));
         Arc::get_mut(&mut scheduler)
@@ -1947,7 +1949,7 @@ mod tests {
             .expect("post-GET budget wait is outside the request timeout");
 
         assert_eq!(fetched, expected);
-        assert!(scheduler.data_store.payload_limit_status().3 >= 8_000_000_000);
+        assert!(scheduler.data_store.payload_limit_status().3 >= 2_000_000_000);
     }
 
     #[tokio::test(start_paused = true)]
