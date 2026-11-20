@@ -35,10 +35,6 @@ impl MetaEngineCore for PgMetaEngine {
         self.local.get_scratch_overlay(ino, chunk)
     }
 
-    fn get_legacy_scratch_block(&self, ino: Ino, block: u32) -> MetaResult<Option<u64>> {
-        self.local.get_legacy_scratch_block(ino, block)
-    }
-
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {
         self.local.set_scratch_xattr(ino, name, value)
     }

@@ -5,24 +5,6 @@ pub(super) fn storage_error(error: impl std::fmt::Display) -> MetaError {
     MetaError::Storage(error.to_string())
 }
 
-pub(super) fn open_scratch_overlay_tables(txn: &WriteTransaction) -> MetaResult<()> {
-    // Early scratch builds stored one object ID per volume block.
-    if matches!(
-        txn.open_table(SCRATCH_OVERLAY),
-        Err(redb::TableError::TableTypeMismatch { .. })
-    ) {
-        let blocks = txn
-            .open_table(TableDefinition::<(u64, u32), u64>::new("scratch_overlay"))
-            .map_err(storage_error)?;
-        txn.rename_table(blocks, LEGACY_SCRATCH_OVERLAY)
-            .map_err(storage_error)?;
-    }
-    txn.open_table(SCRATCH_OVERLAY).map_err(storage_error)?;
-    txn.open_table(LEGACY_SCRATCH_OVERLAY)
-        .map_err(storage_error)?;
-    Ok(())
-}
-
 impl RedbMetaEngine {
     pub(super) fn insert_scratch_entry(
         &self,
@@ -190,33 +172,49 @@ impl RedbMetaEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{PayloadRef, SliceId, SliceOrder, SliceRange};
+
+    fn slice(object_id: u64, start: u32, end: u32) -> SliceRecord {
+        SliceRecord::new(
+            SliceId(0),
+            SliceOrder(0),
+            SliceRange::new(start, end).unwrap(),
+            PayloadRef::new_partial(object_id, end - start),
+        )
+    }
 
     #[test]
-    fn scratch_overlay_upgrade_preserves_legacy_block_roots() {
+    fn scratch_overlay_roots_are_cache_live_and_displaced_on_overwrite() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("legacy.redb");
-        let db = Database::create(&path).unwrap();
-        let txn = db.begin_write().unwrap();
-        txn.open_table(TableDefinition::<(u64, u32), u64>::new("scratch_overlay"))
-            .unwrap()
-            .insert((42, 3), 91)
+        let meta = RedbMetaEngine::open(temp.path().join("meta.redb")).unwrap();
+        meta.init_root(0, 0).unwrap();
+        let attr = InodeAttr::new_file(42, ROOT_INO, 0, 0, 0o644);
+        meta.create_scratch_entry(ROOT_INO, b"scene.tmp", &attr)
             .unwrap();
-        txn.commit().unwrap();
-        drop(db);
 
-        let meta = RedbMetaEngine::open(path).unwrap();
-        assert_eq!(meta.get_legacy_scratch_block(42, 3).unwrap(), Some(91));
+        let displaced = meta
+            .commit_scratch_overlay(42, &[(ChunkId(0), vec![slice(91, 0, 8)])])
+            .unwrap();
+        assert!(displaced.is_empty());
+        assert_eq!(meta.get_scratch_attr(42).unwrap().size, 8);
         assert!(
             meta.get_local_cache_referenced_object_ids()
                 .unwrap()
                 .contains(&91)
         );
+        assert!(!meta.get_referenced_object_ids().unwrap().contains(&91));
         assert!(
             !meta
                 .get_local_referenced_object_ids()
                 .unwrap()
                 .contains(&91)
         );
-        assert!(meta.get_scratch_overlay(42, ChunkId(0)).unwrap().is_none());
+
+        let displaced = meta
+            .commit_scratch_overlay(42, &[(ChunkId(0), vec![slice(92, 0, 8)])])
+            .unwrap();
+        assert_eq!(displaced, vec![91]);
+        let cache_roots = meta.get_local_cache_referenced_object_ids().unwrap();
+        assert!(!cache_roots.contains(&91) && cache_roots.contains(&92));
     }
 }

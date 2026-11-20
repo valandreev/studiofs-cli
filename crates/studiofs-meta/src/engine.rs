@@ -1380,12 +1380,6 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         Err(MetaError::Storage("scratch storage is unsupported".into()))
     }
 
-    /// Read a block written by the initial scratch storage layout.
-    fn get_legacy_scratch_block(&self, ino: Ino, block: u32) -> MetaResult<Option<u64>> {
-        let _ = (ino, block);
-        Ok(None)
-    }
-
     /// Persist a local scratch extended attribute.
     fn set_scratch_xattr(&self, _ino: Ino, _name: &[u8], _value: &[u8]) -> MetaResult<()> {
         Err(MetaError::Storage("scratch storage is unsupported".into()))

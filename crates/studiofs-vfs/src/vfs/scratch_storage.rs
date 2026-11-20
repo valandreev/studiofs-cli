@@ -96,17 +96,7 @@ impl StudioVfs {
         if start >= end {
             return Ok(None);
         }
-        let mut data =
-            if let Some(object) = self.sync_meta().get_legacy_scratch_block(ino, block)? {
-                let bytes = self.payload_store_get_async(object).await?.ok_or_else(|| {
-                    io::Error::other("legacy scratch payload missing in local store")
-                })?;
-                let mut bytes = bytes.to_vec();
-                bytes.resize((end - start) as usize, 0);
-                Some(bytes)
-            } else {
-                None
-            };
+        let mut data: Option<Vec<u8>> = None;
         let mut cursor = start;
         while cursor < end {
             let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);

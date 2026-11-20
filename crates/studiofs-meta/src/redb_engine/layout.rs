@@ -14,8 +14,6 @@ pub(super) const SCRATCH_INODES: TableDefinition<u64, &[u8]> =
     TableDefinition::new("scratch_inodes");
 pub(super) const SCRATCH_DENTRIES: TableDefinition<&[u8], u64> =
     TableDefinition::new("scratch_dentries");
-pub(super) const LEGACY_SCRATCH_OVERLAY: TableDefinition<(u64, u32), u64> =
-    TableDefinition::new("scratch_overlay_legacy");
 pub(super) const SCRATCH_OVERLAY: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("scratch_overlay");
 pub(super) const SCRATCH_XATTRS: TableDefinition<&[u8], &[u8]> =

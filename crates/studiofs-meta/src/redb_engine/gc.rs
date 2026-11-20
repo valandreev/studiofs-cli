@@ -621,13 +621,6 @@ impl RedbMetaEngine {
         Self::pending_recovery_object_ids_from_read_txn(&txn, &mut refs)?;
         if include_scratch {
             Self::regular_file_graph_object_ids_from_table(&txn, SCRATCH_OVERLAY, &mut refs)?;
-            // shortcut: retain legacy block roots even when shadowed, until legacy blocks are converted to slices.
-            let legacy = txn
-                .open_table(LEGACY_SCRATCH_OVERLAY)
-                .map_err(super::scratch::storage_error)?;
-            for row in legacy.iter()? {
-                refs.insert(row?.1.value());
-            }
         }
         Ok(refs)
     }
