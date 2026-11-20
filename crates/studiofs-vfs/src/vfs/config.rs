@@ -223,6 +223,10 @@ pub struct VfsConfig {
     pub upload_limit: u64,
     /// Maximum aggregate object download rate in megabits per second; zero is unlimited.
     pub download_limit: u64,
+    pub cache_scrub: bool,
+    pub cache_scrub_interval_secs: u64,
+    pub cache_scrub_bytes_per_sec: u64,
+    pub cache_scrub_iops: u64,
     /// Background janitor cycle interval.
     pub janitor_interval_secs: u64,
     /// Janitor grace window for newer objects.
@@ -412,6 +416,10 @@ pub struct VfsConfigRaw {
     pub upload_limit: Option<u64>,
     /// Optional aggregate object download limit in megabits per second; zero is unlimited.
     pub download_limit: Option<u64>,
+    pub cache_scrub: Option<bool>,
+    pub cache_scrub_interval_secs: Option<u64>,
+    pub cache_scrub_bytes_per_sec: Option<u64>,
+    pub cache_scrub_iops: Option<u64>,
     /// Optional override for background janitor interval in seconds.
     pub janitor_interval_secs: Option<u64>,
     /// Optional override for janitor skip-newer-than window in seconds.
@@ -648,6 +656,10 @@ impl VfsConfigRaw {
         overlay!(
             upload_limit,
             download_limit,
+            cache_scrub,
+            cache_scrub_interval_secs,
+            cache_scrub_bytes_per_sec,
+            cache_scrub_iops,
             janitor_interval_secs,
             janitor_skip_newer_secs,
             janitor_max_deletes,
@@ -754,6 +766,9 @@ fn normalize_vfs_config(
         .max(DEFAULT_PREFETCH_CONCURRENCY_MIN);
     // Zero explicitly disables VFS readahead for platforms whose file cache
     // already performs sequential read-ahead.
+    cfg.cache_scrub_interval_secs = cfg.cache_scrub_interval_secs.max(1);
+    cfg.cache_scrub_bytes_per_sec = cfg.cache_scrub_bytes_per_sec.max(1);
+    cfg.cache_scrub_iops = cfg.cache_scrub_iops.max(1);
     cfg.readahead_min_prefetch = cfg.readahead_min_prefetch.max(1);
     cfg.dir_prefetch_max_batch = cfg.dir_prefetch_max_batch.max(1);
     cfg.readdir_attr_batch_chunk = cfg.readdir_attr_batch_chunk.max(1);
@@ -825,6 +840,10 @@ impl From<VfsConfig> for VfsConfigRaw {
         Self {
             upload_limit: Some(cfg.upload_limit),
             download_limit: Some(cfg.download_limit),
+            cache_scrub: Some(cfg.cache_scrub),
+            cache_scrub_interval_secs: Some(cfg.cache_scrub_interval_secs),
+            cache_scrub_bytes_per_sec: Some(cfg.cache_scrub_bytes_per_sec),
+            cache_scrub_iops: Some(cfg.cache_scrub_iops),
             janitor_interval_secs: Some(cfg.janitor_interval_secs),
             janitor_skip_newer_secs: Some(cfg.janitor_skip_newer_secs),
             janitor_max_deletes: Some(cfg.janitor_max_deletes),
@@ -910,6 +929,10 @@ impl Default for VfsConfig {
         Self {
             upload_limit: 0,
             download_limit: 0,
+            cache_scrub: true,
+            cache_scrub_interval_secs: 7 * 24 * 60 * 60,
+            cache_scrub_bytes_per_sec: 20 * 1024 * 1024,
+            cache_scrub_iops: 200,
             janitor_interval_secs: DEFAULT_JANITOR_INTERVAL.as_secs(),
             janitor_skip_newer_secs: DEFAULT_JANITOR_SKIP_NEWER_THAN.as_secs(),
             janitor_max_deletes: DEFAULT_JANITOR_MAX_DELETES_PER_RUN,

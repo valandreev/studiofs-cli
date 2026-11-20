@@ -38,6 +38,18 @@ const COUNTER_DIRTY_BYTES: &str = "dirty_bytes";
 const COUNTER_EVICTABLE_BYTES: &str = "evictable_bytes";
 const COUNTER_NEXT_DIRTY_SEQ: &str = "next_dirty_seq";
 const COUNTER_NEXT_ACCESS_SEQ: &str = "next_access_seq";
+const SCRUB_LAST_OBJECT: &str = "scrub_last_object_id";
+const SCRUB_STARTED: &str = "scrub_pass_started_ms";
+const SCRUB_COMPLETED: &str = "scrub_pass_completed_ms";
+
+/// Progress of the local payload scrub, stored independently of cache accounting.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScrubCursor {
+    pub last_object_id: Option<u64>,
+    pub started_ms: u64,
+    pub completed_ms: u64,
+}
+
 const LIST_PAGE_SIZE: usize = 4_096;
 #[cfg(not(test))]
 const TOUCH_ACCESS_LRU_CAPACITY: usize = 200_000;
@@ -276,6 +288,69 @@ impl CacheIndex {
         usize::try_from(dirty_order.len().map_err(storage_error)?).map_err(|_| {
             CacheIndexError::Corruption("dirty order length overflowed usize".to_string())
         })
+    }
+
+    /// Load the most recent committed scrub checkpoint.
+    pub fn scrub_cursor(&self) -> Result<ScrubCursor, CacheIndexError> {
+        let txn = self.db.begin_read().map_err(storage_error)?;
+        let counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
+        let read = |key: &str| {
+            counters
+                .get(key)
+                .map(|value| value.map(|v| v.value()))
+                .map_err(storage_error)
+        };
+        Ok(ScrubCursor {
+            last_object_id: read(SCRUB_LAST_OBJECT)?,
+            started_ms: read(SCRUB_STARTED)?.unwrap_or_default(),
+            completed_ms: read(SCRUB_COMPLETED)?.unwrap_or_default(),
+        })
+    }
+
+    /// Save the cursor and pass timestamps in the same transaction.
+    pub fn save_scrub_cursor(&self, cursor: ScrubCursor) -> Result<(), CacheIndexError> {
+        let txn = self.db.begin_write().map_err(storage_error)?;
+        {
+            let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
+            if let Some(id) = cursor.last_object_id {
+                counters
+                    .insert(SCRUB_LAST_OBJECT, id)
+                    .map_err(storage_error)?;
+            } else {
+                counters.remove(SCRUB_LAST_OBJECT).map_err(storage_error)?;
+            }
+            counters
+                .insert(SCRUB_STARTED, cursor.started_ms)
+                .map_err(storage_error)?;
+            counters
+                .insert(SCRUB_COMPLETED, cursor.completed_ms)
+                .map_err(storage_error)?;
+        }
+        txn.commit().map_err(storage_error)
+    }
+
+    /// Take a bounded page in object id order, without touching access order.
+    pub fn scrub_page(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<CacheIndexEntry>, CacheIndexError> {
+        use std::ops::Bound;
+        let txn = self.db.begin_read().map_err(storage_error)?;
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        payloads
+            .range::<u64>((start, Bound::Unbounded))
+            .map_err(storage_error)?
+            .take(limit)
+            .map(|pair| {
+                let (key, value) = pair.map_err(storage_error)?;
+                let id = key.value();
+                Ok(decode_entry(value.value(), id)?.into_public(id))
+            })
+            .collect()
     }
 
     /// Look up a single object id and return its current index entry, if present.
@@ -1788,6 +1863,38 @@ mod tests {
 
     fn open_index(path: &Path) -> CacheIndex {
         CacheIndex::open(path).expect("open cache index")
+    }
+
+    #[test]
+    fn scrub_cursor_survives_index_reopen() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("scrub-cursor");
+        let path = tmp.path().join("payload.redb");
+        let cursor = ScrubCursor {
+            last_object_id: Some(u64::MAX),
+            started_ms: 42,
+            completed_ms: 0,
+        };
+        {
+            let index = CacheIndex::open(&path).unwrap();
+            assert_eq!(index.scrub_cursor().unwrap(), ScrubCursor::default());
+            index.save_scrub_cursor(cursor).unwrap();
+        }
+        let index = CacheIndex::open(&path).unwrap();
+        assert_eq!(index.scrub_cursor().unwrap(), cursor);
+        assert!(
+            index
+                .scrub_page(cursor.last_object_id, 16)
+                .unwrap()
+                .is_empty()
+        );
+        index
+            .save_scrub_cursor(ScrubCursor {
+                last_object_id: None,
+                completed_ms: 43,
+                ..cursor
+            })
+            .unwrap();
+        assert_eq!(index.scrub_cursor().unwrap().last_object_id, None);
     }
 
     #[test]

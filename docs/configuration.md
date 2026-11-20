@@ -305,6 +305,23 @@ Remove-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\WinFsp' -Name 'MountUseMou
 Remove-ItemProperty -Path 'HKLM:\SOFTWARE\WinFsp' -Name 'MountUseMountmgrFromFSD' -ErrorAction SilentlyContinue
 ```
 
+### Background cache scrub
+
+StudioFS verifies checksummed local payloads and refetches damaged objects
+using the shared background download budget. Local verification waits for
+foreground local cache I/O to go idle. After a restart, verification resumes
+from its last saved page.
+
+Set these options with `studiofs settings` to save defaults. The same options
+on `studiofs mount` override those defaults for a mount.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--cache-scrub <BOOL>` | `true` | Enable the worker. Use `false` to disable it. |
+| `--cache-scrub-interval-secs <SECONDS>` | `604800` (7 days) | Wait after each completed pass. |
+| `--cache-scrub-bytes-per-sec <BYTES>` | `20971520` (20 MiB/s) | Local verification byte rate. |
+| `--cache-scrub-iops <COUNT>` | `200` | Local payload verification operations per second. |
+
 ### `settings`
 
 ```bash
