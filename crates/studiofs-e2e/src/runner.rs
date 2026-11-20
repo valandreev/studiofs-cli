@@ -4783,6 +4783,10 @@ plain child stderr\n",
     }
 
     impl CommandExecutor for RecordingExecutor {
+        fn probe_port(&self, _host: &str, _port: u16) -> std::io::Result<()> {
+            Ok(())
+        }
+
         fn run(&self, command: &crate::infra::CommandSpec) -> std::io::Result<CommandOutput> {
             self.calls.borrow_mut().push(command.clone());
             if command.args.contains(&"run-one".to_string()) {
