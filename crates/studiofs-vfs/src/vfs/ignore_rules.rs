@@ -341,7 +341,10 @@ impl StudioVfs {
                         Err(error) => return Err(error),
                     };
                     let file_objects = meta.get_regular_file_graph_object_usage(entry.ino)?;
-                    objects.extend(file_objects.iter().map(|(object_id, _)| *object_id));
+                    // An oversized file is never loaded, so it gets no eviction exemption.
+                    if attr.size <= MAX_RULE_BYTES as u64 {
+                        objects.extend(file_objects.iter().map(|(object_id, _)| *object_id));
+                    }
                     files.insert(
                         path,
                         RuleVersion {
@@ -890,6 +893,41 @@ mod tests {
                 .put(upload.object_id, payload, true)
                 .unwrap();
             assert!(!vfs.local_payload_backend.is_evictable(upload.object_id));
+        });
+    }
+
+    /// A rule file over the size limit is never loaded, so its payload must
+    /// not stay exempt from cache eviction.
+    #[test]
+    fn ignore_rules_release_oversized_rule_payload_pins() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-");
+        let (runtime, vfs, _) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-oversized");
+        runtime.block_on(async {
+            let ino = write_rule_file(&vfs, ROOT_INO, &vec![b'#'; MAX_RULE_BYTES + 1]).await;
+            let uploads = vfs.pending_uploads_snapshot_for_inode(ino);
+            assert!(!uploads.is_empty());
+            for upload in &uploads {
+                vfs.local_payload_backend
+                    .mark_uploaded(upload.object_id)
+                    .unwrap();
+                vfs.cached_store.complete_upload(upload);
+            }
+
+            let worker = tokio::spawn(Arc::clone(&vfs).background_ignore_rules());
+            vfs.wait_for_ignore_rules_bootstrap().await;
+            for upload in &uploads {
+                assert!(
+                    vfs.local_payload_backend.is_evictable(upload.object_id),
+                    "oversized rule payload {} stayed pinned",
+                    upload.object_id
+                );
+            }
+            vfs.state.shutdown.background_shutdown_token.cancel();
+            tokio::time::timeout(BOOTSTRAP_BUDGET, worker)
+                .await
+                .unwrap()
+                .unwrap();
         });
     }
 
