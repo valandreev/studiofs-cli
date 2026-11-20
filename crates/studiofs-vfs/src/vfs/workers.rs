@@ -3878,7 +3878,24 @@ mod tests {
                 assert_eq!(backend.get(id).unwrap(), original);
             }
             assert_eq!(backend.get(4).unwrap().as_ref(), b"local only");
-            assert_eq!(vfs.cache_scrub_refetch_failures.load(Ordering::Relaxed), 0);
+            let stats = vfs.cache_scrub_snapshot().unwrap();
+            assert_eq!(stats.cache_scrub_checked, 3);
+            assert_eq!(
+                stats.cache_scrub_corrupt,
+                super::super::VfsCacheScrubCorruption {
+                    checksum: 1,
+                    missing: 1,
+                    size: 1,
+                    io: 0,
+                }
+            );
+            assert_eq!(stats.cache_scrub_refetched, 3);
+            assert_eq!(stats.cache_scrub_refetch_failed, 0);
+            assert_eq!(stats.progress, None);
+            assert_eq!(
+                stats.cache_scrub_pass_completed_at,
+                Some(backend.scrub_index().scrub_cursor().unwrap().completed_ms)
+            );
 
             backend
                 .scrub_index()
@@ -3913,7 +3930,12 @@ mod tests {
                     .load(Ordering::Relaxed),
                 1
             );
-            assert_eq!(vfs.cache_scrub_refetch_failures.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                vfs.cache_scrub_snapshot()
+                    .unwrap()
+                    .cache_scrub_refetch_failed,
+                0
+            );
             drop(credit);
 
             backend
@@ -4893,6 +4915,11 @@ impl ScrubBucket {
 }
 
 impl StudioVfs {
+    /// Scrub telemetry is available when the background worker is enabled.
+    pub fn cache_scrub_snapshot(&self) -> Option<super::VfsCacheScrubSnapshot> {
+        self.cache_scrub.map(|_| *self.cache_scrub_stats.lock())
+    }
+
     pub(super) fn spawn_cache_scrub_worker(self: &Arc<Self>) {
         let Some(config) = self.cache_scrub else {
             return;
@@ -4908,8 +4935,12 @@ impl StudioVfs {
             };
             let shutdown = &vfs.state.shutdown.background_shutdown_token;
             while !shutdown.is_cancelled() {
-                if let Err(error) = vfs.run_cache_scrub(backend, config, shutdown).await {
-                    warn!(%error, "cache scrub pass interrupted");
+                if vfs
+                    .run_cache_scrub(backend, config, shutdown)
+                    .await
+                    .is_err()
+                {
+                    warn!("cache scrub pass interrupted");
                     tokio::select! {
                         _ = shutdown.cancelled() => break,
                         _ = tokio::time::sleep(Duration::from_secs(60)) => {}
@@ -4928,9 +4959,15 @@ impl StudioVfs {
         use crate::fetch::FetchError;
         use studiofs_cache::local::{CorruptEvictionOutcome, LocalPayloadBackend, ObservedPayload};
 
+        use studiofs_cache::runtime::ScrubCheck;
+
         const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
         let index = backend.scrub_index();
         let mut cursor = run_local_cache_io(|| index.scrub_cursor()).0?;
+        if cursor.last_completed_ms != 0 {
+            self.cache_scrub_stats.lock().cache_scrub_pass_completed_at =
+                Some(cursor.last_completed_ms);
+        }
         let now = tokio::time::Instant::now();
         let mut bytes = ScrubBucket::new(config.bytes_per_sec, now);
         let mut ops = ScrubBucket::new(config.iops, now);
@@ -4949,6 +4986,10 @@ impl StudioVfs {
             cursor.completed_ms = 0;
             run_local_cache_io(|| index.save_scrub_cursor(cursor)).0?;
         }
+        self.cache_scrub_stats.lock().progress = Some(super::VfsCacheScrubProgress {
+            started_unix_ms: cursor.started_ms,
+            last_object_id: cursor.last_object_id,
+        });
         let mut last_checkpoint = tokio::time::Instant::now();
         let mut saved_object_id = cursor.last_object_id;
         while !shutdown.is_cancelled() {
@@ -4967,9 +5008,11 @@ impl StudioVfs {
             if page.is_empty() {
                 cursor.last_object_id = None;
                 cursor.completed_ms = now_unix_millis();
-                return run_local_cache_io(|| index.save_scrub_cursor(cursor))
-                    .0
-                    .map_err(Into::into);
+                run_local_cache_io(|| index.save_scrub_cursor(cursor)).0?;
+                let mut stats = self.cache_scrub_stats.lock();
+                stats.cache_scrub_pass_completed_at = Some(cursor.completed_ms);
+                stats.progress = None;
+                return Ok(());
             }
             let mut checked = false;
             for entry in page {
@@ -4994,52 +5037,74 @@ impl StudioVfs {
                     }
                     let corruption = run_local_cache_io(|| backend.check_scrub_entry(&entry)).0;
                     checked = true;
-                    match corruption {
-                        Ok(Some(kind)) => {
-                            let object_id = entry.object_id;
-                            warn!(object_id, kind, "cache scrub detected corruption");
-                            tokio::select! {
-                                biased;
-                                _ = shutdown.cancelled() => break,
-                                _ = pace() => {}
+                    let kind = {
+                        let mut stats = self.cache_scrub_stats.lock();
+                        let corrupt = &mut stats.cache_scrub_corrupt;
+                        let kind = match corruption {
+                            Ok(ScrubCheck::Checksum) => Some(("checksum", &mut corrupt.checksum)),
+                            Ok(ScrubCheck::Missing) => Some(("missing", &mut corrupt.missing)),
+                            Ok(ScrubCheck::Size) => Some(("size", &mut corrupt.size)),
+                            Ok(ScrubCheck::Io) => Some(("io", &mut corrupt.io)),
+                            Ok(ScrubCheck::Clean | ScrubCheck::Skipped) => None,
+                            Err(_) => {
+                                warn!(
+                                    object_id = entry.object_id,
+                                    "cache scrub verification failed"
+                                );
+                                None
                             }
-                            match run_local_cache_io(|| {
-                                backend.evict_corrupt(object_id, &ObservedPayload::from(&entry))
-                            })
-                            .0
-                            {
-                                Ok(CorruptEvictionOutcome::Evicted) => {
-                                    let keys =
-                                        format_object_fragment_keys(&self.data_prefix, object_id);
-                                    tokio::select! {
-                                        _ = shutdown.cancelled() => break,
-                                        result = self.fetch_scheduler.refetch_scrubbed_payload(object_id, &keys) => {
-                                            match result {
-                                                Ok(_) => {}
-                                                Err(FetchError::PrefetchSkipped) => {
-                                                    debug!(object_id, "cache scrub refetch deferred by prefetch admission");
-                                                }
-                                                Err(_) => {
-                                                    self.cache_scrub_refetch_failures.fetch_add(1, Ordering::Relaxed);
-                                                    error!(object_id, "cache scrub refetch failed");
-                                                }
+                        };
+                        let kind = kind.map(|(kind, counter)| {
+                            *counter += 1;
+                            kind
+                        });
+                        if matches!(corruption, Ok(result) if result != ScrubCheck::Skipped) {
+                            stats.cache_scrub_checked += 1;
+                        }
+                        kind
+                    };
+                    if let Some(kind) = kind {
+                        let object_id = entry.object_id;
+                        warn!(object_id, kind, "cache scrub detected corruption");
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => break,
+                            _ = pace() => {}
+                        }
+                        match run_local_cache_io(|| {
+                            backend.evict_corrupt(object_id, &ObservedPayload::from(&entry))
+                        })
+                        .0
+                        {
+                            Ok(CorruptEvictionOutcome::Evicted) => {
+                                let keys =
+                                    format_object_fragment_keys(&self.data_prefix, object_id);
+                                tokio::select! {
+                                    _ = shutdown.cancelled() => break,
+                                    result = self.fetch_scheduler.refetch_scrubbed_payload(object_id, &keys) => {
+                                        match result {
+                                            Ok(_) => self.cache_scrub_stats.lock().cache_scrub_refetched += 1,
+                                            Err(FetchError::PrefetchSkipped) => {
+                                                debug!(object_id, "cache scrub refetch deferred by prefetch admission");
+                                            }
+                                            Err(_) => {
+                                                self.cache_scrub_stats.lock().cache_scrub_refetch_failed += 1;
+                                                error!(object_id, "cache scrub refetch failed");
                                             }
                                         }
                                     }
                                 }
-                                Ok(_) => {}
-                                Err(error) => {
-                                    warn!(object_id, %error, "cache scrub eviction failed")
-                                }
                             }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            warn!(object_id = entry.object_id, %error, "cache scrub verification failed")
+                            Ok(_) => {}
+                            Err(_) => warn!(object_id, "cache scrub eviction failed"),
                         }
                     }
                 }
                 cursor.last_object_id = Some(entry.object_id);
+                self.cache_scrub_stats.lock().progress = Some(super::VfsCacheScrubProgress {
+                    started_unix_ms: cursor.started_ms,
+                    last_object_id: cursor.last_object_id,
+                });
             }
             if checked || last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
                 run_local_cache_io(|| index.save_scrub_cursor(cursor)).0?;

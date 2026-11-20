@@ -2387,6 +2387,33 @@ pub struct VfsSyncSafetySnapshot {
     pub reasons: Vec<VfsSyncSafetyReason>,
 }
 
+/// Mount-local cache scrub counters and durable pass position.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VfsCacheScrubSnapshot {
+    pub cache_scrub_checked: u64,
+    pub cache_scrub_corrupt: VfsCacheScrubCorruption,
+    pub cache_scrub_refetched: u64,
+    pub cache_scrub_refetch_failed: u64,
+    /// Most recent completed pass in Unix milliseconds, including across restarts.
+    pub cache_scrub_pass_completed_at: Option<u64>,
+    pub progress: Option<VfsCacheScrubProgress>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VfsCacheScrubCorruption {
+    pub checksum: u64,
+    pub missing: u64,
+    pub size: u64,
+    pub io: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VfsCacheScrubProgress {
+    pub started_unix_ms: u64,
+    /// Last visited object in the current pass, including skipped entries.
+    pub last_object_id: Option<u64>,
+}
+
 /// Runtime event emitted by metrics stream.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VfsRuntimeEvent {

@@ -635,6 +635,62 @@ fn legacy_runtime_snapshot_cannot_certify_sync_completion() {
 }
 
 #[test]
+fn diagnostics_runtime_snapshot_cache_scrub_is_additive_in_v5() {
+    #[derive(Deserialize, Serialize)]
+    struct V5RuntimeSnapshot {
+        logical_quota: Option<studiofs_vfs::LogicalQuotaStatus>,
+        schema_version: u32,
+        generated_unix_ms: u64,
+        process: DiagnosticsProcessSnapshot,
+        ingress: VfsIngressStats,
+        write_path: VfsWritePathObservabilitySnapshot,
+        upload: VfsUploadStats,
+        zeroio: VfsZeroIoRuntimeSnapshot,
+        cache: DiagnosticsCacheSnapshot,
+        synchronization: DiagnosticsSynchronizationSnapshot,
+        sync_safety: studiofs_vfs::VfsSyncSafetySnapshot,
+        coherence: CoherenceHealthSnapshot,
+    }
+
+    let mut snapshot = DiagnosticsRuntimeSnapshot {
+        schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
+        generated_unix_ms: 42,
+        ..DiagnosticsRuntimeSnapshot::default()
+    };
+    let old = serde_json::to_value(&snapshot).unwrap();
+    assert!(old.get("cache_scrub").is_none());
+    assert!(
+        serde_json::from_value::<DiagnosticsRuntimeSnapshot>(old.clone())
+            .unwrap()
+            .cache_scrub
+            .is_none()
+    );
+
+    snapshot.cache_scrub = Some(studiofs_vfs::VfsCacheScrubSnapshot {
+        cache_scrub_checked: 3,
+        cache_scrub_corrupt: studiofs_vfs::VfsCacheScrubCorruption {
+            checksum: 1,
+            missing: 1,
+            size: 1,
+            io: 0,
+        },
+        cache_scrub_refetched: 3,
+        cache_scrub_pass_completed_at: Some(40),
+        ..Default::default()
+    });
+    let new = serde_json::to_value(&snapshot).unwrap();
+    let v5: V5RuntimeSnapshot = serde_json::from_value(new.clone()).unwrap();
+    assert_eq!(serde_json::to_value(v5).unwrap(), old);
+    assert_eq!(DIAGNOSTICS_PROTOCOL_VERSION, 5);
+    assert_eq!(
+        serde_json::from_value::<DiagnosticsRuntimeSnapshot>(new)
+            .unwrap()
+            .cache_scrub,
+        snapshot.cache_scrub
+    );
+}
+
+#[test]
 fn diagnostics_runtime_snapshot_round_trips_coherence_health() {
     let snapshot = DiagnosticsRuntimeSnapshot {
         coherence: CoherenceHealthSnapshot {

@@ -127,6 +127,28 @@ fn format_version(value: Option<u64>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn format_cache_scrub(snapshot: &studiofs_vfs::VfsCacheScrubSnapshot, now_ms: u64) -> String {
+    let last_pass = snapshot.cache_scrub_pass_completed_at.map_or_else(
+        || "never".to_owned(),
+        |timestamp| format_last_successful_sync(i64::try_from(timestamp).ok(), now_ms),
+    );
+    let progress = snapshot.progress.map_or_else(
+        || "idle".to_owned(),
+        |progress| {
+            progress.last_object_id.map_or_else(
+                || "starting".to_owned(),
+                |id| format!("scanned through object {id}"),
+            )
+        },
+    );
+    let corrupt = snapshot.cache_scrub_corrupt;
+    let total = corrupt.checksum + corrupt.missing + corrupt.size + corrupt.io;
+    format!(
+        "  Cache scrub: last pass {last_pass}, {progress}, {total} corrupt, {} refetch failures",
+        snapshot.cache_scrub_refetch_failed
+    )
+}
+
 fn mounted_runtime_snapshot(
     volume_name: &str,
 ) -> Option<crate::diagnostics::DiagnosticsRuntimeSnapshot> {
@@ -692,6 +714,9 @@ pub fn run(
                     );
                 }
                 print_pg_sync_diagnostics(&snapshot.synchronization.state.pg_sync);
+                if let Some(scrub) = snapshot.cache_scrub {
+                    println!("{}", format_cache_scrub(&scrub, current_unix_ms()));
+                }
                 let cache_root = cache_dir
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| meta_dir.join("cache"));
@@ -1344,6 +1369,32 @@ mod tests {
         assert_eq!(
             format_payload_limit_status(&upload),
             "Payload limits upload/download Mbps: 17/29; throttle wait upload/download: 1.500ms/2.500ms"
+        );
+    }
+
+    #[test]
+    fn mounted_status_formats_cache_scrub() {
+        let snapshot = studiofs_vfs::VfsCacheScrubSnapshot {
+            cache_scrub_pass_completed_at: Some(1_000),
+            progress: Some(studiofs_vfs::VfsCacheScrubProgress {
+                started_unix_ms: 1_200,
+                last_object_id: Some(12),
+            }),
+            cache_scrub_corrupt: studiofs_vfs::VfsCacheScrubCorruption {
+                checksum: 1,
+                size: 2,
+                ..Default::default()
+            },
+            cache_scrub_refetch_failed: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_cache_scrub(&snapshot, 2_500),
+            "  Cache scrub: last pass 1.5s ago, scanned through object 12, 3 corrupt, 2 refetch failures"
+        );
+        assert_eq!(
+            format_cache_scrub(&Default::default(), 2_500),
+            "  Cache scrub: last pass never, idle, 0 corrupt, 0 refetch failures"
         );
     }
 

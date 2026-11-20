@@ -292,5 +292,7 @@ pub(crate) use test_fixtures::{
 pub(super) use test_fixtures::{TestFailingScenario, TestPassingScenario};
 pub(super) use worker_concurrency::WorkerConcurrency;
 
+mod cache_scrub;
 #[cfg(test)]
 mod tests;
+pub(super) use cache_scrub::MountedCacheScrub;
