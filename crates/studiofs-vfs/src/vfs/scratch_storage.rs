@@ -358,6 +358,53 @@ mod tests {
     }
 
     #[test]
+    fn scratch_materialization_consumes_prefetched_object_ids() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-prefetch-");
+        let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs_at(
+            temp.path(),
+            VOLUME,
+            VfsConfig {
+                disable_background_slab_flush: true,
+                ..VfsConfig::default()
+            },
+            None,
+        );
+        let attr = vfs
+            .store_scratch_entry(NAME, InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
+            .unwrap();
+        let block = vec![7u8; vfs.block_size as usize];
+        runtime.block_on(async {
+            vfs.write_scratch(0, attr.ino, 0, &block).await.unwrap();
+            vfs.prefetch_writer_stack_object_ids_for_completed_blocks(attr.ino)
+                .await
+                .unwrap();
+            let prefetched = vfs
+                .state
+                .writer_stack_prefetched_object_ids
+                .lock()
+                .iter()
+                .find(|range| range.ino == attr.ino)
+                .map(|range| range.start)
+                .unwrap();
+            assert!(
+                vfs.materialize_writer_stack_completed_blocks_for_inode(attr.ino)
+                    .await
+                    .unwrap()
+                    > 0
+            );
+            assert!(
+                !vfs.state
+                    .writer_stack_prefetched_object_ids
+                    .lock()
+                    .iter()
+                    .any(|range| range.ino == attr.ino)
+            );
+            vfs.flush(attr.ino).await.unwrap();
+            assert_eq!(scratch_object(meta.as_ref(), attr.ino), prefetched);
+        });
+    }
+
+    #[test]
     fn scratch_deferred_release_drains_writer_pages() {
         let temp = studiofs_test_support::workspace_target_tempdir("scratch-release-");
         let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs(&temp, VOLUME);

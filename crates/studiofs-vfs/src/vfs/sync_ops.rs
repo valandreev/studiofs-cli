@@ -2421,23 +2421,30 @@ impl StudioVfs {
         if object_count == 0 {
             return Ok(0);
         }
-        if !scratch
-            && let Some(first_object_id) =
-                self.take_prefetched_writer_stack_object_ids(ino, object_count)
+        let prefetched = self.take_prefetched_writer_stack_object_ids(ino, object_count);
+        if let Some(first_object_id) = prefetched
+            && !scratch
         {
             return Ok(first_object_id);
         }
-        let ids = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            let ids = engine.next_object_ids(object_count)?;
+        // Scratch payload is written durably, so its allocator state is fenced first.
+        run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            let first_object_id = match prefetched {
+                Some(first_object_id) => first_object_id,
+                None => engine
+                    .next_object_ids(object_count)?
+                    .first()
+                    .copied()
+                    .ok_or_else(|| {
+                        MetaError::Storage("writer stack object id reservation was empty".into())
+                    })?,
+            };
             if scratch {
                 engine.sync_local_metadata()?;
             }
-            Ok(ids)
+            Ok(first_object_id)
         })
-        .await?;
-        ids.first()
-            .copied()
-            .ok_or_else(|| VfsError::Other("writer stack object id reservation was empty".into()))
+        .await
     }
 
     fn take_prefetched_writer_stack_object_ids(&self, ino: Ino, object_count: u32) -> Option<u64> {
