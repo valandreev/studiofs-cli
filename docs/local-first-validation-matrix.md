@@ -279,7 +279,7 @@ mounted scenario on WinFSP when available.
 | Dirty, Pending, Uploading, pinned, and concurrently changed entries are protected from scrub eviction. | `cargo test -p studiofs-cache --lib evict_corrupt` (SFS-1118) |
 | The worker repairs clean corrupt entries, resumes from a persisted cursor, respects limits and foreground I/O, and joins on shutdown. | `cargo test -p studiofs-cache --lib scrub_cursor` and `cargo test -p studiofs-vfs --lib cache_scrub` (SFS-1119) |
 | Runtime counters and status keep v5 clients working. | `cargo test -p studiofs --bin studiofs cache_scrub` covers `diagnostics_runtime_snapshot_cache_scrub_is_additive_in_v5` and `mounted_status_formats_cache_scrub` (SFS-1120) |
-| The mounted worker repairs a flipped byte, a missing file, and a truncated file. An unpublished payload survives an offline pass. | `studiofs-e2e run --scenario mounted-cache-scrub --studiofs-bin <rebuilt-binary> --infra compose --retain always` on macFUSE and Linux FUSE, plus WinFSP when available (SFS-1120) |
+| The mounted worker refetches objects with a flipped byte, a missing file, or a truncated file. Reads return the original bytes, and an unpublished payload survives a full offline pass unchanged. | `studiofs-e2e run --scenario mounted-cache-scrub --studiofs-bin <rebuilt-binary> --infra compose --retain always` passed on Linux FUSE (WSL) and WinFSP (SFS-1120).<br>macFUSE 5.5.0 passed on 2026-11-20 with both binaries rebuilt from `main` at `1c7d6362` (SFS-1121). The retained run report is `target/e2e-runs/sfs1121-macfuse-1c7d6362/report.json`. Its `artifacts/scenarios/mounted-cache-scrub/cache-scrub.json` records three refetches, zero refetch failures, and an unchanged unpublished payload. |
 
 ## SFS-356 Encrypted remote object regression gate
 
