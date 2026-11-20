@@ -5526,11 +5526,12 @@ impl StudioVfs {
             upload_rx,
         }: StartupChannels,
     ) -> VfsResult<()> {
+        self.run_startup_local_metadata_compaction();
+        // After compaction, whose exclusive database lock a rule scan would contend.
         let vfs = self.clone();
         self.spawn_background_cleanup_task_on(&tokio::runtime::Handle::current(), async move {
             vfs.background_ignore_rules().await;
         });
-        self.run_startup_local_metadata_compaction();
         self.spawn_landing_zone_recovery_worker();
         self.spawn_aggressive_materialization_worker();
         self.spawn_local_dirty_flush_worker();

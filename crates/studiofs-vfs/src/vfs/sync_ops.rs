@@ -1383,7 +1383,7 @@ impl StudioVfs {
         };
 
         if had_local_dirty_state {
-            self.ignore_rules.refresh.notify_one();
+            self.ignore_rules.note_local_barrier(ino);
         }
         if matches!(sticky_error_policy, StickyErrorPolicy::Report) {
             self.ensure_no_upload_sticky_error(ino)?;

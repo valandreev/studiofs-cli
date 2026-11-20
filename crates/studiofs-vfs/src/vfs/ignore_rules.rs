@@ -1,14 +1,33 @@
 use super::*;
 use crate::scratch_rules::{MAX_RULE_BYTES, RULE_FILE, ScratchClass, ScratchRules};
 use std::collections::BTreeMap;
+use studiofs_meta::coherence::{InvalidationBatch, InvalidationIntent};
 use tokio::sync::{Notify, broadcast, watch};
 
 type RuleSources = BTreeMap<Vec<u8>, Vec<u8>>;
 
+/// Mount bootstrap waits this long for the first discovery and prefetch pass.
+const BOOTSTRAP_BUDGET: Duration = Duration::from_secs(5);
+/// Shared payload read deadline for one refresh, inside the bootstrap budget.
+const PAYLOAD_READ_BUDGET: Duration = Duration::from_secs(3);
+/// Backoff before retrying a refresh that could not read every payload.
+const RETRY_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Inodes whose changes can alter the compiled rules. Entries are added before
+/// a scan reads their state and are never removed during a mount, so a commit
+/// that a scan missed is still recognized when its invalidation arrives.
+#[derive(Default)]
+struct RuleInodes {
+    files: HashSet<Ino>,
+    /// Directories on the path to a rule file, including its own directory.
+    directories: HashSet<Ino>,
+}
+
 pub(super) struct IgnoreRules {
     snapshot: parking_lot::RwLock<Arc<ScratchRules>>,
     sources: RuleSources,
-    pub(super) refresh: Notify,
+    refresh: Notify,
+    watched: Arc<parking_lot::Mutex<RuleInodes>>,
     changed: broadcast::Sender<Vec<Vec<u8>>>,
     bootstrap: watch::Sender<bool>,
 }
@@ -43,9 +62,59 @@ impl IgnoreRules {
             snapshot: parking_lot::RwLock::new(Arc::new(rules)),
             sources,
             refresh: Notify::new(),
+            watched: Arc::default(),
             changed: broadcast::channel(32).0,
             bootstrap: watch::channel(restored).0,
         }
+    }
+
+    /// Request a refresh after a local flush or close of a known rule file.
+    pub(super) fn note_local_barrier(&self, ino: Ino) {
+        if self.watched.lock().files.contains(&ino) {
+            self.refresh.notify_one();
+        }
+    }
+
+    /// Request a refresh after a local namespace change binds or unbinds
+    /// `name`. `ino` is the inode moved or created, when known.
+    pub(super) fn note_local_entry(&self, name: &[u8], ino: Option<Ino>) {
+        if self.watched.lock().note_entry(name, ino) {
+            self.refresh.notify_one();
+        }
+    }
+
+    /// Request a refresh when a committed batch names a rule file or moves a
+    /// directory above one. Other namespace and content churn is ignored so
+    /// ordinary commits do not rescan the volume.
+    pub(super) fn note_invalidation(&self, batch: &InvalidationBatch) {
+        let mut watched = self.watched.lock();
+        let mut relevant = false;
+        for intent in &batch.intents {
+            relevant |= match intent {
+                InvalidationIntent::Reset => true,
+                InvalidationIntent::Entry { name, ino, .. } => watched.note_entry(name, *ino),
+                InvalidationIntent::Attributes { ino } | InvalidationIntent::Content { ino } => {
+                    watched.files.contains(ino)
+                }
+                InvalidationIntent::Directory { .. } => false,
+            };
+        }
+        drop(watched);
+        if relevant {
+            self.refresh.notify_one();
+        }
+    }
+}
+
+impl RuleInodes {
+    /// Whether a binding change of `name` to or from `ino` can alter the
+    /// rules. A rule file name starts watching its inode.
+    fn note_entry(&mut self, name: &[u8], ino: Option<Ino>) -> bool {
+        if studiofs_meta::fold_dentry_name(name).as_ref() == RULE_FILE {
+            self.files.extend(ino);
+            return true;
+        }
+        ino.is_some_and(|ino| self.files.contains(&ino) || self.directories.contains(&ino))
     }
 }
 
@@ -65,7 +134,7 @@ impl StudioVfs {
     pub async fn wait_for_ignore_rules_bootstrap(&self) {
         if !self.read_only_mount {
             let mut bootstrap = self.ignore_rules.bootstrap.subscribe();
-            if tokio::time::timeout(Duration::from_secs(5), bootstrap.wait_for(|ready| *ready))
+            if tokio::time::timeout(BOOTSTRAP_BUDGET, bootstrap.wait_for(|ready| *ready))
                 .await
                 .is_err()
             {
@@ -87,7 +156,7 @@ impl StudioVfs {
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 _ = self.ignore_rules.refresh.notified() => {}
-                _ = tokio::time::sleep(Duration::from_secs(15)), if retry => {}
+                _ = tokio::time::sleep(RETRY_INTERVAL), if retry => {}
             }
         }
         self.ignore_rules.bootstrap.send_replace(true);
@@ -119,35 +188,63 @@ impl StudioVfs {
         pinned: &mut HashSet<u64>,
     ) -> bool {
         let cancellation = self.state.shutdown.background_shutdown_token.clone();
+        let watched = Arc::clone(&self.ignore_rules.watched);
         let scan = self
             .meta
             .run_maintenance(move |meta| {
+                use studiofs_meta::MetaError;
                 let mut directories = vec![(ROOT_INO, Vec::new())];
+                let mut parents = HashMap::new();
                 let mut files = BTreeMap::new();
                 let mut objects = HashSet::new();
                 while let Some((ino, path)) = directories.pop() {
                     if cancellation.is_cancelled() {
                         break;
                     }
-                    for entry in meta.readdir(ino)? {
+                    // A directory removed after its parent was listed has no
+                    // rules; its invalidation requests another pass if needed.
+                    let entries = match meta.readdir(ino) {
+                        Ok(entries) => entries,
+                        Err(MetaError::InodeNotFound(_)) => continue,
+                        Err(error) => return Err(error),
+                    };
+                    for entry in entries {
                         if entry.kind == FileType::Directory {
                             let mut child = path.clone();
                             if !child.is_empty() {
                                 child.push(b'/');
                             }
                             child.extend_from_slice(&entry.name);
+                            parents.insert(entry.ino, ino);
                             directories.push((entry.ino, child));
                         }
                     }
                     let entry = match meta.lookup(ino, RULE_FILE) {
                         Ok(entry) => entry,
-                        Err(studiofs_meta::MetaError::EntryNotFound { .. }) => continue,
+                        Err(MetaError::EntryNotFound { .. } | MetaError::InodeNotFound(_)) => {
+                            continue;
+                        }
                         Err(error) => return Err(error),
                     };
                     if entry.kind != FileType::RegularFile {
                         continue;
                     }
-                    let attr = meta.get_attr(entry.ino)?;
+                    // Watch before reading so a later commit is either seen
+                    // here or recognized by its invalidation.
+                    {
+                        let mut watched = watched.lock();
+                        watched.files.insert(entry.ino);
+                        let mut directory = Some(ino);
+                        while let Some(current) = directory {
+                            watched.directories.insert(current);
+                            directory = parents.get(&current).copied();
+                        }
+                    }
+                    let attr = match meta.get_attr(entry.ino) {
+                        Ok(attr) => attr,
+                        Err(MetaError::InodeNotFound(_)) => continue,
+                        Err(error) => return Err(error),
+                    };
                     objects.extend(
                         meta.get_regular_file_graph_object_usage(entry.ino)?
                             .into_iter()
@@ -192,7 +289,7 @@ impl StudioVfs {
         }
         next_versions.retain(|path, _| files.contains_key(path));
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now() + PAYLOAD_READ_BUDGET;
         let mut missing = Vec::new();
         for (directory, version @ (ino, _, size)) in files {
             if versions.get(&directory) == Some(&version) {
@@ -258,6 +355,93 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    fn take_refresh_permit(rules: &IgnoreRules) -> bool {
+        let mut notified = std::pin::pin!(rules.refresh.notified());
+        notified
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    }
+
+    async fn write_rule_file(vfs: &StudioVfs, parent: Ino, payload: &[u8]) {
+        let attr = vfs.create(parent, RULE_FILE, 0, 0, 0o644).unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        vfs.write_fh(fh, attr.ino, 0, payload).await.unwrap();
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    }
+
+    /// Wait on change notifications until `path` has `class`, and return the
+    /// directories announced meanwhile. Each wait is bounded.
+    async fn wait_for_class(
+        vfs: &StudioVfs,
+        changes: &mut broadcast::Receiver<Vec<Vec<u8>>>,
+        path: &[u8],
+        class: ScratchClass,
+    ) -> BTreeSet<Vec<u8>> {
+        let mut announced = BTreeSet::new();
+        while vfs.classify_scratch_path(path, false) != class {
+            let paths = tokio::time::timeout(Duration::from_secs(5), changes.recv())
+                .await
+                .expect("rules changed notification")
+                .unwrap();
+            announced.extend(paths);
+        }
+        announced
+    }
+
+    #[test]
+    fn ignore_rules_refresh_only_for_rule_files_and_their_directories() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-");
+        let (_runtime, vfs, _meta) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-filter");
+        let rules = &vfs.ignore_rules;
+        {
+            let mut watched = rules.watched.lock();
+            watched.files.insert(10);
+            watched.directories.insert(2);
+        }
+        let batch = |intents| InvalidationBatch {
+            generation: 1,
+            intents,
+        };
+        let entry = |parent, name: &[u8], ino| InvalidationIntent::Entry {
+            parent,
+            name: name.to_vec(),
+            ancestors: None,
+            ino,
+        };
+
+        // Children created in a watched directory touch its attributes only.
+        rules.note_invalidation(&batch(vec![
+            entry(2, b"render.exr", Some(11)),
+            InvalidationIntent::Directory { ino: 2 },
+            InvalidationIntent::Attributes { ino: 2 },
+            InvalidationIntent::Content { ino: 11 },
+        ]));
+        assert!(!take_refresh_permit(rules));
+        rules.note_local_barrier(11);
+        assert!(!take_refresh_permit(rules));
+
+        rules.note_local_barrier(10);
+        assert!(take_refresh_permit(rules));
+        rules.note_invalidation(&batch(vec![InvalidationIntent::Content { ino: 10 }]));
+        assert!(take_refresh_permit(rules));
+        rules.note_invalidation(&batch(vec![entry(ROOT_INO, b"shots", Some(2))]));
+        assert!(take_refresh_permit(rules));
+        rules.note_invalidation(&batch(vec![InvalidationIntent::Reset]));
+        assert!(take_refresh_permit(rules));
+
+        // A new rule file, in any case spelling, is watched from its first intent.
+        rules.note_invalidation(&batch(vec![entry(7, b".StudioFSIgnore", Some(12))]));
+        assert!(take_refresh_permit(rules));
+        rules.note_local_barrier(12);
+        assert!(take_refresh_permit(rules));
+    }
 
     #[test]
     fn ignore_rules_flush_publishes_snapshot_and_restores_after_reopen() {
@@ -274,23 +458,12 @@ mod tests {
             )
             .await
             .expect("initial rule inventory");
-            let attr = vfs.create(ROOT_INO, RULE_FILE, 0, 0, 0o644).unwrap();
-            let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
-            vfs.write_fh(fh, attr.ino, 0, b"*.tmp\n").await.unwrap();
-            vfs.flush_fh(fh).await.unwrap();
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), changes.recv())
-                    .await
-                    .unwrap()
-                    .unwrap(),
-                vec![Vec::<u8>::new()],
-            );
+            write_rule_file(&vfs, ROOT_INO, b"*.tmp\n").await;
+            let announced =
+                wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Scratch).await;
+            assert_eq!(announced, BTreeSet::from([Vec::new()]));
+            // A snapshot taken before the refresh is never mutated in place.
             assert_eq!(old.classify(b"file.tmp", false), ScratchClass::Tracked);
-            assert_eq!(
-                vfs.classify_scratch_path(b"file.tmp", false),
-                ScratchClass::Scratch
-            );
-            vfs.release_fh(fh).await.unwrap();
             vfs.state.shutdown.background_shutdown_token.cancel();
             tokio::time::timeout(Duration::from_secs(5), worker)
                 .await
@@ -304,5 +477,97 @@ mod tests {
             reopened.classify_scratch_path(b"file.tmp", false),
             ScratchClass::Scratch
         );
+    }
+
+    /// Local rename and unlink of a rule file, and a move of its directory,
+    /// trigger a refresh without any flush. The worker is then abandoned
+    /// without shutdown and the metadata cache reopened.
+    #[test]
+    fn ignore_rules_follow_rule_file_rename_unlink_and_survive_abandoned_worker() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-");
+        let (runtime, vfs, meta) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-moves");
+        let mut changes = vfs.subscribe_ignore_rules_changes();
+        runtime.block_on(async {
+            let worker = tokio::spawn(Arc::clone(&vfs).background_ignore_rules());
+            vfs.wait_for_ignore_rules_bootstrap().await;
+            write_rule_file(&vfs, ROOT_INO, b"*.tmp\n").await;
+            wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Scratch).await;
+
+            vfs.rename(ROOT_INO, RULE_FILE, ROOT_INO, b"rules.off", false)
+                .unwrap();
+            wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Tracked).await;
+
+            vfs.rename(ROOT_INO, b"rules.off", ROOT_INO, RULE_FILE, false)
+                .unwrap();
+            wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Scratch).await;
+
+            let shots = vfs.mkdir(ROOT_INO, b"shots", 0, 0, 0o755).unwrap();
+            write_rule_file(&vfs, shots.ino, b"*.log\n").await;
+            wait_for_class(&vfs, &mut changes, b"shots/a.log", ScratchClass::Scratch).await;
+
+            // Moving the directory moves its rules with it.
+            vfs.rename(ROOT_INO, b"shots", ROOT_INO, b"plates", false)
+                .unwrap();
+            let announced =
+                wait_for_class(&vfs, &mut changes, b"plates/a.log", ScratchClass::Scratch).await;
+            assert_eq!(
+                announced,
+                BTreeSet::from([b"plates".to_vec(), b"shots".to_vec()])
+            );
+            assert_eq!(
+                vfs.classify_scratch_path(b"shots/a.log", false),
+                ScratchClass::Tracked
+            );
+
+            vfs.unlink(ROOT_INO, RULE_FILE).unwrap();
+            wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Tracked).await;
+
+            worker.abort();
+            assert!(worker.await.unwrap_err().is_cancelled());
+        });
+        drop(vfs);
+        drop(meta);
+        drop(runtime);
+        let (_, reopened, _) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-moves");
+        assert_eq!(
+            reopened.classify_scratch_path(b"plates/a.log", false),
+            ScratchClass::Scratch
+        );
+        assert_eq!(
+            reopened.classify_scratch_path(b"file.tmp", false),
+            ScratchClass::Tracked
+        );
+    }
+
+    /// A peer's removal of a rule file reaches the worker only through the
+    /// committed invalidation batch of foreign apply.
+    #[test]
+    fn ignore_rules_follow_foreign_rule_file_removal() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-");
+        let (runtime, vfs, meta) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-foreign");
+        let mut changes = vfs.subscribe_ignore_rules_changes();
+        runtime.block_on(async {
+            let worker = tokio::spawn(Arc::clone(&vfs).background_ignore_rules());
+            vfs.wait_for_ignore_rules_bootstrap().await;
+            write_rule_file(&vfs, ROOT_INO, b"*.tmp\n").await;
+            wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Scratch).await;
+
+            meta.apply_replica_serving_state(&[studiofs_meta::MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: RULE_FILE.to_vec(),
+            }])
+            .expect("apply foreign removal");
+            // Stand in for the running metadata invalidation worker.
+            vfs.drain_semantic_invalidations();
+            let announced =
+                wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Tracked).await;
+            assert_eq!(announced, BTreeSet::from([Vec::new()]));
+
+            vfs.state.shutdown.background_shutdown_token.cancel();
+            worker.await.unwrap();
+        });
     }
 }
