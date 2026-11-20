@@ -75,7 +75,7 @@ pub use pg_engine::{
 };
 pub use pg_transport::connect_studiofs_postgres;
 pub use read_only::ReadOnlyMetaEngine;
-pub use redb_engine::RedbMetaEngine;
+pub use redb_engine::{RedbMetaEngine, layout::fold_dentry_name};
 pub use types::*;
 
 #[derive(serde::Deserialize)]

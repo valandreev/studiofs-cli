@@ -20,6 +20,7 @@ mod ordered_mutex;
 pub mod qos;
 pub mod readahead;
 mod runtime;
+pub mod scratch_rules;
 pub mod snapshot_mount;
 mod snapshot_worker;
 pub mod upload;
