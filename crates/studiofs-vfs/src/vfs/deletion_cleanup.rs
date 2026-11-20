@@ -90,7 +90,7 @@ impl StudioVfs {
         // One shared scan keeps inodes whose candidates are all current away from their gates.
         let observed = self
             .meta
-            .run_maintenance(|meta| meta.get_local_referenced_object_ids())
+            .run_maintenance(|meta| meta.get_local_cache_referenced_object_ids())
             .await?;
         let mut displaced = Vec::new();
         for (ino, candidates) in present {
@@ -152,7 +152,7 @@ impl StudioVfs {
             .run_before_retired_payload_recheck_for_test();
         let referenced = self
             .meta
-            .run_maintenance(|meta| meta.get_local_referenced_object_ids())
+            .run_maintenance(|meta| meta.get_local_cache_referenced_object_ids())
             .await?;
         // Barrier: a prefetch that resolved before the recheck may still read a displaced object.
         // Later ones resolve the rechecked graph, which the held inode gates keep unchanged.

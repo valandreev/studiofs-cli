@@ -434,7 +434,10 @@ impl LocalPayloadBackendRuntime {
     fn run_budget_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError> {
         self.flush_access_touches(true, "run_pressure_maintenance");
         let stats = self.index.stats()?;
-        if let Some(target_bytes) = self.budget_governor.background_target(stats.current_bytes) {
+        if let Some(target_bytes) = self
+            .budget_governor
+            .background_target(stats.budgeted_bytes())
+        {
             match self.try_evict_to_target_bytes(target_bytes, "run_pressure_maintenance")? {
                 Some(current_bytes) => {
                     debug!(
@@ -1031,14 +1034,14 @@ impl LocalPayloadBackendRuntime {
     ) -> Result<u64, LocalPayloadBackendError> {
         self.flush_access_touches(true, operation);
         let stats = self.index.stats()?;
-        if stats.current_bytes <= target_bytes {
-            return Ok(stats.current_bytes);
+        if stats.budgeted_bytes() <= target_bytes {
+            return Ok(stats.budgeted_bytes());
         }
 
         let mut cursor = None;
         // The deletion limit also caps Durable shard-directory barriers per batch.
         let mut batch = Vec::with_capacity(EVICTION_DELETE_BATCH_SIZE);
-        let mut estimated_current = stats.current_bytes;
+        let mut estimated_current = stats.budgeted_bytes();
         loop {
             if estimated_current <= target_bytes {
                 break;
@@ -1086,7 +1089,7 @@ impl LocalPayloadBackendRuntime {
             }
         }
 
-        let final_current = self.index.stats()?.current_bytes;
+        let final_current = self.index.stats()?.budgeted_bytes();
         if final_current > target_bytes {
             warn!(
                 operation,
@@ -1128,7 +1131,7 @@ impl LocalPayloadBackendRuntime {
         let stats = self.index.stats()?;
         let Some(target_bytes) = self
             .budget_governor
-            .target_before_insert(stats.current_bytes, payload_len)
+            .target_before_insert(stats.budgeted_bytes(), payload_len)
         else {
             return Ok(false);
         };
@@ -1430,6 +1433,140 @@ fn check_scrub_payload(
     })
 }
 
+impl LocalPayloadBackendRuntime {
+    fn put_batch_with_mode(
+        &self,
+        entries: &[LocalPayloadPut],
+        scratch: bool,
+    ) -> Result<(), LocalPayloadBackendError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut updates = Vec::with_capacity(entries.len());
+        let mut persisted_entries = Vec::with_capacity(entries.len());
+        let mut estimated_current = self.index.stats()?.budgeted_bytes();
+
+        for entry in entries {
+            let payload_len = u64::try_from(entry.data.len()).map_err(|_| {
+                LocalPayloadBackendError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "payload length exceeds u64",
+                ))
+            })?;
+
+            if !scratch
+                && let Some(target_bytes) = self
+                    .budget_governor
+                    .target_before_insert(estimated_current, payload_len)
+            {
+                let mut current_after_evict =
+                    self.evict_to_target_bytes(target_bytes, "put_batch")?;
+                if !entry.evictable {
+                    current_after_evict = self.retry_non_evictable_put_after_upload_drain(
+                        target_bytes,
+                        payload_len,
+                        current_after_evict,
+                    )?;
+                }
+                if self
+                    .budget_governor
+                    .exceeds_budget_after_insert(current_after_evict, payload_len)
+                {
+                    if entry.evictable {
+                        warn!(
+                            object_id = entry.object_id,
+                            payload_len,
+                            current_bytes = current_after_evict,
+                            budget_bytes = ?self.budget_governor.budget_bytes(),
+                            "local payload runtime skipped evictable batch put because budget remained under hard pressure"
+                        );
+                        estimated_current = current_after_evict;
+                        continue;
+                    }
+                    return Err(LocalPayloadBackendError::CapacityExhausted {
+                        needed: payload_len,
+                        free: self.budget_governor.free_bytes(current_after_evict),
+                    });
+                }
+                estimated_current = current_after_evict;
+            }
+            estimated_current = estimated_current.saturating_add(payload_len);
+
+            let lifecycle = if scratch || entry.evictable {
+                LocalPayloadLifecycleState::Uploaded
+            } else {
+                LocalPayloadLifecycleState::Dirty
+            };
+            let payload_key = self
+                .layout
+                .payload_object_relative_path(entry.object_id)
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes();
+            updates.push(CacheIndexUpsert {
+                object_id: entry.object_id,
+                payload_key,
+                payload_len,
+                lifecycle,
+                origin: if scratch {
+                    LocalPayloadOrigin::Scratch
+                } else if entry.evictable {
+                    LocalPayloadOrigin::Downloaded
+                } else {
+                    LocalPayloadOrigin::Local
+                },
+                upload_state: if scratch || entry.evictable {
+                    LocalPayloadUploadState::None
+                } else {
+                    LocalPayloadUploadState::Pending
+                },
+                evictable: !scratch && entry.evictable,
+            });
+            persisted_entries.push(PayloadBatchEntry {
+                object_id: entry.object_id,
+                data: entry.data.as_ref(),
+            });
+        }
+
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let written_object_ids = persisted_entries
+            .iter()
+            .map(|entry| entry.object_id)
+            .collect::<Vec<_>>();
+        let _mutations = self.lock_payload_mutations(&written_object_ids);
+        self.index.clear_checksums_before_put(&written_object_ids)?;
+
+        let batch_commit = self
+            .payload_store
+            .put_batch_with_durability(&persisted_entries, scratch)
+            .map_err(|error| self.note_payload_write_error(error))?;
+
+        if let Err(error) = self.index.upsert_many(&updates) {
+            if let Err(rollback_error) =
+                self.rollback_failed_index_put(&written_object_ids, batch_commit)
+            {
+                warn!(object_count = persisted_entries.len(), error = ?rollback_error,
+                    "local payload runtime batch rollback failed; retained recovery intent");
+            }
+            warn!(
+                object_count = persisted_entries.len(),
+                error = ?error,
+                "local payload runtime batch index upsert failed after payload writes; attempted payload rollback"
+            );
+            self.refresh_runtime_pin_bytes(&written_object_ids);
+            return Err(error.into());
+        }
+
+        self.refresh_runtime_pin_bytes(&written_object_ids);
+        batch_commit.complete();
+        Ok(())
+    }
+}
+
 impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -1556,128 +1693,20 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     }
 
     fn put_batch(&self, entries: &[LocalPayloadPut]) -> Result<(), LocalPayloadBackendError> {
-        if entries.is_empty() {
-            return Ok(());
+        self.put_batch_with_mode(entries, false)
+    }
+
+    fn put_scratch_batch(
+        &self,
+        entries: &[LocalPayloadPut],
+    ) -> Result<(), LocalPayloadBackendError> {
+        let status = self.physical_space_status();
+        if let Some((available, reserve)) = status.available_bytes.zip(status.reserve_bytes)
+            && available < reserve
+        {
+            return Err(io::Error::from(io::ErrorKind::StorageFull).into());
         }
-
-        let mut updates = Vec::with_capacity(entries.len());
-        let mut persisted_entries = Vec::with_capacity(entries.len());
-        let mut estimated_current = self.index.stats()?.current_bytes;
-
-        for entry in entries {
-            let payload_len = u64::try_from(entry.data.len()).map_err(|_| {
-                LocalPayloadBackendError::Io(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "payload length exceeds u64",
-                ))
-            })?;
-
-            if let Some(target_bytes) = self
-                .budget_governor
-                .target_before_insert(estimated_current, payload_len)
-            {
-                let mut current_after_evict =
-                    self.evict_to_target_bytes(target_bytes, "put_batch")?;
-                if !entry.evictable {
-                    current_after_evict = self.retry_non_evictable_put_after_upload_drain(
-                        target_bytes,
-                        payload_len,
-                        current_after_evict,
-                    )?;
-                }
-                if self
-                    .budget_governor
-                    .exceeds_budget_after_insert(current_after_evict, payload_len)
-                {
-                    if entry.evictable {
-                        warn!(
-                            object_id = entry.object_id,
-                            payload_len,
-                            current_bytes = current_after_evict,
-                            budget_bytes = ?self.budget_governor.budget_bytes(),
-                            "local payload runtime skipped evictable batch put because budget remained under hard pressure"
-                        );
-                        estimated_current = current_after_evict;
-                        continue;
-                    }
-                    return Err(LocalPayloadBackendError::CapacityExhausted {
-                        needed: payload_len,
-                        free: self.budget_governor.free_bytes(current_after_evict),
-                    });
-                }
-                estimated_current = current_after_evict;
-            }
-            estimated_current = estimated_current.saturating_add(payload_len);
-
-            let lifecycle = if entry.evictable {
-                LocalPayloadLifecycleState::Uploaded
-            } else {
-                LocalPayloadLifecycleState::Dirty
-            };
-            let payload_key = self
-                .layout
-                .payload_object_relative_path(entry.object_id)
-                .to_string_lossy()
-                .into_owned()
-                .into_bytes();
-            updates.push(CacheIndexUpsert {
-                object_id: entry.object_id,
-                payload_key,
-                payload_len,
-                lifecycle,
-                origin: if entry.evictable {
-                    LocalPayloadOrigin::Downloaded
-                } else {
-                    LocalPayloadOrigin::Local
-                },
-                upload_state: if entry.evictable {
-                    LocalPayloadUploadState::None
-                } else {
-                    LocalPayloadUploadState::Pending
-                },
-                evictable: entry.evictable,
-            });
-            persisted_entries.push(PayloadBatchEntry {
-                object_id: entry.object_id,
-                data: entry.data.as_ref(),
-            });
-        }
-
-        if updates.is_empty() {
-            return Ok(());
-        }
-
-        let written_object_ids = persisted_entries
-            .iter()
-            .map(|entry| entry.object_id)
-            .collect::<Vec<_>>();
-        let _mutations = self.lock_payload_mutations(&written_object_ids);
-        self.index.clear_checksums_before_put(&written_object_ids)?;
-
-        let batch_commit = self
-            .payload_store
-            .put_batch(&persisted_entries)
-            .map_err(|error| self.note_payload_write_error(error))?;
-
-        if let Err(error) = self.index.upsert_many(&updates) {
-            if let Err(rollback_error) =
-                self.rollback_failed_index_put(&written_object_ids, batch_commit)
-            {
-                warn!(object_count = persisted_entries.len(), error = ?rollback_error,
-                    "local payload runtime batch rollback failed; retained recovery intent");
-            }
-            warn!(
-                object_count = persisted_entries.len(),
-                error = ?error,
-                "local payload runtime batch index upsert failed after payload writes; attempted payload rollback"
-            );
-            self.refresh_runtime_pin_bytes(&written_object_ids);
-            return Err(error.into());
-        }
-
-        self.refresh_runtime_pin_bytes(&written_object_ids);
-        batch_commit.complete();
-        Ok(())
+        self.put_batch_with_mode(entries, true)
     }
 
     fn sync_data(&self) -> Result<(), LocalPayloadBackendError> {

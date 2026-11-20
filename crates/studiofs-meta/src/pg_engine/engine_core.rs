@@ -7,6 +7,40 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 impl MetaEngineCore for PgMetaEngine {
+    fn create_scratch_entry(&self, parent: Ino, name: &[u8], attr: &InodeAttr) -> MetaResult<()> {
+        self.local.create_scratch_entry(parent, name, attr)
+    }
+
+    fn lookup_scratch_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<Option<Ino>> {
+        self.local.lookup_scratch_entry(parent, name)
+    }
+
+    fn get_scratch_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
+        self.local.get_scratch_attr(ino)
+    }
+
+    fn commit_scratch_block(
+        &self,
+        ino: Ino,
+        block: u32,
+        object_id: u64,
+        end: u64,
+    ) -> MetaResult<Option<u64>> {
+        self.local.commit_scratch_block(ino, block, object_id, end)
+    }
+
+    fn get_scratch_block(&self, ino: Ino, block: u32) -> MetaResult<Option<u64>> {
+        self.local.get_scratch_block(ino, block)
+    }
+
+    fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {
+        self.local.set_scratch_xattr(ino, name, value)
+    }
+
+    fn get_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
+        self.local.get_scratch_xattr(ino, name)
+    }
+
     fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {
         self.local.load_ignore_rules_cache()
     }

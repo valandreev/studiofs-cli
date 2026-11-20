@@ -596,6 +596,20 @@ impl MetaGc for RedbMetaEngine {
     }
 
     fn get_local_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.local_payload_roots(false)
+    }
+
+    fn get_cache_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.get_local_cache_referenced_object_ids()
+    }
+
+    fn get_local_cache_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.local_payload_roots(true)
+    }
+}
+
+impl RedbMetaEngine {
+    fn local_payload_roots(&self, include_scratch: bool) -> MetaResult<HashSet<u64>> {
         let txn = self.begin_read_txn()?;
         let mut refs = HashSet::new();
         Self::regular_file_graph_object_ids_from_table(
@@ -605,6 +619,14 @@ impl MetaGc for RedbMetaEngine {
         )?;
         Self::regular_file_graph_object_ids_from_table(&txn, REGULAR_FILE_BASE_TABLE, &mut refs)?;
         Self::pending_recovery_object_ids_from_read_txn(&txn, &mut refs)?;
+        if include_scratch {
+            let scratch = txn
+                .open_table(SCRATCH_OVERLAY)
+                .map_err(super::scratch::storage_error)?;
+            for row in scratch.iter()? {
+                refs.insert(row?.1.value());
+            }
+        }
         Ok(refs)
     }
 }

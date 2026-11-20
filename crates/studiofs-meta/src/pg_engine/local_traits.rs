@@ -455,6 +455,16 @@ impl MetaGc for PgMetaEngine {
         Ok(referenced)
     }
 
+    fn get_cache_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        let mut referenced = self.local.get_local_cache_referenced_object_ids()?;
+        referenced.extend(self.load_pg_current_reference_object_ids()?);
+        Ok(referenced)
+    }
+
+    fn get_local_cache_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.local.get_local_cache_referenced_object_ids()
+    }
+
     fn get_local_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
         self.local.get_local_referenced_object_ids()
     }

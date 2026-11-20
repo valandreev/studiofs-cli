@@ -506,6 +506,14 @@ where
         self.inner.get_referenced_object_ids()
     }
 
+    fn get_cache_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.inner.get_cache_referenced_object_ids()
+    }
+
+    fn get_local_cache_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.inner.get_local_cache_referenced_object_ids()
+    }
+
     fn get_local_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
         self.inner.get_local_referenced_object_ids()
     }

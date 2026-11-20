@@ -9,6 +9,16 @@ pub(super) const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition:
 pub(super) const IGNORE_RULES_CACHE: TableDefinition<u8, &[u8]> =
     TableDefinition::new("ignore_rules_cache");
 
+// Mount-local tables deliberately excluded from the replicated graph.
+pub(super) const SCRATCH_INODES: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("scratch_inodes");
+pub(super) const SCRATCH_DENTRIES: TableDefinition<&[u8], u64> =
+    TableDefinition::new("scratch_dentries");
+pub(super) const SCRATCH_OVERLAY: TableDefinition<(u64, u32), u64> =
+    TableDefinition::new("scratch_overlay");
+pub(super) const SCRATCH_XATTRS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("scratch_xattrs");
+
 /// Counters: counter_name -> u64 (as bytes)
 pub(super) const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
 

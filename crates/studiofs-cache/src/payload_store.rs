@@ -514,13 +514,21 @@ impl FilePayloadStore {
         &self,
         entries: &[PayloadBatchEntry<'_>],
     ) -> Result<PayloadBatchCommit, FilePayloadStoreError> {
+        self.put_batch_with_durability(entries, false)
+    }
+
+    pub(crate) fn put_batch_with_durability(
+        &self,
+        entries: &[PayloadBatchEntry<'_>],
+        force_durable: bool,
+    ) -> Result<PayloadBatchCommit, FilePayloadStoreError> {
         if entries.is_empty() {
             return Ok(PayloadBatchCommit {
                 intent_path: PathBuf::new(),
             });
         }
 
-        let durable_sync = matches!(self.sync_mode, LocalPayloadSyncMode::Durable);
+        let durable_sync = force_durable || matches!(self.sync_mode, LocalPayloadSyncMode::Durable);
         let mut prepared_dirs = HashSet::new();
         let mut prepared = Vec::with_capacity(entries.len());
         for entry in entries {

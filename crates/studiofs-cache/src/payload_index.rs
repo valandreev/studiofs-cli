@@ -33,6 +33,7 @@ const ACCESS_ORDER_TABLE: TableDefinition<u64, u64> = TableDefinition::new("acce
 const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
 
 const COUNTER_INDEX_FORMAT: &str = "index_format_version";
+const COUNTER_SCRATCH_BYTES: &str = "scratch_bytes";
 const COUNTER_CURRENT_BYTES: &str = "current_bytes";
 const COUNTER_DIRTY_BYTES: &str = "dirty_bytes";
 const COUNTER_EVICTABLE_BYTES: &str = "evictable_bytes";
@@ -117,10 +118,18 @@ impl CacheIndexError {
 pub struct CacheIndexStats {
     /// Total bytes currently tracked in the index.
     pub current_bytes: u64,
+    /// Bytes owned by local-only scratch, outside the cache budget.
+    pub scratch_bytes: u64,
     /// Bytes currently considered dirty (pending upload / not evictable).
     pub dirty_bytes: u64,
     /// Bytes that are eligible for eviction (uploaded + evictable).
     pub evictable_bytes: u64,
+}
+
+impl CacheIndexStats {
+    pub(super) fn budgeted_bytes(self) -> u64 {
+        self.current_bytes.saturating_sub(self.scratch_bytes)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -282,6 +291,7 @@ impl CacheIndex {
         let counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
         Ok(CacheIndexStats {
             current_bytes: required_counter(&counters, COUNTER_CURRENT_BYTES)?,
+            scratch_bytes: required_counter(&counters, COUNTER_SCRATCH_BYTES)?,
             dirty_bytes: required_counter(&counters, COUNTER_DIRTY_BYTES)?,
             evictable_bytes: required_counter(&counters, COUNTER_EVICTABLE_BYTES)?,
         })
@@ -1171,6 +1181,17 @@ impl CacheIndex {
                     .map_err(storage_error)?;
             }
 
+            // Older indexes cannot contain scratch rows.
+            if counters
+                .get(COUNTER_SCRATCH_BYTES)
+                .map_err(storage_error)?
+                .is_none()
+            {
+                counters
+                    .insert(COUNTER_SCRATCH_BYTES, 0)
+                    .map_err(storage_error)?;
+            }
+
             for (name, default) in [
                 (COUNTER_CURRENT_BYTES, 0_u64),
                 (COUNTER_DIRTY_BYTES, 0_u64),
@@ -1391,11 +1412,12 @@ fn apply_accounting_delta(
     old: Option<&StoredEntry>,
     new: Option<&StoredEntry>,
 ) -> Result<(), CacheIndexError> {
-    let (old_current, old_dirty, old_evictable) = contribution(old);
-    let (new_current, new_dirty, new_evictable) = contribution(new);
+    let (old_current, old_dirty, old_evictable, old_scratch) = contribution(old);
+    let (new_current, new_dirty, new_evictable, new_scratch) = contribution(new);
     apply_accounting_delta_values(
         counters,
         AccountingDelta {
+            scratch_delta: i128::from(new_scratch) - i128::from(old_scratch),
             current_delta: i128::from(new_current) - i128::from(old_current),
             dirty_delta: i128::from(new_dirty) - i128::from(old_dirty),
             evictable_delta: i128::from(new_evictable) - i128::from(old_evictable),
@@ -1408,14 +1430,15 @@ fn apply_accounting_delta_values(
     delta: AccountingDelta,
 ) -> Result<(), CacheIndexError> {
     adjust_counter(counters, COUNTER_CURRENT_BYTES, delta.current_delta)?;
+    adjust_counter(counters, COUNTER_SCRATCH_BYTES, delta.scratch_delta)?;
     adjust_counter(counters, COUNTER_DIRTY_BYTES, delta.dirty_delta)?;
     adjust_counter(counters, COUNTER_EVICTABLE_BYTES, delta.evictable_delta)?;
     Ok(())
 }
 
-fn contribution(entry: Option<&StoredEntry>) -> (u64, u64, u64) {
+fn contribution(entry: Option<&StoredEntry>) -> (u64, u64, u64, u64) {
     let Some(entry) = entry else {
-        return (0, 0, 0);
+        return (0, 0, 0, 0);
     };
     let dirty = if is_dirty_like(entry.lifecycle) {
         entry.payload_len
@@ -1427,11 +1450,17 @@ fn contribution(entry: Option<&StoredEntry>) -> (u64, u64, u64) {
     } else {
         0
     };
-    (entry.payload_len, dirty, evictable)
+    let scratch = if entry.origin == LocalPayloadOrigin::Scratch {
+        entry.payload_len
+    } else {
+        0
+    };
+    (entry.payload_len, dirty, evictable, scratch)
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 struct AccountingDelta {
+    scratch_delta: i128,
     current_delta: i128,
     dirty_delta: i128,
     evictable_delta: i128,
@@ -1439,7 +1468,10 @@ struct AccountingDelta {
 
 impl AccountingDelta {
     fn is_zero(self) -> bool {
-        self.current_delta == 0 && self.dirty_delta == 0 && self.evictable_delta == 0
+        self.current_delta == 0
+            && self.scratch_delta == 0
+            && self.dirty_delta == 0
+            && self.evictable_delta == 0
     }
 
     fn subtract_entry(&mut self, entry: &StoredEntry) -> Result<(), CacheIndexError> {
@@ -1448,6 +1480,11 @@ impl AccountingDelta {
             .current_delta
             .checked_sub(payload)
             .ok_or_else(|| CacheIndexError::Corruption("current_delta underflow".to_string()))?;
+        if entry.origin == LocalPayloadOrigin::Scratch {
+            self.scratch_delta = self.scratch_delta.checked_sub(payload).ok_or_else(|| {
+                CacheIndexError::Corruption("scratch_delta underflow".to_string())
+            })?;
+        }
         if is_dirty_like(entry.lifecycle) {
             self.dirty_delta = self
                 .dirty_delta
@@ -1794,6 +1831,7 @@ fn encode_origin(origin: LocalPayloadOrigin) -> u8 {
     match origin {
         LocalPayloadOrigin::Local => 1,
         LocalPayloadOrigin::Downloaded => 2,
+        LocalPayloadOrigin::Scratch => 3,
     }
 }
 
@@ -1801,6 +1839,7 @@ fn decode_origin(raw: u8) -> Option<LocalPayloadOrigin> {
     match raw {
         1 => Some(LocalPayloadOrigin::Local),
         2 => Some(LocalPayloadOrigin::Downloaded),
+        3 => Some(LocalPayloadOrigin::Scratch),
         _ => None,
     }
 }

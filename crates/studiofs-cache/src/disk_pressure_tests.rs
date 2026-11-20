@@ -446,3 +446,54 @@ fn storage_full_write_error_forces_one_early_resample() {
 
     assert_eq!(calls, 2);
 }
+
+#[test]
+fn scratch_payload_survives_budget_and_physical_pressure() {
+    let temp = studiofs_test_support::workspace_target_tempdir("scratch-pressure-");
+    let layout = LocalPayloadLayout::from_cache_root(temp.path());
+    layout.provision().unwrap();
+    let config = LocalPayloadBackendConfig {
+        cache_root: temp.path().to_path_buf(),
+        volume_uuid: [0x87; 16],
+    };
+    let backend = LocalPayloadBackendRuntime::open_with_budget(config, Some(64)).unwrap();
+    backend.put(1, &[1; 32], true).unwrap();
+    backend
+        .put_scratch_batch(&[LocalPayloadPut {
+            object_id: 2,
+            data: Bytes::from_static(&[2; 64]),
+            evictable: false,
+        }])
+        .unwrap();
+    // Scratch bytes stay outside the tracked budget.
+    backend.put(4, &[4; 32], true).unwrap();
+    assert!(backend.contains(1));
+    assert!(backend.contains(4));
+    backend
+        .evict_to_target_bytes(0, "scratch_budget_test")
+        .unwrap();
+    assert!(!backend.contains(1));
+    assert!(!backend.contains(4));
+    assert!(backend.contains(2));
+
+    // Use a separate backend with headroom to exercise physical eviction.
+    drop(backend);
+    let backend = LocalPayloadBackendRuntime::open_with_budget(
+        LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x87; 16],
+        },
+        Some(1 << 30),
+    )
+    .unwrap();
+    backend.put(3, &[3; 32], true).unwrap();
+    pressure(&backend, Instant::now());
+    assert!(!backend.contains(3));
+    assert_eq!(backend.get(2).unwrap().as_ref(), &[2; 64]);
+    assert_eq!(
+        backend.object_stats(2).unwrap().origin,
+        LocalPayloadOrigin::Scratch
+    );
+    assert!(!backend.is_evictable(2));
+    assert_eq!(backend.storage_stats().dirty_bytes, 0);
+}
