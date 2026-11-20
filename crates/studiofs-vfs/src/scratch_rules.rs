@@ -4,6 +4,7 @@ mod wildmatch;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use regex_automata::meta::Regex;
 use regex_automata::nfa::thompson::WhichCaptures;
@@ -12,7 +13,7 @@ use regex_automata::{Anchored, Input, MatchKind, PatternSet};
 use studiofs_meta::fold_dentry_name;
 
 pub const MAX_RULE_BYTES: usize = 64 * 1024;
-const RULE_FILE: &[u8] = b".studiofsignore";
+pub(crate) const RULE_FILE: &[u8] = b".studiofsignore";
 /// Lazy DFA cache limit. Thousands of wildcard rules share DFA states that
 /// exceed the 2 MiB default, which falls back to a slower NFA simulation.
 const DFA_CACHE_BYTES: usize = 8 * 1024 * 1024;
@@ -40,10 +41,10 @@ pub enum RuleUpdateError {
 }
 
 /// Compiled rule files indexed by their volume-relative directory.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ScratchRules {
     case_insensitive: bool,
-    directories: HashMap<Vec<u8>, RuleSet>,
+    directories: HashMap<Vec<u8>, Arc<RuleSet>>,
 }
 
 /// One rule file, with a multi-pattern matcher for each combination of
@@ -155,7 +156,7 @@ impl ScratchRules {
         Ok(&self
             .directories
             .entry(directory)
-            .insert_entry(set)
+            .insert_entry(Arc::new(set))
             .into_mut()
             .diagnostics)
     }

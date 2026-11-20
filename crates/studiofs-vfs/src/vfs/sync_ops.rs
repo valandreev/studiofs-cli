@@ -1382,6 +1382,9 @@ impl StudioVfs {
             false
         };
 
+        if had_local_dirty_state {
+            self.ignore_rules.refresh.notify_one();
+        }
         if matches!(sticky_error_policy, StickyErrorPolicy::Report) {
             self.ensure_no_upload_sticky_error(ino)?;
         } else if let Some(msg) = self

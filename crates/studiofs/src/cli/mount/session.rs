@@ -1510,6 +1510,7 @@ impl MountPlan {
                     "failed to start vfs background workers: {error}"
                 ));
             }
+            runtime.block_on(vfs.wait_for_ignore_rules_bootstrap());
             let write_path_observability_publisher = WritePathObservabilityPublisher::new(
                 vfs.clone(),
                 cache_path.join(WRITE_PATH_OBSERVABILITY_FILE),

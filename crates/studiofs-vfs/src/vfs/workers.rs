@@ -1009,6 +1009,7 @@ impl StudioVfs {
     ) -> (InvalidationAcceptance, bool) {
         use studiofs_meta::coherence::InvalidationIntent;
 
+        self.ignore_rules.refresh.notify_one();
         let original_inodes = Self::semantic_batch_inodes(&batch);
         let intent_summary = tracing::enabled!(tracing::Level::DEBUG)
             .then(|| Self::semantic_intent_summary(&batch))

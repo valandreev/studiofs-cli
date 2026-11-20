@@ -7,6 +7,14 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 impl MetaEngineCore for PgMetaEngine {
+    fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {
+        self.local.load_ignore_rules_cache()
+    }
+
+    fn store_ignore_rules_cache(&self, snapshot: &[u8]) -> MetaResult<()> {
+        self.local.store_ignore_rules_cache(snapshot)
+    }
+
     fn metadata_write_observability(&self) -> MetadataWriteObservability {
         self.local.metadata_write_observability()
     }
