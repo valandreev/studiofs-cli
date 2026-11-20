@@ -781,7 +781,7 @@ impl<'a> StartupReplayCoordinator<'a> {
     }
 
     fn metadata_reachable_object_ids(&self) -> Option<HashSet<u64>> {
-        match self.vfs.sync_meta().get_referenced_object_ids() {
+        match self.vfs.sync_meta().get_cache_referenced_object_ids() {
             Ok(ids) => Some(ids),
             Err(error) => {
                 warn!(

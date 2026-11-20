@@ -32,6 +32,8 @@ pub enum LocalPayloadOrigin {
     Local,
     /// Downloaded from the published remote view for read-cache reuse.
     Downloaded,
+    /// Durable local-only scratch payload.
+    Scratch,
 }
 
 /// Upload state tracked per persisted local payload.
@@ -133,6 +135,19 @@ pub enum LocalPayloadBackendError {
 
 /// Minimal local payload API required by read/write/upload paths.
 pub trait LocalPayloadBackend: Send + Sync {
+    /// Checks the cached physical-space reserve at scratch write admission.
+    fn admit_scratch_write(&self) -> Result<(), LocalPayloadBackendError> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into())
+    }
+
+    /// Persists admitted local-only objects before committing scratch metadata.
+    fn put_scratch_batch(
+        &self,
+        _entries: &[LocalPayloadPut],
+    ) -> Result<(), LocalPayloadBackendError> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into())
+    }
+
     /// Returns `self` as `dyn Any` for downcasting to a concrete backend type.
     fn as_any(&self) -> &dyn Any;
 

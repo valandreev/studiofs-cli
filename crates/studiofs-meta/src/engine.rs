@@ -1340,6 +1340,56 @@ impl MetadataReplicationBacklog {
 /// `AsyncMetaEngine` (for example `SyncMetaEngineAdapter`) to establish an
 /// explicit async boundary.
 pub trait MetaEngineCore: Send + Sync + MetaInodes {
+    /// Create a local scratch inode and its directory entry atomically.
+    fn create_scratch_entry(
+        &self,
+        _parent: Ino,
+        _name: &[u8],
+        _attr: &InodeAttr,
+    ) -> MetaResult<()> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Look up the exact byte name of a local scratch entry.
+    fn lookup_scratch_entry(&self, _parent: Ino, _name: &[u8]) -> MetaResult<Option<Ino>> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Read attributes from the local scratch inode table.
+    fn get_scratch_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
+        Err(MetaError::InodeNotFound(ino))
+    }
+
+    /// Commit durable scratch slices and return objects no longer referenced.
+    fn commit_scratch_overlay(
+        &self,
+        ino: Ino,
+        chunks: &[(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)],
+    ) -> MetaResult<Vec<u64>> {
+        let _ = (ino, chunks);
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Read the committed local scratch chunk.
+    fn get_scratch_overlay(
+        &self,
+        ino: Ino,
+        chunk: crate::schema::ChunkId,
+    ) -> MetaResult<Option<crate::schema::RegularFileChunkState>> {
+        let _ = (ino, chunk);
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Persist a local scratch extended attribute.
+    fn set_scratch_xattr(&self, _ino: Ino, _name: &[u8], _value: &[u8]) -> MetaResult<()> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Read a local scratch extended attribute.
+    fn get_scratch_xattr(&self, _ino: Ino, _name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
     /// Mount-local last-good ignore rule sources, encoded by the VFS.
     fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {
         Ok(None)
@@ -1910,6 +1960,16 @@ pub trait MetaGc: Send + Sync {
     /// Prefer streaming the underlying rows into a shared accumulator instead
     /// of materializing intermediate per-table graphs.
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>>;
+
+    /// Cache reachability for startup cleanup, including scratch and shared snapshot roots.
+    fn get_cache_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.get_referenced_object_ids()
+    }
+
+    /// Local cache reachability, including objects owned by scratch storage.
+    fn get_local_cache_referenced_object_ids(&self) -> MetaResult<HashSet<u64>> {
+        self.get_local_referenced_object_ids()
+    }
 
     /// Local base, overlay and recovery roots for cache reclamation, without remote IO.
     ///

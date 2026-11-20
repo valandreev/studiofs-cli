@@ -1143,6 +1143,14 @@ impl RedbMetaEngine {
 
         {
             let txn = begin_redb_write_txn(&db, None)?;
+            txn.open_table(SCRATCH_INODES)
+                .map_err(scratch::storage_error)?;
+            txn.open_table(SCRATCH_DENTRIES)
+                .map_err(scratch::storage_error)?;
+            txn.open_table(SCRATCH_OVERLAY)
+                .map_err(scratch::storage_error)?;
+            txn.open_table(SCRATCH_XATTRS)
+                .map_err(scratch::storage_error)?;
             let _ = txn.open_table(SETTINGS_TABLE);
             let _ = txn.open_table(COUNTERS_TABLE);
             let _ = txn.open_table(LOCAL_ALLOCATOR_STATE_TABLE);
@@ -1443,6 +1451,7 @@ impl RedbMetaEngine {
         txn.commit().expect("commit failing deferred deletes");
     }
 }
+mod scratch;
 mod snapshots;
 mod symlink;
 mod txn;
@@ -1450,6 +1459,42 @@ mod upload_ledger;
 mod xattr;
 
 impl MetaEngineCore for RedbMetaEngine {
+    fn create_scratch_entry(&self, parent: Ino, name: &[u8], attr: &InodeAttr) -> MetaResult<()> {
+        self.insert_scratch_entry(parent, name, attr)
+    }
+
+    fn lookup_scratch_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<Option<Ino>> {
+        self.read_scratch_dentry(parent, name)
+    }
+
+    fn get_scratch_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
+        self.read_scratch_attr(ino)
+    }
+
+    fn commit_scratch_overlay(
+        &self,
+        ino: Ino,
+        chunks: &[(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)],
+    ) -> MetaResult<Vec<u64>> {
+        self.replace_scratch_overlay(ino, chunks)
+    }
+
+    fn get_scratch_overlay(
+        &self,
+        ino: Ino,
+        chunk: crate::schema::ChunkId,
+    ) -> MetaResult<Option<crate::schema::RegularFileChunkState>> {
+        self.read_scratch_overlay(ino, chunk)
+    }
+
+    fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {
+        self.write_scratch_xattr(ino, name, value)
+    }
+
+    fn get_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
+        self.read_scratch_xattr(ino, name)
+    }
+
     fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {
         let txn = self.begin_read_txn()?;
         let table = match txn.open_table(IGNORE_RULES_CACHE) {

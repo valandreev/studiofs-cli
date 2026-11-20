@@ -8458,7 +8458,7 @@ fn ready_attr_supersede_keeps_materializing_writer_slices() {
             .expect("reserve object ids")[0];
         vfs.state
             .writer_stack
-            .finish_prepared_inode(ino, first_object_id)
+            .finish_prepared_inode(ino, first_object_id, false)
             .expect("detach slices into materialization");
         assert!(
             !vfs.state.writer_stack.has_dirty_writers(ino),

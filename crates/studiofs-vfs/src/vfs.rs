@@ -48,6 +48,7 @@ mod read_context;
 mod read_path;
 mod retained_views;
 mod runtime_stats_surface;
+mod scratch_storage;
 mod startup;
 mod startup_replay;
 mod statfs;

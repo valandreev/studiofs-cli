@@ -782,7 +782,7 @@ impl MountedWriterStack {
     #[cfg(test)]
     fn finish_inode(&self, ino: Ino) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
         self.prepare_finish_inode(ino)?;
-        let finished = self.finish_prepared_inode_with_object_ids(ino, None)?;
+        let finished = self.finish_prepared_inode_with_object_ids(ino, None, false)?;
         let object_ids = finished
             .iter()
             .map(|slice| slice.object_id)
@@ -867,14 +867,16 @@ impl MountedWriterStack {
         &self,
         ino: Ino,
         first_object_id: u64,
+        scratch: bool,
     ) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
-        self.finish_prepared_inode_with_object_ids(ino, Some(first_object_id))
+        self.finish_prepared_inode_with_object_ids(ino, Some(first_object_id), scratch)
     }
 
     fn finish_prepared_inode_with_object_ids(
         &self,
         ino: Ino,
         first_object_id: Option<u64>,
+        scratch: bool,
     ) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
         let file = {
             let shard = self.shards[Self::inode_shard_index(ino)].lock();
@@ -976,7 +978,7 @@ impl MountedWriterStack {
         if clean {
             self.remove_file_if_clean_and_closed(ino);
         }
-        self.persist_detached_finished_slices(ino, detached_finished)?;
+        self.persist_detached_finished_slices(ino, detached_finished, scratch)?;
         Ok(finished)
     }
 
@@ -1014,6 +1016,7 @@ impl MountedWriterStack {
         ino: Ino,
         first_object_id: u64,
         max_blocks: usize,
+        scratch: bool,
     ) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
         if max_blocks == 0 {
             return Ok(Vec::new());
@@ -1104,7 +1107,7 @@ impl MountedWriterStack {
                 .remove(&ino);
             self.remove_file_if_clean_and_closed(ino);
         }
-        self.persist_detached_finished_slices(ino, detached_finished)?;
+        self.persist_detached_finished_slices(ino, detached_finished, scratch)?;
         Ok(finished)
     }
 
@@ -1317,6 +1320,7 @@ impl MountedWriterStack {
         &self,
         ino: Ino,
         detached_finished: Vec<DetachedFinishedWriterSlice>,
+        scratch: bool,
     ) -> Result<(), WriterStackError> {
         let object_ids = detached_finished
             .iter()
@@ -1331,7 +1335,7 @@ impl MountedWriterStack {
         if detached.is_empty() {
             return Ok(());
         }
-        if let Err(error) = self.cached_store.persist_detached_staged_slices(detached) {
+        if let Err(error) = self.cached_store.persist_writer_slices(detached, scratch) {
             let source = Arc::new(error);
             self.set_sticky_error(
                 ino,
@@ -2239,7 +2243,7 @@ mod tests {
             stack.prepare_finish_inode_if_idle(7, idle).unwrap() > 0,
             "dirty fragments older than one idle window must drain even after a recent write"
         );
-        stack.finish_prepared_inode(7, 900).unwrap();
+        stack.finish_prepared_inode(7, 900, false).unwrap();
 
         stack
             .write_bytes(write_spec(1, 7, 8, 102), b"next")
@@ -2303,7 +2307,7 @@ mod tests {
                 expected,
                 "reservation retries must use the same packing geometry"
             );
-            let finished = stack.finish_prepared_inode(7, 900).unwrap();
+            let finished = stack.finish_prepared_inode(7, 900, false).unwrap();
             let ids: HashSet<_> = finished.iter().map(|slice| slice.object_id).collect();
             assert_eq!(ids.len(), expected as usize);
         }
@@ -2342,7 +2346,9 @@ mod tests {
                 .expect("accept fragment");
         }
         stack.prepare_finish_inode(7).expect("prepare");
-        let finished = stack.finish_prepared_inode(7, 900).expect("materialize");
+        let finished = stack
+            .finish_prepared_inode(7, 900, false)
+            .expect("materialize");
         let ids: HashSet<_> = finished.iter().map(|slice| slice.object_id).collect();
         assert_eq!(
             ids.len(),
@@ -2564,7 +2570,7 @@ mod tests {
         );
 
         let finished = stack
-            .finish_prepared_inode(7, 900)
+            .finish_prepared_inode(7, 900, false)
             .expect("finish with reserved object ID");
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0].object_id, 900);
@@ -2698,7 +2704,7 @@ mod tests {
             .expect("write full block and tail");
 
         let finished = stack
-            .flush_completed_blocks_for_inode(7, 900, usize::MAX)
+            .flush_completed_blocks_for_inode(7, 900, usize::MAX, false)
             .expect("flush completed blocks");
 
         assert_eq!(finished.len(), 1);
@@ -2970,7 +2976,7 @@ mod tests {
             .expect("write slow file");
         let staging = Arc::clone(&stack);
         let staging_thread =
-            std::thread::spawn(move || staging.flush_completed_blocks_for_inode(7, 900, 1));
+            std::thread::spawn(move || staging.flush_completed_blocks_for_inode(7, 900, 1, false));
         entered_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("flush should enter backend put");

@@ -733,6 +733,15 @@ impl CachedStore {
         &self,
         entries: Vec<DetachedStagedSlice>,
     ) -> Result<(), CachedStoreWriterError> {
+        self.persist_writer_slices(entries, false)
+    }
+
+    /// Persists writer slices using local-only storage for scratch inodes.
+    pub fn persist_writer_slices(
+        &self,
+        entries: Vec<DetachedStagedSlice>,
+        scratch: bool,
+    ) -> Result<(), CachedStoreWriterError> {
         let Some(first_entry) = entries.first() else {
             return Ok(());
         };
@@ -751,7 +760,12 @@ impl CachedStore {
                 evictable: false,
             })
             .collect::<Vec<_>>();
-        if let Err(source) = self.local_payload_backend.put_batch(&puts) {
+        let result = if scratch {
+            self.local_payload_backend.put_scratch_batch(&puts)
+        } else {
+            self.local_payload_backend.put_batch(&puts)
+        };
+        if let Err(source) = result {
             if let Err(cleanup_error) = self.local_payload_backend.remove_batch(&object_ids) {
                 warn!(
                     object_count = object_ids.len(),
@@ -764,7 +778,7 @@ impl CachedStore {
                 source,
             });
         }
-        if let Err(source) = self.upload_stage_store.link_payload_batch(&object_ids) {
+        if !scratch && let Err(source) = self.upload_stage_store.link_payload_batch(&object_ids) {
             if let Err(cleanup_error) = self.upload_stage_store.remove_batch(&object_ids) {
                 warn!(
                     object_count = object_ids.len(),
@@ -784,11 +798,13 @@ impl CachedStore {
                 source,
             });
         }
-        self.cache_hot_upload_batch(&puts);
+        if !scratch {
+            self.cache_hot_upload_batch(&puts);
+        }
         let mut total_bytes = 0u64;
         for entry in &entries {
             total_bytes = total_bytes.saturating_add(saturating_u64_from_usize(entry.staged.len));
-            if entry.submit_upload {
+            if !scratch && entry.submit_upload {
                 self.submit_staged_upload(
                     entry.staged.ino,
                     entry.staged.offset,

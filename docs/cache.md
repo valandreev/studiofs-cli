@@ -42,6 +42,13 @@ metadata publication. Active readers retain their open file handles. Insufficien
 eligible cache is reported without a destructive fallback or suppression of
 normal disk-full errors.
 
+Scratch payloads (ADR 0014) use the same object files with a `Scratch` origin.
+They are never evictable, never pending upload, and excluded from the cache
+budget through a separate `scratch_bytes` counter. A scratch batch writes its
+files durably before the index row commits. It is rejected with `StorageFull`
+when the cached sample shows available space below the 10% reserve; admission
+never samples the filesystem, and no sample admits the write.
+
 The native sampler follows the cache location, including secondary volumes and
 directory links. Windows uses actual filesystem capacity and quota-limited
 caller availability. Unix uses `statvfs` capacity and `f_bavail`, including its

@@ -446,3 +446,94 @@ fn storage_full_write_error_forces_one_early_resample() {
 
     assert_eq!(calls, 2);
 }
+
+#[test]
+fn scratch_payload_survives_budget_and_physical_pressure() {
+    let temp = studiofs_test_support::workspace_target_tempdir("scratch-pressure-");
+    let layout = LocalPayloadLayout::from_cache_root(temp.path());
+    layout.provision().unwrap();
+    let config = LocalPayloadBackendConfig {
+        cache_root: temp.path().to_path_buf(),
+        volume_uuid: [0x87; 16],
+    };
+    let backend = LocalPayloadBackendRuntime::open_with_budget(config, Some(64)).unwrap();
+    backend.put(1, &[1; 32], true).unwrap();
+    backend
+        .put_scratch_batch(&[LocalPayloadPut {
+            object_id: 2,
+            data: Bytes::from_static(&[2; 64]),
+            evictable: false,
+        }])
+        .unwrap();
+    // Scratch bytes stay outside the tracked budget.
+    backend.put(4, &[4; 32], true).unwrap();
+    assert!(backend.contains(1));
+    assert!(backend.contains(4));
+    backend
+        .evict_to_target_bytes(0, "scratch_budget_test")
+        .unwrap();
+    assert!(!backend.contains(1));
+    assert!(!backend.contains(4));
+    assert!(backend.contains(2));
+
+    // Use a separate backend with headroom to exercise physical eviction.
+    drop(backend);
+    let backend = LocalPayloadBackendRuntime::open_with_budget(
+        LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x87; 16],
+        },
+        Some(1 << 30),
+    )
+    .unwrap();
+    backend.put(3, &[3; 32], true).unwrap();
+    pressure(&backend, Instant::now());
+    assert!(!backend.contains(3));
+    assert_eq!(backend.get(2).unwrap().as_ref(), &[2; 64]);
+    assert_eq!(
+        backend.object_stats(2).unwrap().origin,
+        LocalPayloadOrigin::Scratch
+    );
+    assert!(!backend.is_evictable(2));
+    assert_eq!(backend.storage_stats().dirty_bytes, 0);
+}
+
+#[test]
+fn scratch_admission_reads_only_the_cached_reserve_sample() {
+    let (_temp, backend) = backend();
+    let put_scratch = |object_id| {
+        backend.admit_scratch_write()?;
+        backend.put_scratch_batch(&[LocalPayloadPut {
+            object_id,
+            data: Bytes::from_static(b"scratch"),
+            evictable: false,
+        }])
+    };
+    platform::FILESYSTEM_SPACE_QUERIES.with(|calls| calls.set(0));
+
+    // Without a sample there is no evidence of pressure.
+    put_scratch(1).unwrap();
+    let start = Instant::now();
+    backend
+        .run_disk_pressure_maintenance(start, |_| Ok(space(TOTAL_BYTES / 10, TOTAL_BYTES)))
+        .unwrap();
+    // Available space equal to the reserve is not below it.
+    put_scratch(2).unwrap();
+    backend
+        .run_disk_pressure_maintenance(start + SAMPLE_INTERVAL, |_| {
+            Ok(space(LOW_BYTES, TOTAL_BYTES))
+        })
+        .unwrap();
+    let error = put_scratch(3).unwrap_err();
+    assert!(
+        matches!(&error, LocalPayloadBackendError::Io(io) if io.kind() == io::ErrorKind::StorageFull),
+        "{error:?}"
+    );
+    assert!(!backend.contains(3));
+    assert!(backend.index.get_entry(3).unwrap().is_none());
+    // Tracked writes keep their contract under the same sample.
+    backend.put(4, b"tracked", false).unwrap();
+
+    assert!(backend.contains(1) && backend.contains(2) && backend.contains(4));
+    platform::FILESYSTEM_SPACE_QUERIES.with(|calls| assert_eq!(calls.get(), 0));
+}
