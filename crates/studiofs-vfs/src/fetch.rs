@@ -584,8 +584,22 @@ impl FetchScheduler {
         self.fetch_block_with_class(
             object_id,
             keys,
-            FetchClass::Prefetch,
+            FetchClass::Prefetch { scrub: false },
             LocalCacheHint::CheckFastPath,
+        )
+        .await
+    }
+
+    pub(crate) async fn refetch_scrubbed_payload(
+        &self,
+        object_id: u64,
+        keys: &[String],
+    ) -> Result<Bytes, FetchError> {
+        self.fetch_block_with_class(
+            object_id,
+            keys,
+            FetchClass::Prefetch { scrub: true },
+            LocalCacheHint::Skip,
         )
         .await
     }
@@ -608,7 +622,7 @@ impl FetchScheduler {
             return Ok(cached);
         }
 
-        if matches!(class, FetchClass::Prefetch) && !self.prefetch_admission_open() {
+        if matches!(class, FetchClass::Prefetch { .. }) && !self.prefetch_admission_open() {
             self.metrics.prefetch_skips.fetch_add(1, Ordering::Relaxed);
             return Err(FetchError::PrefetchSkipped);
         }
@@ -867,7 +881,7 @@ impl FetchScheduler {
                     .acquire_foreground(budget_bytes)
                     .await
             }
-            FetchClass::Prefetch => {
+            FetchClass::Prefetch { .. } => {
                 let wait = tokio::time::timeout(
                     Duration::from_millis(self.prefetch_acquire_wait_ms.load(Ordering::Acquire)),
                     self.transit_memory_budget.acquire_background(budget_bytes),
@@ -889,7 +903,7 @@ impl FetchScheduler {
                 .await?;
             validate_single_fragment_payload_len(object_id, payload.len())?;
             let cache_put_start = Instant::now();
-            self.payload_store_put_async(object_id, payload.clone(), xxh64)
+            self.payload_store_put_async(object_id, payload.clone(), xxh64, class)
                 .await?;
             self.record_local_cache_put(cache_put_start.elapsed());
             return Ok(payload);
@@ -935,7 +949,7 @@ impl FetchScheduler {
 
         // Populate cache (L1 + L2) with the reconstructed logical block.
         let cache_put_start = Instant::now();
-        self.payload_store_put_async(object_id, payload.clone(), None)
+        self.payload_store_put_async(object_id, payload.clone(), None, class)
             .await?;
         self.record_local_cache_put(cache_put_start.elapsed());
 
@@ -944,7 +958,7 @@ impl FetchScheduler {
 
     async fn foreground_local_io_permit(
         &self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, FetchError> {
+    ) -> Result<crate::qos::ForegroundLocalIoPermit, FetchError> {
         self.qos
             .acquire_foreground_local_io(1)
             .await
@@ -988,7 +1002,24 @@ impl FetchScheduler {
         object_id: u64,
         payload: Bytes,
         xxh64: Option<u64>,
+        class: FetchClass,
     ) -> Result<(), FetchError> {
+        if matches!(class, FetchClass::Prefetch { scrub: true }) {
+            let backend = self.cached_store.local_payload_backend();
+            let Some(backend) = backend
+                .as_any()
+                .downcast_ref::<studiofs_cache::PersistentLocalPayloadBackend>()
+            else {
+                return Err(FetchError::CacheAccess(
+                    "scrub requires the persistent payload backend".into(),
+                ));
+            };
+            return crate::runtime::run_local_cache_io(|| {
+                backend.put_scrub_refetch(object_id, &payload, xxh64)
+            })
+            .0
+            .map_err(|error| FetchError::CacheAccess(error.to_string()));
+        }
         let local_io = self.foreground_local_io_permit().await?;
         let cached_store = self.cached_store.clone();
         let submitted_at = Instant::now();
@@ -1036,7 +1067,8 @@ impl FetchScheduler {
         let overall_start = Instant::now();
         let max_attempts = match class {
             FetchClass::Foreground => self.max_fetch_attempts,
-            FetchClass::Prefetch => self.prefetch_max_fetch_attempts.max(1),
+            FetchClass::Prefetch { scrub: true } => 2,
+            FetchClass::Prefetch { scrub: false } => self.prefetch_max_fetch_attempts.max(1),
         };
         let mut attempts_made = 0;
 
@@ -1058,7 +1090,7 @@ impl FetchScheduler {
             let wait_start = Instant::now();
             let permit = match class {
                 FetchClass::Foreground => self.aimd.acquire().await,
-                FetchClass::Prefetch => {
+                FetchClass::Prefetch { .. } => {
                     let deadline = Instant::now()
                         + Duration::from_millis(
                             self.prefetch_acquire_wait_ms.load(Ordering::Acquire),
@@ -1086,7 +1118,7 @@ impl FetchScheduler {
                     FetchError::CacheAccess(format!("fetch qos permit failed: {e}"))
                 })?;
             // Prefetch budget is charged only after it has been admitted.
-            if matches!(class, FetchClass::Prefetch)
+            if matches!(class, FetchClass::Prefetch { .. })
                 && let Some(range) = &payload_range
             {
                 self.data_store
@@ -1238,7 +1270,7 @@ impl FetchScheduler {
                             .min(self.retry_max_delay);
                         let delay = jittered_delay(delay, object_id, attempt);
                         self.metrics.retries.fetch_add(1, Ordering::Relaxed);
-                        if matches!(class, FetchClass::Prefetch) {
+                        if matches!(class, FetchClass::Prefetch { .. }) {
                             debug!(
                                 attempt = attempt + 1,
                                 max = max_attempts,
@@ -1268,7 +1300,7 @@ impl FetchScheduler {
                         drop(_fetch_qos);
                         tokio::time::sleep(delay).await;
                     } else if retryable {
-                        if matches!(class, FetchClass::Prefetch) {
+                        if matches!(class, FetchClass::Prefetch { .. }) {
                             debug!(
                                 attempts = max_attempts,
                                 key,
@@ -1289,7 +1321,7 @@ impl FetchScheduler {
                                 "fetch exhausted all retries"
                             );
                         }
-                    } else if matches!(class, FetchClass::Prefetch) {
+                    } else if matches!(class, FetchClass::Prefetch { .. }) {
                         debug!(
                             attempts = attempts_made,
                             key,
@@ -1335,7 +1367,7 @@ impl FetchScheduler {
                             .saturating_mul(2u32.saturating_pow(attempt))
                             .min(self.retry_max_delay);
                         self.metrics.retries.fetch_add(1, Ordering::Relaxed);
-                        if matches!(class, FetchClass::Prefetch) {
+                        if matches!(class, FetchClass::Prefetch { .. }) {
                             debug!(
                                 attempt = attempt + 1,
                                 max = max_attempts,
@@ -1359,7 +1391,7 @@ impl FetchScheduler {
                         drop(_fetch_qos);
                         tokio::time::sleep(delay).await;
                     } else {
-                        if matches!(class, FetchClass::Prefetch) {
+                        if matches!(class, FetchClass::Prefetch { .. }) {
                             debug!(
                                 attempts = max_attempts,
                                 key,
@@ -1542,13 +1574,14 @@ enum Action {
 #[derive(Clone, Copy, Debug)]
 enum FetchClass {
     Foreground,
-    Prefetch,
+    Prefetch { scrub: bool },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalCacheHint {
     CheckFastPath,
     ConfirmedMiss,
+    Skip,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1774,7 +1807,12 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 pending,
-                scheduler.payload_store_put_async(object_id, Bytes::from_static(b"cold"), None),
+                scheduler.payload_store_put_async(
+                    object_id,
+                    Bytes::from_static(b"cold"),
+                    None,
+                    FetchClass::Foreground,
+                ),
             )
             .await
             .is_err()

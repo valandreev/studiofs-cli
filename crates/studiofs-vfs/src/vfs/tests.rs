@@ -3313,7 +3313,7 @@ fn published_read_plan_cache_evicts_least_recently_used_inode_when_full() {
     assert!(cache.contains(&9_999));
 }
 
-fn test_format_info(volume_suffix: &str) -> FormatInfo {
+pub(super) fn test_format_info(volume_suffix: &str) -> FormatInfo {
     let volume_name = format!("namespace-resolver-{volume_suffix}-{}", std::process::id());
     FormatInfo {
         format_version: CURRENT_FORMAT_VERSION,

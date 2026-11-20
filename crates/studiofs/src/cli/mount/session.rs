@@ -3295,6 +3295,10 @@ mod tests {
                 prefetch_concurrency: Some(32),
                 upload_limit: Some(3),
                 download_limit: Some(4),
+                cache_scrub: Some(false),
+                cache_scrub_interval_secs: Some(3600),
+                cache_scrub_bytes_per_sec: Some(1024),
+                cache_scrub_iops: Some(40),
                 ..VfsConfigRaw::default()
             },
             None,
@@ -3304,6 +3308,9 @@ mod tests {
                 prefetch: Some(192),
                 upload_limit: Some(17),
                 download_limit: Some(29),
+                cache_scrub: Some(true),
+                cache_scrub_iops: Some(10),
+                ..PublicRuntimeTuningArgs::default()
             },
             |mut config| {
                 config.read_buffer_mb = Some(2048);
@@ -3319,6 +3326,10 @@ mod tests {
         assert_eq!(resolved.vfs_config.prefetch_concurrency, 192);
         assert_eq!(resolved.vfs_config.upload_limit, 17);
         assert_eq!(resolved.vfs_config.download_limit, 29);
+        assert!(resolved.vfs_config.cache_scrub);
+        assert_eq!(resolved.vfs_config.cache_scrub_interval_secs, 3600);
+        assert_eq!(resolved.vfs_config.cache_scrub_bytes_per_sec, 1024);
+        assert_eq!(resolved.vfs_config.cache_scrub_iops, 10);
     }
 
     #[test]

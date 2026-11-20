@@ -28,6 +28,24 @@ pub struct QosController {
     commit_slots: Arc<Semaphore>,
     fetch_slots: Arc<Semaphore>,
     foreground_local_io_slots: Arc<Semaphore>,
+    foreground_local_io_idle: Arc<Notify>,
+}
+
+/// Foreground local cache I/O admission held until the operation ends.
+#[derive(Debug)]
+pub struct ForegroundLocalIoPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    slots: Arc<Semaphore>,
+    idle: Arc<Notify>,
+}
+
+impl Drop for ForegroundLocalIoPermit {
+    fn drop(&mut self) {
+        drop(self.permit.take());
+        if self.slots.available_permits() == FOREGROUND_LOCAL_IO_SLOTS {
+            self.idle.notify_one();
+        }
+    }
 }
 
 impl QosController {
@@ -42,6 +60,7 @@ impl QosController {
             commit_slots: Arc::new(Semaphore::new(config.qos_commit_slots.max(1))),
             fetch_slots: Arc::new(Semaphore::new(config.qos_fetch_slots.max(1))),
             foreground_local_io_slots: Arc::new(Semaphore::new(FOREGROUND_LOCAL_IO_SLOTS)),
+            foreground_local_io_idle: Arc::new(Notify::new()),
         }
     }
 
@@ -81,11 +100,31 @@ impl QosController {
     pub async fn acquire_foreground_local_io(
         &self,
         slots: u32,
-    ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
-        self.foreground_local_io_slots
+    ) -> Result<ForegroundLocalIoPermit, tokio::sync::AcquireError> {
+        let permit = self
+            .foreground_local_io_slots
             .clone()
             .acquire_many_owned(slots)
-            .await
+            .await?;
+        Ok(ForegroundLocalIoPermit {
+            permit: Some(permit),
+            slots: self.foreground_local_io_slots.clone(),
+            idle: self.foreground_local_io_idle.clone(),
+        })
+    }
+
+    pub(crate) fn foreground_local_io_is_idle(&self) -> bool {
+        self.foreground_local_io_slots.available_permits() == FOREGROUND_LOCAL_IO_SLOTS
+    }
+
+    pub(crate) async fn wait_foreground_local_io_idle(&self) {
+        loop {
+            let notified = self.foreground_local_io_idle.notified();
+            if self.foreground_local_io_is_idle() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     #[cfg(test)]

@@ -678,6 +678,12 @@ impl StudioVfs {
         );
         insert_counter(
             &mut snapshot.cache,
+            "cache_scrub_refetch_failures",
+            "count",
+            write_path.fetch.cache_scrub_refetch_failures,
+        );
+        insert_counter(
+            &mut snapshot.cache,
             "readahead_scheduled_ops",
             "count",
             write_path.fetch.readahead_scheduled_blocks,

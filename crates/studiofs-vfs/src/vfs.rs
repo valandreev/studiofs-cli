@@ -4247,6 +4247,8 @@ pub struct StudioVfs {
     /// Upload worker pool size.
     upload_worker_count: usize,
     disable_background_slab_flush: bool,
+    cache_scrub: Option<workers::CacheScrubConfig>,
+    cache_scrub_refetch_failures: std::sync::atomic::AtomicU64,
     publish_visibility_timeout: Duration,
     /// Sequential read-ahead tracker.
     readahead: Arc<ReadAheadTracker>,
@@ -5526,6 +5528,7 @@ impl StudioVfs {
         self.spawn_aggressive_materialization_worker();
         self.spawn_local_dirty_flush_worker();
         self.spawn_prefetch_worker(prefetch_rx);
+        self.spawn_cache_scrub_worker();
         self.spawn_uploader_worker(upload_rx);
         self.spawn_epoch_finalizer_worker();
         self.spawn_upload_stats_worker();
@@ -6941,7 +6944,7 @@ impl StudioVfs {
     async fn foreground_local_io_permit(
         &self,
         slots: u32,
-    ) -> VfsResult<tokio::sync::OwnedSemaphorePermit> {
+    ) -> VfsResult<crate::qos::ForegroundLocalIoPermit> {
         self.qos
             .acquire_foreground_local_io(slots)
             .await
@@ -10249,6 +10252,9 @@ impl StudioVfs {
                 encrypted_object_read_failures: fetch_encrypted_object_read_failures,
                 malformed_encrypted_objects: fetch_malformed_encrypted_objects,
                 prefetch_skips: fetch_prefetch_skips,
+                cache_scrub_refetch_failures: self
+                    .cache_scrub_refetch_failures
+                    .load(Ordering::Relaxed),
                 readahead_scheduled_blocks,
                 readahead_dropped_blocks,
                 prefetch_ingress_depth,

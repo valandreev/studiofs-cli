@@ -1625,6 +1625,9 @@ pub struct VfsFetchStats {
     pub malformed_encrypted_objects: u64,
     /// Prefetch skips count.
     pub prefetch_skips: u64,
+    /// Scrub repair fetches that failed after admission.
+    #[serde(default)]
+    pub cache_scrub_refetch_failures: u64,
     /// Readahead blocks scheduled for background prefetch.
     #[serde(default)]
     pub readahead_scheduled_blocks: u64,

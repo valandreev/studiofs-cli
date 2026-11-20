@@ -26,6 +26,22 @@ pub(crate) struct PublicRuntimeTuningArgs {
     /// Aggregate object download limit in Mbps; zero disables the limit.
     #[arg(long, value_name = "MBPS", value_parser = clap::value_parser!(u64).range(0..=1_000_000))]
     pub(crate) download_limit: Option<u64>,
+
+    /// Enable or disable background verification of the local payload cache.
+    #[arg(long, value_name = "BOOL")]
+    pub(crate) cache_scrub: Option<bool>,
+
+    /// Seconds to wait between local cache scrub passes.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) cache_scrub_interval_secs: Option<u64>,
+
+    /// Local bytes per second budget for cache scrub reads.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) cache_scrub_bytes_per_sec: Option<u64>,
+
+    /// Local payload checks per second for cache scrub.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) cache_scrub_iops: Option<u64>,
 }
 
 impl PublicRuntimeTuningArgs {
@@ -45,6 +61,14 @@ impl PublicRuntimeTuningArgs {
         if let Some(value) = self.download_limit {
             config.download_limit = Some(value);
         }
+        config.cache_scrub = self.cache_scrub.or(config.cache_scrub);
+        config.cache_scrub_interval_secs = self
+            .cache_scrub_interval_secs
+            .or(config.cache_scrub_interval_secs);
+        config.cache_scrub_bytes_per_sec = self
+            .cache_scrub_bytes_per_sec
+            .or(config.cache_scrub_bytes_per_sec);
+        config.cache_scrub_iops = self.cache_scrub_iops.or(config.cache_scrub_iops);
         Ok(())
     }
 
@@ -54,10 +78,14 @@ impl PublicRuntimeTuningArgs {
             || self.prefetch.is_some()
             || self.upload_limit.is_some()
             || self.download_limit.is_some()
+            || self.cache_scrub.is_some()
+            || self.cache_scrub_interval_secs.is_some()
+            || self.cache_scrub_bytes_per_sec.is_some()
+            || self.cache_scrub_iops.is_some()
     }
 }
 
-pub(crate) fn runtime_tuning_summary_lines(config: &VfsConfigRaw) -> [String; 5] {
+pub(crate) fn runtime_tuning_summary_lines(config: &VfsConfigRaw) -> [String; 9] {
     let defaults = VfsConfig::default();
     [
         format!(
@@ -91,6 +119,26 @@ pub(crate) fn runtime_tuning_summary_lines(config: &VfsConfigRaw) -> [String; 5]
         format!(
             "  download-limit: {} Mbps",
             config.download_limit.unwrap_or(defaults.download_limit)
+        ),
+        format!(
+            "  cache-scrub: {}",
+            config.cache_scrub.unwrap_or(defaults.cache_scrub)
+        ),
+        format!(
+            "  cache-scrub-interval-secs: {}",
+            config
+                .cache_scrub_interval_secs
+                .unwrap_or(defaults.cache_scrub_interval_secs)
+        ),
+        format!(
+            "  cache-scrub-bytes-per-sec: {}",
+            config
+                .cache_scrub_bytes_per_sec
+                .unwrap_or(defaults.cache_scrub_bytes_per_sec)
+        ),
+        format!(
+            "  cache-scrub-iops: {}",
+            config.cache_scrub_iops.unwrap_or(defaults.cache_scrub_iops)
         ),
     ]
 }

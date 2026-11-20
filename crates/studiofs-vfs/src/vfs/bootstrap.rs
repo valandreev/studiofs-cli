@@ -545,6 +545,14 @@ impl VfsBootstrap {
             upload_user_idle_grace: plan.upload_user_idle_grace,
             upload_worker_count: plan.upload_worker_count,
             disable_background_slab_flush: plan.disable_background_slab_flush,
+            cache_scrub: config
+                .cache_scrub
+                .then_some(super::workers::CacheScrubConfig {
+                    interval_secs: config.cache_scrub_interval_secs,
+                    bytes_per_sec: config.cache_scrub_bytes_per_sec,
+                    iops: config.cache_scrub_iops,
+                }),
+            cache_scrub_refetch_failures: Default::default(),
             publish_visibility_timeout: plan.publish_visibility_timeout,
             readahead: resources.readahead,
             dir_prefetch: resources.dir_prefetch,

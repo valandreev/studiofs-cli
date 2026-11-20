@@ -631,6 +631,12 @@ fn runtime_stats_from_diagnostics(
         "count",
         write_path.fetch.prefetch_skips,
     );
+    insert_counter(
+        &mut snapshot.cache,
+        "cache_scrub_refetch_failures",
+        "count",
+        write_path.fetch.cache_scrub_refetch_failures,
+    );
     insert_gauge(
         &mut snapshot.upload_queue,
         "pending_depth",

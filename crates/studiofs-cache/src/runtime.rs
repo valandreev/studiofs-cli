@@ -53,7 +53,7 @@ pub mod reconcile;
 
 pub use cache_index::{
     CacheIndex, CacheIndexEntry, CacheIndexError, CacheIndexStats, CacheIndexUpsert,
-    DirtyReplayEntry, EvictionCandidateEntry,
+    DirtyReplayEntry, EvictionCandidateEntry, ScrubCursor,
 };
 use eviction::{CacheBudgetGovernor, EVICTION_CANDIDATE_PAGE_SIZE, EVICTION_DELETE_BATCH_SIZE};
 pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError, PayloadBatchEntry};
@@ -1221,6 +1221,152 @@ impl From<CacheIndexError> for LocalPayloadBackendError {
 }
 
 impl LocalPayloadBackendRuntime {
+    /// Index used for bounded scrub scans and durable checkpoints.
+    pub fn scrub_index(&self) -> &CacheIndex {
+        &self.index
+    }
+
+    /// Inspect a verified clean payload without touching access order.
+    pub fn check_scrub_entry(
+        &self,
+        entry: &CacheIndexEntry,
+    ) -> Result<Option<&'static str>, LocalPayloadBackendError> {
+        let Some(checksum) = entry.xxh64 else {
+            return Ok(None);
+        };
+        let file = {
+            // Pin the observed file identity under the stripe. Rewrites install
+            // a replacement file, so the hash can run after releasing the stripe.
+            let _mutation = self.lock_payload_mutations(&[entry.object_id]);
+            let Some(current) = self.index.get_entry(entry.object_id)? else {
+                return Ok(None);
+            };
+            if current.lifecycle != LocalPayloadLifecycleState::Uploaded
+                || current.upload_state != LocalPayloadUploadState::None
+                || ObservedPayload::from(&current) != ObservedPayload::from(entry)
+            {
+                return Ok(None);
+            }
+            std::fs::File::open(self.layout.payload_object_path(entry.object_id))
+        };
+        Ok(
+            match check_scrub_payload(file, entry.payload_len, checksum) {
+                Ok(kind) => kind,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Some("missing"),
+                Err(_) => Some("read_error"),
+            },
+        )
+    }
+
+    /// Admit repaired bytes only if another writer has not populated the cache.
+    pub fn put_scrub_refetch(
+        &self,
+        object_id: u64,
+        data: &[u8],
+        xxh64: Option<u64>,
+    ) -> Result<(), LocalPayloadBackendError> {
+        self.put_payload(object_id, data, true, xxh64, true)
+    }
+
+    fn put_payload(
+        &self,
+        object_id: u64,
+        data: &[u8],
+        evictable: bool,
+        xxh64: Option<u64>,
+        only_if_absent: bool,
+    ) -> Result<(), LocalPayloadBackendError> {
+        let payload_len = u64::try_from(data.len()).map_err(|_| {
+            LocalPayloadBackendError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "payload length exceeds u64",
+            ))
+        })?;
+        if only_if_absent && self.index.get_entry(object_id)?.is_some() {
+            return Ok(());
+        }
+        if self.enforce_budget_before_put(object_id, payload_len, evictable)? {
+            return Ok(());
+        }
+
+        let _mutation = self.lock_payload_mutations(&[object_id]);
+
+        if only_if_absent && self.index.get_entry(object_id)?.is_some() {
+            return Ok(());
+        }
+
+        // The file may be replaced before the new index row commits.
+        self.index.clear_checksums_before_put(&[object_id])?;
+        let payload_commit = self
+            .payload_store
+            .put_with_intent(object_id, data)
+            .map_err(|error| self.note_payload_write_error(error))?;
+
+        // Leave the real file/index crash boundary intact for startup recovery tests.
+        #[cfg(test)]
+        if self
+            .stop_next_put_before_index
+            .swap(false, Ordering::Relaxed)
+        {
+            return Err(LocalPayloadBackendError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "injected stop after payload commit and before index commit",
+            )));
+        }
+
+        let lifecycle = if evictable {
+            LocalPayloadLifecycleState::Uploaded
+        } else {
+            LocalPayloadLifecycleState::Dirty
+        };
+        let payload_key = self
+            .layout
+            .payload_object_relative_path(object_id)
+            .to_string_lossy()
+            .into_owned()
+            .into_bytes();
+        if let Err(error) = self.index.upsert_with_xxh64(
+            CacheIndexUpsert {
+                object_id,
+                payload_key,
+                payload_len,
+                lifecycle,
+                origin: if evictable {
+                    LocalPayloadOrigin::Downloaded
+                } else {
+                    LocalPayloadOrigin::Local
+                },
+                upload_state: if evictable {
+                    LocalPayloadUploadState::None
+                } else {
+                    LocalPayloadUploadState::Pending
+                },
+                evictable,
+            },
+            xxh64,
+        ) {
+            if let Err(rollback_error) =
+                self.rollback_failed_index_put(&[object_id], payload_commit)
+            {
+                warn!(object_id, error = ?rollback_error,
+                    "local payload runtime rollback failed; retained recovery intent");
+            }
+            warn!(
+                object_id,
+                volume_uuid = ?self.volume_uuid,
+                error = ?error,
+                "local payload runtime index upsert failed after payload write; attempted payload rollback"
+            );
+            // A failed commit may still have applied, so refresh from the index either way.
+            self.refresh_runtime_pin_bytes(&[object_id]);
+            return Err(error.into());
+        }
+
+        self.refresh_runtime_pin_bytes(&[object_id]);
+        payload_commit.complete();
+        Ok(())
+    }
+
     fn finish_upload(
         &self,
         object_id: u64,
@@ -1233,6 +1379,26 @@ impl LocalPayloadBackendRuntime {
         self.note_storage_state_change();
         Ok(())
     }
+}
+
+fn check_scrub_payload(
+    file: io::Result<std::fs::File>,
+    payload_len: u64,
+    expected_checksum: u64,
+) -> io::Result<Option<&'static str>> {
+    let file = file?;
+    if file.metadata()?.len() != payload_len {
+        return Ok(Some("length"));
+    }
+    let mut hasher = Xxh64::new(0);
+    let len = io::copy(&mut file.take(payload_len.saturating_add(1)), &mut hasher)?;
+    Ok(if len != payload_len {
+        Some("length")
+    } else if hasher.digest() != expected_checksum {
+        Some("checksum")
+    } else {
+        None
+    })
 }
 
 impl LocalPayloadBackend for LocalPayloadBackendRuntime {
@@ -1259,26 +1425,15 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return Ok(CorruptEvictionOutcome::NotEligible);
         };
 
-        // A cached handle can still refer to a replaced or unlinked file.
-        let path = self.layout.payload_object_path(object_id);
-        let matches = (|| -> io::Result<bool> {
-            let file = std::fs::File::open(path)?;
-            if file.metadata()?.len() != entry.payload_len {
-                return Ok(false);
-            }
-            let mut hasher = Xxh64::new(0);
-            let len = io::copy(
-                &mut file.take(entry.payload_len.saturating_add(1)),
-                &mut hasher,
-            )?;
-            Ok(len == entry.payload_len && hasher.digest() == expected_checksum)
-        })();
-        // A missing file or a read I/O error also confirms corruption (ADR 0017).
-        match matches {
-            Ok(true) => return Ok(CorruptEvictionOutcome::NotCorrupt),
-            Ok(false) => {}
+        match check_scrub_payload(
+            std::fs::File::open(self.layout.payload_object_path(object_id)),
+            entry.payload_len,
+            expected_checksum,
+        ) {
+            Ok(None) => return Ok(CorruptEvictionOutcome::NotCorrupt),
+            Ok(Some(_)) => {}
             Err(error) => {
-                warn!(object_id, %error, "cache scrub confirmed corruption via I/O error");
+                warn!(object_id, %error, "cache scrub confirmed corruption via I/O error")
             }
         }
         #[cfg(test)]
@@ -1368,88 +1523,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         evictable: bool,
         xxh64: Option<u64>,
     ) -> Result<(), LocalPayloadBackendError> {
-        let payload_len = u64::try_from(data.len()).map_err(|_| {
-            LocalPayloadBackendError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "payload length exceeds u64",
-            ))
-        })?;
-        if self.enforce_budget_before_put(object_id, payload_len, evictable)? {
-            return Ok(());
-        }
-
-        let _mutation = self.lock_payload_mutations(&[object_id]);
-
-        // The file may be replaced before the new index row commits.
-        self.index.clear_checksums_before_put(&[object_id])?;
-        let payload_commit = self
-            .payload_store
-            .put_with_intent(object_id, data)
-            .map_err(|error| self.note_payload_write_error(error))?;
-
-        // Leave the real file/index crash boundary intact for startup recovery tests.
-        #[cfg(test)]
-        if self
-            .stop_next_put_before_index
-            .swap(false, Ordering::Relaxed)
-        {
-            return Err(LocalPayloadBackendError::Io(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "injected stop after payload commit and before index commit",
-            )));
-        }
-
-        let lifecycle = if evictable {
-            LocalPayloadLifecycleState::Uploaded
-        } else {
-            LocalPayloadLifecycleState::Dirty
-        };
-        let payload_key = self
-            .layout
-            .payload_object_relative_path(object_id)
-            .to_string_lossy()
-            .into_owned()
-            .into_bytes();
-        if let Err(error) = self.index.upsert_with_xxh64(
-            CacheIndexUpsert {
-                object_id,
-                payload_key,
-                payload_len,
-                lifecycle,
-                origin: if evictable {
-                    LocalPayloadOrigin::Downloaded
-                } else {
-                    LocalPayloadOrigin::Local
-                },
-                upload_state: if evictable {
-                    LocalPayloadUploadState::None
-                } else {
-                    LocalPayloadUploadState::Pending
-                },
-                evictable,
-            },
-            xxh64,
-        ) {
-            if let Err(rollback_error) =
-                self.rollback_failed_index_put(&[object_id], payload_commit)
-            {
-                warn!(object_id, error = ?rollback_error,
-                    "local payload runtime rollback failed; retained recovery intent");
-            }
-            warn!(
-                object_id,
-                volume_uuid = ?self.volume_uuid,
-                error = ?error,
-                "local payload runtime index upsert failed after payload write; attempted payload rollback"
-            );
-            // A failed commit may still have applied, so refresh from the index either way.
-            self.refresh_runtime_pin_bytes(&[object_id]);
-            return Err(error.into());
-        }
-
-        self.refresh_runtime_pin_bytes(&[object_id]);
-        payload_commit.complete();
-        Ok(())
+        self.put_payload(object_id, data, evictable, xxh64, false)
     }
 
     fn put_batch(&self, entries: &[LocalPayloadPut]) -> Result<(), LocalPayloadBackendError> {
@@ -2668,8 +2742,10 @@ mod tests {
         backend
             .put_with_checksum(1, b"hello", true, Some(hello_xxh64))
             .unwrap();
-        let observed = observe();
+        let entry = backend.index.get_entry(1).unwrap().unwrap();
+        let observed = ObservedPayload::from(&entry);
         std::fs::write(&path, b"HELLO").unwrap();
+        assert_eq!(backend.check_scrub_entry(&entry).unwrap(), Some("checksum"));
         backend
             .put_with_checksum(1, b"hello", true, Some(hello_xxh64))
             .unwrap();
@@ -2694,7 +2770,16 @@ mod tests {
         backend.unpin(1);
 
         backend.put(1, b"hello", false).unwrap();
+        let dirty = backend.index.get_entry(1).unwrap().unwrap();
+        assert_eq!(dirty.lifecycle, LocalPayloadLifecycleState::Dirty);
+        assert_eq!(dirty.xxh64, None);
+        backend.put_scrub_refetch(1, b"remote", None).unwrap();
+        assert!(backend.index.get_entry(1).unwrap().unwrap() == dirty);
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         std::fs::write(&path, b"HELLO").unwrap();
+        // A scan can still hold the uploaded row after the payload becomes Dirty.
+        assert_eq!(entry.xxh64, Some(hello_xxh64));
+        assert_eq!(backend.check_scrub_entry(&entry).unwrap(), None);
         assert_eq!(
             backend.evict_corrupt(1, &observe()).unwrap(),
             CorruptEvictionOutcome::NotEligible
