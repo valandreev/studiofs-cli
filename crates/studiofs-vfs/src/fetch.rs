@@ -24,7 +24,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::CachedStore;
-use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, read_object, validate_cloud_fragment_layout};
+use studiofs_data::object::{
+    CLOUD_FRAGMENT_SIZE, read_object_with_checksum, validate_cloud_fragment_layout,
+};
 use studiofs_data::store::{DataError, DataStore};
 use tokio::sync::broadcast;
 use tokio::task;
@@ -552,7 +554,7 @@ impl FetchScheduler {
                 object_id,
                 reason: "partial payload range refers to a missing cloud fragment".to_string(),
             })?;
-        let payload = self
+        let (payload, _) = self
             .fetch_fragment_with_retry(
                 object_id,
                 fragment_index,
@@ -882,12 +884,12 @@ impl FetchScheduler {
         };
 
         if let [key] = keys {
-            let payload = self
+            let (payload, xxh64) = self
                 .fetch_fragment_with_retry(object_id, 0, key, class, None)
                 .await?;
             validate_single_fragment_payload_len(object_id, payload.len())?;
             let cache_put_start = Instant::now();
-            self.payload_store_put_async(object_id, payload.clone(), true)
+            self.payload_store_put_async(object_id, payload.clone(), xxh64)
                 .await?;
             self.record_local_cache_put(cache_put_start.elapsed());
             return Ok(payload);
@@ -901,7 +903,7 @@ impl FetchScheduler {
             .map(|(fragment_index, key)| async move {
                 self.fetch_fragment_with_retry(object_id, fragment_index, &key, class, None)
                     .await
-                    .map(|part| (fragment_index, part))
+                    .map(|(part, _)| (fragment_index, part))
             })
             .buffer_unordered(fragment_window.max(1));
 
@@ -933,7 +935,7 @@ impl FetchScheduler {
 
         // Populate cache (L1 + L2) with the reconstructed logical block.
         let cache_put_start = Instant::now();
-        self.payload_store_put_async(object_id, payload.clone(), true)
+        self.payload_store_put_async(object_id, payload.clone(), None)
             .await?;
         self.record_local_cache_put(cache_put_start.elapsed());
 
@@ -985,7 +987,7 @@ impl FetchScheduler {
         &self,
         object_id: u64,
         payload: Bytes,
-        evictable: bool,
+        xxh64: Option<u64>,
     ) -> Result<(), FetchError> {
         let local_io = self.foreground_local_io_permit().await?;
         let cached_store = self.cached_store.clone();
@@ -998,7 +1000,12 @@ impl FetchScheduler {
                 .checked_duration_since(submitted_at)
                 .unwrap_or_default()
                 .to_nanos_u64();
-            let result = cached_store.put(object_id, payload.as_ref(), evictable);
+            let result = cached_store.local_payload_backend().put_with_checksum(
+                object_id,
+                payload.as_ref(),
+                true,
+                xxh64,
+            );
             let backend_io_ns = io_started.elapsed().to_nanos_u64();
             (
                 result,
@@ -1024,7 +1031,7 @@ impl FetchScheduler {
         key: &str,
         class: FetchClass,
         payload_range: Option<Range<u64>>,
-    ) -> Result<Bytes, FetchError> {
+    ) -> Result<(Bytes, Option<u64>), FetchError> {
         let mut last_err: Option<DataError> = None;
         let overall_start = Instant::now();
         let max_attempts = match class {
@@ -1163,16 +1170,17 @@ impl FetchScheduler {
                         "remote fragment read ok"
                     );
 
-                    let payload = if payload_range.is_some() {
-                        compressed.to_bytes()
+                    let result = if payload_range.is_some() {
+                        (compressed.to_bytes(), None)
                     } else {
                         // Decode STFS object payload.
                         let decode_start = Instant::now();
-                        let payload = read_object(compressed);
+                        let decoded = read_object_with_checksum(compressed);
                         self.record_object_decode(decode_start.elapsed());
-                        payload?
+                        let (payload, xxh64) = decoded?;
+                        (payload, Some(xxh64))
                     };
-                    return Ok(payload);
+                    return Ok(result);
                 }
                 Ok(Err(e)) => {
                     self.record_s3_get(req_elapsed);
@@ -1766,7 +1774,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 pending,
-                scheduler.payload_store_put_async(object_id, Bytes::from_static(b"cold"), true),
+                scheduler.payload_store_put_async(object_id, Bytes::from_static(b"cold"), None),
             )
             .await
             .is_err()
@@ -1797,6 +1805,19 @@ mod tests {
             "fetch cache should hold plaintext payload bytes, not the SFEC object"
         );
         assert_eq!(scheduler.metrics.s3_fetches.load(Ordering::Relaxed), 1);
+        let (_, expected_xxh64) = read_object_with_checksum(
+            studiofs_data::object::create_object_buffer(expected).unwrap(),
+        )
+        .unwrap();
+        drop(scheduler);
+        drop(cached_store);
+        let layout =
+            studiofs_cache::LocalPayloadLayout::from_cache_root(tmp.path().join("fetch-cache"));
+        let index = studiofs_cache::runtime::CacheIndex::open(layout.redb_index_path).unwrap();
+        assert_eq!(
+            index.get_entry(object_id).unwrap().unwrap().xxh64,
+            Some(expected_xxh64)
+        );
     }
 
     #[tokio::test]

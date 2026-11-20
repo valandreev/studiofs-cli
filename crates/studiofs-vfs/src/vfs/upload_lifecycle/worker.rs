@@ -15,7 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::upload_queue::{ObjectFileMapping, PendingUpload};
 use studiofs_data::object::{
-    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
+    CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, ObjectHeader, create_object_buffer,
+    format_object_fragment_keys,
 };
 use studiofs_meta::schema::{
     ChunkId, DEFAULT_CHUNK_SIZE, FileType, PayloadRef, PayloadRefState, ResolvedSliceSource,
@@ -159,7 +160,7 @@ enum RemoteVisibility {
 
 #[derive(Debug)]
 enum UploadPutOutcome {
-    Uploaded,
+    Uploaded(Option<u64>),
     Cancelled,
     Failed(VfsError),
 }
@@ -300,13 +301,27 @@ trait CachedStorePort: Clone + Send + Sync + 'static {
     fn cancel_upload(&self, op: &PendingUpload);
 }
 
+#[derive(Debug)]
+struct UploadPayload {
+    bytes: Bytes,
+    from_indexed_file: bool,
+}
+
 trait UploadLocalPayloadPort: Clone + Send + Sync + 'static {
-    fn mark_uploading(&self, object_id: u64) -> VfsResult<()>;
+    fn mark_uploading(&self, object_id: u64) -> VfsResult<Option<u64>>;
     fn mark_upload_failed(&self, object_id: u64) -> VfsResult<()>;
     async fn prepare_local_priority_read(&self, object_id: u64) -> VfsResult<()>;
-    async fn read_for_upload(&self, object_id: u64, payload_len: u64) -> VfsResult<Option<Bytes>>;
+    async fn read_for_upload(
+        &self,
+        object_id: u64,
+        payload_len: u64,
+    ) -> VfsResult<Option<UploadPayload>>;
     async fn remove(&self, object_id: u64) -> VfsResult<()>;
-    async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()>;
+    async fn mark_uploaded(
+        &self,
+        object_id: u64,
+        checksum: Option<(u64, UploadPayload, u64)>,
+    ) -> VfsResult<()>;
     async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()>;
     async fn remove_upload_stage(&self, object_id: u64) -> VfsResult<()>;
     fn open_handle_count(&self, ino: Ino) -> usize;
@@ -674,7 +689,7 @@ where
             .await?;
 
         let t0 = Instant::now();
-        self.local_payloads.mark_uploading(op.object_id)?;
+        let dirty_order = self.local_payloads.mark_uploading(op.object_id)?;
         let fragment_keys = self.remote.fragment_keys(op.object_id);
         let mut remote_object_visible = false;
         if op.retry_count > 0 {
@@ -697,7 +712,7 @@ where
             }
         }
 
-        let raw_payload: Option<Bytes> = if remote_object_visible {
+        let raw_payload = if remote_object_visible {
             None
         } else {
             self.local_payloads
@@ -706,8 +721,8 @@ where
         };
 
         let raw_payload = match raw_payload {
-            Some(data) => data,
-            None if remote_object_visible => Bytes::new(),
+            Some(payload) => Some(payload),
+            None if remote_object_visible => None,
             None => {
                 if op.retry_count > 0 {
                     match self
@@ -715,10 +730,7 @@ where
                         .all_fragments_visible(op, &fragment_keys, upload_cancel_token)
                         .await
                     {
-                        RemoteVisibility::Visible => {
-                            remote_object_visible = true;
-                            Bytes::new()
-                        }
+                        RemoteVisibility::Visible => None,
                         RemoteVisibility::NotVisible => {
                             if self.shutdown.deleted_inode_marked(op.ino) {
                                 self.cancel_upload_for_deleted_inode(op).await?;
@@ -750,24 +762,24 @@ where
             }
         };
 
-        let payload_len = if remote_object_visible {
-            op.payload_len
-        } else {
-            raw_payload.len() as u64
-        };
-        if !remote_object_visible {
+        let payload_len = raw_payload
+            .as_ref()
+            .map_or(op.payload_len, |payload| payload.bytes.len() as u64);
+        let uploaded_checksum = if let Some(raw_payload) = raw_payload {
             match self
                 .remote
                 .upload_fragments(
                     op,
                     block_index,
-                    raw_payload,
+                    raw_payload.bytes.clone(),
                     &fragment_keys,
                     upload_cancel_token,
                 )
                 .await
             {
-                UploadPutOutcome::Uploaded => {}
+                UploadPutOutcome::Uploaded(xxh64) => dirty_order
+                    .zip(xxh64)
+                    .map(|(order, checksum)| (order, raw_payload, checksum)),
                 UploadPutOutcome::Cancelled => {
                     return if self.cancel_upload_if_inode_deleted(op).await? {
                         Ok(SingleUploadOutcome::CancelledDeleted)
@@ -777,7 +789,9 @@ where
                 }
                 UploadPutOutcome::Failed(error) => return Err(error),
             }
-        }
+        } else {
+            None
+        };
 
         if self.cancel_upload_if_inode_deleted(op).await? {
             debug!(
@@ -857,7 +871,9 @@ where
         if self.local_payloads.clear_pending_eviction(op.object_id) {
             self.local_payloads.remove(op.object_id).await?;
         } else if keep_local_object {
-            self.local_payloads.mark_uploaded(op.object_id).await?;
+            self.local_payloads
+                .mark_uploaded(op.object_id, uploaded_checksum)
+                .await?;
         } else {
             self.local_payloads.remove(op.object_id).await?;
         }
@@ -1156,66 +1172,12 @@ struct VfsUploadLocalPayloadPort {
     vfs: Arc<StudioVfs>,
 }
 
-impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
-    fn mark_uploading(&self, object_id: u64) -> VfsResult<()> {
-        self.vfs
-            .local_payload_backend
-            .mark_uploading(object_id)
-            .map_err(VfsError::LocalPayload)
-    }
-
-    fn mark_upload_failed(&self, object_id: u64) -> VfsResult<()> {
-        self.vfs
-            .local_payload_backend
-            .mark_upload_failed(object_id)
-            .map_err(VfsError::LocalPayload)
-    }
-
-    async fn prepare_local_priority_read(&self, object_id: u64) -> VfsResult<()> {
-        if self.vfs.upload_hot_get(object_id).is_some() {
-            return Ok(());
-        }
-        if self.vfs.upload_stage_contains_async(object_id).await? {
-            return Ok(());
-        }
-        match self
-            .vfs
-            .upload_stage_link_batch_async(vec![object_id])
-            .await
-        {
-            Ok(()) if self.vfs.upload_stage_contains_async(object_id).await? => {
-                return Ok(());
-            }
-            Ok(()) => {}
-            Err(_) => {}
-        }
-        Ok(())
-    }
-
-    async fn read_for_upload(&self, object_id: u64, payload_len: u64) -> VfsResult<Option<Bytes>> {
-        if let Some(hot_payload) = self.vfs.upload_hot_get(object_id) {
-            self.vfs
-                .state
-                .upload
-                .upload_local_payload_reads
-                .fetch_add(1, Ordering::Relaxed);
-            self.vfs
-                .state
-                .upload
-                .upload_local_payload_read_bytes
-                .fetch_add(hot_payload.len() as u64, Ordering::Relaxed);
-            self.vfs
-                .state
-                .upload
-                .upload_hot_payload_reads
-                .fetch_add(1, Ordering::Relaxed);
-            self.vfs
-                .state
-                .upload
-                .upload_hot_payload_read_bytes
-                .fetch_add(hot_payload.len() as u64, Ordering::Relaxed);
-            return Ok(Some(hot_payload));
-        }
+impl VfsUploadLocalPayloadPort {
+    async fn acquire_upload_read_slot(
+        &self,
+        object_id: u64,
+        payload_len: u64,
+    ) -> VfsResult<Option<(OwnedSemaphorePermit, u64)>> {
         let _ = self
             .vfs
             .wait_for_foreground_reads_idle(FOREGROUND_UPLOAD_REREAD_YIELD)
@@ -1257,6 +1219,83 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 message: error.to_string(),
             })?;
         let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
+        Ok(Some((upload_io_permit, wait_ns)))
+    }
+}
+
+impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
+    fn mark_uploading(&self, object_id: u64) -> VfsResult<Option<u64>> {
+        self.vfs
+            .local_payload_backend
+            .mark_uploading_with_order(object_id)
+            .map_err(VfsError::LocalPayload)
+    }
+
+    fn mark_upload_failed(&self, object_id: u64) -> VfsResult<()> {
+        self.vfs
+            .local_payload_backend
+            .mark_upload_failed(object_id)
+            .map_err(VfsError::LocalPayload)
+    }
+
+    async fn prepare_local_priority_read(&self, object_id: u64) -> VfsResult<()> {
+        if self.vfs.upload_hot_get(object_id).is_some() {
+            return Ok(());
+        }
+        if self.vfs.upload_stage_contains_async(object_id).await? {
+            return Ok(());
+        }
+        match self
+            .vfs
+            .upload_stage_link_batch_async(vec![object_id])
+            .await
+        {
+            Ok(()) if self.vfs.upload_stage_contains_async(object_id).await? => {
+                return Ok(());
+            }
+            Ok(()) => {}
+            Err(_) => {}
+        }
+        Ok(())
+    }
+
+    async fn read_for_upload(
+        &self,
+        object_id: u64,
+        payload_len: u64,
+    ) -> VfsResult<Option<UploadPayload>> {
+        if let Some(hot_payload) = self.vfs.upload_hot_get(object_id) {
+            self.vfs
+                .state
+                .upload
+                .upload_local_payload_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_local_payload_read_bytes
+                .fetch_add(hot_payload.len() as u64, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_hot_payload_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_hot_payload_read_bytes
+                .fetch_add(hot_payload.len() as u64, Ordering::Relaxed);
+            return Ok(Some(UploadPayload {
+                bytes: hot_payload,
+                from_indexed_file: false,
+            }));
+        }
+        let Some((upload_io_permit, wait_ns)) = self
+            .acquire_upload_read_slot(object_id, payload_len)
+            .await?
+        else {
+            return Ok(None);
+        };
         let staged_payload = self.vfs.upload_stage_get_async(object_id).await?;
         if let Some(staged_payload) = staged_payload {
             drop(upload_io_permit);
@@ -1280,7 +1319,10 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 .upload
                 .upload_staged_payload_read_bytes
                 .fetch_add(staged_payload.len() as u64, Ordering::Relaxed);
-            return Ok(Some(staged_payload));
+            return Ok(Some(UploadPayload {
+                bytes: staged_payload,
+                from_indexed_file: false,
+            }));
         }
         let read_started = Instant::now();
         let read_result = self
@@ -1338,15 +1380,43 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
                 .upload_fallback_reread_cache_misses
                 .fetch_add(1, Ordering::Relaxed);
         }
-        Ok(read_result)
+        Ok(read_result.map(|bytes| UploadPayload {
+            bytes,
+            from_indexed_file: true,
+        }))
     }
 
     async fn remove(&self, object_id: u64) -> VfsResult<()> {
         self.vfs.payload_store_remove_async(object_id).await
     }
 
-    async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()> {
-        self.vfs.payload_store_mark_uploaded_async(object_id).await
+    async fn mark_uploaded(
+        &self,
+        object_id: u64,
+        checksum: Option<(u64, UploadPayload, u64)>,
+    ) -> VfsResult<()> {
+        let verified = if let Some((order, payload, xxh64)) = checksum {
+            let payload_len = payload.bytes.len() as u64;
+            // A staged hard link can still name the old file after an indexed replacement.
+            let matches = if payload.from_indexed_file {
+                true
+            } else if let Ok(Some((_permit, _))) =
+                self.acquire_upload_read_slot(object_id, payload_len).await
+            {
+                self.vfs
+                    .payload_store_get_for_upload_async(object_id)
+                    .await
+                    .is_ok_and(|indexed| indexed.as_ref() == Some(&payload.bytes))
+            } else {
+                false
+            };
+            matches.then_some((order, payload_len, xxh64))
+        } else {
+            None
+        };
+        self.vfs
+            .payload_store_mark_uploaded_async(object_id, verified)
+            .await
     }
 
     async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()> {
@@ -1916,6 +1986,7 @@ struct VfsRemoteUploadPort {
 }
 
 struct BuiltFragment {
+    xxh64: u64,
     payload: Buffer,
     expected_byte_length: u64,
     expected_sha256: [u8; 32],
@@ -1935,6 +2006,13 @@ impl VfsRemoteUploadPort {
         Ok(volume_id)
     }
 
+    fn whole_payload_checksum(raw_len: usize, fragments: &[BuiltFragment]) -> Option<u64> {
+        match fragments {
+            [fragment] if raw_len <= CLOUD_FRAGMENT_SIZE => Some(fragment.xxh64),
+            _ => None,
+        }
+    }
+
     fn build_fragments(raw_payload: Bytes) -> VfsResult<Vec<BuiltFragment>> {
         let mut fragments = Vec::with_capacity(CLOUD_FRAGMENT_COUNT);
         for fragment_index in 0..CLOUD_FRAGMENT_COUNT {
@@ -1946,12 +2024,14 @@ impl VfsRemoteUploadPort {
                 Bytes::new()
             };
             let payload = create_object_buffer(fragment_payload)?;
+            let xxh64 = ObjectHeader::from_bytes(&payload.current())?.checksum;
             // Hash the object chunks in place; the ledger digest stays the SHA-256 of the exact uploaded bytes.
             let mut hasher = Sha256::new();
             for chunk in payload.clone() {
                 hasher.update(&chunk);
             }
             fragments.push(BuiltFragment {
+                xxh64,
                 expected_byte_length: payload.len() as u64,
                 expected_sha256: hasher.finalize().into(),
                 payload,
@@ -2055,6 +2135,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             Err(error) => return UploadPutOutcome::Failed(error),
         };
         let object_id = op.object_id;
+        let raw_len = raw_payload.len();
         let built_fragments = match run_blocking(move || Self::build_fragments(raw_payload)).await {
             Ok(fragments) => fragments,
             Err(error) => return UploadPutOutcome::Failed(error),
@@ -2064,6 +2145,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
         }
         let mut fragment_uploads = Vec::with_capacity(fragment_keys.len());
         let mut ledger_entries = Vec::with_capacity(fragment_keys.len());
+        let checksum = Self::whole_payload_checksum(raw_len, &built_fragments);
         for (fragment_index, (key, fragment)) in
             fragment_keys.iter().zip(built_fragments).enumerate()
         {
@@ -2164,7 +2246,7 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                 "fragment upload ledger confirmation failed: {error}"
             )));
         }
-        UploadPutOutcome::Uploaded
+        UploadPutOutcome::Uploaded(checksum)
     }
 }
 
@@ -2831,7 +2913,7 @@ mod tests {
     }
 
     impl UploadLocalPayloadPort for GatedVfsUploadLocalPayloadPort {
-        fn mark_uploading(&self, object_id: u64) -> VfsResult<()> {
+        fn mark_uploading(&self, object_id: u64) -> VfsResult<Option<u64>> {
             self.inner.mark_uploading(object_id)
         }
 
@@ -2847,7 +2929,7 @@ mod tests {
             &self,
             object_id: u64,
             payload_len: u64,
-        ) -> VfsResult<Option<Bytes>> {
+        ) -> VfsResult<Option<UploadPayload>> {
             self.read_entered.notify_one();
             self.release_read.notified().await;
             self.inner.read_for_upload(object_id, payload_len).await
@@ -2857,8 +2939,12 @@ mod tests {
             self.inner.remove(object_id).await
         }
 
-        async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()> {
-            self.inner.mark_uploaded(object_id).await
+        async fn mark_uploaded(
+            &self,
+            object_id: u64,
+            checksum: Option<(u64, UploadPayload, u64)>,
+        ) -> VfsResult<()> {
+            self.inner.mark_uploaded(object_id, checksum).await
         }
 
         async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()> {
@@ -2951,6 +3037,9 @@ mod tests {
             for fragment in VfsRemoteUploadPort::build_fragments(raw).expect("build fragments") {
                 let bytes = fragment.payload.to_bytes();
                 assert_eq!(fragment.expected_byte_length, bytes.len() as u64);
+                let (_, verified_checksum) =
+                    studiofs_data::object::read_object_with_checksum(bytes.clone()).unwrap();
+                assert_eq!(fragment.xxh64, verified_checksum);
                 assert_eq!(
                     fragment.expected_sha256,
                     <[u8; 32]>::from(Sha256::digest(&bytes))
@@ -3092,8 +3181,8 @@ mod tests {
     }
 
     impl UploadLocalPayloadPort for FakeLocalPayloads {
-        fn mark_uploading(&self, _object_id: u64) -> VfsResult<()> {
-            Ok(())
+        fn mark_uploading(&self, _object_id: u64) -> VfsResult<Option<u64>> {
+            Ok(None)
         }
 
         fn mark_upload_failed(&self, object_id: u64) -> VfsResult<()> {
@@ -3114,7 +3203,7 @@ mod tests {
             &self,
             object_id: u64,
             _payload_len: u64,
-        ) -> VfsResult<Option<Bytes>> {
+        ) -> VfsResult<Option<UploadPayload>> {
             if let Some(token) = self.cancel_token_during_read.lock().take() {
                 token.cancel();
             }
@@ -3128,7 +3217,11 @@ mod tests {
                 .lock()
                 .get(&object_id)
                 .cloned()
-                .unwrap_or_else(|| Some(Bytes::from_static(b"payload"))))
+                .unwrap_or_else(|| Some(Bytes::from_static(b"payload")))
+                .map(|bytes| UploadPayload {
+                    bytes,
+                    from_indexed_file: true,
+                }))
         }
 
         async fn remove(&self, object_id: u64) -> VfsResult<()> {
@@ -3139,7 +3232,11 @@ mod tests {
             Ok(())
         }
 
-        async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()> {
+        async fn mark_uploaded(
+            &self,
+            object_id: u64,
+            _checksum: Option<(u64, UploadPayload, u64)>,
+        ) -> VfsResult<()> {
             self.trace.record("local_cleanup");
             self.uploaded.lock().push(object_id);
             if self.fail_mark_uploaded.swap(false, Ordering::Relaxed) {
@@ -3351,7 +3448,7 @@ mod tests {
                 visibility: Arc::new(Mutex::new(RemoteVisibility::NotVisible)),
                 visibility_checks: Arc::new(AtomicUsize::new(0)),
                 visibility_after_upload: Arc::new(Mutex::new(Some(RemoteVisibility::Visible))),
-                upload_result: Arc::new(Mutex::new(Some(UploadPutOutcome::Uploaded))),
+                upload_result: Arc::new(Mutex::new(Some(UploadPutOutcome::Uploaded(None)))),
                 remove_overlay_after_upload: Arc::new(Mutex::new(None)),
                 remove_overlay_after_visibility: Arc::new(Mutex::new(None)),
                 advance_epoch_after_upload: Arc::new(Mutex::new(None)),
@@ -3408,33 +3505,33 @@ mod tests {
                 .upload_result
                 .lock()
                 .take()
-                .unwrap_or(UploadPutOutcome::Uploaded);
-            if matches!(outcome, UploadPutOutcome::Uploaded)
+                .unwrap_or(UploadPutOutcome::Uploaded(None));
+            if matches!(outcome, UploadPutOutcome::Uploaded(_))
                 && let Some(visibility) = self.visibility_after_upload.lock().take()
             {
                 *self.visibility.lock() = visibility;
             }
-            if matches!(outcome, UploadPutOutcome::Uploaded)
+            if matches!(outcome, UploadPutOutcome::Uploaded(_))
                 && self
                     .cancel_token_after_upload
                     .swap(false, Ordering::Relaxed)
             {
                 cancel_token.cancel();
             }
-            if matches!(outcome, UploadPutOutcome::Uploaded)
+            if matches!(outcome, UploadPutOutcome::Uploaded(_))
                 && let Some((meta, ino, object_id)) = self.remove_overlay_after_upload.lock().take()
                 && let Some(objects) = meta.overlay_objects.lock().get_mut(&ino)
             {
                 objects.remove(&object_id);
             }
-            if matches!(outcome, UploadPutOutcome::Uploaded)
+            if matches!(outcome, UploadPutOutcome::Uploaded(_))
                 && let Some((meta, ino, content_epoch)) =
                     self.advance_epoch_after_upload.lock().take()
                 && let Some(Some(attr)) = meta.attrs.lock().get_mut(&ino)
             {
                 attr.content_epoch = content_epoch;
             }
-            if matches!(outcome, UploadPutOutcome::Uploaded)
+            if matches!(outcome, UploadPutOutcome::Uploaded(_))
                 && let Some((shutdown, ino)) = self.mark_deleted_after_upload.lock().take()
             {
                 shutdown.deleted_inodes.lock().insert(ino);
@@ -3676,7 +3773,7 @@ mod tests {
                 .expect("upload reread result")
                 .expect("persisted payload should exist");
             assert_eq!(
-                reread_payload,
+                reread_payload.bytes,
                 Bytes::from_static(b"disk-backed upload payload")
             );
             assert_eq!(
@@ -4348,6 +4445,86 @@ mod tests {
             created_unix_ms: 0,
             not_before_unix_ms: 0,
             retry_count: 0,
+        }
+    }
+
+    #[test]
+    fn process_upload_records_only_matching_whole_payload_checksums() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "upload-checksums");
+        let hello_xxh64 = 0x26c7827d889f6da3;
+        let cases = [
+            (Bytes::from_static(b"hello"), false, Some(hello_xxh64)),
+            (Bytes::from(vec![0; CLOUD_FRAGMENT_SIZE + 1]), false, None),
+            (Bytes::from_static(b"hello"), true, None),
+        ];
+
+        rt.block_on(async {
+            for (i, (payload, stale_stage, _)) in cases.iter().enumerate() {
+                let (fixture, coordinator, _, meta, remote, _, _) = processor_fixture();
+                let mut op = make_pending_upload();
+                op.object_id += i as u64;
+                op.payload_len = payload.len() as u64;
+                op.file_mapping = Some(ObjectFileMapping::whole(0, op.payload_len));
+                coordinator.pending_inodes.lock().insert(op.ino);
+                meta.attrs
+                    .lock()
+                    .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+                meta.overlay_objects
+                    .lock()
+                    .insert(op.ino, HashSet::from([op.object_id]));
+                vfs.payload_store_put_async(op.object_id, payload.clone(), false)
+                    .await
+                    .unwrap();
+                if *stale_stage {
+                    vfs.upload_stage_link_batch_async(vec![op.object_id])
+                        .await
+                        .unwrap();
+                    vfs.payload_store_put_async(op.object_id, Bytes::from_static(b"world"), false)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        vfs.upload_stage_get_async(op.object_id)
+                            .await
+                            .unwrap()
+                            .as_ref(),
+                        Some(payload),
+                    );
+                }
+
+                let fragments: Vec<_> = (0..payload.len())
+                    .step_by(CLOUD_FRAGMENT_SIZE)
+                    .flat_map(|start| {
+                        let end = (start + CLOUD_FRAGMENT_SIZE).min(payload.len());
+                        VfsRemoteUploadPort::build_fragments(payload.slice(start..end)).unwrap()
+                    })
+                    .collect();
+                *remote.upload_result.lock() = Some(UploadPutOutcome::Uploaded(
+                    VfsRemoteUploadPort::whole_payload_checksum(payload.len(), &fragments),
+                ));
+                let processor = UploadProcessor {
+                    coordinator: fixture.coordinator,
+                    local_payloads: VfsUploadLocalPayloadPort { vfs: vfs.clone() },
+                    meta: fixture.meta,
+                    remote: fixture.remote,
+                    shutdown: fixture.shutdown,
+                    policy: fixture.policy,
+                    block_size: vfs.block_size,
+                    upload_requeue_base: Duration::ZERO,
+                    upload_requeue_max: Duration::ZERO,
+                };
+                assert_eq!(processor.process_upload(op).await, UploadOutcome::Completed);
+            }
+        });
+        drop(vfs);
+        drop(rt);
+
+        let layout = studiofs_cache::LocalPayloadLayout::from_cache_root(tmp.path().join("cache"));
+        let index = studiofs_cache::runtime::CacheIndex::open(layout.redb_index_path).unwrap();
+        for (i, (_, _, expected)) in cases.into_iter().enumerate() {
+            let object_id = make_pending_upload().object_id + i as u64;
+            let entry = index.get_entry(object_id).unwrap().unwrap();
+            assert_eq!(entry.xxh64, expected, "object {object_id}");
         }
     }
 
