@@ -223,9 +223,13 @@ pub struct VfsConfig {
     pub upload_limit: u64,
     /// Maximum aggregate object download rate in megabits per second; zero is unlimited.
     pub download_limit: u64,
+    /// Whether to scrub clean local cache payloads in the background.
     pub cache_scrub: bool,
+    /// Delay in seconds after a scrub pass completes before another pass starts.
     pub cache_scrub_interval_secs: u64,
+    /// Scrub scan rate limit in bytes per second.
     pub cache_scrub_bytes_per_sec: u64,
+    /// Scrub scan rate limit in operations per second.
     pub cache_scrub_iops: u64,
     /// Background janitor cycle interval.
     pub janitor_interval_secs: u64,
@@ -416,9 +420,13 @@ pub struct VfsConfigRaw {
     pub upload_limit: Option<u64>,
     /// Optional aggregate object download limit in megabits per second; zero is unlimited.
     pub download_limit: Option<u64>,
+    /// Optional override for whether background cache scrubbing is enabled.
     pub cache_scrub: Option<bool>,
+    /// Optional override for the delay between scrub passes in seconds.
     pub cache_scrub_interval_secs: Option<u64>,
+    /// Optional override for the scrub scan rate in bytes per second.
     pub cache_scrub_bytes_per_sec: Option<u64>,
+    /// Optional override for the scrub scan rate in operations per second.
     pub cache_scrub_iops: Option<u64>,
     /// Optional override for background janitor interval in seconds.
     pub janitor_interval_secs: Option<u64>,

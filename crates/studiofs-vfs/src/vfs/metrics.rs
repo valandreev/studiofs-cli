@@ -2391,26 +2391,38 @@ pub struct VfsSyncSafetySnapshot {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VfsCacheScrubSnapshot {
+    /// Payload checks that produced a clean or corrupt result.
     pub cache_scrub_checked: u64,
+    /// Corruption detections by kind.
     pub cache_scrub_corrupt: VfsCacheScrubCorruption,
+    /// Successful refetches after scrub eviction.
     pub cache_scrub_refetched: u64,
+    /// Failed refetches after scrub eviction, excluding admission deferrals.
     pub cache_scrub_refetch_failed: u64,
     /// Most recent completed pass in Unix milliseconds, including across restarts.
     pub cache_scrub_pass_completed_at: Option<u64>,
+    /// Current scrub pass position, if a pass is in progress.
     pub progress: Option<VfsCacheScrubProgress>,
 }
 
+/// Mount-local counts of cache corruption detected by the scrub worker.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VfsCacheScrubCorruption {
+    /// Payloads whose bytes did not match the stored checksum.
     pub checksum: u64,
+    /// Payloads whose local file was absent.
     pub missing: u64,
+    /// Payloads whose length differed from the indexed length.
     pub size: u64,
+    /// Payloads whose inspection failed with a filesystem error other than a missing file.
     pub io: u64,
 }
 
+/// Scan position of the current cache scrub pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VfsCacheScrubProgress {
+    /// Start time of this pass in milliseconds since the Unix epoch.
     pub started_unix_ms: u64,
     /// Last visited object in the current pass, including skipped entries.
     pub last_object_id: Option<u64>,

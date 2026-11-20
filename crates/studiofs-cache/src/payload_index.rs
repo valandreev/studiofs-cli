@@ -46,8 +46,11 @@ const SCRUB_COMPLETED: &str = "scrub_pass_completed_ms";
 /// Progress of the local payload scrub, stored independently of cache accounting.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ScrubCursor {
+    /// Last visited object ID, or `None` when there is no saved scan position.
     pub last_object_id: Option<u64>,
+    /// Start of the most recent pass in Unix milliseconds, or zero before the first pass.
     pub started_ms: u64,
+    /// Completion of the most recent pass in Unix milliseconds, or zero until it completes.
     pub completed_ms: u64,
     /// Most recent completion, retained when a new pass clears `completed_ms`.
     pub last_completed_ms: u64,
