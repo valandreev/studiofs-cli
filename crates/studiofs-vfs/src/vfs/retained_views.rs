@@ -1875,6 +1875,11 @@ mod tests {
         let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "retained-trash-restore");
         let (trash, receipt, view) = retained_source_in_trash(&vfs, &meta, &rt);
 
+        vfs.create_ignored_entry(ROOT_INO, b".Trash", 0, 0, 0o755, FileType::Directory);
+        assert!(matches!(
+            vfs.rename(trash, view.as_bytes(), ROOT_INO, b".Trash", true),
+            Err(VfsError::OperationNotSupported)
+        ));
         vfs.rename(trash, view.as_bytes(), ROOT_INO, b"restored", false)
             .unwrap();
         assert!(meta.lookup(META_ROOT, b"restored").is_ok());

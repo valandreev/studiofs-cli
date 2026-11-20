@@ -168,10 +168,15 @@ pub struct CommandOutput {
     pub stderr: String,
 }
 
-/// Abstraction for executing infra commands.
+/// Executes infra commands and probes host ports.
 pub trait CommandExecutor {
     /// Runs a prepared command and captures output.
     fn run(&self, command: &CommandSpec) -> std::io::Result<CommandOutput>;
+
+    /// Checks whether the host can bind a service port.
+    fn probe_port(&self, host: &str, port: u16) -> std::io::Result<()> {
+        TcpListener::bind((host, port)).map(drop)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -634,7 +639,7 @@ impl DockerComposeStack {
                 timeout: Some(COMPOSE_DIAGNOSTIC_TIMEOUT),
             },
         ));
-        checks.extend(self.ports.iter().map(port_check));
+        checks.extend(self.ports.iter().map(|port| port_check(port, executor)));
         checks
     }
 
@@ -1187,16 +1192,13 @@ fn command_diagnostics(stdout: &str, stderr: &str) -> String {
     }
 }
 
-fn port_check(port: &ServicePort) -> InfraCheck {
-    match TcpListener::bind((port.host.as_str(), port.host_port)) {
-        Ok(listener) => {
-            drop(listener);
-            InfraCheck {
-                name: format!("port {} {}", port.service, port.host_port),
-                passed: true,
-                detail: "available on 127.0.0.1".to_string(),
-            }
-        }
+fn port_check(port: &ServicePort, executor: &dyn CommandExecutor) -> InfraCheck {
+    match executor.probe_port(&port.host, port.host_port) {
+        Ok(()) => InfraCheck {
+            name: format!("port {} {}", port.service, port.host_port),
+            passed: true,
+            detail: "available on 127.0.0.1".to_string(),
+        },
         Err(err) => InfraCheck {
             name: format!("port {} {}", port.service, port.host_port),
             passed: false,

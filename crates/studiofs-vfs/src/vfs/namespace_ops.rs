@@ -4165,6 +4165,11 @@ impl StudioVfs {
         let namespace_mutations = self.namespace_mutations();
         let meta = self.sync_meta();
         super::validate_name_len(name)?;
+        let target_is_ignored_trash_root = new_parent == super::ROOT_INO
+            && super::is_probable_trash_component(new_name)
+            && self
+                .ignored_entry_lookup(new_parent, new_name)
+                .is_some_and(|entry| entry.view.is_none());
         if let Some(receipt) = self.trash_view_receipt_for(parent, name)? {
             self.reject_private_store_path(new_parent, new_name)?;
             self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
@@ -4184,7 +4189,10 @@ impl StudioVfs {
                 );
                 return Ok(());
             }
-            if self.is_retained_view_ino(new_parent) || self.is_trash_container_ino(new_parent)? {
+            if target_is_ignored_trash_root
+                || self.is_retained_view_ino(new_parent)
+                || self.is_trash_container_ino(new_parent)?
+            {
                 return Err(VfsError::OperationNotSupported);
             }
             return self
@@ -4246,8 +4254,8 @@ impl StudioVfs {
         if parent >= super::FIRST_IGNORED_INO && source_ignored.is_none() {
             return Err(Self::ignored_entry_not_found(parent, name));
         }
-        let target_is_ignored = self.should_ignore_regular_file_path(new_parent, new_name)
-            || self.should_ignore_directory_path(new_parent, new_name);
+        let target_is_ignored = target_is_ignored_trash_root
+            || self.should_ignore_regular_file_path(new_parent, new_name);
         let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
             && self.ignored_directory_has_probable_trash_ancestor(new_parent);
         let prevalidated_source_entry = if !replace_if_exists && source_ignored.is_none() {
@@ -4272,6 +4280,17 @@ impl StudioVfs {
         if !replace_if_exists && (source_ignored.is_some() || target_is_ignored) {
             return self.reject_nontransactional_no_replace(new_parent, new_name);
         }
+        if target_is_ignored_trash_root
+            || (source_ignored.is_none()
+                && target_is_ignored
+                && !target_is_ignored_trash
+                && self.should_ignore_directory_path(new_parent, new_name))
+        {
+            if source_ignored.is_none() {
+                self.lookup(parent, name)?;
+            }
+            return Err(VfsError::OperationNotSupported);
+        }
         // Period zero is a direct delete (the OS "do not use the Recycle Bin"
         // behavior). A fresh trash name is not a collision; an existing one is.
         if !replace_if_exists
@@ -4286,6 +4305,16 @@ impl StudioVfs {
             return self.reject_nontransactional_no_replace(new_parent, new_name);
         }
         if let Some(source) = source_ignored {
+            // Discard entries hold no bytes, so trashing one is a delete; any
+            // other move into the ordinary namespace would drop its subtree.
+            if !target_is_ignored
+                && (self.should_ignore_directory_path(parent, name)
+                    || (parent == super::ROOT_INO && super::is_probable_trash_component(name)))
+                && !self.is_posix_trash_move_target_dir(new_parent)?
+                && !self.directory_has_probable_trash_ancestor(new_parent)?
+            {
+                return Err(VfsError::OperationNotSupported);
+            }
             if target_is_ignored && !target_is_ignored_trash {
                 self.create_public_ignored_entry(
                     new_parent,
