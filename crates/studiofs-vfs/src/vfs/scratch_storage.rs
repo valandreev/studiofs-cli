@@ -13,6 +13,10 @@ impl StudioVfs {
         Ok(attr)
     }
 
+    /// Reports whether `ino` is a local-only scratch inode.
+    ///
+    /// Bridges use this to keep tracked-only maintenance, such as WinFSP
+    /// orphan healing, away from scratch directories.
     pub fn is_scratch_inode(&self, ino: Ino) -> VfsResult<bool> {
         match self.sync_meta().get_scratch_attr(ino) {
             Ok(_) => Ok(true),
