@@ -23,7 +23,8 @@ use crate::local::{LocalPayloadLifecycleState, LocalPayloadOrigin, LocalPayloadU
 const LEGACY_INDEX_FORMAT_VERSION: u64 = 1;
 const INDEX_FORMAT_VERSION: u64 = 2;
 const LEGACY_ENTRY_ENCODING_VERSION: u8 = 1;
-const ENTRY_ENCODING_VERSION: u8 = 2;
+const ENTRY_ENCODING_VERSION_V2: u8 = 2;
+const ENTRY_ENCODING_VERSION: u8 = 3;
 const NO_DIRTY_ORDER: u64 = u64::MAX;
 
 const PAYLOAD_OBJECTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("payload_objects");
@@ -49,12 +50,14 @@ const ENTRY_OFFSET_LIFECYCLE: usize = 1;
 const ENTRY_OFFSET_EVICTABLE: usize = 2;
 const ENTRY_OFFSET_ORIGIN: usize = 3;
 const ENTRY_OFFSET_UPLOAD_STATE: usize = 4;
+const ENTRY_OFFSET_HAS_XXH64: usize = 5;
 const ENTRY_OFFSET_PAYLOAD_LEN: usize = 8;
 const ENTRY_OFFSET_DIRTY_ORDER: usize = 16;
 const ENTRY_OFFSET_ACCESS_ORDER: usize = 24;
 const ENTRY_OFFSET_LAST_ACCESS_UNIX_MILLIS: usize = 32;
 const ENTRY_OFFSET_PAYLOAD_KEY_LEN: usize = 40;
-const ENTRY_HEADER_LEN: usize = 44;
+const ENTRY_HEADER_LEN_V2: usize = 44;
+const ENTRY_HEADER_LEN: usize = ENTRY_HEADER_LEN_V2 + 8;
 const LEGACY_ENTRY_OFFSET_LIFECYCLE: usize = 1;
 const LEGACY_ENTRY_OFFSET_EVICTABLE: usize = 2;
 const LEGACY_ENTRY_OFFSET_PAYLOAD_LEN: usize = 4;
@@ -105,6 +108,8 @@ pub struct CacheIndexStats {
 #[derive(Clone, PartialEq, Eq)]
 /// Public view of a payload-index row for a single object id.
 pub struct CacheIndexEntry {
+    /// Verified XXH64 of the exact cached payload bytes, when available.
+    pub xxh64: Option<u64>,
     /// The unique object id for the payload object.
     pub object_id: u64,
     /// Opaque payload key (storage key / content key bytes).
@@ -322,7 +327,15 @@ impl CacheIndex {
     }
 
     /// Insert or update a single entry, updating accounting counters atomically.
-    pub fn upsert(&self, mut update: CacheIndexUpsert) -> Result<(), CacheIndexError> {
+    pub fn upsert(&self, update: CacheIndexUpsert) -> Result<(), CacheIndexError> {
+        self.upsert_with_xxh64(update, None)
+    }
+
+    pub(crate) fn upsert_with_xxh64(
+        &self,
+        mut update: CacheIndexUpsert,
+        xxh64: Option<u64>,
+    ) -> Result<(), CacheIndexError> {
         #[cfg(test)]
         self.maybe_fail_write_for_test()?;
         update = normalize_upsert(update);
@@ -338,6 +351,10 @@ impl CacheIndex {
 
             let old = read_entry_write(&payloads, update.object_id)?;
             let mut new = StoredEntry {
+                xxh64: xxh64.filter(|_| {
+                    update.lifecycle == LocalPayloadLifecycleState::Uploaded
+                        && update.upload_state == LocalPayloadUploadState::None
+                }),
                 payload_key: update.payload_key,
                 payload_len: update.payload_len,
                 lifecycle: update.lifecycle,
@@ -387,6 +404,7 @@ impl CacheIndex {
             for update in updates.iter().cloned().map(normalize_upsert) {
                 let old = read_entry_write(&payloads, update.object_id)?;
                 let mut new = StoredEntry {
+                    xxh64: None,
                     payload_key: update.payload_key,
                     payload_len: update.payload_len,
                     lifecycle: update.lifecycle,
@@ -530,9 +548,16 @@ impl CacheIndex {
 
     /// Mark a dirty object as uploading.
     pub fn mark_uploading(&self, object_id: u64) -> Result<(), CacheIndexError> {
+        self.mark_uploading_with_order(object_id).map(|_| ())
+    }
+
+    pub(crate) fn mark_uploading_with_order(
+        &self,
+        object_id: u64,
+    ) -> Result<Option<u64>, CacheIndexError> {
         self.maybe_fail_write_for_test()?;
         let txn = self.db.begin_write().map_err(storage_error)?;
-        {
+        let order = {
             let mut payloads = txn
                 .open_table(PAYLOAD_OBJECTS_TABLE)
                 .map_err(storage_error)?;
@@ -541,10 +566,14 @@ impl CacheIndex {
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
             let Some(old) = read_entry_write(&payloads, object_id)? else {
-                return Ok(());
+                return Ok(None);
             };
             if old.lifecycle != LocalPayloadLifecycleState::Dirty {
-                return Ok(());
+                return Ok(if old.lifecycle == LocalPayloadLifecycleState::Uploading {
+                    old.dirty_order
+                } else {
+                    None
+                });
             }
 
             let mut new = old.clone();
@@ -564,10 +593,11 @@ impl CacheIndex {
                 &mut access_order,
                 &mut counters,
             )?;
-        }
+            new.dirty_order
+        };
 
         txn.commit().map_err(storage_error)?;
-        Ok(())
+        Ok(order)
     }
 
     /// Mark a previously uploading object as upload-failed / pending (dirty).
@@ -612,6 +642,14 @@ impl CacheIndex {
 
     /// Mark an object as uploaded and eligible for eviction.
     pub fn mark_uploaded(&self, object_id: u64) -> Result<(), CacheIndexError> {
+        self.mark_uploaded_with_xxh64(object_id, None)
+    }
+
+    pub(crate) fn mark_uploaded_with_xxh64(
+        &self,
+        object_id: u64,
+        verified: Option<(u64, u64, u64)>,
+    ) -> Result<(), CacheIndexError> {
         self.maybe_fail_write_for_test()?;
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
@@ -626,6 +664,12 @@ impl CacheIndex {
                 return Ok(());
             };
             let mut new = old.clone();
+            if let Some((dirty_order, payload_len, xxh64)) = verified
+                && old.dirty_order == Some(dirty_order)
+                && old.payload_len == payload_len
+            {
+                new.xxh64 = Some(xxh64);
+            }
             new.lifecycle = LocalPayloadLifecycleState::Uploaded;
             new.upload_state = LocalPayloadUploadState::None;
             new.evictable = true;
@@ -644,6 +688,36 @@ impl CacheIndex {
 
         txn.commit().map_err(storage_error)?;
         Ok(())
+    }
+
+    pub(crate) fn clear_checksums_before_put(
+        &self,
+        object_ids: &[u64],
+    ) -> Result<(), CacheIndexError> {
+        let with_checksum: Vec<_> = object_ids
+            .iter()
+            .zip(self.get_entries(object_ids)?)
+            .filter_map(|(id, entry)| entry.and_then(|entry| entry.xxh64.map(|_| *id)))
+            .collect();
+        if with_checksum.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write().map_err(storage_error)?;
+        {
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
+            for id in with_checksum {
+                if let Some(mut entry) = read_entry_write(&payloads, id)? {
+                    entry.xxh64 = None;
+                    let encoded = encode_entry(&entry)?;
+                    payloads
+                        .insert(id, encoded.as_slice())
+                        .map_err(storage_error)?;
+                }
+            }
+        }
+        txn.commit().map_err(storage_error)
     }
 
     /// Remove a single object id from the index.
@@ -1092,6 +1166,7 @@ impl CacheIndex {
 
 #[derive(Clone, PartialEq, Eq)]
 struct StoredEntry {
+    xxh64: Option<u64>,
     payload_key: Vec<u8>,
     payload_len: u64,
     lifecycle: LocalPayloadLifecycleState,
@@ -1106,6 +1181,7 @@ struct StoredEntry {
 impl StoredEntry {
     fn into_public(self, object_id: u64) -> CacheIndexEntry {
         CacheIndexEntry {
+            xxh64: self.xxh64,
             object_id,
             payload_key: self.payload_key,
             payload_len: self.payload_len,
@@ -1372,12 +1448,13 @@ fn encode_entry(entry: &StoredEntry) -> Result<Vec<u8>, CacheIndexError> {
     out.push(u8::from(entry.evictable));
     out.push(encode_origin(entry.origin));
     out.push(encode_upload_state(entry.upload_state));
-    out.extend_from_slice(&[0_u8; 3]);
+    out.extend_from_slice(&[u8::from(entry.xxh64.is_some()), 0, 0]);
     out.extend_from_slice(&entry.payload_len.to_le_bytes());
     out.extend_from_slice(&entry.dirty_order.unwrap_or(NO_DIRTY_ORDER).to_le_bytes());
     out.extend_from_slice(&entry.access_order.to_le_bytes());
     out.extend_from_slice(&entry.last_access_unix_millis.to_le_bytes());
     out.extend_from_slice(&payload_key_len.to_le_bytes());
+    out.extend_from_slice(&entry.xxh64.unwrap_or_default().to_le_bytes());
     out.extend_from_slice(&entry.payload_key);
     Ok(out)
 }
@@ -1391,7 +1468,7 @@ fn decode_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, CacheIndexErr
     };
     match version {
         LEGACY_ENTRY_ENCODING_VERSION => decode_legacy_entry(raw, object_id),
-        ENTRY_ENCODING_VERSION => decode_current_entry(raw, object_id),
+        ENTRY_ENCODING_VERSION_V2 | ENTRY_ENCODING_VERSION => decode_current_entry(raw, object_id),
         _ => Err(CacheIndexError::Corruption(format!(
             "unknown entry encoding version for object_id={object_id}: {version}",
         ))),
@@ -1399,7 +1476,13 @@ fn decode_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, CacheIndexErr
 }
 
 fn decode_current_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, CacheIndexError> {
-    if raw.len() < ENTRY_HEADER_LEN {
+    let has_checksum_field = raw[ENTRY_OFFSET_VERSION] == ENTRY_ENCODING_VERSION;
+    let header_len = if has_checksum_field {
+        ENTRY_HEADER_LEN
+    } else {
+        ENTRY_HEADER_LEN_V2
+    };
+    if raw.len() < header_len {
         return Err(CacheIndexError::Corruption(format!(
             "entry too short for object_id={object_id}: len={}",
             raw.len()
@@ -1446,13 +1529,13 @@ fn decode_current_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, Cache
         ))
     })?;
 
-    if raw.len() != ENTRY_HEADER_LEN + payload_key_len {
+    if raw.len() != header_len + payload_key_len {
         return Err(CacheIndexError::Corruption(format!(
             "payload key length mismatch for object_id={object_id}: encoded={payload_key_len}, total_len={}",
             raw.len()
         )));
     }
-    let payload_key = raw[ENTRY_HEADER_LEN..].to_vec();
+    let payload_key = raw[header_len..].to_vec();
 
     let dirty_order = if dirty_order_raw == NO_DIRTY_ORDER {
         None
@@ -1461,6 +1544,16 @@ fn decode_current_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, Cache
     };
 
     Ok(StoredEntry {
+        xxh64: if has_checksum_field && raw[ENTRY_OFFSET_HAS_XXH64] != 0 {
+            Some(read_u64_field(
+                raw,
+                ENTRY_HEADER_LEN_V2,
+                object_id,
+                "xxh64",
+            )?)
+        } else {
+            None
+        },
         payload_key,
         payload_len,
         lifecycle,
@@ -1532,6 +1625,7 @@ fn decode_legacy_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, CacheI
     };
 
     Ok(StoredEntry {
+        xxh64: None,
         payload_key,
         payload_len,
         lifecycle,
@@ -1703,6 +1797,63 @@ mod tests {
 
         let other = CacheIndexError::Storage(RedbError::DatabaseClosed);
         assert!(!other.is_database_lock_conflict());
+    }
+
+    #[test]
+    fn entry_checksum_encoding_reads_legacy_rows_without_rewriting_them() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let path = temp.path().join("index.redb");
+        let index = CacheIndex::open(&path).unwrap();
+        let entry = StoredEntry {
+            xxh64: Some(0),
+            payload_key: b"payload".to_vec(),
+            payload_len: 5,
+            lifecycle: LocalPayloadLifecycleState::Uploaded,
+            origin: LocalPayloadOrigin::Downloaded,
+            upload_state: LocalPayloadUploadState::None,
+            last_access_unix_millis: 1,
+            evictable: true,
+            dirty_order: None,
+            access_order: 1,
+        };
+        let v3 = encode_entry(&entry).unwrap();
+        assert!(decode_entry(&v3, 1).unwrap() == entry);
+
+        let mut v2 = v3;
+        v2[ENTRY_OFFSET_VERSION] = ENTRY_ENCODING_VERSION_V2;
+        v2[ENTRY_OFFSET_HAS_XXH64] = 0;
+        v2.drain(ENTRY_HEADER_LEN_V2..ENTRY_HEADER_LEN);
+
+        let mut v1 = vec![
+            LEGACY_ENTRY_ENCODING_VERSION,
+            encode_lifecycle(entry.lifecycle),
+            1,
+            0,
+        ];
+        v1.extend_from_slice(&entry.payload_len.to_le_bytes());
+        v1.extend_from_slice(&NO_DIRTY_ORDER.to_le_bytes());
+        v1.extend_from_slice(&entry.access_order.to_le_bytes());
+        v1.extend_from_slice(&7_u32.to_le_bytes());
+        v1.extend_from_slice(&entry.payload_key);
+
+        let txn = index.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(PAYLOAD_OBJECTS_TABLE).unwrap();
+            table.insert(1, v1.as_slice()).unwrap();
+            table.insert(2, v2.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+        drop(index);
+
+        let index = CacheIndex::open(&path).unwrap();
+        let txn = index.db.begin_read().unwrap();
+        let table = txn.open_table(PAYLOAD_OBJECTS_TABLE).unwrap();
+        for (id, original) in [(1, v1), (2, v2)] {
+            let decoded = index.get_entry(id).unwrap().unwrap();
+            assert_eq!(decoded.xxh64, None);
+            assert_eq!(decoded.payload_key, entry.payload_key);
+            assert_eq!(table.get(id).unwrap().unwrap().value(), original);
+        }
     }
 
     fn upsert_dirty(index: &CacheIndex, object_id: u64, payload_len: u64) {

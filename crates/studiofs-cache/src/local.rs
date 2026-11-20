@@ -140,6 +140,17 @@ pub trait LocalPayloadBackend: Send + Sync {
         evictable: bool,
     ) -> Result<(), LocalPayloadBackendError>;
 
+    /// Persists a payload and, for clean entries, its verified XXH64.
+    fn put_with_checksum(
+        &self,
+        object_id: u64,
+        data: &[u8],
+        evictable: bool,
+        _xxh64: Option<u64>,
+    ) -> Result<(), LocalPayloadBackendError> {
+        self.put(object_id, data, evictable)
+    }
+
     /// Convenience wrapper around [`Self::put`] taking an owned entry.
     fn put_owned(&self, put: LocalPayloadPut) -> Result<(), LocalPayloadBackendError> {
         self.put(put.object_id, put.data.as_ref(), put.evictable)
@@ -163,6 +174,14 @@ pub trait LocalPayloadBackend: Send + Sync {
     ///
     /// Returns an error if the durable lifecycle transition cannot be committed.
     fn mark_uploading(&self, object_id: u64) -> Result<(), LocalPayloadBackendError>;
+    /// Marks the entry as uploading and returns its dirty-order identity, when tracked.
+    fn mark_uploading_with_order(
+        &self,
+        object_id: u64,
+    ) -> Result<Option<u64>, LocalPayloadBackendError> {
+        self.mark_uploading(object_id)?;
+        Ok(None)
+    }
     /// Marks the upload attempt for `object_id` as failed (payload remains dirty).
     ///
     /// Returns an error if the durable lifecycle transition cannot be committed.
@@ -171,6 +190,17 @@ pub trait LocalPayloadBackend: Send + Sync {
     ///
     /// Returns an error if the durable lifecycle transition cannot be committed.
     fn mark_uploaded(&self, object_id: u64) -> Result<(), LocalPayloadBackendError>;
+
+    /// Marks an upload complete, recording the checksum if the entry still matches the uploaded bytes.
+    fn mark_uploaded_with_checksum(
+        &self,
+        object_id: u64,
+        _dirty_order: u64,
+        _payload: &[u8],
+        _xxh64: u64,
+    ) -> Result<(), LocalPayloadBackendError> {
+        self.mark_uploaded(object_id)
+    }
 
     /// Pins `object_id` to prevent eviction.
     fn pin(&self, object_id: u64);

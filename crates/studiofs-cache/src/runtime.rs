@@ -1193,6 +1193,36 @@ impl From<CacheIndexError> for LocalPayloadBackendError {
     }
 }
 
+impl LocalPayloadBackendRuntime {
+    fn finish_upload(
+        &self,
+        object_id: u64,
+        uploaded: Option<(u64, &[u8], u64)>,
+    ) -> Result<(), LocalPayloadBackendError> {
+        let _mutation = self.lock_payload_mutations(&[object_id]);
+        let verified = if let Some((dirty_order, payload, xxh64)) = uploaded {
+            let payload_len = payload.len() as u64;
+            let entry = self.index.get_entry(object_id)?;
+            // Uploads can read from the hot cache or staging, independently of the indexed file.
+            if entry.is_some_and(|entry| {
+                entry.dirty_order == Some(dirty_order) && entry.payload_len == payload_len
+            }) && self.payload_store.get(object_id).as_deref() == Some(payload)
+            {
+                Some((dirty_order, payload_len, xxh64))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let result = self.index.mark_uploaded_with_xxh64(object_id, verified);
+        self.refresh_runtime_pin_bytes(&[object_id]);
+        result?;
+        self.note_storage_state_change();
+        Ok(())
+    }
+}
+
 impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -1266,6 +1296,16 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         data: &[u8],
         evictable: bool,
     ) -> Result<(), LocalPayloadBackendError> {
+        self.put_with_checksum(object_id, data, evictable, None)
+    }
+
+    fn put_with_checksum(
+        &self,
+        object_id: u64,
+        data: &[u8],
+        evictable: bool,
+        xxh64: Option<u64>,
+    ) -> Result<(), LocalPayloadBackendError> {
         let payload_len = u64::try_from(data.len()).map_err(|_| {
             LocalPayloadBackendError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1278,6 +1318,8 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
 
         let _mutation = self.lock_payload_mutations(&[object_id]);
 
+        // The file may be replaced before the new index row commits.
+        self.index.clear_checksums_before_put(&[object_id])?;
         let payload_commit = self
             .payload_store
             .put_with_intent(object_id, data)
@@ -1306,23 +1348,26 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             .to_string_lossy()
             .into_owned()
             .into_bytes();
-        if let Err(error) = self.index.upsert(CacheIndexUpsert {
-            object_id,
-            payload_key,
-            payload_len,
-            lifecycle,
-            origin: if evictable {
-                LocalPayloadOrigin::Downloaded
-            } else {
-                LocalPayloadOrigin::Local
+        if let Err(error) = self.index.upsert_with_xxh64(
+            CacheIndexUpsert {
+                object_id,
+                payload_key,
+                payload_len,
+                lifecycle,
+                origin: if evictable {
+                    LocalPayloadOrigin::Downloaded
+                } else {
+                    LocalPayloadOrigin::Local
+                },
+                upload_state: if evictable {
+                    LocalPayloadUploadState::None
+                } else {
+                    LocalPayloadUploadState::Pending
+                },
+                evictable,
             },
-            upload_state: if evictable {
-                LocalPayloadUploadState::None
-            } else {
-                LocalPayloadUploadState::Pending
-            },
-            evictable,
-        }) {
+            xxh64,
+        ) {
             if let Err(rollback_error) =
                 self.rollback_failed_index_put(&[object_id], payload_commit)
             {
@@ -1442,6 +1487,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             .map(|entry| entry.object_id)
             .collect::<Vec<_>>();
         let _mutations = self.lock_payload_mutations(&written_object_ids);
+        self.index.clear_checksums_before_put(&written_object_ids)?;
 
         let batch_commit = self
             .payload_store
@@ -1483,9 +1529,16 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
 
     // Dirty/Uploading rows are never evictable, so these transitions leave pinned bytes unchanged.
     fn mark_uploading(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
+        self.mark_uploading_with_order(object_id).map(|_| ())
+    }
+
+    fn mark_uploading_with_order(
+        &self,
+        object_id: u64,
+    ) -> Result<Option<u64>, LocalPayloadBackendError> {
         let _mutation = self.lock_payload_mutations(&[object_id]);
         self.index
-            .mark_uploading(object_id)
+            .mark_uploading_with_order(object_id)
             .map_err(LocalPayloadBackendError::from)
     }
 
@@ -1497,12 +1550,17 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     }
 
     fn mark_uploaded(&self, object_id: u64) -> Result<(), LocalPayloadBackendError> {
-        let _mutation = self.lock_payload_mutations(&[object_id]);
-        let result = self.index.mark_uploaded(object_id);
-        self.refresh_runtime_pin_bytes(&[object_id]);
-        result?;
-        self.note_storage_state_change();
-        Ok(())
+        self.finish_upload(object_id, None)
+    }
+
+    fn mark_uploaded_with_checksum(
+        &self,
+        object_id: u64,
+        dirty_order: u64,
+        payload: &[u8],
+        xxh64: u64,
+    ) -> Result<(), LocalPayloadBackendError> {
+        self.finish_upload(object_id, Some((dirty_order, payload, xxh64)))
     }
 
     fn pin(&self, object_id: u64) {
@@ -2529,6 +2587,54 @@ mod tests {
             LocalPayloadLifecycleState::Dirty
         );
         assert_eq!(backend.dirty_object_ids(), vec![42]);
+    }
+
+    #[test]
+    fn payload_checksum_follows_upload_identity_and_rewrites() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0xCD; 16],
+        })
+        .unwrap();
+        let checksum = |id| backend.index.get_entry(id).unwrap().unwrap().xxh64;
+        let hello_xxh64 = 0x26c7827d889f6da3;
+
+        backend.put(1, b"hello", false).unwrap();
+        assert_eq!(checksum(1), None);
+        let order = backend.mark_uploading_with_order(1).unwrap().unwrap();
+        assert_eq!(checksum(1), None);
+        backend
+            .mark_uploaded_with_checksum(1, order, b"hello", hello_xxh64)
+            .unwrap();
+        assert_eq!(checksum(1), Some(hello_xxh64));
+
+        backend.put(1, b"world", false).unwrap();
+        assert_eq!(checksum(1), None);
+        backend
+            .mark_uploaded_with_checksum(1, order, b"world", hello_xxh64)
+            .unwrap();
+        assert_eq!(checksum(1), None);
+
+        backend.put(1, b"world", false).unwrap();
+        let order = backend.mark_uploading_with_order(1).unwrap().unwrap();
+        backend
+            .mark_uploaded_with_checksum(1, order, b"hello", hello_xxh64)
+            .unwrap();
+        assert_eq!(checksum(1), None);
+
+        backend
+            .put_with_checksum(1, b"hello", true, Some(hello_xxh64))
+            .unwrap();
+        backend
+            .stop_next_put_before_index
+            .store(true, Ordering::Relaxed);
+        assert!(backend.put(1, b"world", false).is_err());
+        drop(backend);
+        let index = CacheIndex::open(layout.redb_index_path).unwrap();
+        assert_eq!(index.get_entry(1).unwrap().unwrap().xxh64, None);
     }
 
     #[test]

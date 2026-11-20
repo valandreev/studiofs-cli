@@ -360,6 +360,11 @@ pub use create_object_buffer_with as create_object_buffer_with_flags;
 /// sizes, [`ObjectError::ObjectTooLarge`] for consistent sizes above the limit,
 /// or [`ObjectError::ChecksumMismatch`] for a checksum failure.
 pub fn read_object(data: impl Into<Buffer>) -> Result<Bytes, ObjectError> {
+    read_object_with_checksum(data).map(|(payload, _)| payload)
+}
+
+/// Performs the same validation as [`read_object`] and returns the verified XXH64.
+pub fn read_object_with_checksum(data: impl Into<Buffer>) -> Result<(Bytes, u64), ObjectError> {
     let data: Buffer = data.into();
     if data.len() < ObjectHeader::SIZE {
         return Err(
@@ -388,9 +393,9 @@ pub fn read_object(data: impl Into<Buffer>) -> Result<Bytes, ObjectError> {
 
     // Preserve zero-copy when payload is a single remaining chunk.
     if Buffer::count(&payload) == 1 {
-        Ok(payload.current())
+        Ok((payload.current(), computed_checksum))
     } else {
-        Ok(payload.to_bytes())
+        Ok((payload.to_bytes(), computed_checksum))
     }
 }
 
