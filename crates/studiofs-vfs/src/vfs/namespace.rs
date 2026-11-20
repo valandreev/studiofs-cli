@@ -1344,6 +1344,68 @@ impl<'a> NamespaceMutationOps<'a> {
             None,
             false,
         );
+        self.vfs.ignore_rules.bump_dir_rename_epoch();
+    }
+
+    /// Records a local-only scratch insertion without waking ignore-rule scans.
+    pub(super) fn record_scratch_insertion(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        child: Ino,
+        attr_invalidations: impl IntoIterator<Item = Ino>,
+    ) {
+        let mut invalidated = vec![parent];
+        invalidated.extend(attr_invalidations);
+        self.vfs.invalidate_attr_read_cache(invalidated);
+        self.vfs.record_dentry_changes(
+            self.started_epoch,
+            &[parent],
+            &[(parent, name, DentryCacheValue::Positive(child))],
+        );
+    }
+
+    /// Records a local-only scratch removal without waking ignore-rule scans.
+    pub(super) fn record_scratch_removal(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        attr_invalidations: impl IntoIterator<Item = Ino>,
+    ) {
+        let mut invalidated = vec![parent];
+        invalidated.extend(attr_invalidations);
+        self.vfs.invalidate_attr_read_cache(invalidated);
+        self.vfs.record_dentry_changes(
+            self.started_epoch,
+            &[parent],
+            &[(parent, name, DentryCacheValue::Negative)],
+        );
+    }
+
+    /// Records a local-only scratch rename without waking ignore-rule scans.
+    pub(super) fn record_scratch_rename(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        moved_ino: Ino,
+    ) {
+        let mut invalidated = if parent == new_parent {
+            vec![parent]
+        } else {
+            vec![parent, new_parent]
+        };
+        invalidated.push(moved_ino);
+        self.vfs.invalidate_attr_read_cache(invalidated);
+        self.vfs.record_dentry_changes(
+            self.started_epoch,
+            &[parent, new_parent],
+            &[
+                (parent, name, DentryCacheValue::Negative),
+                (new_parent, new_name, DentryCacheValue::Positive(moved_ino)),
+            ],
+        );
     }
 
     /// Records a rename that is rejected for destination update but should invalidate source state.
@@ -1384,6 +1446,7 @@ impl<'a> NamespaceMutationOps<'a> {
             None,
             false,
         );
+        self.vfs.ignore_rules.bump_dir_rename_epoch();
     }
 
     /// Records successful rename/move and updates both old and new parent cache states.
@@ -1422,6 +1485,7 @@ impl<'a> NamespaceMutationOps<'a> {
             Some(moved_ino),
             true,
         );
+        self.vfs.ignore_rules.bump_dir_rename_epoch();
     }
 }
 

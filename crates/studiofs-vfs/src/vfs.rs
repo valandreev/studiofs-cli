@@ -37,6 +37,7 @@ mod io_ops;
 mod local_dirty;
 mod locking;
 mod metrics;
+pub use misc_ops::SCRATCH_XATTR_NAME;
 mod misc_ops;
 mod namespace;
 mod namespace_ops;
@@ -563,6 +564,10 @@ pub enum VfsError {
     #[error("operation is not supported")]
     OperationNotSupported,
 
+    /// Operation crosses incompatible filesystem classes (`EXDEV`).
+    #[error("cross-device link or rename is not supported")]
+    CrossDevice,
+
     /// Open/read is blocked while remote content is still uploading.
     #[error("remote content is still uploading (EAGAIN)")]
     RemoteContentPending,
@@ -762,10 +767,6 @@ fn is_probable_trash_component(name: &[u8]) -> bool {
 /// Returns true when a root metadata entry should be hidden on platforms where it is not native.
 pub fn is_hidden_platform_root_metadata_name(name: &[u8]) -> bool {
     name == b".Trashes"
-}
-
-fn is_ignored_macos_metadata(name: &[u8]) -> bool {
-    name.len() > 2 && name.starts_with(b"._")
 }
 
 fn is_blocked_root_macos_metadata(name: &[u8]) -> bool {
@@ -10837,6 +10838,7 @@ impl StudioVfs {
         // background prefetch of the first block to hide initial S3 latency.
         if read_context.attr.kind == studiofs_meta::types::FileType::RegularFile
             && !self.is_runtime_stats_file_ino(ino)
+            && !self.is_scratch_inode(ino)?
             && read_context.attr.size > 0
             && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
             && read_ahead_owner == ReadAheadOwner::Vfs

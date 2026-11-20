@@ -163,6 +163,8 @@ pub struct RedbMetaEngine {
     write_metrics: Arc<MetadataWriteMetrics>,
     relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
     write_txn_lock: Arc<Mutex<()>>,
+    scratch_mutation_lock: Mutex<()>,
+    scratch_index: RwLock<scratch::ScratchIndex>,
     invalidation_journal: Mutex<InvalidationJournal>,
     pub(crate) invalidation_notify: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -1151,6 +1153,8 @@ impl RedbMetaEngine {
                 .map_err(scratch::storage_error)?;
             txn.open_table(SCRATCH_XATTRS)
                 .map_err(scratch::storage_error)?;
+            txn.open_table(SCRATCH_SYMLINKS)
+                .map_err(scratch::storage_error)?;
             let _ = txn.open_table(SETTINGS_TABLE);
             let _ = txn.open_table(COUNTERS_TABLE);
             let _ = txn.open_table(LOCAL_ALLOCATOR_STATE_TABLE);
@@ -1214,11 +1218,14 @@ impl RedbMetaEngine {
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability,
             write_txn_lock,
+            scratch_mutation_lock: Mutex::new(()),
+            scratch_index: RwLock::new(scratch::ScratchIndex::default()),
             invalidation_journal: Mutex::default(),
             invalidation_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             allocator_state_write_hook: Mutex::new(None),
         };
+        engine.refresh_scratch_index()?;
         if !format_upgrade {
             engine.ensure_dentry_by_inode_indexes()?;
             // A PostgreSQL-backed cache defers an unacknowledged retained child purge.
@@ -1266,6 +1273,8 @@ impl RedbMetaEngine {
             write_metrics: Arc::new(MetadataWriteMetrics::default()),
             relaxed_durability: None,
             write_txn_lock: Arc::new(Mutex::new(())),
+            scratch_mutation_lock: Mutex::new(()),
+            scratch_index: RwLock::new(scratch::ScratchIndex::default()),
             invalidation_journal: Mutex::default(),
             invalidation_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
@@ -1463,12 +1472,38 @@ impl MetaEngineCore for RedbMetaEngine {
         self.insert_scratch_entry(parent, name, attr)
     }
 
+    fn create_scratch_symlink(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        attr: &InodeAttr,
+    ) -> MetaResult<()> {
+        self.insert_scratch_symlink(parent, name, target, attr)
+    }
+
     fn lookup_scratch_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<Option<Ino>> {
         self.read_scratch_dentry(parent, name)
     }
 
+    fn readdir_scratch(&self, parent: Ino) -> MetaResult<Vec<(Vec<u8>, InodeAttr)>> {
+        self.list_scratch_children(parent)
+    }
+
+    fn has_scratch_children(&self, parent: Ino) -> MetaResult<bool> {
+        self.scratch_parent_has_children(parent)
+    }
+
     fn get_scratch_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
         self.read_scratch_attr(ino)
+    }
+
+    fn set_scratch_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
+        self.update_scratch_attr(attr)
+    }
+
+    fn truncate_scratch(&self, ino: Ino, new_size: u64, attr: &InodeAttr) -> MetaResult<Vec<u64>> {
+        self.truncate_scratch_file(ino, new_size, attr)
     }
 
     fn commit_scratch_overlay(
@@ -1487,12 +1522,79 @@ impl MetaEngineCore for RedbMetaEngine {
         self.read_scratch_overlay(ino, chunk)
     }
 
+    fn lookup_scratch_slices(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>> {
+        self.read_scratch_slices(ino, offset, length)
+    }
+
+    fn get_scratch_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>> {
+        self.read_scratch_symlink_target(ino)
+    }
+
+    fn unlink_scratch_entry(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        keep_open_inode: bool,
+    ) -> MetaResult<(InodeAttr, Vec<u64>)> {
+        self.remove_scratch_entry(parent, name, keep_open_inode)
+    }
+
+    fn finalize_orphan_scratch_inode(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        self.cleanup_orphan_scratch_inode(ino)
+    }
+
+    fn rmdir_scratch_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr> {
+        self.remove_scratch_dir(parent, name)
+    }
+
+    fn rename_scratch_entry(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        replace_if_exists: bool,
+        keep_displaced_open: bool,
+    ) -> MetaResult<ScratchRenameResult> {
+        self.move_scratch_entry(
+            parent,
+            name,
+            new_parent,
+            new_name,
+            replace_if_exists,
+            keep_displaced_open,
+        )
+    }
+
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {
         self.write_scratch_xattr(ino, name, value)
     }
 
+    fn set_scratch_xattr_with_flags(
+        &self,
+        ino: Ino,
+        name: &[u8],
+        value: &[u8],
+        flags: u32,
+    ) -> MetaResult<()> {
+        self.write_scratch_xattr_with_flags(ino, name, value, flags)
+    }
+
     fn get_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
         self.read_scratch_xattr(ino, name)
+    }
+
+    fn remove_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()> {
+        self.delete_scratch_xattr(ino, name)
+    }
+
+    fn list_scratch_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
+        self.enumerate_scratch_xattrs(ino)
     }
 
     fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {

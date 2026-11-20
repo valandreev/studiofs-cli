@@ -13,7 +13,7 @@ impl StudioVfs {
         Ok(attr)
     }
 
-    pub(crate) fn is_scratch_inode(&self, ino: Ino) -> VfsResult<bool> {
+    pub fn is_scratch_inode(&self, ino: Ino) -> VfsResult<bool> {
         match self.sync_meta().get_scratch_attr(ino) {
             Ok(_) => Ok(true),
             Err(MetaError::InodeNotFound(_)) => Ok(false),
@@ -21,12 +21,89 @@ impl StudioVfs {
         }
     }
 
+    pub(super) fn record_scratch_writer_stack_payload(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        data: super::sync_ops::VfsWritePayload<'_>,
+    ) -> VfsResult<u32> {
+        let base_attr = self
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| {
+                self.sync_meta()
+                    .get_scratch_attr(ino)
+                    .map_err(VfsError::Meta)
+            })?;
+        if base_attr.kind != FileType::RegularFile {
+            return Err(MetaError::TargetChanged.into());
+        }
+        if !data.is_empty() {
+            self.local_payload_backend
+                .admit_scratch_write()
+                .map_err(VfsError::LocalPayload)?;
+        }
+        let spec = super::writer_stack::WriterWriteSpec {
+            fh,
+            ino,
+            current_size: base_attr.size,
+            content_epoch: base_attr.content_epoch,
+            first_object_id: 0,
+            offset,
+        };
+        let accepted = match data {
+            super::sync_ops::VfsWritePayload::Borrowed(bytes) => {
+                self.state.writer_stack.write_bytes(spec, bytes)
+            }
+            super::sync_ops::VfsWritePayload::Owned(bytes) => {
+                self.state.writer_stack.write_owned_bytes(spec, bytes)
+            }
+        }
+        .map_err(|error| error.into_vfs_error("scratch writer stack write failed"))?;
+        {
+            let mut dirty = self.state.namespace.dirty_attrs.lock();
+            let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
+            attr.kind = FileType::RegularFile;
+            attr.size = attr.size.max(accepted.visible_len);
+            attr.touch_mtime();
+        }
+        self.invalidate_attr_read_cache([ino]);
+        self.retain_kernel_inode_attr_refresh(ino);
+        Ok(accepted.accepted_bytes)
+    }
+
+    pub(super) async fn cleanup_scratch_inode_runtime_and_payloads(
+        &self,
+        ino: Ino,
+        mut object_ids: Vec<u64>,
+    ) {
+        self.state.writer_stack.clear_inode(ino);
+        let pending_objects = self.take_pending_dirty_slice_object_ids_for_inode(ino);
+        object_ids.extend(pending_objects);
+        self.clear_pending_payloads_for_inode(ino);
+        self.state.namespace.dirty_attrs.lock().remove(&ino);
+        self.invalidate_attr_read_cache([ino]);
+        self.retire_os_cache_inode(ino);
+        object_ids.sort_unstable();
+        object_ids.dedup();
+        if !object_ids.is_empty()
+            && let Err(error) = self.payload_store_remove_batch_async(&object_ids).await
+        {
+            warn!(ino, %error, "failed to remove freed scratch payload objects");
+        }
+    }
+
     /// Accepts scratch bytes into the mounted writer stack.
     ///
-    /// The caller owns namespace and access checks. Like an opportunistic
-    /// tracked write, admission applies the dirty-buffer backpressure and the
-    /// accepted bytes start background materialization; flush and release use
-    /// the same entry points as tracked files.
+    /// Like an opportunistic tracked write, admission applies access checks and
+    /// dirty-buffer backpressure and starts background materialization; flush
+    /// and release use the same entry points as tracked files.
     pub async fn write_scratch(
         self: &Arc<Self>,
         fh: u64,
@@ -42,41 +119,25 @@ impl StudioVfs {
                 .enter_op(ino, FileSessionOperation::Write)
                 .await,
         );
+        self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if fh != 0 {
             self.enforce_mutating_handle_access(fh, ino)?;
         }
-        let attr = self.sync_meta().get_scratch_attr(ino)?;
-        if attr.kind != FileType::RegularFile {
-            return Err(MetaError::TargetChanged.into());
-        }
-        if !data.is_empty() {
-            self.local_payload_backend
-                .admit_scratch_write()
-                .map_err(VfsError::LocalPayload)?;
-        }
-        let accepted = self
-            .state
-            .writer_stack
-            .write_bytes(
-                super::writer_stack::WriterWriteSpec {
-                    fh,
-                    ino,
-                    current_size: attr.size,
-                    content_epoch: attr.content_epoch,
-                    first_object_id: 0,
-                    offset,
-                },
-                data,
-            )
-            .map_err(|error| error.into_vfs_error("scratch writer stack write failed"))?;
+        let accepted_bytes = self.record_scratch_writer_stack_payload(
+            fh,
+            ino,
+            offset,
+            super::sync_ops::VfsWritePayload::Borrowed(data),
+        )?;
         drop(session);
-        if accepted.accepted_bytes > 0 {
+        if accepted_bytes > 0 {
             self.spawn_deferred_materialization_if_needed(ino);
         }
-        Ok(accepted.accepted_bytes)
+        Ok(accepted_bytes)
     }
 
-    /// Reads committed scratch bytes for a block. An uncovered block denotes a hole.
+    /// Reads scratch bytes for a block, including unflushed writer pages and
+    /// pending local-dirty slices. An uncovered block denotes a hole.
     pub async fn read_scratch_block(&self, ino: Ino, block: u32) -> VfsResult<Option<Bytes>> {
         use studiofs_meta::schema::{
             DEFAULT_CHUNK_SIZE, SliceRange, chunk_id_from_offset, chunk_start_offset,
@@ -91,11 +152,12 @@ impl StudioVfs {
                 .await,
         );
         let start = u64::from(block) * u64::from(self.block_size);
-        let size = self.sync_meta().get_scratch_attr(ino)?.size;
+        let size = self.getattr_async_unchecked(ino).await?.size;
         let end = (start + u64::from(self.block_size)).min(size);
         if start >= end {
             return Ok(None);
         }
+        let block_len = (end - start) as usize;
         let mut data: Option<Vec<u8>> = None;
         let mut cursor = start;
         while cursor < end {
@@ -125,12 +187,61 @@ impl StudioVfs {
                         .ok_or_else(|| {
                             io::Error::other("scratch payload missing or truncated in local store")
                         })?;
-                    let data = data.get_or_insert_with(|| vec![0; (end - start) as usize]);
+                    let data = data.get_or_insert_with(|| vec![0; block_len]);
                     data[offset..offset + bytes.len()].copy_from_slice(bytes);
                 }
             }
             cursor = chunk_end;
         }
+
+        // Overlay pending local-dirty slices (oldest-to-newest so newer wins).
+        let mut pending_spans =
+            self.snapshot_pending_dirty_slice_read_spans(ino, start, end - start);
+        pending_spans.extend(self.snapshot_pending_local_dirty_block_read_spans(
+            ino,
+            start,
+            end - start,
+        ));
+        // snapshot_pending_dirty_slice_read_spans returns newest-first; apply oldest-first.
+        for span in pending_spans.into_iter().rev() {
+            let overlap_start = span.start.max(start);
+            let overlap_end = span.end.min(end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let delta = (overlap_start - span.start) as usize;
+            let len = (overlap_end - overlap_start) as usize;
+            let dst_offset = (overlap_start - start) as usize;
+            let src_offset = span.block_offset as usize + delta;
+            let bytes = if let Some(object_id) = span.object_id {
+                let obj = self.payload_store_get_async(object_id).await?;
+                obj.and_then(|buf| {
+                    buf.get(src_offset..src_offset + len)
+                        .map(Bytes::copy_from_slice)
+                })
+                .ok_or_else(|| {
+                    io::Error::other("scratch payload missing or truncated in local store")
+                })?
+            } else {
+                span.data.slice(src_offset..src_offset + len)
+            };
+            let data = data.get_or_insert_with(|| vec![0; block_len]);
+            data[dst_offset..dst_offset + len].copy_from_slice(&bytes);
+        }
+
+        // Overlay unflushed writer-stack pages on top of committed and pending slices.
+        let writer_claims = self
+            .state
+            .writer_stack
+            .snapshot_read_claims(ino, start, end - start);
+        if !writer_claims.is_empty() {
+            let buf = data.get_or_insert_with(|| vec![0; block_len]);
+            let _ = self
+                .state
+                .writer_stack
+                .copy_read_spans_into(ino, start, buf);
+        }
+
         Ok(data.map(Bytes::from))
     }
 }
@@ -138,8 +249,9 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
     use studiofs_meta::trash::MetaVolumeSettings;
-    use studiofs_meta::{MetaEngineCore, MetaGc, MetaInodes};
+    use studiofs_meta::{MetaEngineCore, MetaGc, MetaInodes, MetaNamespace};
 
     const CRASH_ROOT: &str = "STUDIOFS_TEST_SCRATCH_CRASH_ROOT";
     const VOLUME: &str = "scratch-storage";
@@ -466,5 +578,564 @@ mod tests {
         let object = scratch_object(meta.as_ref(), attr.ino);
         assert!(!backend.is_evictable(object));
         assert_eq!(backend.storage_stats().dirty_bytes, 0);
+    }
+
+    fn make_started_test_vfs(
+        temp: &tempfile::TempDir,
+        volume: &str,
+    ) -> (
+        Arc<tokio::runtime::Runtime>,
+        Arc<StudioVfs>,
+        Arc<studiofs_meta::RedbMetaEngine>,
+    ) {
+        let (rt, vfs, meta) = super::super::tests::make_unstarted_test_vfs(temp, volume);
+        let _guard = rt.enter();
+        vfs.start().unwrap();
+        (rt, vfs, meta)
+    }
+
+    async fn install_ignore_rules(vfs: &Arc<StudioVfs>, parent: Ino, payload: &[u8]) {
+        let staging = b"studiofsignore_stage";
+        let attr = vfs.create(parent, staging, 0, 0, 0o644).unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, true).unwrap();
+        if !payload.is_empty() {
+            vfs.write_fh(fh, attr.ino, 0, payload).await.unwrap();
+        }
+        vfs.fsync(attr.ino, false).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+        let mut changed = vfs.subscribe_ignore_rules_changes();
+        vfs.rename(
+            parent,
+            staging,
+            parent,
+            crate::scratch_rules::RULE_FILE,
+            true,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), changed.recv())
+            .await
+            .expect("ignore rule refresh completed")
+            .expect("ignore rule change delivered");
+    }
+
+    #[test]
+    fn scratch_namespace_create_mkdir_symlink_and_rule_change_does_not_reclassify() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-ns-create-");
+        let (runtime, vfs, meta) = make_started_test_vfs(&temp, "scratch-ns-create");
+        let _guard = runtime.enter();
+        runtime.block_on(async {
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\nbuild/\n!keep.tmp\n").await;
+            let events_before = meta.read_events_range(0, u64::MAX).unwrap().len();
+            let uploads_before = vfs
+                .cached_store
+                .cache_pipeline_metrics()
+                .upload_queue
+                .submitted;
+
+            let tmp_file = vfs.create(ROOT_INO, b"scene.tmp", 0, 0, 0o644).unwrap();
+            assert!(vfs.is_scratch_inode(tmp_file.ino).unwrap());
+            let scratch_dir = vfs.mkdir(ROOT_INO, b"build", 0, 0, 0o755).unwrap();
+            assert!(vfs.is_scratch_inode(scratch_dir.ino).unwrap());
+
+            // Whole subtree of a scratch directory is scratch regardless of name.
+            let nested_file = vfs
+                .create(scratch_dir.ino, b"output.txt", 0, 0, 0o644)
+                .unwrap();
+            let nested_dir = vfs.mkdir(scratch_dir.ino, b"nested", 0, 0, 0o755).unwrap();
+            let nested_link = vfs
+                .symlink(nested_dir.ino, b"latest", b"../output.txt", 0, 0)
+                .unwrap();
+            assert!(vfs.is_scratch_inode(nested_file.ino).unwrap());
+            assert!(vfs.is_scratch_inode(nested_dir.ino).unwrap());
+            assert!(vfs.is_scratch_inode(nested_link.ino).unwrap());
+            assert_eq!(vfs.readlink(nested_link.ino).unwrap(), b"../output.txt");
+
+            // Zero event_log rows and zero upload submissions for all scratch creates.
+            assert_eq!(
+                meta.read_events_range(0, u64::MAX).unwrap().len(),
+                events_before
+            );
+            assert_eq!(
+                vfs.cached_store
+                    .cache_pipeline_metrics()
+                    .upload_queue
+                    .submitted,
+                uploads_before
+            );
+
+            // Negated and ordinary files stay tracked.
+            let keep = vfs.create(ROOT_INO, b"keep.tmp", 0, 0, 0o644).unwrap();
+            assert!(!vfs.is_scratch_inode(keep.ino).unwrap());
+            let normal = vfs.create(ROOT_INO, b"normal.txt", 0, 0, 0o644).unwrap();
+            assert!(!vfs.is_scratch_inode(normal.ino).unwrap());
+
+            // Changing `.studiofsignore` never reclassifies existing scratch entries on lookup.
+            install_ignore_rules(&vfs, ROOT_INO, b"").await;
+            assert_eq!(
+                vfs.lookup(ROOT_INO, b"scene.tmp").unwrap().ino,
+                tmp_file.ino
+            );
+            assert!(vfs.is_scratch_inode(tmp_file.ino).unwrap());
+            assert_eq!(
+                vfs.lookup(scratch_dir.ino, b"output.txt").unwrap().ino,
+                nested_file.ino
+            );
+            assert!(vfs.is_scratch_inode(nested_file.ino).unwrap());
+            // Newly created `.tmp` file under the empty rules is now tracked.
+            let after_change = vfs.create(ROOT_INO, b"fresh.tmp", 0, 0, 0o644).unwrap();
+            assert!(!vfs.is_scratch_inode(after_change.ino).unwrap());
+        });
+    }
+
+    #[test]
+    fn scratch_read_write_unflushed_truncate_setattr_xattrs_and_acl() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-ns-io-");
+        let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs_at(
+            temp.path(),
+            "scratch-ns-io",
+            VfsConfig {
+                disable_background_slab_flush: true,
+                ..VfsConfig::default()
+            },
+            None,
+        );
+        let _guard = runtime.enter();
+        runtime.block_on(async {
+            let dir = vfs.mkdir(ROOT_INO, b"work", 0, 0, 0o755).unwrap();
+            let events_before = meta.read_events_range(0, u64::MAX).unwrap().len();
+            let uploads_before = vfs
+                .cached_store
+                .cache_pipeline_metrics()
+                .upload_queue
+                .submitted;
+
+            // AppleDouble `._*` enters scratch through the built-in rule.
+            let attr = vfs
+                .create(dir.ino, b"._asset.bin", 1000, 1000, 0o644)
+                .unwrap();
+            assert!(vfs.is_scratch_inode(attr.ino).unwrap());
+            assert!(!vfs.is_synthesized_ignored_ino(attr.ino));
+
+            // Virtual read-only xattr `user.studiofs.scratch` marks scratch entries
+            // and stays hidden from list_xattrs.
+            assert_eq!(
+                vfs.get_xattr(attr.ino, super::SCRATCH_XATTR_NAME)
+                    .unwrap()
+                    .as_deref(),
+                Some(b"1".as_slice())
+            );
+            assert_eq!(
+                vfs.get_xattr_size(attr.ino, super::SCRATCH_XATTR_NAME)
+                    .unwrap(),
+                Some(1)
+            );
+            assert!(vfs.list_xattrs(attr.ino).unwrap().is_empty());
+            assert!(matches!(
+                vfs.set_xattr(attr.ino, super::SCRATCH_XATTR_NAME, b"0", 0),
+                Err(VfsError::Meta(MetaError::AccessDenied { .. }))
+            ));
+            assert!(matches!(
+                vfs.remove_xattr(attr.ino, super::SCRATCH_XATTR_NAME),
+                Err(VfsError::Meta(MetaError::AccessDenied { .. }))
+            ));
+            assert_eq!(
+                vfs.get_xattr(dir.ino, super::SCRATCH_XATTR_NAME).unwrap(),
+                None
+            );
+            assert!(matches!(
+                vfs.set_xattr(dir.ino, super::SCRATCH_XATTR_NAME, b"1", 0),
+                Err(VfsError::Meta(MetaError::AccessDenied { .. }))
+            ));
+
+            // Ordinary xattrs work with create/replace flags.
+            vfs.set_xattr(attr.ino, b"user.note", b"v1", XATTR_CREATE_FLAG)
+                .unwrap();
+            assert!(matches!(
+                vfs.set_xattr(attr.ino, b"user.note", b"v2", XATTR_CREATE_FLAG),
+                Err(VfsError::Meta(MetaError::EntryExists { .. }))
+            ));
+            vfs.set_xattr(attr.ino, b"user.note", b"v2", XATTR_REPLACE_FLAG)
+                .unwrap();
+            assert_eq!(
+                vfs.get_xattr(attr.ino, b"user.note").unwrap().as_deref(),
+                Some(b"v2".as_slice())
+            );
+            assert_eq!(
+                vfs.list_xattrs(attr.ino).unwrap(),
+                vec![b"user.note".to_vec()]
+            );
+            vfs.remove_xattr(attr.ino, b"user.note").unwrap();
+            assert!(vfs.list_xattrs(attr.ino).unwrap().is_empty());
+
+            // Unflushed writer pages are immediately readable via both `read` and `read_scratch_block`.
+            let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh(fh, attr.ino, 0, b"hello-unflushed")
+                .await
+                .unwrap();
+            assert_eq!(vfs.getattr(attr.ino).unwrap().size, 15);
+            assert_eq!(
+                vfs.read(attr.ino, 0, 32).await.unwrap().as_ref(),
+                b"hello-unflushed"
+            );
+            assert_eq!(
+                vfs.read_scratch_block(attr.ino, 0)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                b"hello-unflushed"
+            );
+
+            // Flush & fsync commit scratch overlay, then truncate shrinks and frees displaced objects.
+            vfs.fsync(attr.ino, false).await.unwrap();
+            let full_obj = scratch_object(meta.as_ref(), attr.ino);
+            assert!(vfs.local_payload_backend.contains(full_obj));
+
+            let shrunk = vfs
+                .setattr_with_handle_posix(
+                    Some(fh),
+                    attr.ino,
+                    studiofs_meta::SetattrArgs::size_only(5),
+                )
+                .unwrap();
+            assert_eq!(shrunk.size, 5);
+            assert_eq!(vfs.read(attr.ino, 0, 16).await.unwrap().as_ref(), b"hello");
+
+            let zeroed = vfs
+                .setattr_with_handle_posix(
+                    Some(fh),
+                    attr.ino,
+                    studiofs_meta::SetattrArgs::size_only(0),
+                )
+                .unwrap();
+            assert_eq!(zeroed.size, 0);
+            assert!(!vfs.local_payload_backend.contains(full_obj));
+
+            // Attr-only setattr updates mode without journaling.
+            let chmod = vfs
+                .setattr_attr_only_deferred_metadata(
+                    attr.ino,
+                    studiofs_meta::SetattrArgs {
+                        mode: Some(0o600),
+                        ..studiofs_meta::SetattrArgs::default()
+                    },
+                    runtime.handle(),
+                )
+                .unwrap();
+            assert_eq!(chmod.mode & 0o7777, 0o600);
+            assert_eq!(vfs.getattr(attr.ino).unwrap().mode & 0o7777, 0o600);
+
+            assert_eq!(
+                meta.read_events_range(0, u64::MAX).unwrap().len(),
+                events_before
+            );
+            assert_eq!(
+                vfs.cached_store
+                    .cache_pipeline_metrics()
+                    .upload_queue
+                    .submitted,
+                uploads_before
+            );
+
+            // ACL checks apply to scratch write, write_scratch, setattr, xattr, and fsync.
+            vfs.set_acl_rule(dir.ino, &vfs.acl_principal, AccessLevel::ReadOnly)
+                .unwrap();
+            assert!(matches!(
+                vfs.write_scratch(fh, attr.ino, 0, b"blocked").await,
+                Err(VfsError::Meta(MetaError::AccessDenied { .. }))
+            ));
+            assert!(matches!(
+                vfs.write_fh(fh, attr.ino, 0, b"blocked").await,
+                Err(VfsError::Meta(MetaError::AccessDenied { .. }))
+            ));
+            assert!(matches!(
+                vfs.set_xattr(attr.ino, b"user.ro", b"no", 0),
+                Err(VfsError::Meta(MetaError::AccessDenied { .. }))
+            ));
+            // ReadOnly still allows fsync and read.
+            vfs.fsync(attr.ino, false).await.unwrap();
+
+            // NoAccess blocks fsync and async read on scratch inodes.
+            vfs.set_acl_rule(dir.ino, &vfs.acl_principal, AccessLevel::NoAccess)
+                .unwrap();
+            assert!(matches!(
+                vfs.fsync(attr.ino, false).await,
+                Err(VfsError::Meta(MetaError::InodeNotFound(_)))
+            ));
+            assert!(matches!(
+                vfs.read(attr.ino, 0, 16).await,
+                Err(VfsError::Meta(MetaError::InodeNotFound(_)))
+            ));
+
+            vfs.set_acl_rule(dir.ino, &vfs.acl_principal, AccessLevel::ReadWrite)
+                .unwrap();
+            vfs.release_fh(fh).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn scratch_readdir_merges_tracked_and_scratch_with_stable_order() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-ns-readdir-");
+        let (_runtime, vfs, _meta) =
+            super::super::tests::make_unstarted_test_vfs(&temp, "scratch-ns-readdir");
+
+        let _a = vfs.create(ROOT_INO, b"b_tracked.txt", 0, 0, 0o644).unwrap();
+        let _b = vfs.create(ROOT_INO, b"._a_scratch", 0, 0, 0o644).unwrap();
+        let _c = vfs.create(ROOT_INO, b"d_tracked.txt", 0, 0, 0o644).unwrap();
+        let _d = vfs.create(ROOT_INO, b"._c_scratch", 0, 0, 0o644).unwrap();
+
+        let first: Vec<Vec<u8>> = vfs
+            .readdir(ROOT_INO)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        let second: Vec<Vec<u8>> = vfs
+            .readdir_with_attrs(ROOT_INO)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.entry.name)
+            .collect();
+        let expected = vec![
+            b"._a_scratch".to_vec(),
+            b"._c_scratch".to_vec(),
+            b"b_tracked.txt".to_vec(),
+            b"d_tracked.txt".to_vec(),
+        ];
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+    }
+
+    #[test]
+    fn scratch_unlink_open_handle_reclaims_payloads_on_last_close_and_rmdir_enotempty() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-ns-unlink-");
+        let (runtime, vfs, meta) =
+            super::super::tests::make_unstarted_test_vfs(&temp, "scratch-ns-unlink");
+        let _guard = runtime.enter();
+        runtime.block_on(async {
+            let dir = vfs.mkdir(ROOT_INO, b"holder", 0, 0, 0o755).unwrap();
+            let events_before = meta.read_events_range(0, u64::MAX).unwrap().len();
+
+            let file = vfs.create(dir.ino, b"._open.tmp", 0, 0, 0o644).unwrap();
+            let fh1 = vfs.open_file(file.ino, OpenFlags::RDWR, false).unwrap();
+            let fh2 = vfs.open_file(file.ino, OpenFlags::RDONLY, false).unwrap();
+            vfs.write_fh(fh1, file.ino, 0, b"payload-bytes")
+                .await
+                .unwrap();
+            vfs.fsync(file.ino, false).await.unwrap();
+            let obj_id = scratch_object(meta.as_ref(), file.ino);
+            assert!(vfs.local_payload_backend.contains(obj_id));
+
+            // Tracked directory containing only a scratch entry fails rmdir with ENOTEMPTY.
+            assert!(matches!(
+                vfs.rmdir(ROOT_INO, b"holder"),
+                Err(VfsError::Meta(MetaError::DirNotEmpty(ino))) if ino == dir.ino
+            ));
+
+            // Unlink while open: dentry vanishes, zero events emitted, payload survives until last close.
+            vfs.unlink(dir.ino, b"._open.tmp").unwrap();
+            assert!(vfs.lookup(dir.ino, b"._open.tmp").is_err());
+            assert!(vfs.local_payload_backend.contains(obj_id));
+            assert_eq!(
+                vfs.read(file.ino, 0, 32).await.unwrap().as_ref(),
+                b"payload-bytes"
+            );
+            assert_eq!(
+                meta.read_events_range(0, u64::MAX).unwrap().len(),
+                events_before
+            );
+
+            // Closing first handle keeps payload alive.
+            vfs.release_fh(fh1).await.unwrap();
+            assert!(vfs.local_payload_backend.contains(obj_id));
+            assert_eq!(
+                vfs.read(file.ino, 0, 32).await.unwrap().as_ref(),
+                b"payload-bytes"
+            );
+
+            // Closing last handle finalizes orphan scratch inode and frees payload object.
+            vfs.release_fh(fh2).await.unwrap();
+            assert!(!vfs.local_payload_backend.contains(obj_id));
+            assert!(matches!(
+                meta.get_scratch_attr(file.ino),
+                Err(MetaError::InodeNotFound(_))
+            ));
+            assert_eq!(
+                meta.read_events_range(0, u64::MAX).unwrap().len(),
+                events_before
+            );
+
+            // Now tracked directory is empty and rmdir succeeds.
+            vfs.rmdir(ROOT_INO, b"holder").unwrap();
+        });
+    }
+
+    #[test]
+    fn scratch_rename_hardlink_discard_split_and_zero_events() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-ns-rename-");
+        let (runtime, vfs, meta) = make_started_test_vfs(&temp, "scratch-ns-rename");
+        let _guard = runtime.enter();
+        runtime.block_on(async {
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\nscratch_dir/\n").await;
+            let tracked_dir = vfs.mkdir(ROOT_INO, b"tracked_dir", 0, 0, 0o755).unwrap();
+            let tracked_file = vfs.create(ROOT_INO, b"doc.txt", 0, 0, 0o644).unwrap();
+            let scratch_dir = vfs.mkdir(ROOT_INO, b"scratch_dir", 0, 0, 0o755).unwrap();
+            let scratch_a = vfs.create(ROOT_INO, b"a.tmp", 0, 0, 0o644).unwrap();
+            let scratch_b = vfs.create(ROOT_INO, b"b.tmp", 0, 0, 0o644).unwrap();
+            assert!(vfs.is_scratch_inode(scratch_dir.ino).unwrap());
+            assert!(vfs.is_scratch_inode(scratch_a.ino).unwrap());
+
+            let events_before_scratch_ops = meta.read_events_range(0, u64::MAX).unwrap().len();
+
+            // Rename within scratch class stays scratch (including overwrite & case-only).
+            vfs.rename(ROOT_INO, b"a.tmp", ROOT_INO, b"b.tmp", true)
+                .unwrap();
+            assert_eq!(vfs.lookup(ROOT_INO, b"b.tmp").unwrap().ino, scratch_a.ino);
+            assert!(vfs.lookup(ROOT_INO, b"a.tmp").is_err());
+            assert!(matches!(
+                meta.get_scratch_attr(scratch_b.ino),
+                Err(MetaError::InodeNotFound(_))
+            ));
+            vfs.rename(ROOT_INO, b"b.tmp", scratch_dir.ino, b"moved.txt", false)
+                .unwrap();
+            assert_eq!(
+                vfs.lookup(scratch_dir.ino, b"moved.txt").unwrap().ino,
+                scratch_a.ino
+            );
+            assert!(vfs.is_scratch_inode(scratch_a.ino).unwrap());
+            vfs.rename(
+                scratch_dir.ino,
+                b"moved.txt",
+                scratch_dir.ino,
+                b"MOVED.TXT",
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                vfs.lookup(scratch_dir.ino, b"MOVED.TXT").unwrap().ino,
+                scratch_a.ino
+            );
+
+            // Cross-class renames return EXDEV until SFS-1078/SFS-1079 land.
+            assert!(matches!(
+                vfs.rename(
+                    scratch_dir.ino,
+                    b"MOVED.TXT",
+                    ROOT_INO,
+                    b"promoted.txt",
+                    true
+                ),
+                Err(VfsError::CrossDevice)
+            ));
+            assert!(matches!(
+                vfs.rename(ROOT_INO, b"doc.txt", scratch_dir.ino, b"demoted.txt", true),
+                Err(VfsError::CrossDevice)
+            ));
+
+            // Hardlinks: scratch -> any name returns EXDEV; tracked -> into scratch dir returns EXDEV.
+            assert!(matches!(
+                vfs.link(scratch_a.ino, ROOT_INO, b"link.tmp"),
+                Err(VfsError::CrossDevice)
+            ));
+            assert!(matches!(
+                vfs.link(scratch_a.ino, scratch_dir.ino, b"link2"),
+                Err(VfsError::CrossDevice)
+            ));
+            assert!(matches!(
+                vfs.link(tracked_file.ino, scratch_dir.ino, b"link_in_scratch"),
+                Err(VfsError::CrossDevice)
+            ));
+
+            // Discard paths stay in IgnoredEntryRegistry (not scratch).
+            let spotlight = vfs
+                .mkdir(ROOT_INO, b".Spotlight-V100", 0, 0, 0o755)
+                .unwrap();
+            let fsevents = vfs.create(ROOT_INO, b".fseventsd", 0, 0, 0o644).unwrap();
+            assert!(vfs.is_synthesized_ignored_ino(spotlight.ino));
+            assert!(!vfs.is_scratch_inode(spotlight.ino).unwrap());
+            assert!(vfs.is_synthesized_ignored_ino(fsevents.ino));
+            assert!(!vfs.is_scratch_inode(fsevents.ino).unwrap());
+
+            // Zero events emitted by all scratch/cross-class/discard operations above.
+            assert_eq!(
+                meta.read_events_range(0, u64::MAX).unwrap().len(),
+                events_before_scratch_ops
+            );
+
+            // Tracked -> matching name in a tracked parent stays tracked (hardlink & rename).
+            let hardlinked = vfs
+                .link(tracked_file.ino, tracked_dir.ino, b"hardlink.tmp")
+                .unwrap();
+            assert_eq!(hardlinked.ino, tracked_file.ino);
+            assert_eq!(hardlinked.nlink, 2);
+            assert!(!vfs.is_scratch_inode(hardlinked.ino).unwrap());
+
+            vfs.rename(ROOT_INO, b"doc.txt", tracked_dir.ino, b"renamed.tmp", false)
+                .unwrap();
+            let renamed = vfs.lookup(tracked_dir.ino, b"renamed.tmp").unwrap();
+            assert_eq!(renamed.ino, tracked_file.ino);
+            assert!(!vfs.is_scratch_inode(renamed.ino).unwrap());
+            assert!(meta.lookup(tracked_dir.ino, b"renamed.tmp").is_ok());
+        });
+    }
+
+    #[test]
+    fn scratch_dir_rule_cache_matches_full_classify_and_invalidates_on_epoch_change() {
+        let mut rules = crate::scratch_rules::ScratchRules::new(true);
+        rules.update(b"", b"*.tmp\nbuild/\n!build/keep\n").unwrap();
+        rules.update(b"sub", b"*.bak\n!special.tmp\n").unwrap();
+
+        for (dir, name, is_dir) in [
+            (b"".as_slice(), b"a.tmp".as_slice(), false),
+            (b"", b"a.txt", false),
+            (b"", b"._apple", false),
+            (b"", b".studiofsignore", false),
+            (b"sub", b"x.bak", false),
+            (b"sub", b"special.tmp", false),
+            (b"sub", b"other.tmp", false),
+            (b"sub/deep", b"nested.bak", false),
+            (b"build", b"anything.txt", false),
+            (b"build/deep", b"nested", true),
+        ] {
+            let compiled = rules.compile_directory(dir);
+            let mut full_path = dir.to_vec();
+            if !full_path.is_empty() {
+                full_path.push(b'/');
+            }
+            full_path.extend_from_slice(name);
+            assert_eq!(
+                compiled.classify_child(name, is_dir),
+                rules.classify(&full_path, is_dir),
+                "mismatch for dir={:?} name={:?}",
+                String::from_utf8_lossy(dir),
+                String::from_utf8_lossy(name)
+            );
+        }
+
+        // Verify VFS per-directory cache hits and epoch invalidation.
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-rule-cache-");
+        let (runtime, vfs, _meta) = make_started_test_vfs(&temp, "scratch-rule-cache");
+        let _guard = runtime.enter();
+        runtime.block_on(async {
+            install_ignore_rules(&vfs, ROOT_INO, b"dir_a/*.log\n").await;
+            let dir = vfs.mkdir(ROOT_INO, b"dir_a", 0, 0, 0o755).unwrap();
+            assert_eq!(
+                vfs.classify_new_entry(dir.ino, b"app.log", false).unwrap(),
+                crate::scratch_rules::ScratchClass::Scratch
+            );
+            // Second classification uses cached CompiledDirRules for dir.ino.
+            assert_eq!(
+                vfs.classify_new_entry(dir.ino, b"other.log", false)
+                    .unwrap(),
+                crate::scratch_rules::ScratchClass::Scratch
+            );
+            // Renaming dir_a -> dir_b bumps dir_rename_epoch and invalidates the cache.
+            vfs.rename(ROOT_INO, b"dir_a", ROOT_INO, b"dir_b", false)
+                .unwrap();
+            assert_eq!(
+                vfs.classify_new_entry(dir.ino, b"app.log", false).unwrap(),
+                crate::scratch_rules::ScratchClass::Tracked
+            );
+        });
     }
 }

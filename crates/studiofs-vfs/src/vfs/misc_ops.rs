@@ -4,6 +4,19 @@ use super::{
 };
 use crate::runtime::run_local_cache_io_blocking;
 
+/// Virtual read-only extended attribute marking local-only scratch entries.
+pub const SCRATCH_XATTR_NAME: &[u8] = b"user.studiofs.scratch";
+const SCRATCH_XATTR_VALUE: &[u8] = b"1";
+
+fn reserved_scratch_xattr_error(ino: Ino) -> VfsError {
+    VfsError::Meta(MetaError::AccessDenied {
+        ino,
+        principal: "reserved-xattr".to_string(),
+        required: AccessLevel::ReadWrite,
+        actual: AccessLevel::ReadOnly,
+    })
+}
+
 impl StudioVfs {
     /// Get an extended attribute value.
     pub fn get_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<Option<Vec<u8>>> {
@@ -14,6 +27,15 @@ impl StudioVfs {
             return Err(err);
         }
         if self.is_synthesized_ignored_ino(ino) {
+            return Ok(None);
+        }
+        if self.is_scratch_inode(ino)? {
+            if name == SCRATCH_XATTR_NAME {
+                return Ok(Some(SCRATCH_XATTR_VALUE.to_vec()));
+            }
+            return Ok(self.sync_meta().get_scratch_xattr(ino, name)?);
+        }
+        if name == SCRATCH_XATTR_NAME {
             return Ok(None);
         }
         Ok(self.sync_meta().get_xattr(ino, name)?)
@@ -30,6 +52,18 @@ impl StudioVfs {
         if self.is_synthesized_ignored_ino(ino) {
             return Ok(None);
         }
+        if self.is_scratch_inode(ino)? {
+            if name == SCRATCH_XATTR_NAME {
+                return Ok(Some(SCRATCH_XATTR_VALUE.len()));
+            }
+            return Ok(self
+                .sync_meta()
+                .get_scratch_xattr(ino, name)?
+                .map(|value| value.len()));
+        }
+        if name == SCRATCH_XATTR_NAME {
+            return Ok(None);
+        }
         Ok(self.sync_meta().get_xattr_size(ino, name)?)
     }
 
@@ -37,6 +71,9 @@ impl StudioVfs {
     pub fn set_xattr(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> VfsResult<()> {
         let operation = self.try_mutating_operation_admission()?;
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
+        if name == SCRATCH_XATTR_NAME {
+            return Err(reserved_scratch_xattr_error(ino));
+        }
         if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             if ignored.view.is_some() {
@@ -50,7 +87,13 @@ impl StudioVfs {
                 limit: self.max_xattr_bytes,
             }));
         }
-        self.commit_xattr_mutation(&operation, ino, || {
+        if self.is_scratch_inode(ino)? {
+            return self.commit_xattr_mutation(&operation, ino, true, || {
+                self.sync_meta()
+                    .set_scratch_xattr_with_flags(ino, name, value, flags)
+            });
+        }
+        self.commit_xattr_mutation(&operation, ino, false, || {
             self.sync_meta().set_xattr(ino, name, value, flags)
         })
     }
@@ -59,6 +102,9 @@ impl StudioVfs {
     pub fn remove_xattr(&self, ino: Ino, name: &[u8]) -> VfsResult<()> {
         let operation = self.try_mutating_operation_admission()?;
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
+        if name == SCRATCH_XATTR_NAME {
+            return Err(reserved_scratch_xattr_error(ino));
+        }
         if self.is_synthesized_ignored_ino(ino) {
             let ignored = self.visible_ignored_entry_snapshot(ino)?;
             if ignored.view.is_some() {
@@ -66,7 +112,14 @@ impl StudioVfs {
             }
             return Ok(());
         }
-        self.commit_xattr_mutation(&operation, ino, || self.sync_meta().remove_xattr(ino, name))
+        if self.is_scratch_inode(ino)? {
+            return self.commit_xattr_mutation(&operation, ino, true, || {
+                self.sync_meta().remove_scratch_xattr(ino, name)
+            });
+        }
+        self.commit_xattr_mutation(&operation, ino, false, || {
+            self.sync_meta().remove_xattr(ino, name)
+        })
     }
 
     /// Run an xattr mutation, whose ctime touch updates the inode row.
@@ -74,19 +127,22 @@ impl StudioVfs {
         &self,
         operation: &MutatingOperationAdmission<'_>,
         ino: Ino,
+        is_scratch: bool,
         mutate: impl FnOnce() -> Result<(), MetaError>,
     ) -> VfsResult<()> {
         if self.is_runtime_stats_file_ino(ino) {
             return Err(Self::runtime_stats_access_denied_error());
         }
         // A queued create has not committed the inode row yet.
-        if self.has_deferred_namespace_metadata(ino) {
+        if !is_scratch && self.has_deferred_namespace_metadata(ino) {
             self.run_sync_future_with_admission(
                 operation,
                 self.drain_deferred_namespace_metadata_for_barrier(),
             )?;
         }
-        self.ensure_no_deferred_namespace_error(ino)?;
+        if !is_scratch {
+            self.ensure_no_deferred_namespace_error(ino)?;
+        }
         // A flush persisting its dirty attr snapshot would overwrite the new ctime.
         let cleanup = self.file_session_cleanup(ino);
         let permit = self.run_sync_future_with_admission(operation, async {
@@ -102,7 +158,12 @@ impl StudioVfs {
         let has_dirty_attr = self.state.namespace.dirty_attrs.lock().contains_key(&ino);
         if has_dirty_attr {
             // The mutation already committed, so a failed read must not report it as failed.
-            match self.sync_meta().get_attr(ino) {
+            let committed_result = if is_scratch {
+                self.sync_meta().get_scratch_attr(ino)
+            } else {
+                self.sync_meta().get_attr(ino)
+            };
+            match committed_result {
                 Ok(committed) => {
                     if let Some(attr) = self.state.namespace.dirty_attrs.lock().get_mut(&ino) {
                         attr.ctime = committed.ctime;
@@ -125,6 +186,9 @@ impl StudioVfs {
         }
         if self.is_synthesized_ignored_ino(ino) {
             return Ok(Vec::new());
+        }
+        if self.is_scratch_inode(ino)? {
+            return Ok(self.sync_meta().list_scratch_xattrs(ino)?);
         }
         Ok(self.sync_meta().list_xattrs(ino)?)
     }

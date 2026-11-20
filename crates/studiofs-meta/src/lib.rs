@@ -58,7 +58,7 @@ pub use engine::{
     MetadataCheckpointRefreshReason, MetadataCoherenceProgress, MetadataWriteObservability,
     MetadataWriteStageTiming, NamespaceMutation, OrphanInodeFinalization, PgSyncDiagnostics,
     PgSyncFailure, PgSyncLifecycle, PgSyncPageDiagnostics, PgSyncStatus,
-    PgSyncWriteAuthorityReason, RegularFileOverlayMutation,
+    PgSyncWriteAuthorityReason, RegularFileOverlayMutation, ScratchRenameResult,
 };
 pub use events::MetaEvent;
 pub use janitor::{

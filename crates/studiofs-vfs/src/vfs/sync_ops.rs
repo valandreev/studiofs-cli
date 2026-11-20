@@ -21,7 +21,7 @@ use studiofs_meta::types::block_index_from_offset;
 
 const MAX_FLUSH_QUIESCE_PASSES: usize = 8;
 
-enum VfsWritePayload<'a> {
+pub(super) enum VfsWritePayload<'a> {
     Borrowed(&'a [u8]),
     Owned(Bytes),
 }
@@ -34,7 +34,7 @@ impl VfsWritePayload<'_> {
         }
     }
 
-    fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
@@ -89,7 +89,7 @@ impl StudioVfs {
         .await
     }
 
-    async fn sync_metadata_barrier(&self) -> VfsResult<()> {
+    pub(super) async fn sync_metadata_barrier(&self) -> VfsResult<()> {
         #[cfg(test)]
         self.state
             .metrics
@@ -842,6 +842,18 @@ impl StudioVfs {
         ino: Ino,
     ) -> VfsResult<ReleaseFhOutcome> {
         if self.release_ignored_entry(ino) {
+            return Ok(ReleaseFhOutcome {
+                closed_last_handle: true,
+                flushed_local_dirty_state: false,
+            });
+        }
+        if self.is_scratch_inode(ino)? {
+            let freed_objects = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.finalize_orphan_scratch_inode(ino)
+            })
+            .await?;
+            self.cleanup_scratch_inode_runtime_and_payloads(ino, freed_objects)
+                .await;
             return Ok(ReleaseFhOutcome {
                 closed_last_handle: true,
                 flushed_local_dirty_state: false,
@@ -1664,9 +1676,7 @@ impl StudioVfs {
             .enter_op(ino, FileSessionOperation::Fsync)
             .await;
         let result: VfsResult<FsyncOutcome> = async {
-            if !self.is_scratch_inode(ino)? {
-                self.enforce_access(ino, AccessLevel::ReadOnly)?;
-            }
+            self.enforce_access(ino, AccessLevel::ReadOnly)?;
             if self.is_synthesized_ignored_ino(ino) {
                 let _ignored = self.visible_ignored_entry_snapshot(ino)?;
                 return Ok(FsyncOutcome::default());
@@ -2216,6 +2226,9 @@ impl StudioVfs {
         offset: u64,
         data: VfsWritePayload<'_>,
     ) -> VfsResult<u32> {
+        if self.is_scratch_inode(ino)? {
+            return self.record_scratch_writer_stack_payload(fh, ino, offset, data);
+        }
         loop {
             let dirty_attr = self.state.namespace.dirty_attrs.lock().get(&ino).cloned();
             let mut open_attr = self

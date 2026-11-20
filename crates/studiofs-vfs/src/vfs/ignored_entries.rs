@@ -1,7 +1,6 @@
 use super::{
     AccessLevel, FileType, Ino, InodeAttr, MetaError, Ordering, ROOT_INO, StudioVfs, VfsError,
-    VfsResult, is_blocked_root_macos_metadata, is_ignored_macos_metadata,
-    is_probable_trash_component,
+    VfsResult, is_blocked_root_macos_metadata, is_probable_trash_component,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -696,8 +695,7 @@ impl StudioVfs {
     }
 
     pub(super) fn should_ignore_regular_file_path(&self, parent: Ino, name: &[u8]) -> bool {
-        is_ignored_macos_metadata(name)
-            || self.is_blocked_root_metadata_path(parent, name)
+        self.is_blocked_root_metadata_path(parent, name)
             || self.ignored_dir_attr(parent).is_some()
             || self.is_trash_sidecar_draft(parent, name)
             || self.is_macos_trash_metadata_entry(parent, name)

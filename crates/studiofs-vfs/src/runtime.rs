@@ -314,12 +314,26 @@ impl<M: ?Sized + UploadedFragmentLedger> UploadedFragmentLedger for RuntimeMetaH
 
 impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
     forward_method!(fn create_scratch_entry(&self, parent: Ino, name: &[u8], attr: &InodeAttr) -> MetaResult<()>);
+    forward_method!(fn create_scratch_symlink(&self, parent: Ino, name: &[u8], target: &[u8], attr: &InodeAttr) -> MetaResult<()>);
     forward_method!(fn lookup_scratch_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<Option<Ino>>);
+    forward_method!(fn readdir_scratch(&self, parent: Ino) -> MetaResult<Vec<(Vec<u8>, InodeAttr)>>);
+    forward_method!(fn has_scratch_children(&self, parent: Ino) -> MetaResult<bool>);
     forward_method!(fn get_scratch_attr(&self, ino: Ino) -> MetaResult<InodeAttr>);
+    forward_method!(fn set_scratch_attr(&self, attr: &InodeAttr) -> MetaResult<()>);
+    forward_method!(fn truncate_scratch(&self, ino: Ino, new_size: u64, attr: &InodeAttr) -> MetaResult<Vec<u64>>);
     forward_method!(fn commit_scratch_overlay(&self, ino: Ino, chunks: &[(studiofs_meta::schema::ChunkId, Vec<studiofs_meta::schema::SliceRecord>)]) -> MetaResult<Vec<u64>>);
     forward_method!(fn get_scratch_overlay(&self, ino: Ino, chunk: studiofs_meta::schema::ChunkId) -> MetaResult<Option<studiofs_meta::schema::RegularFileChunkState>>);
+    forward_method!(fn lookup_scratch_slices(&self, ino: Ino, offset: u64, length: u64) -> MetaResult<Vec<studiofs_meta::ResolvedSliceSpan>>);
+    forward_method!(fn get_scratch_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>>);
+    forward_method!(fn unlink_scratch_entry(&self, parent: Ino, name: &[u8], keep_open_inode: bool) -> MetaResult<(InodeAttr, Vec<u64>)>);
+    forward_method!(fn finalize_orphan_scratch_inode(&self, ino: Ino) -> MetaResult<Vec<u64>>);
+    forward_method!(fn rmdir_scratch_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<InodeAttr>);
+    forward_method!(fn rename_scratch_entry(&self, parent: Ino, name: &[u8], new_parent: Ino, new_name: &[u8], replace_if_exists: bool, keep_displaced_open: bool) -> MetaResult<studiofs_meta::ScratchRenameResult>);
     forward_method!(fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()>);
+    forward_method!(fn set_scratch_xattr_with_flags(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()>);
     forward_method!(fn get_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>);
+    forward_method!(fn remove_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()>);
+    forward_method!(fn list_scratch_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>>);
     forward_method!(fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>>);
     forward_method!(fn store_ignore_rules_cache(&self, snapshot: &[u8]) -> MetaResult<()>);
     forward_method!(fn metadata_write_observability(&self) -> MetadataWriteObservability);

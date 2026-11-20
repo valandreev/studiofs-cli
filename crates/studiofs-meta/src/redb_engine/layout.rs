@@ -18,6 +18,8 @@ pub(super) const SCRATCH_OVERLAY: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("scratch_overlay");
 pub(super) const SCRATCH_XATTRS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("scratch_xattrs");
+pub(super) const SCRATCH_SYMLINKS: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("scratch_symlinks");
 
 /// Counters: counter_name -> u64 (as bytes)
 pub(super) const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
