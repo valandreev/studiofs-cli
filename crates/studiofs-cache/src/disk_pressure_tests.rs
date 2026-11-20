@@ -502,6 +502,7 @@ fn scratch_payload_survives_budget_and_physical_pressure() {
 fn scratch_admission_reads_only_the_cached_reserve_sample() {
     let (_temp, backend) = backend();
     let put_scratch = |object_id| {
+        backend.admit_scratch_write()?;
         backend.put_scratch_batch(&[LocalPayloadPut {
             object_id,
             data: Bytes::from_static(b"scratch"),

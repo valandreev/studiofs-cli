@@ -13,79 +13,128 @@ impl StudioVfs {
         Ok(attr)
     }
 
-    /// Writes one complete scratch block and durably updates its local mapping.
-    ///
-    /// The caller assembles partial edits into a full block before replacement.
-    /// The final block may be shorter than the volume block size.
-    pub async fn write_scratch_block(&self, ino: Ino, block: u32, data: Bytes) -> VfsResult<()> {
-        self.enforce_metadata_mutation_authority(ino)?;
-        if data.is_empty() || data.len() > self.block_size as usize {
-            return Err(VfsError::Io(io::ErrorKind::InvalidInput.into()));
+    pub(crate) fn is_scratch_inode(&self, ino: Ino) -> VfsResult<bool> {
+        match self.sync_meta().get_scratch_attr(ino) {
+            Ok(_) => Ok(true),
+            Err(MetaError::InodeNotFound(_)) => Ok(false),
+            Err(error) => Err(error.into()),
         }
-        let end = u64::from(block) * self.block_size as u64 + data.len() as u64;
-        let _session = self
-            .state
-            .file_session
-            .enter_op(ino, FileSessionOperation::Write)
-            .await;
-        let object_id = run_meta(self.meta.clone(), move |meta: Arc<dyn VfsMeta>| {
-            let attr = meta.get_scratch_attr(ino)?;
-            if attr.kind != FileType::RegularFile {
-                return Err(MetaError::TargetChanged);
-            }
-            let id = meta.next_object_ids(1)?.into_iter().next().ok_or_else(|| {
-                MetaError::Storage("allocated scratch object batch is empty".into())
-            })?;
-            // Fence the ID before a payload file can exist after a crash.
-            meta.sync_local_metadata()?;
-            Ok(id)
-        })
-        .await?;
-
-        self.payload_store_put_batch_with_mode(
-            vec![LocalPayloadPut {
-                object_id,
-                data,
-                evictable: false,
-            }],
-            true,
-        )
-        .await?;
-
-        let previous = run_meta(self.meta.clone(), move |meta: Arc<dyn VfsMeta>| {
-            meta.commit_scratch_block(ino, block, object_id, end)
-        })
-        .await?;
-        if let Some(previous) = previous
-            && let Err(error) = self.payload_store_remove_batch_async(&[previous]).await
-        {
-            warn!(ino, previous, %error, "failed to remove displaced scratch payload");
-        }
-        Ok(())
     }
 
-    /// Reads a scratch block from local storage. An absent mapping denotes a hole.
-    pub async fn read_scratch_block(&self, ino: Ino, block: u32) -> VfsResult<Option<Bytes>> {
-        let _session = self
+    /// Accepts scratch bytes into the mounted writer stack.
+    ///
+    /// The caller owns namespace and access checks and schedules ordinary
+    /// writeback through the same flush/release entry points as tracked files.
+    pub async fn write_scratch(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        data: &[u8],
+    ) -> VfsResult<u32> {
+        self.enforce_metadata_mutation_authority(ino)?;
+        let _session = self.file_session_cleanup(ino).with_permit(
+            self.state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Write)
+                .await,
+        );
+        if fh != 0 {
+            self.enforce_mutating_handle_access(fh, ino)?;
+        }
+        let attr = self.sync_meta().get_scratch_attr(ino)?;
+        if attr.kind != FileType::RegularFile {
+            return Err(MetaError::TargetChanged.into());
+        }
+        if !data.is_empty() {
+            self.local_payload_backend
+                .admit_scratch_write()
+                .map_err(VfsError::LocalPayload)?;
+        }
+        let accepted = self
             .state
-            .file_session
-            .enter_op(ino, FileSessionOperation::Read)
-            .await;
-        let object = run_meta(self.meta.clone(), move |meta: Arc<dyn VfsMeta>| {
-            meta.get_scratch_block(ino, block)
-        })
-        .await?;
-        let Some(object) = object else {
-            return Ok(None);
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino,
+                    current_size: attr.size,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset,
+                },
+                data,
+            )
+            .map_err(|error| error.into_vfs_error("scratch writer stack write failed"))?;
+        Ok(accepted.accepted_bytes)
+    }
+
+    /// Reads committed scratch bytes for a block. An uncovered block denotes a hole.
+    pub async fn read_scratch_block(&self, ino: Ino, block: u32) -> VfsResult<Option<Bytes>> {
+        use studiofs_meta::schema::{
+            DEFAULT_CHUNK_SIZE, SliceRange, chunk_id_from_offset, chunk_start_offset,
+            resolve_chunk_slice_spans,
         };
-        self.payload_store_get_async(object)
-            .await?
-            .map(Some)
-            .ok_or_else(|| {
-                VfsError::Io(io::Error::other(
-                    "scratch payload missing from the local store",
-                ))
-            })
+
+        // A background overlay commit can retire objects from the old mapping.
+        let _session = self.file_session_cleanup(ino).with_permit(
+            self.state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Flush)
+                .await,
+        );
+        let start = u64::from(block) * u64::from(self.block_size);
+        let size = self.sync_meta().get_scratch_attr(ino)?.size;
+        let end = (start + u64::from(self.block_size)).min(size);
+        if start >= end {
+            return Ok(None);
+        }
+        let mut data =
+            if let Some(object) = self.sync_meta().get_legacy_scratch_block(ino, block)? {
+                let bytes = self.payload_store_get_async(object).await?.ok_or_else(|| {
+                    io::Error::other("legacy scratch payload missing in local store")
+                })?;
+                let mut bytes = bytes.to_vec();
+                bytes.resize((end - start) as usize, 0);
+                Some(bytes)
+            } else {
+                None
+            };
+        let mut cursor = start;
+        while cursor < end {
+            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            let chunk_end = (chunk_start + u64::from(DEFAULT_CHUNK_SIZE)).min(end);
+            if let Some(chunk) = self.sync_meta().get_scratch_overlay(ino, chunk_id)? {
+                let range = SliceRange::new(
+                    (cursor - chunk_start) as u32,
+                    (chunk_end - chunk_start) as u32,
+                )
+                .expect("nonempty range within a chunk");
+                for span in resolve_chunk_slice_spans(chunk_id, range, Some(&chunk), None) {
+                    let Some(payload) = span.payload else {
+                        continue;
+                    };
+                    let offset = (chunk_start + u64::from(span.range.start) - start) as usize;
+                    let bytes = self.payload_store_get_async(payload.object_id).await?;
+                    let bytes = bytes
+                        .as_ref()
+                        .and_then(|bytes| {
+                            bytes.get(
+                                payload.offset as usize
+                                    ..payload.offset as usize + payload.length as usize,
+                            )
+                        })
+                        .ok_or_else(|| {
+                            io::Error::other("scratch payload missing or truncated in local store")
+                        })?;
+                    let data = data.get_or_insert_with(|| vec![0; (end - start) as usize]);
+                    data[offset..offset + bytes.len()].copy_from_slice(bytes);
+                }
+            }
+            cursor = chunk_end;
+        }
+        Ok(data.map(Bytes::from))
     }
 }
 
@@ -99,6 +148,19 @@ mod tests {
     const VOLUME: &str = "scratch-storage";
     const NAME: &[u8] = b"scene.tmp";
     const DATA: &[u8] = b"locally durable data";
+
+    fn scratch_object(meta: &dyn MetaEngineCore, ino: Ino) -> u64 {
+        meta.get_scratch_overlay(ino, studiofs_meta::schema::ChunkId(0))
+            .unwrap()
+            .unwrap()
+            .slices
+            .values()
+            .next()
+            .unwrap()
+            .payload
+            .unwrap()
+            .object_id
+    }
 
     #[test]
     fn scratch_storage_survives_unclean_process_exit_without_publication() {
@@ -124,11 +186,48 @@ mod tests {
             assert!(attr.ino < 1 << 63);
             meta.set_scratch_xattr(attr.ino, b"user.test", b"local")
                 .unwrap();
+            let counters = vfs.cached_store.snapshot_writer_counters();
+            let commits = meta.metadata_write_observability().commit.calls;
+            let submissions = vfs
+                .cached_store
+                .cache_pipeline_metrics()
+                .upload_queue
+                .submitted;
+            let syncs = vfs
+                .state
+                .metrics
+                .metadata_sync_barrier_calls
+                .load(Ordering::Relaxed);
             runtime
-                .block_on(vfs.write_scratch_block(attr.ino, 0, Bytes::from_static(DATA)))
+                .block_on(vfs.write_scratch(0, attr.ino, 0, DATA))
                 .unwrap();
+            let accepted = vfs.cached_store.snapshot_writer_counters();
+            assert!(accepted.dirty_bytes > counters.dirty_bytes);
+            assert_eq!(accepted.staged_bytes, counters.staged_bytes);
+            assert_eq!(meta.metadata_write_observability().commit.calls, commits);
+            assert_eq!(
+                vfs.state
+                    .metrics
+                    .metadata_sync_barrier_calls
+                    .load(Ordering::Relaxed),
+                syncs
+            );
+            assert_eq!(meta.get_scratch_attr(attr.ino).unwrap().size, 0);
+            assert!(
+                meta.get_scratch_overlay(attr.ino, studiofs_meta::schema::ChunkId(0))
+                    .unwrap()
+                    .is_none()
+            );
+            runtime.block_on(vfs.fsync(attr.ino, false)).unwrap();
             assert_eq!(meta.read_events_range(0, u64::MAX).unwrap().len(), events);
             assert_eq!(vfs.cached_store.pending_upload_count(), pending);
+            assert_eq!(
+                vfs.cached_store
+                    .cache_pipeline_metrics()
+                    .upload_queue
+                    .submitted,
+                submissions
+            );
             assert_eq!(meta.logical_usage(&HashMap::new()).unwrap(), usage);
             // Exit immediately with the database and VFS still open.
             std::process::exit(42);
@@ -149,7 +248,7 @@ mod tests {
             meta.get_scratch_xattr(ino, b"user.test").unwrap().unwrap(),
             b"local"
         );
-        let object = meta.get_scratch_block(ino, 0).unwrap().unwrap();
+        let object = scratch_object(meta.as_ref(), ino);
         assert!(
             meta.get_local_cache_referenced_object_ids()
                 .unwrap()
@@ -179,14 +278,16 @@ mod tests {
             .store_scratch_entry(NAME, InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
             .unwrap();
         runtime
-            .block_on(vfs.write_scratch_block(attr.ino, 0, Bytes::from_static(DATA)))
+            .block_on(vfs.write_scratch(0, attr.ino, 0, DATA))
             .unwrap();
-        let first = meta.get_scratch_block(attr.ino, 0).unwrap().unwrap();
+        runtime.block_on(vfs.flush(attr.ino)).unwrap();
+        let first = scratch_object(meta.as_ref(), attr.ino);
         runtime
-            .block_on(vfs.write_scratch_block(attr.ino, 0, Bytes::from_static(b"second")))
+            .block_on(vfs.write_scratch(0, attr.ino, 0, b"second durable data!"))
             .unwrap();
 
-        let second = meta.get_scratch_block(attr.ino, 0).unwrap().unwrap();
+        runtime.block_on(vfs.flush(attr.ino)).unwrap();
+        let second = scratch_object(meta.as_ref(), attr.ino);
         assert_ne!(first, second);
         assert!(!vfs.local_payload_backend().contains(first));
         assert!(
@@ -200,13 +301,62 @@ mod tests {
                 .block_on(vfs.read_scratch_block(attr.ino, 0))
                 .unwrap()
                 .unwrap(),
-            b"second".as_slice()
+            b"second durable data!".as_slice()
         );
+        runtime.block_on(async {
+            vfs.write_scratch(0, attr.ino, 7, b"saved").await.unwrap();
+            vfs.flush_volatile_writeback_with_outcome(attr.ino, 0)
+                .await
+                .unwrap();
+            vfs.wait_for_deferred_materialization_inflight(attr.ino)
+                .await;
+            assert_eq!(
+                vfs.read_scratch_block(attr.ino, 0).await.unwrap().unwrap(),
+                b"second savedle data!".as_slice()
+            );
+        });
         // The size only grows; SFS-1077 owns truncation.
         assert_eq!(
             meta.get_scratch_attr(attr.ino).unwrap().size,
             DATA.len() as u64
         );
+    }
+
+    #[test]
+    fn scratch_deferred_release_drains_writer_pages() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-release-");
+        let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs(&temp, VOLUME);
+        let attr = vfs
+            .store_scratch_entry(NAME, InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
+            .unwrap();
+        let ino = attr.ino;
+        // Emulate the handle registration that the scratch namespace will use.
+        let file = vfs
+            .handle_table
+            .open(ino, OpenFlags::RDWR, Some(attr), false);
+        vfs.state.file_session.note_open_handle(ino);
+        vfs.sync_meta().note_open_handle(ino, true);
+        vfs.state
+            .read
+            .increment_active_access_class(file.current_access_class());
+
+        runtime.block_on(async {
+            let events = meta.read_events_range(0, u64::MAX).unwrap().len();
+            vfs.write_scratch(file.fh, ino, 0, DATA).await.unwrap();
+            let release =
+                vfs.release_fh_with_deferred_last_handle_barrier(file.fh, runtime.handle());
+            assert!(release.closed_last_handle && release.flushed_local_dirty_state);
+            vfs.wait_for_deferred_release_inflight(ino).await;
+            assert_eq!(vfs.read_scratch_block(ino, 0).await.unwrap().unwrap(), DATA);
+            assert_eq!(meta.read_events_range(0, u64::MAX).unwrap().len(), events);
+            assert_eq!(
+                vfs.cached_store
+                    .cache_pipeline_metrics()
+                    .upload_queue
+                    .submitted,
+                0
+            );
+        });
     }
 
     #[test]
@@ -217,7 +367,7 @@ mod tests {
             .store_scratch_entry(NAME, InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
             .unwrap();
         runtime
-            .block_on(vfs.write_scratch_block(attr.ino, 0, Bytes::from_static(DATA)))
+            .block_on(vfs.write_scratch(0, attr.ino, 0, DATA))
             .unwrap();
         let backend = vfs
             .local_payload_backend
@@ -226,12 +376,14 @@ mod tests {
             .unwrap();
         backend.run_low_disk_space_for_test().unwrap();
         let error = runtime
-            .block_on(vfs.write_scratch_block(attr.ino, 0, Bytes::from_static(b"replacement")))
+            .block_on(vfs.write_scratch(0, attr.ino, 0, b"replacement"))
             .unwrap_err();
         assert_eq!(
             crate::bridge::classify_vfs_error(&error),
             crate::BridgeVfsErrorKind::StorageFull
         );
+        // Bytes accepted before the sample changed still drain.
+        runtime.block_on(vfs.flush(attr.ino)).unwrap();
         assert_eq!(
             runtime
                 .block_on(vfs.read_scratch_block(attr.ino, 0))
@@ -239,7 +391,7 @@ mod tests {
                 .unwrap(),
             DATA
         );
-        let object = meta.get_scratch_block(attr.ino, 0).unwrap().unwrap();
+        let object = scratch_object(meta.as_ref(), attr.ino);
         assert!(!backend.is_evictable(object));
         assert_eq!(backend.storage_stats().dirty_bytes, 0);
     }

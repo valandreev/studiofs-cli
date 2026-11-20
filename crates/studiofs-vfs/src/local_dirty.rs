@@ -1644,6 +1644,38 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 .flush_barrier_calls
                 .fetch_add(1, Ordering::Relaxed);
         }
+        if self.vfs.is_scratch_inode(self.ino)? {
+            let pending_slices = self
+                .vfs
+                .snapshot_pending_persisted_local_dirty_slices(self.ino);
+            if !pending_slices.is_empty() {
+                let drain = LocalDirtyDrainCore {
+                    commit_meta: ScratchOverlayCommitter { vfs: self.vfs },
+                    uploads: ScratchUploadSubmitter,
+                    local_payloads: self.drain.local_payloads,
+                    object_ids: self.drain.object_ids,
+                    observer: self.drain.observer,
+                    block_size: self.drain.block_size,
+                    put_concurrency: self.drain.put_concurrency,
+                };
+                drain
+                    .execute_drain(
+                        self.ino,
+                        Vec::new(),
+                        pending_slices.clone(),
+                        0,
+                        None,
+                        PayloadPersistConfig {
+                            put_concurrency: drain.put_concurrency,
+                            local_sync_policy,
+                        },
+                    )
+                    .await?;
+                self.vfs
+                    .commit_pending_local_dirty_slices(self.ino, &pending_slices);
+            }
+            return Ok(());
+        }
         self.vfs
             .enforce_access_for_local_drain(self.ino, AccessLevel::ReadWrite)?;
         if self.vfs.ignored_entry_attr(self.ino).is_some() {

@@ -1356,24 +1356,34 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
     }
 
     /// Read attributes from the local scratch inode table.
-    fn get_scratch_attr(&self, _ino: Ino) -> MetaResult<InodeAttr> {
-        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    fn get_scratch_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
+        Err(MetaError::InodeNotFound(ino))
     }
 
-    /// Commit an already durable scratch block and return the displaced object ID.
-    fn commit_scratch_block(
+    /// Commit durable scratch slices and return objects no longer referenced.
+    fn commit_scratch_overlay(
         &self,
-        _ino: Ino,
-        _block: u32,
-        _object_id: u64,
-        _end: u64,
-    ) -> MetaResult<Option<u64>> {
+        ino: Ino,
+        chunks: &[(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)],
+    ) -> MetaResult<Vec<u64>> {
+        let _ = (ino, chunks);
         Err(MetaError::Storage("scratch storage is unsupported".into()))
     }
 
-    /// Read the local object ID for a scratch block.
-    fn get_scratch_block(&self, _ino: Ino, _block: u32) -> MetaResult<Option<u64>> {
+    /// Read the committed local scratch chunk.
+    fn get_scratch_overlay(
+        &self,
+        ino: Ino,
+        chunk: crate::schema::ChunkId,
+    ) -> MetaResult<Option<crate::schema::RegularFileChunkState>> {
+        let _ = (ino, chunk);
         Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Read a block written by the initial scratch storage layout.
+    fn get_legacy_scratch_block(&self, ino: Ino, block: u32) -> MetaResult<Option<u64>> {
+        let _ = (ino, block);
+        Ok(None)
     }
 
     /// Persist a local scratch extended attribute.

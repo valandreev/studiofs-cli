@@ -7117,14 +7117,6 @@ impl StudioVfs {
     }
 
     async fn payload_store_put_batch_async(&self, entries: Vec<LocalPayloadPut>) -> VfsResult<()> {
-        self.payload_store_put_batch_with_mode(entries, false).await
-    }
-
-    async fn payload_store_put_batch_with_mode(
-        &self,
-        entries: Vec<LocalPayloadPut>,
-        scratch: bool,
-    ) -> VfsResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -7133,12 +7125,9 @@ impl StudioVfs {
         let ((), timing) = run_local_cache_io_blocking(move || {
             // The closure keeps running if this future is dropped, so it owns the slot.
             let _local_io = local_io;
-            if scratch {
-                payload_store.put_scratch_batch(&entries)
-            } else {
-                payload_store.put_batch(&entries)
-            }
-            .map_err(VfsError::LocalPayload)
+            payload_store
+                .put_batch(&entries)
+                .map_err(VfsError::LocalPayload)
         })
         .await?;
         self.record_local_cache_io_timing(timing);

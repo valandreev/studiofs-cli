@@ -1664,7 +1664,9 @@ impl StudioVfs {
             .enter_op(ino, FileSessionOperation::Fsync)
             .await;
         let result: VfsResult<FsyncOutcome> = async {
-            self.enforce_access(ino, AccessLevel::ReadOnly)?;
+            if !self.is_scratch_inode(ino)? {
+                self.enforce_access(ino, AccessLevel::ReadOnly)?;
+            }
             if self.is_synthesized_ignored_ino(ino) {
                 let _ignored = self.visible_ignored_entry_snapshot(ino)?;
                 return Ok(FsyncOutcome::default());
@@ -2414,17 +2416,23 @@ impl StudioVfs {
         &self,
         ino: Ino,
         object_count: u32,
+        scratch: bool,
     ) -> VfsResult<u64> {
         if object_count == 0 {
             return Ok(0);
         }
-        if let Some(first_object_id) =
-            self.take_prefetched_writer_stack_object_ids(ino, object_count)
+        if !scratch
+            && let Some(first_object_id) =
+                self.take_prefetched_writer_stack_object_ids(ino, object_count)
         {
             return Ok(first_object_id);
         }
         let ids = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.next_object_ids(object_count)
+            let ids = engine.next_object_ids(object_count)?;
+            if scratch {
+                engine.sync_local_metadata()?;
+            }
+            Ok(ids)
         })
         .await?;
         ids.first()
@@ -2544,13 +2552,14 @@ impl StudioVfs {
             .prepare_finish_inode(ino)
             .map_err(|error| error.into_vfs_error("writer stack finish failed"))?;
         // Detached slices can still need a retry without reserving new IDs.
+        let scratch = self.is_scratch_inode(ino)?;
         let first_object_id = self
-            .reserve_writer_stack_object_ids_by_count(ino, object_count)
+            .reserve_writer_stack_object_ids_by_count(ino, object_count, scratch)
             .await?;
         let finished = self
             .state
             .writer_stack
-            .finish_prepared_inode(ino, first_object_id)
+            .finish_prepared_inode(ino, first_object_id, scratch)
             .map_err(|error| error.into_vfs_error("writer stack finish failed"))?;
         if finished.is_empty() {
             return Ok(0);
@@ -2584,13 +2593,14 @@ impl StudioVfs {
         if object_count == 0 {
             return Ok(0);
         }
+        let scratch = self.is_scratch_inode(ino)?;
         let first_object_id = self
-            .reserve_writer_stack_object_ids_by_count(ino, object_count)
+            .reserve_writer_stack_object_ids_by_count(ino, object_count, scratch)
             .await?;
         let finished = self
             .state
             .writer_stack
-            .finish_prepared_inode(ino, first_object_id)
+            .finish_prepared_inode(ino, first_object_id, scratch)
             .map_err(|error| error.into_vfs_error("writer stack idle finish failed"))?;
         if finished.is_empty() {
             return Ok(0);
@@ -2624,13 +2634,14 @@ impl StudioVfs {
             return Ok(0);
         }
         let object_count = self.completed_block_materialization_batch_blocks(object_count);
+        let scratch = self.is_scratch_inode(ino)?;
         let first_object_id = self
-            .reserve_writer_stack_object_ids_by_count(ino, object_count)
+            .reserve_writer_stack_object_ids_by_count(ino, object_count, scratch)
             .await?;
         let finished = self
             .state
             .writer_stack
-            .flush_completed_blocks_for_inode(ino, first_object_id, object_count as usize)
+            .flush_completed_blocks_for_inode(ino, first_object_id, object_count as usize, scratch)
             .map_err(|error| error.into_vfs_error("writer stack completed block flush failed"))?;
         if finished.is_empty() {
             return Ok(0);

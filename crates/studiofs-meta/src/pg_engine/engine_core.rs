@@ -19,18 +19,24 @@ impl MetaEngineCore for PgMetaEngine {
         self.local.get_scratch_attr(ino)
     }
 
-    fn commit_scratch_block(
+    fn commit_scratch_overlay(
         &self,
         ino: Ino,
-        block: u32,
-        object_id: u64,
-        end: u64,
-    ) -> MetaResult<Option<u64>> {
-        self.local.commit_scratch_block(ino, block, object_id, end)
+        chunks: &[(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)],
+    ) -> MetaResult<Vec<u64>> {
+        self.local.commit_scratch_overlay(ino, chunks)
     }
 
-    fn get_scratch_block(&self, ino: Ino, block: u32) -> MetaResult<Option<u64>> {
-        self.local.get_scratch_block(ino, block)
+    fn get_scratch_overlay(
+        &self,
+        ino: Ino,
+        chunk: crate::schema::ChunkId,
+    ) -> MetaResult<Option<crate::schema::RegularFileChunkState>> {
+        self.local.get_scratch_overlay(ino, chunk)
+    }
+
+    fn get_legacy_scratch_block(&self, ino: Ino, block: u32) -> MetaResult<Option<u64>> {
+        self.local.get_legacy_scratch_block(ino, block)
     }
 
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {

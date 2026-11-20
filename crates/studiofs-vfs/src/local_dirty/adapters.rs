@@ -8,6 +8,47 @@ pub(super) struct VfsLocalPayloadWriter<'a> {
 }
 
 #[derive(Clone, Copy)]
+pub(super) struct ScratchOverlayCommitter<'a> {
+    pub(super) vfs: &'a StudioVfs,
+}
+
+pub(super) struct ScratchUploadSubmitter;
+
+impl UploadSubmissionPort for ScratchUploadSubmitter {
+    async fn submit_uploads(
+        &self,
+        _ino: Ino,
+        _blocks: &[PersistedPayloadEntry],
+        _content_epoch: u64,
+    ) {
+    }
+}
+
+impl OverlayCommitPort for ScratchOverlayCommitter<'_> {
+    async fn commit_overlay(
+        &self,
+        ino: Ino,
+        chunk_slices: Vec<(
+            studiofs_meta::schema::ChunkId,
+            Vec<studiofs_meta::schema::SliceRecord>,
+        )>,
+        _attr: Option<InodeAttr>,
+        _wait_for_completion: bool,
+    ) -> VfsResult<Option<InodeAttr>> {
+        let retired = run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.commit_scratch_overlay(ino, &chunk_slices)
+        })
+        .await?;
+        if !retired.is_empty()
+            && let Err(error) = self.vfs.payload_store_remove_batch_async(&retired).await
+        {
+            warn!(ino, %error, "failed to remove displaced scratch payloads");
+        }
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct VfsOverlayCommitter<'a> {
     pub(super) vfs: &'a StudioVfs,
 }

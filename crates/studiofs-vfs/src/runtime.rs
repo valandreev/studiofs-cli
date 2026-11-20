@@ -316,8 +316,9 @@ impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
     forward_method!(fn create_scratch_entry(&self, parent: Ino, name: &[u8], attr: &InodeAttr) -> MetaResult<()>);
     forward_method!(fn lookup_scratch_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<Option<Ino>>);
     forward_method!(fn get_scratch_attr(&self, ino: Ino) -> MetaResult<InodeAttr>);
-    forward_method!(fn commit_scratch_block(&self, ino: Ino, block: u32, object_id: u64, end: u64) -> MetaResult<Option<u64>>);
-    forward_method!(fn get_scratch_block(&self, ino: Ino, block: u32) -> MetaResult<Option<u64>>);
+    forward_method!(fn commit_scratch_overlay(&self, ino: Ino, chunks: &[(studiofs_meta::schema::ChunkId, Vec<studiofs_meta::schema::SliceRecord>)]) -> MetaResult<Vec<u64>>);
+    forward_method!(fn get_scratch_overlay(&self, ino: Ino, chunk: studiofs_meta::schema::ChunkId) -> MetaResult<Option<studiofs_meta::schema::RegularFileChunkState>>);
+    forward_method!(fn get_legacy_scratch_block(&self, ino: Ino, block: u32) -> MetaResult<Option<u64>>);
     forward_method!(fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()>);
     forward_method!(fn get_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>);
     forward_method!(fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>>);

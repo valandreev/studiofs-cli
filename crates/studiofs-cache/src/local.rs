@@ -135,7 +135,12 @@ pub enum LocalPayloadBackendError {
 
 /// Minimal local payload API required by read/write/upload paths.
 pub trait LocalPayloadBackend: Send + Sync {
-    /// Writes protected local-only objects using the cached physical-space reserve.
+    /// Checks the cached physical-space reserve at scratch write admission.
+    fn admit_scratch_write(&self) -> Result<(), LocalPayloadBackendError> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported).into())
+    }
+
+    /// Persists admitted local-only objects before committing scratch metadata.
     fn put_scratch_batch(
         &self,
         _entries: &[LocalPayloadPut],

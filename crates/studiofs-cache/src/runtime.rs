@@ -1696,16 +1696,20 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         self.put_batch_with_mode(entries, false)
     }
 
-    fn put_scratch_batch(
-        &self,
-        entries: &[LocalPayloadPut],
-    ) -> Result<(), LocalPayloadBackendError> {
+    fn admit_scratch_write(&self) -> Result<(), LocalPayloadBackendError> {
         let status = self.physical_space_status();
         if let Some((available, reserve)) = status.available_bytes.zip(status.reserve_bytes)
             && available < reserve
         {
             return Err(io::Error::from(io::ErrorKind::StorageFull).into());
         }
+        Ok(())
+    }
+
+    fn put_scratch_batch(
+        &self,
+        entries: &[LocalPayloadPut],
+    ) -> Result<(), LocalPayloadBackendError> {
         self.put_batch_with_mode(entries, true)
     }
 

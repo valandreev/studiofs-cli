@@ -1147,8 +1147,7 @@ impl RedbMetaEngine {
                 .map_err(scratch::storage_error)?;
             txn.open_table(SCRATCH_DENTRIES)
                 .map_err(scratch::storage_error)?;
-            txn.open_table(SCRATCH_OVERLAY)
-                .map_err(scratch::storage_error)?;
+            scratch::open_scratch_overlay_tables(&txn)?;
             txn.open_table(SCRATCH_XATTRS)
                 .map_err(scratch::storage_error)?;
             let _ = txn.open_table(SETTINGS_TABLE);
@@ -1471,18 +1470,28 @@ impl MetaEngineCore for RedbMetaEngine {
         self.read_scratch_attr(ino)
     }
 
-    fn commit_scratch_block(
+    fn commit_scratch_overlay(
         &self,
         ino: Ino,
-        block: u32,
-        object_id: u64,
-        end: u64,
-    ) -> MetaResult<Option<u64>> {
-        self.replace_scratch_block(ino, block, object_id, end)
+        chunks: &[(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)],
+    ) -> MetaResult<Vec<u64>> {
+        self.replace_scratch_overlay(ino, chunks)
     }
 
-    fn get_scratch_block(&self, ino: Ino, block: u32) -> MetaResult<Option<u64>> {
-        self.read_scratch_block(ino, block)
+    fn get_scratch_overlay(
+        &self,
+        ino: Ino,
+        chunk: crate::schema::ChunkId,
+    ) -> MetaResult<Option<crate::schema::RegularFileChunkState>> {
+        self.read_scratch_overlay(ino, chunk)
+    }
+
+    fn get_legacy_scratch_block(&self, ino: Ino, block: u32) -> MetaResult<Option<u64>> {
+        let txn = self.begin_read_txn()?;
+        let table = txn
+            .open_table(LEGACY_SCRATCH_OVERLAY)
+            .map_err(scratch::storage_error)?;
+        Ok(table.get((ino, block))?.map(|row| row.value()))
     }
 
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {
