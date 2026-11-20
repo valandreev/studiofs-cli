@@ -73,6 +73,34 @@ pub struct LocalPayloadObjectStats {
     pub evictable: bool,
 }
 
+/// Index metadata captured before the scrub reads the payload file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedPayload {
+    /// Object associated with the observation.
+    pub object_id: u64,
+    /// Recorded XXH64 of the payload, when available.
+    pub xxh64: Option<u64>,
+    /// Recorded file length in bytes.
+    pub payload_len: u64,
+    /// Lifecycle at the time of observation.
+    pub lifecycle: LocalPayloadLifecycleState,
+    /// Index sequence replaced by every rewrite. Access touches can also advance it.
+    pub access_order: u64,
+}
+
+/// Result of revalidating a scrub observation for eviction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorruptEvictionOutcome {
+    /// Corruption was confirmed and the cache entry was removed.
+    Evicted,
+    /// Current state protects the payload or no verified checksum is available.
+    NotEligible,
+    /// The observed entry changed or disappeared.
+    Changed,
+    /// The file still matches the verified length and checksum.
+    NotCorrupt,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Owned put request used by batch APIs.
 pub struct LocalPayloadPut {
@@ -107,6 +135,16 @@ pub enum LocalPayloadBackendError {
 pub trait LocalPayloadBackend: Send + Sync {
     /// Returns `self` as `dyn Any` for downcasting to a concrete backend type.
     fn as_any(&self) -> &dyn Any;
+
+    /// Evicts an unchanged, eligible entry if a fresh read confirms corruption.
+    /// Backends without scrub support leave the entry in place.
+    fn evict_corrupt(
+        &self,
+        _object_id: u64,
+        _observed: &ObservedPayload,
+    ) -> Result<CorruptEvictionOutcome, LocalPayloadBackendError> {
+        Ok(CorruptEvictionOutcome::NotEligible)
+    }
 
     /// Returns the full payload bytes for `object_id`, if present.
     fn get(&self, object_id: u64) -> Option<Bytes>;

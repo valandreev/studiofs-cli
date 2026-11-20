@@ -17,6 +17,7 @@ parking_lot.workspace = true
 lru.workspace = true
 uuid.workspace = true
 redb.workspace = true
+xxhash-rust = { version = "0.8.15", features = ["std", "xxh64"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
