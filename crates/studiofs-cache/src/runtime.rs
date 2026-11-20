@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,15 +16,16 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use tracing::{debug, warn};
+use xxhash_rust::xxh64::Xxh64;
 
 #[path = "disk_pressure.rs"]
 mod disk_pressure;
 pub use disk_pressure::PhysicalSpaceStatus;
 
 use crate::local::{
-    LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState,
-    LocalPayloadObjectStats, LocalPayloadOrigin, LocalPayloadPut, LocalPayloadStorageStats,
-    LocalPayloadUploadState,
+    CorruptEvictionOutcome, LocalPayloadBackend, LocalPayloadBackendError,
+    LocalPayloadLifecycleState, LocalPayloadObjectStats, LocalPayloadOrigin, LocalPayloadPut,
+    LocalPayloadStorageStats, LocalPayloadUploadState, ObservedPayload,
 };
 
 const PAYLOAD_MUTATION_STRIPES: usize = 64;
@@ -62,6 +63,18 @@ pub use layout::{
 };
 pub use reconcile::{LocalPayloadStartupReconcileError, LocalPayloadStartupReconcileReport};
 use reconcile::{LocalPayloadStartupReconcileMode, reconcile_startup_state};
+
+impl From<&CacheIndexEntry> for ObservedPayload {
+    fn from(entry: &CacheIndexEntry) -> Self {
+        Self {
+            object_id: entry.object_id,
+            xxh64: entry.xxh64,
+            payload_len: entry.payload_len,
+            lifecycle: entry.lifecycle,
+            access_order: entry.access_order,
+        }
+    }
+}
 
 const ACCESS_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const ACCESS_TOUCH_BATCH_SIZE: usize = 128;
@@ -378,6 +391,13 @@ pub struct LocalPayloadBackendRuntime {
     #[cfg(test)]
     payload_gate_probe: Mutex<Option<std::sync::mpsc::SyncSender<bool>>>,
     #[cfg(test)]
+    pause_after_corrupt_check: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
     pause_after_removal_chunk: Mutex<
         Option<(
             std::sync::mpsc::SyncSender<()>,
@@ -594,6 +614,8 @@ impl LocalPayloadBackendRuntime {
             #[cfg(test)]
             payload_gate_probe: Mutex::new(None),
             #[cfg(test)]
+            pause_after_corrupt_check: Mutex::new(None),
+            #[cfg(test)]
             pause_after_removal_chunk: Mutex::new(None),
         })
     }
@@ -799,6 +821,14 @@ impl LocalPayloadBackendRuntime {
         result.map_err(LocalPayloadBackendError::from)
     }
 
+    // The caller holds the object's mutation stripe through removal.
+    fn can_evict_locked(&self, entry: &CacheIndexEntry) -> bool {
+        entry.evictable
+            && entry.lifecycle == LocalPayloadLifecycleState::Uploaded
+            && entry.upload_state == LocalPayloadUploadState::None
+            && !self.is_runtime_pinned(entry.object_id)
+    }
+
     fn evict_batch_internal(
         &self,
         object_ids: &[u64],
@@ -809,10 +839,7 @@ impl LocalPayloadBackendRuntime {
         let mut removed_bytes = 0_u64;
         for &object_id in object_ids {
             let Some(entry) = self.index.get_entry(object_id)?.filter(|entry| {
-                !self.is_runtime_pinned(object_id)
-                    && entry.evictable
-                    && entry.lifecycle == LocalPayloadLifecycleState::Uploaded
-                    && entry.upload_state == LocalPayloadUploadState::None
+                self.can_evict_locked(entry)
                     && (!downloaded_only || entry.origin == LocalPayloadOrigin::Downloaded)
             }) else {
                 self.eviction_scan_skipped_non_evictable
@@ -1211,6 +1238,56 @@ impl LocalPayloadBackendRuntime {
 impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn evict_corrupt(
+        &self,
+        object_id: u64,
+        observed: &ObservedPayload,
+    ) -> Result<CorruptEvictionOutcome, LocalPayloadBackendError> {
+        let _mutation = self.lock_payload_mutations(&[object_id]);
+        let Some(entry) = self.index.get_entry(object_id)? else {
+            return Ok(CorruptEvictionOutcome::Changed);
+        };
+        if !self.can_evict_locked(&entry) {
+            return Ok(CorruptEvictionOutcome::NotEligible);
+        }
+        if ObservedPayload::from(&entry) != *observed {
+            return Ok(CorruptEvictionOutcome::Changed);
+        }
+        let Some(expected_checksum) = entry.xxh64 else {
+            return Ok(CorruptEvictionOutcome::NotEligible);
+        };
+
+        // A cached handle can still refer to a replaced or unlinked file.
+        let path = self.layout.payload_object_path(object_id);
+        let matches = (|| -> io::Result<bool> {
+            let file = std::fs::File::open(path)?;
+            if file.metadata()?.len() != entry.payload_len {
+                return Ok(false);
+            }
+            let mut hasher = Xxh64::new(0);
+            let len = io::copy(
+                &mut file.take(entry.payload_len.saturating_add(1)),
+                &mut hasher,
+            )?;
+            Ok(len == entry.payload_len && hasher.digest() == expected_checksum)
+        })();
+        // A missing file or a read I/O error also confirms corruption (ADR 0017).
+        match matches {
+            Ok(true) => return Ok(CorruptEvictionOutcome::NotCorrupt),
+            Ok(false) => {}
+            Err(error) => {
+                warn!(object_id, %error, "cache scrub confirmed corruption via I/O error");
+            }
+        }
+        #[cfg(test)]
+        if let Some((checked, resume)) = self.pause_after_corrupt_check.lock().take() {
+            let _ = checked.send(());
+            let _ = resume.recv_timeout(Duration::from_secs(5));
+        }
+        self.remove_payloads_locked(&[object_id])?;
+        Ok(CorruptEvictionOutcome::Evicted)
     }
 
     fn get(&self, object_id: u64) -> Option<Bytes> {
@@ -2572,6 +2649,141 @@ mod tests {
             LocalPayloadLifecycleState::Dirty
         );
         assert_eq!(backend.dirty_object_ids(), vec![42]);
+    }
+
+    #[test]
+    fn evict_corrupt_rechecks_rewrite_and_upload_state() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0xCD; 16],
+        })
+        .unwrap();
+        let path = layout.payload_object_path(1);
+        let hello_xxh64 = 0x26c7827d889f6da3;
+        let observe = || ObservedPayload::from(&backend.index.get_entry(1).unwrap().unwrap());
+
+        backend
+            .put_with_checksum(1, b"hello", true, Some(hello_xxh64))
+            .unwrap();
+        let observed = observe();
+        std::fs::write(&path, b"HELLO").unwrap();
+        backend
+            .put_with_checksum(1, b"hello", true, Some(hello_xxh64))
+            .unwrap();
+        assert_eq!(
+            backend.evict_corrupt(1, &observed).unwrap(),
+            CorruptEvictionOutcome::Changed
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+
+        let observed = observe();
+        assert_eq!(
+            backend.evict_corrupt(1, &observed).unwrap(),
+            CorruptEvictionOutcome::NotCorrupt
+        );
+        std::fs::write(&path, b"HELLO").unwrap();
+        backend.pin(1);
+        assert_eq!(
+            backend.evict_corrupt(1, &observed).unwrap(),
+            CorruptEvictionOutcome::NotEligible
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"HELLO");
+        backend.unpin(1);
+
+        backend.put(1, b"hello", false).unwrap();
+        std::fs::write(&path, b"HELLO").unwrap();
+        assert_eq!(
+            backend.evict_corrupt(1, &observe()).unwrap(),
+            CorruptEvictionOutcome::NotEligible
+        );
+        backend.mark_uploading(1).unwrap();
+        assert_eq!(
+            backend.evict_corrupt(1, &observed).unwrap(),
+            CorruptEvictionOutcome::NotEligible
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"HELLO");
+        assert_eq!(backend.storage_stats().dirty_bytes, 5);
+    }
+
+    #[test]
+    fn evict_corrupt_holds_stripe_from_recheck_through_removal() {
+        use std::sync::mpsc::sync_channel;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0xCD; 16],
+        })
+        .unwrap();
+        let path = layout.payload_object_path(1);
+        backend
+            .put_with_checksum(1, b"hello", true, Some(0x26c7827d889f6da3))
+            .unwrap();
+        let observed = ObservedPayload::from(&backend.index.get_entry(1).unwrap().unwrap());
+        std::fs::write(&path, b"HELLO").unwrap();
+
+        let (checked_tx, checked_rx) = sync_channel(1);
+        let (resume_tx, resume_rx) = sync_channel(1);
+        *backend.pause_after_corrupt_check.lock() = Some((checked_tx, resume_rx));
+        std::thread::scope(|scope| {
+            let evict = scope.spawn(|| backend.evict_corrupt(1, &observed));
+            checked_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("evict_corrupt did not reach its post-check pause");
+            let (gate_probe_tx, gate_probe_rx) = sync_channel(1);
+            *backend.payload_gate_probe.lock() = Some(gate_probe_tx);
+            let rewrite = scope.spawn(|| backend.put(1, b"world", true));
+            let blocked = gate_probe_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("rewrite did not attempt its mutation gate");
+            assert!(blocked, "rewrite must wait for evict_corrupt's stripe");
+            let _ = resume_tx.send(());
+            assert_eq!(
+                evict.join().unwrap().unwrap(),
+                CorruptEvictionOutcome::Evicted
+            );
+            rewrite.join().unwrap().unwrap();
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), b"world");
+        assert!(backend.index.get_entry(1).unwrap().is_some());
+    }
+
+    #[test]
+    fn evict_corrupt_removes_bad_missing_and_short_payloads_with_accounting() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0xCD; 16],
+        })
+        .unwrap();
+
+        for fault in [Some(b"HELLO".as_slice()), None, Some(b"he".as_slice())] {
+            backend
+                .put_with_checksum(1, b"hello", true, Some(0x26c7827d889f6da3))
+                .unwrap();
+            let observed = ObservedPayload::from(&backend.index.get_entry(1).unwrap().unwrap());
+            let path = layout.payload_object_path(1);
+            match fault {
+                Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+                None => std::fs::remove_file(&path).unwrap(),
+            }
+            assert_eq!(backend.storage_stats().current_bytes, 5);
+            assert_eq!(backend.storage_stats().evictable_bytes, 5);
+            assert_eq!(
+                backend.evict_corrupt(1, &observed).unwrap(),
+                CorruptEvictionOutcome::Evicted
+            );
+            assert!(!path.exists());
+            assert!(backend.index.get_entry(1).unwrap().is_none());
+            assert_eq!(backend.storage_stats(), LocalPayloadStorageStats::default());
+        }
     }
 
     #[test]
