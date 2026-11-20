@@ -564,6 +564,27 @@ mod tests {
         announced
     }
 
+    /// Waits for `path` to reach `class` and for notifications naming every
+    /// `expected` directory. The snapshot is swapped before the notification is
+    /// sent, so the class alone can change before its notification arrives.
+    async fn wait_for_announced(
+        vfs: &StudioVfs,
+        changes: &mut broadcast::Receiver<Vec<Vec<u8>>>,
+        path: &[u8],
+        class: ScratchClass,
+        expected: &BTreeSet<Vec<u8>>,
+    ) -> BTreeSet<Vec<u8>> {
+        let mut announced = wait_for_class(vfs, changes, path, class).await;
+        while !announced.is_superset(expected) {
+            let paths = tokio::time::timeout(Duration::from_secs(5), changes.recv())
+                .await
+                .expect("rules changed notification")
+                .unwrap();
+            announced.extend(paths);
+        }
+        announced
+    }
+
     #[test]
     fn ignore_rules_refresh_only_for_rule_files_and_their_directories() {
         let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-");
@@ -641,9 +662,16 @@ mod tests {
             .await
             .expect("initial rule inventory");
             write_rule_file(&vfs, ROOT_INO, b"*.tmp\n").await;
-            let announced =
-                wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Scratch).await;
-            assert_eq!(announced, BTreeSet::from([Vec::new()]));
+            let expected = BTreeSet::from([Vec::new()]);
+            let announced = wait_for_announced(
+                &vfs,
+                &mut changes,
+                b"file.tmp",
+                ScratchClass::Scratch,
+                &expected,
+            )
+            .await;
+            assert_eq!(announced, expected);
             // A snapshot taken before the refresh is never mutated in place.
             assert_eq!(old.classify(b"file.tmp", false), ScratchClass::Tracked);
             vfs.state.shutdown.background_shutdown_token.cancel();
@@ -863,17 +891,30 @@ mod tests {
 
             let shots = vfs.mkdir(ROOT_INO, b"shots", 0, 0, 0o755).unwrap();
             write_rule_file(&vfs, shots.ino, b"*.log\n").await;
-            wait_for_class(&vfs, &mut changes, b"shots/a.log", ScratchClass::Scratch).await;
+            wait_for_announced(
+                &vfs,
+                &mut changes,
+                b"shots/a.log",
+                ScratchClass::Scratch,
+                &BTreeSet::from([b"shots".to_vec()]),
+            )
+            .await;
+            // Drop notifications left over from the earlier steps.
+            while changes.try_recv().is_ok() {}
 
             // Moving the directory moves its rules with it.
             vfs.rename(ROOT_INO, b"shots", ROOT_INO, b"plates", false)
                 .unwrap();
-            let announced =
-                wait_for_class(&vfs, &mut changes, b"plates/a.log", ScratchClass::Scratch).await;
-            assert_eq!(
-                announced,
-                BTreeSet::from([b"plates".to_vec(), b"shots".to_vec()])
-            );
+            let expected = BTreeSet::from([b"plates".to_vec(), b"shots".to_vec()]);
+            let announced = wait_for_announced(
+                &vfs,
+                &mut changes,
+                b"plates/a.log",
+                ScratchClass::Scratch,
+                &expected,
+            )
+            .await;
+            assert_eq!(announced, expected);
             assert_eq!(
                 vfs.classify_scratch_path(b"shots/a.log", false),
                 ScratchClass::Tracked
