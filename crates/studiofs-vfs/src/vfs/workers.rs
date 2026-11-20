@@ -3972,6 +3972,65 @@ mod tests {
         });
     }
 
+    #[test]
+    fn cache_scrub_counts_io_corruption() {
+        use studiofs_cache::LocalPayloadLayout;
+        use studiofs_data::object::{create_object_buffer, read_object_with_checksum};
+
+        let tmp = studiofs_test_support::workspace_target_tempdir("cache-scrub-io");
+        let (rt, vfs, _) = super::super::tests::make_unstarted_test_vfs(&tmp, "cache-scrub-io");
+        let backend = vfs
+            .local_payload_backend
+            .as_any()
+            .downcast_ref::<studiofs_cache::PersistentLocalPayloadBackend>()
+            .unwrap();
+        let object_id = 1;
+        let layout = LocalPayloadLayout::from_cache_root(tmp.path().join("cache"));
+        let path = layout.payload_object_path(object_id);
+        let directory = tmp.path().join("unreadable-payload");
+        std::fs::create_dir(&directory).unwrap();
+        // Linux can open a directory as a file, so match its length to reach the read.
+        let len = usize::try_from(std::fs::metadata(&directory).unwrap().len()).unwrap();
+        let payload = Bytes::from(vec![0; len]);
+        let (payload, checksum) =
+            read_object_with_checksum(create_object_buffer(payload).unwrap()).unwrap();
+        backend
+            .put_with_checksum(object_id, &payload, true, Some(checksum))
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&directory, &path).unwrap();
+
+        let before = vfs.cache_scrub_snapshot().unwrap();
+        rt.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                vfs.run_cache_scrub(backend, vfs.cache_scrub.unwrap(), &CancellationToken::new()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        });
+        let after = vfs.cache_scrub_snapshot().unwrap();
+        assert_eq!(after.cache_scrub_checked, before.cache_scrub_checked + 1);
+        assert_eq!(
+            after.cache_scrub_corrupt.io,
+            before.cache_scrub_corrupt.io + 1
+        );
+        assert!(
+            backend
+                .scrub_index()
+                .get_entry(object_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(path.is_dir());
+        assert_eq!(after.cache_scrub_refetched, before.cache_scrub_refetched);
+        assert_eq!(
+            after.cache_scrub_refetch_failed,
+            before.cache_scrub_refetch_failed
+        );
+    }
+
     #[tokio::test]
     async fn reconciliation_finishes_are_bounded_and_drain_before_stopping() {
         use std::sync::atomic::{AtomicUsize, Ordering};
