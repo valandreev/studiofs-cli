@@ -22,13 +22,16 @@ const PAYLOAD_READ_BUDGET: Duration = Duration::from_secs(3);
 const RETRY_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Inodes whose changes can alter the compiled rules. Entries are added before
-/// a scan reads their state and are never removed during a mount, so a commit
-/// that a scan missed is still recognized when its invalidation arrives.
+/// a scan reads their state, so a commit that a scan missed is still
+/// recognized when its invalidation arrives. A completed scan drops the
+/// inodes it no longer found unless a binding was noted meanwhile.
 #[derive(Default)]
 struct RuleInodes {
     files: HashSet<Ino>,
     /// Directories on the path to a rule file, including its own directory.
     directories: HashSet<Ino>,
+    /// Rule files bound by a namespace change since the current scan began.
+    bound_during_scan: HashSet<Ino>,
 }
 
 #[derive(Default)]
@@ -154,12 +157,20 @@ impl IgnoreRules {
         }
     }
 
-    /// Request a refresh after a local namespace change binds or unbinds
-    /// `name`. `ino` is the inode moved or created, when known.
-    pub(super) fn note_local_entry(&self, meta: &dyn VfsMeta, name: &[u8], ino: Option<Ino>) {
-        let relevant = self.watched.lock().note_entry(name, ino);
+    /// Request a refresh after a local namespace change binds `name` to `ino`
+    /// (`bound`) or removes `name`. `ino` is the inode moved or created, when
+    /// known. Only a binding as a rule file watches and pins the inode.
+    pub(super) fn note_local_entry(
+        &self,
+        meta: &dyn VfsMeta,
+        name: &[u8],
+        ino: Option<Ino>,
+        bound: bool,
+    ) {
+        let relevant = self.watched.lock().note_entry(name, ino, bound);
         if relevant {
-            if let Some(ino) = ino
+            if bound
+                && let Some(ino) = ino
                 && studiofs_meta::fold_dentry_name(name).as_ref() == RULE_FILE
             {
                 self.pin_inode(meta, ino);
@@ -178,7 +189,9 @@ impl IgnoreRules {
         for intent in &batch.intents {
             relevant |= match intent {
                 InvalidationIntent::Reset => true,
-                InvalidationIntent::Entry { name, ino, .. } => watched.note_entry(name, *ino),
+                // The pre-mutation inode of a foreign removal is also watched
+                // until the refresh this requests finds it unbound.
+                InvalidationIntent::Entry { name, ino, .. } => watched.note_entry(name, *ino, true),
                 InvalidationIntent::Attributes { ino } | InvalidationIntent::Content { ino } => {
                     watched.files.contains(ino)
                 }
@@ -214,14 +227,32 @@ impl Drop for IgnoreRules {
 }
 
 impl RuleInodes {
-    /// Whether a binding change of `name` to or from `ino` can alter the
-    /// rules. A rule file name starts watching its inode.
-    fn note_entry(&mut self, name: &[u8], ino: Option<Ino>) -> bool {
+    /// Whether a binding change of `name` to (`bound`) or from `ino` can alter
+    /// the rules. Binding a rule file name starts watching its inode, and
+    /// unbinding one stops; a scan rewatches an inode still bound elsewhere.
+    fn note_entry(&mut self, name: &[u8], ino: Option<Ino>, bound: bool) -> bool {
         if studiofs_meta::fold_dentry_name(name).as_ref() == RULE_FILE {
-            self.files.extend(ino);
+            if let Some(ino) = ino {
+                if bound {
+                    self.files.insert(ino);
+                    self.bound_during_scan.insert(ino);
+                } else {
+                    self.files.remove(&ino);
+                    self.bound_during_scan.remove(&ino);
+                }
+            }
             return true;
         }
         ino.is_some_and(|ino| self.files.contains(&ino) || self.directories.contains(&ino))
+    }
+
+    /// Keep only what a completed scan found, plus rule files bound since it
+    /// began.
+    fn retain_scanned(&mut self, files: &HashSet<Ino>, directories: &HashSet<Ino>) {
+        let bound = std::mem::take(&mut self.bound_during_scan);
+        self.files
+            .retain(|ino| files.contains(ino) || bound.contains(ino));
+        self.directories.retain(|ino| directories.contains(ino));
     }
 }
 
@@ -289,6 +320,7 @@ impl StudioVfs {
     ) -> bool {
         let cancellation = self.state.shutdown.background_shutdown_token.clone();
         let watched = Arc::clone(&self.ignore_rules.watched);
+        watched.lock().bound_during_scan.clear();
         let pin_revision = self.ignore_rules.pins.lock().revision;
         let scan = self
             .meta
@@ -298,6 +330,7 @@ impl StudioVfs {
                 let mut parents = HashMap::new();
                 let mut files = BTreeMap::new();
                 let mut objects = HashSet::new();
+                let mut scanned = (HashSet::new(), HashSet::new());
                 while let Some((ino, path)) = directories.pop() {
                     if cancellation.is_cancelled() {
                         break;
@@ -335,9 +368,11 @@ impl StudioVfs {
                     {
                         let mut watched = watched.lock();
                         watched.files.insert(entry.ino);
+                        scanned.0.insert(entry.ino);
                         let mut directory = Some(ino);
                         while let Some(current) = directory {
                             watched.directories.insert(current);
+                            scanned.1.insert(current);
                             directory = parents.get(&current).copied();
                         }
                     }
@@ -362,10 +397,10 @@ impl StudioVfs {
                         },
                     );
                 }
-                Ok((files, objects))
+                Ok((files, objects, scanned))
             })
             .await;
-        let (files, objects) = match scan {
+        let (files, objects, (scanned_files, scanned_directories)) = match scan {
             Ok(result) => result,
             Err(error) => {
                 warn!(%error, "could not discover ignore rule files");
@@ -376,6 +411,10 @@ impl StudioVfs {
         if cancellation.is_cancelled() {
             return false;
         }
+        self.ignore_rules
+            .watched
+            .lock()
+            .retain_scanned(&scanned_files, &scanned_directories);
 
         {
             let mut pins = self.ignore_rules.pins.lock();
@@ -899,6 +938,56 @@ mod tests {
                 .put(upload.object_id, payload, true)
                 .unwrap();
             assert!(!vfs.local_payload_backend.is_evictable(upload.object_id));
+        });
+    }
+
+    /// Renaming a rule file away stops watching and pinning its inode, and a
+    /// scan drops an unlinked rule file from the watched set.
+    #[test]
+    fn ignore_rules_stop_watching_rule_file_renamed_away_or_unlinked() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-");
+        let (runtime, vfs, meta) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-unwatch");
+        let mut changes = vfs.subscribe_ignore_rules_changes();
+        runtime.block_on(async {
+            let worker = tokio::spawn(Arc::clone(&vfs).background_ignore_rules());
+            vfs.wait_for_ignore_rules_bootstrap().await;
+            let ino = write_rule_file(&vfs, ROOT_INO, b"*.tmp\n").await;
+            wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Scratch).await;
+            assert!(vfs.ignore_rules.watched.lock().files.contains(&ino));
+
+            vfs.rename(ROOT_INO, RULE_FILE, ROOT_INO, b"rules.off", false)
+                .unwrap();
+            wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Tracked).await;
+            assert!(!vfs.ignore_rules.watched.lock().files.contains(&ino));
+
+            let other = write_rule_file(&vfs, ROOT_INO, b"*.log\n").await;
+            wait_for_class(&vfs, &mut changes, b"a.log", ScratchClass::Scratch).await;
+            vfs.unlink(ROOT_INO, RULE_FILE).unwrap();
+            wait_for_class(&vfs, &mut changes, b"a.log", ScratchClass::Tracked).await;
+            assert!(!vfs.ignore_rules.watched.lock().files.contains(&other));
+
+            vfs.state.shutdown.background_shutdown_token.cancel();
+            tokio::time::timeout(BOOTSTRAP_BUDGET, worker)
+                .await
+                .unwrap()
+                .unwrap();
+
+            // With the worker stopped, a rewrite of the ordinary file neither
+            // requests a rescan nor gains a rule pin.
+            let _ = take_refresh_permit(&vfs.ignore_rules);
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh(fh, ino, 0, b"plain bytes\n").await.unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+            vfs.release_fh(fh).await.unwrap();
+            assert!(!take_refresh_permit(&vfs.ignore_rules));
+            let pins = vfs.ignore_rules.pins.lock();
+            for (object_id, _) in meta.get_regular_file_graph_object_usage(ino).unwrap() {
+                assert!(
+                    !pins.objects.contains(&object_id),
+                    "renamed-away payload {object_id} gained a rule pin"
+                );
+            }
         });
     }
 

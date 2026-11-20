@@ -1307,6 +1307,7 @@ impl<'a> NamespaceMutationOps<'a> {
             self.vfs.meta.sync_view().as_ref(),
             name,
             Some(child),
+            true,
         );
     }
 
@@ -1337,9 +1338,12 @@ impl<'a> NamespaceMutationOps<'a> {
             &[parent],
             &[(parent, name, DentryCacheValue::Negative)],
         );
-        self.vfs
-            .ignore_rules
-            .note_local_entry(self.vfs.meta.sync_view().as_ref(), name, None);
+        self.vfs.ignore_rules.note_local_entry(
+            self.vfs.meta.sync_view().as_ref(),
+            name,
+            None,
+            false,
+        );
     }
 
     /// Records a rename that is rejected for destination update but should invalidate source state.
@@ -1374,9 +1378,12 @@ impl<'a> NamespaceMutationOps<'a> {
             &[parent],
             &[(parent, name, DentryCacheValue::Negative)],
         );
-        self.vfs
-            .ignore_rules
-            .note_local_entry(self.vfs.meta.sync_view().as_ref(), name, None);
+        self.vfs.ignore_rules.note_local_entry(
+            self.vfs.meta.sync_view().as_ref(),
+            name,
+            None,
+            false,
+        );
     }
 
     /// Records successful rename/move and updates both old and new parent cache states.
@@ -1407,11 +1414,13 @@ impl<'a> NamespaceMutationOps<'a> {
             self.vfs.meta.sync_view().as_ref(),
             name,
             Some(moved_ino),
+            false,
         );
         self.vfs.ignore_rules.note_local_entry(
             self.vfs.meta.sync_view().as_ref(),
             new_name,
             Some(moved_ino),
+            true,
         );
     }
 }
