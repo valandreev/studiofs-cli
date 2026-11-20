@@ -1385,11 +1385,17 @@ impl LocalPayloadBackendRuntime {
 /// Result of inspecting an observed local payload for a scrub pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrubCheck {
+    /// The entry was ineligible for verification or changed since it was scanned.
     Skipped,
+    /// The payload length and checksum match the index.
     Clean,
+    /// The payload length matches, but its checksum differs from the index.
     Checksum,
+    /// The payload file was absent.
     Missing,
+    /// The payload length differs from the indexed length.
     Size,
+    /// A filesystem operation failed while opening or inspecting the payload.
     Io,
 }
 
