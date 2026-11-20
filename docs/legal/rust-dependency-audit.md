@@ -1,5 +1,19 @@
 # Rust dependency license audit for v0.2.0
 
+## SFS-1074 scratch rule matcher renewal, 2026-11-20
+
+The rule matcher adds `globset 0.4.19` and its dependency `bstr 1.14.0`.
+Select MIT for both under the existing policy. The original manifest
+expressions are `Unlicense OR MIT` and `MIT OR Apache-2.0`, respectively.
+Both pinned crate archives match the lockfile checksums and include
+`COPYING` and `LICENSE-MIT`. The inventory verifies these files against
+their archive members.
+
+The refreshed inventory covers 653 lock entries (641 registry packages and
+12 workspace packages). The product dependency scopes contain 334 Windows,
+375 Linux, and 368 macOS packages. The LF-normalized lockfile SHA-256 is
+`2e08e1140b19866e30b6c9b84d05dddf8a8b16bd6ed7e46e027bca88d7a2bcb8`.
+
 ## RUSTSEC-2026-0538 quinn-udp renewal, 2026-11-16
 
 The reviewed inventory is renewed for `quinn-udp 0.5.14 -> 0.5.16`. The new
