@@ -112,6 +112,23 @@ metadata and destructive trash renames do not use that transaction: no-replace
 requests reject an existing target as a collision and an absent target as
 unsupported, preserving the source in both cases.
 
+Renaming an ordinary entry into the discard namespace at root
+`.Spotlight-V100` or `.fseventsd`, including their descendants, fails with
+`EOPNOTSUPP` on POSIX and `STATUS_NOT_SUPPORTED` on WinFSP. The same error
+protects ignored entries renamed out of those locations or out of an ignored
+trash tree into the ordinary namespace. The failure preserves the source and
+destination. These errors avoid the cross-device copy-and-delete fallback,
+which could delete the source after a discard destination accepts writes
+without storing their bytes. Moving such an ignored entry into a trash
+directory deletes it instead, because discard entries hold no bytes to retain.
+A rename between two discard names keeps only the top-level entry; its
+contentless descendants are dropped.
+
+An existing ignored trash root also rejects replacement. Desktop deletion
+renames target entries inside trash directories. Moves into a legacy ignored
+trash directory delete the source when replacement is allowed. Moves through
+the native trash containers follow the volume's retention setting.
+
 ## macOS backend selection
 
 The default macOS backend is the existing low-level macFUSE bridge. Select it

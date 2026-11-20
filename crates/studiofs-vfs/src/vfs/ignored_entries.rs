@@ -824,6 +824,130 @@ mod tests {
     }
 
     #[test]
+    fn discard_boundary_rename_into_system_metadata_preserves_source() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "discard-boundary-into");
+        let source = vfs
+            .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
+            .expect("create source");
+        rt.block_on(vfs.write(source.ino, 0, b"payload")).unwrap();
+        let fsevents = vfs
+            .mkdir(ROOT_INO, b".fseventsd", 1000, 1000, 0o755)
+            .expect("create ignored directory");
+        let trash =
+            vfs.create_ignored_entry(ROOT_INO, b".Trash", 1000, 1000, 0o755, FileType::Directory);
+        let targets: [(Ino, &[u8]); 3] = [
+            (fsevents.ino, b"source.txt"),
+            (ROOT_INO, b".Spotlight-V100"),
+            (ROOT_INO, b".Trash"),
+        ];
+        for (parent, name) in targets {
+            let error = vfs
+                .rename(ROOT_INO, b"source.txt", parent, name, true)
+                .expect_err("rename into a discard name");
+            assert!(matches!(error, VfsError::OperationNotSupported));
+            assert_eq!(vfs.lookup(ROOT_INO, b"source.txt").unwrap().ino, source.ino);
+            assert!(vfs.lookup(parent, name).is_err());
+        }
+        assert_eq!(
+            rt.block_on(vfs.read(source.ino, 0, 7)).unwrap().as_ref(),
+            b"payload"
+        );
+        assert_eq!(
+            vfs.ignored_entry_lookup(ROOT_INO, b".Trash")
+                .unwrap()
+                .attr
+                .ino,
+            trash.ino
+        );
+    }
+
+    #[test]
+    fn discard_boundary_rename_of_directory_preserves_subtree_with_and_without_replace() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "discard-boundary-directory");
+        let dir = vfs
+            .mkdir(ROOT_INO, b"project", 1000, 1000, 0o755)
+            .expect("create source directory");
+        let child = vfs
+            .create(dir.ino, b"child", 1000, 1000, 0o644)
+            .expect("create source child");
+        let fsevents = vfs
+            .mkdir(ROOT_INO, b".fseventsd", 1000, 1000, 0o755)
+            .expect("create ignored directory");
+        let nested = vfs
+            .mkdir(fsevents.ino, b"nested", 1000, 1000, 0o755)
+            .expect("create nested ignored directory");
+        let spotlight = vfs
+            .mkdir(ROOT_INO, b".Spotlight-V100", 1000, 1000, 0o755)
+            .expect("create ignored source");
+
+        for replace in [true, false] {
+            let error = vfs
+                .rename(ROOT_INO, b"project", nested.ino, b"project", replace)
+                .expect_err("rename directory below a discard directory");
+            assert!(matches!(error, VfsError::OperationNotSupported));
+            // No-replace reports the existing discard target as a collision.
+            let error = vfs
+                .rename(ROOT_INO, b"project", ROOT_INO, b".Spotlight-V100", replace)
+                .expect_err("rename directory over a discard directory");
+            if replace {
+                assert!(matches!(error, VfsError::OperationNotSupported));
+            } else {
+                assert!(matches!(
+                    error,
+                    VfsError::Meta(MetaError::EntryExists { .. })
+                ));
+            }
+            let error = vfs
+                .rename(ROOT_INO, b".Spotlight-V100", ROOT_INO, b"restored", replace)
+                .expect_err("rename discard directory out to an absent name");
+            assert!(matches!(error, VfsError::OperationNotSupported));
+            assert_eq!(vfs.lookup(ROOT_INO, b"project").unwrap().ino, dir.ino);
+            assert_eq!(vfs.lookup(dir.ino, b"child").unwrap().ino, child.ino);
+            assert!(vfs.lookup(nested.ino, b"project").is_err());
+            assert_eq!(
+                vfs.lookup(ROOT_INO, b".Spotlight-V100").unwrap().ino,
+                spotlight.ino
+            );
+            assert!(vfs.lookup(ROOT_INO, b"restored").is_err());
+        }
+    }
+
+    #[test]
+    fn discard_boundary_rename_out_of_system_metadata_preserves_subtree() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "discard-boundary-out-of");
+        let ordinary = vfs
+            .create(ROOT_INO, b"ordinary", 1000, 1000, 0o644)
+            .expect("create existing ordinary destination");
+
+        let trash =
+            vfs.create_ignored_entry(ROOT_INO, b".Trash", 1000, 1000, 0o755, FileType::Directory);
+        let sources: [(Ino, &[u8]); 3] = [
+            (ROOT_INO, b".Spotlight-V100"),
+            (ROOT_INO, b".fseventsd"),
+            (trash.ino, b"discarded"),
+        ];
+        for (parent, name) in sources {
+            let discarded = vfs
+                .mkdir(parent, name, 1000, 1000, 0o755)
+                .expect("create ignored directory");
+            let child = vfs
+                .create(discarded.ino, b"child", 1000, 1000, 0o644)
+                .expect("create ignored child");
+
+            let error = vfs
+                .rename(parent, name, ROOT_INO, b"ordinary", true)
+                .expect_err("rename out of a discard directory");
+            assert!(matches!(error, VfsError::OperationNotSupported));
+            assert_eq!(vfs.lookup(parent, name).unwrap().ino, discarded.ino);
+            assert_eq!(vfs.lookup(discarded.ino, b"child").unwrap().ino, child.ino);
+            assert_eq!(vfs.lookup(ROOT_INO, b"ordinary").unwrap().ino, ordinary.ino);
+        }
+    }
+
+    #[test]
     fn rename_between_ignored_names_invalidates_parent_attr_cache() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-rename-invalidates-parent-attr-cache");
@@ -902,14 +1026,62 @@ mod tests {
     }
 
     #[test]
+    fn rename_ordinary_source_into_ignored_trash_deletes_source() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ordinary-source-ignored-trash");
+        vfs.create(ROOT_INO, b"source", 1000, 1000, 0o644)
+            .expect("create source");
+        let trash =
+            vfs.create_ignored_entry(ROOT_INO, b".Trash", 1000, 1000, 0o755, FileType::Directory);
+
+        vfs.rename(ROOT_INO, b"source", trash.ino, b"discarded", true)
+            .expect("move to ignored trash");
+
+        assert!(vfs.lookup(ROOT_INO, b"source").is_err());
+        assert!(vfs.lookup(trash.ino, b"discarded").is_err());
+    }
+
+    #[test]
     fn rename_ignored_source_into_ignored_trash_does_not_create_target() {
         let tmp = studiofs_test_support::workspace_target_tempdir("test-");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-source-trash-rename-deletes");
-        vfs.mkdir(ROOT_INO, b".Spotlight-V100", 1000, 1000, 0o755)
+        let source = vfs
+            .mkdir(ROOT_INO, b".Spotlight-V100", 1000, 1000, 0o755)
             .expect("create ignored source");
+        vfs.create(source.ino, b"store.db", 1000, 1000, 0o644)
+            .expect("create ignored child");
         let trash_root = vfs
             .mkdir(ROOT_INO, b".Trash", 1000, 1000, 0o755)
-            .expect("create ignored trash root");
+            .expect("create trash root");
+        let trash_child = vfs
+            .mkdir(trash_root.ino, b"501", 1000, 1000, 0o755)
+            .expect("create trash child");
+
+        vfs.rename(
+            ROOT_INO,
+            b".Spotlight-V100",
+            trash_child.ino,
+            b".Spotlight-V100",
+            true,
+        )
+        .expect("rename ignored source into trash subtree");
+
+        assert!(vfs.lookup(ROOT_INO, b".Spotlight-V100").is_err());
+        assert!(
+            vfs.lookup(trash_child.ino, b".Spotlight-V100").is_err(),
+            "ignored-source trash rename must not create a recoverable target"
+        );
+    }
+
+    #[test]
+    fn rename_ignored_source_into_registered_ignored_trash_does_not_create_target() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("test-");
+        let (_rt, vfs, _meta) =
+            make_test_vfs(&tmp, "ignored-source-registered-trash-rename-deletes");
+        vfs.mkdir(ROOT_INO, b".Spotlight-V100", 1000, 1000, 0o755)
+            .expect("create ignored source");
+        let trash_root =
+            vfs.create_ignored_entry(ROOT_INO, b".Trash", 1000, 1000, 0o755, FileType::Directory);
         let trash_child = vfs
             .mkdir(trash_root.ino, b"501", 1000, 1000, 0o755)
             .expect("create ignored trash child");
