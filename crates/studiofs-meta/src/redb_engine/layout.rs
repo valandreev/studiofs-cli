@@ -243,7 +243,7 @@ pub(super) fn encode_dentry_by_inode_key(ino: Ino, parent: Ino, name: &[u8]) -> 
 /// Two names fold equal exactly when the foreground lookup treats them as the
 /// same name: ASCII names compare ignoring ASCII case, and any other name
 /// compares by the Unicode lowercase of its lossy UTF-8 decoding.
-pub(super) fn fold_dentry_name(name: &[u8]) -> Cow<'_, [u8]> {
+pub fn fold_dentry_name(name: &[u8]) -> Cow<'_, [u8]> {
     if name.is_ascii() {
         if name.iter().any(u8::is_ascii_uppercase) {
             Cow::Owned(name.to_ascii_lowercase())

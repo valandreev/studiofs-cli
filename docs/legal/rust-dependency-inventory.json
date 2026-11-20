@@ -4,7 +4,7 @@
   "inputs": {
     "lockfile": {
       "path": "Cargo.lock",
-      "sha256": "c093264bdfc51835f763806f207e4363364d3f857bd2f93e7d3c88745c35c90a",
+      "sha256": "2e08e1140b19866e30b6c9b84d05dddf8a8b16bd6ed7e46e027bca88d7a2bcb8",
       "sha256_input": "LF-normalized bytes"
     },
     "metadata_snapshot": {
@@ -15,22 +15,22 @@
     "windows-x86_64": {
       "triple": "x86_64-pc-windows-msvc",
       "selection_source": "cargo tree -e normal,build package set and features; roles propagated through target-filtered metadata restricted to that set",
-      "package_count": 333
+      "package_count": 334
     },
     "linux-x86_64": {
       "triple": "x86_64-unknown-linux-gnu",
       "selection_source": "cargo tree -e normal,build package set and features; roles propagated through target-filtered metadata restricted to that set",
-      "package_count": 372
+      "package_count": 375
     },
     "macos-aarch64": {
       "triple": "aarch64-apple-darwin",
       "selection_source": "cargo tree -e normal,build package set and features; roles propagated through target-filtered metadata restricted to that set",
-      "package_count": 365
+      "package_count": 368
     }
   },
   "package_counts": {
-    "lock_rows": 651,
-    "registry_third_party": 639,
+    "lock_rows": 653,
+    "registry_third_party": 641,
     "workspace": 12
   },
   "packages": [
@@ -590,9 +590,22 @@
       "license_evidence_status": "present",
       "distribution_obligation_profile": "spdx:2f9f1b1a9e44ec2d",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
-      "target_scope_classification": "outside-selected-studiofs-targets",
+      "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "globset",
+            "version": "0.4.19",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
         {
           "from": {
             "name": "regex",
@@ -620,7 +633,39 @@
           ]
         }
       ],
-      "targets": {}
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "host-build",
+            "runtime"
+          ],
+          "enabled_features": [
+            "default",
+            "perf-literal",
+            "std"
+          ]
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "default",
+            "perf-literal",
+            "std"
+          ]
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "default",
+            "perf-literal",
+            "std"
+          ]
+        }
+      }
     },
     {
       "name": "aligned-vec",
@@ -1616,7 +1661,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -1629,8 +1674,22 @@
         },
         {
           "from": {
+            "name": "studiofs-data",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-data"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -1723,7 +1782,6 @@
       "targets": {
         "windows-x86_64": {
           "roles": [
-            "host-build",
             "runtime"
           ],
           "enabled_features": [
@@ -2951,6 +3009,20 @@
         },
         {
           "from": {
+            "name": "studiofs-data",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-data"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "tokio-postgres",
             "version": "0.7.18",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -3671,7 +3743,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -3685,7 +3757,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -4200,7 +4272,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -4214,7 +4286,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -6137,7 +6209,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -6151,7 +6223,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -6885,6 +6957,101 @@
       }
     },
     {
+      "name": "bstr",
+      "version": "1.14.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "a680398c10c7bc0488067c4612226ea905a85f607134b69f3068d505d58c4214",
+      "package_kind": "third-party",
+      "license_expression": "MIT OR Apache-2.0",
+      "license_expression_id": "spdx:db11fec9946737df",
+      "repository": "https://github.com/BurntSushi/bstr",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#bstr@1.14.0/Cargo.toml",
+        "sha256": "8437665acc1697f87f62d338fe14eee00a004d83be59d9aef2d3b4e177fa0e93"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "8437665acc1697f87f62d338fe14eee00a004d83be59d9aef2d3b4e177fa0e93",
+          "archive_member_sha256": "8437665acc1697f87f62d338fe14eee00a004d83be59d9aef2d3b4e177fa0e93",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "COPYING",
+          "sha256": "68653aaa727a2bfa31b7a751e31701ce33c49d695c12dd291a07d1c54da4c14b",
+          "archive_member_sha256": "68653aaa727a2bfa31b7a751e31701ce33c49d695c12dd291a07d1c54da4c14b",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-APACHE",
+          "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "archive_member_sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "6b7374c39a57e57fc2c38eb529c4c88340152b10f51dd5ae2d819dfa67f61715",
+          "archive_member_sha256": "6b7374c39a57e57fc2c38eb529c4c88340152b10f51dd5ae2d819dfa67f61715",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/bstr-1.14.0.crate",
+        "sha256": "a680398c10c7bc0488067c4612226ea905a85f607134b69f3068d505d58c4214"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:db11fec9946737df",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "globset",
+            "version": "0.4.19",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "std"
+          ]
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "std"
+          ]
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "alloc",
+            "std"
+          ]
+        }
+      }
+    },
+    {
       "name": "bumpalo",
       "version": "3.19.1",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -7347,7 +7514,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -7365,7 +7532,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -7730,7 +7897,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -7744,7 +7911,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -7758,7 +7925,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -8128,7 +8295,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -8142,7 +8309,7 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
@@ -9209,7 +9376,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -9338,7 +9505,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -9352,7 +9519,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -9366,7 +9533,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -9380,7 +9547,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -9503,7 +9670,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -9770,7 +9937,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -9784,7 +9951,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -12830,7 +12997,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -13149,26 +13316,28 @@
       "distribution_obligation_profile": "spdx:e5dcffe836b6ec8a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
-      "nonproduction_scope_hints": [],
+      "nonproduction_scope_hints": [
+        "has-target-conditioned-edge"
+      ],
       "resolved_incoming_dependency_edges": [
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
           "dependency_kinds": [
             {
               "kind": "normal",
-              "target": null
+              "target": "cfg(target_os = \"macos\")"
             }
           ]
         },
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -13692,7 +13861,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -14268,7 +14437,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -14282,7 +14451,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -14296,7 +14465,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -14310,7 +14479,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -14324,7 +14493,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -14635,10 +14804,7 @@
           "roles": [
             "host-build"
           ],
-          "enabled_features": [
-            "std",
-            "use_std"
-          ]
+          "enabled_features": []
         },
         "linux-x86_64": {
           "roles": [
@@ -16427,7 +16593,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -16641,27 +16807,29 @@
       "distribution_obligation_profile": "spdx:dc65a73a784e2954",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
-      "nonproduction_scope_hints": [],
+      "nonproduction_scope_hints": [
+        "has-target-conditioned-edge"
+      ],
       "resolved_incoming_dependency_edges": [
         {
           "from": {
-            "name": "hashbrown",
-            "version": "0.16.1",
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
           },
           "dependency_kinds": [
             {
               "kind": "normal",
-              "target": null
+              "target": "cfg(target_os = \"macos\")"
             }
           ]
         },
         {
           "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
+            "name": "hashbrown",
+            "version": "0.16.1",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
             {
@@ -17167,30 +17335,28 @@
       "distribution_obligation_profile": "spdx:ec5c82d846feaa2a",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
-      "nonproduction_scope_hints": [
-        "has-target-conditioned-edge"
-      ],
+      "nonproduction_scope_hints": [],
       "resolved_incoming_dependency_edges": [
         {
           "from": {
-            "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "name": "studiofs",
+            "version": "0.2.4",
             "source": null,
-            "workspace_path": "crates/studiofs-e2e"
+            "workspace_path": "crates/studiofs"
           },
           "dependency_kinds": [
             {
               "kind": "normal",
-              "target": "cfg(target_os = \"macos\")"
+              "target": null
             }
           ]
         },
         {
           "from": {
-            "name": "studiofs",
-            "version": "0.2.3",
+            "name": "studiofs-e2e",
+            "version": "0.2.4",
             "source": null,
-            "workspace_path": "crates/studiofs"
+            "workspace_path": "crates/studiofs-e2e"
           },
           "dependency_kinds": [
             {
@@ -17321,8 +17487,24 @@
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
-      "nonproduction_scope_hints": [],
+      "nonproduction_scope_hints": [
+        "has-target-conditioned-edge"
+      ],
       "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "studiofs-winfsp",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-winfsp"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
         {
           "from": {
             "name": "opendal",
@@ -17339,7 +17521,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -17353,7 +17535,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -17367,23 +17549,9 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "studiofs-winfsp",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-winfsp"
           },
           "dependency_kinds": [
             {
@@ -19839,6 +20007,102 @@
       }
     },
     {
+      "name": "globset",
+      "version": "0.4.19",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "checksum": "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd",
+      "package_kind": "third-party",
+      "license_expression": "Unlicense OR MIT",
+      "license_expression_id": "spdx:2f9f1b1a9e44ec2d",
+      "repository": "https://github.com/BurntSushi/ripgrep/tree/master/crates/globset",
+      "manifest": {
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#globset@0.4.19/Cargo.toml",
+        "sha256": "1bc50c3e5e15d039f6739e245c7ab283a7d1cfff485d207378c4216eebfb0150"
+      },
+      "license_evidence": [
+        {
+          "path": "Cargo.toml",
+          "sha256": "1bc50c3e5e15d039f6739e245c7ab283a7d1cfff485d207378c4216eebfb0150",
+          "archive_member_sha256": "1bc50c3e5e15d039f6739e245c7ab283a7d1cfff485d207378c4216eebfb0150",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "COPYING",
+          "sha256": "01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d40d75012390f",
+          "archive_member_sha256": "01c266bced4a434da0051174d6bee16a4c82cf634e2679b6155d40d75012390f",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "LICENSE-MIT",
+          "sha256": "0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f",
+          "archive_member_sha256": "0f96a83840e146e43c0ec96a22ec1f392e0680e6c1226e6f3ba87e0740af850f",
+          "archive_member_status": "verified"
+        },
+        {
+          "path": "UNLICENSE",
+          "sha256": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c",
+          "archive_member_sha256": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c",
+          "archive_member_status": "verified"
+        }
+      ],
+      "cargo_cache_checksum_evidence": {
+        "kind": "crate-archive",
+        "path": "registry/cache/crates-io/globset-0.4.19.crate",
+        "sha256": "e47d37d2ae4464254884b60ab7071be2b876a9c35b696bd018ddcc76847309cd"
+      },
+      "source_integrity_status": "verified",
+      "license_evidence_status": "present",
+      "distribution_obligation_profile": "spdx:2f9f1b1a9e44ec2d",
+      "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
+      "target_scope_classification": "selected-for-studiofs-target",
+      "nonproduction_scope_hints": [],
+      "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "studiofs-vfs",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-vfs"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        }
+      ],
+      "targets": {
+        "windows-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "default",
+            "log"
+          ]
+        },
+        "linux-x86_64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "default",
+            "log"
+          ]
+        },
+        "macos-aarch64": {
+          "roles": [
+            "runtime"
+          ],
+          "enabled_features": [
+            "default",
+            "log"
+          ]
+        }
+      }
+    },
+    {
       "name": "gloo-timers",
       "version": "0.3.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -20741,7 +21005,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -20847,7 +21111,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -20980,7 +21244,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -21156,7 +21420,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -21636,7 +21900,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -23760,7 +24024,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -24386,11 +24650,7 @@
           "roles": [
             "host-build"
           ],
-          "enabled_features": [
-            "default",
-            "use_alloc",
-            "use_std"
-          ]
+          "enabled_features": []
         },
         "linux-x86_64": {
           "roles": [
@@ -26269,7 +26529,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -26277,6 +26537,20 @@
             {
               "kind": "normal",
               "target": "cfg(target_os = \"linux\")"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_os = \"macos\")"
             }
           ]
         },
@@ -26413,7 +26687,7 @@
         {
           "from": {
             "name": "studiofs-bridge",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-bridge"
           },
@@ -26426,8 +26700,22 @@
         },
         {
           "from": {
+            "name": "studiofs-cache",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-cache"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(unix)"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -26805,37 +27093,9 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "studiofs-cache",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-cache"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
           },
           "dependency_kinds": [
             {
@@ -27844,6 +28104,19 @@
         },
         {
           "from": {
+            "name": "globset",
+            "version": "0.4.19",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "jiff",
             "version": "0.2.20",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -28117,20 +28390,21 @@
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
       "nonproduction_scope_hints": [
-        "has-workspace-or-dependency-dev-edge"
+        "has-workspace-or-dependency-dev-edge",
+        "has-target-conditioned-edge"
       ],
       "resolved_incoming_dependency_edges": [
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
           "dependency_kinds": [
             {
               "kind": "dev",
-              "target": null
+              "target": "cfg(target_os = \"macos\")"
             }
           ]
         },
@@ -28150,7 +28424,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -28164,7 +28438,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -28756,6 +29030,19 @@
         },
         {
           "from": {
+            "name": "bstr",
+            "version": "1.14.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "combine",
             "version": "4.6.7",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -29285,7 +29572,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -31863,7 +32150,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -32223,7 +32510,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -33933,7 +34220,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -35573,7 +35860,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -35587,7 +35874,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -35601,7 +35888,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -36249,12 +36536,42 @@
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
-      "nonproduction_scope_hints": [],
+      "nonproduction_scope_hints": [
+        "has-target-conditioned-edge"
+      ],
       "resolved_incoming_dependency_edges": [
         {
           "from": {
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_os = \"macos\")"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-winfsp",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-winfsp"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -36268,7 +36585,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -36281,38 +36598,10 @@
         },
         {
           "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "studiofs-winfsp",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-winfsp"
           },
           "dependency_kinds": [
             {
@@ -36905,7 +37194,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -38138,7 +38427,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -38708,7 +38997,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -38722,7 +39011,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -38736,7 +39025,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -39651,7 +39940,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -40238,8 +40527,24 @@
       "distribution_obligation_profile": "spdx:2af71558e438db0b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
-      "nonproduction_scope_hints": [],
+      "nonproduction_scope_hints": [
+        "has-target-conditioned-edge"
+      ],
       "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "studiofs",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(unix)"
+            }
+          ]
+        },
         {
           "from": {
             "name": "pprof_util",
@@ -40265,33 +40570,9 @@
               "target": null
             }
           ]
-        },
-        {
-          "from": {
-            "name": "studiofs",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
         }
       ],
       "targets": {
-        "windows-x86_64": {
-          "roles": [
-            "runtime"
-          ],
-          "enabled_features": [
-            "default",
-            "derive",
-            "std"
-          ]
-        },
         "linux-x86_64": {
           "roles": [
             "runtime"
@@ -40370,12 +40651,6 @@
         }
       ],
       "targets": {
-        "windows-x86_64": {
-          "roles": [
-            "host-build"
-          ],
-          "enabled_features": []
-        },
         "linux-x86_64": {
           "roles": [
             "host-build"
@@ -40520,7 +40795,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -41926,7 +42201,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -42738,7 +43013,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -42752,7 +43027,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -43138,6 +43413,19 @@
       "resolved_incoming_dependency_edges": [
         {
           "from": {
+            "name": "globset",
+            "version": "0.4.19",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "matchers",
             "version": "0.2.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -43154,6 +43442,20 @@
             "name": "regex",
             "version": "1.12.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-vfs",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-vfs"
           },
           "dependency_kinds": [
             {
@@ -43184,14 +43486,32 @@
           ],
           "enabled_features": [
             "alloc",
+            "default",
+            "dfa",
             "dfa-build",
+            "dfa-onepass",
             "dfa-search",
+            "hybrid",
             "meta",
+            "nfa",
+            "nfa-backtrack",
             "nfa-pikevm",
             "nfa-thompson",
+            "perf",
+            "perf-inline",
+            "perf-literal",
+            "perf-literal-multisubstring",
+            "perf-literal-substring",
             "std",
             "syntax",
+            "unicode",
+            "unicode-age",
+            "unicode-bool",
+            "unicode-case",
+            "unicode-gencat",
             "unicode-perl",
+            "unicode-script",
+            "unicode-segment",
             "unicode-word-boundary"
           ]
         },
@@ -43201,11 +43521,33 @@
           ],
           "enabled_features": [
             "alloc",
+            "default",
+            "dfa",
             "dfa-build",
+            "dfa-onepass",
             "dfa-search",
+            "hybrid",
+            "meta",
+            "nfa",
+            "nfa-backtrack",
+            "nfa-pikevm",
             "nfa-thompson",
+            "perf",
+            "perf-inline",
+            "perf-literal",
+            "perf-literal-multisubstring",
+            "perf-literal-substring",
             "std",
-            "syntax"
+            "syntax",
+            "unicode",
+            "unicode-age",
+            "unicode-bool",
+            "unicode-case",
+            "unicode-gencat",
+            "unicode-perl",
+            "unicode-script",
+            "unicode-segment",
+            "unicode-word-boundary"
           ]
         },
         "macos-aarch64": {
@@ -43214,11 +43556,33 @@
           ],
           "enabled_features": [
             "alloc",
+            "default",
+            "dfa",
             "dfa-build",
+            "dfa-onepass",
             "dfa-search",
+            "hybrid",
+            "meta",
+            "nfa",
+            "nfa-backtrack",
+            "nfa-pikevm",
             "nfa-thompson",
+            "perf",
+            "perf-inline",
+            "perf-literal",
+            "perf-literal-multisubstring",
+            "perf-literal-substring",
             "std",
-            "syntax"
+            "syntax",
+            "unicode",
+            "unicode-age",
+            "unicode-bool",
+            "unicode-case",
+            "unicode-gencat",
+            "unicode-perl",
+            "unicode-script",
+            "unicode-segment",
+            "unicode-word-boundary"
           ]
         }
       }
@@ -43337,6 +43701,19 @@
       "resolved_incoming_dependency_edges": [
         {
           "from": {
+            "name": "globset",
+            "version": "0.4.19",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "regex",
             "version": "1.12.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -43370,7 +43747,14 @@
           ],
           "enabled_features": [
             "std",
-            "unicode-perl"
+            "unicode",
+            "unicode-age",
+            "unicode-bool",
+            "unicode-case",
+            "unicode-gencat",
+            "unicode-perl",
+            "unicode-script",
+            "unicode-segment"
           ]
         },
         "linux-x86_64": {
@@ -43378,7 +43762,15 @@
             "runtime"
           ],
           "enabled_features": [
-            "std"
+            "std",
+            "unicode",
+            "unicode-age",
+            "unicode-bool",
+            "unicode-case",
+            "unicode-gencat",
+            "unicode-perl",
+            "unicode-script",
+            "unicode-segment"
           ]
         },
         "macos-aarch64": {
@@ -43386,7 +43778,15 @@
             "runtime"
           ],
           "enabled_features": [
-            "std"
+            "std",
+            "unicode",
+            "unicode-age",
+            "unicode-bool",
+            "unicode-case",
+            "unicode-gencat",
+            "unicode-perl",
+            "unicode-script",
+            "unicode-segment"
           ]
         }
       }
@@ -43435,6 +43835,20 @@
             "name": "opendal",
             "version": "0.55.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-data",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-data"
           },
           "dependency_kinds": [
             {
@@ -43548,9 +43962,23 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-data",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-data"
           },
           "dependency_kinds": [
             {
@@ -44776,7 +45204,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -46043,6 +46471,20 @@
         },
         {
           "from": {
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_os = \"macos\")"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "chrono",
             "version": "0.4.43",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -46265,7 +46707,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -46279,7 +46721,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -46292,22 +46734,8 @@
         },
         {
           "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -46321,7 +46749,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -46335,7 +46763,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -46539,7 +46967,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -46602,6 +47030,19 @@
           "from": {
             "name": "bitflags",
             "version": "2.11.0",
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "bstr",
+            "version": "1.14.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -46954,6 +47395,20 @@
         },
         {
           "from": {
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_os = \"macos\")"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "opendal",
             "version": "0.55.0",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -46994,7 +47449,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -47008,7 +47463,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -47021,22 +47476,8 @@
         },
         {
           "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -47050,7 +47491,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -47064,7 +47505,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -47664,7 +48105,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -47678,7 +48119,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -47692,7 +48133,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -47706,7 +48147,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -47720,7 +48161,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -48752,7 +49193,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -49487,7 +49928,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -49733,21 +50174,21 @@
     },
     {
       "name": "studiofs",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
       "license_expression": "GPL-3.0-only",
       "license_expression_id": "spdx:ffbc986889d4c74b",
-      "repository": null,
+      "repository": "https://github.com/valandreev/studiofs-cli",
       "manifest": {
         "path": "crates/studiofs/Cargo.toml",
-        "sha256": "39fcbaffcab6fdb0e1b1a592cbab7695def9e99c18aab1ddd2f22ada97b78357"
+        "sha256": "7a218b7ee78bebc04099f337be5f99295d2b191a8939350caa824e3b6b91967b"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "39fcbaffcab6fdb0e1b1a592cbab7695def9e99c18aab1ddd2f22ada97b78357"
+          "sha256": "7a218b7ee78bebc04099f337be5f99295d2b191a8939350caa824e3b6b91967b"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49783,7 +50224,7 @@
     },
     {
       "name": "studiofs-bridge",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -49792,12 +50233,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-bridge/Cargo.toml",
-        "sha256": "7f39a0061f6f855d70e4f3e3b89bcd186874d75d7a3e6c55d54cdcf6cb796d0c"
+        "sha256": "d268ea4ed11dca237d1a8fe32a58b21007f9ecb7ca472af521825faaad0a7cd1"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "7f39a0061f6f855d70e4f3e3b89bcd186874d75d7a3e6c55d54cdcf6cb796d0c"
+          "sha256": "d268ea4ed11dca237d1a8fe32a58b21007f9ecb7ca472af521825faaad0a7cd1"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49813,7 +50254,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -49827,14 +50268,14 @@
         {
           "from": {
             "name": "studiofs-macfuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-macfuse"
           },
           "dependency_kinds": [
             {
               "kind": "normal",
-              "target": null
+              "target": "cfg(target_os = \"macos\")"
             }
           ]
         }
@@ -49856,7 +50297,7 @@
     },
     {
       "name": "studiofs-cache",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -49865,12 +50306,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-cache/Cargo.toml",
-        "sha256": "52d9b1a39493ca48e94dd122794fa0577b4d36e216fa9baad4646f7f987d665d"
+        "sha256": "f977d4ee0bf71565357b8a32c7723dd9f382d1042c601ab99eb3b28af819fc2f"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "52d9b1a39493ca48e94dd122794fa0577b4d36e216fa9baad4646f7f987d665d"
+          "sha256": "f977d4ee0bf71565357b8a32c7723dd9f382d1042c601ab99eb3b28af819fc2f"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49884,7 +50325,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -49898,7 +50339,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -49933,7 +50374,7 @@
     },
     {
       "name": "studiofs-data",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -49942,12 +50383,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-data/Cargo.toml",
-        "sha256": "bde29dff8bc967b5a9c5f4293b4c2e643672c84c0b18d793d7e44ab4515d9d5f"
+        "sha256": "7df3f6707f782aa5831ebbf65cc224458cb52ef0192c9b5a2b809f8fbed4776e"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "bde29dff8bc967b5a9c5f4293b4c2e643672c84c0b18d793d7e44ab4515d9d5f"
+          "sha256": "7df3f6707f782aa5831ebbf65cc224458cb52ef0192c9b5a2b809f8fbed4776e"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -49963,7 +50404,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -49981,7 +50422,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -49995,7 +50436,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50009,7 +50450,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -50044,7 +50485,7 @@
     },
     {
       "name": "studiofs-e2e",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50053,12 +50494,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-e2e/Cargo.toml",
-        "sha256": "5e3631abb7f6f10dd4dab7a2598530e7b05d13217b5fb4f13a05bbd3ca410810"
+        "sha256": "af7758fa2326d5634d5e2a2923ec4c31ef6afbf6fb0e081c970b4cdb899b5d1d"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "5e3631abb7f6f10dd4dab7a2598530e7b05d13217b5fb4f13a05bbd3ca410810"
+          "sha256": "af7758fa2326d5634d5e2a2923ec4c31ef6afbf6fb0e081c970b4cdb899b5d1d"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -50074,7 +50515,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50090,7 +50531,7 @@
     },
     {
       "name": "studiofs-linux-fuse",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50120,7 +50561,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50143,7 +50584,7 @@
     },
     {
       "name": "studiofs-macfuse",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50152,12 +50593,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-macfuse/Cargo.toml",
-        "sha256": "a305bdeaaf4e664713a7b35b9267ed0c9327a578bb5fb4fae78133eecdf5e6f6"
+        "sha256": "385c242cd502246f79751136a22d7d6ed580949dee6a9e2f8276c01e3393fce9"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "a305bdeaaf4e664713a7b35b9267ed0c9327a578bb5fb4fae78133eecdf5e6f6"
+          "sha256": "385c242cd502246f79751136a22d7d6ed580949dee6a9e2f8276c01e3393fce9"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -50173,7 +50614,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50196,7 +50637,7 @@
     },
     {
       "name": "studiofs-meta",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50226,7 +50667,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -50239,8 +50680,50 @@
         },
         {
           "from": {
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_os = \"macos\")"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-bridge",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-bridge"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(unix)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-winfsp",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-winfsp"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50253,22 +50736,8 @@
         },
         {
           "from": {
-            "name": "studiofs-bridge",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-bridge"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -50282,7 +50751,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -50295,38 +50764,10 @@
         },
         {
           "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "studiofs-winfsp",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-winfsp"
           },
           "dependency_kinds": [
             {
@@ -50359,7 +50800,7 @@
     },
     {
       "name": "studiofs-scenario",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50390,7 +50831,7 @@
     },
     {
       "name": "studiofs-test-support",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50421,7 +50862,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -50434,8 +50875,22 @@
         },
         {
           "from": {
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "dev",
+              "target": "cfg(target_os = \"macos\")"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50449,7 +50904,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -50463,7 +50918,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -50476,22 +50931,8 @@
         },
         {
           "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "dev",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -50505,7 +50946,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -50519,7 +50960,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -50533,7 +50974,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -50549,7 +50990,7 @@
     },
     {
       "name": "studiofs-vfs",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50558,12 +50999,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-vfs/Cargo.toml",
-        "sha256": "af36bdfeac74778ef439b26c51cabd2b15e4bc331bc68fec1c2eadc4e3701811"
+        "sha256": "88223402cef17a4e8d36a3d8f209b85d8e62a3a492bc4049e8c7dd309d2f0e5e"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "af36bdfeac74778ef439b26c51cabd2b15e4bc331bc68fec1c2eadc4e3701811"
+          "sha256": "88223402cef17a4e8d36a3d8f209b85d8e62a3a492bc4049e8c7dd309d2f0e5e"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -50579,7 +51020,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -50592,8 +51033,50 @@
         },
         {
           "from": {
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_os = \"macos\")"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-bridge",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-bridge"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(unix)"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-winfsp",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-winfsp"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -50606,52 +51089,10 @@
         },
         {
           "from": {
-            "name": "studiofs-bridge",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-bridge"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "studiofs-winfsp",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-winfsp"
           },
           "dependency_kinds": [
             {
@@ -50684,7 +51125,7 @@
     },
     {
       "name": "studiofs-winfsp",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "source": null,
       "checksum": null,
       "package_kind": "workspace",
@@ -50693,12 +51134,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-winfsp/Cargo.toml",
-        "sha256": "7c6b061ccd2c5c3bcb0f744419c5b3b784b93d3199698327ec0f3a6ca329dbbe"
+        "sha256": "ebe29495a1eb310ab41b9b65958bd18c3cc63eda967391e404810a4f5ff949e5"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "7c6b061ccd2c5c3bcb0f744419c5b3b784b93d3199698327ec0f3a6ca329dbbe"
+          "sha256": "ebe29495a1eb310ab41b9b65958bd18c3cc63eda967391e404810a4f5ff949e5"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -50714,7 +51155,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -51031,7 +51472,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -51045,7 +51486,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -51940,7 +52381,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -51954,7 +52395,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -51968,7 +52409,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -52152,7 +52593,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -52166,7 +52607,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -52180,7 +52621,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -52233,7 +52674,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -52247,7 +52688,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -52261,7 +52702,7 @@
         {
           "from": {
             "name": "studiofs-test-support",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-test-support"
           },
@@ -52275,7 +52716,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -52447,8 +52888,38 @@
       "distribution_obligation_profile": "spdx:db11fec9946737df",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
-      "nonproduction_scope_hints": [],
+      "nonproduction_scope_hints": [
+        "has-target-conditioned-edge"
+      ],
       "resolved_incoming_dependency_edges": [
+        {
+          "from": {
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_os = \"macos\")"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-winfsp",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-winfsp"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
+            }
+          ]
+        },
         {
           "from": {
             "name": "android-activity",
@@ -52595,7 +53066,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -52609,7 +53080,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -52623,7 +53094,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -52637,7 +53108,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -52650,22 +53121,8 @@
         },
         {
           "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -52679,7 +53136,7 @@
         {
           "from": {
             "name": "studiofs-scenario",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-scenario"
           },
@@ -52693,23 +53150,9 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "studiofs-winfsp",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-winfsp"
           },
           "dependency_kinds": [
             {
@@ -53966,7 +54409,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -53984,7 +54427,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -54058,7 +54501,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -54066,6 +54509,34 @@
             {
               "kind": "normal",
               "target": "cfg(target_os = \"linux\")"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_os = \"macos\")"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-winfsp",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-winfsp"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
             }
           ]
         },
@@ -54232,7 +54703,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -54246,7 +54717,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -54260,7 +54731,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -54273,38 +54744,10 @@
         },
         {
           "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "studiofs-winfsp",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-winfsp"
           },
           "dependency_kinds": [
             {
@@ -54563,7 +55006,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -54577,7 +55020,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -54591,7 +55034,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -54605,7 +55048,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -54739,7 +55182,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -54837,6 +55280,20 @@
         },
         {
           "from": {
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_os = \"macos\")"
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "aws-smithy-types",
             "version": "1.4.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
@@ -54864,7 +55321,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -54877,22 +55334,8 @@
         },
         {
           "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -54906,7 +55349,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -55014,7 +55457,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -55967,7 +56410,7 @@
         {
           "from": {
             "name": "studiofs-linux-fuse",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-linux-fuse"
           },
@@ -55975,6 +56418,34 @@
             {
               "kind": "normal",
               "target": "cfg(target_os = \"linux\")"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-macfuse",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-macfuse"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(target_os = \"macos\")"
+            }
+          ]
+        },
+        {
+          "from": {
+            "name": "studiofs-winfsp",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-winfsp"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": "cfg(windows)"
             }
           ]
         },
@@ -56189,7 +56660,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -56203,7 +56674,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -56217,7 +56688,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -56230,22 +56701,8 @@
         },
         {
           "from": {
-            "name": "studiofs-macfuse",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-macfuse"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -56259,23 +56716,9 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
-          },
-          "dependency_kinds": [
-            {
-              "kind": "normal",
-              "target": null
-            }
-          ]
-        },
-        {
-          "from": {
-            "name": "studiofs-winfsp",
-            "version": "0.2.3",
-            "source": null,
-            "workspace_path": "crates/studiofs-winfsp"
           },
           "dependency_kinds": [
             {
@@ -56402,7 +56845,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -56754,7 +57197,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -56768,7 +57211,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -56782,7 +57225,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -56796,7 +57239,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -56946,7 +57389,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -58203,7 +58646,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -58217,7 +58660,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -58231,7 +58674,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -58245,7 +58688,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -58523,7 +58966,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -58541,7 +58984,7 @@
         {
           "from": {
             "name": "studiofs-vfs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-vfs"
           },
@@ -58615,7 +59058,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -58629,7 +59072,7 @@
         {
           "from": {
             "name": "studiofs-cache",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-cache"
           },
@@ -58643,7 +59086,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -58657,7 +59100,7 @@
         {
           "from": {
             "name": "studiofs-e2e",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-e2e"
           },
@@ -61305,7 +61748,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },
@@ -61990,7 +62433,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -62004,7 +62447,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -64906,7 +65349,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -64979,7 +65422,7 @@
         {
           "from": {
             "name": "studiofs-winfsp",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-winfsp"
           },
@@ -65058,7 +65501,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -65329,7 +65772,7 @@
         {
           "from": {
             "name": "studiofs",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs"
           },
@@ -66317,8 +66760,22 @@
       "resolved_incoming_dependency_edges": [
         {
           "from": {
+            "name": "studiofs-cache",
+            "version": "0.2.4",
+            "source": null,
+            "workspace_path": "crates/studiofs-cache"
+          },
+          "dependency_kinds": [
+            {
+              "kind": "normal",
+              "target": null
+            }
+          ]
+        },
+        {
+          "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -66336,6 +66793,7 @@
             "runtime"
           ],
           "enabled_features": [
+            "std",
             "xxh64"
           ]
         },
@@ -66344,6 +66802,7 @@
             "runtime"
           ],
           "enabled_features": [
+            "std",
             "xxh64"
           ]
         },
@@ -66352,6 +66811,7 @@
             "runtime"
           ],
           "enabled_features": [
+            "std",
             "xxh64"
           ]
         }
@@ -67413,7 +67873,7 @@
         {
           "from": {
             "name": "studiofs-data",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-data"
           },
@@ -67427,7 +67887,7 @@
         {
           "from": {
             "name": "studiofs-meta",
-            "version": "0.2.3",
+            "version": "0.2.4",
             "source": null,
             "workspace_path": "crates/studiofs-meta"
           },

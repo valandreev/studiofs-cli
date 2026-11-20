@@ -52,6 +52,10 @@ http = "1"
 # Metadata
 redb = "4.3"
 
+# Pattern matching
+globset = "0.4"
+regex-automata = "0.4"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
