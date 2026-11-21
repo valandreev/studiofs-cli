@@ -1359,6 +1359,64 @@ pub struct ScratchDemotion {
     pub objects: std::collections::HashMap<u64, u64>,
 }
 
+/// Persisted status record emitted when a replicated tracked entry wins a name
+/// conflict against a local scratch entry and renames the scratch entry to
+/// `<name>.scratch-conflict-<n>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchConflictRecord {
+    /// Inode of the renamed local scratch entry.
+    pub ino: Ino,
+    /// Parent directory inode where the conflict occurred.
+    pub parent: Ino,
+    /// Volume-relative path of the parent directory at conflict time (empty for root).
+    pub parent_path: Vec<u8>,
+    /// Original scratch entry name before conflict renaming.
+    pub original_name: Vec<u8>,
+    /// New scratch entry name (`<name>.scratch-conflict-<n>`).
+    pub conflict_name: Vec<u8>,
+    /// Inode of the entry that kept the original name: the replicated tracked
+    /// entry, or an existing scratch entry when an ADR 0012 alias merge collides.
+    pub winning_ino: Ino,
+    /// Wall-clock timestamp (Unix milliseconds) when the conflict was resolved.
+    pub recorded_at_unix_ms: u64,
+}
+
+/// One entry within an orphaned scratch subtree relocated to
+/// `<cache>/scratch-orphans/<timestamp>/<old path>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchOrphanEntry {
+    /// Volume-relative path of this entry prior to parent removal (e.g. `b"dir/build/out.o"`).
+    pub old_path: Vec<u8>,
+    /// Original scratch inode number.
+    pub ino: Ino,
+    /// Original parent inode number.
+    pub parent_ino: Ino,
+    /// Preserved inode attributes (kind, size, mode, uid, gid, timestamps, nlink).
+    pub attr: InodeAttr,
+    /// Preserved symlink target when `attr.kind == FileType::Symlink`.
+    pub symlink_target: Option<Vec<u8>>,
+    /// Preserved extended attributes `(name, value)`.
+    pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Preserved regular-file chunk slice mappings referencing local cache payload objects.
+    pub chunks: Vec<(crate::schema::ChunkId, crate::schema::RegularFileChunkState)>,
+}
+
+/// Durable record for a scratch entry or directory subtree relocated to
+/// `<cache>/scratch-orphans/<timestamp>/<old path>` after foreign parent removal
+/// or snapshot restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchOrphanRecord {
+    /// Relocation batch timestamp (Unix milliseconds) forming the `<timestamp>` path segment.
+    pub timestamp_unix_ms: u64,
+    /// Volume-relative path of the root orphaned scratch entry (e.g. `b"dir/target"`).
+    pub root_old_path: Vec<u8>,
+    /// Pre-order list of orphaned scratch entries in the subtree (root first).
+    pub entries: Vec<ScratchOrphanEntry>,
+    /// True once `<cache>/scratch-orphans/<timestamp>/<old path>` has been durably
+    /// materialized on the local filesystem.
+    pub materialized: bool,
+}
+
 /// Strict backend contract.
 ///
 /// This trait is intentionally comprehensive: storage backends implement it once,
@@ -1548,6 +1606,49 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
     /// List extended attribute names stored on a local scratch inode.
     fn list_scratch_xattrs(&self, _ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
         Ok(Vec::new())
+    }
+
+    /// List persisted scratch conflict records produced when replicated tracked
+    /// entries displaced colliding local scratch names.
+    fn list_scratch_conflicts(&self) -> MetaResult<Vec<ScratchConflictRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Remove a resolved scratch conflict record by scratch inode number.
+    fn clear_scratch_conflict(&self, _ino: Ino) -> MetaResult<bool> {
+        Ok(false)
+    }
+
+    /// List orphaned scratch subtrees relocated outside the active namespace.
+    fn list_scratch_orphans(&self) -> MetaResult<Vec<ScratchOrphanRecord>> {
+        Ok(Vec::new())
+    }
+
+    /// Restore an orphaned scratch entry or subtree back into the scratch layer.
+    ///
+    /// When `target_parent` and `target_name` are omitted, restores to the
+    /// recorded original path (creating any missing intermediate directories as
+    /// scratch directories).
+    fn restore_scratch_orphan(
+        &self,
+        _timestamp_unix_ms: u64,
+        _root_old_path: &[u8],
+        _target_parent: Option<Ino>,
+        _target_name: Option<&[u8]>,
+    ) -> MetaResult<InodeAttr> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Configure the local cache root where `<cache>/scratch-orphans` and
+    /// local payload objects reside, and materialize any pending orphans.
+    fn set_scratch_cache_dir(&self, _cache_dir: std::path::PathBuf) -> MetaResult<()> {
+        Ok(())
+    }
+
+    /// Return the local directory storing orphaned scratch subtrees
+    /// (`<cache>/scratch-orphans`).
+    fn scratch_orphans_dir(&self) -> MetaResult<std::path::PathBuf> {
+        Err(MetaError::Storage("scratch storage is unsupported".into()))
     }
 
     /// Mount-local last-good ignore rule sources, encoded by the VFS.

@@ -165,6 +165,7 @@ pub struct RedbMetaEngine {
     write_txn_lock: Arc<Mutex<()>>,
     scratch_mutation_lock: Mutex<()>,
     scratch_index: RwLock<scratch::ScratchIndex>,
+    scratch_cache_dir: RwLock<Option<PathBuf>>,
     invalidation_journal: Mutex<InvalidationJournal>,
     pub(crate) invalidation_notify: Arc<tokio::sync::Notify>,
     #[cfg(test)]
@@ -1155,6 +1156,10 @@ impl RedbMetaEngine {
                 .map_err(scratch::storage_error)?;
             txn.open_table(SCRATCH_SYMLINKS)
                 .map_err(scratch::storage_error)?;
+            txn.open_table(SCRATCH_CONFLICTS)
+                .map_err(scratch::storage_error)?;
+            txn.open_table(SCRATCH_ORPHANS)
+                .map_err(scratch::storage_error)?;
             let _ = txn.open_table(SETTINGS_TABLE);
             let _ = txn.open_table(COUNTERS_TABLE);
             let _ = txn.open_table(LOCAL_ALLOCATOR_STATE_TABLE);
@@ -1220,6 +1225,7 @@ impl RedbMetaEngine {
             write_txn_lock,
             scratch_mutation_lock: Mutex::new(()),
             scratch_index: RwLock::new(scratch::ScratchIndex::default()),
+            scratch_cache_dir: RwLock::new(None),
             invalidation_journal: Mutex::default(),
             invalidation_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
@@ -1275,6 +1281,7 @@ impl RedbMetaEngine {
             write_txn_lock: Arc::new(Mutex::new(())),
             scratch_mutation_lock: Mutex::new(()),
             scratch_index: RwLock::new(scratch::ScratchIndex::default()),
+            scratch_cache_dir: RwLock::new(None),
             invalidation_journal: Mutex::default(),
             invalidation_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
@@ -1461,6 +1468,7 @@ impl RedbMetaEngine {
     }
 }
 mod scratch;
+pub(crate) use scratch::ScratchReconciliationOutcome;
 mod snapshots;
 mod symlink;
 mod txn;
@@ -1615,6 +1623,41 @@ impl MetaEngineCore for RedbMetaEngine {
 
     fn list_scratch_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>> {
         self.enumerate_scratch_xattrs(ino)
+    }
+
+    fn list_scratch_conflicts(&self) -> MetaResult<Vec<ScratchConflictRecord>> {
+        self.read_scratch_conflicts()
+    }
+
+    fn clear_scratch_conflict(&self, ino: Ino) -> MetaResult<bool> {
+        self.delete_scratch_conflict(ino)
+    }
+
+    fn list_scratch_orphans(&self) -> MetaResult<Vec<ScratchOrphanRecord>> {
+        self.read_scratch_orphans()
+    }
+
+    fn restore_scratch_orphan(
+        &self,
+        timestamp_unix_ms: u64,
+        root_old_path: &[u8],
+        target_parent: Option<Ino>,
+        target_name: Option<&[u8]>,
+    ) -> MetaResult<InodeAttr> {
+        self.restore_scratch_orphan_entry(
+            timestamp_unix_ms,
+            root_old_path,
+            target_parent,
+            target_name,
+        )
+    }
+
+    fn set_scratch_cache_dir(&self, cache_dir: PathBuf) -> MetaResult<()> {
+        self.configure_scratch_cache_dir(cache_dir)
+    }
+
+    fn scratch_orphans_dir(&self) -> MetaResult<PathBuf> {
+        Ok(self.resolved_scratch_orphans_dir())
     }
 
     fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {

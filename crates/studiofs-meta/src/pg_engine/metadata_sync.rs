@@ -493,6 +493,7 @@ impl PgMetaEngine {
                 max_namespace_version: context.current_namespace_version,
                 flushed_event_seq: None,
                 serving_reconciled: false,
+                scratch_reconciliation: Default::default(),
             });
         }
         let (local_event_ack_barrier, published_prefixes, published_ranges, local_only_completed) = {
@@ -579,6 +580,8 @@ impl PgMetaEngine {
         self.run_catch_up_fault_hook(super::CatchUpFaultPoint::AfterLocalCommit {
             last_batch_version: outcome.max_version,
         })?;
+        self.local
+            .finish_scratch_reconciliation(outcome.scratch_reconciliation)?;
         self.publish_replay_position(&outcome);
         self.trim_local_event_progress_before_locked(
             self.flushed_event_seq.load(Ordering::SeqCst),

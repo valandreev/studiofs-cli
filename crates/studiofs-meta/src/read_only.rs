@@ -116,6 +116,38 @@ impl<M> MetaEngineCore for ReadOnlyMetaEngine<M>
 where
     M: ?Sized + MetaEngine,
 {
+    fn list_scratch_conflicts(&self) -> MetaResult<Vec<ScratchConflictRecord>> {
+        self.inner.list_scratch_conflicts()
+    }
+
+    fn clear_scratch_conflict(&self, ino: Ino) -> MetaResult<bool> {
+        Err(read_only_error(ino))
+    }
+
+    fn list_scratch_orphans(&self) -> MetaResult<Vec<ScratchOrphanRecord>> {
+        self.inner.list_scratch_orphans()
+    }
+
+    fn restore_scratch_orphan(
+        &self,
+        _timestamp_unix_ms: u64,
+        _root_old_path: &[u8],
+        target_parent: Option<Ino>,
+        _target_name: Option<&[u8]>,
+    ) -> MetaResult<InodeAttr> {
+        Err(read_only_error(target_parent.unwrap_or(ROOT_INO)))
+    }
+
+    // Snapshot mounts call this during bootstrap; a read-only view never
+    // reconciles, so there are no orphans to materialize.
+    fn set_scratch_cache_dir(&self, _cache_dir: std::path::PathBuf) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn scratch_orphans_dir(&self) -> MetaResult<std::path::PathBuf> {
+        self.inner.scratch_orphans_dir()
+    }
+
     fn metadata_write_observability(&self) -> MetadataWriteObservability {
         self.inner.metadata_write_observability()
     }
@@ -820,6 +852,17 @@ mod tests {
             Err(MetaError::AccessDenied { .. })
         ));
         assert_eq!(inner.lookup(ROOT_INO, b"entry").unwrap(), entry);
+    }
+
+    #[test]
+    fn read_only_meta_accepts_scratch_cache_dir_for_snapshot_mount_bootstrap() {
+        let dir = studiofs_test_support::workspace_target_tempdir("read-only-scratch-cache-");
+        let inner = Arc::new(RedbMetaEngine::open(dir.path().join("meta.redb")).unwrap());
+        let read_only = ReadOnlyMetaEngine::new(inner);
+
+        read_only
+            .set_scratch_cache_dir(dir.path().join("cache"))
+            .expect("VfsBootstrap::prepare calls this for snapshot mounts too");
     }
 
     #[test]

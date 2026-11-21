@@ -162,6 +162,7 @@ fn removal_fault_engine(backend: &RemoveFaultBackend) -> RedbMetaEngine {
         write_txn_lock: Arc::new(Mutex::new(())),
         scratch_mutation_lock: Mutex::new(()),
         scratch_index: RwLock::new(scratch::ScratchIndex::default()),
+        scratch_cache_dir: RwLock::new(None),
         invalidation_journal: Mutex::default(),
         invalidation_notify: Arc::new(tokio::sync::Notify::new()),
         allocator_state_write_hook: Mutex::new(None),

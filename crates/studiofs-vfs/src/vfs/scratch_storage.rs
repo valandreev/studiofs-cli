@@ -25,6 +25,38 @@ impl StudioVfs {
         }
     }
 
+    /// List persisted scratch name-conflict records (`<name>.scratch-conflict-<n>`).
+    pub fn list_scratch_conflicts(&self) -> VfsResult<Vec<studiofs_meta::ScratchConflictRecord>> {
+        self.sync_meta()
+            .list_scratch_conflicts()
+            .map_err(Into::into)
+    }
+
+    /// Clear a persisted scratch conflict record by scratch inode number.
+    pub fn clear_scratch_conflict(&self, ino: Ino) -> VfsResult<bool> {
+        self.sync_meta()
+            .clear_scratch_conflict(ino)
+            .map_err(Into::into)
+    }
+
+    /// List orphaned scratch subtrees relocated outside the active namespace.
+    pub fn list_scratch_orphans(&self) -> VfsResult<Vec<studiofs_meta::ScratchOrphanRecord>> {
+        self.sync_meta().list_scratch_orphans().map_err(Into::into)
+    }
+
+    /// Restore an orphaned scratch entry or subtree back into the scratch layer.
+    pub fn restore_scratch_orphan(
+        &self,
+        timestamp_unix_ms: u64,
+        root_old_path: &[u8],
+        target_parent: Option<Ino>,
+        target_name: Option<&[u8]>,
+    ) -> VfsResult<InodeAttr> {
+        self.sync_meta()
+            .restore_scratch_orphan(timestamp_unix_ms, root_old_path, target_parent, target_name)
+            .map_err(Into::into)
+    }
+
     pub(super) fn record_scratch_writer_stack_payload(
         &self,
         fh: u64,
@@ -1505,6 +1537,117 @@ mod tests {
                 vfs.classify_new_entry(dir.ino, b"app.log", false).unwrap(),
                 crate::scratch_rules::ScratchClass::Tracked
             );
+        });
+    }
+
+    #[test]
+    fn vfs_replay_scratch_conflict_and_orphan_preserve_payload_and_restore() {
+        use studiofs_meta::MetaReplication;
+        use studiofs_meta::events::MetaEvent;
+        use studiofs_meta::types::UploadState;
+
+        let temp = studiofs_test_support::workspace_target_tempdir("vfs-scratch-conflict-orphan-");
+        let (runtime, vfs, meta) = make_started_test_vfs(&temp, "scratch-conflict-orphan");
+        let _guard = runtime.enter();
+        runtime.block_on(async {
+            let tracked_work = vfs.mkdir(ROOT_INO, b"work", 0, 0, 0o755).unwrap();
+
+            let shared_scratch = vfs
+                .store_scratch_entry(b"shared.tmp", InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
+                .unwrap();
+            vfs.write_scratch(0, shared_scratch.ino, 0, b"local scratch bytes")
+                .await
+                .unwrap();
+            vfs.fsync(shared_scratch.ino, false).await.unwrap();
+
+            let orphan_scratch = vfs
+                .store_scratch_entry(
+                    b"orphan.tmp",
+                    InodeAttr::new_file(0, tracked_work.ino, 0, 0, 0o644),
+                )
+                .unwrap();
+            vfs.write_scratch(0, orphan_scratch.ino, 0, b"orphan payload bytes")
+                .await
+                .unwrap();
+            vfs.fsync(orphan_scratch.ino, false).await.unwrap();
+
+            // Peer adds tracked `/shared.tmp` and removes `/work`.
+            let mut peer_shared = InodeAttr::new_file(5000, ROOT_INO, 0, 0, 0o644);
+            peer_shared.upload_state = UploadState::Updating;
+            meta.apply_replica_serving_state(&[
+                MetaEvent::SetAttr { attr: peer_shared },
+                MetaEvent::AddEntry {
+                    parent: ROOT_INO,
+                    name: b"shared.tmp".to_vec(),
+                    entry: studiofs_meta::types::DirEntryValue {
+                        ino: 5000,
+                        kind: FileType::RegularFile,
+                    },
+                },
+                MetaEvent::RemoveAttr {
+                    ino: tracked_work.ino,
+                },
+                MetaEvent::RemoveEntry {
+                    parent: ROOT_INO,
+                    name: b"work".to_vec(),
+                },
+            ])
+            .unwrap();
+            // Consume meta invalidations so VFS caches reflect the replicated change immediately.
+            for batch in meta.take_invalidation_batches() {
+                vfs.apply_semantic_invalidation_batch(batch);
+            }
+            vfs.dentry_cache_invalidate(ROOT_INO, b"shared.tmp");
+            vfs.dentry_cache_invalidate(ROOT_INO, b"work");
+
+            // Tracked entry wins `/shared.tmp`; scratch file is readable at `.scratch-conflict-1`.
+            assert_eq!(vfs.lookup(ROOT_INO, b"shared.tmp").unwrap().ino, 5000);
+            let renamed = vfs
+                .lookup(ROOT_INO, b"shared.tmp.scratch-conflict-1")
+                .unwrap();
+            assert_eq!(renamed.ino, shared_scratch.ino);
+            let scratch_data = vfs
+                .read_scratch_block(renamed.ino, 0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&scratch_data[..], b"local scratch bytes");
+
+            let conflicts = vfs.list_scratch_conflicts().unwrap();
+            assert_eq!(conflicts.len(), 1);
+            assert_eq!(conflicts[0].conflict_name, b"shared.tmp.scratch-conflict-1");
+
+            // `/work` is gone, and `work/orphan.tmp` is materialized in `<cache>/scratch-orphans/<ts>/work/orphan.tmp`.
+            assert!(vfs.lookup(ROOT_INO, b"work").is_err());
+            let orphans = vfs.list_scratch_orphans().unwrap();
+            assert_eq!(orphans.len(), 1);
+            assert!(orphans[0].materialized);
+            let orphan_disk = meta
+                .scratch_orphans_dir()
+                .unwrap()
+                .join(orphans[0].timestamp_unix_ms.to_string())
+                .join("work/orphan.tmp");
+            assert_eq!(
+                std::fs::read(&orphan_disk).unwrap(),
+                b"orphan payload bytes"
+            );
+
+            // Restore brings it back with intact payload.
+            let restored = vfs
+                .restore_scratch_orphan(
+                    orphans[0].timestamp_unix_ms,
+                    b"work/orphan.tmp",
+                    None,
+                    None,
+                )
+                .unwrap();
+            let restored_data = vfs
+                .read_scratch_block(restored.ino, 0)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&restored_data[..], b"orphan payload bytes");
+            assert!(!orphan_disk.exists());
         });
     }
 }
