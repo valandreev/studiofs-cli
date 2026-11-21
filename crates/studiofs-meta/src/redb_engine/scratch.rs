@@ -1183,13 +1183,13 @@ impl RedbMetaEngine {
             }
             let local_only = attr.kind == FileType::RegularFile
                 && attr.committed_content_epoch == 0
-                && !Self::lookup_exact_in_write_table(
+                && Self::lookup_exact_in_write_table(
                     &txn,
                     BASE_DENTRIES_TABLE,
                     old_parent,
                     &old_name,
                 )?
-                .is_some_and(|entry| entry.ino == ino);
+                .is_none_or(|entry| entry.ino != ino);
             if attr.kind == FileType::RegularFile {
                 Self::demote_file_in_txn(&txn, &mut attr, plan)?;
             }
