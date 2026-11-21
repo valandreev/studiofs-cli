@@ -198,11 +198,25 @@ pub(super) enum ScratchPromoteSubtreeWalk {
     OverLimit { entry_count: usize },
 }
 
+/// How the subtree walk treats an inode it reaches a second time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScratchPromoteRevisit {
+    /// Promotion freezes an exact set, so a repeated inode means the subtree
+    /// changed under the walk.
+    TargetChanged,
+    /// Offline over-limit inspection only counts entries and skips repeats.
+    Skip,
+}
+
+/// Walks the scratch subtree under `root_attr`. Every direct child counts
+/// toward `entry_limit`, including children `keep_child_scratch` leaves in
+/// scratch; their own descendants are not visited.
 fn collect_scratch_promote_subtree<M: MetaEngineCore + ?Sized>(
     meta: &M,
     root_attr: InodeAttr,
     root_rel_path: &[u8],
     entry_limit: usize,
+    revisit: ScratchPromoteRevisit,
     mut keep_child_scratch: impl FnMut(&[u8], bool) -> bool,
 ) -> VfsResult<ScratchPromoteSubtreeWalk> {
     let mut frozen = HashSet::new();
@@ -211,7 +225,12 @@ fn collect_scratch_promote_subtree<M: MetaEngineCore + ?Sized>(
     let mut files = Vec::new();
     while let Some((attr, attr_path)) = pending.pop() {
         if !frozen.insert(attr.ino) {
-            return Err(MetaError::TargetChanged.into());
+            match revisit {
+                ScratchPromoteRevisit::TargetChanged => {
+                    return Err(MetaError::TargetChanged.into());
+                }
+                ScratchPromoteRevisit::Skip => continue,
+            }
         }
         if frozen.len() + pending.len() > entry_limit {
             return Ok(ScratchPromoteSubtreeWalk::OverLimit {
@@ -219,7 +238,12 @@ fn collect_scratch_promote_subtree<M: MetaEngineCore + ?Sized>(
             });
         }
         if attr.kind == FileType::Directory {
-            for (child_name, child) in meta.readdir_scratch(attr.ino)? {
+            let children = meta.readdir_scratch(attr.ino)?;
+            let entry_count = frozen.len() + pending.len() + children.len();
+            if entry_count > entry_limit {
+                return Ok(ScratchPromoteSubtreeWalk::OverLimit { entry_count });
+            }
+            for (child_name, child) in children {
                 let child_path = join_relative_path(&attr_path, &child_name);
                 let child_is_dir = child.kind == FileType::Directory;
                 // A descendant that still matches a rule stays scratch with its subtree.
@@ -228,11 +252,6 @@ fn collect_scratch_promote_subtree<M: MetaEngineCore + ?Sized>(
                 } else {
                     pending.push((child, child_path));
                 }
-            }
-            if frozen.len() + pending.len() > entry_limit {
-                return Ok(ScratchPromoteSubtreeWalk::OverLimit {
-                    entry_count: frozen.len() + pending.len(),
-                });
             }
         } else if attr.kind == FileType::RegularFile {
             files.push(attr.ino);
@@ -290,9 +309,10 @@ pub fn find_over_limit_scratch_directories(
                 attr,
                 &rel_path,
                 entry_limit,
-                |child_path, child_is_dir| {
-                    rules.classify(child_path, child_is_dir) != ScratchClass::Tracked
-                },
+                ScratchPromoteRevisit::Skip,
+                // The status report counts the whole scratch subtree, including
+                // descendants that rules would keep in scratch.
+                |_, _| false,
             )?
         {
             over_limit.push(ScratchPromoteOverLimitEntry {
@@ -700,6 +720,7 @@ impl StudioVfs {
             root_attr,
             root_rel_path,
             self.scratch_promote_entry_limit,
+            ScratchPromoteRevisit::TargetChanged,
             keep_child_scratch,
         )? {
             ScratchPromoteSubtreeWalk::Ready(subtree) => subtree,
@@ -740,14 +761,12 @@ impl StudioVfs {
         }))
     }
 
-    /// Refreshes open-handle attrs, invalidates attribute read cache, and hands
-    /// promoted regular-file payloads to the background uploader (or queues empty
-    /// epoch finalization). Must run while holding the frozen restore permits.
+    /// Hands promoted regular-file payloads to the background uploader (or
+    /// queues empty epoch finalization). Callers refresh caches and open-handle
+    /// attrs themselves. Must run after the metadata commit while holding the
+    /// frozen restore permits.
     pub(super) fn submit_promoted_subtree_uploads(&self, attrs: &[InodeAttr]) {
         for attr in attrs {
-            self.handle_table
-                .update_open_attrs_for_inode(attr.ino, attr);
-            self.invalidate_attr_read_cache([attr.ino]);
             if !Self::needs_epoch_finalization(attr) {
                 continue;
             }
@@ -834,7 +853,15 @@ impl StudioVfs {
         root_is_dir: bool,
         promoted: &ScratchAutoPromoteResult,
     ) {
-        self.invalidate_attr_read_cache([promoted.parent]);
+        // Unlike explicit rename promotion, refresh open-handle attrs for the
+        // promoted inodes before dropping their cached attributes.
+        for attr in &promoted.attrs {
+            self.handle_table
+                .update_open_attrs_for_inode(attr.ino, attr);
+        }
+        self.invalidate_attr_read_cache(
+            std::iter::once(promoted.parent).chain(promoted.attrs.iter().map(|attr| attr.ino)),
+        );
         // Never insert DentryCacheValue::Negative for `original_name` when conflict-renamed:
         // the colliding tracked winner still occupies `original_name`.
         self.dentry_cache_invalidate(promoted.parent, &promoted.original_name);
@@ -858,7 +885,6 @@ impl StudioVfs {
         );
         self.bump_acl_namespace_epoch();
 
-        self.submit_promoted_subtree_uploads(&promoted.attrs);
         let mut kernel_entries = vec![(promoted.parent, promoted.final_name.clone())];
         if promoted.conflict_renamed {
             kernel_entries.push((promoted.parent, promoted.original_name.clone()));
@@ -867,6 +893,7 @@ impl StudioVfs {
         self.invalidate_kernel_inode_attrs(
             std::iter::once(promoted.parent).chain(promoted.attrs.iter().map(|attr| attr.ino)),
         );
+        self.submit_promoted_subtree_uploads(&promoted.attrs);
     }
 }
 
@@ -1287,6 +1314,43 @@ mod tests {
                 wait_for_auto_promote_generation(&mut status_rx, vfs.ignore_rule_generation())
                     .await;
             assert!(cleared.over_limit_directories.is_empty());
+
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn scratch_auto_promote_limit_counts_children_that_stay_scratch() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-auto-limit-kept-");
+        let (rt, vfs, meta) =
+            make_started_vfs_with_limit(&temp, "scratch-auto-limit-kept", Some(3), None, None);
+        let _guard = rt.enter();
+        rt.block_on(async {
+            install_ignore_rules(&vfs, ROOT_INO, b"big/\n*.tmp\n").await;
+
+            let big = vfs.mkdir(ROOT_INO, b"big", 0, 0, 0o755).unwrap();
+            let moved = write_and_close_file(&vfs, big.ino, b"a.txt", b"a").await;
+            let kept_b = write_and_close_file(&vfs, big.ino, b"b.tmp", b"b").await;
+            let kept_c = write_and_close_file(&vfs, big.ino, b"c.tmp", b"c").await;
+
+            let mut status_rx = vfs.subscribe_scratch_auto_promote_status();
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n").await;
+            let snap =
+                wait_for_auto_promote_generation(&mut status_rx, vfs.ignore_rule_generation())
+                    .await;
+
+            // Children that still match a rule count toward the limit before
+            // they are classified, so `big` (1 + 3 children) stays scratch.
+            for ino in [big.ino, moved.ino, kept_b.ino, kept_c.ino] {
+                assert!(vfs.is_scratch_inode(ino).unwrap());
+            }
+            assert_eq!(snap.over_limit_directories.len(), 1);
+            assert_eq!(snap.over_limit_directories[0].dir_ino, big.ino);
+            assert_eq!(snap.over_limit_directories[0].entry_count, 4);
+
+            // Offline inspection counts the whole scratch subtree and agrees.
+            let offline = find_over_limit_scratch_directories(meta.as_ref(), 3).unwrap();
+            assert_eq!(offline, snap.over_limit_directories);
 
             vfs.shutdown(Duration::from_secs(5)).await.unwrap();
         });

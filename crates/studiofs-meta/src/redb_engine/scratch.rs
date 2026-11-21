@@ -201,16 +201,37 @@ fn remove_scratch_inode_aux_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> Me
 
 struct ScratchSubtreePromoteSpec<'a> {
     source_parent: Ino,
-    stored_name: Vec<u8>,
+    stored_name: &'a [u8],
     source_ino: Ino,
-    target_parent: Ino,
-    /// Automatic promotion binds the root entry in place via `AddEntry` (and
-    /// journals the parent directory attribute update before it) so concurrent
-    /// promotions across clients merge under ADR 0012. Explicit promotion passes
-    /// `None` and commits the root move/replacement via `rename_or_promote_in_txn`.
-    root_add_entry: Option<(&'a [u8], &'a mut InodeAttr)>,
     frozen: &'a HashSet<Ino>,
-    kept_scratch: &'a HashSet<Ino>,
+    mode: ScratchSubtreePromoteMode<'a>,
+}
+
+/// How a scratch subtree is journaled into tracked tables.
+///
+/// The two per-inode event sequences differ on purpose: each keeps the journal
+/// order its own replay and recovery paths were written against. The shared
+/// walk, overlay, symlink, xattr, and scratch-row removal steps stay common.
+enum ScratchSubtreePromoteMode<'a> {
+    /// Explicit rename promotion. Siblings are visited in descending key order.
+    /// Per inode, in order: `set_inode` before the content-epoch bump, an
+    /// unconditional `SetAttr`, then for non-root inodes `AddEntry` plus a
+    /// pending-recovery refresh for every kind, then `SetSymlinkTarget` and
+    /// `SetXattr`. The caller binds the root through `rename_or_promote_in_txn`
+    /// (`RenameEntry`), which may move it to `target_parent`.
+    Rename { target_parent: Ino },
+    /// Automatic promotion in place. Siblings are visited in ascending key
+    /// order and `kept_scratch` children stay scratch. Per inode, in order:
+    /// `touch_ctime` and the content-epoch bump before `set_inode`, `SetAttr`
+    /// only when the overlay apply did not journal one, `SetSymlinkTarget`,
+    /// the parent `SetAttr` (root only), `AddEntry` (the root under
+    /// `target_name`) so concurrent promotions merge under ADR 0012, then
+    /// `SetXattr` and a pending-recovery refresh for regular files.
+    AddEntry {
+        target_name: &'a [u8],
+        parent_attr: &'a mut InodeAttr,
+        kept_scratch: &'a HashSet<Ino>,
+    },
 }
 
 impl RedbMetaEngine {
@@ -1368,26 +1389,21 @@ impl RedbMetaEngine {
 
     /// Moves a frozen scratch subtree into tracked tables inside `txn`.
     ///
-    /// Explicit promotion passes `root_add_entry = None` and commits the root
-    /// move/replacement separately via `rename_or_promote_in_txn`. Automatic
-    /// promotion passes `root_add_entry = Some((target_name, parent_attr))` so
-    /// the root entry is bound via `AddEntry` (after updating `parent_attr`)
-    /// and concurrent promotions merge under ADR 0012.
+    /// Both promotion paths share the subtree walk, the frozen-set checks, the
+    /// overlay/symlink/xattr copies, and the scratch-row removal; `spec.mode`
+    /// selects the per-inode journal sequence (see [`ScratchSubtreePromoteMode`]).
     fn promote_scratch_subtree_in_txn(
         &self,
         txn: &super::RedbWriteTransaction<'_>,
-        spec: &mut ScratchSubtreePromoteSpec<'_>,
+        mut spec: ScratchSubtreePromoteSpec<'_>,
     ) -> MetaResult<Vec<(Ino, InodeAttr)>> {
-        use crate::events::MetaEvent;
-
-        let touch_ctime = spec.root_add_entry.is_some();
         let mut pending = vec![(
             spec.source_parent,
-            spec.stored_name.clone(),
+            spec.stored_name.to_vec(),
             spec.source_ino,
         )];
         let mut moved = Vec::new();
-        while let Some((entry_parent, old_scratch_name, ino)) = pending.pop() {
+        while let Some((entry_parent, scratch_name, ino)) = pending.pop() {
             if !spec.frozen.contains(&ino) || moved.len() == spec.frozen.len() {
                 return Err(MetaError::TargetChanged);
             }
@@ -1396,6 +1412,10 @@ impl RedbMetaEngine {
                 read_scratch_attr_from_table(&inodes, ino)?.ok_or(MetaError::TargetChanged)?
             };
             if attr.kind == FileType::Directory {
+                let kept_scratch = match &spec.mode {
+                    ScratchSubtreePromoteMode::Rename { .. } => None,
+                    ScratchSubtreePromoteMode::AddEntry { kept_scratch, .. } => Some(*kept_scratch),
+                };
                 let dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
                 let start = dentry_prefix(ino);
                 let range_end = prefix_successor(&start);
@@ -1412,7 +1432,7 @@ impl RedbMetaEngine {
                         break;
                     }
                     let child_ino = child.value();
-                    if spec.kept_scratch.contains(&child_ino) {
+                    if kept_scratch.is_some_and(|kept| kept.contains(&child_ino)) {
                         // Still matches a rule: stays scratch under the promoted directory,
                         // and tracked directories do not count scratch subdirectories in nlink.
                         let inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
@@ -1428,158 +1448,51 @@ impl RedbMetaEngine {
                     }
                     children.push((ino, child_name.to_vec(), child_ino));
                 }
-                for child in children.into_iter().rev() {
-                    pending.push(child);
-                }
-            }
-
-            attr.parent = if ino == spec.source_ino {
-                spec.target_parent
-            } else {
-                entry_parent
-            };
-            if attr.kind == FileType::RegularFile && attr.size != 0 {
-                attr.content_epoch = attr.content_epoch.max(1);
-            }
-            if touch_ctime {
-                attr.touch_ctime();
-            }
-            Self::set_inode_in_txn(txn, &attr)?;
-            if attr.kind == FileType::RegularFile && attr.size != 0 {
-                let chunks: Vec<_> = {
-                    let overlay = txn.open_table(SCRATCH_OVERLAY).map_err(storage_error)?;
-                    Self::regular_file_chunk_states_for_inode_in_opened_table(&overlay, ino)?
-                        .into_iter()
-                        .map(|(chunk, state)| (chunk, state.slices.into_values().collect()))
-                        .collect()
-                };
-                let (normalized, applied) = self.apply_regular_file_overlay_mutation_in_txn(
-                    txn,
-                    ino,
-                    &chunks,
-                    Some(&attr),
-                )?;
-                if let Some(normalized) = normalized {
-                    attr = normalized;
-                }
-                if !applied {
-                    Self::append_event_in_txn(txn, &MetaEvent::SetAttr { attr: attr.clone() })?;
-                }
-            } else {
-                if attr.kind == FileType::RegularFile {
-                    Self::sync_inode_lifecycle_in_txn(txn, ino)?;
-                }
-                Self::append_event_in_txn(txn, &MetaEvent::SetAttr { attr: attr.clone() })?;
-            }
-
-            if attr.kind == FileType::Symlink {
-                let target = {
-                    let symlinks = txn.open_table(SCRATCH_SYMLINKS).map_err(storage_error)?;
-                    symlinks
-                        .get(ino)
-                        .map_err(storage_error)?
-                        .map(|row| row.value().to_vec())
-                };
-                if let Some(target) = target {
-                    Self::set_symlink_in_txn(txn, ino, &target)?;
-                    Self::append_event_in_txn(txn, &MetaEvent::SetSymlinkTarget { ino, target })?;
-                }
-            }
-
-            if ino == spec.source_ino {
-                // Emit parent SetAttr immediately before the root AddEntry so
-                // `RemoteApplyCoordinator::local_event_is_contextually_visible`
-                // hides parent mtime updates along with hidden zero-size drafts.
-                // Emit AddEntry before child entries and before SetXattr so ADR 0012
-                // directory merges record the alias before rewriting children/xattrs.
-                if let Some((target_name, parent_attr)) = spec.root_add_entry.as_mut() {
-                    if attr.kind == FileType::Directory {
-                        parent_attr.nlink = parent_attr.nlink.saturating_add(1);
+                match spec.mode {
+                    ScratchSubtreePromoteMode::Rename { .. } => pending.extend(children),
+                    ScratchSubtreePromoteMode::AddEntry { .. } => {
+                        pending.extend(children.into_iter().rev());
                     }
-                    parent_attr.touch_mtime();
-                    Self::set_inode_in_txn(txn, parent_attr)?;
-                    Self::append_event_in_txn(
+                }
+            }
+
+            let is_root = ino == spec.source_ino;
+            match &mut spec.mode {
+                ScratchSubtreePromoteMode::Rename { target_parent } => {
+                    if is_root {
+                        attr.parent = *target_parent;
+                    }
+                    self.journal_renamed_scratch_inode_in_txn(
                         txn,
-                        &MetaEvent::SetAttr {
-                            attr: (*parent_attr).clone(),
-                        },
+                        (entry_parent, &scratch_name),
+                        is_root,
+                        &mut attr,
                     )?;
-                    let entry = DirEntryValue {
-                        ino,
-                        kind: attr.kind,
+                }
+                ScratchSubtreePromoteMode::AddEntry {
+                    target_name,
+                    parent_attr,
+                    ..
+                } => {
+                    let (tracked_name, root_parent_attr) = if is_root {
+                        (*target_name, Some(&mut **parent_attr))
+                    } else {
+                        (scratch_name.as_slice(), None)
                     };
-                    Self::set_dentry_in_txn(txn, entry_parent, target_name, &entry)?;
-                    Self::append_event_in_txn(
+                    self.journal_auto_promoted_scratch_inode_in_txn(
                         txn,
-                        &MetaEvent::AddEntry {
-                            parent: entry_parent,
-                            name: target_name.to_vec(),
-                            entry,
-                        },
+                        (entry_parent, tracked_name),
+                        root_parent_attr,
+                        &mut attr,
                     )?;
                 }
-            } else {
-                let entry = DirEntryValue {
-                    ino,
-                    kind: attr.kind,
-                };
-                Self::set_dentry_in_txn(txn, entry_parent, &old_scratch_name, &entry)?;
-                Self::append_event_in_txn(
-                    txn,
-                    &MetaEvent::AddEntry {
-                        parent: entry_parent,
-                        name: old_scratch_name.clone(),
-                        entry,
-                    },
-                )?;
-            }
-
-            {
-                let xattrs = txn.open_table(SCRATCH_XATTRS).map_err(storage_error)?;
-                let start = xattr_prefix(ino);
-                let range_end = prefix_successor(&start);
-                let iter = match range_end.as_ref() {
-                    Some(end) => xattrs.range(start.as_slice()..end.as_ref()),
-                    None => xattrs.range(start.as_slice()..),
-                }
-                .map_err(storage_error)?;
-                let mut collected = Vec::new();
-                for row in iter {
-                    let (key, value) = row.map_err(storage_error)?;
-                    if !key.value().starts_with(&start) {
-                        break;
-                    }
-                    collected.push((
-                        xattr_name_from_key(key.value()).to_vec(),
-                        value.value().to_vec(),
-                    ));
-                }
-                drop(xattrs);
-                for (xname, xval) in collected {
-                    Self::set_xattr_in_txn(txn, ino, &xname, &xval)?;
-                    Self::append_event_in_txn(
-                        txn,
-                        &MetaEvent::SetXattr {
-                            ino,
-                            name: xname,
-                            value: xval,
-                            flags: 0,
-                        },
-                    )?;
-                }
-            }
-
-            if attr.kind == FileType::RegularFile
-                && (ino != spec.source_ino || spec.root_add_entry.is_some())
-            {
-                Self::refresh_pending_regular_file_recovery_metadata_in_txn(txn, ino)?;
             }
 
             remove_scratch_inode_aux_in_txn(txn, ino)?;
             {
                 let mut dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
                 let _ = dentries
-                    .remove(encode_dentry_key(entry_parent, &old_scratch_name).as_slice())
+                    .remove(encode_dentry_key(entry_parent, &scratch_name).as_slice())
                     .map_err(storage_error)?;
             }
             {
@@ -1590,6 +1503,197 @@ impl RedbMetaEngine {
         }
 
         Ok(moved)
+    }
+
+    /// Journals one inode of an explicit rename promotion; see
+    /// [`ScratchSubtreePromoteMode::Rename`] for the event order.
+    fn journal_renamed_scratch_inode_in_txn(
+        &self,
+        txn: &super::RedbWriteTransaction<'_>,
+        (entry_parent, entry_name): (Ino, &[u8]),
+        is_root: bool,
+        attr: &mut InodeAttr,
+    ) -> MetaResult<()> {
+        use crate::events::MetaEvent;
+
+        Self::set_inode_in_txn(txn, attr)?;
+        if attr.kind == FileType::RegularFile && attr.size != 0 {
+            attr.content_epoch = attr.content_epoch.max(1);
+            if let (Some(normalized), _) = self.apply_promoted_scratch_overlay_in_txn(txn, attr)? {
+                *attr = normalized;
+            }
+        }
+        Self::append_event_in_txn(txn, &MetaEvent::SetAttr { attr: attr.clone() })?;
+        if !is_root {
+            Self::add_promoted_scratch_entry_in_txn(txn, (entry_parent, entry_name), attr)?;
+            Self::refresh_pending_regular_file_recovery_metadata_in_txn(txn, attr.ino)?;
+        }
+        Self::copy_scratch_symlink_in_txn(txn, attr.ino)?;
+        Self::copy_scratch_xattrs_in_txn(txn, attr.ino)
+    }
+
+    /// Journals one inode of an automatic promotion; see
+    /// [`ScratchSubtreePromoteMode::AddEntry`] for the event order.
+    fn journal_auto_promoted_scratch_inode_in_txn(
+        &self,
+        txn: &super::RedbWriteTransaction<'_>,
+        (entry_parent, tracked_name): (Ino, &[u8]),
+        root_parent_attr: Option<&mut InodeAttr>,
+        attr: &mut InodeAttr,
+    ) -> MetaResult<()> {
+        use crate::events::MetaEvent;
+
+        attr.parent = entry_parent;
+        if attr.kind == FileType::RegularFile && attr.size != 0 {
+            attr.content_epoch = attr.content_epoch.max(1);
+        }
+        attr.touch_ctime();
+        Self::set_inode_in_txn(txn, attr)?;
+        if attr.kind == FileType::RegularFile && attr.size != 0 {
+            let (normalized, applied) = self.apply_promoted_scratch_overlay_in_txn(txn, attr)?;
+            if let Some(normalized) = normalized {
+                *attr = normalized;
+            }
+            if !applied {
+                Self::append_event_in_txn(txn, &MetaEvent::SetAttr { attr: attr.clone() })?;
+            }
+        } else {
+            if attr.kind == FileType::RegularFile {
+                Self::sync_inode_lifecycle_in_txn(txn, attr.ino)?;
+            }
+            Self::append_event_in_txn(txn, &MetaEvent::SetAttr { attr: attr.clone() })?;
+        }
+        if attr.kind == FileType::Symlink {
+            Self::copy_scratch_symlink_in_txn(txn, attr.ino)?;
+        }
+
+        // Emit parent SetAttr immediately before the root AddEntry so
+        // `RemoteApplyCoordinator::local_event_is_contextually_visible`
+        // hides parent mtime updates along with hidden zero-size drafts.
+        if let Some(parent_attr) = root_parent_attr {
+            if attr.kind == FileType::Directory {
+                parent_attr.nlink = parent_attr.nlink.saturating_add(1);
+            }
+            parent_attr.touch_mtime();
+            Self::set_inode_in_txn(txn, parent_attr)?;
+            Self::append_event_in_txn(
+                txn,
+                &MetaEvent::SetAttr {
+                    attr: parent_attr.clone(),
+                },
+            )?;
+        }
+
+        // Emit AddEntry before child entries and before SetXattr so ADR 0012
+        // directory merges record the alias before rewriting children/xattrs.
+        Self::add_promoted_scratch_entry_in_txn(txn, (entry_parent, tracked_name), attr)?;
+        Self::copy_scratch_xattrs_in_txn(txn, attr.ino)?;
+        if attr.kind == FileType::RegularFile {
+            Self::refresh_pending_regular_file_recovery_metadata_in_txn(txn, attr.ino)?;
+        }
+        Ok(())
+    }
+
+    /// Applies a promoted regular file's scratch overlay slices to tracked
+    /// chunks; returns the normalized attr and whether the apply journaled it.
+    fn apply_promoted_scratch_overlay_in_txn(
+        &self,
+        txn: &super::RedbWriteTransaction<'_>,
+        attr: &InodeAttr,
+    ) -> MetaResult<(Option<InodeAttr>, bool)> {
+        let chunks: Vec<_> = {
+            let overlay = txn.open_table(SCRATCH_OVERLAY).map_err(storage_error)?;
+            Self::regular_file_chunk_states_for_inode_in_opened_table(&overlay, attr.ino)?
+                .into_iter()
+                .map(|(chunk, state)| (chunk, state.slices.into_values().collect()))
+                .collect()
+        };
+        self.apply_regular_file_overlay_mutation_in_txn(txn, attr.ino, &chunks, Some(attr))
+    }
+
+    fn add_promoted_scratch_entry_in_txn(
+        txn: &super::RedbWriteTransaction<'_>,
+        (parent, name): (Ino, &[u8]),
+        attr: &InodeAttr,
+    ) -> MetaResult<()> {
+        use crate::events::MetaEvent;
+
+        let entry = DirEntryValue {
+            ino: attr.ino,
+            kind: attr.kind,
+        };
+        Self::set_dentry_in_txn(txn, parent, name, &entry)?;
+        Self::append_event_in_txn(
+            txn,
+            &MetaEvent::AddEntry {
+                parent,
+                name: name.to_vec(),
+                entry,
+            },
+        )
+    }
+
+    fn copy_scratch_symlink_in_txn(
+        txn: &super::RedbWriteTransaction<'_>,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        use crate::events::MetaEvent;
+
+        let target = {
+            let symlinks = txn.open_table(SCRATCH_SYMLINKS).map_err(storage_error)?;
+            symlinks
+                .get(ino)
+                .map_err(storage_error)?
+                .map(|row| row.value().to_vec())
+        };
+        if let Some(target) = target {
+            Self::set_symlink_in_txn(txn, ino, &target)?;
+            Self::append_event_in_txn(txn, &MetaEvent::SetSymlinkTarget { ino, target })?;
+        }
+        Ok(())
+    }
+
+    fn copy_scratch_xattrs_in_txn(
+        txn: &super::RedbWriteTransaction<'_>,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        use crate::events::MetaEvent;
+
+        let collected = {
+            let xattrs = txn.open_table(SCRATCH_XATTRS).map_err(storage_error)?;
+            let start = xattr_prefix(ino);
+            let range_end = prefix_successor(&start);
+            let iter = match range_end.as_ref() {
+                Some(end) => xattrs.range(start.as_slice()..end.as_ref()),
+                None => xattrs.range(start.as_slice()..),
+            }
+            .map_err(storage_error)?;
+            let mut collected = Vec::new();
+            for row in iter {
+                let (key, value) = row.map_err(storage_error)?;
+                if !key.value().starts_with(&start) {
+                    break;
+                }
+                collected.push((
+                    xattr_name_from_key(key.value()).to_vec(),
+                    value.value().to_vec(),
+                ));
+            }
+            collected
+        };
+        for (name, value) in collected {
+            Self::set_xattr_in_txn(txn, ino, &name, &value)?;
+            Self::append_event_in_txn(
+                txn,
+                &MetaEvent::SetXattr {
+                    ino,
+                    name,
+                    value,
+                    flags: 0,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn finish_promoted_scratch_index(&self, moved: Vec<(Ino, InodeAttr)>) -> Vec<InodeAttr> {
@@ -1641,17 +1745,16 @@ impl RedbMetaEngine {
             stored_name
         };
 
-        let kept_scratch = HashSet::new();
-        let mut spec = ScratchSubtreePromoteSpec {
+        let spec = ScratchSubtreePromoteSpec {
             source_parent: parent,
-            stored_name: stored_name.clone(),
+            stored_name: &stored_name,
             source_ino: source,
-            target_parent: new_parent,
-            root_add_entry: None,
             frozen,
-            kept_scratch: &kept_scratch,
+            mode: ScratchSubtreePromoteMode::Rename {
+                target_parent: new_parent,
+            },
         };
-        let moved = self.promote_scratch_subtree_in_txn(&txn, &mut spec)?;
+        let moved = self.promote_scratch_subtree_in_txn(&txn, spec)?;
         let root_kind = moved[0].1.kind;
         {
             let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
@@ -1791,16 +1894,18 @@ impl RedbMetaEngine {
             _ => (stored_name.clone(), false),
         };
 
-        let mut spec = ScratchSubtreePromoteSpec {
+        let spec = ScratchSubtreePromoteSpec {
             source_parent: parent,
-            stored_name: stored_name.clone(),
+            stored_name: &stored_name,
             source_ino: source,
-            target_parent: parent,
-            root_add_entry: Some((&target_name, &mut parent_attr)),
             frozen,
-            kept_scratch,
+            mode: ScratchSubtreePromoteMode::AddEntry {
+                target_name: &target_name,
+                parent_attr: &mut parent_attr,
+                kept_scratch,
+            },
         };
-        let moved = self.promote_scratch_subtree_in_txn(&txn, &mut spec)?;
+        let moved = self.promote_scratch_subtree_in_txn(&txn, spec)?;
         let added_inodes = u64::try_from(moved.len()).unwrap_or(u64::MAX);
         Self::update_counter_in_txn(&txn, counters::TOTAL_INODES, |total| {
             total
@@ -4896,6 +5001,88 @@ mod tests {
             .join(orphan_ts.to_string())
             .join("dir/work.tmp");
         assert_eq!(std::fs::read(&disk_path).unwrap(), b"object-901");
+    }
+
+    #[test]
+    fn scratch_explicit_promote_keeps_rename_journal_order() {
+        use crate::events::MetaEvent;
+        use crate::schema::counters::NEXT_EVENT_SEQ;
+
+        let temp = tempfile::tempdir().unwrap();
+        let meta = RedbMetaEngine::open(temp.path().join("meta.redb")).unwrap();
+        meta.init_root(0, 0).unwrap();
+
+        let sdir = InodeAttr::new_dir(200, ROOT_INO, 0, 0, 0o755);
+        meta.create_scratch_entry(ROOT_INO, b"shared", &sdir)
+            .unwrap();
+        meta.set_scratch_xattr(sdir.ino, b"user.dir", b"dir-xattr")
+            .unwrap();
+        let empty_file = InodeAttr::new_file(203, sdir.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(sdir.ino, b"a-empty", &empty_file)
+            .unwrap();
+        let nested_file = InodeAttr::new_file(201, sdir.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(sdir.ino, b"child.bin", &nested_file)
+            .unwrap();
+        meta.commit_scratch_overlay(nested_file.ino, &[(ChunkId(0), vec![slice(801, 0, 12)])])
+            .unwrap();
+        let mut sized_child = nested_file.clone();
+        sized_child.size = 12;
+        meta.set_scratch_attr(&sized_child).unwrap();
+        let nested_link = InodeAttr::new_symlink(202, sdir.ino, 0, 0, 9);
+        meta.create_scratch_symlink(sdir.ino, b"link", b"child.bin", &nested_link)
+            .unwrap();
+
+        let before_seq = meta.get_counter(NEXT_EVENT_SEQ).unwrap();
+        let frozen = HashSet::from([sdir.ino, empty_file.ino, nested_file.ino, nested_link.ino]);
+        let (_, attrs) = meta
+            .promote_scratch_entry(
+                (ROOT_INO, b"shared"),
+                (ROOT_INO, b"tracked"),
+                sdir.ino,
+                &frozen,
+                false,
+            )
+            .unwrap();
+        assert_eq!(attrs.len(), 4);
+        let after_seq = meta.get_counter(NEXT_EVENT_SEQ).unwrap();
+
+        // Explicit rename promotion journals with its own per-inode order
+        // (SFS-1125): descending sibling keys, an unconditional SetAttr, child
+        // AddEntry before SetSymlinkTarget, and the root bound by RenameEntry.
+        let journal: Vec<String> =
+            meta.read_events_range(before_seq, after_seq)
+                .unwrap()
+                .iter()
+                .map(|event| {
+                    let ino = match event {
+                        MetaEvent::SetAttr { attr } => Some(attr.ino),
+                        MetaEvent::AddEntry { entry, .. }
+                        | MetaEvent::RenameEntry { entry, .. } => Some(entry.ino),
+                        MetaEvent::SetSymlinkTarget { ino, .. }
+                        | MetaEvent::SetXattr { ino, .. } => Some(*ino),
+                        _ => None,
+                    };
+                    match ino {
+                        Some(ino) => format!("{}:{ino}", event.kind()),
+                        None => event.kind().to_string(),
+                    }
+                })
+                .collect();
+        let expected = [
+            "set_attr:200",
+            "set_xattr:200",
+            "set_attr:202",
+            "add_entry:202",
+            "set_symlink_target:202",
+            "set_regular_file_overlay_slices",
+            "set_attr:201",
+            "set_attr:201",
+            "add_entry:201",
+            "set_attr:203",
+            "add_entry:203",
+            "rename_entry:200",
+        ];
+        assert_eq!(journal, expected);
     }
 
     #[test]

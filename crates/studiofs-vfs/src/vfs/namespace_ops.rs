@@ -2,6 +2,7 @@ use super::namespace::{
     DeferredNamespaceInner, DeferredNamespaceKey, DeferredNamespaceOp, DeferredNamespaceProgress,
     DeferredNamespaceState, DeferredNamespaceWait,
 };
+use super::scratch_auto_promote::FreezeScratchSubtreeOutcome;
 use super::{
     ATTR_CACHE_TTL, AccessLevel, Arc, ChunkId, DEFAULT_CHUNK_SIZE, DentryCacheValue,
     DirAccessEntry, DirEntry, FileSessionOperation, FileType, Ino, InodeAttr,
@@ -5374,15 +5375,16 @@ impl StudioVfs {
             }
         }
 
-        let root_attr = source_attr.clone();
-        let source_ino = root_attr.ino;
+        let source_ino = source_attr.ino;
+        // Unlike automatic promotion, explicit rename does not abort the freeze on
+        // shutdown; it keeps waiting for the write gates.
         let frozen = match self
-            .freeze_scratch_promote_subtree(meta.as_ref(), root_attr, &[], false, |_, _| false)
+            .freeze_scratch_promote_subtree(meta.as_ref(), source_attr, &[], false, |_, _| false)
             .await?
         {
-            super::scratch_auto_promote::FreezeScratchSubtreeOutcome::Ready(frozen) => frozen,
-            super::scratch_auto_promote::FreezeScratchSubtreeOutcome::OverLimit { .. }
-            | super::scratch_auto_promote::FreezeScratchSubtreeOutcome::Cancelled => {
+            FreezeScratchSubtreeOutcome::Ready(frozen) => frozen,
+            FreezeScratchSubtreeOutcome::OverLimit { .. }
+            | FreezeScratchSubtreeOutcome::Cancelled => {
                 return Err(VfsError::CrossDevice);
             }
         };
@@ -5395,6 +5397,9 @@ impl StudioVfs {
             meta.promote_scratch_entry(source, target, source_ino, &frozen.frozen, replace)?;
         namespace_mutations.record_rename(source.0, source.1, target.0, target.1, source_ino);
         self.bump_acl_namespace_epoch();
+        // Unlike automatic promotion, explicit rename leaves open-handle attrs
+        // alone and drops cached attrs right before the payload hand-off.
+        self.invalidate_attr_read_cache(attrs.iter().map(|attr| attr.ino));
         self.submit_promoted_subtree_uploads(&attrs);
         drop(frozen);
         self.finish_rename_displacement(&meta, result.displaced.as_ref())
