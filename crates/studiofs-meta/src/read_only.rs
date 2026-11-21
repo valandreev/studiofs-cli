@@ -138,8 +138,10 @@ where
         Err(read_only_error(target_parent.unwrap_or(ROOT_INO)))
     }
 
+    // Snapshot mounts call this during bootstrap; a read-only view never
+    // reconciles, so there are no orphans to materialize.
     fn set_scratch_cache_dir(&self, _cache_dir: std::path::PathBuf) -> MetaResult<()> {
-        Err(read_only_error(ROOT_INO))
+        Ok(())
     }
 
     fn scratch_orphans_dir(&self) -> MetaResult<std::path::PathBuf> {
@@ -850,6 +852,17 @@ mod tests {
             Err(MetaError::AccessDenied { .. })
         ));
         assert_eq!(inner.lookup(ROOT_INO, b"entry").unwrap(), entry);
+    }
+
+    #[test]
+    fn read_only_meta_accepts_scratch_cache_dir_for_snapshot_mount_bootstrap() {
+        let dir = studiofs_test_support::workspace_target_tempdir("read-only-scratch-cache-");
+        let inner = Arc::new(RedbMetaEngine::open(dir.path().join("meta.redb")).unwrap());
+        let read_only = ReadOnlyMetaEngine::new(inner);
+
+        read_only
+            .set_scratch_cache_dir(dir.path().join("cache"))
+            .expect("VfsBootstrap::prepare calls this for snapshot mounts too");
     }
 
     #[test]

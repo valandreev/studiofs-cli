@@ -1831,8 +1831,12 @@ impl RedbMetaEngine {
                 .map_err(|_| storage_error("scratch mutation lock poisoned"))?;
             self.refresh_scratch_index()?;
         }
-        if outcome.orphans_created > 0 {
-            self.materialize_pending_scratch_orphans()?;
+        // The orphan records are already committed; a disk failure here only
+        // defers materialization to the next `set_scratch_cache_dir`.
+        if outcome.orphans_created > 0
+            && let Err(error) = self.materialize_pending_scratch_orphans()
+        {
+            tracing::warn!(%error, "deferring scratch orphan materialization");
         }
         Ok(())
     }
@@ -2011,16 +2015,19 @@ impl RedbMetaEngine {
         let timestamp_unix_ms = {
             let orphans = txn.open_table(SCRATCH_ORPHANS).map_err(storage_error)?;
             let mut ts = current_unix_millis();
-            while orphaned_roots.iter().any(|(_, root_old_path, _, _)| {
-                orphans
-                    .get(encode_scratch_orphan_key(ts, root_old_path).as_slice())
-                    .ok()
-                    .flatten()
-                    .is_some()
-            }) {
-                ts = ts.saturating_add(1);
+            'probe: loop {
+                for (_, root_old_path, _, _) in &orphaned_roots {
+                    if orphans
+                        .get(encode_scratch_orphan_key(ts, root_old_path).as_slice())
+                        .map_err(storage_error)?
+                        .is_some()
+                    {
+                        ts = ts.saturating_add(1);
+                        continue 'probe;
+                    }
+                }
+                break ts;
             }
-            ts
         };
 
         for (tracked_parent, root_old_path, child_name, root_ino) in orphaned_roots {
@@ -2308,6 +2315,16 @@ impl RedbMetaEngine {
         if self.db.is_none() {
             return Ok(());
         }
+        // Payload objects live under the mount's cache dir; materializing
+        // against a guessed fallback would write empty files and mark them done.
+        let Some(cache_root) = self
+            .scratch_cache_dir
+            .read()
+            .map_err(|_| storage_error("scratch cache dir lock poisoned"))?
+            .clone()
+        else {
+            return Ok(());
+        };
         let _mutation_guard = self
             .scratch_mutation_lock
             .lock()
@@ -2333,16 +2350,27 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let cache_root = self.resolved_scratch_cache_dir();
         let orphans_root = cache_root.join("scratch-orphans");
         std::fs::create_dir_all(&orphans_root)
             .map_err(|e| storage_error(format!("create scratch-orphans root failed: {e}")))?;
 
         let mut completed_keys = Vec::with_capacity(pending_keys.len());
         for (key, mut record) in pending_keys {
-            materialize_single_orphan_record(&cache_root, &orphans_root, &record)?;
+            if let Err(error) =
+                materialize_single_orphan_record(&cache_root, &orphans_root, &record)
+            {
+                tracing::warn!(
+                    %error,
+                    timestamp_unix_ms = record.timestamp_unix_ms,
+                    "scratch orphan stays pending; redb record keeps its payload"
+                );
+                continue;
+            }
             record.materialized = true;
             completed_keys.push((key, record));
+        }
+        if completed_keys.is_empty() {
+            return Ok(());
         }
 
         let txn = self.begin_immediate_write_txn()?;
@@ -3170,16 +3198,22 @@ fn write_orphan_regular_file(
                 continue;
             }
             let object_path = local_payload_object_path(cache_root, payload.object_id);
-            let Ok(mut obj_file) = std::fs::File::open(&object_path) else {
-                continue;
-            };
+            let mut obj_file = std::fs::File::open(&object_path).map_err(|e| {
+                storage_error(format!(
+                    "open orphan payload object {} failed: {e}",
+                    payload.object_id
+                ))
+            })?;
             obj_file
                 .seek(SeekFrom::Start(u64::from(payload.offset)))
                 .map_err(|e| storage_error(format!("seek orphan payload object failed: {e}")))?;
             let mut buf = vec![0_u8; copy_len];
-            if obj_file.read_exact(&mut buf).is_err() {
-                continue;
-            }
+            obj_file.read_exact(&mut buf).map_err(|e| {
+                storage_error(format!(
+                    "read orphan payload object {} failed: {e}",
+                    payload.object_id
+                ))
+            })?;
             out.seek(SeekFrom::Start(file_offset))
                 .map_err(|e| storage_error(format!("seek orphan output file failed: {e}")))?;
             out.write_all(&buf)
@@ -3807,6 +3841,11 @@ mod tests {
     fn snapshot_restore_relocates_orphaned_scratch_entries_and_resolves_conflicts() {
         let temp = tempfile::tempdir().unwrap();
         let meta = RedbMetaEngine::open(temp.path().join("meta.redb")).unwrap();
+        let cache_dir = temp.path().join("cache");
+        meta.set_scratch_cache_dir(cache_dir.clone()).unwrap();
+        let payload_path = local_payload_object_path(&cache_dir, 801);
+        std::fs::create_dir_all(payload_path.parent().unwrap()).unwrap();
+        std::fs::write(&payload_path, b"object-801!!").unwrap();
         meta.init_root(0, 0).unwrap();
 
         let gone = meta.create_dir(ROOT_INO, b"gone", 0, 0, 0o755).unwrap();
@@ -4119,8 +4158,19 @@ mod tests {
                 .unwrap(),
             None
         );
+        // Opening alone must not materialize against a guessed cache root.
         let orphans = reopened.list_scratch_orphans().unwrap();
         assert_eq!(orphans.len(), 1);
+        assert!(!orphans[0].materialized);
+        // A missing payload object leaves the orphan pending instead of zero-filling it.
+        let cache_dir = temp.path().join("cache");
+        reopened.set_scratch_cache_dir(cache_dir.clone()).unwrap();
+        assert!(!reopened.list_scratch_orphans().unwrap()[0].materialized);
+        let payload_path = local_payload_object_path(&cache_dir, 901);
+        std::fs::create_dir_all(payload_path.parent().unwrap()).unwrap();
+        std::fs::write(&payload_path, b"object-901").unwrap();
+        reopened.set_scratch_cache_dir(cache_dir).unwrap();
+        let orphans = reopened.list_scratch_orphans().unwrap();
         assert!(orphans[0].materialized);
         assert_eq!(orphans[0].root_old_path, b"dir/work.tmp");
         let disk_path = reopened
@@ -4128,6 +4178,6 @@ mod tests {
             .unwrap()
             .join(orphan_ts.to_string())
             .join("dir/work.tmp");
-        assert!(disk_path.exists());
+        assert_eq!(std::fs::read(&disk_path).unwrap(), b"object-901");
     }
 }

@@ -1239,7 +1239,6 @@ impl RedbMetaEngine {
                 format.metadata.backend == crate::schema::MetadataBackend::Postgres
             });
             let _ = engine.recover_undo_logs_guarded(replicated)?;
-            engine.materialize_pending_scratch_orphans()?;
         }
 
         match persisted_format {
