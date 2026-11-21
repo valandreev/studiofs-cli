@@ -1390,8 +1390,10 @@ impl RedbMetaEngine {
     /// Moves a frozen scratch subtree into tracked tables inside `txn`.
     ///
     /// Both promotion paths share the subtree walk, the frozen-set checks, the
-    /// overlay/symlink/xattr copies, and the scratch-row removal; `spec.mode`
-    /// selects the per-inode journal sequence (see [`ScratchSubtreePromoteMode`]).
+    /// overlay/symlink/xattr copies, the scratch-row removal, and the
+    /// `TOTAL_INODES` increment (one per promoted inode, the same as a tracked
+    /// create); `spec.mode` selects the per-inode journal sequence (see
+    /// [`ScratchSubtreePromoteMode`]).
     fn promote_scratch_subtree_in_txn(
         &self,
         txn: &super::RedbWriteTransaction<'_>,
@@ -1501,6 +1503,14 @@ impl RedbMetaEngine {
             }
             moved.push((entry_parent, attr));
         }
+
+        let added_inodes = u64::try_from(moved.len())
+            .map_err(|_| MetaError::Storage("total inodes counter overflow".to_string()))?;
+        Self::update_counter_in_txn(txn, counters::TOTAL_INODES, |total| {
+            total
+                .checked_add(added_inodes)
+                .ok_or_else(|| MetaError::Storage("total inodes counter overflow".to_string()))
+        })?;
 
         Ok(moved)
     }
@@ -1819,7 +1829,7 @@ impl RedbMetaEngine {
 
     /// Automatically promotes a frozen scratch subtree in place under tracked
     /// `parent`, handling directory merges, conflict renames, `kept_scratch`
-    /// descendants, `AddEntry` journaling, and `TOTAL_INODES` accounting.
+    /// descendants, and `AddEntry` journaling.
     pub(super) fn promote_scratch_auto_inner(
         &self,
         parent: Ino,
@@ -1906,12 +1916,6 @@ impl RedbMetaEngine {
             },
         };
         let moved = self.promote_scratch_subtree_in_txn(&txn, spec)?;
-        let added_inodes = u64::try_from(moved.len()).unwrap_or(u64::MAX);
-        Self::update_counter_in_txn(&txn, counters::TOTAL_INODES, |total| {
-            total
-                .checked_add(added_inodes)
-                .ok_or_else(|| MetaError::Storage("total inodes counter overflow".to_string()))
-        })?;
         txn.commit()?;
 
         let attrs = self.finish_promoted_scratch_index(moved);
@@ -5381,5 +5385,163 @@ mod tests {
         assert!(client_a.lookup(merged_a.ino, b"b.txt").is_ok());
         assert!(client_b.lookup(merged_b.ino, b"a.txt").is_ok());
         assert!(client_b.lookup(merged_b.ino, b"b.txt").is_ok());
+    }
+
+    #[test]
+    fn scratch_promote_paths_update_total_inodes_identically() {
+        use crate::schema::counters::TOTAL_INODES;
+
+        let temp = tempfile::tempdir().unwrap();
+        let meta = RedbMetaEngine::open(temp.path().join("meta.redb")).unwrap();
+        meta.init_root(0, 0).unwrap();
+        assert_eq!(meta.get_counter(TOTAL_INODES).unwrap(), 1);
+
+        // Scratch creates do not increment TOTAL_INODES.
+        let explicit_dir = InodeAttr::new_dir(200, ROOT_INO, 0, 0, 0o755);
+        meta.create_scratch_entry(ROOT_INO, b"explicit.tmp", &explicit_dir)
+            .unwrap();
+        let explicit_file = InodeAttr::new_file(201, explicit_dir.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(explicit_dir.ino, b"child.bin", &explicit_file)
+            .unwrap();
+        let explicit_link = InodeAttr::new_symlink(202, explicit_dir.ino, 0, 0, 9);
+        meta.create_scratch_symlink(explicit_dir.ino, b"link", b"child.bin", &explicit_link)
+            .unwrap();
+
+        let auto_dir = InodeAttr::new_dir(300, ROOT_INO, 0, 0, 0o755);
+        meta.create_scratch_entry(ROOT_INO, b"auto.tmp", &auto_dir)
+            .unwrap();
+        let auto_file = InodeAttr::new_file(301, auto_dir.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(auto_dir.ino, b"child.bin", &auto_file)
+            .unwrap();
+        let auto_link = InodeAttr::new_symlink(302, auto_dir.ino, 0, 0, 9);
+        meta.create_scratch_symlink(auto_dir.ino, b"link", b"child.bin", &auto_link)
+            .unwrap();
+        assert_eq!(meta.get_counter(TOTAL_INODES).unwrap(), 1);
+
+        // Explicit promote of the 3-inode subtree adds 3 to TOTAL_INODES.
+        let before_explicit = meta.get_counter(TOTAL_INODES).unwrap();
+        let (_, explicit_attrs) = meta
+            .promote_scratch_entry(
+                (ROOT_INO, b"explicit.tmp"),
+                (ROOT_INO, b"explicit"),
+                explicit_dir.ino,
+                &HashSet::from([explicit_dir.ino, explicit_file.ino, explicit_link.ino]),
+                false,
+            )
+            .unwrap();
+        let explicit_delta = meta.get_counter(TOTAL_INODES).unwrap() - before_explicit;
+        assert_eq!(explicit_attrs.len(), 3);
+        assert_eq!(explicit_delta, 3);
+
+        // Automatic promote of an equivalent 3-inode subtree changes TOTAL_INODES by the same amount.
+        let before_auto = meta.get_counter(TOTAL_INODES).unwrap();
+        let auto_res = meta
+            .promote_scratch_auto(
+                ROOT_INO,
+                b"auto.tmp",
+                auto_dir.ino,
+                &HashSet::from([auto_dir.ino, auto_file.ino, auto_link.ino]),
+                &HashSet::new(),
+                "client-a",
+            )
+            .unwrap();
+        let auto_delta = meta.get_counter(TOTAL_INODES).unwrap() - before_auto;
+        assert_eq!(auto_res.attrs.len(), 3);
+        assert_eq!(auto_delta, explicit_delta);
+
+        // Auto-promote with a kept_scratch child counts only the promoted inodes.
+        let partial_dir = InodeAttr::new_dir(350, ROOT_INO, 0, 0, 0o755);
+        meta.create_scratch_entry(ROOT_INO, b"partial", &partial_dir)
+            .unwrap();
+        let promoted_child = InodeAttr::new_file(351, partial_dir.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(partial_dir.ino, b"keep.txt", &promoted_child)
+            .unwrap();
+        let kept_child = InodeAttr::new_file(352, partial_dir.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(partial_dir.ino, b"still.tmp", &kept_child)
+            .unwrap();
+        let before_partial = meta.get_counter(TOTAL_INODES).unwrap();
+        let partial_res = meta
+            .promote_scratch_auto(
+                ROOT_INO,
+                b"partial",
+                partial_dir.ino,
+                &HashSet::from([partial_dir.ino, promoted_child.ino]),
+                &HashSet::from([kept_child.ino]),
+                "client-a",
+            )
+            .unwrap();
+        assert_eq!(partial_res.attrs.len(), 2);
+        assert_eq!(meta.get_counter(TOTAL_INODES).unwrap() - before_partial, 2);
+
+        // Merging a scratch directory into an existing tracked directory does not
+        // increment TOTAL_INODES; its children remain scratch until promoted.
+        let merge_dir = InodeAttr::new_dir(360, ROOT_INO, 0, 0, 0o755);
+        meta.create_scratch_entry(ROOT_INO, b"merge_target", &merge_dir)
+            .unwrap();
+        let merge_child = InodeAttr::new_file(361, merge_dir.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(merge_dir.ino, b"merged.txt", &merge_child)
+            .unwrap();
+        let tracked_merge_target = meta
+            .create_dir(ROOT_INO, b"merge_target", 0, 0, 0o755)
+            .unwrap();
+        let before_merge = meta.get_counter(TOTAL_INODES).unwrap();
+        let merge_res = meta
+            .promote_scratch_auto(
+                ROOT_INO,
+                b"merge_target",
+                merge_dir.ino,
+                &HashSet::from([merge_dir.ino, merge_child.ino]),
+                &HashSet::new(),
+                "client-a",
+            )
+            .unwrap();
+        assert_eq!(merge_res.merged_into, Some(tracked_merge_target.ino));
+        assert_eq!(meta.get_counter(TOTAL_INODES).unwrap(), before_merge);
+
+        // Demoting a tracked entry into a scratch directory follows tracked delete semantics
+        // (does not decrement TOTAL_INODES).
+        let scratch_sink = InodeAttr::new_dir(400, ROOT_INO, 0, 0, 0o755);
+        meta.create_scratch_entry(ROOT_INO, b"sink.tmp", &scratch_sink)
+            .unwrap();
+        let before_demote = meta.get_counter(TOTAL_INODES).unwrap();
+        meta.demote_scratch_entry(
+            (explicit_dir.ino, b"child.bin"),
+            (scratch_sink.ino, b"demoted.bin"),
+            &crate::engine::ScratchDemotion {
+                source: explicit_file.ino,
+                frozen: HashSet::from([explicit_file.ino]),
+                files: HashMap::from([(explicit_file.ino, (0, Vec::new()))]),
+                objects: HashMap::new(),
+                displaced: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(meta.get_counter(TOTAL_INODES).unwrap(), before_demote);
+
+        // Overflow of TOTAL_INODES aborts explicit promotion without mutating tracked or scratch state.
+        let overflow_file = InodeAttr::new_file(500, ROOT_INO, 0, 0, 0o644);
+        meta.create_scratch_entry(ROOT_INO, b"overflow.tmp", &overflow_file)
+            .unwrap();
+        meta.set_counter(TOTAL_INODES, u64::MAX).unwrap();
+        let err = meta
+            .promote_scratch_entry(
+                (ROOT_INO, b"overflow.tmp"),
+                (ROOT_INO, b"overflow"),
+                overflow_file.ino,
+                &HashSet::from([overflow_file.ino]),
+                false,
+            )
+            .expect_err("explicit promote must fail when TOTAL_INODES overflows");
+        assert!(
+            matches!(&err, MetaError::Storage(msg) if msg.contains("total inodes counter overflow")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(meta.get_counter(TOTAL_INODES).unwrap(), u64::MAX);
+        assert_eq!(
+            meta.lookup_scratch_entry(ROOT_INO, b"overflow.tmp")
+                .unwrap(),
+            Some(overflow_file.ino)
+        );
+        assert!(meta.lookup(ROOT_INO, b"overflow").is_err());
     }
 }

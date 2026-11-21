@@ -1348,14 +1348,17 @@ mod tests {
         meta.set_scratch_xattr(file.ino, b"user.test", b"preserved")
             .unwrap();
         let target = vfs.mkdir(ROOT_INO, b"tree", 0, 0, 0o755).unwrap();
+        let inodes_before = vfs.statfs().unwrap().files;
         assert!(matches!(
             vfs.rename(ROOT_INO, b"tree.tmp", ROOT_INO, b"tree", false),
             Err(VfsError::Meta(MetaError::EntryExists { .. }))
         ));
+        assert_eq!(vfs.statfs().unwrap().files, inodes_before);
         assert_eq!(vfs.cached_store.pending_upload_count(), 0);
         assert_eq!(vfs.lookup(ROOT_INO, b"tree").unwrap().ino, target.ino);
         vfs.rename(ROOT_INO, b"tree.tmp", ROOT_INO, b"tree", true)
             .unwrap();
+        assert_eq!(vfs.statfs().unwrap().files, inodes_before + 2);
         assert_eq!(meta.lookup(ROOT_INO, b"tree").unwrap().ino, dir.ino);
         assert_eq!(meta.lookup(dir.ino, b"child.exr").unwrap().ino, file.ino);
         assert!(!vfs.is_scratch_inode(file.ino).unwrap());
