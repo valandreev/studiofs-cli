@@ -975,6 +975,26 @@ mod tests {
     }
 
     #[test]
+    fn scratch_promote_preserves_open_writer() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-promote-writer-");
+        let (runtime, vfs, _) = make_started_test_vfs(&temp, "scratch-promote-writer");
+        let _guard = runtime.enter();
+        runtime.block_on(async {
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n").await;
+            let file = vfs.create(ROOT_INO, b"shot.exr.tmp", 0, 0, 0o644).unwrap();
+            let fh = vfs.open_file(file.ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh(fh, file.ino, 0, b"before").await.unwrap();
+            vfs.rename(ROOT_INO, b"shot.exr.tmp", ROOT_INO, b"shot.exr", false)
+                .unwrap();
+            assert_eq!(vfs.lookup(ROOT_INO, b"shot.exr").unwrap().ino, file.ino);
+            assert!(!vfs.is_scratch_inode(file.ino).unwrap());
+            vfs.write_fh(fh, file.ino, 6, b"after").await.unwrap();
+            vfs.flush(file.ino).await.unwrap();
+            assert_eq!(&vfs.read(file.ino, 0, 11).await.unwrap()[..], b"beforeafter");
+        });
+    }
+
+    #[test]
     fn scratch_rename_hardlink_discard_split_and_zero_events() {
         let temp = studiofs_test_support::workspace_target_tempdir("scratch-ns-rename-");
         let (runtime, vfs, meta) = make_started_test_vfs(&temp, "scratch-ns-rename");
