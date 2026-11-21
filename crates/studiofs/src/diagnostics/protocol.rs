@@ -152,6 +152,10 @@ pub(super) enum DiagnosticsRequest {
         actor: Option<String>,
         reason: Option<String>,
     },
+    ScratchPromote {
+        auth_token: String,
+        path: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -214,6 +218,9 @@ pub(super) enum DiagnosticsResponse {
     },
     TimelineEntry {
         entry: TimelineEntry,
+    },
+    ScratchPromote {
+        outcome: studiofs_vfs::ScratchPromotePathOutcome,
     },
     Error {
         code: String,

@@ -2435,10 +2435,22 @@ pub struct ScratchPromoteOverLimitEntry {
     pub dir_ino: u64,
     /// Path relative to the volume root.
     pub relative_path: String,
+    /// Whether the display path contains replacements for non-UTF-8 bytes.
+    #[serde(default)]
+    pub path_is_lossy: bool,
     /// Number of entries observed in the subtree (including the directory itself).
     pub entry_count: usize,
     /// Configured `STUDIOFS_SCRATCH_PROMOTE_ENTRY_LIMIT` threshold that was exceeded.
     pub entry_limit: usize,
+}
+
+/// Summary returned by an explicit control-API scratch promotion (`studiofs scratch promote`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchPromotePathOutcome {
+    /// Normalized path relative to the volume root.
+    pub relative_path: String,
+    /// Total number of inodes moved from scratch to tracked tables.
+    pub promoted_inodes: usize,
 }
 
 /// Observability snapshot for the background scratch-layer automatic promotion worker.

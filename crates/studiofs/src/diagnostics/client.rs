@@ -581,6 +581,23 @@ impl LocalDiagnosticsClient {
         }
     }
 
+    pub(crate) async fn promote_scratch_path(
+        &self,
+        path: &str,
+    ) -> Result<studiofs_vfs::ScratchPromotePathOutcome> {
+        match self
+            .send(DiagnosticsRequest::ScratchPromote {
+                auth_token: self.discovery.auth_token.clone(),
+                path: path.to_string(),
+            })
+            .await?
+        {
+            DiagnosticsResponse::ScratchPromote { outcome } => Ok(outcome),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
     pub(super) async fn send(&self, request: DiagnosticsRequest) -> Result<DiagnosticsResponse> {
         #[cfg(unix)]
         {

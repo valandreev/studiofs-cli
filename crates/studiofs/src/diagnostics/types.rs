@@ -189,6 +189,12 @@ pub(crate) trait DiagnosticsDataSource: Send + Sync + 'static {
     fn reset_observability_counters(&self) -> std::result::Result<(), DiagnosticsActionError> {
         Err(DiagnosticsActionError::ResetUnavailable)
     }
+
+    fn promote_scratch_path(&self, _path: &str) -> Result<studiofs_vfs::ScratchPromotePathOutcome> {
+        Err(anyhow!(
+            "scratch promote control is unavailable for this diagnostics session"
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

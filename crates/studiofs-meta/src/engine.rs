@@ -1616,22 +1616,23 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         0
     }
 
-    /// Automatically promote a frozen scratch subtree under its tracked parent.
+    /// Promote a frozen scratch subtree in place under its tracked parent.
     ///
-    /// If the entry's name is already taken in the tracked local base, it is
+    /// With a conflict client, a name taken in the tracked local base is
     /// renamed to `<name>.scratch-conflict-<conflict_client>` (with numeric
     /// fallback on collision) before promotion. Emits pre-order `AddEntry`
     /// events so concurrent promotions across clients converge under ADR 0012.
+    /// Without a conflict client, a taken name rejects the operation atomically.
     /// Descendants in `kept_scratch` (still matching a rule) and their subtrees
     /// stay scratch under the promoted directory.
-    fn promote_scratch_auto(
+    fn promote_scratch_in_place(
         &self,
         _parent: Ino,
         _name: &[u8],
         _ino: Ino,
         _frozen: &std::collections::HashSet<Ino>,
         _kept_scratch: &std::collections::HashSet<Ino>,
-        _conflict_client: &str,
+        _conflict_client: Option<&str>,
     ) -> MetaResult<ScratchAutoPromoteResult> {
         Err(MetaError::Storage(
             "scratch promotion is unsupported".into(),

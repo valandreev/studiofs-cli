@@ -24,6 +24,7 @@ pub(super) enum DiagnosticsServiceError {
     ProfilingStart(ProfilingWindowStartError),
     ProfilingStop(anyhow::Error),
     PayloadLimitUpdate(anyhow::Error),
+    ScratchPromote(anyhow::Error),
 }
 
 impl DiagnosticsServiceError {
@@ -71,6 +72,10 @@ impl DiagnosticsServiceError {
             },
             Self::PayloadLimitUpdate(error) => DiagnosticsResponse::Error {
                 code: "payload_limit_update_failed".to_string(),
+                message: error.to_string(),
+            },
+            Self::ScratchPromote(error) => DiagnosticsResponse::Error {
+                code: "scratch_promote_failed".to_string(),
                 message: error.to_string(),
             },
         }
@@ -348,6 +353,16 @@ impl<'a> DiagnosticsSessionService<'a> {
             .source
             .set_payload_limits(upload_mbps, download_mbps)
             .map_err(DiagnosticsServiceError::PayloadLimitUpdate)
+    }
+
+    pub(super) fn promote_scratch_path(
+        &self,
+        path: &str,
+    ) -> DiagnosticsServiceResult<studiofs_vfs::ScratchPromotePathOutcome> {
+        self.deps
+            .source
+            .promote_scratch_path(path)
+            .map_err(DiagnosticsServiceError::ScratchPromote)
     }
 
     pub(super) fn create_case(
@@ -1078,6 +1093,15 @@ pub(super) fn dispatch_protocol(
                 )
             },
             |entry| DiagnosticsResponse::TimelineEntry { entry },
+        ),
+        DiagnosticsRequest::ScratchPromote {
+            auth_token: provided,
+            path,
+        } => authorized_response(
+            &provided,
+            auth_token,
+            || service.promote_scratch_path(&path),
+            |outcome| DiagnosticsResponse::ScratchPromote { outcome },
         ),
     }
 }

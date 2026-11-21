@@ -1830,14 +1830,14 @@ impl RedbMetaEngine {
     /// Automatically promotes a frozen scratch subtree in place under tracked
     /// `parent`, handling directory merges, conflict renames, `kept_scratch`
     /// descendants, and `AddEntry` journaling.
-    pub(super) fn promote_scratch_auto_inner(
+    pub(super) fn promote_scratch_in_place_inner(
         &self,
         parent: Ino,
         name: &[u8],
         source: Ino,
         frozen: &HashSet<Ino>,
         kept_scratch: &HashSet<Ino>,
-        conflict_client: &str,
+        conflict_client: Option<&str>,
     ) -> MetaResult<ScratchAutoPromoteResult> {
         let _mutation_guard = self
             .scratch_mutation_lock
@@ -1868,40 +1868,42 @@ impl RedbMetaEngine {
         };
 
         let existing_tracked =
-            Self::find_colliding_live_tracked_entry_in_txn(&txn, parent, &stored_name)?;
-        if let Some(existing) = existing_tracked.as_ref()
-            && existing.ino != source
-            && existing.kind == FileType::Directory
-            && source_kind == FileType::Directory
-        {
-            return self.merge_auto_promote_directory(
-                txn,
-                parent,
-                stored_name,
-                source,
-                existing.ino,
-                conflict_client,
-            );
-        }
-        let (target_name, conflict_renamed) = match existing_tracked {
-            Some(existing) if existing.ino != source => {
-                let conflict = allocate_auto_promote_conflict_name_in_txn(
-                    &txn,
+            Self::find_colliding_live_tracked_entry_in_txn(&txn, parent, &stored_name)?
+                .filter(|entry| entry.ino != source);
+        let (target_name, conflict_renamed) = if let Some(existing) = existing_tracked {
+            let Some(conflict_client) = conflict_client else {
+                return Err(MetaError::EntryExists {
                     parent,
-                    &stored_name,
+                    name: String::from_utf8_lossy(&stored_name).into_owned(),
+                });
+            };
+            if existing.kind == FileType::Directory && source_kind == FileType::Directory {
+                return self.merge_auto_promote_directory(
+                    txn,
+                    parent,
+                    stored_name,
+                    source,
+                    existing.ino,
                     conflict_client,
-                )?;
-                tracing::warn!(
-                    parent,
-                    scratch_ino = source,
-                    existing_ino = existing.ino,
-                    original_name = %String::from_utf8_lossy(&stored_name),
-                    conflict_name = %String::from_utf8_lossy(&conflict),
-                    "auto-promote target name taken in local base; renaming scratch entry before promotion"
                 );
-                (conflict, true)
             }
-            _ => (stored_name.clone(), false),
+            let conflict = allocate_auto_promote_conflict_name_in_txn(
+                &txn,
+                parent,
+                &stored_name,
+                conflict_client,
+            )?;
+            tracing::warn!(
+                parent,
+                scratch_ino = source,
+                existing_ino = existing.ino,
+                original_name = %String::from_utf8_lossy(&stored_name),
+                conflict_name = %String::from_utf8_lossy(&conflict),
+                "auto-promote target name taken in local base; renaming scratch entry before promotion"
+            );
+            (conflict, true)
+        } else {
+            (stored_name.clone(), false)
         };
 
         let spec = ScratchSubtreePromoteSpec {
@@ -5128,13 +5130,13 @@ mod tests {
         let before_seq = meta.get_counter(NEXT_EVENT_SEQ).unwrap();
         let frozen = HashSet::from([sdir.ino, nested_file.ino, nested_link.ino]);
         let promoted = meta
-            .promote_scratch_auto(
+            .promote_scratch_in_place(
                 ROOT_INO,
                 b"shared",
                 sdir.ino,
                 &frozen,
                 &HashSet::new(),
-                "client-a",
+                Some("client-a"),
             )
             .unwrap();
         assert_eq!(promoted.promoted_ino, sdir.ino);
@@ -5225,13 +5227,13 @@ mod tests {
             .unwrap();
 
         let res1 = meta
-            .promote_scratch_auto(
+            .promote_scratch_in_place(
                 ROOT_INO,
                 b"taken.tmp",
                 sfile1.ino,
                 &HashSet::from([sfile1.ino]),
                 &HashSet::new(),
-                "client/1",
+                Some("client/1"),
             )
             .unwrap();
         assert!(res1.conflict_renamed);
@@ -5248,13 +5250,13 @@ mod tests {
         );
 
         let res2 = meta
-            .promote_scratch_auto(
+            .promote_scratch_in_place(
                 tracked_subdir.ino,
                 b"taken.tmp",
                 sfile2.ino,
                 &HashSet::from([sfile2.ino]),
                 &HashSet::new(),
-                "client/1",
+                Some("client/1"),
             )
             .unwrap();
         assert!(res2.conflict_renamed);
@@ -5312,13 +5314,13 @@ mod tests {
 
         let a_start = client_a.get_counter(NEXT_EVENT_SEQ).unwrap();
         client_a
-            .promote_scratch_auto(
+            .promote_scratch_in_place(
                 ROOT_INO,
                 b"merge",
                 dir_a.ino,
                 &HashSet::from([dir_a.ino, file_a.ino]),
                 &HashSet::new(),
-                "client-a",
+                Some("client-a"),
             )
             .unwrap();
         assert!(
@@ -5337,13 +5339,13 @@ mod tests {
 
         let b_start = client_b.get_counter(NEXT_EVENT_SEQ).unwrap();
         client_b
-            .promote_scratch_auto(
+            .promote_scratch_in_place(
                 ROOT_INO,
                 b"merge",
                 dir_b.ino,
                 &HashSet::from([dir_b.ino, file_b.ino]),
                 &HashSet::new(),
-                "client-b",
+                Some("client-b"),
             )
             .unwrap();
         assert!(
@@ -5389,7 +5391,7 @@ mod tests {
 
     #[test]
     fn scratch_promote_paths_update_total_inodes_identically() {
-        use crate::schema::counters::TOTAL_INODES;
+        use crate::schema::counters::{NEXT_EVENT_SEQ, TOTAL_INODES};
 
         let temp = tempfile::tempdir().unwrap();
         let meta = RedbMetaEngine::open(temp.path().join("meta.redb")).unwrap();
@@ -5436,13 +5438,13 @@ mod tests {
         // Automatic promote of an equivalent 3-inode subtree changes TOTAL_INODES by the same amount.
         let before_auto = meta.get_counter(TOTAL_INODES).unwrap();
         let auto_res = meta
-            .promote_scratch_auto(
+            .promote_scratch_in_place(
                 ROOT_INO,
                 b"auto.tmp",
                 auto_dir.ino,
                 &HashSet::from([auto_dir.ino, auto_file.ino, auto_link.ino]),
                 &HashSet::new(),
-                "client-a",
+                Some("client-a"),
             )
             .unwrap();
         let auto_delta = meta.get_counter(TOTAL_INODES).unwrap() - before_auto;
@@ -5461,13 +5463,13 @@ mod tests {
             .unwrap();
         let before_partial = meta.get_counter(TOTAL_INODES).unwrap();
         let partial_res = meta
-            .promote_scratch_auto(
+            .promote_scratch_in_place(
                 ROOT_INO,
                 b"partial",
                 partial_dir.ino,
                 &HashSet::from([partial_dir.ino, promoted_child.ino]),
                 &HashSet::from([kept_child.ino]),
-                "client-a",
+                Some("client-a"),
             )
             .unwrap();
         assert_eq!(partial_res.attrs.len(), 2);
@@ -5485,14 +5487,38 @@ mod tests {
             .create_dir(ROOT_INO, b"merge_target", 0, 0, 0o755)
             .unwrap();
         let before_merge = meta.get_counter(TOTAL_INODES).unwrap();
-        let merge_res = meta
-            .promote_scratch_auto(
+        let before_events = meta.get_counter(NEXT_EVENT_SEQ).unwrap();
+        let frozen = HashSet::from([merge_dir.ino, merge_child.ino]);
+        assert!(matches!(
+            meta.promote_scratch_in_place(
                 ROOT_INO,
                 b"merge_target",
                 merge_dir.ino,
-                &HashSet::from([merge_dir.ino, merge_child.ino]),
+                &frozen,
                 &HashSet::new(),
-                "client-a",
+                None
+            ),
+            Err(MetaError::EntryExists { .. })
+        ));
+        assert_eq!(meta.get_counter(NEXT_EVENT_SEQ).unwrap(), before_events);
+        assert_eq!(
+            meta.lookup_scratch_entry(ROOT_INO, b"merge_target")
+                .unwrap(),
+            Some(merge_dir.ino)
+        );
+        assert_eq!(
+            meta.lookup_scratch_entry(merge_dir.ino, b"merged.txt")
+                .unwrap(),
+            Some(merge_child.ino)
+        );
+        let merge_res = meta
+            .promote_scratch_in_place(
+                ROOT_INO,
+                b"merge_target",
+                merge_dir.ino,
+                &frozen,
+                &HashSet::new(),
+                Some("client-a"),
             )
             .unwrap();
         assert_eq!(merge_res.merged_into, Some(tracked_merge_target.ino));

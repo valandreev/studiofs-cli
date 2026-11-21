@@ -333,7 +333,7 @@ impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
     forward_method!(fn promote_scratch_entry(&self, source: (Ino, &[u8]), target: (Ino, &[u8]), ino: Ino, frozen: &std::collections::HashSet<Ino>, replace: bool) -> MetaResult<(studiofs_meta::RenameAtomicResult, Vec<InodeAttr>)>);
     forward_method!(fn list_tracked_parent_scratch_entries(&self) -> MetaResult<Vec<(Ino, Vec<u8>, InodeAttr)>>);
     forward_method!(fn scratch_replay_merge_generation(&self) -> u64);
-    forward_method!(fn promote_scratch_auto(&self, parent: Ino, name: &[u8], ino: Ino, frozen: &std::collections::HashSet<Ino>, kept_scratch: &std::collections::HashSet<Ino>, conflict_client: &str) -> MetaResult<studiofs_meta::ScratchAutoPromoteResult>);
+    forward_method!(fn promote_scratch_in_place(&self, parent: Ino, name: &[u8], ino: Ino, frozen: &std::collections::HashSet<Ino>, kept_scratch: &std::collections::HashSet<Ino>, conflict_client: Option<&str>) -> MetaResult<studiofs_meta::ScratchAutoPromoteResult>);
     forward_method!(fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()>);
     forward_method!(fn set_scratch_xattr_with_flags(&self, ino: Ino, name: &[u8], value: &[u8], flags: u32) -> MetaResult<()>);
     forward_method!(fn get_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>);

@@ -149,14 +149,37 @@ fn format_cache_scrub(snapshot: &studiofs_vfs::VfsCacheScrubSnapshot, now_ms: u6
     )
 }
 
+fn shell_quote_cli_arg(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b':')
+        })
+    {
+        value.to_string()
+    } else if cfg!(windows) {
+        // PowerShell single-quoted strings escape a quote by doubling it.
+        format!("'{}'", value.replace('\'', "''"))
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn format_scratch_over_limit_directories(
+    volume_name: &str,
     entries: &[studiofs_vfs::ScratchPromoteOverLimitEntry],
 ) -> Vec<String> {
+    let volume_arg = shell_quote_cli_arg(volume_name);
     entries
         .iter()
         .map(|entry| {
+            let guidance = if entry.path_is_lossy {
+                "manual promotion requires a UTF-8 path".to_owned()
+            } else {
+                let path_arg = shell_quote_cli_arg(&entry.relative_path);
+                format!("run `studiofs scratch promote --volume {volume_arg} -- {path_arg}`")
+            };
             format!(
-                "  Scratch dir `{}` exceeds promote limit; run `studiofs scratch promote` ({} > {} entries)",
+                "  Scratch dir `{}` exceeds promote limit; {guidance} ({} > {} entries)",
                 entry.relative_path, entry.entry_count, entry.entry_limit
             )
         })
@@ -732,9 +755,10 @@ pub fn run(
                     println!("{}", format_cache_scrub(&scrub, current_unix_ms()));
                 }
                 if let Some(auto_promote) = snapshot.scratch_auto_promote.as_ref() {
-                    for line in
-                        format_scratch_over_limit_directories(&auto_promote.over_limit_directories)
-                    {
+                    for line in format_scratch_over_limit_directories(
+                        name,
+                        &auto_promote.over_limit_directories,
+                    ) {
                         println!("{line}");
                     }
                 }
@@ -945,7 +969,7 @@ pub fn run(
         studiofs_vfs::scratch_promote_entry_limit_from_env(),
     ) {
         Ok(over_limit) => {
-            for line in format_scratch_over_limit_directories(&over_limit) {
+            for line in format_scratch_over_limit_directories(name, &over_limit) {
                 println!("{line}");
             }
         }
@@ -1434,16 +1458,25 @@ mod tests {
 
     #[test]
     fn format_scratch_over_limit_directories_reports_promote_guidance() {
-        let lines =
-            format_scratch_over_limit_directories(&[studiofs_vfs::ScratchPromoteOverLimitEntry {
+        let lines = format_scratch_over_limit_directories(
+            "myvol",
+            &[studiofs_vfs::ScratchPromoteOverLimitEntry {
                 dir_ino: 77,
-                relative_path: "renders/tmp".to_string(),
+                relative_path: "-renders/O'Brien ".to_string(),
+                path_is_lossy: false,
                 entry_count: 4,
                 entry_limit: 3,
-            }]);
+            }],
+        );
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("renders/tmp"));
-        assert!(lines[0].contains("exceeds promote limit; run `studiofs scratch promote`"));
+        let expected_argument = if cfg!(windows) {
+            "'-renders/O''Brien '"
+        } else {
+            "'-renders/O'\\''Brien '"
+        };
+        assert!(lines[0].contains(&format!(
+            "exceeds promote limit; run `studiofs scratch promote --volume myvol -- {expected_argument}`"
+        )));
         assert!(lines[0].contains("4 > 3"));
     }
 
