@@ -112,6 +112,17 @@ impl MetaEngineCore for PgMetaEngine {
         )
     }
 
+    fn promote_scratch_entry(
+        &self,
+        source: (Ino, &[u8]),
+        target: (Ino, &[u8]),
+        ino: Ino,
+        frozen: &std::collections::HashSet<Ino>,
+        replace: bool,
+    ) -> MetaResult<(crate::RenameAtomicResult, Vec<InodeAttr>)> {
+        self.mutate(|local| local.promote_scratch_entry(source, target, ino, frozen, replace))
+    }
+
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {
         self.local.set_scratch_xattr(ino, name, value)
     }

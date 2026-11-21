@@ -673,7 +673,9 @@ impl CacheIndex {
             let Some(old) = read_entry_write(&payloads, object_id)? else {
                 return Ok(None);
             };
-            if old.lifecycle != LocalPayloadLifecycleState::Dirty {
+            if old.lifecycle != LocalPayloadLifecycleState::Dirty
+                && old.origin != LocalPayloadOrigin::Scratch
+            {
                 return Ok(if old.lifecycle == LocalPayloadLifecycleState::Uploading {
                     old.dirty_order
                 } else {
@@ -682,6 +684,9 @@ impl CacheIndex {
             }
 
             let mut new = old.clone();
+            if new.origin == LocalPayloadOrigin::Scratch {
+                new.origin = LocalPayloadOrigin::Local;
+            }
             new.lifecycle = LocalPayloadLifecycleState::Uploading;
             new.upload_state = LocalPayloadUploadState::Uploading;
             new.evictable = false;

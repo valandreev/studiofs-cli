@@ -975,6 +975,185 @@ mod tests {
     }
 
     #[test]
+    fn scratch_promote_preserves_open_writer() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-promote-writer-");
+        let (runtime, vfs, _) = make_started_test_vfs(&temp, "scratch-promote-writer");
+        let _guard = runtime.enter();
+        runtime.block_on(async {
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n").await;
+            let file = vfs.create(ROOT_INO, b"shot.exr.tmp", 0, 0, 0o644).unwrap();
+            let fh = vfs.open_file(file.ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh(fh, file.ino, 0, b"before").await.unwrap();
+            vfs.rename(ROOT_INO, b"shot.exr.tmp", ROOT_INO, b"shot.exr", false)
+                .unwrap();
+            assert_eq!(vfs.lookup(ROOT_INO, b"shot.exr").unwrap().ino, file.ino);
+            assert!(!vfs.is_scratch_inode(file.ino).unwrap());
+            vfs.write_fh(fh, file.ino, 6, b"after").await.unwrap();
+            vfs.flush(file.ino).await.unwrap();
+            assert_eq!(
+                &vfs.read(file.ino, 0, 11).await.unwrap()[..],
+                b"beforeafter"
+            );
+        });
+    }
+
+    #[test]
+    fn scratch_promote_replace_retains_displaced_tracked_identity() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-promote-replace-");
+        let (runtime, vfs, meta) = make_started_test_vfs(&temp, "scratch-promote-replace");
+        let _guard = runtime.enter();
+        runtime.block_on(async {
+            install_ignore_rules(
+                &vfs, ROOT_INO, b"*.tmp
+",
+            )
+            .await;
+            let old = vfs.create(ROOT_INO, b"shot.exr", 0, 0, 0o644).unwrap();
+            let old_fh = vfs.open_file(old.ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh(old_fh, old.ino, 0, b"old").await.unwrap();
+            vfs.fsync_fh(old_fh).await.unwrap();
+
+            let new = vfs.create(ROOT_INO, b"shot.exr.tmp", 0, 0, 0o644).unwrap();
+            vfs.write(new.ino, 0, b"new").await.unwrap();
+            vfs.flush(new.ino).await.unwrap();
+            vfs.rename(ROOT_INO, b"shot.exr.tmp", ROOT_INO, b"shot.exr", true)
+                .unwrap();
+
+            assert_eq!(meta.lookup(ROOT_INO, b"shot.exr").unwrap().ino, new.ino);
+            // The displaced tracked inode survives for its open handle.
+            assert_eq!(&vfs.read(old.ino, 0, 3).await.unwrap()[..], b"old");
+            assert_eq!(&vfs.read(new.ino, 0, 3).await.unwrap()[..], b"new");
+            vfs.release_fh(old_fh).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn scratch_promote_replays_payload_after_commit_before_submission() {
+        const CRASH: &str = "STUDIOFS_TEST_SCRATCH_PROMOTE_CRASH";
+        const TARGET: &[u8] = b"scene.exr";
+        if let Some(root) = std::env::var_os(CRASH) {
+            let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs_at(
+                Path::new(&root),
+                VOLUME,
+                VfsConfig::default(),
+                None,
+            );
+            let file = vfs
+                .store_scratch_entry(NAME, InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
+                .unwrap();
+            runtime
+                .block_on(vfs.write_scratch(0, file.ino, 0, DATA))
+                .unwrap();
+            runtime.block_on(vfs.flush(file.ino)).unwrap();
+            let object = scratch_object(meta.as_ref(), file.ino);
+            assert_eq!(vfs.cached_store.pending_upload_count(), 0);
+            let (result, _) = meta
+                .promote_scratch_entry(
+                    (ROOT_INO, NAME),
+                    (ROOT_INO, TARGET),
+                    file.ino,
+                    &std::collections::HashSet::from([file.ino]),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(result.moved_ino, file.ino);
+            assert_eq!(vfs.cached_store.pending_upload_count(), 0);
+            assert_eq!(vfs.local_payload_backend.object_ids(), [object]);
+            assert!(
+                meta.get_local_referenced_object_ids()
+                    .unwrap()
+                    .contains(&object)
+            );
+            assert!(!vfs.cached_store.has_staged_upload(object));
+            std::process::exit(42);
+        }
+
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-promote-crash-");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "vfs::scratch_storage::tests::scratch_promote_replays_payload_after_commit_before_submission"])
+            .env(CRASH, temp.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(42));
+        let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs(&temp, VOLUME);
+        let ino = meta.lookup(ROOT_INO, TARGET).unwrap().ino;
+        let object_ids = vfs.local_payload_backend.object_ids();
+        assert_eq!(object_ids.len(), 1);
+        let object = object_ids[0];
+        assert_eq!(vfs.cached_store.pending_upload_count(), 1);
+        assert!(vfs.cached_store.has_staged_upload(object));
+        assert_eq!(
+            &runtime
+                .block_on(vfs.read(ino, 0, DATA.len() as u32))
+                .unwrap()[..],
+            DATA
+        );
+    }
+
+    #[test]
+    fn scratch_promote_moves_subtree_and_reuses_staged_objects() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-promote-tree-");
+        let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs(&temp, VOLUME);
+        let dir = vfs
+            .store_scratch_entry(b"tree.tmp", InodeAttr::new_dir(0, ROOT_INO, 0, 0, 0o755))
+            .unwrap();
+        let file = vfs
+            .store_scratch_entry(b"child.exr", InodeAttr::new_file(0, dir.ino, 0, 0, 0o644))
+            .unwrap();
+        runtime
+            .block_on(vfs.write_scratch(0, file.ino, 0, DATA))
+            .unwrap();
+        runtime.block_on(vfs.flush(file.ino)).unwrap();
+        let object = scratch_object(meta.as_ref(), file.ino);
+        meta.set_scratch_xattr(file.ino, b"user.test", b"preserved")
+            .unwrap();
+        let target = vfs.mkdir(ROOT_INO, b"tree", 0, 0, 0o755).unwrap();
+        assert!(matches!(
+            vfs.rename(ROOT_INO, b"tree.tmp", ROOT_INO, b"tree", false),
+            Err(VfsError::Meta(MetaError::EntryExists { .. }))
+        ));
+        assert_eq!(vfs.cached_store.pending_upload_count(), 0);
+        assert_eq!(vfs.lookup(ROOT_INO, b"tree").unwrap().ino, target.ino);
+        vfs.rename(ROOT_INO, b"tree.tmp", ROOT_INO, b"tree", true)
+            .unwrap();
+        assert_eq!(meta.lookup(ROOT_INO, b"tree").unwrap().ino, dir.ino);
+        assert_eq!(meta.lookup(dir.ino, b"child.exr").unwrap().ino, file.ino);
+        assert!(!vfs.is_scratch_inode(file.ino).unwrap());
+        assert_eq!(
+            vfs.get_xattr(file.ino, b"user.test").unwrap().unwrap(),
+            b"preserved"
+        );
+        assert_eq!(vfs.local_payload_backend.object_ids(), [object]);
+        assert!(vfs.cached_store.has_staged_upload(object));
+        assert_eq!(vfs.cached_store.pending_upload_count(), 1);
+    }
+
+    #[test]
+    fn scratch_promote_rejects_subtree_over_entry_limit() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-promote-limit-");
+        let (_runtime, mut vfs, meta) = super::super::tests::make_unstarted_test_vfs(&temp, VOLUME);
+        Arc::get_mut(&mut vfs).unwrap().scratch_promote_entry_limit = 1;
+        let dir = vfs
+            .store_scratch_entry(b"tree.tmp", InodeAttr::new_dir(0, ROOT_INO, 0, 0, 0o755))
+            .unwrap();
+        vfs.store_scratch_entry(b"child", InodeAttr::new_file(0, dir.ino, 0, 0, 0o644))
+            .unwrap();
+        let before = meta.read_events_range(0, u64::MAX).unwrap();
+        assert!(matches!(
+            vfs.rename(ROOT_INO, b"tree.tmp", ROOT_INO, b"tree", false),
+            Err(VfsError::CrossDevice)
+        ));
+        assert_eq!(
+            meta.lookup_scratch_entry(ROOT_INO, b"tree.tmp").unwrap(),
+            Some(dir.ino)
+        );
+        assert_eq!(
+            meta.read_events_range(0, u64::MAX).unwrap().len(),
+            before.len()
+        );
+    }
+
+    #[test]
     fn scratch_rename_hardlink_discard_split_and_zero_events() {
         let temp = studiofs_test_support::workspace_target_tempdir("scratch-ns-rename-");
         let (runtime, vfs, meta) = make_started_test_vfs(&temp, "scratch-ns-rename");
@@ -1020,17 +1199,7 @@ mod tests {
                 scratch_a.ino
             );
 
-            // Cross-class renames return EXDEV until SFS-1078/SFS-1079 land.
-            assert!(matches!(
-                vfs.rename(
-                    scratch_dir.ino,
-                    b"MOVED.TXT",
-                    ROOT_INO,
-                    b"promoted.txt",
-                    true
-                ),
-                Err(VfsError::CrossDevice)
-            ));
+            // Demotion lands in SFS-1079.
             assert!(matches!(
                 vfs.rename(ROOT_INO, b"doc.txt", scratch_dir.ino, b"demoted.txt", true),
                 Err(VfsError::CrossDevice)

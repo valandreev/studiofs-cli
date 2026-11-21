@@ -1050,6 +1050,172 @@ impl RedbMetaEngine {
         Ok(result)
     }
 
+    pub(super) fn promote_scratch(
+        &self,
+        (parent, name): (Ino, &[u8]),
+        (new_parent, new_name): (Ino, &[u8]),
+        source: Ino,
+        frozen: &HashSet<Ino>,
+        replace: bool,
+    ) -> MetaResult<(RenameAtomicResult, Vec<InodeAttr>)> {
+        use crate::events::MetaEvent;
+
+        let _mutation_guard = self
+            .scratch_mutation_lock
+            .lock()
+            .map_err(|_| storage_error("scratch mutation lock poisoned"))?;
+        let txn = self.begin_immediate_write_txn()?;
+        if Self::get_attr_merged_in_write_txn(&txn, new_parent)?.kind != FileType::Directory {
+            return Err(MetaError::NotADirectory(new_parent));
+        }
+        let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
+        let mut dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
+        let (stored_name, ino) = find_scratch_dentry_in_table(&dentries, parent, name)?
+            .filter(|(_, ino)| *ino == source)
+            .ok_or(MetaError::TargetChanged)?;
+        if find_scratch_dentry_in_table(&dentries, new_parent, new_name)?
+            .is_some_and(|(_, target)| target != source)
+        {
+            return Err(MetaError::EntryExists {
+                parent: new_parent,
+                name: String::from_utf8_lossy(new_name).into_owned(),
+            });
+        }
+        let mut pending = vec![(parent, stored_name.clone(), ino)];
+        let mut moved = Vec::new();
+        while let Some((entry_parent, entry_name, ino)) = pending.pop() {
+            if !frozen.contains(&ino) || moved.len() == frozen.len() {
+                return Err(MetaError::TargetChanged);
+            }
+            let mut attr =
+                read_scratch_attr_from_table(&inodes, ino)?.ok_or(MetaError::TargetChanged)?;
+            if attr.kind == FileType::Directory {
+                let start = dentry_prefix(ino);
+                for row in dentries.range(start.as_slice()..)? {
+                    let (key, child) = row?;
+                    if !key.value().starts_with(&start) {
+                        break;
+                    }
+                    if pending.len() + moved.len() + 1 >= frozen.len() {
+                        return Err(MetaError::TargetChanged);
+                    }
+                    let (_, child_name) = decode_dentry_key(key.value())?;
+                    pending.push((ino, child_name.to_vec(), child.value()));
+                }
+            }
+            if ino == source {
+                attr.parent = new_parent;
+            }
+            Self::set_inode_in_txn(&txn, &attr)?;
+            if attr.kind == FileType::RegularFile && attr.size != 0 {
+                attr.content_epoch = attr.content_epoch.max(1);
+                let overlay = txn.open_table(SCRATCH_OVERLAY).map_err(storage_error)?;
+                let chunks: Vec<_> =
+                    Self::regular_file_chunk_states_for_inode_in_opened_table(&overlay, ino)?
+                        .into_iter()
+                        .map(|(chunk, state)| (chunk, state.slices.into_values().collect()))
+                        .collect();
+                drop(overlay);
+                if let (Some(normalized), _) = self.apply_regular_file_overlay_mutation_in_txn(
+                    &txn,
+                    ino,
+                    &chunks,
+                    Some(&attr),
+                )? {
+                    attr = normalized;
+                }
+            }
+            Self::append_event_in_txn(&txn, &MetaEvent::SetAttr { attr: attr.clone() })?;
+            if ino != source {
+                let entry = DirEntryValue {
+                    ino,
+                    kind: attr.kind,
+                };
+                Self::set_dentry_in_txn(&txn, entry_parent, &entry_name, &entry)?;
+                Self::append_event_in_txn(
+                    &txn,
+                    &MetaEvent::AddEntry {
+                        parent: entry_parent,
+                        name: entry_name.clone(),
+                        entry,
+                    },
+                )?;
+                Self::refresh_pending_regular_file_recovery_metadata_in_txn(&txn, ino)?;
+            }
+            {
+                let symlinks = txn.open_table(SCRATCH_SYMLINKS).map_err(storage_error)?;
+                if let Some(row) = symlinks.get(ino)? {
+                    let target = row.value().to_vec();
+                    Self::set_symlink_in_txn(&txn, ino, &target)?;
+                    Self::append_event_in_txn(&txn, &MetaEvent::SetSymlinkTarget { ino, target })?;
+                }
+            }
+            {
+                let xattrs = txn.open_table(SCRATCH_XATTRS).map_err(storage_error)?;
+                let start = xattr_prefix(ino);
+                for row in xattrs.range(start.as_slice()..)? {
+                    let (key, value) = row?;
+                    if !key.value().starts_with(&start) {
+                        break;
+                    }
+                    let name = xattr_name_from_key(key.value()).to_vec();
+                    let value = value.value().to_vec();
+                    Self::set_xattr_in_txn(&txn, ino, &name, &value)?;
+                    Self::append_event_in_txn(
+                        &txn,
+                        &MetaEvent::SetXattr {
+                            ino,
+                            name,
+                            value,
+                            flags: 0,
+                        },
+                    )?;
+                }
+            }
+            remove_scratch_inode_aux_in_txn(&txn, ino)?;
+            dentries.remove(encode_dentry_key(entry_parent, &entry_name).as_slice())?;
+            inodes.remove(ino)?;
+            moved.push((entry_parent, attr));
+        }
+        if let Some(mut old_parent) = read_scratch_attr_from_table(&inodes, parent)? {
+            if moved[0].1.kind == FileType::Directory {
+                old_parent.nlink = old_parent.nlink.saturating_sub(1);
+            }
+            old_parent.touch_mtime();
+            old_parent.touch_ctime();
+            inodes.insert(
+                parent,
+                postcard::to_allocvec(&old_parent)
+                    .map_err(storage_error)?
+                    .as_slice(),
+            )?;
+        }
+        drop(dentries);
+        drop(inodes);
+        let result = Self::rename_or_promote_in_txn(
+            &txn,
+            (parent, &stored_name),
+            (new_parent, new_name),
+            replace,
+            true,
+            Some(DirEntryValue {
+                ino: source,
+                kind: moved[0].1.kind,
+            }),
+        )?;
+        txn.commit()?;
+        let mut index = self.scratch_index_write();
+        let attrs = moved
+            .into_iter()
+            .map(|(parent, attr)| {
+                index.note_remove_dentry(parent);
+                index.note_remove_inode(attr.ino);
+                attr
+            })
+            .collect();
+        Ok((result, attrs))
+    }
+
     pub(super) fn write_scratch_xattr(
         &self,
         ino: Ino,

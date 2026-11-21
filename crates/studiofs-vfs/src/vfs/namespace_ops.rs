@@ -4703,8 +4703,14 @@ impl StudioVfs {
                 src_attr.kind == FileType::Directory,
             )?;
             if dst_class != crate::scratch_rules::ScratchClass::Scratch {
-                // Promote (scratch -> tracked) lands in SFS-1078.
-                return Err(VfsError::CrossDevice);
+                return self
+                    .promote_scratch_rename(
+                        (parent, name),
+                        (new_parent, new_name),
+                        src_attr,
+                        replace_if_exists,
+                    )
+                    .await;
             }
             self.wait_for_deferred_namespace_entry(new_parent, new_name)
                 .await?;
@@ -5063,7 +5069,29 @@ impl StudioVfs {
         drop(rule_payloads);
         self.bump_acl_namespace_epoch();
 
-        if let Some(attr) = &rename_result.displaced {
+        self.finish_rename_displacement(&meta, rename_result.displaced.as_ref())
+            .await?;
+
+        meta.request_eager_flush();
+        debug!(
+            parent,
+            name = %name_display,
+            new_parent,
+            new_name = %new_name_display,
+            moved_ino = rename_result.moved_ino,
+            displaced_ino = ?rename_result.displaced.as_ref().map(|attr| attr.ino),
+            elapsed_ms = rename_started.elapsed().as_millis(),
+            "VFS rename completed"
+        );
+        Ok(())
+    }
+
+    async fn finish_rename_displacement(
+        &self,
+        meta: &std::sync::Arc<dyn super::VfsMeta>,
+        displaced: Option<&InodeAttr>,
+    ) -> VfsResult<()> {
+        if let Some(attr) = displaced {
             let ino = attr.ino;
             self.record_committed_link_change(ino, attr.nlink, Some(attr.ctime));
             self.invalidate_attr_read_cache([ino]);
@@ -5072,7 +5100,7 @@ impl StudioVfs {
                 self.mark_inode_deleted_for_uploads(ino);
                 if attr.kind == FileType::Directory {
                     self.cleanup_deleted_inode_storage_deferred_cache_eviction(
-                        &meta,
+                        meta,
                         ino,
                         0,
                         "rename overwrite",
@@ -5103,17 +5131,113 @@ impl StudioVfs {
             }
         }
 
+        Ok(())
+    }
+
+    async fn promote_scratch_rename(
+        &self,
+        source: (Ino, &[u8]),
+        target: (Ino, &[u8]),
+        source_attr: InodeAttr,
+        replace: bool,
+    ) -> VfsResult<()> {
+        let meta = self.sync_meta();
+        self.wait_for_deferred_namespace_entry(target.0, target.1)
+            .await?;
+        let existing = match meta.lookup(target.0, target.1) {
+            Ok(entry) => Some(entry),
+            Err(MetaError::EntryNotFound { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(entry) = existing {
+            if !replace {
+                return Err(MetaError::EntryExists {
+                    parent: target.0,
+                    name: String::from_utf8_lossy(target.1).into_owned(),
+                }
+                .into());
+            }
+            self.enforce_no_known_foreign_hard_lock(entry.ino)?;
+            if self.has_deferred_namespace_children(entry.ino) {
+                return Err(MetaError::DirNotEmpty(entry.ino).into());
+            }
+        }
+
+        let source_ino = source_attr.ino;
+        let mut frozen = std::collections::HashSet::new();
+        let mut pending = vec![source_attr];
+        let mut files = Vec::new();
+        while let Some(attr) = pending.pop() {
+            if !frozen.insert(attr.ino) {
+                return Err(MetaError::TargetChanged.into());
+            }
+            if frozen.len() + pending.len() > self.scratch_promote_entry_limit {
+                return Err(VfsError::CrossDevice);
+            }
+            if attr.kind == FileType::Directory {
+                pending.extend(
+                    meta.readdir_scratch(attr.ino)?
+                        .into_iter()
+                        .map(|(_, attr)| attr),
+                );
+            } else if attr.kind == FileType::RegularFile {
+                files.push(attr.ino);
+            }
+        }
+        files.sort_unstable();
+        for &ino in &files {
+            self.wait_for_deferred_release_inflight(ino).await;
+            self.wait_for_deferred_materialization_inflight(ino).await;
+        }
+        let mut sessions = Vec::with_capacity(files.len());
+        // Hold the write gates through the namespace commit and upload handoff.
+        for ino in files {
+            sessions.push(
+                self.state
+                    .file_session
+                    .enter_op(ino, FileSessionOperation::Restore)
+                    .await,
+            );
+            self.flush_retained_source_ordered(ino).await?;
+        }
+
+        let namespace_mutations = self.namespace_mutations();
+        let (result, attrs) =
+            meta.promote_scratch_entry(source, target, source_ino, &frozen, replace)?;
+        namespace_mutations.record_rename(source.0, source.1, target.0, target.1, source_ino);
+        self.bump_acl_namespace_epoch();
+        for attr in &attrs {
+            self.invalidate_attr_read_cache([attr.ino]);
+            if !Self::needs_epoch_finalization(attr) {
+                continue;
+            }
+            let objects = match self.regular_file_graph_objects(attr) {
+                Ok(objects) => objects,
+                Err(error) => {
+                    warn!(ino = attr.ino, %error, "could not enumerate committed promotion payloads");
+                    continue;
+                }
+            };
+            let extents: Vec<_> = objects
+                .iter()
+                .map(|object| object.live_extent(attr.ino, attr.content_epoch))
+                .collect();
+            let mut queued = std::collections::HashSet::new();
+            let ops: Vec<_> = objects
+                .iter()
+                .filter(|object| queued.insert(object.object_id))
+                .map(|object| object.upload_op(attr.ino, attr.content_epoch))
+                .collect();
+            self.record_live_extents(&extents);
+            self.cached_store.submit_uploads_batch(&ops);
+            if ops.is_empty() {
+                self.queue_epoch_finalization(attr.ino, attr.content_epoch);
+            }
+        }
+        drop(sessions);
+        self.finish_rename_displacement(&meta, result.displaced.as_ref())
+            .await?;
         meta.request_eager_flush();
-        debug!(
-            parent,
-            name = %name_display,
-            new_parent,
-            new_name = %new_name_display,
-            moved_ino = rename_result.moved_ino,
-            displaced_ino = ?rename_result.displaced.as_ref().map(|attr| attr.ino),
-            elapsed_ms = rename_started.elapsed().as_millis(),
-            "VFS rename completed"
-        );
         Ok(())
     }
 }

@@ -7,7 +7,7 @@ use super::overlay::{
     pending_upload_key,
 };
 use super::{PendingUpload, StudioVfs, VfsResult, ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT};
-use studiofs_cache::local::LocalPayloadLifecycleState;
+use studiofs_cache::local::{LocalPayloadLifecycleState, LocalPayloadOrigin};
 use studiofs_meta::MetaError;
 use studiofs_meta::schema::{
     DEFAULT_CHUNK_SIZE, UploadState as MetaUploadState, chunk_start_offset,
@@ -41,12 +41,29 @@ pub(super) struct StartupReplayCoordinator<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct StartupGraphObject {
-    block_index: u32,
-    object_id: u64,
-    payload_len: u64,
-    absolute_offset: u64,
-    file_mapping: Option<studiofs_cache::ObjectFileMapping>,
+pub(super) struct StartupGraphObject {
+    pub(super) block_index: u32,
+    pub(super) object_id: u64,
+    pub(super) payload_len: u64,
+    pub(super) absolute_offset: u64,
+    pub(super) file_mapping: Option<studiofs_cache::ObjectFileMapping>,
+}
+
+impl StartupGraphObject {
+    pub(super) fn upload_op(&self, ino: Ino, content_epoch: u64) -> studiofs_cache::UploadOp {
+        (
+            ino,
+            self.absolute_offset,
+            self.file_mapping,
+            self.object_id,
+            content_epoch,
+            self.payload_len,
+        )
+    }
+
+    pub(super) fn live_extent(&self, ino: Ino, content_epoch: u64) -> (Ino, u32, u64, u64) {
+        (ino, self.block_index, self.object_id, content_epoch)
+    }
 }
 
 impl<'a> StartupReplayCoordinator<'a> {
@@ -137,7 +154,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             return;
         }
 
-        if self.has_dirty_or_recovered_objects() {
+        if self.has_dirty_or_recovered_objects() || needs_finalization {
             for graph_object in &graph_objects {
                 self.record_recovered_graph_object_if_local(ino, graph_object, attr.content_epoch);
             }
@@ -226,11 +243,19 @@ impl<'a> StartupReplayCoordinator<'a> {
     }
 
     fn regular_file_graph_objects(&self, attr: &InodeAttr) -> VfsResult<Vec<StartupGraphObject>> {
+        self.vfs.regular_file_graph_objects(attr)
+    }
+}
+
+impl StudioVfs {
+    pub(super) fn regular_file_graph_objects(
+        &self,
+        attr: &InodeAttr,
+    ) -> VfsResult<Vec<StartupGraphObject>> {
         if attr.size == 0 {
             return Ok(Vec::new());
         }
         let spans = self
-            .vfs
             .sync_meta()
             .lookup_regular_file_stored_slices(attr.ino, 0, attr.size)?;
         let mut objects = Vec::new();
@@ -247,7 +272,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 .and_modify(|current| current.include(geometry))
                 .or_insert(geometry);
             objects.push(StartupGraphObject {
-                block_index: block_index_from_offset(absolute_offset, self.vfs.block_size),
+                block_index: block_index_from_offset(absolute_offset, self.block_size),
                 object_id: block.object_id,
                 payload_len: u64::from(block.offset).saturating_add(u64::from(block.length)),
                 absolute_offset,
@@ -256,7 +281,6 @@ impl<'a> StartupReplayCoordinator<'a> {
         }
         for (object_id, geometry) in &mut geometries {
             let payload_len = self
-                .vfs
                 .local_payload_backend
                 .object_stats(*object_id)
                 .map(|stats| stats.payload_len);
@@ -270,6 +294,15 @@ impl<'a> StartupReplayCoordinator<'a> {
         Ok(objects)
     }
 
+    fn is_unsubmitted_promoted_payload(&self, object_id: u64) -> bool {
+        // A tracked graph can commit before the uploader changes the cache origin.
+        self.local_payload_backend
+            .object_stats(object_id)
+            .is_some_and(|stats| stats.origin == LocalPayloadOrigin::Scratch)
+    }
+}
+
+impl StartupReplayCoordinator<'_> {
     fn needs_scan(&self, attr: &InodeAttr) -> bool {
         !self.dirty_set.is_empty()
             || !self.recovered_dirty_object_ids.is_empty()
@@ -298,14 +331,8 @@ impl<'a> StartupReplayCoordinator<'a> {
         graph_object: &StartupGraphObject,
         content_epoch: u64,
     ) {
-        self.replay_ops.push((
-            ino,
-            graph_object.absolute_offset,
-            graph_object.file_mapping,
-            graph_object.object_id,
-            content_epoch,
-            graph_object.payload_len,
-        ));
+        self.replay_ops
+            .push(graph_object.upload_op(ino, content_epoch));
         self.record_live_extent(
             ino,
             graph_object.block_index,
@@ -321,7 +348,14 @@ impl<'a> StartupReplayCoordinator<'a> {
         graph_object: &StartupGraphObject,
         content_epoch: u64,
     ) {
-        if self.take_dirty_object(graph_object.object_id) {
+        if self.take_dirty_object(graph_object.object_id)
+            || (!self
+                .recovered_dirty_object_ids
+                .contains(&graph_object.object_id)
+                && self
+                    .vfs
+                    .is_unsubmitted_promoted_payload(graph_object.object_id))
+        {
             self.recovered_dirty_object_ids
                 .insert(graph_object.object_id);
             self.record_recovered_object_bytes(graph_object);
@@ -366,10 +400,14 @@ impl<'a> StartupReplayCoordinator<'a> {
         let uploaded_object_ids: Vec<_> = graph_objects
             .iter()
             .filter(|graph_object| {
-                self.vfs
-                    .local_payload_backend
-                    .lifecycle_state(graph_object.object_id)
-                    == LocalPayloadLifecycleState::Uploaded
+                !self
+                    .vfs
+                    .is_unsubmitted_promoted_payload(graph_object.object_id)
+                    && self
+                        .vfs
+                        .local_payload_backend
+                        .lifecycle_state(graph_object.object_id)
+                        == LocalPayloadLifecycleState::Uploaded
             })
             .map(|graph_object| graph_object.object_id)
             .collect();

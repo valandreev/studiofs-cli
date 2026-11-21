@@ -1480,6 +1480,20 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         Err(MetaError::Storage("scratch storage is unsupported".into()))
     }
 
+    /// Promote the frozen scratch tree and commit its tracked rename.
+    fn promote_scratch_entry(
+        &self,
+        _source: (Ino, &[u8]),
+        _target: (Ino, &[u8]),
+        _ino: Ino,
+        _frozen: &std::collections::HashSet<Ino>,
+        _replace: bool,
+    ) -> MetaResult<(RenameAtomicResult, Vec<InodeAttr>)> {
+        Err(MetaError::Storage(
+            "scratch promotion is unsupported".into(),
+        ))
+    }
+
     /// Persist a local scratch extended attribute.
     fn set_scratch_xattr(&self, _ino: Ino, _name: &[u8], _value: &[u8]) -> MetaResult<()> {
         Err(MetaError::Storage("scratch storage is unsupported".into()))

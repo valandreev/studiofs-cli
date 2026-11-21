@@ -87,7 +87,10 @@ source, and ignored -> normal unlinks the source without creating the target.
   the objects pending upload. Uploads are submitted after the commit. No payload
   is copied. Lock order is LocalDirty -> Namespace -> Upload. A directory
   promotes with its subtree in one transaction; above a configurable entry
-  limit the rename fails with `EXDEV`.
+  limit the rename fails with `EXDEV`. Set
+  `STUDIOFS_SCRATCH_PROMOTE_ENTRY_LIMIT` on the mounting process to override
+  the default of 100,000 entries, including the directory itself.
+  Explicit promotion follows ordinary rename collision and replacement semantics.
 - A tracked entry renamed to a matching name in a tracked parent stays tracked
   (a normal published rename).
 - **Demote** (moving a tracked entry into a scratch directory): peers receive a
