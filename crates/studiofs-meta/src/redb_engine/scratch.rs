@@ -1504,7 +1504,8 @@ impl RedbMetaEngine {
             moved.push((entry_parent, attr));
         }
 
-        let added_inodes = u64::try_from(moved.len()).unwrap_or(u64::MAX);
+        let added_inodes = u64::try_from(moved.len())
+            .map_err(|_| MetaError::Storage("total inodes counter overflow".to_string()))?;
         Self::update_counter_in_txn(txn, counters::TOTAL_INODES, |total| {
             total
                 .checked_add(added_inodes)
@@ -1828,7 +1829,7 @@ impl RedbMetaEngine {
 
     /// Automatically promotes a frozen scratch subtree in place under tracked
     /// `parent`, handling directory merges, conflict renames, `kept_scratch`
-    /// descendants, `AddEntry` journaling, and `TOTAL_INODES` accounting.
+    /// descendants, and `AddEntry` journaling.
     pub(super) fn promote_scratch_auto_inner(
         &self,
         parent: Ino,
@@ -5447,6 +5448,55 @@ mod tests {
         let auto_delta = meta.get_counter(TOTAL_INODES).unwrap() - before_auto;
         assert_eq!(auto_res.attrs.len(), 3);
         assert_eq!(auto_delta, explicit_delta);
+
+        // Auto-promote with a kept_scratch child counts only the promoted inodes.
+        let partial_dir = InodeAttr::new_dir(350, ROOT_INO, 0, 0, 0o755);
+        meta.create_scratch_entry(ROOT_INO, b"partial", &partial_dir)
+            .unwrap();
+        let promoted_child = InodeAttr::new_file(351, partial_dir.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(partial_dir.ino, b"keep.txt", &promoted_child)
+            .unwrap();
+        let kept_child = InodeAttr::new_file(352, partial_dir.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(partial_dir.ino, b"still.tmp", &kept_child)
+            .unwrap();
+        let before_partial = meta.get_counter(TOTAL_INODES).unwrap();
+        let partial_res = meta
+            .promote_scratch_auto(
+                ROOT_INO,
+                b"partial",
+                partial_dir.ino,
+                &HashSet::from([partial_dir.ino, promoted_child.ino]),
+                &HashSet::from([kept_child.ino]),
+                "client-a",
+            )
+            .unwrap();
+        assert_eq!(partial_res.attrs.len(), 2);
+        assert_eq!(meta.get_counter(TOTAL_INODES).unwrap() - before_partial, 2);
+
+        // Merging a scratch directory into an existing tracked directory does not
+        // increment TOTAL_INODES; its children remain scratch until promoted.
+        let merge_dir = InodeAttr::new_dir(360, ROOT_INO, 0, 0, 0o755);
+        meta.create_scratch_entry(ROOT_INO, b"merge_target", &merge_dir)
+            .unwrap();
+        let merge_child = InodeAttr::new_file(361, merge_dir.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(merge_dir.ino, b"merged.txt", &merge_child)
+            .unwrap();
+        let tracked_merge_target = meta
+            .create_dir(ROOT_INO, b"merge_target", 0, 0, 0o755)
+            .unwrap();
+        let before_merge = meta.get_counter(TOTAL_INODES).unwrap();
+        let merge_res = meta
+            .promote_scratch_auto(
+                ROOT_INO,
+                b"merge_target",
+                merge_dir.ino,
+                &HashSet::from([merge_dir.ino, merge_child.ino]),
+                &HashSet::new(),
+                "client-a",
+            )
+            .unwrap();
+        assert_eq!(merge_res.merged_into, Some(tracked_merge_target.ino));
+        assert_eq!(meta.get_counter(TOTAL_INODES).unwrap(), before_merge);
 
         // Demoting a tracked entry into a scratch directory follows tracked delete semantics
         // (does not decrement TOTAL_INODES).
