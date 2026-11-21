@@ -26,6 +26,7 @@ const LEGACY_ENTRY_ENCODING_VERSION: u8 = 1;
 const ENTRY_ENCODING_VERSION_V2: u8 = 2;
 const ENTRY_ENCODING_VERSION: u8 = 3;
 const NO_DIRTY_ORDER: u64 = u64::MAX;
+const NO_ACCESS_ORDER: u64 = u64::MAX;
 
 const PAYLOAD_OBJECTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("payload_objects");
 const DIRTY_ORDER_TABLE: TableDefinition<u64, u64> = TableDefinition::new("dirty_order");
@@ -34,6 +35,7 @@ const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counter
 
 const COUNTER_INDEX_FORMAT: &str = "index_format_version";
 const COUNTER_SCRATCH_BYTES: &str = "scratch_bytes";
+const COUNTER_SCRATCH_EXCLUDED_FROM_ACCESS_ORDER: &str = "scratch_excluded_from_access_order";
 const COUNTER_CURRENT_BYTES: &str = "current_bytes";
 const COUNTER_DIRTY_BYTES: &str = "dirty_bytes";
 const COUNTER_EVICTABLE_BYTES: &str = "evictable_bytes";
@@ -236,6 +238,12 @@ pub struct CacheIndex {
 }
 
 fn normalize_upsert(mut update: CacheIndexUpsert) -> CacheIndexUpsert {
+    if update.origin == LocalPayloadOrigin::Scratch {
+        update.lifecycle = LocalPayloadLifecycleState::Uploaded;
+        update.upload_state = LocalPayloadUploadState::None;
+        update.evictable = false;
+        return update;
+    }
     if matches!(
         update.lifecycle,
         LocalPayloadLifecycleState::Dirty | LocalPayloadLifecycleState::Uploading
@@ -457,7 +465,8 @@ impl CacheIndex {
             let old = read_entry_write(&payloads, update.object_id)?;
             let mut new = StoredEntry {
                 xxh64: xxh64.filter(|_| {
-                    update.lifecycle == LocalPayloadLifecycleState::Uploaded
+                    update.origin != LocalPayloadOrigin::Scratch
+                        && update.lifecycle == LocalPayloadLifecycleState::Uploaded
                         && update.upload_state == LocalPayloadUploadState::None
                 }),
                 payload_key: update.payload_key,
@@ -468,7 +477,7 @@ impl CacheIndex {
                 last_access_unix_millis: now_unix_millis(),
                 evictable: update.evictable,
                 dirty_order: None,
-                access_order: allocate_sequence(&mut counters, COUNTER_NEXT_ACCESS_SEQ)?,
+                access_order: initial_access_order(update.origin, &mut counters)?,
             };
             if is_dirty_like(new.lifecycle) {
                 new.dirty_order = Some(allocate_sequence(&mut counters, COUNTER_NEXT_DIRTY_SEQ)?);
@@ -518,7 +527,7 @@ impl CacheIndex {
                     last_access_unix_millis: now_unix_millis(),
                     evictable: update.evictable,
                     dirty_order: None,
-                    access_order: allocate_sequence(&mut counters, COUNTER_NEXT_ACCESS_SEQ)?,
+                    access_order: initial_access_order(update.origin, &mut counters)?,
                 };
                 if is_dirty_like(new.lifecycle) {
                     new.dirty_order =
@@ -632,7 +641,9 @@ impl CacheIndex {
                     continue;
                 };
                 let mut new = old.clone();
-                new.access_order = allocate_sequence(&mut counters, COUNTER_NEXT_ACCESS_SEQ)?;
+                if new.origin != LocalPayloadOrigin::Scratch {
+                    new.access_order = allocate_sequence(&mut counters, COUNTER_NEXT_ACCESS_SEQ)?;
+                }
                 new.last_access_unix_millis = now_unix_millis();
 
                 apply_entry_change(
@@ -686,6 +697,7 @@ impl CacheIndex {
             let mut new = old.clone();
             if new.origin == LocalPayloadOrigin::Scratch {
                 new.origin = LocalPayloadOrigin::Local;
+                new.access_order = allocate_sequence(&mut counters, COUNTER_NEXT_ACCESS_SEQ)?;
             }
             new.lifecycle = LocalPayloadLifecycleState::Uploading;
             new.upload_state = LocalPayloadUploadState::Uploading;
@@ -773,6 +785,9 @@ impl CacheIndex {
             let Some(old) = read_entry_write(&payloads, object_id)? else {
                 return Ok(());
             };
+            if old.origin == LocalPayloadOrigin::Scratch {
+                return Ok(());
+            }
             let mut new = old.clone();
             if let Some((dirty_order, payload_len, xxh64)) = verified
                 && old.dirty_order == Some(dirty_order)
@@ -886,7 +901,7 @@ impl CacheIndex {
                 remove_order_link(&mut dirty_order, old.dirty_order, *object_id, "dirty")?;
                 remove_order_link(
                     &mut access_order,
-                    Some(old.access_order),
+                    stored_access_link(&old),
                     *object_id,
                     "access",
                 )?;
@@ -984,7 +999,50 @@ impl CacheIndex {
         Ok(ordered)
     }
 
-    /// Return all object ids ordered by access sequence.
+    /// Return all indexed object ids in ascending object-id order, including scratch rows.
+    pub fn all_object_ids(&self) -> Result<Vec<u64>, CacheIndexError> {
+        let mut cursor = None;
+        let mut out = Vec::new();
+        loop {
+            let page = self.object_ids_page(cursor, LIST_PAGE_SIZE)?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().copied();
+            out.extend(page);
+        }
+        Ok(out)
+    }
+
+    /// Page all indexed object ids in ascending object-id order, including scratch rows.
+    pub fn object_ids_page(
+        &self,
+        start_after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<u64>, CacheIndexError> {
+        use std::ops::Bound;
+
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let txn = self.db.begin_read().map_err(storage_error)?;
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
+        let start = start_after.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut ids = Vec::with_capacity(limit.min(256));
+        for pair in payloads
+            .range::<u64>((start, Bound::Unbounded))
+            .map_err(storage_error)?
+            .take(limit)
+        {
+            let (key, _) = pair.map_err(storage_error)?;
+            ids.push(key.value());
+        }
+        Ok(ids)
+    }
+
+    /// Return all tracked (non-scratch) object ids ordered by access sequence.
     pub fn access_order_object_ids(&self) -> Result<Vec<u64>, CacheIndexError> {
         let mut cursor = None;
         let mut out = Vec::new();
@@ -999,7 +1057,7 @@ impl CacheIndex {
         Ok(out)
     }
 
-    /// Page access-order ids by sequence; returns `(object_id, access_order_seq)`.
+    /// Page tracked (non-scratch) access-order ids by sequence; returns `(object_id, access_order_seq)`.
     pub fn access_order_page(
         &self,
         start_after: Option<u64>,
@@ -1128,7 +1186,10 @@ impl CacheIndex {
                     entry.access_order
                 )));
             }
-            if entry.lifecycle == LocalPayloadLifecycleState::Uploaded && entry.evictable {
+            if entry.lifecycle == LocalPayloadLifecycleState::Uploaded
+                && entry.evictable
+                && entry.origin != LocalPayloadOrigin::Scratch
+            {
                 ordered.push(EvictionCandidateEntry {
                     object_id,
                     payload_len: entry.payload_len,
@@ -1150,14 +1211,12 @@ impl CacheIndex {
     fn initialize_schema(&self) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let payloads_exist = {
-                let payloads = txn
-                    .open_table(PAYLOAD_OBJECTS_TABLE)
-                    .map_err(storage_error)?;
-                payloads.first().map_err(storage_error)?.is_some()
-            };
+            let payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
+            let payloads_exist = payloads.first().map_err(storage_error)?.is_some();
             let _ = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
-            let _ = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
+            let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
 
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
@@ -1187,11 +1246,11 @@ impl CacheIndex {
             }
 
             // Older indexes cannot contain scratch rows.
-            if counters
+            let had_scratch_counter = counters
                 .get(COUNTER_SCRATCH_BYTES)
                 .map_err(storage_error)?
-                .is_none()
-            {
+                .is_some();
+            if !had_scratch_counter {
                 counters
                     .insert(COUNTER_SCRATCH_BYTES, 0)
                     .map_err(storage_error)?;
@@ -1213,11 +1272,45 @@ impl CacheIndex {
                     counters.insert(name, &default).map_err(storage_error)?;
                 }
             }
+
+            let scratch_excluded = counters
+                .get(COUNTER_SCRATCH_EXCLUDED_FROM_ACCESS_ORDER)
+                .map_err(storage_error)?
+                .is_some_and(|value| value.value() != 0);
+            if !scratch_excluded {
+                if had_scratch_counter && payloads_exist {
+                    prune_scratch_access_order_links(&payloads, &mut access_order)?;
+                }
+                counters
+                    .insert(COUNTER_SCRATCH_EXCLUDED_FROM_ACCESS_ORDER, 1)
+                    .map_err(storage_error)?;
+            }
         }
 
         txn.commit().map_err(storage_error)?;
         Ok(())
     }
+}
+
+fn prune_scratch_access_order_links(
+    payloads: &redb::Table<'_, u64, &[u8]>,
+    access_order: &mut redb::Table<'_, u64, u64>,
+) -> Result<(), CacheIndexError> {
+    let iter = payloads.iter().map_err(storage_error)?;
+    for pair in iter {
+        let (key, value) = pair.map_err(storage_error)?;
+        let object_id = key.value();
+        let entry = decode_entry(value.value(), object_id)?;
+        if entry.origin == LocalPayloadOrigin::Scratch {
+            remove_order_link(
+                access_order,
+                stored_access_link(&entry),
+                object_id,
+                "access",
+            )?;
+        }
+    }
+    Ok(())
 }
 
 impl CacheIndex {
@@ -1361,8 +1454,8 @@ fn apply_entry_change(
         }
     }
 
-    let old_access_order = old.map(|entry| entry.access_order);
-    let new_access_order = new.map(|entry| entry.access_order);
+    let old_access_order = old.and_then(stored_access_link);
+    let new_access_order = new.and_then(tracked_access_order);
     if old_access_order != new_access_order {
         if let Some(old_access) = old_access_order {
             remove_order_link(access_order, Some(old_access), object_id, "access")?;
@@ -1574,6 +1667,27 @@ fn is_dirty_like(lifecycle: LocalPayloadLifecycleState) -> bool {
         lifecycle,
         LocalPayloadLifecycleState::Dirty | LocalPayloadLifecycleState::Uploading
     )
+}
+
+fn tracked_access_order(entry: &StoredEntry) -> Option<u64> {
+    (entry.origin != LocalPayloadOrigin::Scratch).then_some(entry.access_order)
+}
+
+fn initial_access_order(
+    origin: LocalPayloadOrigin,
+    counters: &mut redb::Table<'_, &str, u64>,
+) -> Result<u64, CacheIndexError> {
+    if origin == LocalPayloadOrigin::Scratch {
+        Ok(NO_ACCESS_ORDER)
+    } else {
+        allocate_sequence(counters, COUNTER_NEXT_ACCESS_SEQ)
+    }
+}
+
+/// Link this row may still own: a scratch row keeps a legacy sequence after
+/// migration, and an older binary can relink it, so removals must not trust origin.
+fn stored_access_link(entry: &StoredEntry) -> Option<u64> {
+    (entry.access_order != NO_ACCESS_ORDER).then_some(entry.access_order)
 }
 
 fn encode_entry(entry: &StoredEntry) -> Result<Vec<u8>, CacheIndexError> {
@@ -2055,6 +2169,20 @@ mod tests {
                 evictable: true,
             })
             .expect("upsert uploaded payload object");
+    }
+
+    fn upsert_scratch(index: &CacheIndex, object_id: u64, payload_len: u64) {
+        index
+            .upsert(CacheIndexUpsert {
+                object_id,
+                payload_key: format!("payload/{object_id}.object").into_bytes(),
+                payload_len,
+                lifecycle: LocalPayloadLifecycleState::Uploaded,
+                origin: LocalPayloadOrigin::Scratch,
+                upload_state: LocalPayloadUploadState::None,
+                evictable: false,
+            })
+            .expect("upsert scratch payload object");
     }
 
     #[test]
@@ -2637,6 +2765,284 @@ mod tests {
                 .map(|entry| entry.object_id)
                 .collect::<Vec<_>>(),
             vec![3]
+        );
+    }
+
+    #[test]
+    fn scratch_rows_are_excluded_from_access_order_and_eviction_scans() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-scratch-index-");
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+
+        let before_scratch: Vec<_> = (1..=500)
+            .map(|object_id| CacheIndexUpsert {
+                object_id,
+                payload_key: format!("payload/{object_id}.object").into_bytes(),
+                payload_len: if object_id % 10 == 0 { 0 } else { 8 },
+                lifecycle: LocalPayloadLifecycleState::Uploaded,
+                origin: LocalPayloadOrigin::Scratch,
+                upload_state: LocalPayloadUploadState::None,
+                evictable: false,
+            })
+            .collect();
+        index.upsert_many(&before_scratch).unwrap();
+
+        upsert_uploaded(&index, 1_001, 16);
+        upsert_uploaded(&index, 1_002, 24);
+        upsert_uploaded(&index, 1_003, 32);
+
+        for object_id in 2_001..=2_500 {
+            upsert_scratch(&index, object_id, if object_id % 10 == 0 { 0 } else { 8 });
+        }
+
+        index.touch_access(1).unwrap();
+        index
+            .touch_access_many(&[500, 2_001, 2_500], Duration::ZERO)
+            .unwrap();
+
+        let stats = index.stats().unwrap();
+        let expected_scratch_bytes = 900 * 8;
+        assert_eq!(stats.scratch_bytes, expected_scratch_bytes);
+        assert_eq!(stats.budgeted_bytes(), 72);
+        assert_eq!(stats.evictable_bytes, 72);
+        assert_eq!(stats.dirty_bytes, 0);
+
+        assert_eq!(
+            index.access_order_object_ids().unwrap(),
+            vec![1_001, 1_002, 1_003]
+        );
+        let page = index.eviction_candidates_page_stats(None, 64).unwrap();
+        assert_eq!(page.scanned_rows, 3);
+        assert_eq!(page.skipped_non_evictable, 0);
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.object_id)
+                .collect::<Vec<_>>(),
+            vec![1_001, 1_002, 1_003]
+        );
+
+        let scan_page = index.eviction_candidates_scan_page(None, 64).unwrap();
+        assert_eq!(scan_page.scanned_rows, 3);
+        assert_eq!(scan_page.skipped_non_evictable, 0);
+
+        let all_ids = index.all_object_ids().unwrap();
+        assert_eq!(all_ids.len(), 1_003);
+        assert_eq!(all_ids[0], 1);
+        assert_eq!(all_ids[500], 1_001);
+        assert_eq!(all_ids[1_002], 2_500);
+        let page1 = index.object_ids_page(None, 502).unwrap();
+        let page2 = index.object_ids_page(page1.last().copied(), 600).unwrap();
+        assert_eq!(page1.len() + page2.len(), 1_003);
+        assert_eq!(page2[0], 1_003);
+
+        // Removing scratch rows via single and batch paths preserves tracked access_order links
+        // (including sequence 0) and reconciles scratch_bytes back to zero.
+        index.remove(1).unwrap();
+        let batch_remove: Vec<_> = (2..=500).chain(2_001..=2_500).collect();
+        index.remove_batch(&batch_remove).unwrap();
+
+        assert_eq!(
+            index.access_order_object_ids().unwrap(),
+            vec![1_001, 1_002, 1_003]
+        );
+        let after_stats = index.stats().unwrap();
+        assert_eq!(after_stats.scratch_bytes, 0);
+        assert_eq!(after_stats.budgeted_bytes(), 72);
+        assert_eq!(index.all_object_ids().unwrap(), vec![1_001, 1_002, 1_003]);
+    }
+
+    #[test]
+    fn existing_index_with_scratch_rows_in_access_order_migrates_on_open() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-scratch-migrate-");
+        let db_path = temp.path().join("cache.redb");
+        let raw_tracked_1;
+        {
+            let index = open_index(&db_path);
+            upsert_uploaded(&index, 1, 10);
+            upsert_uploaded(&index, 2, 20);
+            upsert_scratch(&index, 100, 30);
+            upsert_scratch(&index, 101, 0);
+
+            let txn = index.db.begin_write().unwrap();
+            {
+                let mut payloads = txn.open_table(PAYLOAD_OBJECTS_TABLE).unwrap();
+                let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).unwrap();
+                let mut counters = txn.open_table(COUNTERS_TABLE).unwrap();
+
+                raw_tracked_1 = payloads.get(1).unwrap().unwrap().value().to_vec();
+                counters
+                    .remove(COUNTER_SCRATCH_EXCLUDED_FROM_ACCESS_ORDER)
+                    .unwrap();
+
+                for (object_id, seq) in [(100_u64, 2_u64), (101_u64, 3_u64)] {
+                    let mut entry = read_entry_write(&payloads, object_id).unwrap().unwrap();
+                    entry.access_order = seq;
+                    let encoded = encode_entry(&entry).unwrap();
+                    payloads.insert(object_id, encoded.as_slice()).unwrap();
+                    access_order.insert(seq, object_id).unwrap();
+                }
+                counters.insert(COUNTER_NEXT_ACCESS_SEQ, 4_u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let reopened = open_index(&db_path);
+        assert_eq!(reopened.access_order_object_ids().unwrap(), vec![1, 2]);
+        assert_eq!(reopened.all_object_ids().unwrap(), vec![1, 2, 100, 101]);
+
+        let page = reopened.eviction_candidates_page_stats(None, 64).unwrap();
+        assert_eq!(page.scanned_rows, 2);
+        assert_eq!(page.skipped_non_evictable, 0);
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.object_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let stats = reopened.stats().unwrap();
+        assert_eq!(stats.current_bytes, 60);
+        assert_eq!(stats.scratch_bytes, 30);
+        assert_eq!(stats.dirty_bytes, 0);
+        assert_eq!(stats.evictable_bytes, 30);
+
+        {
+            let txn = reopened.db.begin_read().unwrap();
+            let payloads = txn.open_table(PAYLOAD_OBJECTS_TABLE).unwrap();
+            assert_eq!(
+                payloads.get(1).unwrap().unwrap().value(),
+                raw_tracked_1.as_slice()
+            );
+            assert_eq!(reopened.get_entry(100).unwrap().unwrap().access_order, 2);
+            assert_eq!(reopened.get_entry(101).unwrap().unwrap().access_order, 3);
+        }
+        drop(reopened);
+
+        // Reopening again stays idempotent.
+        let reopened_twice = open_index(&db_path);
+        assert_eq!(
+            reopened_twice.access_order_object_ids().unwrap(),
+            vec![1, 2]
+        );
+        assert_eq!(reopened_twice.stats().unwrap(), stats);
+
+        // Post-migration transitions on legacy scratch rows work without access-order mismatches.
+        reopened_twice.touch_access(100).unwrap();
+        assert_eq!(
+            reopened_twice.access_order_object_ids().unwrap(),
+            vec![1, 2]
+        );
+        reopened_twice.remove(101).unwrap();
+        reopened_twice.mark_uploading(100).unwrap();
+        reopened_twice.mark_uploaded(100).unwrap();
+        assert_eq!(
+            reopened_twice.access_order_object_ids().unwrap(),
+            vec![1, 2, 100]
+        );
+        assert_eq!(reopened_twice.stats().unwrap().scratch_bytes, 0);
+    }
+
+    #[test]
+    fn stray_scratch_access_links_written_after_migration_are_dropped_on_transition() {
+        // An older binary (pre-SFS-1124) can reopen a migrated index and relink a scratch row.
+        let temp = studiofs_test_support::workspace_target_tempdir("test-scratch-stray-link-");
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+        upsert_uploaded(&index, 1, 10);
+        upsert_scratch(&index, 100, 30);
+        upsert_scratch(&index, 101, 40);
+        {
+            let txn = index.db.begin_write().unwrap();
+            {
+                let mut payloads = txn.open_table(PAYLOAD_OBJECTS_TABLE).unwrap();
+                let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).unwrap();
+                let mut counters = txn.open_table(COUNTERS_TABLE).unwrap();
+                for (object_id, seq) in [(100_u64, 2_u64), (101_u64, 3_u64)] {
+                    let mut entry = read_entry_write(&payloads, object_id).unwrap().unwrap();
+                    entry.access_order = seq;
+                    let encoded = encode_entry(&entry).unwrap();
+                    payloads.insert(object_id, encoded.as_slice()).unwrap();
+                    access_order.insert(seq, object_id).unwrap();
+                }
+                counters.insert(COUNTER_NEXT_ACCESS_SEQ, 4_u64).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        index.mark_uploading(100).unwrap();
+        index.remove(101).unwrap();
+
+        assert_eq!(index.access_order_object_ids().unwrap(), vec![1, 100]);
+        let page = index.eviction_candidates_page_stats(None, 64).unwrap();
+        assert_eq!(page.scanned_rows, 2);
+    }
+
+    #[test]
+    fn promoting_scratch_rows_via_mark_uploading_joins_access_order_and_becomes_evictable() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-scratch-promote-");
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+
+        upsert_scratch(&index, 101, 12);
+        upsert_scratch(&index, 102, 24);
+        upsert_scratch(&index, 103, 36);
+
+        let initial_page = index.eviction_candidates_page_stats(None, 64).unwrap();
+        assert_eq!(initial_page.scanned_rows, 0);
+
+        // Direct mark_uploaded on a Scratch row must be a no-op.
+        index.mark_uploaded(103).unwrap();
+        let entry_103 = index.get_entry(103).unwrap().unwrap();
+        assert_eq!(entry_103.origin, LocalPayloadOrigin::Scratch);
+        assert!(!entry_103.evictable);
+        assert_eq!(index.stats().unwrap().scratch_bytes, 72);
+        assert_eq!(
+            index
+                .eviction_candidates_page_stats(None, 64)
+                .unwrap()
+                .scanned_rows,
+            0
+        );
+
+        let order_101 = index.mark_uploading_with_order(101).unwrap();
+        let order_102 = index.mark_uploading_with_order(102).unwrap();
+        assert!(order_101.is_some());
+        assert!(order_102.is_some());
+
+        let promoted_101 = index.get_entry(101).unwrap().unwrap();
+        let promoted_102 = index.get_entry(102).unwrap().unwrap();
+        assert_eq!(promoted_101.origin, LocalPayloadOrigin::Local);
+        assert_eq!(promoted_102.origin, LocalPayloadOrigin::Local);
+        assert_ne!(promoted_101.access_order, NO_ACCESS_ORDER);
+        assert_ne!(promoted_102.access_order, NO_ACCESS_ORDER);
+        assert_ne!(promoted_101.access_order, promoted_102.access_order);
+        assert_eq!(index.access_order_object_ids().unwrap(), vec![101, 102]);
+        assert_eq!(
+            index
+                .dirty_uploading_entries()
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.object_id)
+                .collect::<Vec<_>>(),
+            vec![101, 102]
+        );
+        assert_eq!(index.stats().unwrap().scratch_bytes, 36);
+        assert_eq!(index.stats().unwrap().dirty_bytes, 36);
+
+        index.mark_uploaded(101).unwrap();
+        index.mark_uploaded(102).unwrap();
+
+        let page = index.eviction_candidates_page_stats(None, 64).unwrap();
+        assert_eq!(page.scanned_rows, 2);
+        assert_eq!(page.skipped_non_evictable, 0);
+        assert_eq!(
+            page.entries
+                .iter()
+                .map(|entry| entry.object_id)
+                .collect::<Vec<_>>(),
+            vec![101, 102]
         );
     }
 }

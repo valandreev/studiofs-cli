@@ -140,6 +140,8 @@ impl LocalPayloadBackendRuntime {
             let page = self
                 .index
                 .eviction_candidates_scan_page(state.cursor, EVICTION_CANDIDATE_PAGE_SIZE)?;
+            self.eviction_scan_visited_rows
+                .fetch_add(page.scanned_rows, Ordering::Relaxed);
             state.cursor = if page.scanned_rows < EVICTION_CANDIDATE_PAGE_SIZE as u64 {
                 None
             } else {
