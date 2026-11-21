@@ -500,6 +500,16 @@ impl StudioVfs {
         // A committed create changed the parent attributes behind its cached copy.
         self.invalidate_attr_read_cache(std::iter::once(ino).chain(op.created_parent()));
         self.refresh_inode_incarnation_state_from_attr(ino, committed_attr);
+        // A rule scan that ran before this commit could not find the entry and dropped its
+        // watch; re-announce the committed binding (no-op for non-rule names).
+        if let DeferredNamespaceOp::CreateFile { name, .. } = op {
+            self.ignore_rules.note_local_entry(
+                self.meta.sync_view().as_ref(),
+                name,
+                Some(ino),
+                true,
+            );
+        }
         self.state.namespace.deferred.notify.notify_waiters();
     }
 

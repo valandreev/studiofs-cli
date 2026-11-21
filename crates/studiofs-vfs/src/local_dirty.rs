@@ -3676,6 +3676,8 @@ impl StudioVfs {
         self.local_dirty_flush_session(ino)
             .flush(local_sync_policy, true)
             .await?;
+        // WinFSP write-through commits a rule file here, outside any local sync barrier.
+        self.ignore_rules.note_local_barrier(ino);
         let Ok(_recovery_gate) = self.landing_zone_recovery_gate.try_lock() else {
             return Ok(());
         };
@@ -3692,6 +3694,8 @@ impl StudioVfs {
         self.local_dirty_flush_session(ino)
             .flush(local_sync_policy, false)
             .await?;
+        // A volatile writeback (WinFSP flush) commits a rule file here, outside any barrier.
+        self.ignore_rules.note_local_barrier(ino);
         let Ok(_recovery_gate) = self.landing_zone_recovery_gate.try_lock() else {
             return Ok(());
         };
