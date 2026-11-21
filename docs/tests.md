@@ -1443,6 +1443,7 @@ cargo run -p studiofs-e2e -- run mounted-client-crash-restart-recovery --studiof
 cargo run -p studiofs-e2e -- run collision-rename-vs-unlink --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-concurrent-mkdir-merge-convergence --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- run mounted-scratch-demote-two-client --studiofs-bin target\debug\studiofs.exe
+cargo run -p studiofs-e2e -- run mounted-scratch-auto-promote-two-client --studiofs-bin target\debug\studiofs.exe
 cargo run -p studiofs-e2e -- local-first-baseline-gate --studiofs-bin target\debug\studiofs.exe --run-id-prefix sfs405-baseline --iterations 3 --seed 405 --port-range 29700-29800
 cargo run -p studiofs-e2e -- clean
 ```

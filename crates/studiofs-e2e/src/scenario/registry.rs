@@ -60,6 +60,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             LogicalQuota.definition(),
             MountedCacheScrub.definition(),
             ScratchDemote.definition(),
+            ScratchAutoPromote.definition(),
         ]
     })
 }
@@ -71,6 +72,7 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         "mounted-logical-quota" => Some(Box::new(LogicalQuota)),
         "mounted-cache-scrub" => Some(Box::new(MountedCacheScrub)),
         SCRATCH_DEMOTE => Some(Box::new(ScratchDemote)),
+        SCRATCH_AUTO_PROMOTE => Some(Box::new(ScratchAutoPromote)),
         "mounted-recoverable-trash-durability" => {
             Some(Box::new(RecoverableTrashDurability::OfflineCrashReplay))
         }
