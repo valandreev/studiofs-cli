@@ -4197,6 +4197,7 @@ pub struct StudioVfs {
     read_only_mount: bool,
     /// Environment filter read once at construction; changing it requires a new VFS.
     debug_pending_path_suffix: Option<DebugPendingPathSuffix>,
+    scratch_promote_entry_limit: usize,
     /// Optional durable-lease fence for an immutable snapshot mount.
     snapshot_mount_fence: Option<SnapshotMountFence>,
     /// Data store for writes (uploads, deletes, GC).

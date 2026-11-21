@@ -510,6 +510,10 @@ impl VfsBootstrap {
             meta: MetaExecutor::new(meta),
             read_only_mount,
             debug_pending_path_suffix: debug_pending_path_suffix_reader(),
+            scratch_promote_entry_limit: std::env::var("STUDIOFS_SCRATCH_PROMOTE_ENTRY_LIMIT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(100_000),
             snapshot_mount_fence,
             data_write: resources.data_write,
             snapshot_worker,

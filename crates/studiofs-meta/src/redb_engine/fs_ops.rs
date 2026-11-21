@@ -1169,12 +1169,35 @@ impl RedbMetaEngine {
         replace_if_exists: bool,
         retain_displaced_inode: bool,
     ) -> MetaResult<RenameAtomicResult> {
-        let src_entry = Self::lookup_merged_in_write_txn(txn, parent, name)?.ok_or_else(|| {
-            MetaError::EntryNotFound {
-                parent,
-                name: String::from_utf8_lossy(name).to_string(),
-            }
-        })?;
+        Self::rename_or_promote_in_txn(
+            txn,
+            (parent, name),
+            (new_parent, new_name),
+            replace_if_exists,
+            retain_displaced_inode,
+            None,
+        )
+    }
+
+    pub(super) fn rename_or_promote_in_txn(
+        txn: &RedbWriteTransaction<'_>,
+        (parent, name): (Ino, &[u8]),
+        (new_parent, new_name): (Ino, &[u8]),
+        replace_if_exists: bool,
+        retain_displaced_inode: bool,
+        promoted: Option<DirEntryValue>,
+    ) -> MetaResult<RenameAtomicResult> {
+        let promoting = promoted.is_some();
+        let src_entry = if let Some(entry) = promoted {
+            entry
+        } else {
+            Self::lookup_merged_in_write_txn(txn, parent, name)?.ok_or_else(|| {
+                MetaError::EntryNotFound {
+                    parent,
+                    name: String::from_utf8_lossy(name).to_string(),
+                }
+            })?
+        };
         let dst_entry_opt = Self::lookup_merged_in_write_txn(txn, new_parent, new_name)?;
         if !replace_if_exists && dst_entry_opt.is_some() {
             return Err(MetaError::EntryExists {
@@ -1193,6 +1216,14 @@ impl RedbMetaEngine {
             });
         }
         if let Some(dst_entry) = &dst_entry_opt {
+            if promoting && dst_entry.kind != src_entry.kind {
+                if src_entry.kind == FileType::Directory {
+                    return Err(MetaError::NotADirectory(dst_entry.ino));
+                }
+                if dst_entry.kind == FileType::Directory {
+                    return Err(MetaError::IsADirectory(dst_entry.ino));
+                }
+            }
             Self::reject_receipt_removal_in_txn(txn, dst_entry.ino)?;
             if dst_entry.kind == FileType::Directory {
                 Self::ensure_directory_empty_in_write_txn(txn, dst_entry.ino)?;
@@ -1204,7 +1235,7 @@ impl RedbMetaEngine {
         } else {
             None
         };
-        let old_parent_seed = if parent != new_parent {
+        let old_parent_seed = if parent != new_parent && !promoting {
             Some(Self::get_attr_merged_in_write_txn(txn, parent)?)
         } else {
             None
@@ -1219,7 +1250,9 @@ impl RedbMetaEngine {
         let mut moved_dir_attr = moved_dir_seed;
         let mut old_parent_attr = old_parent_seed;
         {
-            Self::remove_dentry_overlay_in_txn(txn, parent, name)?;
+            if !promoting {
+                Self::remove_dentry_overlay_in_txn(txn, parent, name)?;
+            }
             if let Some(dst_entry) = &dst_entry_opt {
                 let mut attr = Self::get_attr_merged_in_write_txn(txn, dst_entry.ino)?;
                 if dst_entry.kind == FileType::Directory {
@@ -1278,7 +1311,7 @@ impl RedbMetaEngine {
                 Self::set_inode_in_txn(txn, &attr)?;
                 old_parent_attr = Some(attr);
             }
-            if src_entry.kind == FileType::Directory && parent != new_parent {
+            if src_entry.kind == FileType::Directory && (parent != new_parent || promoting) {
                 new_parent_attr.nlink += 1;
             }
             // The displaced directory's ".." link to new_parent goes with it.
