@@ -31,7 +31,7 @@ struct PromoteArgs {
     /// Absolute mounted path or volume-relative path to promote
     path: String,
 
-    /// Target mounted volume name (optional when <PATH> is under a mount point or one volume is mounted)
+    /// Target mounted volume name (optional for absolute mounted paths or when one volume is mounted)
     #[arg(long, value_name = "VOLUME_NAME")]
     volume: Option<String>,
 }
