@@ -1374,8 +1374,9 @@ pub struct ScratchConflictRecord {
     pub original_name: Vec<u8>,
     /// New scratch entry name (`<name>.scratch-conflict-<n>`).
     pub conflict_name: Vec<u8>,
-    /// Inode of the replicated tracked entry that won the original name.
-    pub winning_tracked_ino: Ino,
+    /// Inode of the entry that kept the original name: the replicated tracked
+    /// entry, or an existing scratch entry when an ADR 0012 alias merge collides.
+    pub winning_ino: Ino,
     /// Wall-clock timestamp (Unix milliseconds) when the conflict was resolved.
     pub recorded_at_unix_ms: u64,
 }

@@ -1895,16 +1895,15 @@ impl RedbMetaEngine {
             let canonical_ancestors = Self::invalidation_ancestors(txn, canonical_parent)?;
 
             for (child_name, child_ino) in children {
-                let target_name = {
+                let existing_winner = {
                     let dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
-                    if find_scratch_dentry_in_table(&dentries, canonical_parent, &child_name)?
-                        .is_none()
-                    {
-                        child_name.clone()
-                    } else {
-                        drop(dentries);
-                        allocate_conflict_scratch_name_in_txn(txn, canonical_parent, &child_name)?
-                    }
+                    find_scratch_dentry_in_table(&dentries, canonical_parent, &child_name)?
+                        .map(|(_, ino)| ino)
+                };
+                let target_name = if existing_winner.is_none() {
+                    child_name.clone()
+                } else {
+                    allocate_conflict_scratch_name_in_txn(txn, canonical_parent, &child_name)?
                 };
                 {
                     let mut dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
@@ -1928,7 +1927,7 @@ impl RedbMetaEngine {
                             .map_err(storage_error)?;
                     }
                 }
-                if target_name != child_name {
+                if let Some(winning_ino) = existing_winner {
                     let canonical_path = parent_paths
                         .get(&canonical_parent)
                         .cloned()
@@ -1943,7 +1942,7 @@ impl RedbMetaEngine {
                         parent_path: canonical_path,
                         original_name: child_name.clone(),
                         conflict_name: target_name.clone(),
-                        winning_tracked_ino: canonical_parent,
+                        winning_ino,
                         recorded_at_unix_ms: current_unix_millis(),
                     };
                     let mut conflicts = txn.open_table(SCRATCH_CONFLICTS).map_err(storage_error)?;
@@ -2143,7 +2142,7 @@ impl RedbMetaEngine {
                     parent_path,
                     original_name: stored_name.clone(),
                     conflict_name: conflict_name.clone(),
-                    winning_tracked_ino: tracked_winner.ino,
+                    winning_ino: tracked_winner.ino,
                     recorded_at_unix_ms: current_unix_millis(),
                 };
                 {
@@ -2155,7 +2154,7 @@ impl RedbMetaEngine {
                 tracing::warn!(
                     parent = parent_ino,
                     scratch_ino,
-                    winning_tracked_ino = tracked_winner.ino,
+                    winning_ino = tracked_winner.ino,
                     original_name = %String::from_utf8_lossy(&stored_name),
                     conflict_name = %String::from_utf8_lossy(&conflict_name),
                     "replicated tracked entry conflicted with local scratch entry; renamed scratch entry"
@@ -3551,11 +3550,11 @@ mod tests {
         let c1 = conflicts.iter().find(|c| c.ino == 101).unwrap();
         assert_eq!(c1.original_name, b"Temp.tmp");
         assert_eq!(c1.conflict_name, b"Temp.tmp.scratch-conflict-1");
-        assert_eq!(c1.winning_tracked_ino, 201);
+        assert_eq!(c1.winning_ino, 201);
         let c2 = conflicts.iter().find(|c| c.ino == 102).unwrap();
         assert_eq!(c2.original_name, b"ren.tmp");
         assert_eq!(c2.conflict_name, b"ren.tmp.scratch-conflict-2");
-        assert_eq!(c2.winning_tracked_ino, 202);
+        assert_eq!(c2.winning_ino, 202);
 
         // Zero event_log rows published by conflict resolution.
         assert_eq!(
@@ -4044,6 +4043,59 @@ mod tests {
         );
         assert_eq!(meta.get_scratch_attr(402).unwrap().parent, 250);
         assert!(meta.list_scratch_orphans().unwrap().is_empty());
+    }
+
+    #[test]
+    fn adr_0012_alias_merge_scratch_collision_records_existing_scratch_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta = RedbMetaEngine::open(temp.path().join("meta.redb")).unwrap();
+        meta.init_root(0, 0).unwrap();
+
+        let canonical = meta
+            .create_dir(ROOT_INO, b"canonical", 0, 0, 0o755)
+            .unwrap();
+        let alias = meta.create_dir(ROOT_INO, b"alias", 0, 0, 0o755).unwrap();
+        let existing = InodeAttr::new_file(601, canonical.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(canonical.ino, b"a.tmp", &existing)
+            .unwrap();
+        let moved = InodeAttr::new_file(602, alias.ino, 0, 0, 0o644);
+        meta.create_scratch_entry(alias.ino, b"a.tmp", &moved)
+            .unwrap();
+
+        let txn = meta.begin_write_txn().unwrap();
+        let pre = meta
+            .capture_pre_mutation_scratch_context_in_txn(&txn)
+            .unwrap();
+        // Merge: the alias directory loses its path and resolves to the canonical one.
+        RedbMetaEngine::apply_replica_serving_state_in_txn(
+            &txn,
+            &[crate::events::MetaEvent::RemoveEntry {
+                parent: ROOT_INO,
+                name: b"alias".to_vec(),
+            }],
+            false,
+        )
+        .unwrap();
+        txn.open_table(DIRECTORY_ALIASES_TABLE)
+            .unwrap()
+            .insert(alias.ino, canonical.ino)
+            .unwrap();
+        let outcome = meta
+            .reconcile_scratch_after_tracked_mutations_in_txn(&txn, &pre)
+            .unwrap();
+        txn.commit().unwrap();
+        meta.finish_scratch_reconciliation(outcome).unwrap();
+
+        assert_eq!(
+            meta.lookup_scratch_entry(canonical.ino, b"a.tmp.scratch-conflict-1")
+                .unwrap(),
+            Some(602)
+        );
+        let conflicts = meta.list_scratch_conflicts().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].ino, 602);
+        // The existing scratch entry kept the name, not the directory inode.
+        assert_eq!(conflicts[0].winning_ino, 601);
     }
 
     #[test]
