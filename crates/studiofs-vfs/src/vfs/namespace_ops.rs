@@ -2,6 +2,7 @@ use super::namespace::{
     DeferredNamespaceInner, DeferredNamespaceKey, DeferredNamespaceOp, DeferredNamespaceProgress,
     DeferredNamespaceState, DeferredNamespaceWait,
 };
+use super::scratch_auto_promote::FreezeScratchSubtreeOutcome;
 use super::{
     ATTR_CACHE_TTL, AccessLevel, Arc, ChunkId, DEFAULT_CHUNK_SIZE, DentryCacheValue,
     DirAccessEntry, DirEntry, FileSessionOperation, FileType, Ino, InodeAttr,
@@ -5375,80 +5376,32 @@ impl StudioVfs {
         }
 
         let source_ino = source_attr.ino;
-        let mut frozen = std::collections::HashSet::new();
-        let mut pending = vec![source_attr];
-        let mut files = Vec::new();
-        while let Some(attr) = pending.pop() {
-            if !frozen.insert(attr.ino) {
-                return Err(MetaError::TargetChanged.into());
-            }
-            if frozen.len() + pending.len() > self.scratch_promote_entry_limit {
+        // Unlike automatic promotion, explicit rename does not abort the freeze on
+        // shutdown; it keeps waiting for the write gates.
+        let frozen = match self
+            .freeze_scratch_promote_subtree(meta.as_ref(), source_attr, &[], false, |_, _| false)
+            .await?
+        {
+            FreezeScratchSubtreeOutcome::Ready(frozen) => frozen,
+            FreezeScratchSubtreeOutcome::OverLimit { .. }
+            | FreezeScratchSubtreeOutcome::Cancelled => {
                 return Err(VfsError::CrossDevice);
             }
-            if attr.kind == FileType::Directory {
-                pending.extend(
-                    meta.readdir_scratch(attr.ino)?
-                        .into_iter()
-                        .map(|(_, attr)| attr),
-                );
-            } else if attr.kind == FileType::RegularFile {
-                files.push(attr.ino);
-            }
-        }
-        files.sort_unstable();
-        for &ino in &files {
-            self.wait_for_deferred_release_inflight(ino).await;
-            self.wait_for_deferred_materialization_inflight(ino).await;
-        }
-        // Outermost lock: serializes these multi-permit sessions with retained restore.
-        let restore_gate = self.retained_restore_gate.lock().await;
-        let mut sessions = Vec::with_capacity(files.len());
-        // Hold the write gates through the namespace commit and upload handoff.
-        for ino in files {
-            sessions.push(
-                self.state
-                    .file_session
-                    .enter_op(ino, FileSessionOperation::Restore)
-                    .await,
-            );
-            self.flush_retained_source_ordered(ino).await?;
-        }
+        };
 
+        // Explicit rename promotion moves the root into tracked tables via `RenameEntry`,
+        // records the rename across old/new parent dentry caches, and settles any
+        // displaced tracked target.
         let namespace_mutations = self.namespace_mutations();
         let (result, attrs) =
-            meta.promote_scratch_entry(source, target, source_ino, &frozen, replace)?;
+            meta.promote_scratch_entry(source, target, source_ino, &frozen.frozen, replace)?;
         namespace_mutations.record_rename(source.0, source.1, target.0, target.1, source_ino);
         self.bump_acl_namespace_epoch();
-        for attr in &attrs {
-            self.invalidate_attr_read_cache([attr.ino]);
-            if !Self::needs_epoch_finalization(attr) {
-                continue;
-            }
-            let objects = match self.regular_file_graph_objects(attr) {
-                Ok(objects) => objects,
-                Err(error) => {
-                    warn!(ino = attr.ino, %error, "could not enumerate committed promotion payloads");
-                    continue;
-                }
-            };
-            let extents: Vec<_> = objects
-                .iter()
-                .map(|object| object.live_extent(attr.ino, attr.content_epoch))
-                .collect();
-            let mut queued = std::collections::HashSet::new();
-            let ops: Vec<_> = objects
-                .iter()
-                .filter(|object| queued.insert(object.object_id))
-                .map(|object| object.upload_op(attr.ino, attr.content_epoch))
-                .collect();
-            self.record_live_extents(&extents);
-            self.cached_store.submit_uploads_batch(&ops);
-            if ops.is_empty() {
-                self.queue_epoch_finalization(attr.ino, attr.content_epoch);
-            }
-        }
-        drop(sessions);
-        drop(restore_gate);
+        // Unlike automatic promotion, explicit rename leaves open-handle attrs
+        // alone and drops cached attrs right before the payload hand-off.
+        self.invalidate_attr_read_cache(attrs.iter().map(|attr| attr.ino));
+        self.submit_promoted_subtree_uploads(&attrs);
+        drop(frozen);
         self.finish_rename_displacement(&meta, result.displaced.as_ref())
             .await?;
         meta.request_eager_flush();
