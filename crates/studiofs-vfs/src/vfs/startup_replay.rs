@@ -49,6 +49,23 @@ pub(super) struct StartupGraphObject {
     pub(super) file_mapping: Option<studiofs_cache::ObjectFileMapping>,
 }
 
+impl StartupGraphObject {
+    pub(super) fn upload_op(&self, ino: Ino, content_epoch: u64) -> studiofs_cache::UploadOp {
+        (
+            ino,
+            self.absolute_offset,
+            self.file_mapping,
+            self.object_id,
+            content_epoch,
+            self.payload_len,
+        )
+    }
+
+    pub(super) fn live_extent(&self, ino: Ino, content_epoch: u64) -> (Ino, u32, u64, u64) {
+        (ino, self.block_index, self.object_id, content_epoch)
+    }
+}
+
 impl<'a> StartupReplayCoordinator<'a> {
     pub(super) fn new(
         vfs: &'a StudioVfs,
@@ -314,14 +331,8 @@ impl StartupReplayCoordinator<'_> {
         graph_object: &StartupGraphObject,
         content_epoch: u64,
     ) {
-        self.replay_ops.push((
-            ino,
-            graph_object.absolute_offset,
-            graph_object.file_mapping,
-            graph_object.object_id,
-            content_epoch,
-            graph_object.payload_len,
-        ));
+        self.replay_ops
+            .push(graph_object.upload_op(ino, content_epoch));
         self.record_live_extent(
             ino,
             graph_object.block_index,

@@ -5218,27 +5218,16 @@ impl StudioVfs {
                     continue;
                 }
             };
-            let mut extents = Vec::new();
-            let mut ops = Vec::new();
+            let extents: Vec<_> = objects
+                .iter()
+                .map(|object| object.live_extent(attr.ino, attr.content_epoch))
+                .collect();
             let mut queued = std::collections::HashSet::new();
-            for object in objects {
-                extents.push((
-                    attr.ino,
-                    object.block_index,
-                    object.object_id,
-                    attr.content_epoch,
-                ));
-                if queued.insert(object.object_id) {
-                    ops.push((
-                        attr.ino,
-                        object.absolute_offset,
-                        object.file_mapping,
-                        object.object_id,
-                        attr.content_epoch,
-                        object.payload_len,
-                    ));
-                }
-            }
+            let ops: Vec<_> = objects
+                .iter()
+                .filter(|object| queued.insert(object.object_id))
+                .map(|object| object.upload_op(attr.ino, attr.content_epoch))
+                .collect();
             self.record_live_extents(&extents);
             self.cached_store.submit_uploads_batch(&ops);
             if ops.is_empty() {
