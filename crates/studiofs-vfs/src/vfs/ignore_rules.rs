@@ -293,6 +293,93 @@ impl RuleInodes {
     }
 }
 
+/// Resolve the canonical volume-relative byte path of a tracked directory.
+///
+/// Callers supply `deferred_step` when uncommitted deferred creates may still
+/// sit ahead of committed metadata; offline callers pass `|_| None` and
+/// `check_root_exists = true`. Returns `Ok(None)` when the directory is no
+/// longer bound in metadata.
+pub(super) fn resolve_tracked_directory_path_with<
+    M: studiofs_meta::MetaInodes + studiofs_meta::MetaNamespace + ?Sized,
+>(
+    meta: &M,
+    dir_ino: Ino,
+    check_root_exists: bool,
+    mut deferred_step: impl FnMut(Ino) -> Option<(Ino, Vec<u8>)>,
+) -> VfsResult<Option<Vec<u8>>> {
+    if dir_ino == ROOT_INO {
+        if check_root_exists {
+            return match meta.get_attr(ROOT_INO) {
+                Ok(_) => Ok(Some(Vec::new())),
+                Err(MetaError::InodeNotFound(_)) => Ok(None),
+                Err(error) => Err(error.into()),
+            };
+        }
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut components: Vec<Vec<u8>> = Vec::new();
+    let mut visited = HashSet::new();
+    let mut current = dir_ino;
+    while current != ROOT_INO {
+        if current == 0 || components.len() >= 1024 || !visited.insert(current) {
+            return Ok(None);
+        }
+        if let Some((parent, name)) = deferred_step(current) {
+            if parent == current {
+                return Ok(None);
+            }
+            components.push(name);
+            current = parent;
+            continue;
+        }
+
+        let attr = match meta.get_attr(current) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let parent = attr.parent;
+        if parent == 0 || parent == current {
+            return Ok(None);
+        }
+        let mut resolved_name = None;
+        for (binding_parent, binding_name) in meta.entry_bindings_for_inode(current)? {
+            if binding_parent != parent {
+                continue;
+            }
+            match meta.lookup(parent, &binding_name) {
+                Ok(entry) if entry.ino == current => {
+                    resolved_name = Some(binding_name);
+                    break;
+                }
+                Ok(_) | Err(MetaError::EntryNotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let Some(name) = resolved_name else {
+            return Ok(None);
+        };
+        components.push(name);
+        current = parent;
+    }
+
+    components.reverse();
+    let total_len: usize = components
+        .iter()
+        .map(Vec::len)
+        .sum::<usize>()
+        .saturating_add(components.len().saturating_sub(1));
+    let mut path = Vec::with_capacity(total_len);
+    for (idx, component) in components.into_iter().enumerate() {
+        if idx > 0 {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&component);
+    }
+    Ok(Some(path))
+}
+
 impl StudioVfs {
     /// Returns the monotonically increasing ignore-rule snapshot generation.
     pub(super) fn ignore_rule_generation(&self) -> u64 {
@@ -312,84 +399,20 @@ impl StudioVfs {
         &self,
         dir_ino: Ino,
     ) -> VfsResult<Option<Vec<u8>>> {
-        if dir_ino == ROOT_INO {
-            return Ok(Some(Vec::new()));
-        }
         let meta = self.sync_meta();
-        let mut components: Vec<Vec<u8>> = Vec::new();
-        let mut current = dir_ino;
-        let mut hops = 0usize;
-        while current != ROOT_INO {
-            if current == 0 || hops >= 1024 {
-                return Ok(None);
-            }
+        resolve_tracked_directory_path_with(meta.as_ref(), dir_ino, false, |current| {
             // Check pending deferred namespace creates first so uncommitted directories
             // classify children with their real path before metadata settlement.
-            let deferred_step = {
-                let inner = self.state.namespace.deferred.inner.lock();
-                inner.attrs.get(&current).and_then(|attr| {
-                    let parent = attr.parent;
-                    inner
-                        .entries
-                        .iter()
-                        .find(|(key, ino)| **ino == current && key.parent == parent)
-                        .map(|(key, _)| (parent, key.name.as_ref().to_vec()))
-                })
-            };
-            if let Some((parent, name)) = deferred_step {
-                components.push(name);
-                if parent == current {
-                    return Ok(None);
-                }
-                current = parent;
-                hops += 1;
-                continue;
-            }
-
-            let attr = match meta.get_attr(current) {
-                Ok(attr) => attr,
-                Err(studiofs_meta::MetaError::InodeNotFound(_)) => return Ok(None),
-                Err(error) => return Err(error.into()),
-            };
-            let parent = attr.parent;
-            if parent == 0 || parent == current {
-                return Ok(None);
-            }
-            let mut resolved_name = None;
-            for (binding_parent, binding_name) in meta.entry_bindings_for_inode(current)? {
-                if binding_parent != parent {
-                    continue;
-                }
-                match meta.lookup(parent, &binding_name) {
-                    Ok(entry) if entry.ino == current => {
-                        resolved_name = Some(binding_name);
-                        break;
-                    }
-                    Ok(_) | Err(studiofs_meta::MetaError::EntryNotFound { .. }) => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            let Some(name) = resolved_name else {
-                return Ok(None);
-            };
-            components.push(name);
-            current = parent;
-            hops += 1;
-        }
-        components.reverse();
-        let total_len: usize = components
-            .iter()
-            .map(Vec::len)
-            .sum::<usize>()
-            .saturating_add(components.len().saturating_sub(1));
-        let mut path = Vec::with_capacity(total_len);
-        for (idx, component) in components.into_iter().enumerate() {
-            if idx > 0 {
-                path.push(b'/');
-            }
-            path.extend_from_slice(&component);
-        }
-        Ok(Some(path))
+            let inner = self.state.namespace.deferred.inner.lock();
+            inner.attrs.get(&current).and_then(|attr| {
+                let parent = attr.parent;
+                inner
+                    .entries
+                    .iter()
+                    .find(|(key, ino)| **ino == current && key.parent == parent)
+                    .map(|(key, _)| (parent, key.name.as_ref().to_vec()))
+            })
+        })
     }
 
     /// Classify a new entry being created under `parent`.

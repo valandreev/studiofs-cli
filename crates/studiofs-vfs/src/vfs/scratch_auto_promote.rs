@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use studiofs_meta::{
-    FileType, Ino, InodeAttr, MetaEngine, MetaError, ROOT_INO, ScratchAutoPromoteResult,
+    FileType, Ino, InodeAttr, MetaEngine, MetaEngineCore, MetaError, ScratchAutoPromoteResult,
 };
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
@@ -187,69 +187,63 @@ fn load_compiled_scratch_rules_from_meta(meta: &dyn MetaEngine) -> VfsResult<Scr
     Ok(rules)
 }
 
-fn resolve_tracked_directory_path_from_meta(
-    meta: &dyn MetaEngine,
-    dir_ino: Ino,
-) -> VfsResult<Option<Vec<u8>>> {
-    if dir_ino == ROOT_INO {
-        return match meta.get_attr(ROOT_INO) {
-            Ok(_) => Ok(Some(Vec::new())),
-            Err(MetaError::InodeNotFound(_)) => Ok(None),
-            Err(error) => Err(error.into()),
-        };
-    }
+pub(super) struct ScratchPromoteSubtree {
+    pub(super) frozen: HashSet<Ino>,
+    pub(super) kept_scratch: HashSet<Ino>,
+    pub(super) files: Vec<Ino>,
+}
 
-    let mut components: Vec<Vec<u8>> = Vec::new();
-    let mut visited = HashSet::new();
-    let mut current = dir_ino;
-    while current != ROOT_INO {
-        if current == 0 || components.len() >= 1024 || !visited.insert(current) {
-            return Ok(None);
+pub(super) enum ScratchPromoteSubtreeWalk {
+    Ready(ScratchPromoteSubtree),
+    OverLimit { entry_count: usize },
+}
+
+fn collect_scratch_promote_subtree<M: MetaEngineCore + ?Sized>(
+    meta: &M,
+    root_attr: InodeAttr,
+    root_rel_path: &[u8],
+    entry_limit: usize,
+    mut keep_child_scratch: impl FnMut(&[u8], bool) -> bool,
+) -> VfsResult<ScratchPromoteSubtreeWalk> {
+    let mut frozen = HashSet::new();
+    let mut kept_scratch = HashSet::new();
+    let mut pending = vec![(root_attr, root_rel_path.to_vec())];
+    let mut files = Vec::new();
+    while let Some((attr, attr_path)) = pending.pop() {
+        if !frozen.insert(attr.ino) {
+            return Err(MetaError::TargetChanged.into());
         }
-        let attr = match meta.get_attr(current) {
-            Ok(attr) => attr,
-            Err(MetaError::InodeNotFound(_)) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let parent = attr.parent;
-        if parent == 0 || parent == current {
-            return Ok(None);
+        if frozen.len() + pending.len() > entry_limit {
+            return Ok(ScratchPromoteSubtreeWalk::OverLimit {
+                entry_count: frozen.len() + pending.len(),
+            });
         }
-        let mut resolved_name = None;
-        for (binding_parent, binding_name) in meta.entry_bindings_for_inode(current)? {
-            if binding_parent != parent {
-                continue;
-            }
-            match meta.lookup(parent, &binding_name) {
-                Ok(entry) if entry.ino == current => {
-                    resolved_name = Some(binding_name);
-                    break;
+        if attr.kind == FileType::Directory {
+            for (child_name, child) in meta.readdir_scratch(attr.ino)? {
+                let child_path = join_relative_path(&attr_path, &child_name);
+                let child_is_dir = child.kind == FileType::Directory;
+                // A descendant that still matches a rule stays scratch with its subtree.
+                if keep_child_scratch(&child_path, child_is_dir) {
+                    kept_scratch.insert(child.ino);
+                } else {
+                    pending.push((child, child_path));
                 }
-                Ok(_) | Err(MetaError::EntryNotFound { .. }) => {}
-                Err(error) => return Err(error.into()),
             }
+            if frozen.len() + pending.len() > entry_limit {
+                return Ok(ScratchPromoteSubtreeWalk::OverLimit {
+                    entry_count: frozen.len() + pending.len(),
+                });
+            }
+        } else if attr.kind == FileType::RegularFile {
+            files.push(attr.ino);
         }
-        let Some(name) = resolved_name else {
-            return Ok(None);
-        };
-        components.push(name);
-        current = parent;
     }
-
-    components.reverse();
-    let total_len = components
-        .iter()
-        .map(Vec::len)
-        .sum::<usize>()
-        .saturating_add(components.len().saturating_sub(1));
-    let mut path = Vec::with_capacity(total_len);
-    for (idx, component) in components.into_iter().enumerate() {
-        if idx > 0 {
-            path.push(b'/');
-        }
-        path.extend_from_slice(&component);
-    }
-    Ok(Some(path))
+    files.sort_unstable();
+    Ok(ScratchPromoteSubtreeWalk::Ready(ScratchPromoteSubtree {
+        frozen,
+        kept_scratch,
+        files,
+    }))
 }
 
 /// Inspect scratch directories attached to tracked parents that would be
@@ -272,7 +266,12 @@ pub fn find_over_limit_scratch_directories(
         let parent_path = if let Some(cached) = parent_paths.get(&parent) {
             cached.clone()
         } else {
-            let resolved = resolve_tracked_directory_path_from_meta(meta, parent)?;
+            let resolved = super::ignore_rules::resolve_tracked_directory_path_with(
+                meta,
+                parent,
+                true,
+                |_| None,
+            )?;
             parent_paths.insert(parent, resolved.clone());
             resolved
         };
@@ -285,34 +284,21 @@ pub fn find_over_limit_scratch_directories(
         }
 
         let dir_ino = attr.ino;
-        let mut visited = HashSet::new();
-        let mut pending = vec![attr];
-        let mut exceeded = false;
-        while let Some(node) = pending.pop() {
-            if !visited.insert(node.ino) {
-                continue;
-            }
-            if visited.len() + pending.len() > entry_limit {
-                exceeded = true;
-                break;
-            }
-            if node.kind == FileType::Directory {
-                pending.extend(
-                    meta.readdir_scratch(node.ino)?
-                        .into_iter()
-                        .map(|(_, child)| child),
-                );
-                if visited.len() + pending.len() > entry_limit {
-                    exceeded = true;
-                    break;
-                }
-            }
-        }
-        if exceeded {
+        if let ScratchPromoteSubtreeWalk::OverLimit { entry_count } =
+            collect_scratch_promote_subtree(
+                meta,
+                attr,
+                &rel_path,
+                entry_limit,
+                |child_path, child_is_dir| {
+                    rules.classify(child_path, child_is_dir) != ScratchClass::Tracked
+                },
+            )?
+        {
             over_limit.push(ScratchPromoteOverLimitEntry {
                 dir_ino,
                 relative_path: format_relative_path(&rel_path),
-                entry_count: visited.len() + pending.len(),
+                entry_count,
                 entry_limit,
             });
         }
@@ -320,6 +306,20 @@ pub fn find_over_limit_scratch_directories(
 
     over_limit.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(over_limit)
+}
+
+pub(super) struct FrozenScratchSubtree<'a> {
+    pub(super) frozen: HashSet<Ino>,
+    pub(super) kept_scratch: HashSet<Ino>,
+    // Drop order matters: release per-inode `Restore` permits before releasing `retained_restore_gate`.
+    _sessions: Vec<super::file_session::FileSessionCleanup>,
+    _restore_gate: tokio::sync::MutexGuard<'a, ()>,
+}
+
+pub(super) enum FreezeScratchSubtreeOutcome<'a> {
+    Ready(FrozenScratchSubtree<'a>),
+    OverLimit { entry_count: usize },
+    Cancelled,
 }
 
 impl StudioVfs {
@@ -631,19 +631,25 @@ impl StudioVfs {
             return Ok(self.finish_auto_promote(meta.as_ref(), started_epoch, true, merged));
         }
 
-        let mut frozen = HashSet::new();
-        let mut kept_scratch = HashSet::new();
-        let mut pending = vec![(current_attr.clone(), rel_path.clone())];
-        let mut files = Vec::new();
-        while let Some((attr, attr_path)) = pending.pop() {
-            if !frozen.insert(attr.ino) {
-                return Err(MetaError::TargetChanged.into());
-            }
-            if frozen.len() + pending.len() > self.scratch_promote_entry_limit {
+        let root_ino = current_attr.ino;
+        let frozen = match self
+            .freeze_scratch_promote_subtree(
+                meta.as_ref(),
+                current_attr,
+                &rel_path,
+                true,
+                |child_path, child_is_dir| {
+                    // A descendant that still matches a rule stays scratch with its subtree.
+                    self.classify_scratch_path(child_path, child_is_dir) != ScratchClass::Tracked
+                },
+            )
+            .await?
+        {
+            FreezeScratchSubtreeOutcome::Ready(frozen) => frozen,
+            FreezeScratchSubtreeOutcome::OverLimit { entry_count } => {
                 let relative_path = format_relative_path(&rel_path);
-                let entry_count = frozen.len() + pending.len();
                 warn!(
-                    dir_ino = current_attr.ino,
+                    dir_ino = root_ino,
                     %relative_path,
                     entry_count,
                     entry_limit = self.scratch_promote_entry_limit,
@@ -651,63 +657,69 @@ impl StudioVfs {
                     relative_path
                 );
                 return Ok(CandidateOutcome::OverLimit(ScratchPromoteOverLimitEntry {
-                    dir_ino: current_attr.ino,
+                    dir_ino: root_ino,
                     relative_path,
                     entry_count,
                     entry_limit: self.scratch_promote_entry_limit,
                 }));
             }
-            if attr.kind == FileType::Directory {
-                let children = meta.readdir_scratch(attr.ino)?;
-                if frozen.len() + pending.len() + children.len() > self.scratch_promote_entry_limit
-                {
-                    let relative_path = format_relative_path(&rel_path);
-                    let entry_count = frozen.len() + pending.len() + children.len();
-                    warn!(
-                        dir_ino = current_attr.ino,
-                        %relative_path,
-                        entry_count,
-                        entry_limit = self.scratch_promote_entry_limit,
-                        "Scratch directory `{}` exceeds promote limit; run `studiofs scratch promote`",
-                        relative_path
-                    );
-                    return Ok(CandidateOutcome::OverLimit(ScratchPromoteOverLimitEntry {
-                        dir_ino: current_attr.ino,
-                        relative_path,
-                        entry_count,
-                        entry_limit: self.scratch_promote_entry_limit,
-                    }));
-                }
-                for (child_name, child) in children {
-                    let child_path = join_relative_path(&attr_path, &child_name);
-                    let child_is_dir = child.kind == FileType::Directory;
-                    // A descendant that still matches a rule stays scratch with its subtree.
-                    if self.classify_scratch_path(&child_path, child_is_dir)
-                        != ScratchClass::Tracked
-                    {
-                        kept_scratch.insert(child.ino);
-                    } else {
-                        pending.push((child, child_path));
-                    }
-                }
-            } else if attr.kind == FileType::RegularFile {
-                files.push(attr.ino);
-            }
-        }
+            FreezeScratchSubtreeOutcome::Cancelled => return Ok(CandidateOutcome::Cancelled),
+        };
 
-        files.sort_unstable();
-        for &ino in &files {
+        let conflict_client = meta
+            .invalidation_sender_id()
+            .unwrap_or_else(|| "local".to_string());
+        let started_epoch = self.state.namespace.namespace_epoch.load(Ordering::Acquire);
+        let promoted = meta.promote_scratch_auto(
+            parent,
+            name,
+            root_ino,
+            &frozen.frozen,
+            &frozen.kept_scratch,
+            &conflict_client,
+        )?;
+
+        let outcome = self.finish_auto_promote(meta.as_ref(), started_epoch, root_is_dir, promoted);
+        drop(frozen);
+        Ok(outcome)
+    }
+
+    /// Walks the scratch subtree under `root_attr`, waits for in-flight deferred
+    /// release/materialization work, and freezes every regular file in ascending
+    /// inode order under `retained_restore_gate` -> `FileSessionOperation::Restore`.
+    pub(super) async fn freeze_scratch_promote_subtree<'a, M: MetaEngineCore + ?Sized>(
+        &'a self,
+        meta: &M,
+        root_attr: InodeAttr,
+        root_rel_path: &[u8],
+        abort_on_shutdown: bool,
+        keep_child_scratch: impl FnMut(&[u8], bool) -> bool,
+    ) -> VfsResult<FreezeScratchSubtreeOutcome<'a>> {
+        let subtree = match collect_scratch_promote_subtree(
+            meta,
+            root_attr,
+            root_rel_path,
+            self.scratch_promote_entry_limit,
+            keep_child_scratch,
+        )? {
+            ScratchPromoteSubtreeWalk::Ready(subtree) => subtree,
+            ScratchPromoteSubtreeWalk::OverLimit { entry_count } => {
+                return Ok(FreezeScratchSubtreeOutcome::OverLimit { entry_count });
+            }
+        };
+
+        for &ino in &subtree.files {
             self.wait_for_deferred_release_inflight(ino).await;
             self.wait_for_deferred_materialization_inflight(ino).await;
         }
 
         // Outermost lock: serializes these multi-permit sessions with retained restore.
         let restore_gate = self.retained_restore_gate.lock().await;
-        let mut sessions = Vec::with_capacity(files.len());
-        for ino in files {
-            // Shutdown waits for the mutating gate before cancelling background work.
-            if self.is_shutting_down() {
-                return Ok(CandidateOutcome::Cancelled);
+        let mut sessions = Vec::with_capacity(subtree.files.len());
+        // Hold the write gates through the metadata commit and upload hand-off.
+        for ino in subtree.files {
+            if abort_on_shutdown && self.is_shutting_down() {
+                return Ok(FreezeScratchSubtreeOutcome::Cancelled);
             }
             sessions.push(
                 self.file_session_cleanup(ino).with_permit(
@@ -720,23 +732,48 @@ impl StudioVfs {
             self.flush_retained_source_ordered(ino).await?;
         }
 
-        let conflict_client = meta
-            .invalidation_sender_id()
-            .unwrap_or_else(|| "local".to_string());
-        let started_epoch = self.state.namespace.namespace_epoch.load(Ordering::Acquire);
-        let promoted = meta.promote_scratch_auto(
-            parent,
-            name,
-            current_attr.ino,
-            &frozen,
-            &kept_scratch,
-            &conflict_client,
-        )?;
+        Ok(FreezeScratchSubtreeOutcome::Ready(FrozenScratchSubtree {
+            frozen: subtree.frozen,
+            kept_scratch: subtree.kept_scratch,
+            _sessions: sessions,
+            _restore_gate: restore_gate,
+        }))
+    }
 
-        let outcome = self.finish_auto_promote(meta.as_ref(), started_epoch, root_is_dir, promoted);
-        drop(sessions);
-        drop(restore_gate);
-        Ok(outcome)
+    /// Refreshes open-handle attrs, invalidates attribute read cache, and hands
+    /// promoted regular-file payloads to the background uploader (or queues empty
+    /// epoch finalization). Must run while holding the frozen restore permits.
+    pub(super) fn submit_promoted_subtree_uploads(&self, attrs: &[InodeAttr]) {
+        for attr in attrs {
+            self.handle_table
+                .update_open_attrs_for_inode(attr.ino, attr);
+            self.invalidate_attr_read_cache([attr.ino]);
+            if !Self::needs_epoch_finalization(attr) {
+                continue;
+            }
+            let objects = match self.regular_file_graph_objects(attr) {
+                Ok(objects) => objects,
+                Err(error) => {
+                    warn!(ino = attr.ino, %error, "could not enumerate promoted payloads");
+                    continue;
+                }
+            };
+            let extents: Vec<_> = objects
+                .iter()
+                .map(|object| object.live_extent(attr.ino, attr.content_epoch))
+                .collect();
+            let mut queued = HashSet::new();
+            let ops: Vec<_> = objects
+                .iter()
+                .filter(|object| queued.insert(object.object_id))
+                .map(|object| object.upload_op(attr.ino, attr.content_epoch))
+                .collect();
+            self.record_live_extents(&extents);
+            self.cached_store.submit_uploads_batch(&ops);
+            if ops.is_empty() {
+                self.queue_epoch_finalization(attr.ino, attr.content_epoch);
+            }
+        }
     }
 
     fn finish_auto_promote(
@@ -785,6 +822,11 @@ impl StudioVfs {
         self.invalidate_kernel_inode_attrs(inodes);
     }
 
+    /// Applies post-commit VFS side effects for an in-place automatic promotion.
+    ///
+    /// Unlike explicit rename promotion (`promote_scratch_rename`), auto-promotion
+    /// does not move across parents or insert a negative dentry on `original_name`
+    /// (since a conflict-renamed winner still owns `original_name`).
     fn apply_auto_promote_side_effects(
         &self,
         meta: &dyn super::VfsMeta,
@@ -792,13 +834,7 @@ impl StudioVfs {
         root_is_dir: bool,
         promoted: &ScratchAutoPromoteResult,
     ) {
-        for attr in &promoted.attrs {
-            self.handle_table
-                .update_open_attrs_for_inode(attr.ino, attr);
-        }
-        self.invalidate_attr_read_cache(
-            std::iter::once(promoted.parent).chain(promoted.attrs.iter().map(|attr| attr.ino)),
-        );
+        self.invalidate_attr_read_cache([promoted.parent]);
         // Never insert DentryCacheValue::Negative for `original_name` when conflict-renamed:
         // the colliding tracked winner still occupies `original_name`.
         self.dentry_cache_invalidate(promoted.parent, &promoted.original_name);
@@ -822,6 +858,7 @@ impl StudioVfs {
         );
         self.bump_acl_namespace_epoch();
 
+        self.submit_promoted_subtree_uploads(&promoted.attrs);
         let mut kernel_entries = vec![(promoted.parent, promoted.final_name.clone())];
         if promoted.conflict_renamed {
             kernel_entries.push((promoted.parent, promoted.original_name.clone()));
@@ -830,34 +867,6 @@ impl StudioVfs {
         self.invalidate_kernel_inode_attrs(
             std::iter::once(promoted.parent).chain(promoted.attrs.iter().map(|attr| attr.ino)),
         );
-
-        for attr in &promoted.attrs {
-            if !Self::needs_epoch_finalization(attr) {
-                continue;
-            }
-            let objects = match self.regular_file_graph_objects(attr) {
-                Ok(objects) => objects,
-                Err(error) => {
-                    warn!(ino = attr.ino, %error, "could not enumerate auto-promoted payloads");
-                    continue;
-                }
-            };
-            let extents: Vec<_> = objects
-                .iter()
-                .map(|object| object.live_extent(attr.ino, attr.content_epoch))
-                .collect();
-            let mut queued = HashSet::new();
-            let ops: Vec<_> = objects
-                .iter()
-                .filter(|object| queued.insert(object.object_id))
-                .map(|object| object.upload_op(attr.ino, attr.content_epoch))
-                .collect();
-            self.record_live_extents(&extents);
-            self.cached_store.submit_uploads_batch(&ops);
-            if ops.is_empty() {
-                self.queue_epoch_finalization(attr.ino, attr.content_epoch);
-            }
-        }
     }
 }
 
@@ -878,7 +887,7 @@ mod tests {
     };
     use studiofs_meta::{
         InodeAttr, MetaEngineCore, MetaEvent, MetaFsOps, MetaInodes, MetaNamespace,
-        MetaPayloadObjects, RedbMetaEngine,
+        MetaPayloadObjects, ROOT_INO, RedbMetaEngine,
     };
 
     fn make_started_vfs_with_limit(
