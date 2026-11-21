@@ -130,6 +130,7 @@ where
         _name: &[u8],
         _ino: Ino,
         _frozen: &std::collections::HashSet<Ino>,
+        _kept_scratch: &std::collections::HashSet<Ino>,
         _conflict_client: &str,
     ) -> MetaResult<ScratchAutoPromoteResult> {
         Err(read_only_error(parent))

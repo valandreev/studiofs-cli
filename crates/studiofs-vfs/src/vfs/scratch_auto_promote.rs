@@ -16,6 +16,8 @@ const SCRATCH_PROMOTE_RATE_LIMIT_ENV: &str = "STUDIOFS_SCRATCH_PROMOTE_RATE_LIMI
 const DEFAULT_AUTO_PROMOTE_RATE_PER_SEC: u64 = 64;
 const DEFAULT_AUTO_PROMOTE_BURST: u64 = 16;
 const MAX_CANDIDATE_RETRIES: usize = 3;
+const FOLLOW_UP_PASS_MIN_DELAY: Duration = Duration::from_secs(1);
+const FOLLOW_UP_PASS_MAX_DELAY: Duration = Duration::from_secs(60);
 
 #[cfg(test)]
 type RateOverride = Option<(u64, u64)>;
@@ -338,10 +340,21 @@ impl StudioVfs {
         let cancel = self.state.shutdown.background_shutdown_token.clone();
         let (rate_per_sec, burst) = self.scratch_auto_promote.effective_rate();
         let mut limiter = AutoPromoteRateLimiter::new(rate_per_sec, burst);
+        // A pass that promoted or failed something gets a backed-off follow-up pass: it picks
+        // up entries created as scratch under a directory promoted mid-pass and candidates
+        // that kept changing under active writes.
+        let mut follow_up: Option<Duration> = None;
 
         loop {
+            let follow_up_timer = async {
+                match follow_up {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 _ = cancel.cancelled() => return,
+                _ = follow_up_timer => {}
                 recv = rules_rx.recv() => {
                     match recv {
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -355,16 +368,23 @@ impl StudioVfs {
             if cancel.is_cancelled() {
                 return;
             }
-            self.run_scratch_auto_promote_pass(&mut limiter, &cancel)
+            let needs_follow_up = self
+                .run_scratch_auto_promote_pass(&mut limiter, &cancel)
                 .await;
+            follow_up = needs_follow_up.then(|| {
+                follow_up.map_or(FOLLOW_UP_PASS_MIN_DELAY, |delay| {
+                    (delay * 2).min(FOLLOW_UP_PASS_MAX_DELAY)
+                })
+            });
         }
     }
 
+    /// Runs one pass; returns whether a follow-up pass is warranted.
     async fn run_scratch_auto_promote_pass(
         &self,
         limiter: &mut AutoPromoteRateLimiter,
         cancel: &CancellationToken,
-    ) {
+    ) -> bool {
         let (rate_per_sec, burst) = self.scratch_auto_promote.effective_rate();
         limiter.sync_config(rate_per_sec, burst);
 
@@ -374,7 +394,7 @@ impl StudioVfs {
             Ok(entries) => entries,
             Err(error) => {
                 warn!(%error, "failed to list tracked-parent scratch candidates");
-                return;
+                return true;
             }
         };
 
@@ -420,15 +440,15 @@ impl StudioVfs {
 
         for (has_open_handle, parent, name) in candidates {
             if cancel.is_cancelled() {
-                return;
+                return false;
             }
             if !has_open_handle {
                 tokio::select! {
-                    _ = cancel.cancelled() => return,
+                    _ = cancel.cancelled() => return false,
                     _ = self.qos.wait_foreground_local_io_idle() => {}
                 }
                 if !limiter.acquire(cancel).await {
-                    return;
+                    return false;
                 }
             }
 
@@ -447,7 +467,7 @@ impl StudioVfs {
                         break;
                     }
                     Ok(CandidateOutcome::Skipped) => break,
-                    Ok(CandidateOutcome::Cancelled) => return,
+                    Ok(CandidateOutcome::Cancelled) => return false,
                     Err(VfsError::Meta(MetaError::TargetChanged))
                         if attempt + 1 < MAX_CANDIDATE_RETRIES =>
                     {
@@ -486,6 +506,7 @@ impl StudioVfs {
         self.scratch_auto_promote
             .status_tx
             .send_replace(next_snapshot);
+        pass_promoted > 0 || pass_failed > 0
     }
 
     async fn promote_one_auto_candidate(
@@ -519,9 +540,10 @@ impl StudioVfs {
         }
 
         let mut frozen = HashSet::new();
-        let mut pending = vec![current_attr.clone()];
+        let mut kept_scratch = HashSet::new();
+        let mut pending = vec![(current_attr.clone(), rel_path.clone())];
         let mut files = Vec::new();
-        while let Some(attr) = pending.pop() {
+        while let Some((attr, attr_path)) = pending.pop() {
             if !frozen.insert(attr.ino) {
                 return Err(MetaError::TargetChanged.into());
             }
@@ -564,7 +586,18 @@ impl StudioVfs {
                         entry_limit: self.scratch_promote_entry_limit,
                     }));
                 }
-                pending.extend(children.into_iter().map(|(_, child)| child));
+                for (child_name, child) in children {
+                    let child_path = join_relative_path(&attr_path, &child_name);
+                    let child_is_dir = child.kind == FileType::Directory;
+                    // A descendant that still matches a rule stays scratch with its subtree.
+                    if self.classify_scratch_path(&child_path, child_is_dir)
+                        != ScratchClass::Tracked
+                    {
+                        kept_scratch.insert(child.ino);
+                    } else {
+                        pending.push((child, child_path));
+                    }
+                }
             } else if attr.kind == FileType::RegularFile {
                 files.push(attr.ino);
             }
@@ -580,6 +613,10 @@ impl StudioVfs {
         let restore_gate = self.retained_restore_gate.lock().await;
         let mut sessions = Vec::with_capacity(files.len());
         for ino in files {
+            // Shutdown waits for the mutating gate before cancelling background work.
+            if self.is_shutting_down() {
+                return Ok(CandidateOutcome::Cancelled);
+            }
             sessions.push(
                 self.file_session_cleanup(ino).with_permit(
                     self.state
@@ -595,8 +632,14 @@ impl StudioVfs {
             .invalidation_sender_id()
             .unwrap_or_else(|| "local".to_string());
         let started_epoch = self.state.namespace.namespace_epoch.load(Ordering::Acquire);
-        let promoted =
-            meta.promote_scratch_auto(parent, name, current_attr.ino, &frozen, &conflict_client)?;
+        let promoted = meta.promote_scratch_auto(
+            parent,
+            name,
+            current_attr.ino,
+            &frozen,
+            &kept_scratch,
+            &conflict_client,
+        )?;
 
         self.apply_auto_promote_side_effects(meta.as_ref(), started_epoch, root_is_dir, &promoted);
 
@@ -634,9 +677,6 @@ impl StudioVfs {
                 DentryCacheValue::Positive(promoted.promoted_ino),
             )],
         );
-        if promoted.conflict_renamed {
-            self.dentry_cache_invalidate(promoted.parent, &promoted.original_name);
-        }
         if root_is_dir {
             self.ignore_rules.bump_dir_rename_epoch();
         }
@@ -997,6 +1037,43 @@ mod tests {
             for still_scratch in [sdir.ino, inside_tmp.ino, inside_txt.ino] {
                 assert!(vfs.is_scratch_inode(still_scratch).unwrap());
             }
+
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn scratch_auto_promote_directory_keeps_descendants_that_still_match_a_rule() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-auto-keep-");
+        let (rt, vfs, meta) =
+            make_started_vfs_with_limit(&temp, "scratch-auto-keep", None, None, None);
+        let _guard = rt.enter();
+        rt.block_on(async {
+            install_ignore_rules(&vfs, ROOT_INO, b"cache/\n*.tmp\n").await;
+            let cache = vfs.mkdir(ROOT_INO, b"cache", 0, 0, 0o755).unwrap();
+            let kept_file = write_and_close_file(&vfs, cache.ino, b"a.tmp", b"tmp").await;
+            let kept_dir = vfs.mkdir(cache.ino, b"sub.tmp", 0, 0, 0o755).unwrap();
+            let kept_nested =
+                write_and_close_file(&vfs, kept_dir.ino, b"nested.txt", b"nested").await;
+            let moved_file = write_and_close_file(&vfs, cache.ino, b"b.txt", b"keep").await;
+
+            let mut status_rx = vfs.subscribe_scratch_auto_promote_status();
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n").await;
+            let snap =
+                wait_for_auto_promote_generation(&mut status_rx, vfs.ignore_rule_generation())
+                    .await;
+            assert_eq!(snap.failed_entries, 0);
+
+            assert!(!vfs.is_scratch_inode(cache.ino).unwrap());
+            assert!(!vfs.is_scratch_inode(moved_file.ino).unwrap());
+            for still_scratch in [kept_file.ino, kept_dir.ino, kept_nested.ino] {
+                assert!(vfs.is_scratch_inode(still_scratch).unwrap());
+            }
+            // Tracked directories do not count scratch subdirectories in nlink.
+            assert_eq!(meta.get_attr(cache.ino).unwrap().nlink, 2);
+            // The kept entries stay visible under the promoted directory.
+            assert_eq!(vfs.lookup(cache.ino, b"a.tmp").unwrap().ino, kept_file.ino);
+            assert_eq!(vfs.lookup(cache.ino, b"sub.tmp").unwrap().ino, kept_dir.ino);
 
             vfs.shutdown(Duration::from_secs(5)).await.unwrap();
         });

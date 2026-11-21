@@ -1609,9 +1609,10 @@ impl MetaEngineCore for RedbMetaEngine {
         name: &[u8],
         ino: Ino,
         frozen: &HashSet<Ino>,
+        kept_scratch: &HashSet<Ino>,
         conflict_client: &str,
     ) -> MetaResult<ScratchAutoPromoteResult> {
-        self.promote_scratch_auto_inner(parent, name, ino, frozen, conflict_client)
+        self.promote_scratch_auto_inner(parent, name, ino, frozen, kept_scratch, conflict_client)
     }
 
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {

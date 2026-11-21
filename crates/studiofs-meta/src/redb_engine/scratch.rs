@@ -1553,6 +1553,7 @@ impl RedbMetaEngine {
         name: &[u8],
         source: Ino,
         frozen: &HashSet<Ino>,
+        kept_scratch: &HashSet<Ino>,
         conflict_client: &str,
     ) -> MetaResult<ScratchAutoPromoteResult> {
         use crate::events::MetaEvent;
@@ -1633,6 +1634,18 @@ impl RedbMetaEngine {
                     let (decoded_parent, child_name) = decode_dentry_key(key.value())?;
                     if decoded_parent != ino {
                         break;
+                    }
+                    let child_ino = child.value();
+                    if kept_scratch.contains(&child_ino) {
+                        // Still matches a rule: stays scratch under the promoted directory,
+                        // and tracked directories do not count scratch subdirectories in nlink.
+                        let inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
+                        let kept = read_scratch_attr_from_table(&inodes, child_ino)?
+                            .ok_or(MetaError::TargetChanged)?;
+                        if kept.kind == FileType::Directory {
+                            attr.nlink = attr.nlink.saturating_sub(1);
+                        }
+                        continue;
                     }
                     if pending.len() + moved.len() + children.len() + 1 >= frozen.len() {
                         return Err(MetaError::TargetChanged);
@@ -4614,7 +4627,14 @@ mod tests {
         let before_seq = meta.get_counter(NEXT_EVENT_SEQ).unwrap();
         let frozen = HashSet::from([sdir.ino, nested_file.ino, nested_link.ino]);
         let promoted = meta
-            .promote_scratch_auto(ROOT_INO, b"shared", sdir.ino, &frozen, "client-a")
+            .promote_scratch_auto(
+                ROOT_INO,
+                b"shared",
+                sdir.ino,
+                &frozen,
+                &HashSet::new(),
+                "client-a",
+            )
             .unwrap();
         assert_eq!(promoted.promoted_ino, sdir.ino);
         assert_eq!(promoted.final_name, b"shared");
@@ -4709,6 +4729,7 @@ mod tests {
                 b"taken.tmp",
                 sfile1.ino,
                 &HashSet::from([sfile1.ino]),
+                &HashSet::new(),
                 "client/1",
             )
             .unwrap();
@@ -4731,6 +4752,7 @@ mod tests {
                 b"taken.tmp",
                 sfile2.ino,
                 &HashSet::from([sfile2.ino]),
+                &HashSet::new(),
                 "client/1",
             )
             .unwrap();
@@ -4794,6 +4816,7 @@ mod tests {
                 b"merge",
                 dir_a.ino,
                 &HashSet::from([dir_a.ino, file_a.ino]),
+                &HashSet::new(),
                 "client-a",
             )
             .unwrap();
@@ -4818,6 +4841,7 @@ mod tests {
                 b"merge",
                 dir_b.ino,
                 &HashSet::from([dir_b.ino, file_b.ino]),
+                &HashSet::new(),
                 "client-b",
             )
             .unwrap();

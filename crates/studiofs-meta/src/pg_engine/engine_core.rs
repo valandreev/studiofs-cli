@@ -142,9 +142,12 @@ impl MetaEngineCore for PgMetaEngine {
         name: &[u8],
         ino: Ino,
         frozen: &std::collections::HashSet<Ino>,
+        kept_scratch: &std::collections::HashSet<Ino>,
         conflict_client: &str,
     ) -> MetaResult<crate::engine::ScratchAutoPromoteResult> {
-        self.mutate(|local| local.promote_scratch_auto(parent, name, ino, frozen, conflict_client))
+        self.mutate(|local| {
+            local.promote_scratch_auto(parent, name, ino, frozen, kept_scratch, conflict_client)
+        })
     }
 
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {

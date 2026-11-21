@@ -2455,7 +2455,7 @@ pub struct VfsScratchAutoPromoteSnapshot {
     pub promoted_entries: u64,
     /// Total automatic promotions that renamed the target to avoid a tracked-base name collision.
     pub conflict_renames: u64,
-    /// Total candidate promotions that failed transiently.
+    /// Total candidate promotions that failed (after bounded `TargetChanged` retries).
     pub failed_entries: u64,
     /// Configured promotion rate limit in entries per second.
     pub rate_limit_per_sec: u64,
