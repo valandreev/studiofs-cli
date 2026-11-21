@@ -1834,10 +1834,8 @@ impl RedbMetaEngine {
     }
 
     /// Merges a scratch directory into the tracked directory that holds its name
-    /// (ADR 0012: directories merge). Children move as scratch entries; nested
-    /// directory-vs-directory collisions merge recursively and any other name
-    /// collision renames the moved child to `<name>.scratch-conflict-<client>`.
-    /// Emits no events: the caller promotes the moved children afterwards.
+    /// (ADR 0012: directories merge) during automatic promotion. Emits no events:
+    /// the caller promotes the moved children afterwards.
     fn merge_auto_promote_directory(
         &self,
         txn: super::RedbWriteTransaction<'_>,
@@ -1847,104 +1845,26 @@ impl RedbMetaEngine {
         target: Ino,
         conflict_client: &str,
     ) -> MetaResult<ScratchAutoPromoteResult> {
-        let mut merged_children = Vec::new();
-        // `(old scratch parent, new tracked parent)` per moved child, for the scratch index.
-        let mut index_moves = Vec::new();
-        let mut merged_away_dirs = vec![(parent, stored_name.clone(), source)];
-        let mut conflict_renamed = false;
         {
             let mut dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
             let _ = dentries
                 .remove(encode_dentry_key(parent, &stored_name).as_slice())
                 .map_err(storage_error)?;
         }
-        let mut pending = vec![(source, target)];
-        while let Some((src_dir, dst_dir)) = pending.pop() {
-            let children: Vec<(Vec<u8>, Ino)> = {
-                let dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
-                let start = dentry_prefix(src_dir);
-                let range_end = prefix_successor(&start);
-                let iter = match range_end.as_ref() {
-                    Some(end) => dentries.range(start.as_slice()..end.as_ref()),
-                    None => dentries.range(start.as_slice()..),
-                }
-                .map_err(storage_error)?;
-                let mut children = Vec::new();
-                for row in iter {
-                    let (key, child) = row.map_err(storage_error)?;
-                    let (decoded_parent, child_name) = decode_dentry_key(key.value())?;
-                    if decoded_parent != src_dir {
-                        break;
-                    }
-                    children.push((child_name.to_vec(), child.value()));
-                }
-                children
-            };
-            for (name, ino) in children {
-                let mut attr = {
-                    let inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
-                    read_scratch_attr_from_table(&inodes, ino)?.ok_or(MetaError::TargetChanged)?
-                };
-                {
-                    let mut dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
-                    let _ = dentries
-                        .remove(encode_dentry_key(src_dir, &name).as_slice())
-                        .map_err(storage_error)?;
-                }
-                let tracked = Self::find_colliding_live_tracked_entry_in_txn(&txn, dst_dir, &name)?;
-                if let Some(tracked) = tracked.as_ref()
-                    && tracked.kind == FileType::Directory
-                    && attr.kind == FileType::Directory
-                {
-                    merged_away_dirs.push((src_dir, name, ino));
-                    pending.push((ino, tracked.ino));
-                    continue;
-                }
-                let scratch_taken = {
-                    let dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
-                    find_scratch_dentry_in_table(&dentries, dst_dir, &name)?.is_some()
-                };
-                let final_name = if tracked.is_some() || scratch_taken {
-                    conflict_renamed = true;
-                    allocate_auto_promote_conflict_name_in_txn(
-                        &txn,
-                        dst_dir,
-                        &name,
-                        conflict_client,
-                    )?
-                } else {
-                    name
-                };
-                attr.parent = dst_dir;
-                attr.touch_ctime();
-                {
-                    let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
-                    let bytes = postcard::to_allocvec(&attr).map_err(storage_error)?;
-                    inodes
-                        .insert(ino, bytes.as_slice())
-                        .map_err(storage_error)?;
-                }
-                {
-                    let mut dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
-                    dentries
-                        .insert(encode_dentry_key(dst_dir, &final_name).as_slice(), ino)
-                        .map_err(storage_error)?;
-                }
-                index_moves.push((src_dir, dst_dir));
-                merged_children.push((dst_dir, final_name, attr));
-            }
-            remove_scratch_inode_aux_in_txn(&txn, src_dir)?;
-            let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
-            let _ = inodes.remove(src_dir).map_err(storage_error)?;
-        }
+        let merge =
+            merge_scratch_dir_into_tracked_in_txn(&txn, source, target, &mut |txn, dir, name| {
+                allocate_auto_promote_conflict_name_in_txn(txn, dir, name, conflict_client)
+            })?;
         txn.commit()?;
 
+        let mut merged_away_dirs = vec![(parent, stored_name.clone(), source)];
+        merged_away_dirs.extend(merge.merged_away_dirs);
         let mut index = self.scratch_index_write();
         for (old_parent, _, ino) in &merged_away_dirs {
             index.note_remove_dentry(*old_parent);
             index.note_remove_inode(*ino);
         }
-        for (old_parent, new_parent) in index_moves {
+        for (old_parent, new_parent) in merge.index_moves {
             index.note_remove_dentry(old_parent);
             index.note_increment_parent(new_parent);
         }
@@ -1954,10 +1874,10 @@ impl RedbMetaEngine {
             parent,
             original_name: stored_name.clone(),
             final_name: stored_name,
-            conflict_renamed,
+            conflict_renamed: merge.conflict_renamed,
             attrs: Vec::new(),
             merged_into: Some(target),
-            merged_children,
+            merged_children: merge.children,
             merged_away_dirs,
         })
     }
@@ -2275,6 +2195,10 @@ impl RedbMetaEngine {
                 .map_err(|_| storage_error("scratch mutation lock poisoned"))?;
             self.refresh_scratch_index()?;
         }
+        if outcome.directories_merged > 0 {
+            self.scratch_replay_merge_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         // The orphan records are already committed; a disk failure here only
         // defers materialization to the next `set_scratch_cache_dir`.
         if outcome.orphans_created > 0
@@ -2545,6 +2469,65 @@ impl RedbMetaEngine {
                     continue;
                 };
                 if tracked_winner.ino == scratch_ino {
+                    continue;
+                }
+                let scratch_is_dir = {
+                    let inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
+                    read_scratch_attr_from_table(&inodes, scratch_ino)?
+                        .is_some_and(|attr| attr.kind == FileType::Directory)
+                };
+                if scratch_is_dir && tracked_winner.kind == FileType::Directory {
+                    // ADR 0012: directories merge. The moved children stay scratch until
+                    // the auto-promote pass this merge requests classifies them.
+                    {
+                        let mut dentries =
+                            txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
+                        let _ = dentries
+                            .remove(encode_dentry_key(parent_ino, &stored_name).as_slice())
+                            .map_err(storage_error)?;
+                    }
+                    let merge = merge_scratch_dir_into_tracked_in_txn(
+                        txn,
+                        scratch_ino,
+                        tracked_winner.ino,
+                        &mut |txn, dir, name| allocate_conflict_scratch_name_in_txn(txn, dir, name),
+                    )?;
+                    tracing::info!(
+                        parent = parent_ino,
+                        scratch_ino,
+                        tracked_ino = tracked_winner.ino,
+                        name = %String::from_utf8_lossy(&stored_name),
+                        moved = merge.children.len(),
+                        "replicated tracked directory merged a local scratch directory"
+                    );
+                    let ancestors = Self::invalidation_ancestors(txn, parent_ino)?;
+                    txn.invalidate(InvalidationIntent::Entry {
+                        parent: parent_ino,
+                        name: stored_name,
+                        ancestors,
+                        ino: Some(scratch_ino),
+                    });
+                    txn.invalidate(InvalidationIntent::Directory { ino: parent_ino });
+                    for (old_parent, name, ino) in merge.merged_away_dirs {
+                        txn.invalidate(InvalidationIntent::Entry {
+                            parent: old_parent,
+                            name,
+                            ancestors: None,
+                            ino: Some(ino),
+                        });
+                    }
+                    for (new_parent, name, attr) in merge.children {
+                        txn.invalidate(InvalidationIntent::Entry {
+                            parent: new_parent,
+                            name,
+                            ancestors: Self::invalidation_ancestors(txn, new_parent)?,
+                            ino: Some(attr.ino),
+                        });
+                        txn.invalidate(InvalidationIntent::Directory { ino: new_parent });
+                        txn.invalidate(InvalidationIntent::Attributes { ino: attr.ino });
+                    }
+                    outcome.changed = true;
+                    outcome.directories_merged += 1;
                     continue;
                 }
 
@@ -3127,6 +3110,7 @@ pub(crate) struct ScratchReconciliationOutcome {
     pub(crate) changed: bool,
     pub(crate) conflicts_resolved: usize,
     pub(crate) orphans_created: usize,
+    pub(crate) directories_merged: usize,
 }
 
 fn current_unix_millis() -> u64 {
@@ -3269,6 +3253,112 @@ fn allocate_conflict_scratch_name_in_txn(
         }
     }
     Err(storage_error("exhausted scratch conflict rename suffixes"))
+}
+
+/// Picks the replacement name for a child that collides in `(txn, dir, name)`.
+type ConflictNameFn<'a> =
+    dyn FnMut(&redb::WriteTransaction, Ino, &[u8]) -> MetaResult<Vec<u8>> + 'a;
+
+/// Moves the scratch children of `source` into the tracked directory `target`,
+/// keeping them scratch. Nested directory-vs-directory collisions merge
+/// recursively; any other collision renames the moved child with `conflict_name`.
+/// Removes every emptied scratch directory, including `source`; the caller removes
+/// the dentry that pointed at `source`.
+fn merge_scratch_dir_into_tracked_in_txn(
+    txn: &redb::WriteTransaction,
+    source: Ino,
+    target: Ino,
+    conflict_name: &mut ConflictNameFn<'_>,
+) -> MetaResult<ScratchDirMerge> {
+    let mut merge = ScratchDirMerge::default();
+    let mut pending = vec![(source, target)];
+    while let Some((src_dir, dst_dir)) = pending.pop() {
+        let children: Vec<(Vec<u8>, Ino)> = {
+            let dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
+            let start = dentry_prefix(src_dir);
+            let range_end = prefix_successor(&start);
+            let iter = match range_end.as_ref() {
+                Some(end) => dentries.range(start.as_slice()..end.as_ref()),
+                None => dentries.range(start.as_slice()..),
+            }
+            .map_err(storage_error)?;
+            let mut children = Vec::new();
+            for row in iter {
+                let (key, child) = row.map_err(storage_error)?;
+                let (decoded_parent, child_name) = decode_dentry_key(key.value())?;
+                if decoded_parent != src_dir {
+                    break;
+                }
+                children.push((child_name.to_vec(), child.value()));
+            }
+            children
+        };
+        for (name, ino) in children {
+            let mut attr = {
+                let inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
+                read_scratch_attr_from_table(&inodes, ino)?.ok_or(MetaError::TargetChanged)?
+            };
+            {
+                let mut dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
+                let _ = dentries
+                    .remove(encode_dentry_key(src_dir, &name).as_slice())
+                    .map_err(storage_error)?;
+            }
+            let tracked =
+                RedbMetaEngine::find_colliding_live_tracked_entry_in_txn(txn, dst_dir, &name)?;
+            if let Some(tracked) = tracked.as_ref()
+                && tracked.kind == FileType::Directory
+                && attr.kind == FileType::Directory
+            {
+                merge.merged_away_dirs.push((src_dir, name, ino));
+                pending.push((ino, tracked.ino));
+                continue;
+            }
+            let scratch_taken = {
+                let dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
+                find_scratch_dentry_in_table(&dentries, dst_dir, &name)?.is_some()
+            };
+            let final_name = if tracked.is_some() || scratch_taken {
+                merge.conflict_renamed = true;
+                conflict_name(txn, dst_dir, &name)?
+            } else {
+                name
+            };
+            attr.parent = dst_dir;
+            attr.touch_ctime();
+            {
+                let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
+                let bytes = postcard::to_allocvec(&attr).map_err(storage_error)?;
+                inodes
+                    .insert(ino, bytes.as_slice())
+                    .map_err(storage_error)?;
+            }
+            {
+                let mut dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
+                dentries
+                    .insert(encode_dentry_key(dst_dir, &final_name).as_slice(), ino)
+                    .map_err(storage_error)?;
+            }
+            merge.index_moves.push((src_dir, dst_dir));
+            merge.children.push((dst_dir, final_name, attr));
+        }
+        remove_scratch_inode_aux_in_txn(txn, src_dir)?;
+        let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
+        let _ = inodes.remove(src_dir).map_err(storage_error)?;
+    }
+    Ok(merge)
+}
+
+/// Result of [`merge_scratch_dir_into_tracked_in_txn`].
+#[derive(Default)]
+struct ScratchDirMerge {
+    /// Moved children, still scratch: `(tracked parent, name, attr)`.
+    children: Vec<(Ino, Vec<u8>, InodeAttr)>,
+    /// Nested scratch directories emptied and removed: `(old parent, name, ino)`.
+    merged_away_dirs: Vec<(Ino, Vec<u8>, Ino)>,
+    /// `(old scratch parent, new tracked parent)` per moved child.
+    index_moves: Vec<(Ino, Ino)>,
+    conflict_renamed: bool,
 }
 
 fn allocate_auto_promote_conflict_name_in_txn(
@@ -3941,6 +4031,90 @@ mod tests {
             Some(104)
         );
         assert_eq!(reopened.readdir_scratch(tracked_dir.ino).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replay_tracked_directory_merges_same_named_scratch_directory() {
+        use crate::events::MetaEvent;
+
+        let temp = tempfile::tempdir().unwrap();
+        let meta = RedbMetaEngine::open(temp.path().join("meta.redb")).unwrap();
+        meta.init_root(0, 0).unwrap();
+
+        let scratch_dir = InodeAttr::new_dir(101, ROOT_INO, 0, 0, 0o755);
+        meta.create_scratch_entry(ROOT_INO, b"shared", &scratch_dir)
+            .unwrap();
+        for (ino, parent, name) in [(102, 101, &b"b.txt"[..]), (103, 101, b"x.tmp")] {
+            meta.create_scratch_entry(parent, name, &InodeAttr::new_file(ino, parent, 0, 0, 0o644))
+                .unwrap();
+        }
+        meta.create_scratch_entry(101, b"sub", &InodeAttr::new_dir(104, 101, 0, 0, 0o755))
+            .unwrap();
+        meta.create_scratch_entry(104, b"n.txt", &InodeAttr::new_file(105, 104, 0, 0, 0o644))
+            .unwrap();
+        assert_eq!(meta.scratch_replay_merge_generation(), 0);
+
+        // Peer publishes tracked `shared/` with `shared/sub/` and `shared/b.txt`.
+        let add = |parent, name: &[u8], attr: &InodeAttr| {
+            [
+                MetaEvent::SetAttr { attr: attr.clone() },
+                MetaEvent::AddEntry {
+                    parent,
+                    name: name.to_vec(),
+                    entry: DirEntryValue {
+                        ino: attr.ino,
+                        kind: attr.kind,
+                    },
+                },
+            ]
+        };
+        let mut events = Vec::new();
+        events.extend(add(
+            ROOT_INO,
+            b"shared",
+            &InodeAttr::new_dir(201, ROOT_INO, 0, 0, 0o755),
+        ));
+        events.extend(add(201, b"sub", &InodeAttr::new_dir(202, 201, 0, 0, 0o755)));
+        events.extend(add(
+            201,
+            b"b.txt",
+            &InodeAttr::new_file(203, 201, 0, 0, 0o644),
+        ));
+        meta.apply_replica_serving_state(&events).unwrap();
+
+        // Directories merge: no conflict copy of `shared` or `sub`.
+        assert_eq!(meta.lookup(ROOT_INO, b"shared").unwrap().ino, 201);
+        assert_eq!(
+            meta.lookup_scratch_entry(ROOT_INO, b"shared").unwrap(),
+            None
+        );
+        assert_eq!(
+            meta.lookup_scratch_entry(ROOT_INO, b"shared.scratch-conflict-1")
+                .unwrap(),
+            None
+        );
+        assert!(meta.get_scratch_attr(101).is_err());
+        assert!(meta.get_scratch_attr(104).is_err());
+        // Children move as scratch; a taken file name gets the replay conflict suffix.
+        assert_eq!(meta.lookup(201, b"b.txt").unwrap().ino, 203);
+        assert_eq!(
+            meta.lookup_scratch_entry(201, b"b.txt.scratch-conflict-1")
+                .unwrap(),
+            Some(102)
+        );
+        assert_eq!(meta.lookup_scratch_entry(201, b"x.tmp").unwrap(), Some(103));
+        assert_eq!(meta.lookup_scratch_entry(202, b"n.txt").unwrap(), Some(105));
+        assert_eq!(meta.get_scratch_attr(105).unwrap().parent, 202);
+        // The moved children are automatic-promotion candidates.
+        assert_eq!(meta.scratch_replay_merge_generation(), 1);
+        let mut candidates: Vec<Ino> = meta
+            .list_tracked_parent_scratch_entries()
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, attr)| attr.ino)
+            .collect();
+        candidates.sort_unstable();
+        assert_eq!(candidates, vec![102, 103, 105]);
     }
 
     #[test]

@@ -136,6 +136,10 @@ impl MetaEngineCore for PgMetaEngine {
         self.local.list_tracked_parent_scratch_entries()
     }
 
+    fn scratch_replay_merge_generation(&self) -> u64 {
+        self.local.scratch_replay_merge_generation()
+    }
+
     fn promote_scratch_auto(
         &self,
         parent: Ino,

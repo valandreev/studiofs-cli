@@ -1610,6 +1610,12 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         Ok(Vec::new())
     }
 
+    /// Increments after replay merged a local scratch directory into a replicated
+    /// tracked directory, leaving scratch children for automatic promotion.
+    fn scratch_replay_merge_generation(&self) -> u64 {
+        0
+    }
+
     /// Automatically promote a frozen scratch subtree under its tracked parent.
     ///
     /// If the entry's name is already taken in the tracked local base, it is

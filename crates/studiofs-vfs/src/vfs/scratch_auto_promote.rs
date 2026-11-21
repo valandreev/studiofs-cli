@@ -20,6 +20,10 @@ const DEFAULT_AUTO_PROMOTE_BURST: u64 = 16;
 const MAX_CANDIDATE_RETRIES: usize = 3;
 const FOLLOW_UP_PASS_MIN_DELAY: Duration = Duration::from_secs(1);
 const FOLLOW_UP_PASS_MAX_DELAY: Duration = Duration::from_secs(60);
+/// Quiet period after a rule change before a pass. An in-place rewrite of
+/// `.studiofsignore` (truncate, then write) briefly loads an empty rule set,
+/// which would otherwise promote every scratch entry.
+const RULES_SETTLE_DELAY: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 type RateOverride = Option<(u64, u64)>;
@@ -27,6 +31,9 @@ type RateOverride = Option<(u64, u64)>;
 pub(super) struct ScratchAutoPromoteState {
     snapshot: Mutex<VfsScratchAutoPromoteSnapshot>,
     status_tx: watch::Sender<VfsScratchAutoPromoteSnapshot>,
+    /// Wakes the worker when replay merged scratch children into a tracked directory.
+    replay_merge_wake: tokio::sync::Notify,
+    seen_replay_merge_generation: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     rate_override: Mutex<RateOverride>,
 }
@@ -43,6 +50,8 @@ impl Default for ScratchAutoPromoteState {
         Self {
             snapshot: Mutex::new(initial),
             status_tx,
+            replay_merge_wake: tokio::sync::Notify::new(),
+            seen_replay_merge_generation: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             rate_override: Mutex::new(None),
         }
@@ -321,6 +330,19 @@ impl StudioVfs {
         snapshot
     }
 
+    /// Requests a pass when replay merged a local scratch directory into a replicated
+    /// tracked directory since the last check; its moved children are candidates.
+    pub(super) fn note_scratch_replay_merges(&self) {
+        let generation = self.sync_meta().scratch_replay_merge_generation();
+        let seen = self
+            .scratch_auto_promote
+            .seen_replay_merge_generation
+            .fetch_max(generation, Ordering::AcqRel);
+        if generation > seen {
+            self.scratch_auto_promote.replay_merge_wake.notify_one();
+        }
+    }
+
     /// Subscribes to completed background scratch auto-promotion pass updates.
     pub fn subscribe_scratch_auto_promote_status(
         &self,
@@ -364,12 +386,22 @@ impl StudioVfs {
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = follow_up_timer => {}
+                _ = self.scratch_auto_promote.replay_merge_wake.notified() => {}
                 recv = rules_rx.recv() => {
-                    match recv {
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            while rules_rx.try_recv().is_ok() {}
+                    if matches!(recv, Err(broadcast::error::RecvError::Closed)) {
+                        return;
+                    }
+                    // Run on settled rules: restart the quiet period on every change.
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = tokio::time::sleep(RULES_SETTLE_DELAY) => break,
+                            recv = rules_rx.recv() => {
+                                if matches!(recv, Err(broadcast::error::RecvError::Closed)) {
+                                    return;
+                                }
+                            }
                         }
-                        Err(broadcast::error::RecvError::Closed) => return,
                     }
                 }
             }
@@ -1139,6 +1171,32 @@ mod tests {
             for still_scratch in [sdir.ino, inside_tmp.ino, inside_txt.ino] {
                 assert!(vfs.is_scratch_inode(still_scratch).unwrap());
             }
+
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+        });
+    }
+
+    /// Rewriting `.studiofsignore` in place briefly loads an empty rule set (truncate,
+    /// then write). The pass must run on the settled rules, not on the empty ones.
+    #[test]
+    fn scratch_auto_promote_waits_for_rules_to_settle_after_in_place_rewrite() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-auto-settle-");
+        let (rt, vfs, _meta) =
+            make_started_vfs_with_limit(&temp, "scratch-auto-settle", None, None, None);
+        let _guard = rt.enter();
+        rt.block_on(async {
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n").await;
+            let kept = write_and_close_file(&vfs, ROOT_INO, b"keep.tmp", b"k").await;
+            assert!(vfs.is_scratch_inode(kept.ino).unwrap());
+
+            let mut status_rx = vfs.subscribe_scratch_auto_promote_status();
+            install_ignore_rules(&vfs, ROOT_INO, b"").await;
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n").await;
+            let snap =
+                wait_for_auto_promote_generation(&mut status_rx, vfs.ignore_rule_generation())
+                    .await;
+            assert_eq!(snap.promoted_entries, 0);
+            assert!(vfs.is_scratch_inode(kept.ino).unwrap());
 
             vfs.shutdown(Duration::from_secs(5)).await.unwrap();
         });
