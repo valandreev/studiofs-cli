@@ -582,6 +582,7 @@ impl RedbMetaEngine {
             (Vec::new(), Vec::new())
         };
         let txn = self.begin_write_txn()?;
+        let pre_scratch = self.capture_pre_mutation_scratch_context_in_txn(&txn)?;
         txn.invalidate(InvalidationIntent::Reset);
 
         if !preserve_local_state {
@@ -920,9 +921,12 @@ impl RedbMetaEngine {
             }
         }
         Self::rebuild_inode_lifecycle_table_in_txn(&txn)?;
+        let scratch_outcome =
+            self.reconcile_scratch_after_tracked_mutations_in_txn(&txn, &pre_scratch)?;
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.finish_scratch_reconciliation(scratch_outcome)?;
         Ok(())
     }
 }

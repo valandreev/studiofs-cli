@@ -448,6 +448,7 @@ impl VfsBootstrap {
         plan.log_summary(cache_size, &config);
         let resources =
             VfsBootstrapResources::open(data_config, cache_dir, &plan, &config, cache_runtime)?;
+        meta.set_scratch_cache_dir(PathBuf::from(cache_dir))?;
         Ok(Self {
             meta,
             config,

@@ -283,7 +283,7 @@ impl RedbMetaEngine {
     }
 
     // The boolean records exact-key local authority for remote visibility filtering.
-    fn lookup_merged_exact_key_from_opened_tables<TBase, TCurrent, TTombstones>(
+    pub(super) fn lookup_merged_exact_key_from_opened_tables<TBase, TCurrent, TTombstones>(
         base: &TBase,
         current: &TCurrent,
         tombstones: &TTombstones,

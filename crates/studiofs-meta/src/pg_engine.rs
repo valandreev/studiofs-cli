@@ -2182,4 +2182,52 @@ impl PgMetaEngine {
 }
 
 #[cfg(test)]
+pub(crate) struct ScratchTestReplayInput {
+    pub(crate) batches: Vec<(i64, Vec<MetaEvent>, bool)>,
+    pub(crate) last_seq: i64,
+    pub(crate) current_namespace_version: i64,
+    pub(crate) flushed_event_seq: u64,
+    pub(crate) next_event_seq: u64,
+    pub(crate) protected_dentry_keys: Vec<Vec<u8>>,
+    pub(crate) protected_attr_inodes: Vec<Ino>,
+}
+
+#[cfg(test)]
+pub(crate) fn apply_decoded_batches_for_scratch_test(
+    local: &RedbMetaEngine,
+    input: ScratchTestReplayInput,
+) -> MetaResult<()> {
+    let mut initial_overlay = OverlayConflictSets::default();
+    initial_overlay
+        .dentry_keys
+        .extend(input.protected_dentry_keys);
+    initial_overlay
+        .attr_inodes
+        .extend(input.protected_attr_inodes);
+    let decoded = input
+        .batches
+        .into_iter()
+        .map(
+            |(batch_version, events, is_self_batch)| DecodedReplayBatch {
+                batch_version,
+                events,
+                is_self_batch,
+            },
+        )
+        .collect();
+    RemoteApplyCoordinator::new(local).apply_decoded_batches(
+        decoded,
+        None,
+        RemoteReplayApplyContext {
+            last_seq: input.last_seq,
+            current_namespace_version: input.current_namespace_version,
+            flushed_event_seq: input.flushed_event_seq,
+            next_event_seq: input.next_event_seq,
+            initial_overlay,
+        },
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests;

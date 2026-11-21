@@ -429,7 +429,7 @@ impl RedbMetaEngine {
         Ok(None)
     }
 
-    fn invalidation_ancestors(
+    pub(super) fn invalidation_ancestors(
         txn: &RedbWriteTransaction<'_>,
         mut ino: Ino,
     ) -> MetaResult<Option<Vec<Vec<u8>>>> {
@@ -1404,13 +1404,17 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
+        let pre_scratch = self.capture_pre_mutation_scratch_context_in_txn(&txn)?;
         Self::apply_replica_events_to_base_in_txn(
             &txn,
             events.iter(),
             protected_regular_file_inodes,
         )?;
+        let scratch_outcome =
+            self.reconcile_scratch_after_tracked_mutations_in_txn(&txn, &pre_scratch)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.finish_scratch_reconciliation(scratch_outcome)?;
         Ok(())
     }
 
@@ -1753,6 +1757,7 @@ impl RedbMetaEngine {
         PENDING_SERVING_REPLAYS.with(|count| count.set(count.get() + 1));
 
         let txn = self.begin_write_txn()?;
+        let pre_scratch = self.capture_pre_mutation_scratch_context_in_txn(&txn)?;
         let live_events = {
             let tombstones = txn
                 .open_table(INODE_TOMBSTONES_TABLE)
@@ -1774,8 +1779,11 @@ impl RedbMetaEngine {
         };
         Self::apply_replica_serving_state_in_txn_with(&txn, &live_events, true, true)?;
         Self::sync_replayed_inode_lifecycles_in_txn(&txn, &live_events)?;
+        let scratch_outcome =
+            self.reconcile_scratch_after_tracked_mutations_in_txn(&txn, &pre_scratch)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.finish_scratch_reconciliation(scratch_outcome)?;
         Ok(())
     }
 
@@ -1938,14 +1946,18 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
+        let pre_scratch = self.capture_pre_mutation_scratch_context_in_txn(&txn)?;
         Self::apply_replica_serving_state_in_txn_with(
             &txn,
             events,
             reject_stale_ready_growth,
             discard_unchanged,
         )?;
+        let scratch_outcome =
+            self.reconcile_scratch_after_tracked_mutations_in_txn(&txn, &pre_scratch)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.finish_scratch_reconciliation(scratch_outcome)?;
         Ok(())
     }
 
@@ -2322,15 +2334,19 @@ impl RedbMetaEngine {
             return Ok(false);
         }
         let txn = self.begin_write_txn()?;
+        let pre_scratch = self.capture_pre_mutation_scratch_context_in_txn(&txn)?;
         let changed =
             Self::reconcile_regular_file_serving_from_base_with_protected_dentries_in_txn(
                 &txn,
                 inodes,
                 protected_dentry_keys,
             )?;
+        let scratch_outcome =
+            self.reconcile_scratch_after_tracked_mutations_in_txn(&txn, &pre_scratch)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(changed)
+        self.finish_scratch_reconciliation(scratch_outcome)?;
+        Ok(changed || scratch_outcome.changed)
     }
 
     pub(crate) fn reconcile_regular_file_serving_from_base_with_protected_dentries_in_txn(
@@ -2550,14 +2566,18 @@ impl RedbMetaEngine {
         }
 
         let txn = self.begin_write_txn()?;
+        let pre_scratch = self.capture_pre_mutation_scratch_context_in_txn(&txn)?;
         let changed = Self::reconcile_serving_dentries_from_base_in_txn(
             &txn,
             dentry_keys,
             protected_dentry_keys,
         )?;
+        let scratch_outcome =
+            self.reconcile_scratch_after_tracked_mutations_in_txn(&txn, &pre_scratch)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(changed)
+        self.finish_scratch_reconciliation(scratch_outcome)?;
+        Ok(changed || scratch_outcome.changed)
     }
 
     pub(crate) fn serving_dentry_keys_for_inode_in_txn(
@@ -2766,6 +2786,7 @@ impl RedbMetaEngine {
         entry: &DirEntryValue,
     ) -> MetaResult<()> {
         let txn = self.begin_write_txn()?;
+        let pre_scratch = self.capture_pre_mutation_scratch_context_in_txn(&txn)?;
         Self::reconcile_serving_rename_from_base_in_txn(
             &txn,
             parent,
@@ -2775,8 +2796,11 @@ impl RedbMetaEngine {
             entry,
             &mut ReplayLocalJournal::default(),
         )?;
+        let scratch_outcome =
+            self.reconcile_scratch_after_tracked_mutations_in_txn(&txn, &pre_scratch)?;
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.finish_scratch_reconciliation(scratch_outcome)?;
         Ok(())
     }
 

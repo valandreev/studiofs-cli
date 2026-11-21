@@ -621,6 +621,7 @@ impl RedbMetaEngine {
         Self::pending_recovery_object_ids_from_read_txn(&txn, &mut refs)?;
         if include_scratch {
             Self::regular_file_graph_object_ids_from_table(&txn, SCRATCH_OVERLAY, &mut refs)?;
+            Self::scratch_orphan_object_ids_from_read_txn(&txn, &mut refs)?;
         }
         Ok(refs)
     }

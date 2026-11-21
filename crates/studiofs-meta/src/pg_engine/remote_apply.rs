@@ -253,6 +253,7 @@ pub(super) struct RemoteReplayApplyOutcome {
     /// Whether applying the page changed the local serving view, which the
     /// coherence contract makes observable as a journaled invalidation.
     pub(super) serving_reconciled: bool,
+    pub(super) scratch_reconciliation: crate::redb_engine::ScratchReconciliationOutcome,
 }
 
 pub(super) struct RemoteReplayApplyContext {
@@ -1772,6 +1773,13 @@ impl<'a> RemoteApplyCoordinator<'a> {
         base_protected_regular_file_inodes: &HashSet<Ino>,
     ) -> MetaResult<RemoteApplyBatchOutcome> {
         let txn = self.local.begin_write_txn()?;
+        let pre_scratch = match self.local.capture_pre_mutation_scratch_context_in_txn(&txn) {
+            Ok(pre) => pre,
+            Err(error) => {
+                let _ = txn.abort();
+                return Err(error);
+            }
+        };
         let result = self.apply_foreign_batch_in_txn(
             &txn,
             batch_events,
@@ -1780,9 +1788,14 @@ impl<'a> RemoteApplyCoordinator<'a> {
             false,
         );
         match result {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                let scratch_outcome = self
+                    .local
+                    .reconcile_scratch_after_tracked_mutations_in_txn(&txn, &pre_scratch)?;
+                outcome.changed |= scratch_outcome.changed;
                 txn.commit()
                     .map_err(|error| MetaError::Storage(error.to_string()))?;
+                self.local.finish_scratch_reconciliation(scratch_outcome)?;
                 Ok(outcome)
             }
             Err(error) => {
@@ -2710,15 +2723,26 @@ impl<'a> RemoteApplyCoordinator<'a> {
             return Ok(false);
         }
         let txn = self.local.begin_write_txn()?;
+        let pre_scratch = match self.local.capture_pre_mutation_scratch_context_in_txn(&txn) {
+            Ok(pre) => pre,
+            Err(error) => {
+                let _ = txn.abort();
+                return Err(error);
+            }
+        };
         match self.reconcile_serving_dentries_from_base_with_overlay_in_txn(
             &txn,
             dentry_keys,
             overlay,
         ) {
             Ok(changed) => {
+                let scratch_outcome = self
+                    .local
+                    .reconcile_scratch_after_tracked_mutations_in_txn(&txn, &pre_scratch)?;
                 txn.commit()
                     .map_err(|error| MetaError::Storage(error.to_string()))?;
-                Ok(changed)
+                self.local.finish_scratch_reconciliation(scratch_outcome)?;
+                Ok(changed || scratch_outcome.changed)
             }
             Err(error) => {
                 let _ = txn.abort();
@@ -2773,6 +2797,8 @@ impl<'a> RemoteApplyCoordinator<'a> {
             Ok(outcome) => {
                 txn.commit()
                     .map_err(|error| MetaError::Storage(error.to_string()))?;
+                self.local
+                    .finish_scratch_reconciliation(outcome.scratch_reconciliation)?;
                 Ok(outcome)
             }
             Err(error) => {
@@ -2797,8 +2823,12 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 max_namespace_version: context.current_namespace_version,
                 flushed_event_seq: None,
                 serving_reconciled: false,
+                scratch_reconciliation: Default::default(),
             });
         }
+        let pre_scratch = self
+            .local
+            .capture_pre_mutation_scratch_context_in_txn(txn)?;
         // The caller sampled these bounds before acquiring this write transaction.
         // A foreground namespace write can commit in between, so extend replay
         // protection from that captured boundary using this transaction's view.
@@ -3158,6 +3188,10 @@ impl<'a> RemoteApplyCoordinator<'a> {
                 RedbMetaEngine::invalidate_serving_binding_in_txn(txn, parent, name, ino)?;
             }
         }
+        let scratch_reconciliation = self
+            .local
+            .reconcile_scratch_after_tracked_mutations_in_txn(txn, &pre_scratch)?;
+        applied_any |= scratch_reconciliation.changed;
         if let Some(execution) = execution {
             execution.check()?;
         }
@@ -3167,6 +3201,7 @@ impl<'a> RemoteApplyCoordinator<'a> {
             max_namespace_version,
             flushed_event_seq: acknowledged_flushed_event_seq,
             serving_reconciled: txn.has_serving_corrections(),
+            scratch_reconciliation,
         })
     }
 

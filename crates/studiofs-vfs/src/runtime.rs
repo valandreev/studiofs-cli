@@ -336,6 +336,12 @@ impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
     forward_method!(fn get_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>);
     forward_method!(fn remove_scratch_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<()>);
     forward_method!(fn list_scratch_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>>);
+    forward_method!(fn list_scratch_conflicts(&self) -> MetaResult<Vec<studiofs_meta::ScratchConflictRecord>>);
+    forward_method!(fn clear_scratch_conflict(&self, ino: Ino) -> MetaResult<bool>);
+    forward_method!(fn list_scratch_orphans(&self) -> MetaResult<Vec<studiofs_meta::ScratchOrphanRecord>>);
+    forward_method!(fn restore_scratch_orphan(&self, timestamp_unix_ms: u64, root_old_path: &[u8], target_parent: Option<Ino>, target_name: Option<&[u8]>) -> MetaResult<InodeAttr>);
+    forward_method!(fn set_scratch_cache_dir(&self, cache_dir: std::path::PathBuf) -> MetaResult<()>);
+    forward_method!(fn scratch_orphans_dir(&self) -> MetaResult<std::path::PathBuf>);
     forward_method!(fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>>);
     forward_method!(fn store_ignore_rules_cache(&self, snapshot: &[u8]) -> MetaResult<()>);
     forward_method!(fn metadata_write_observability(&self) -> MetadataWriteObservability);

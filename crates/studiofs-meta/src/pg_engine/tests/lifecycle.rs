@@ -7785,6 +7785,7 @@ fn replay_position_does_not_regress_flushed_event_seq() {
         max_namespace_version: 3,
         flushed_event_seq: Some(19),
         serving_reconciled: true,
+        scratch_reconciliation: Default::default(),
     })
     .expect("persist replay position");
 

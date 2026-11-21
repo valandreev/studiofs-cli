@@ -159,6 +159,41 @@ impl MetaEngineCore for PgMetaEngine {
         self.local.list_scratch_xattrs(ino)
     }
 
+    fn list_scratch_conflicts(&self) -> MetaResult<Vec<crate::engine::ScratchConflictRecord>> {
+        self.local.list_scratch_conflicts()
+    }
+
+    fn clear_scratch_conflict(&self, ino: Ino) -> MetaResult<bool> {
+        self.local.clear_scratch_conflict(ino)
+    }
+
+    fn list_scratch_orphans(&self) -> MetaResult<Vec<crate::engine::ScratchOrphanRecord>> {
+        self.local.list_scratch_orphans()
+    }
+
+    fn restore_scratch_orphan(
+        &self,
+        timestamp_unix_ms: u64,
+        root_old_path: &[u8],
+        target_parent: Option<Ino>,
+        target_name: Option<&[u8]>,
+    ) -> MetaResult<InodeAttr> {
+        self.local.restore_scratch_orphan(
+            timestamp_unix_ms,
+            root_old_path,
+            target_parent,
+            target_name,
+        )
+    }
+
+    fn set_scratch_cache_dir(&self, cache_dir: std::path::PathBuf) -> MetaResult<()> {
+        self.local.set_scratch_cache_dir(cache_dir)
+    }
+
+    fn scratch_orphans_dir(&self) -> MetaResult<std::path::PathBuf> {
+        self.local.scratch_orphans_dir()
+    }
+
     fn load_ignore_rules_cache(&self) -> MetaResult<Option<Vec<u8>>> {
         self.local.load_ignore_rules_cache()
     }

@@ -116,6 +116,36 @@ impl<M> MetaEngineCore for ReadOnlyMetaEngine<M>
 where
     M: ?Sized + MetaEngine,
 {
+    fn list_scratch_conflicts(&self) -> MetaResult<Vec<ScratchConflictRecord>> {
+        self.inner.list_scratch_conflicts()
+    }
+
+    fn clear_scratch_conflict(&self, ino: Ino) -> MetaResult<bool> {
+        Err(read_only_error(ino))
+    }
+
+    fn list_scratch_orphans(&self) -> MetaResult<Vec<ScratchOrphanRecord>> {
+        self.inner.list_scratch_orphans()
+    }
+
+    fn restore_scratch_orphan(
+        &self,
+        _timestamp_unix_ms: u64,
+        _root_old_path: &[u8],
+        target_parent: Option<Ino>,
+        _target_name: Option<&[u8]>,
+    ) -> MetaResult<InodeAttr> {
+        Err(read_only_error(target_parent.unwrap_or(ROOT_INO)))
+    }
+
+    fn set_scratch_cache_dir(&self, _cache_dir: std::path::PathBuf) -> MetaResult<()> {
+        Err(read_only_error(ROOT_INO))
+    }
+
+    fn scratch_orphans_dir(&self) -> MetaResult<std::path::PathBuf> {
+        self.inner.scratch_orphans_dir()
+    }
+
     fn metadata_write_observability(&self) -> MetadataWriteObservability {
         self.inner.metadata_write_observability()
     }
