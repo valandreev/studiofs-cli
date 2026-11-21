@@ -537,3 +537,44 @@ fn scratch_admission_reads_only_the_cached_reserve_sample() {
     assert!(backend.contains(1) && backend.contains(2) && backend.contains(4));
     platform::FILESYSTEM_SPACE_QUERIES.with(|calls| assert_eq!(calls.get(), 0));
 }
+
+#[test]
+fn scratch_rows_do_not_consume_physical_pressure_scan_budget() {
+    let temp = studiofs_test_support::workspace_target_tempdir("scratch-disk-pressure-visits-");
+    let layout = LocalPayloadLayout::from_cache_root(temp.path());
+    layout.provision().unwrap();
+    let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+        LocalPayloadBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x88; 16],
+        },
+        Some(1 << 30),
+        LocalPayloadSyncMode::Fast,
+    )
+    .unwrap();
+
+    let scratch_puts: Vec<_> = (1..=600)
+        .map(|object_id| LocalPayloadPut {
+            object_id,
+            data: Bytes::from_static(b"scratch"),
+            evictable: false,
+        })
+        .collect();
+    backend.put_scratch_batch(&scratch_puts).unwrap();
+    backend.put(601, &[0x11; 32], true).unwrap();
+    backend.put(602, &[0x22; 32], true).unwrap();
+
+    let visited_before = backend.eviction_scan_visited_rows();
+    backend
+        .run_disk_pressure_maintenance(Instant::now(), |_| Ok(space(0, TOTAL_BYTES)))
+        .unwrap();
+    let visited_after = backend.eviction_scan_visited_rows();
+
+    assert_eq!(visited_after - visited_before, 2);
+    assert!(!backend.contains(601));
+    assert!(!backend.contains(602));
+    assert_eq!(backend.object_ids().len(), 600);
+    assert_eq!(backend.index.stats().unwrap().scratch_bytes, 600 * 7);
+    assert_eq!(backend.get(1).unwrap().as_ref(), b"scratch");
+    assert_eq!(backend.get(600).unwrap().as_ref(), b"scratch");
+}

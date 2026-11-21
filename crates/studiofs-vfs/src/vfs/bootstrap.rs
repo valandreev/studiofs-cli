@@ -1409,6 +1409,9 @@ mod tests {
 const SCRATCH_PROMOTE_ENTRY_LIMIT_ENV: &str = "STUDIOFS_SCRATCH_PROMOTE_ENTRY_LIMIT";
 const DEFAULT_SCRATCH_PROMOTE_ENTRY_LIMIT: usize = 100_000;
 
+/// Maximum number of entries a single scratch promote may move, read from
+/// `STUDIOFS_SCRATCH_PROMOTE_ENTRY_LIMIT`; missing, zero, or invalid values
+/// fall back to the default of 100 000. Larger promotes fail with `EXDEV`.
 pub fn scratch_promote_entry_limit_from_env() -> usize {
     parse_scratch_promote_entry_limit(
         std::env::var(SCRATCH_PROMOTE_ENTRY_LIMIT_ENV)

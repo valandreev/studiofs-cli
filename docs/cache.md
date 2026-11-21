@@ -44,7 +44,10 @@ normal disk-full errors.
 
 Scratch payloads (ADR 0014) use the same object files with a `Scratch` origin.
 They are never evictable, never pending upload, and excluded from the cache
-budget through a separate `scratch_bytes` counter. A scratch batch writes its
+budget through a separate `scratch_bytes` counter. They are also excluded from
+the `access_order` index so budget and physical-pressure eviction passes do not
+scan them; opening an older cache index prunes any pre-existing scratch links
+from `access_order` once on startup. A scratch batch writes its
 files durably before the index row commits. It is rejected with `StorageFull`
 when the cached sample shows available space below the 10% reserve; admission
 never samples the filesystem, and no sample admits the write.

@@ -367,6 +367,7 @@ pub struct LocalPayloadBackendRuntime {
     disk_pressure_refresh_requested: AtomicBool,
     payload_mutation_gates: [Mutex<()>; PAYLOAD_MUTATION_STRIPES],
     runtime_pinned: Mutex<RuntimePins>,
+    eviction_scan_visited_rows: AtomicU64,
     eviction_scan_skipped_non_evictable: AtomicU64,
     access_touch: AccessTouchFlusher,
     last_dirty_orphan_prune_at: Mutex<Instant>,
@@ -606,6 +607,7 @@ impl LocalPayloadBackendRuntime {
             disk_pressure_refresh_requested: AtomicBool::new(false),
             payload_mutation_gates: std::array::from_fn(|_| Mutex::new(())),
             runtime_pinned: Mutex::new(RuntimePins::default()),
+            eviction_scan_visited_rows: AtomicU64::new(0),
             eviction_scan_skipped_non_evictable: AtomicU64::new(0),
             last_dirty_orphan_prune_at: Mutex::new(
                 Instant::now()
@@ -838,6 +840,7 @@ impl LocalPayloadBackendRuntime {
     // The caller holds the object's mutation stripe through removal.
     fn can_evict_locked(&self, entry: &CacheIndexEntry) -> bool {
         entry.evictable
+            && entry.origin != LocalPayloadOrigin::Scratch
             && entry.lifecycle == LocalPayloadLifecycleState::Uploaded
             && entry.upload_state == LocalPayloadUploadState::None
             && !self.is_runtime_pinned(entry.object_id)
@@ -999,6 +1002,11 @@ impl LocalPayloadBackendRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn eviction_scan_visited_rows(&self) -> u64 {
+        self.eviction_scan_visited_rows.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     fn low_space_progress_wait_count(&self) -> u64 {
         self.low_space_progress_waits.load(Ordering::Relaxed)
     }
@@ -1050,7 +1058,13 @@ impl LocalPayloadBackendRuntime {
             let page = self
                 .index
                 .eviction_candidates_page_stats(cursor, EVICTION_CANDIDATE_PAGE_SIZE)?;
+            self.eviction_scan_visited_rows
+                .fetch_add(page.scanned_rows, Ordering::Relaxed);
             if page.entries.is_empty() {
+                if page.skipped_non_evictable > 0 {
+                    self.eviction_scan_skipped_non_evictable
+                        .fetch_add(page.skipped_non_evictable, Ordering::Relaxed);
+                }
                 break;
             }
             cursor = page.entries.last().map(|entry| entry.access_order);
@@ -1956,7 +1970,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     }
 
     fn object_ids(&self) -> Vec<u64> {
-        match self.index.access_order_object_ids() {
+        match self.index.all_object_ids() {
             Ok(object_ids) => object_ids,
             Err(error) => {
                 warn!(error = ?error, "local payload runtime index object id snapshot failed");
@@ -4483,6 +4497,114 @@ mod tests {
         );
         assert!(backend.contains(30));
         assert!(backend.contains(32));
+    }
+
+    #[test]
+    fn scratch_rows_do_not_increase_budget_eviction_scan_visits() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-budget-visits-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+            LocalPayloadBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x99; 16],
+            },
+            Some(96),
+            LocalPayloadSyncMode::Fast,
+        )
+        .unwrap();
+
+        let before_puts: Vec<_> = (1..=600)
+            .map(|object_id| LocalPayloadPut {
+                object_id,
+                data: Bytes::from_static(b"scratch"),
+                evictable: false,
+            })
+            .collect();
+        backend.put_scratch_batch(&before_puts).unwrap();
+
+        for object_id in 10_000..10_003 {
+            backend
+                .put(object_id, &[object_id as u8; 32], true)
+                .unwrap();
+        }
+
+        let after_puts: Vec<_> = (20_000..20_600)
+            .map(|object_id| LocalPayloadPut {
+                object_id,
+                data: Bytes::from_static(b"scratch"),
+                evictable: false,
+            })
+            .collect();
+        backend.put_scratch_batch(&after_puts).unwrap();
+
+        assert_eq!(backend.get(1).unwrap().as_ref(), b"scratch");
+        assert_eq!(backend.get(20_000).unwrap().as_ref(), b"scratch");
+        backend.flush_access_touches(true, "test");
+
+        let expected_scratch_bytes = 1_200 * 7;
+        let initial_stats = backend.index.stats().unwrap();
+        assert_eq!(initial_stats.scratch_bytes, expected_scratch_bytes);
+        assert_eq!(initial_stats.budgeted_bytes(), 96);
+
+        // Foreground admission (enforce_budget_before_put) visits only the 3 evictable rows.
+        let visited_before = backend.eviction_scan_visited_rows();
+        let skipped_before = backend
+            .eviction_scan_skipped_non_evictable
+            .load(Ordering::Relaxed);
+        backend.put(10_003, &[0xDD; 32], true).unwrap();
+        let visited_after = backend.eviction_scan_visited_rows();
+        let skipped_after = backend
+            .eviction_scan_skipped_non_evictable
+            .load(Ordering::Relaxed);
+        assert_eq!(visited_after - visited_before, 3);
+        assert_eq!(skipped_after - skipped_before, 0);
+        assert!(!backend.contains(10_000));
+        assert!(backend.contains(10_001));
+        assert!(backend.contains(10_002));
+        assert!(backend.contains(10_003));
+        let after_put_stats = backend.index.stats().unwrap();
+        assert_eq!(after_put_stats.scratch_bytes, expected_scratch_bytes);
+        assert_eq!(after_put_stats.budgeted_bytes(), 96);
+
+        // Background budget maintenance (try_evict_to_target_bytes) visits only the 3 evictable rows.
+        let visited_before = backend.eviction_scan_visited_rows();
+        let skipped_before = backend
+            .eviction_scan_skipped_non_evictable
+            .load(Ordering::Relaxed);
+        backend.run_budget_pressure_maintenance_for_test().unwrap();
+        let visited_after = backend.eviction_scan_visited_rows();
+        let skipped_after = backend
+            .eviction_scan_skipped_non_evictable
+            .load(Ordering::Relaxed);
+        assert_eq!(visited_after - visited_before, 3);
+        assert_eq!(skipped_after - skipped_before, 0);
+        assert!(!backend.contains(10_001));
+        let after_bg_stats = backend.index.stats().unwrap();
+        assert!(after_bg_stats.budgeted_bytes() <= 76);
+        assert_eq!(after_bg_stats.scratch_bytes, expected_scratch_bytes);
+
+        // Explicit eviction to zero visits only the 2 remaining evictable rows.
+        let visited_before = backend.eviction_scan_visited_rows();
+        let skipped_before = backend
+            .eviction_scan_skipped_non_evictable
+            .load(Ordering::Relaxed);
+        backend.evict_to_target_bytes(0, "test_drain").unwrap();
+        let visited_after = backend.eviction_scan_visited_rows();
+        let skipped_after = backend
+            .eviction_scan_skipped_non_evictable
+            .load(Ordering::Relaxed);
+        assert_eq!(visited_after - visited_before, 2);
+        assert_eq!(skipped_after - skipped_before, 0);
+        let final_stats = backend.index.stats().unwrap();
+        assert_eq!(final_stats.budgeted_bytes(), 0);
+        assert_eq!(final_stats.scratch_bytes, expected_scratch_bytes);
+
+        let remaining_ids = backend.object_ids();
+        assert_eq!(remaining_ids.len(), 1_200);
+        assert_eq!(backend.get(600).unwrap().as_ref(), b"scratch");
+        assert_eq!(backend.get(20_599).unwrap().as_ref(), b"scratch");
     }
 
     #[test]

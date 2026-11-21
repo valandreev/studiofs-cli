@@ -330,14 +330,14 @@ fn prune_all_payloads(
     let mut cursor = None;
     let mut removed_total = 0_u64;
     loop {
-        let page = index.access_order_object_ids_page(cursor, LIST_PAGE_SIZE)?;
+        let page = index.object_ids_page(cursor, LIST_PAGE_SIZE)?;
         if page.is_empty() {
             break;
         }
-        cursor = page.last().map(|(_, access_order)| *access_order);
+        cursor = page.last().copied();
 
         let mut stale_ids = Vec::new();
-        for (object_id, _) in page {
+        for object_id in page {
             if !payload_exists(layout, object_id)? {
                 stale_ids.push(object_id);
             }
@@ -925,5 +925,35 @@ mod tests {
 
         assert!(report.is_clean());
         assert_eq!(std::fs::read(&unrelated_path).unwrap(), b"keep-me");
+    }
+
+    #[test]
+    fn startup_reconcile_full_prunes_missing_scratch_payload_entry() {
+        let temp = studiofs_test_support::workspace_target_tempdir("test-scratch-reconcile-");
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        index
+            .upsert(super::super::CacheIndexUpsert {
+                object_id: 77,
+                payload_key: payload_key(&layout, 77),
+                payload_len: 12,
+                lifecycle: LocalPayloadLifecycleState::Uploaded,
+                origin: LocalPayloadOrigin::Scratch,
+                upload_state: LocalPayloadUploadState::None,
+                evictable: false,
+            })
+            .unwrap();
+        assert_eq!(index.stats().unwrap().scratch_bytes, 12);
+
+        let report =
+            reconcile_startup_state(&layout, &index, LocalPayloadStartupReconcileMode::Full)
+                .unwrap();
+
+        assert_eq!(report.stale_index_entries_removed, 1);
+        assert!(index.get_entry(77).unwrap().is_none());
+        assert_eq!(index.stats().unwrap().scratch_bytes, 0);
+        assert_eq!(index.stats().unwrap().current_bytes, 0);
     }
 }
