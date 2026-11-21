@@ -2428,6 +2428,42 @@ pub struct VfsCacheScrubProgress {
     pub last_object_id: Option<u64>,
 }
 
+/// Scratch directory subtree skipped because it exceeded the automatic promotion entry limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchPromoteOverLimitEntry {
+    /// Inode number of the skipped scratch directory.
+    pub dir_ino: u64,
+    /// Path relative to the volume root.
+    pub relative_path: String,
+    /// Number of entries observed in the subtree (including the directory itself).
+    pub entry_count: usize,
+    /// Configured `STUDIOFS_SCRATCH_PROMOTE_ENTRY_LIMIT` threshold that was exceeded.
+    pub entry_limit: usize,
+}
+
+/// Observability snapshot for the background scratch-layer automatic promotion worker.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VfsScratchAutoPromoteSnapshot {
+    /// Configured maximum entries per scratch directory subtree during automatic promotion.
+    pub entry_limit: usize,
+    /// Number of rule-change promotion passes completed.
+    pub passes_completed: u64,
+    /// Ignore-rule generation observed when the most recent completed pass started.
+    #[serde(default)]
+    pub last_rule_generation: u64,
+    /// Total scratch entries automatically promoted to tracked storage.
+    pub promoted_entries: u64,
+    /// Total automatic promotions that renamed the target to avoid a tracked-base name collision.
+    pub conflict_renames: u64,
+    /// Total candidate promotions that failed transiently.
+    pub failed_entries: u64,
+    /// Configured promotion rate limit in entries per second.
+    pub rate_limit_per_sec: u64,
+    /// Scratch directory subtrees currently blocked by the entry limit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub over_limit_directories: Vec<ScratchPromoteOverLimitEntry>,
+}
+
 /// Runtime event emitted by metrics stream.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VfsRuntimeEvent {

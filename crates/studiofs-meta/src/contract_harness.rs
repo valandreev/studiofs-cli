@@ -858,6 +858,29 @@ impl ContractTempDir {
     }
 }
 
+/// Project local journal events through the production PostgreSQL batch projection rules.
+pub fn project_local_events_for_replay(events: &[crate::MetaEvent]) -> Vec<crate::MetaEvent> {
+    crate::pg_engine::project_local_events_for_replay_inner(events)
+}
+
+/// Replay ordered `(batch_version, events, is_self_batch)` batches through ADR 0012
+/// canonicalization and serving-state reconciliation on a local `RedbMetaEngine`.
+pub fn replay_ordered_batches_with_adr_0012(
+    local: &RedbMetaEngine,
+    batches: Vec<(i64, Vec<crate::MetaEvent>, bool)>,
+    last_seq: i64,
+    flushed_event_seq: u64,
+    next_event_seq: u64,
+) -> MetaResult<()> {
+    crate::pg_engine::replay_ordered_batches_with_adr_0012_inner(
+        local,
+        batches,
+        last_seq,
+        flushed_event_seq,
+        next_event_seq,
+    )
+}
+
 fn sanitize_label(label: &str) -> String {
     let sanitized: String = label
         .chars()

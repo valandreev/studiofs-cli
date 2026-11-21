@@ -294,6 +294,11 @@ impl RuleInodes {
 }
 
 impl StudioVfs {
+    /// Returns the monotonically increasing ignore-rule snapshot generation.
+    pub(super) fn ignore_rule_generation(&self) -> u64 {
+        self.ignore_rules.rule_generation.load(Ordering::Acquire)
+    }
+
     /// Classify a canonical volume-relative byte path using the current snapshot.
     pub fn classify_scratch_path(&self, path: &[u8], is_dir: bool) -> ScratchClass {
         let snapshot = Arc::clone(&self.ignore_rules.snapshot.read());
@@ -303,7 +308,10 @@ impl StudioVfs {
     /// Resolve the canonical volume-relative byte path of a tracked directory.
     ///
     /// Returns `Ok(None)` when the directory is no longer bound in metadata.
-    fn resolve_tracked_directory_path(&self, dir_ino: Ino) -> VfsResult<Option<Vec<u8>>> {
+    pub(super) fn resolve_tracked_directory_path(
+        &self,
+        dir_ino: Ino,
+    ) -> VfsResult<Option<Vec<u8>>> {
         if dir_ino == ROOT_INO {
             return Ok(Some(Vec::new()));
         }

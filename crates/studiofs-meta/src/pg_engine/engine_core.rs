@@ -132,6 +132,21 @@ impl MetaEngineCore for PgMetaEngine {
         self.mutate(|local| local.promote_scratch_entry(source, target, ino, frozen, replace))
     }
 
+    fn list_tracked_parent_scratch_entries(&self) -> MetaResult<Vec<(Ino, Vec<u8>, InodeAttr)>> {
+        self.local.list_tracked_parent_scratch_entries()
+    }
+
+    fn promote_scratch_auto(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        ino: Ino,
+        frozen: &std::collections::HashSet<Ino>,
+        conflict_client: &str,
+    ) -> MetaResult<crate::engine::ScratchAutoPromoteResult> {
+        self.mutate(|local| local.promote_scratch_auto(parent, name, ino, frozen, conflict_client))
+    }
+
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {
         self.local.set_scratch_xattr(ino, name, value)
     }

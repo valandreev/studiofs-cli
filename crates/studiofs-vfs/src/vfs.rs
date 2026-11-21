@@ -49,6 +49,7 @@ mod read_context;
 mod read_path;
 mod retained_views;
 mod runtime_stats_surface;
+mod scratch_auto_promote;
 mod scratch_storage;
 mod startup;
 mod startup_replay;
@@ -58,6 +59,7 @@ mod upload_lifecycle;
 mod workers;
 mod writer_stack;
 
+pub use bootstrap::scratch_promote_entry_limit_from_env;
 /// Public VFS configuration types used by clients and tests.
 pub use config::{
     ExplicitFlushOutcome, LocalSyncPolicy, ReleaseFhOutcome, VfsConfig, VfsConfigRaw,
@@ -72,16 +74,17 @@ pub use locking::LockKind;
 pub use metrics::{
     LogicalQuotaStatus, RUNTIME_STATS_SCHEMA_VERSION, RUNTIME_STATS_SECTIONS, RuntimeLatencyBucket,
     RuntimeLatencyHistogram, RuntimeScalarMetric, RuntimeStatsParseError, RuntimeStatsSection,
-    RuntimeStatsSnapshot, StatFs, VfsAttrReadCacheSnapshot, VfsCachePipelineMaterializeStats,
-    VfsCachePipelineStats, VfsCacheScrubCorruption, VfsCacheScrubProgress, VfsCacheScrubSnapshot,
-    VfsCacheStateSnapshot, VfsFetchStats, VfsForegroundReadProtectionStats,
-    VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot, VfsFuseCallbackStats,
-    VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot, VfsFuseIoStats, VfsIngressLane,
-    VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsLinuxFuseOpenCacheStats,
-    VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats, VfsMacFuseOpenMemoryDirectIo,
-    VfsNamespaceCacheSnapshot, VfsNamespaceCreateObservabilityStats, VfsPortableAllocatorStats,
-    VfsReadPathStats, VfsRuntimeEvent, VfsSyncSafetyReason, VfsSyncSafetySnapshot,
-    VfsSyncSafetyState, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    RuntimeStatsSnapshot, ScratchPromoteOverLimitEntry, StatFs, VfsAttrReadCacheSnapshot,
+    VfsCachePipelineMaterializeStats, VfsCachePipelineStats, VfsCacheScrubCorruption,
+    VfsCacheScrubProgress, VfsCacheScrubSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
+    VfsForegroundReadProtectionStats, VfsFuseAsyncReadSnapshot, VfsFuseAsyncWriteSnapshot,
+    VfsFuseCallbackStats, VfsFuseConnectionSnapshot, VfsFuseInvalidationSnapshot, VfsFuseIoStats,
+    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
+    VfsLinuxFuseOpenCacheStats, VfsMacFuseOpenCacheDecision, VfsMacFuseOpenCacheStats,
+    VfsMacFuseOpenMemoryDirectIo, VfsNamespaceCacheSnapshot, VfsNamespaceCreateObservabilityStats,
+    VfsPortableAllocatorStats, VfsReadPathStats, VfsRuntimeEvent, VfsScratchAutoPromoteSnapshot,
+    VfsSyncSafetyReason, VfsSyncSafetySnapshot, VfsSyncSafetyState,
+    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
     VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
     VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
     VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
@@ -104,6 +107,7 @@ pub use runtime_stats_surface::{
     RUNTIME_STATS_FILE_INO, RUNTIME_STATS_FILE_NAME, RUNTIME_STATS_FILE_NAME_STR,
     RUNTIME_STATS_FILE_REPORTED_SIZE, read_runtime_stats_buffer,
 };
+pub use scratch_auto_promote::find_over_limit_scratch_directories;
 
 use crate::coherence::{CoherenceHealthBudget, CoherenceHealthSnapshot, CoherenceHealthTracker};
 use acl::AclState;
@@ -4255,6 +4259,7 @@ pub struct StudioVfs {
     disable_background_slab_flush: bool,
     cache_scrub: Option<workers::CacheScrubConfig>,
     cache_scrub_stats: Mutex<VfsCacheScrubSnapshot>,
+    scratch_auto_promote: scratch_auto_promote::ScratchAutoPromoteState,
     publish_visibility_timeout: Duration,
     /// Sequential read-ahead tracker.
     readahead: Arc<ReadAheadTracker>,
@@ -5530,11 +5535,19 @@ impl StudioVfs {
         }: StartupChannels,
     ) -> VfsResult<()> {
         self.run_startup_local_metadata_compaction();
+        let scratch_rules_rx =
+            (!self.read_only_mount).then(|| self.subscribe_ignore_rules_changes());
         // After compaction, whose exclusive database lock a rule scan would contend.
         let vfs = self.clone();
         self.spawn_background_cleanup_task_on(&tokio::runtime::Handle::current(), async move {
             vfs.background_ignore_rules().await;
         });
+        if let Some(rules_rx) = scratch_rules_rx {
+            let vfs = self.clone();
+            self.spawn_background_cleanup_task_on(&tokio::runtime::Handle::current(), async move {
+                vfs.background_scratch_auto_promote(rules_rx).await;
+            });
+        }
         self.spawn_landing_zone_recovery_worker();
         self.spawn_aggressive_materialization_worker();
         self.spawn_local_dirty_flush_worker();

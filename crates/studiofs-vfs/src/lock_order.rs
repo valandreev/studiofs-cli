@@ -81,6 +81,14 @@
 //! a deferred enqueue cannot race the tracked-to-scratch move; nothing else is
 //! awaited while that mutex is held.
 //!
+//! Automatic scratch promotion on rule removal follows the same restore order:
+//! `mutating_operation_gate` is only taken via `try_read` per candidate
+//! (never across pacing sleeps or `qos.wait_foreground_local_io_idle`), then
+//! `wait_for_deferred_namespace_entry`, `retained_restore_gate`, ascending
+//! `FileSessionOperation::Restore` permits, `flush_retained_source_ordered`,
+//! local redb metadata commit (`promote_scratch_auto`), `record_live_extents`,
+//! `submit_uploads_batch`, and `scratch_auto_promote` snapshot/watch state.
+//!
 //! With `LocalPayloadBackendRuntime`, cached-store first/final pin transitions
 //! acquire locks in this order:
 //! `CachedStore::pinned` -> local backend payload mutation stripe gates ->

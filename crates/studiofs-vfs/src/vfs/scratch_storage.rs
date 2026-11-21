@@ -705,21 +705,64 @@ mod tests {
             let normal = vfs.create(ROOT_INO, b"normal.txt", 0, 0, 0o644).unwrap();
             assert!(!vfs.is_scratch_inode(normal.ino).unwrap());
 
-            // Changing `.studiofsignore` never reclassifies existing scratch entries on lookup.
+            // Rule changes never change existing tracked entries (`keep.tmp`, `normal.txt`),
+            // while removing rules automatically promotes previously scratch entries whose
+            // parent directory is tracked.
+            let mut auto_status = vfs.subscribe_scratch_auto_promote_status();
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\nbuild/\n*.txt\n!keep.tmp\n").await;
+            let sticky_target = vfs.ignore_rule_generation();
+            let sticky_pass = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if auto_status.borrow().last_rule_generation >= sticky_target {
+                        return;
+                    }
+                    auto_status
+                        .changed()
+                        .await
+                        .expect("auto-promote status channel open");
+                }
+            })
+            .await;
+            assert!(
+                sticky_pass.is_ok(),
+                "auto-promote worker processed rule addition"
+            );
+            assert!(!vfs.is_scratch_inode(keep.ino).unwrap());
+            assert!(!vfs.is_scratch_inode(normal.ino).unwrap());
+
             install_ignore_rules(&vfs, ROOT_INO, b"").await;
+            let clear_target = vfs.ignore_rule_generation();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if auto_status.borrow().last_rule_generation >= clear_target {
+                        return;
+                    }
+                    auto_status
+                        .changed()
+                        .await
+                        .expect("auto-promote status channel open");
+                }
+            })
+            .await
+            .expect("auto-promote pass completed after rule removal");
+
             assert_eq!(
                 vfs.lookup(ROOT_INO, b"scene.tmp").unwrap().ino,
                 tmp_file.ino
             );
-            assert!(vfs.is_scratch_inode(tmp_file.ino).unwrap());
+            assert!(!vfs.is_scratch_inode(tmp_file.ino).unwrap());
             assert_eq!(
                 vfs.lookup(scratch_dir.ino, b"output.txt").unwrap().ino,
                 nested_file.ino
             );
-            assert!(vfs.is_scratch_inode(nested_file.ino).unwrap());
+            assert!(!vfs.is_scratch_inode(scratch_dir.ino).unwrap());
+            assert!(!vfs.is_scratch_inode(nested_file.ino).unwrap());
+            assert!(!vfs.is_scratch_inode(nested_dir.ino).unwrap());
+            assert!(!vfs.is_scratch_inode(nested_link.ino).unwrap());
             // Newly created `.tmp` file under the empty rules is now tracked.
             let after_change = vfs.create(ROOT_INO, b"fresh.tmp", 0, 0, 0o644).unwrap();
             assert!(!vfs.is_scratch_inode(after_change.ino).unwrap());
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
         });
     }
 

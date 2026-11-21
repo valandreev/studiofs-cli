@@ -559,6 +559,7 @@ impl VfsBootstrap {
                     iops: config.cache_scrub_iops,
                 }),
             cache_scrub_stats: Default::default(),
+            scratch_auto_promote: Default::default(),
             publish_visibility_timeout: plan.publish_visibility_timeout,
             readahead: resources.readahead,
             dir_prefetch: resources.dir_prefetch,
@@ -1408,7 +1409,7 @@ mod tests {
 const SCRATCH_PROMOTE_ENTRY_LIMIT_ENV: &str = "STUDIOFS_SCRATCH_PROMOTE_ENTRY_LIMIT";
 const DEFAULT_SCRATCH_PROMOTE_ENTRY_LIMIT: usize = 100_000;
 
-fn scratch_promote_entry_limit_from_env() -> usize {
+pub fn scratch_promote_entry_limit_from_env() -> usize {
     parse_scratch_promote_entry_limit(
         std::env::var(SCRATCH_PROMOTE_ENTRY_LIMIT_ENV)
             .ok()

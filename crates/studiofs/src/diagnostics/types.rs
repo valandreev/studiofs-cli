@@ -89,6 +89,8 @@ pub(crate) struct DiagnosticsProcessSnapshot {
 pub(crate) struct DiagnosticsRuntimeSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_scrub: Option<studiofs_vfs::VfsCacheScrubSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_auto_promote: Option<studiofs_vfs::VfsScratchAutoPromoteSnapshot>,
     #[serde(default)]
     pub logical_quota: Option<studiofs_vfs::LogicalQuotaStatus>,
     pub schema_version: u32,
@@ -118,6 +120,7 @@ impl DiagnosticsRuntimeSnapshot {
     pub(super) fn from_health(health: DiagnosticsHealthSnapshot) -> Self {
         Self {
             cache_scrub: None,
+            scratch_auto_promote: None,
             logical_quota: None,
             schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
             generated_unix_ms: health.generated_unix_ms,

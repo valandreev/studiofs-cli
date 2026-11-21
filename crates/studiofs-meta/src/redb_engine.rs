@@ -1599,6 +1599,21 @@ impl MetaEngineCore for RedbMetaEngine {
         self.promote_scratch(source, target, ino, frozen, replace)
     }
 
+    fn list_tracked_parent_scratch_entries(&self) -> MetaResult<Vec<(Ino, Vec<u8>, InodeAttr)>> {
+        self.list_tracked_parent_scratch_entries_inner()
+    }
+
+    fn promote_scratch_auto(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        ino: Ino,
+        frozen: &HashSet<Ino>,
+        conflict_client: &str,
+    ) -> MetaResult<ScratchAutoPromoteResult> {
+        self.promote_scratch_auto_inner(parent, name, ino, frozen, conflict_client)
+    }
+
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {
         self.write_scratch_xattr(ino, name, value)
     }
