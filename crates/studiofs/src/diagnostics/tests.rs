@@ -691,6 +691,36 @@ fn diagnostics_runtime_snapshot_cache_scrub_is_additive_in_v5() {
 }
 
 #[test]
+fn diagnostics_runtime_snapshot_scratch_auto_promote_is_additive_in_v5() {
+    let mut snapshot = DiagnosticsRuntimeSnapshot {
+        schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
+        generated_unix_ms: 42,
+        ..DiagnosticsRuntimeSnapshot::default()
+    };
+    let encoded_none = serde_json::to_value(&snapshot).unwrap();
+    assert!(encoded_none.get("scratch_auto_promote").is_none());
+
+    snapshot.scratch_auto_promote = Some(studiofs_vfs::VfsScratchAutoPromoteSnapshot {
+        entry_limit: 100_000,
+        passes_completed: 2,
+        last_rule_generation: 2,
+        promoted_entries: 5,
+        conflict_renames: 1,
+        failed_entries: 0,
+        rate_limit_per_sec: 64,
+        over_limit_directories: vec![studiofs_vfs::ScratchPromoteOverLimitEntry {
+            dir_ino: 42,
+            relative_path: "big-cache".to_string(),
+            entry_count: 100_001,
+            entry_limit: 100_000,
+        }],
+    });
+    let encoded_some = serde_json::to_value(&snapshot).unwrap();
+    let decoded: DiagnosticsRuntimeSnapshot = serde_json::from_value(encoded_some).unwrap();
+    assert_eq!(decoded.scratch_auto_promote, snapshot.scratch_auto_promote);
+}
+
+#[test]
 fn diagnostics_runtime_snapshot_round_trips_coherence_health() {
     let snapshot = DiagnosticsRuntimeSnapshot {
         coherence: CoherenceHealthSnapshot {

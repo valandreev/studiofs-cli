@@ -120,6 +120,26 @@ where
         self.inner.list_scratch_conflicts()
     }
 
+    fn list_tracked_parent_scratch_entries(&self) -> MetaResult<Vec<(Ino, Vec<u8>, InodeAttr)>> {
+        self.inner.list_tracked_parent_scratch_entries()
+    }
+
+    fn scratch_replay_merge_generation(&self) -> u64 {
+        self.inner.scratch_replay_merge_generation()
+    }
+
+    fn promote_scratch_auto(
+        &self,
+        parent: Ino,
+        _name: &[u8],
+        _ino: Ino,
+        _frozen: &std::collections::HashSet<Ino>,
+        _kept_scratch: &std::collections::HashSet<Ino>,
+        _conflict_client: &str,
+    ) -> MetaResult<ScratchAutoPromoteResult> {
+        Err(read_only_error(parent))
+    }
+
     fn clear_scratch_conflict(&self, ino: Ino) -> MetaResult<bool> {
         Err(read_only_error(ino))
     }

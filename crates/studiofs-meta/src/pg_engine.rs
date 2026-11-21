@@ -2229,5 +2229,54 @@ pub(crate) fn apply_decoded_batches_for_scratch_test(
     Ok(())
 }
 
+pub(crate) fn project_local_events_for_replay_inner(
+    events: &[crate::events::MetaEvent],
+) -> Vec<crate::events::MetaEvent> {
+    RemoteApplyCoordinator::project_local_batch(events).events
+}
+
+pub(crate) fn replay_ordered_batches_with_adr_0012_inner(
+    local: &RedbMetaEngine,
+    batches: Vec<(i64, Vec<crate::events::MetaEvent>, bool)>,
+    last_seq: i64,
+    flushed_event_seq: u64,
+    next_event_seq: u64,
+) -> MetaResult<()> {
+    let pending_events = if next_event_seq > flushed_event_seq {
+        local.read_events_range(flushed_event_seq, next_event_seq)?
+    } else {
+        Vec::new()
+    };
+    let initial_overlay = RemoteApplyCoordinator::overlay_conflicts_for_events(&pending_events);
+    let decoded = batches
+        .into_iter()
+        .map(
+            |(batch_version, events, is_self_batch)| remote_apply::DecodedReplayBatch {
+                batch_version,
+                events,
+                is_self_batch,
+            },
+        )
+        .collect();
+    let outcome = RemoteApplyCoordinator::new(local).apply_decoded_batches(
+        decoded,
+        None,
+        remote_apply::RemoteReplayApplyContext {
+            last_seq,
+            current_namespace_version: last_seq,
+            flushed_event_seq,
+            next_event_seq,
+            initial_overlay,
+        },
+    )?;
+    if let Some(acked_seq) = outcome.flushed_event_seq {
+        local.set_counter(
+            crate::schema::counters::LOCAL_PG_FLUSHED_EVENT_SEQ,
+            acked_seq,
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests;

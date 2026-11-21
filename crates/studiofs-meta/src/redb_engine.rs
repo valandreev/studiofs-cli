@@ -164,6 +164,8 @@ pub struct RedbMetaEngine {
     relaxed_durability: Option<Arc<RelaxedDurabilityRuntime>>,
     write_txn_lock: Arc<Mutex<()>>,
     scratch_mutation_lock: Mutex<()>,
+    /// Bumped after replay merges a local scratch directory into a tracked one.
+    scratch_replay_merge_generation: std::sync::atomic::AtomicU64,
     scratch_index: RwLock<scratch::ScratchIndex>,
     scratch_cache_dir: RwLock<Option<PathBuf>>,
     invalidation_journal: Mutex<InvalidationJournal>,
@@ -1224,6 +1226,7 @@ impl RedbMetaEngine {
             relaxed_durability,
             write_txn_lock,
             scratch_mutation_lock: Mutex::new(()),
+            scratch_replay_merge_generation: std::sync::atomic::AtomicU64::new(0),
             scratch_index: RwLock::new(scratch::ScratchIndex::default()),
             scratch_cache_dir: RwLock::new(None),
             invalidation_journal: Mutex::default(),
@@ -1280,6 +1283,7 @@ impl RedbMetaEngine {
             relaxed_durability: None,
             write_txn_lock: Arc::new(Mutex::new(())),
             scratch_mutation_lock: Mutex::new(()),
+            scratch_replay_merge_generation: std::sync::atomic::AtomicU64::new(0),
             scratch_index: RwLock::new(scratch::ScratchIndex::default()),
             scratch_cache_dir: RwLock::new(None),
             invalidation_journal: Mutex::default(),
@@ -1597,6 +1601,27 @@ impl MetaEngineCore for RedbMetaEngine {
         replace: bool,
     ) -> MetaResult<(RenameAtomicResult, Vec<InodeAttr>)> {
         self.promote_scratch(source, target, ino, frozen, replace)
+    }
+
+    fn list_tracked_parent_scratch_entries(&self) -> MetaResult<Vec<(Ino, Vec<u8>, InodeAttr)>> {
+        self.list_tracked_parent_scratch_entries_inner()
+    }
+
+    fn scratch_replay_merge_generation(&self) -> u64 {
+        self.scratch_replay_merge_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn promote_scratch_auto(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        ino: Ino,
+        frozen: &HashSet<Ino>,
+        kept_scratch: &HashSet<Ino>,
+        conflict_client: &str,
+    ) -> MetaResult<ScratchAutoPromoteResult> {
+        self.promote_scratch_auto_inner(parent, name, ino, frozen, kept_scratch, conflict_client)
     }
 
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {

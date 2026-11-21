@@ -79,6 +79,7 @@ jobs:
               --scenario mounted-logical-quota
               --scenario mounted-cache-scrub
               --scenario mounted-scratch-demote-two-client
+              --scenario mounted-scratch-auto-promote-two-client
             )
           fi
 

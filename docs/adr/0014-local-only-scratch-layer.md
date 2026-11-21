@@ -107,11 +107,20 @@ source, and ignored -> normal unlinks the source without creating the target.
 - When replay inserts a tracked entry under a name a local scratch entry holds,
   the tracked entry wins. The scratch entry is renamed locally to
   `<name>.scratch-conflict-<n>`, with a log warning and a `status` entry.
+  A tracked directory meeting a scratch directory merges instead (ADR 0012):
+  the scratch children move into the tracked directory and stay scratch,
+  nested directories merge the same way, and other colliding children get the
+  conflict suffix. Automatic promotion then promotes the children that no
+  longer match a rule.
 - Concurrent automatic promotion on several clients follows ADR 0012:
   directories merge, files resolve by last writer. Before promoting, a client
-  checks its local base. If the name is taken, it renames the file to
-  `<name>.scratch-conflict-<client>`. The remaining race equals the ordinary
-  concurrent-create race that ADR 0012 accepts.
+  checks its local base. If the name is taken by a tracked file, it renames the
+  file to `<name>.scratch-conflict-<client>`; a tracked directory merges as on
+  replay. The remaining race equals the ordinary concurrent-create race that
+  ADR 0012 accepts.
+- A pass runs only after the rules stay unchanged for a short quiet period, so
+  an in-place rewrite of `.studiofsignore`, which loads an empty rule set
+  between truncate and write, does not promote every scratch entry.
 - When foreign apply or snapshot restore removes the tracked parent of scratch
   entries, they move to `<cache>/scratch-orphans/<timestamp>/<old path>`
   outside the namespace. `studiofs scratch list --orphaned` shows them and

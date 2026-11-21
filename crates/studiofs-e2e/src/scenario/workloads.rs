@@ -246,6 +246,7 @@ use super::types::{Scenario, ScenarioContext, ScenarioDefinition, ScenarioError}
 mod actions;
 mod advanced_mounted;
 mod assertions;
+mod cache_scrub;
 mod concurrent_mkdir;
 mod faults;
 mod logical_quota;
@@ -257,6 +258,7 @@ mod recoverable_trash;
 mod recoverable_trash_durability;
 mod recoverable_trash_gvfs;
 mod recoverable_trash_janitor;
+pub(super) mod scratch_auto_promote;
 mod scratch_demote;
 mod smoke_outage;
 mod snapshot_v2;
@@ -272,6 +274,7 @@ pub use actions::{
 };
 pub(super) use advanced_mounted::*;
 pub(super) use assertions::*;
+pub(super) use cache_scrub::MountedCacheScrub;
 pub(super) use concurrent_mkdir::ConcurrentMkdirMerge;
 pub(super) use faults::*;
 pub(super) use logical_quota::LogicalQuota;
@@ -293,8 +296,5 @@ pub(crate) use test_fixtures::{
 #[cfg(test)]
 pub(super) use test_fixtures::{TestFailingScenario, TestPassingScenario};
 pub(super) use worker_concurrency::WorkerConcurrency;
-
-mod cache_scrub;
 #[cfg(test)]
 mod tests;
-pub(super) use cache_scrub::MountedCacheScrub;

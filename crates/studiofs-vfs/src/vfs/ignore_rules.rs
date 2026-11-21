@@ -294,6 +294,11 @@ impl RuleInodes {
 }
 
 impl StudioVfs {
+    /// Returns the monotonically increasing ignore-rule snapshot generation.
+    pub(super) fn ignore_rule_generation(&self) -> u64 {
+        self.ignore_rules.rule_generation.load(Ordering::Acquire)
+    }
+
     /// Classify a canonical volume-relative byte path using the current snapshot.
     pub fn classify_scratch_path(&self, path: &[u8], is_dir: bool) -> ScratchClass {
         let snapshot = Arc::clone(&self.ignore_rules.snapshot.read());
@@ -303,7 +308,10 @@ impl StudioVfs {
     /// Resolve the canonical volume-relative byte path of a tracked directory.
     ///
     /// Returns `Ok(None)` when the directory is no longer bound in metadata.
-    fn resolve_tracked_directory_path(&self, dir_ino: Ino) -> VfsResult<Option<Vec<u8>>> {
+    pub(super) fn resolve_tracked_directory_path(
+        &self,
+        dir_ino: Ino,
+    ) -> VfsResult<Option<Vec<u8>>> {
         if dir_ino == ROOT_INO {
             return Ok(Some(Vec::new()));
         }
@@ -827,6 +835,97 @@ mod tests {
         assert!(take_refresh_permit(rules));
         rules.note_local_barrier(12);
         assert!(take_refresh_permit(rules));
+    }
+
+    /// WinFSP writes a rule file through the volatile writeback flush and the deferred
+    /// last-handle release; the new rules must load without a remount.
+    #[test]
+    fn ignore_rules_refresh_after_volatile_flush_and_deferred_release() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-winfsp-");
+        let (runtime, vfs, _meta) = super::super::tests::make_unstarted_test_vfs_at(
+            tmp.path(),
+            "ignore-rules-winfsp",
+            crate::VfsConfig::default(),
+            None,
+        );
+        let _guard = runtime.enter();
+        vfs.start().unwrap();
+        let mut changes = vfs.subscribe_ignore_rules_changes();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                vfs.wait_for_ignore_rules_bootstrap(),
+            )
+            .await
+            .expect("initial rule inventory");
+            let attr = vfs
+                .create_with_deferred_metadata_admission(
+                    ROOT_INO,
+                    RULE_FILE,
+                    0,
+                    0,
+                    0o644,
+                    &tokio::runtime::Handle::current(),
+                )
+                .unwrap();
+            let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh(fh, attr.ino, 0, b"*.tmp\n").await.unwrap();
+            vfs.flush_volatile_writeback_with_outcome(attr.ino, fh)
+                .await
+                .unwrap();
+            vfs.release_fh_with_deferred_last_handle_barrier(
+                fh,
+                &tokio::runtime::Handle::current(),
+            );
+            wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Scratch).await;
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+        });
+    }
+
+    /// A WinFSP write-through handle commits the rule file inside the write callback.
+    #[test]
+    fn ignore_rules_refresh_after_write_through_write() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-wt-");
+        let (runtime, vfs, _meta) = super::super::tests::make_unstarted_test_vfs_at(
+            tmp.path(),
+            "ignore-rules-wt",
+            crate::VfsConfig::default(),
+            None,
+        );
+        let _guard = runtime.enter();
+        vfs.start().unwrap();
+        let mut changes = vfs.subscribe_ignore_rules_changes();
+        runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                vfs.wait_for_ignore_rules_bootstrap(),
+            )
+            .await
+            .expect("initial rule inventory");
+            let attr = vfs
+                .create_with_deferred_metadata_admission(
+                    ROOT_INO,
+                    RULE_FILE,
+                    0,
+                    0,
+                    0o644,
+                    &tokio::runtime::Handle::current(),
+                )
+                .unwrap();
+            let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                attr.ino,
+                0,
+                b"*.tmp\n",
+                crate::LocalSyncPolicy::WriteThrough,
+            )
+            .await
+            .unwrap();
+            wait_for_class(&vfs, &mut changes, b"file.tmp", ScratchClass::Scratch).await;
+            vfs.release_fh(fh).await.unwrap();
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+        });
     }
 
     #[test]

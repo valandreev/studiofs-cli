@@ -1417,6 +1417,31 @@ pub struct ScratchOrphanRecord {
     pub materialized: bool,
 }
 
+/// Outcome of automatic scratch promotion triggered by a `.studiofsignore` rule change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScratchAutoPromoteResult {
+    /// Inode number of the promoted root entry (preserved unchanged).
+    pub promoted_ino: Ino,
+    /// Tracked parent directory inode where the entry is bound.
+    pub parent: Ino,
+    /// Original scratch entry name before promotion.
+    pub original_name: Vec<u8>,
+    /// Final tracked entry name (`original_name`, or `<original_name>.scratch-conflict-<client>` if taken).
+    pub final_name: Vec<u8>,
+    /// Whether a pre-existing tracked entry caused conflict renaming.
+    pub conflict_renamed: bool,
+    /// Promoted inode attributes (root entry first, pre-order).
+    pub attrs: Vec<InodeAttr>,
+    /// Set when the scratch directory merged into an existing tracked directory
+    /// of the same name instead of being promoted (ADR 0012: directories merge).
+    pub merged_into: Option<Ino>,
+    /// Entries moved by a merge, still scratch: `(tracked parent, name, attr)`.
+    /// Callers promote them as ordinary candidates.
+    pub merged_children: Vec<(Ino, Vec<u8>, InodeAttr)>,
+    /// Scratch directories emptied and removed by a merge: `(old parent, name, ino)`.
+    pub merged_away_dirs: Vec<(Ino, Vec<u8>, Ino)>,
+}
+
 /// Strict backend contract.
 ///
 /// This trait is intentionally comprehensive: storage backends implement it once,
@@ -1572,6 +1597,42 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         _frozen: &std::collections::HashSet<Ino>,
         _replace: bool,
     ) -> MetaResult<(RenameAtomicResult, Vec<InodeAttr>)> {
+        Err(MetaError::Storage(
+            "scratch promotion is unsupported".into(),
+        ))
+    }
+
+    /// List every scratch entry whose direct parent directory is tracked.
+    ///
+    /// Entries inside a scratch directory are excluded because the enclosing
+    /// scratch directory owns their classification.
+    fn list_tracked_parent_scratch_entries(&self) -> MetaResult<Vec<(Ino, Vec<u8>, InodeAttr)>> {
+        Ok(Vec::new())
+    }
+
+    /// Increments after replay merged a local scratch directory into a replicated
+    /// tracked directory, leaving scratch children for automatic promotion.
+    fn scratch_replay_merge_generation(&self) -> u64 {
+        0
+    }
+
+    /// Automatically promote a frozen scratch subtree under its tracked parent.
+    ///
+    /// If the entry's name is already taken in the tracked local base, it is
+    /// renamed to `<name>.scratch-conflict-<conflict_client>` (with numeric
+    /// fallback on collision) before promotion. Emits pre-order `AddEntry`
+    /// events so concurrent promotions across clients converge under ADR 0012.
+    /// Descendants in `kept_scratch` (still matching a rule) and their subtrees
+    /// stay scratch under the promoted directory.
+    fn promote_scratch_auto(
+        &self,
+        _parent: Ino,
+        _name: &[u8],
+        _ino: Ino,
+        _frozen: &std::collections::HashSet<Ino>,
+        _kept_scratch: &std::collections::HashSet<Ino>,
+        _conflict_client: &str,
+    ) -> MetaResult<ScratchAutoPromoteResult> {
         Err(MetaError::Storage(
             "scratch promotion is unsupported".into(),
         ))

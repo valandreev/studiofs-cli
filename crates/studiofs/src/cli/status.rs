@@ -149,6 +149,20 @@ fn format_cache_scrub(snapshot: &studiofs_vfs::VfsCacheScrubSnapshot, now_ms: u6
     )
 }
 
+fn format_scratch_over_limit_directories(
+    entries: &[studiofs_vfs::ScratchPromoteOverLimitEntry],
+) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "  Scratch dir `{}` exceeds promote limit; run `studiofs scratch promote` ({} > {} entries)",
+                entry.relative_path, entry.entry_count, entry.entry_limit
+            )
+        })
+        .collect()
+}
+
 fn mounted_runtime_snapshot(
     volume_name: &str,
 ) -> Option<crate::diagnostics::DiagnosticsRuntimeSnapshot> {
@@ -717,6 +731,13 @@ pub fn run(
                 if let Some(scrub) = snapshot.cache_scrub {
                     println!("{}", format_cache_scrub(&scrub, current_unix_ms()));
                 }
+                if let Some(auto_promote) = snapshot.scratch_auto_promote.as_ref() {
+                    for line in
+                        format_scratch_over_limit_directories(&auto_promote.over_limit_directories)
+                    {
+                        println!("{line}");
+                    }
+                }
                 let cache_root = cache_dir
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| meta_dir.join("cache"));
@@ -919,6 +940,19 @@ pub fn run(
     }
 
     println!("  Pending uploads:    {}", pending_uploads);
+    match studiofs_vfs::find_over_limit_scratch_directories(
+        engine.as_ref(),
+        studiofs_vfs::scratch_promote_entry_limit_from_env(),
+    ) {
+        Ok(over_limit) => {
+            for line in format_scratch_over_limit_directories(&over_limit) {
+                println!("{line}");
+            }
+        }
+        Err(error) => {
+            eprintln!("warning: failed to scan over-limit scratch directories: {error}");
+        }
+    }
 
     if verbosity.is_verbose() {
         println!("\nMounted Write Path");
@@ -1396,6 +1430,21 @@ mod tests {
             format_cache_scrub(&Default::default(), 2_500),
             "  Cache scrub: last pass never, idle, 0 corrupt, 0 refetch failures"
         );
+    }
+
+    #[test]
+    fn format_scratch_over_limit_directories_reports_promote_guidance() {
+        let lines =
+            format_scratch_over_limit_directories(&[studiofs_vfs::ScratchPromoteOverLimitEntry {
+                dir_ino: 77,
+                relative_path: "renders/tmp".to_string(),
+                entry_count: 4,
+                entry_limit: 3,
+            }]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("renders/tmp"));
+        assert!(lines[0].contains("exceeds promote limit; run `studiofs scratch promote`"));
+        assert!(lines[0].contains("4 > 3"));
     }
 
     #[test]
