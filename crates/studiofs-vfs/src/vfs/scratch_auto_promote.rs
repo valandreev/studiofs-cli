@@ -7,7 +7,9 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use studiofs_meta::{FileType, Ino, MetaEngine, MetaError, ROOT_INO, ScratchAutoPromoteResult};
+use studiofs_meta::{
+    FileType, Ino, InodeAttr, MetaEngine, MetaError, ROOT_INO, ScratchAutoPromoteResult,
+};
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -72,7 +74,14 @@ fn scratch_promote_rate_limit_from_env() -> u64 {
 }
 
 enum CandidateOutcome {
-    Promoted { conflict_renamed: bool },
+    Promoted {
+        conflict_renamed: bool,
+    },
+    /// Merged into a same-named tracked directory; the moved children are still scratch.
+    Merged {
+        children: Vec<(Ino, Vec<u8>, InodeAttr)>,
+        conflict_renamed: bool,
+    },
     OverLimit(ScratchPromoteOverLimitEntry),
     Skipped,
     Cancelled,
@@ -399,32 +408,12 @@ impl StudioVfs {
         };
 
         let mut parent_paths: BTreeMap<Ino, Option<Vec<u8>>> = BTreeMap::new();
-        let mut candidates: Vec<(bool, Ino, Vec<u8>)> = Vec::new();
-        for (parent, name, attr) in entries {
-            let parent_path = if let Some(cached) = parent_paths.get(&parent) {
-                cached.clone()
-            } else {
-                let resolved = match self.resolve_tracked_directory_path(parent) {
-                    Ok(path) => path,
-                    Err(error) => {
-                        debug!(parent, %error, "skipping scratch auto-promote candidate with unresolvable parent");
-                        None
-                    }
-                };
-                parent_paths.insert(parent, resolved.clone());
-                resolved
-            };
-            let Some(parent_path) = parent_path else {
-                continue;
-            };
-            let rel_path = join_relative_path(&parent_path, &name);
-            let is_dir = attr.kind == FileType::Directory;
-            if self.classify_scratch_path(&rel_path, is_dir) != ScratchClass::Tracked {
-                continue;
-            }
-            let has_open_handle = self.handle_table.open_count(attr.ino) > 0;
-            candidates.push((has_open_handle, parent, name));
-        }
+        let mut candidates: Vec<(bool, Ino, Vec<u8>)> = entries
+            .into_iter()
+            .filter_map(|(parent, name, attr)| {
+                self.auto_promote_candidate(&mut parent_paths, parent, name, &attr)
+            })
+            .collect();
 
         // Open-handle entries promote before unopened background entries, then deterministically.
         candidates.sort_by(|a, b| {
@@ -438,7 +427,9 @@ impl StudioVfs {
         let mut pass_failed = 0u64;
         let mut over_limit = Vec::new();
 
-        for (has_open_handle, parent, name) in candidates {
+        let mut next = 0;
+        while let Some((has_open_handle, parent, name)) = candidates.get(next).cloned() {
+            next += 1;
             if cancel.is_cancelled() {
                 return false;
             }
@@ -460,6 +451,25 @@ impl StudioVfs {
                         if conflict_renamed {
                             pass_conflict_renames += 1;
                         }
+                        break;
+                    }
+                    Ok(CandidateOutcome::Merged {
+                        children,
+                        conflict_renamed,
+                    }) => {
+                        if conflict_renamed {
+                            pass_conflict_renames += 1;
+                        }
+                        candidates.extend(children.into_iter().filter_map(
+                            |(child_parent, child_name, attr)| {
+                                self.auto_promote_candidate(
+                                    &mut parent_paths,
+                                    child_parent,
+                                    child_name,
+                                    &attr,
+                                )
+                            },
+                        ));
                         break;
                     }
                     Ok(CandidateOutcome::OverLimit(entry)) => {
@@ -509,6 +519,34 @@ impl StudioVfs {
         pass_promoted > 0 || pass_failed > 0
     }
 
+    /// Returns `(has_open_handle, parent, name)` when a tracked-parent scratch entry no longer
+    /// matches any rule.
+    fn auto_promote_candidate(
+        &self,
+        parent_paths: &mut BTreeMap<Ino, Option<Vec<u8>>>,
+        parent: Ino,
+        name: Vec<u8>,
+        attr: &InodeAttr,
+    ) -> Option<(bool, Ino, Vec<u8>)> {
+        let parent_path = parent_paths
+            .entry(parent)
+            .or_insert_with(|| match self.resolve_tracked_directory_path(parent) {
+                Ok(path) => path,
+                Err(error) => {
+                    debug!(parent, %error, "skipping scratch auto-promote candidate with unresolvable parent");
+                    None
+                }
+            })
+            .as_ref()?;
+        let rel_path = join_relative_path(parent_path, &name);
+        let is_dir = attr.kind == FileType::Directory;
+        if self.classify_scratch_path(&rel_path, is_dir) != ScratchClass::Tracked {
+            return None;
+        }
+        let has_open_handle = self.handle_table.open_count(attr.ino) > 0;
+        Some((has_open_handle, parent, name))
+    }
+
     async fn promote_one_auto_candidate(
         &self,
         parent: Ino,
@@ -537,6 +575,28 @@ impl StudioVfs {
         let root_is_dir = current_attr.kind == FileType::Directory;
         if self.classify_scratch_path(&rel_path, root_is_dir) != ScratchClass::Tracked {
             return Ok(CandidateOutcome::Skipped);
+        }
+
+        // A same-named tracked directory means a merge: only the root is frozen and the
+        // moved children are promoted afterwards as ordinary candidates.
+        if root_is_dir
+            && let Ok(existing) = meta.lookup(parent, name)
+            && existing.kind == FileType::Directory
+            && existing.ino != current_attr.ino
+        {
+            let conflict_client = meta
+                .invalidation_sender_id()
+                .unwrap_or_else(|| "local".to_string());
+            let started_epoch = self.state.namespace.namespace_epoch.load(Ordering::Acquire);
+            let merged = meta.promote_scratch_auto(
+                parent,
+                name,
+                current_attr.ino,
+                &HashSet::from([current_attr.ino]),
+                &HashSet::new(),
+                &conflict_client,
+            )?;
+            return Ok(self.finish_auto_promote(meta.as_ref(), started_epoch, true, merged));
         }
 
         let mut frozen = HashSet::new();
@@ -641,14 +701,56 @@ impl StudioVfs {
             &conflict_client,
         )?;
 
-        self.apply_auto_promote_side_effects(meta.as_ref(), started_epoch, root_is_dir, &promoted);
-
+        let outcome = self.finish_auto_promote(meta.as_ref(), started_epoch, root_is_dir, promoted);
         drop(sessions);
         drop(restore_gate);
+        Ok(outcome)
+    }
+
+    fn finish_auto_promote(
+        &self,
+        meta: &dyn super::VfsMeta,
+        started_epoch: u64,
+        root_is_dir: bool,
+        promoted: ScratchAutoPromoteResult,
+    ) -> CandidateOutcome {
+        if promoted.merged_into.is_some() {
+            self.apply_auto_merge_side_effects(&promoted);
+            return CandidateOutcome::Merged {
+                conflict_renamed: promoted.conflict_renamed,
+                children: promoted.merged_children,
+            };
+        }
+        self.apply_auto_promote_side_effects(meta, started_epoch, root_is_dir, &promoted);
         meta.request_eager_flush();
-        Ok(CandidateOutcome::Promoted {
+        CandidateOutcome::Promoted {
             conflict_renamed: promoted.conflict_renamed,
-        })
+        }
+    }
+
+    /// A merge moves scratch rows only (no events): drop cached names and attrs for the
+    /// removed scratch directories and the moved children.
+    fn apply_auto_merge_side_effects(&self, merged: &ScratchAutoPromoteResult) {
+        let mut entries = Vec::new();
+        let mut inodes = Vec::new();
+        for (old_parent, name, ino) in &merged.merged_away_dirs {
+            entries.push((*old_parent, name.clone()));
+            inodes.push(*ino);
+        }
+        for (new_parent, name, attr) in &merged.merged_children {
+            self.handle_table
+                .update_open_attrs_for_inode(attr.ino, attr);
+            entries.push((*new_parent, name.clone()));
+            inodes.push(attr.ino);
+            inodes.push(*new_parent);
+        }
+        for (parent, name) in &entries {
+            self.dentry_cache_invalidate(*parent, name);
+        }
+        self.invalidate_attr_read_cache(inodes.iter().copied());
+        self.ignore_rules.bump_dir_rename_epoch();
+        self.invalidate_kernel_entries(entries);
+        self.invalidate_kernel_inode_attrs(inodes);
     }
 
     fn apply_auto_promote_side_effects(
@@ -1201,6 +1303,86 @@ mod tests {
                 vfs.read(scratch_sub.ino, 0, 64).await.unwrap().as_ref(),
                 b"scratch-sub"
             );
+
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn scratch_auto_promote_taken_directory_name_merges_instead_of_renaming() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-auto-merge-");
+        let (rt, vfs, meta) =
+            make_started_vfs_with_limit(&temp, "scratch-auto-merge", None, None, None);
+        let _guard = rt.enter();
+        rt.block_on(async {
+            install_ignore_rules(&vfs, ROOT_INO, b"work/\n*.tmp\n").await;
+
+            let scratch_work = vfs.mkdir(ROOT_INO, b"work", 0, 0, 0o755).unwrap();
+            let scratch_a = write_and_close_file(&vfs, scratch_work.ino, b"a.txt", b"sa").await;
+            let scratch_b = write_and_close_file(&vfs, scratch_work.ino, b"b.txt", b"sb").await;
+            let scratch_c = write_and_close_file(&vfs, scratch_work.ino, b"c.tmp", b"sc").await;
+            let scratch_sub = vfs.mkdir(scratch_work.ino, b"sub", 0, 0, 0o755).unwrap();
+            let scratch_n = write_and_close_file(&vfs, scratch_sub.ino, b"n.txt", b"sn").await;
+
+            // Colliding tracked tree populated directly in the tracked base.
+            let tracked_work = meta.create_dir(ROOT_INO, b"work", 0, 0, 0o755).unwrap();
+            let tracked_a = meta
+                .create_file(tracked_work.ino, b"a.txt", 0, 0, 0o644)
+                .unwrap();
+            let tracked_sub = meta
+                .create_dir(tracked_work.ino, b"sub", 0, 0, 0o755)
+                .unwrap();
+
+            let mut status_rx = vfs.subscribe_scratch_auto_promote_status();
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n").await;
+            let snap =
+                wait_for_auto_promote_generation(&mut status_rx, vfs.ignore_rule_generation())
+                    .await;
+            assert_eq!(snap.failed_entries, 0);
+
+            // Directories merge: no conflict copy of `work` or `sub`.
+            assert_eq!(vfs.lookup(ROOT_INO, b"work").unwrap().ino, tracked_work.ino);
+            assert!(
+                vfs.lookup(ROOT_INO, b"work.scratch-conflict-local")
+                    .is_err()
+            );
+            assert_eq!(
+                vfs.lookup(tracked_work.ino, b"sub").unwrap().ino,
+                tracked_sub.ino
+            );
+            assert!(!vfs.is_scratch_inode(scratch_work.ino).unwrap());
+            assert!(!vfs.is_scratch_inode(scratch_sub.ino).unwrap());
+
+            // Files promote into the merged directories; a taken file name is renamed.
+            assert_eq!(
+                vfs.lookup(tracked_work.ino, b"b.txt").unwrap().ino,
+                scratch_b.ino
+            );
+            assert!(!vfs.is_scratch_inode(scratch_b.ino).unwrap());
+            assert_eq!(
+                vfs.lookup(tracked_work.ino, b"a.txt").unwrap().ino,
+                tracked_a.ino
+            );
+            assert_eq!(
+                vfs.lookup(tracked_work.ino, b"a.txt.scratch-conflict-local")
+                    .unwrap()
+                    .ino,
+                scratch_a.ino
+            );
+            assert!(!vfs.is_scratch_inode(scratch_a.ino).unwrap());
+            assert_eq!(
+                vfs.lookup(tracked_sub.ino, b"n.txt").unwrap().ino,
+                scratch_n.ino
+            );
+            assert!(!vfs.is_scratch_inode(scratch_n.ino).unwrap());
+            assert_eq!(vfs.read(scratch_n.ino, 0, 8).await.unwrap().as_ref(), b"sn");
+
+            // A rule-matching child moves into the tracked directory but stays scratch.
+            assert_eq!(
+                vfs.lookup(tracked_work.ino, b"c.tmp").unwrap().ino,
+                scratch_c.ino
+            );
+            assert!(vfs.is_scratch_inode(scratch_c.ino).unwrap());
 
             vfs.shutdown(Duration::from_secs(5)).await.unwrap();
         });

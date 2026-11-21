@@ -1432,6 +1432,14 @@ pub struct ScratchAutoPromoteResult {
     pub conflict_renamed: bool,
     /// Promoted inode attributes (root entry first, pre-order).
     pub attrs: Vec<InodeAttr>,
+    /// Set when the scratch directory merged into an existing tracked directory
+    /// of the same name instead of being promoted (ADR 0012: directories merge).
+    pub merged_into: Option<Ino>,
+    /// Entries moved by a merge, still scratch: `(tracked parent, name, attr)`.
+    /// Callers promote them as ordinary candidates.
+    pub merged_children: Vec<(Ino, Vec<u8>, InodeAttr)>,
+    /// Scratch directories emptied and removed by a merge: `(old parent, name, ino)`.
+    pub merged_away_dirs: Vec<(Ino, Vec<u8>, Ino)>,
 }
 
 /// Strict backend contract.
