@@ -174,10 +174,12 @@ mount-local scratch layer backed by non-replicated `redb` tables
   Payload objects of unlinked scratch files are reclaimed once the last open
   handle closes; `rmdir` on a tracked directory containing scratch children
   returns `ENOTEMPTY`.
-- Same-class scratch renames stay scratch, and tracked entries renamed to a
-  matching name inside a tracked parent stay tracked. Hardlinks touching a
-  scratch inode or directory and cross-class renames (until promote/demote land)
-  return `EXDEV`.
+- Same-class scratch renames stay scratch. Tracked entries renamed to a
+  matching name inside a tracked parent stay tracked. Moving a tracked entry
+  into a scratch directory removes its old tracked name for peers and retains
+  its bytes locally. A missing local payload or a subtree over the configured
+  entry limit causes `EXDEV`. Hardlinks touching a scratch inode or directory
+  also return `EXDEV`.
 
 ## Mounted Benchmark Engine
 

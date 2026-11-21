@@ -1344,6 +1344,21 @@ pub struct ScratchRenameResult {
     pub removed_object_ids: Vec<u64>,
 }
 
+/// Frozen tracked subtree and the durable scratch copies of its file payloads.
+#[derive(Debug, Default)]
+pub struct ScratchDemotion {
+    /// Root inode of the tracked subtree.
+    pub source: Ino,
+    /// Expected scratch replacement and whether its open handles need the inode.
+    pub displaced: Option<(Ino, bool)>,
+    /// Tracked inode identities captured before the commit.
+    pub frozen: std::collections::HashSet<Ino>,
+    /// Frozen file lengths and resolved data spans.
+    pub files: std::collections::HashMap<Ino, (u64, Vec<crate::schema::ResolvedSliceSpan>)>,
+    /// Original payload IDs mapped to durable scratch copies.
+    pub objects: std::collections::HashMap<u64, u64>,
+}
+
 /// Strict backend contract.
 ///
 /// This trait is intentionally comprehensive: storage backends implement it once,
@@ -1478,6 +1493,16 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
         _keep_displaced_open: bool,
     ) -> MetaResult<ScratchRenameResult> {
         Err(MetaError::Storage("scratch storage is unsupported".into()))
+    }
+
+    /// Move the frozen tracked subtree into scratch and journal its old names.
+    fn demote_scratch_entry(
+        &self,
+        _source: (Ino, &[u8]),
+        _target: (Ino, &[u8]),
+        _plan: &ScratchDemotion,
+    ) -> MetaResult<crate::engine::ScratchRenameResult> {
+        Err(MetaError::Storage("scratch demotion is unsupported".into()))
     }
 
     /// Promote the frozen scratch tree and commit its tracked rename.

@@ -1571,6 +1571,15 @@ impl MetaEngineCore for RedbMetaEngine {
         )
     }
 
+    fn demote_scratch_entry(
+        &self,
+        source: (Ino, &[u8]),
+        target: (Ino, &[u8]),
+        plan: &crate::engine::ScratchDemotion,
+    ) -> MetaResult<crate::engine::ScratchRenameResult> {
+        self.demote_scratch(source, target, plan)
+    }
+
     fn promote_scratch_entry(
         &self,
         source: (Ino, &[u8]),

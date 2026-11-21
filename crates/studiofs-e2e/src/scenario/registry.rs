@@ -59,6 +59,7 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             RecoverableTrashJanitor.definition(),
             LogicalQuota.definition(),
             MountedCacheScrub.definition(),
+            ScratchDemote.definition(),
         ]
     })
 }
@@ -69,6 +70,7 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         "mounted-recoverable-trash-two-client" => Some(Box::new(RecoverableTrash)),
         "mounted-logical-quota" => Some(Box::new(LogicalQuota)),
         "mounted-cache-scrub" => Some(Box::new(MountedCacheScrub)),
+        SCRATCH_DEMOTE => Some(Box::new(ScratchDemote)),
         "mounted-recoverable-trash-durability" => {
             Some(Box::new(RecoverableTrashDurability::OfflineCrashReplay))
         }
@@ -199,6 +201,17 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
 #[cfg(test)]
 mod tests {
     use super::{available_scenarios, resolve_scenario};
+
+    #[test]
+    fn scratch_demote_is_registered_and_resolvable() {
+        let name = super::SCRATCH_DEMOTE;
+        assert!(
+            available_scenarios()
+                .iter()
+                .any(|scenario| scenario.name == name)
+        );
+        assert!(resolve_scenario(name).is_some());
+    }
 
     #[test]
     fn logical_quota_is_registered_and_resolvable() {

@@ -1,3 +1,4 @@
+use super::fs_ops::{NamespaceDeleteTxn, current_unix_seconds};
 use super::*;
 use crate::schema::{
     SliceId, SliceOrder, SliceRange, SliceRecord, chunk_id_from_offset, chunk_start_offset,
@@ -1048,6 +1049,294 @@ impl RedbMetaEngine {
             index.note_remove_inode(dst_ino);
         }
         Ok(result)
+    }
+
+    pub(super) fn demote_scratch(
+        &self,
+        (parent, name): (Ino, &[u8]),
+        (new_parent, new_name): (Ino, &[u8]),
+        plan: &crate::engine::ScratchDemotion,
+    ) -> MetaResult<ScratchRenameResult> {
+        use crate::events::MetaEvent;
+
+        let _mutation_guard = self
+            .scratch_mutation_lock
+            .lock()
+            .map_err(|_| storage_error("scratch mutation lock poisoned"))?;
+        let txn = self.begin_immediate_write_txn()?;
+        let snapshot = self.begin_read_txn()?;
+        let mut dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
+        let mut inodes = txn.open_table(SCRATCH_INODES).map_err(storage_error)?;
+        let mut target_parent =
+            read_scratch_attr_from_table(&inodes, new_parent)?.ok_or(MetaError::TargetChanged)?;
+        if target_parent.kind != FileType::Directory {
+            return Err(MetaError::NotADirectory(new_parent));
+        }
+        let existing = find_scratch_dentry_in_table(&dentries, new_parent, new_name)?;
+        if Self::lookup_merged_in_write_txn(&txn, new_parent, new_name)?.is_some() {
+            return Err(MetaError::EntryExists {
+                parent: new_parent,
+                name: String::from_utf8_lossy(new_name).into_owned(),
+            });
+        }
+
+        let mut ancestor = new_parent;
+        let mut ancestors = HashSet::new();
+        while ancestor != ROOT_INO {
+            if ancestor == plan.source || !ancestors.insert(ancestor) {
+                return Err(MetaError::TargetChanged);
+            }
+            ancestor = match read_scratch_attr_from_table(&inodes, ancestor)? {
+                Some(attr) => attr.parent,
+                None => Self::get_attr_merged_in_write_txn(&txn, ancestor)?.parent,
+            };
+        }
+
+        let source = Self::lookup_merged_in_write_txn(&txn, parent, name)?
+            .filter(|entry| entry.ino == plan.source)
+            .ok_or(MetaError::TargetChanged)?;
+        let mut removed_object_ids = Vec::new();
+        let mut displaced = None;
+        let mut removed_inode = None;
+        if existing.as_ref().map(|(_, ino)| *ino) != plan.displaced.map(|(ino, _)| ino) {
+            return Err(MetaError::TargetChanged);
+        }
+        if let (Some((name, ino)), Some((_, keep_open))) = (existing, plan.displaced) {
+            let mut attr =
+                read_scratch_attr_from_table(&inodes, ino)?.ok_or(MetaError::TargetChanged)?;
+            if attr.kind == FileType::Directory {
+                if source.kind != FileType::Directory {
+                    return Err(MetaError::IsADirectory(ino));
+                }
+                drop(dentries);
+                if Self::has_scratch_children_in_write_txn(&txn, ino)? {
+                    return Err(MetaError::DirNotEmpty(ino));
+                }
+                dentries = txn.open_table(SCRATCH_DENTRIES).map_err(storage_error)?;
+                target_parent.nlink = target_parent.nlink.saturating_sub(1);
+                attr.nlink = 0;
+            } else {
+                if source.kind == FileType::Directory {
+                    return Err(MetaError::NotADirectory(ino));
+                }
+                attr.nlink = attr.nlink.saturating_sub(1);
+            }
+            dentries.remove(encode_dentry_key(new_parent, &name).as_slice())?;
+            attr.touch_ctime();
+            if attr.nlink > 0 || (keep_open && attr.kind != FileType::Directory) {
+                inodes.insert(ino, encode(&attr)?.as_slice())?;
+            } else {
+                inodes.remove(ino)?;
+                removed_object_ids = remove_scratch_inode_aux_in_txn(&txn, ino)?;
+                removed_inode = Some(ino);
+            }
+            displaced = Some(attr);
+        }
+        let stored_name = if Self::lookup_merged_exact_in_write_txn(&txn, parent, name)?
+            .is_some_and(|entry| entry.ino == source.ino)
+        {
+            name.to_vec()
+        } else {
+            Self::merged_children_in_write_txn(&txn, parent)?
+                .0
+                .into_iter()
+                .find(|entry| {
+                    entry.ino == source.ino
+                        && fold_dentry_name(&entry.name) == fold_dentry_name(name)
+                })
+                .ok_or(MetaError::TargetChanged)?
+                .name
+        };
+        let mut pending = vec![(parent, stored_name, source.ino)];
+        let mut moved = Vec::with_capacity(plan.frozen.len());
+        let mut visited = HashSet::with_capacity(plan.frozen.len());
+        while let Some((old_parent, old_name, ino)) = pending.pop() {
+            if !plan.frozen.contains(&ino) || !visited.insert(ino) {
+                return Err(MetaError::TargetChanged);
+            }
+            Self::reject_receipt_removal_in_txn(&txn, ino)?;
+            let mut attr = Self::get_attr_merged_in_write_txn(&txn, ino)?;
+            if attr.kind == FileType::Directory {
+                let (children, _) = Self::merged_children_in_write_txn(&txn, ino)?;
+                pending.extend(
+                    children
+                        .into_iter()
+                        .map(|child| (ino, child.name, child.ino)),
+                );
+                if pending.len() + visited.len() > plan.frozen.len() {
+                    return Err(MetaError::TargetChanged);
+                }
+                let prefix = dentry_prefix(ino);
+                for row in dentries.range(prefix.as_slice()..)? {
+                    let (key, child) = row?;
+                    if !key.value().starts_with(&prefix) {
+                        break;
+                    }
+                    if read_scratch_attr_from_table(&inodes, child.value())?
+                        .is_some_and(|child| child.kind == FileType::Directory)
+                    {
+                        attr.nlink = attr.nlink.saturating_add(1);
+                    }
+                }
+            } else if attr.nlink != 1 {
+                return Err(MetaError::TargetChanged);
+            }
+            let local_only = attr.kind == FileType::RegularFile
+                && attr.committed_content_epoch == 0
+                && !Self::lookup_exact_in_write_table(
+                    &txn,
+                    BASE_DENTRIES_TABLE,
+                    old_parent,
+                    &old_name,
+                )?
+                .is_some_and(|entry| entry.ino == ino);
+            if attr.kind == FileType::RegularFile {
+                Self::demote_file_in_txn(&txn, &mut attr, plan)?;
+            }
+            if attr.kind == FileType::Symlink {
+                let target = self
+                    .merged_symlink_target(&snapshot, ino)?
+                    .ok_or(MetaError::TargetChanged)?;
+                txn.open_table(SCRATCH_SYMLINKS)
+                    .map_err(storage_error)?
+                    .insert(ino, target.as_slice())?;
+            }
+            let mut xattrs = txn.open_table(SCRATCH_XATTRS).map_err(storage_error)?;
+            for table in [BASE_XATTRS_TABLE, XATTRS_TABLE] {
+                for key in Self::keys_for_inode_in_table(&snapshot, table, ino)? {
+                    if let Some(value) =
+                        self.merged_xattr_value(&snapshot, ino, xattr_name_from_key(&key))?
+                    {
+                        xattrs.insert(key.as_slice(), value.as_slice())?;
+                    }
+                }
+            }
+
+            let (scratch_parent, scratch_name) = if ino == plan.source {
+                (new_parent, new_name)
+            } else {
+                (old_parent, old_name.as_slice())
+            };
+            attr.parent = scratch_parent;
+            attr.touch_ctime();
+            dentries.insert(
+                encode_dentry_key(scratch_parent, scratch_name).as_slice(),
+                ino,
+            )?;
+            inodes.insert(ino, encode(&attr)?.as_slice())?;
+            moved.push((old_parent, old_name, scratch_parent, attr, local_only));
+        }
+        if moved.len() != plan.frozen.len() {
+            return Err(MetaError::TargetChanged);
+        }
+
+        let delete = NamespaceDeleteTxn::new(&txn);
+        // Remove descendants while each old dentry still identifies its inode.
+        for (old_parent, old_name, _, attr, local_only) in moved.iter().rev() {
+            let ino = attr.ino;
+            let removal = if *local_only {
+                MetaEvent::RemoveLocalEntry {
+                    parent: *old_parent,
+                    name: old_name.clone(),
+                }
+            } else {
+                MetaEvent::RemoveEntry {
+                    parent: *old_parent,
+                    name: old_name.clone(),
+                }
+            };
+            Self::append_event_in_txn(&txn, &removal)?;
+            Self::remove_dentry_overlay_in_txn(&txn, *old_parent, old_name)?;
+            Self::remove_inode_overlay_in_txn(&txn, ino)?;
+            if attr.kind == FileType::RegularFile {
+                let uploaded = delete.uploaded_overlay_object_ids_in_write_txn(ino)?;
+                delete.queue_pending_deletions_in_txn(&uploaded, current_unix_seconds())?;
+            }
+            Self::clear_inode_overlay_aux_in_txn(&txn, ino)?;
+            if attr.kind == FileType::RegularFile {
+                Self::refresh_pending_regular_file_recovery_metadata_in_txn(&txn, ino)?;
+                Self::append_event_in_txn(&txn, &MetaEvent::RemoveRegularFileGraph { ino })?;
+            }
+            Self::remove_inode_lifecycle_in_txn(&txn, ino)?;
+            Self::append_event_in_txn(&txn, &MetaEvent::RemoveAttr { ino })?;
+        }
+        let mut source_parent = Self::get_attr_merged_in_write_txn(&txn, parent)?;
+        if source.kind == FileType::Directory {
+            source_parent.nlink = source_parent.nlink.saturating_sub(1);
+            target_parent.nlink = target_parent.nlink.saturating_add(1);
+        }
+        source_parent.touch_mtime();
+        target_parent.touch_mtime();
+        target_parent.touch_ctime();
+        Self::set_inode_in_txn(&txn, &source_parent)?;
+        Self::append_event_in_txn(
+            &txn,
+            &MetaEvent::SetAttr {
+                attr: source_parent,
+            },
+        )?;
+        inodes.insert(new_parent, encode(&target_parent)?.as_slice())?;
+        drop(inodes);
+        drop(dentries);
+        let mut index = self.scratch_index_write();
+        txn.commit()?;
+        for (_, _, scratch_parent, attr, _) in moved {
+            index.note_insert(scratch_parent, attr.ino);
+        }
+        if displaced.is_some() {
+            index.note_remove_dentry(new_parent);
+        }
+        if let Some(ino) = removed_inode {
+            index.note_remove_inode(ino);
+        }
+        Ok(ScratchRenameResult {
+            moved_ino: plan.source,
+            namespace_changed: true,
+            displaced,
+            removed_object_ids,
+        })
+    }
+
+    fn demote_file_in_txn(
+        txn: &redb::WriteTransaction,
+        attr: &mut InodeAttr,
+        plan: &crate::engine::ScratchDemotion,
+    ) -> MetaResult<()> {
+        let (size, expected) = plan.files.get(&attr.ino).ok_or(MetaError::TargetChanged)?;
+        let spans =
+            Self::lookup_regular_file_stored_slices_in_write_txn(txn, attr.ino, 0, attr.size)?;
+        if attr.size != *size || spans != *expected {
+            return Err(MetaError::TargetChanged);
+        }
+        let mut chunks = std::collections::BTreeMap::<ChunkId, RegularFileChunkState>::new();
+        for span in spans {
+            let Some(mut payload) = span.payload else {
+                continue;
+            };
+            payload.object_id = *plan
+                .objects
+                .get(&payload.object_id)
+                .ok_or(MetaError::TargetChanged)?;
+            let chunk = chunks.entry(span.chunk_id).or_default();
+            let id = chunk
+                .try_alloc_slice_id()
+                .ok_or_else(|| storage_error("scratch slice ID overflow"))?;
+            let order = chunk
+                .try_alloc_slice_order()
+                .ok_or_else(|| storage_error("scratch slice order overflow"))?;
+            chunk.insert_slice(SliceRecord::new(id, order, span.range, payload));
+        }
+        let mut overlay = txn.open_table(SCRATCH_OVERLAY).map_err(storage_error)?;
+        for (chunk, state) in chunks {
+            overlay.insert(
+                encode_regular_file_chunk_key(attr.ino, chunk).as_slice(),
+                encode(&state)?.as_slice(),
+            )?;
+        }
+        attr.upload_state = UploadState::Ready;
+        attr.committed_size = 0;
+        attr.committed_content_epoch = 0;
+        Ok(())
     }
 
     pub(super) fn promote_scratch(
