@@ -711,6 +711,7 @@ fn diagnostics_runtime_snapshot_scratch_auto_promote_is_additive_in_v5() {
         over_limit_directories: vec![studiofs_vfs::ScratchPromoteOverLimitEntry {
             dir_ino: 42,
             relative_path: "big-cache".to_string(),
+            path_is_lossy: false,
             entry_count: 100_001,
             entry_limit: 100_000,
         }],
@@ -3257,11 +3258,11 @@ fn scratch_promote_ipc_enforces_auth_read_only_and_promotes_scratch_path() {
         .expect("tokio runtime");
 
     rt.block_on(async {
-        // `._*` matches the built-in scratch rule so `._big` and its subtree start in scratch.
+        // `._*` matches the built-in scratch rule so `._big ` and its subtree start in scratch.
         let big = vfs
-            .mkdir(ROOT_INO, b"._big", 0, 0, 0o755)
-            .expect("mkdir ._big");
-        assert!(vfs.is_scratch_inode(big.ino).expect("._big scratch"));
+            .mkdir(ROOT_INO, b"._big ", 0, 0, 0o755)
+            .expect("mkdir ._big ");
+        assert!(vfs.is_scratch_inode(big.ino).expect("._big  scratch"));
         let file = vfs
             .create(big.ino, b"shot.exr", 0, 0, 0o644)
             .expect("create shot.exr");
@@ -3313,7 +3314,7 @@ fn scratch_promote_ipc_enforces_auth_read_only_and_promotes_scratch_path() {
         let unauthorized = roundtrip(
             DiagnosticsRequest::ScratchPromote {
                 auth_token: "wrong-token".to_string(),
-                path: "._big".to_string(),
+                path: "._big ".to_string(),
             },
             source.clone(),
             leases.clone(),
@@ -3327,7 +3328,7 @@ fn scratch_promote_ipc_enforces_auth_read_only_and_promotes_scratch_path() {
         let promoted = roundtrip(
             DiagnosticsRequest::ScratchPromote {
                 auth_token: "secret".to_string(),
-                path: "._big".to_string(),
+                path: "._big ".to_string(),
             },
             source.clone(),
             leases.clone(),
@@ -3335,10 +3336,8 @@ fn scratch_promote_ipc_enforces_auth_read_only_and_promotes_scratch_path() {
         .await?;
         match promoted {
             DiagnosticsResponse::ScratchPromote { outcome } => {
-                assert_eq!(outcome.relative_path, "._big");
+                assert_eq!(outcome.relative_path, "._big ");
                 assert_eq!(outcome.promoted_inodes, 2);
-                assert_eq!(outcome.merged_directories, 0);
-                assert_eq!(outcome.conflict_renames, 0);
             }
             other => anyhow::bail!("expected ScratchPromote response, got {other:?}"),
         }
@@ -3382,7 +3381,7 @@ fn scratch_promote_ipc_enforces_auth_read_only_and_promotes_scratch_path() {
         let ro_response = roundtrip(
             DiagnosticsRequest::ScratchPromote {
                 auth_token: "secret".to_string(),
-                path: "._big".to_string(),
+                path: "._big ".to_string(),
             },
             ro_source,
             leases,

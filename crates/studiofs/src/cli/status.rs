@@ -156,6 +156,9 @@ fn shell_quote_cli_arg(value: &str) -> String {
         })
     {
         value.to_string()
+    } else if cfg!(windows) {
+        // PowerShell single-quoted strings escape a quote by doubling it.
+        format!("'{}'", value.replace('\'', "''"))
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
@@ -169,10 +172,15 @@ fn format_scratch_over_limit_directories(
     entries
         .iter()
         .map(|entry| {
-            let path_arg = shell_quote_cli_arg(&entry.relative_path);
+            let guidance = if entry.path_is_lossy {
+                "manual promotion requires a UTF-8 path".to_owned()
+            } else {
+                let path_arg = shell_quote_cli_arg(&entry.relative_path);
+                format!("run `studiofs scratch promote --volume {volume_arg} -- {path_arg}`")
+            };
             format!(
-                "  Scratch dir `{}` exceeds promote limit; run `studiofs scratch promote --volume {} {}` ({} > {} entries)",
-                entry.relative_path, volume_arg, path_arg, entry.entry_count, entry.entry_limit
+                "  Scratch dir `{}` exceeds promote limit; {guidance} ({} > {} entries)",
+                entry.relative_path, entry.entry_count, entry.entry_limit
             )
         })
         .collect()
@@ -1454,16 +1462,21 @@ mod tests {
             "myvol",
             &[studiofs_vfs::ScratchPromoteOverLimitEntry {
                 dir_ino: 77,
-                relative_path: "renders/tmp".to_string(),
+                relative_path: "-renders/O'Brien ".to_string(),
+                path_is_lossy: false,
                 entry_count: 4,
                 entry_limit: 3,
             }],
         );
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("renders/tmp"));
-        assert!(lines[0].contains(
-            "exceeds promote limit; run `studiofs scratch promote --volume myvol renders/tmp`"
-        ));
+        let expected_argument = if cfg!(windows) {
+            "'-renders/O''Brien '"
+        } else {
+            "'-renders/O'\\''Brien '"
+        };
+        assert!(lines[0].contains(&format!(
+            "exceeds promote limit; run `studiofs scratch promote --volume myvol -- {expected_argument}`"
+        )));
         assert!(lines[0].contains("4 > 3"));
     }
 

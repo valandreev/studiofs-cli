@@ -140,17 +140,17 @@ impl MetaEngineCore for PgMetaEngine {
         self.local.scratch_replay_merge_generation()
     }
 
-    fn promote_scratch_auto(
+    fn promote_scratch_in_place(
         &self,
         parent: Ino,
         name: &[u8],
         ino: Ino,
         frozen: &std::collections::HashSet<Ino>,
         kept_scratch: &std::collections::HashSet<Ino>,
-        conflict_client: &str,
+        conflict_client: Option<&str>,
     ) -> MetaResult<crate::engine::ScratchAutoPromoteResult> {
         self.mutate(|local| {
-            local.promote_scratch_auto(parent, name, ino, frozen, kept_scratch, conflict_client)
+            local.promote_scratch_in_place(parent, name, ino, frozen, kept_scratch, conflict_client)
         })
     }
 

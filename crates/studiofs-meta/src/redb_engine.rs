@@ -1612,16 +1612,23 @@ impl MetaEngineCore for RedbMetaEngine {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn promote_scratch_auto(
+    fn promote_scratch_in_place(
         &self,
         parent: Ino,
         name: &[u8],
         ino: Ino,
         frozen: &HashSet<Ino>,
         kept_scratch: &HashSet<Ino>,
-        conflict_client: &str,
+        conflict_client: Option<&str>,
     ) -> MetaResult<ScratchAutoPromoteResult> {
-        self.promote_scratch_auto_inner(parent, name, ino, frozen, kept_scratch, conflict_client)
+        self.promote_scratch_in_place_inner(
+            parent,
+            name,
+            ino,
+            frozen,
+            kept_scratch,
+            conflict_client,
+        )
     }
 
     fn set_scratch_xattr(&self, ino: Ino, name: &[u8], value: &[u8]) -> MetaResult<()> {

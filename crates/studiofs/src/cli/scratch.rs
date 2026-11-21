@@ -28,7 +28,7 @@ enum ScratchCommand {
 
 #[derive(Debug, Args)]
 struct PromoteArgs {
-    /// Mounted filesystem path or volume-relative path to promote
+    /// Absolute mounted path or volume-relative path to promote
     path: String,
 
     /// Target mounted volume name (optional when <PATH> is under a mount point or one volume is mounted)
@@ -62,18 +62,10 @@ fn run_promote(args: PromoteArgs) -> Result<()> {
 }
 
 fn format_promote_outcome(outcome: &ScratchPromotePathOutcome) -> String {
-    let mut parts = vec![format!(
-        "Promoted scratch path `{}` ({} promoted",
+    format!(
+        "Promoted scratch path `{}` ({} inodes)",
         outcome.relative_path, outcome.promoted_inodes
-    )];
-    if outcome.merged_directories > 0 {
-        parts.push(format!(", {} merged", outcome.merged_directories));
-    }
-    if outcome.conflict_renames > 0 {
-        parts.push(format!(", {} conflict-renamed", outcome.conflict_renames));
-    }
-    parts.push(")".to_string());
-    parts.concat()
+    )
 }
 
 fn resolve_promote_target(
@@ -82,6 +74,9 @@ fn resolve_promote_target(
     volume: Option<&str>,
     cwd: Option<&Path>,
 ) -> Result<(LocalDiagnosticsDiscovery, String)> {
+    let path = Path::new(raw_path);
+    let rooted = path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_)));
+    let all_sessions: Vec<&LocalDiagnosticsDiscovery> = sessions.iter().collect();
     if let Some(volume_name) = volume {
         let matching: Vec<&LocalDiagnosticsDiscovery> = sessions
             .iter()
@@ -92,27 +87,34 @@ fn resolve_promote_target(
                 "volume '{volume_name}' is not currently mounted; mount it before running `studiofs scratch promote`"
             );
         }
-        if let Some((session, rel_path)) = match_mounted_path(&matching, Path::new(raw_path), cwd)?
-        {
-            return Ok((session.clone(), rel_path));
+        if rooted {
+            return match_mounted_path(&all_sessions, path, None)?
+                .filter(|(session, _)| session.volume == volume_name)
+                .map(|(session, relative)| (session.clone(), relative))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "path `{raw_path}` is outside the mounts for volume '{volume_name}'"
+                    )
+                });
         }
         if matching.len() == 1 {
-            return Ok((matching[0].clone(), normalize_relative_path(raw_path)?));
+            return Ok((matching[0].clone(), path_to_volume_relative(path)?));
         }
         bail!(
             "volume '{volume_name}' is mounted at multiple mount points; pass a full path inside the target mount point"
         );
     }
 
-    let all_sessions: Vec<&LocalDiagnosticsDiscovery> = sessions.iter().collect();
-    if let Some((session, rel_path)) = match_mounted_path(&all_sessions, Path::new(raw_path), cwd)?
-    {
+    if let Some((session, rel_path)) = match_mounted_path(&all_sessions, path, cwd)? {
         return Ok((session.clone(), rel_path));
+    }
+    if rooted {
+        bail!("path `{raw_path}` is outside the active StudioFS mounts");
     }
 
     match sessions {
         [] => bail!("no active mounted StudioFS volume found for '{raw_path}'"),
-        [only] => Ok((only.clone(), normalize_relative_path(raw_path)?)),
+        [only] => Ok((only.clone(), path_to_volume_relative(path)?)),
         many => {
             let names: Vec<&str> = many.iter().map(|s| s.volume.as_str()).collect();
             bail!(
@@ -136,11 +138,18 @@ fn match_mounted_path<'a>(
         raw_path.to_path_buf()
     };
 
-    let mut best: Option<(&'a LocalDiagnosticsDiscovery, usize, String)> = None;
+    let mut best = None;
     for session in sessions {
         let mount_path = Path::new(&session.mount_point);
-        if let Some(rel) = strip_mount_prefix(mount_path, &candidate)? {
-            let score = session.mount_point.len();
+        let drive_root;
+        let mount_path = if cfg!(windows) && !mount_path.has_root() {
+            drive_root = PathBuf::from(format!("{}\\", session.mount_point));
+            drive_root.as_path()
+        } else {
+            mount_path
+        };
+        if let Some(rel) = strip_mount_prefix(mount_path, &candidate) {
+            let score = mount_path.components().count();
             if best
                 .as_ref()
                 .is_none_or(|(_, best_score, _)| score > *best_score)
@@ -149,38 +158,34 @@ fn match_mounted_path<'a>(
             }
         }
     }
-    Ok(best.map(|(session, _, rel)| (session, rel)))
+    best.map(|(session, _, rel)| Ok((session, path_to_volume_relative(&rel)?)))
+        .transpose()
 }
 
-fn strip_mount_prefix(mount_path: &Path, candidate: &Path) -> Result<Option<String>> {
+fn strip_mount_prefix(mount_path: &Path, candidate: &Path) -> Option<PathBuf> {
     if let Ok(stripped) = candidate.strip_prefix(mount_path) {
-        return Ok(Some(path_to_volume_relative(stripped)?));
+        return Some(stripped.to_path_buf());
     }
-    if let (Ok(canon_mount), Some(canon_candidate)) = (
-        std::fs::canonicalize(mount_path),
-        canonicalize_existing_or_parent(candidate),
-    ) && let Ok(stripped) = canon_candidate.strip_prefix(&canon_mount)
-    {
-        return Ok(Some(path_to_volume_relative(stripped)?));
-    }
-    Ok(None)
-}
-
-fn canonicalize_existing_or_parent(path: &Path) -> Option<PathBuf> {
-    if let Ok(canon) = std::fs::canonicalize(path) {
-        return Some(canon);
-    }
-    let file_name = path.file_name()?;
-    let parent = path.parent()?;
-    let canon_parent = std::fs::canonicalize(parent).ok()?;
-    Some(canon_parent.join(file_name))
+    let canon_mount = std::fs::canonicalize(mount_path).ok()?;
+    // Resolve aliases in the parent without following the target entry itself.
+    let canon_parent = std::fs::canonicalize(candidate.parent()?).ok()?;
+    let canon_candidate = canon_parent.join(candidate.file_name()?);
+    Some(
+        canon_candidate
+            .strip_prefix(canon_mount)
+            .ok()?
+            .to_path_buf(),
+    )
 }
 
 fn path_to_volume_relative(stripped: &Path) -> Result<String> {
     let mut parts = Vec::new();
     for component in stripped.components() {
         match component {
-            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::Normal(part) => parts.push(
+                part.to_str()
+                    .ok_or_else(|| anyhow::anyhow!("scratch promote path must be valid UTF-8"))?,
+            ),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 bail!("invalid scratch promote path `{}`", stripped.display());
@@ -193,30 +198,14 @@ fn path_to_volume_relative(stripped: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-fn normalize_relative_path(raw: &str) -> Result<String> {
-    let normalized_sep = if cfg!(windows) {
-        raw.replace('\\', "/")
-    } else {
-        raw.to_string()
-    };
-    let trimmed = normalized_sep.trim().trim_matches('/');
-    if trimmed.is_empty() {
-        bail!("scratch promote path must name a file or directory inside the volume");
-    }
-    let mut parts = Vec::new();
-    for segment in trimmed.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            bail!("invalid scratch promote path `{raw}`");
-        }
-        parts.push(segment);
-    }
-    Ok(parts.join("/"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::diagnostics::{DIAGNOSTICS_PROTOCOL_VERSION, LocalDiagnosticsEndpoint};
+
+    const MOUNT_A: &str = if cfg!(windows) { "Q:" } else { "/mnt/a" };
+    const MOUNT_B: &str = if cfg!(windows) { "R:" } else { "/mnt/b" };
+    const ROOT_A: &str = if cfg!(windows) { "Q:/" } else { "/mnt/a" };
 
     fn test_session(volume: &str, mount_point: &str) -> LocalDiagnosticsDiscovery {
         #[cfg(unix)]
@@ -246,11 +235,11 @@ mod tests {
     #[test]
     fn resolve_promote_target_matches_full_mount_path() {
         let sessions = vec![
-            test_session("vol-a", "/mnt/a"),
-            test_session("vol-b", "/mnt/b"),
+            test_session("vol-a", MOUNT_A),
+            test_session("vol-b", MOUNT_B),
         ];
-        let (session, rel) =
-            resolve_promote_target(&sessions, "/mnt/b/renders/tmp", None, None).unwrap();
+        let path = format!("{MOUNT_B}/renders/tmp");
+        let (session, rel) = resolve_promote_target(&sessions, &path, None, None).unwrap();
         assert_eq!(session.volume, "vol-b");
         assert_eq!(rel, "renders/tmp");
     }
@@ -258,8 +247,8 @@ mod tests {
     #[test]
     fn resolve_promote_target_uses_explicit_volume_with_relative_path() {
         let sessions = vec![
-            test_session("vol-a", "/mnt/a"),
-            test_session("vol-b", "/mnt/b"),
+            test_session("vol-a", MOUNT_A),
+            test_session("vol-b", MOUNT_B),
         ];
         let (session, rel) =
             resolve_promote_target(&sessions, "renders/tmp", Some("vol-a"), None).unwrap();
@@ -269,7 +258,7 @@ mod tests {
 
     #[test]
     fn resolve_promote_target_uses_single_mounted_volume_for_relative_path() {
-        let sessions = vec![test_session("vol-a", "/mnt/a")];
+        let sessions = vec![test_session("vol-a", MOUNT_A)];
         let (session, rel) = resolve_promote_target(&sessions, "renders/tmp", None, None).unwrap();
         assert_eq!(session.volume, "vol-a");
         assert_eq!(rel, "renders/tmp");
@@ -278,17 +267,42 @@ mod tests {
     #[test]
     fn resolve_promote_target_rejects_ambiguous_relative_path_with_multiple_mounts() {
         let sessions = vec![
-            test_session("vol-a", "/mnt/a"),
-            test_session("vol-b", "/mnt/b"),
+            test_session("vol-a", MOUNT_A),
+            test_session("vol-b", MOUNT_B),
         ];
         let error = resolve_promote_target(&sessions, "renders/tmp", None, None).unwrap_err();
         assert!(error.to_string().contains("--volume"));
     }
 
     #[test]
+    fn resolve_promote_target_preserves_volume_relative_path_inside_mount() {
+        let sessions = vec![test_session("vol-a", MOUNT_A)];
+        let (_, relative) = resolve_promote_target(
+            &sessions,
+            "renders/tmp ",
+            Some("vol-a"),
+            Some(&Path::new(ROOT_A).join("nested")),
+        )
+        .unwrap();
+        assert_eq!(relative, "renders/tmp ");
+    }
+
+    #[test]
+    fn resolve_promote_target_rejects_an_absolute_path_outside_the_mount() {
+        let sessions = vec![test_session("vol-a", MOUNT_A)];
+        let path = if cfg!(windows) {
+            "R:/elsewhere/tmp"
+        } else {
+            "/elsewhere/tmp"
+        };
+        assert!(resolve_promote_target(&sessions, path, Some("vol-a"), None).is_err());
+        assert!(resolve_promote_target(&sessions, path, None, None).is_err());
+    }
+
+    #[test]
     fn resolve_promote_target_rejects_mount_root() {
-        let sessions = vec![test_session("vol-a", "/mnt/a")];
-        let error = resolve_promote_target(&sessions, "/mnt/a", None, None).unwrap_err();
+        let sessions = vec![test_session("vol-a", MOUNT_A)];
+        let error = resolve_promote_target(&sessions, ROOT_A, None, None).unwrap_err();
         assert!(
             error
                 .to_string()
