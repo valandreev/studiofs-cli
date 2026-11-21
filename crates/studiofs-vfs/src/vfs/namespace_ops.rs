@@ -5144,7 +5144,12 @@ impl StudioVfs {
         let meta = self.sync_meta();
         self.wait_for_deferred_namespace_entry(target.0, target.1)
             .await?;
-        if let Ok(entry) = meta.lookup(target.0, target.1) {
+        let existing = match meta.lookup(target.0, target.1) {
+            Ok(entry) => Some(entry),
+            Err(MetaError::EntryNotFound { .. }) => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(entry) = existing {
             if !replace {
                 return Err(MetaError::EntryExists {
                     parent: target.0,

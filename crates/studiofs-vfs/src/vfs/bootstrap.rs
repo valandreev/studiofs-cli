@@ -510,10 +510,7 @@ impl VfsBootstrap {
             meta: MetaExecutor::new(meta),
             read_only_mount,
             debug_pending_path_suffix: debug_pending_path_suffix_reader(),
-            scratch_promote_entry_limit: std::env::var("STUDIOFS_SCRATCH_PROMOTE_ENTRY_LIMIT")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(100_000),
+            scratch_promote_entry_limit: scratch_promote_entry_limit_from_env(),
             snapshot_mount_fence,
             data_write: resources.data_write,
             snapshot_worker,
@@ -1404,5 +1401,47 @@ mod tests {
             sentinel.exists(),
             "cleanup should leave target contents intact"
         );
+    }
+}
+
+const SCRATCH_PROMOTE_ENTRY_LIMIT_ENV: &str = "STUDIOFS_SCRATCH_PROMOTE_ENTRY_LIMIT";
+const DEFAULT_SCRATCH_PROMOTE_ENTRY_LIMIT: usize = 100_000;
+
+fn scratch_promote_entry_limit_from_env() -> usize {
+    parse_scratch_promote_entry_limit(
+        std::env::var(SCRATCH_PROMOTE_ENTRY_LIMIT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// A zero or unparsable limit would silently turn every promote into `EXDEV`.
+fn parse_scratch_promote_entry_limit(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return DEFAULT_SCRATCH_PROMOTE_ENTRY_LIMIT;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(limit) if limit > 0 => limit,
+        _ => {
+            warn!(
+                value = raw,
+                default = DEFAULT_SCRATCH_PROMOTE_ENTRY_LIMIT,
+                "ignoring invalid {SCRATCH_PROMOTE_ENTRY_LIMIT_ENV}; expected a positive integer"
+            );
+            DEFAULT_SCRATCH_PROMOTE_ENTRY_LIMIT
+        }
+    }
+}
+
+#[cfg(test)]
+mod scratch_promote_limit_tests {
+    use super::*;
+
+    #[test]
+    fn scratch_promote_entry_limit_rejects_zero_and_garbage() {
+        assert_eq!(parse_scratch_promote_entry_limit(None), 100_000);
+        assert_eq!(parse_scratch_promote_entry_limit(Some("250")), 250);
+        assert_eq!(parse_scratch_promote_entry_limit(Some("0")), 100_000);
+        assert_eq!(parse_scratch_promote_entry_limit(Some("lots")), 100_000);
     }
 }

@@ -998,6 +998,36 @@ mod tests {
     }
 
     #[test]
+    fn scratch_promote_replace_retains_displaced_tracked_identity() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-promote-replace-");
+        let (runtime, vfs, meta) = make_started_test_vfs(&temp, "scratch-promote-replace");
+        let _guard = runtime.enter();
+        runtime.block_on(async {
+            install_ignore_rules(
+                &vfs, ROOT_INO, b"*.tmp
+",
+            )
+            .await;
+            let old = vfs.create(ROOT_INO, b"shot.exr", 0, 0, 0o644).unwrap();
+            let old_fh = vfs.open_file(old.ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh(old_fh, old.ino, 0, b"old").await.unwrap();
+            vfs.fsync_fh(old_fh).await.unwrap();
+
+            let new = vfs.create(ROOT_INO, b"shot.exr.tmp", 0, 0, 0o644).unwrap();
+            vfs.write(new.ino, 0, b"new").await.unwrap();
+            vfs.flush(new.ino).await.unwrap();
+            vfs.rename(ROOT_INO, b"shot.exr.tmp", ROOT_INO, b"shot.exr", true)
+                .unwrap();
+
+            assert_eq!(meta.lookup(ROOT_INO, b"shot.exr").unwrap().ino, new.ino);
+            // The displaced tracked inode survives for its open handle.
+            assert_eq!(&vfs.read(old.ino, 0, 3).await.unwrap()[..], b"old");
+            assert_eq!(&vfs.read(new.ino, 0, 3).await.unwrap()[..], b"new");
+            vfs.release_fh(old_fh).await.unwrap();
+        });
+    }
+
+    #[test]
     fn scratch_promote_replays_payload_after_commit_before_submission() {
         const CRASH: &str = "STUDIOFS_TEST_SCRATCH_PROMOTE_CRASH";
         const TARGET: &[u8] = b"scene.exr";
