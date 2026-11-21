@@ -72,6 +72,9 @@ impl Scenario for ScratchDemote {
 
             compose.stop_service(RUSTFS_SERVICE_NAME, &SystemCommandExecutor)?;
             s3_stopped = true;
+            // Remount drops kernel page cache and writer memory; bytes must come from local scratch.
+            controller.unmount("client-a")?;
+            controller.mount("client-a")?;
             expect_bytes(&destination, PAYLOAD)?;
             fs::write(
                 context.scenario_dir.join(SUMMARY),

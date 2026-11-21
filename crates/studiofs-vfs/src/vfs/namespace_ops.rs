@@ -4769,23 +4769,12 @@ impl StudioVfs {
                 );
                 self.bump_acl_namespace_epoch();
                 if let Some(displaced) = &rename_result.displaced {
-                    if displaced.kind == FileType::Directory {
-                        self.state
-                            .namespace
-                            .dirty_attrs
-                            .lock()
-                            .remove(&displaced.ino);
-                        self.bump_directory_generation(displaced.ino);
-                        self.dentry_cache_invalidate_parent(displaced.ino);
-                    } else if keep_displaced_open {
-                        self.handle_table.mark_orphan(displaced.ino);
-                    } else {
-                        self.cleanup_scratch_inode_runtime_and_payloads(
-                            displaced.ino,
-                            rename_result.removed_object_ids,
-                        )
-                        .await;
-                    }
+                    self.finish_scratch_displacement(
+                        displaced,
+                        keep_displaced_open,
+                        rename_result.removed_object_ids,
+                    )
+                    .await;
                 }
             }
             return Ok(());
@@ -5212,6 +5201,8 @@ impl StudioVfs {
             self.wait_for_deferred_materialization_inflight(ino).await;
         }
 
+        // Outermost lock: serializes these multi-permit sessions with retained restore.
+        let restore_gate = self.retained_restore_gate.lock().await;
         let mut sessions = Vec::with_capacity(files.len());
         let mut objects = BTreeMap::<u64, u64>::new();
         for ino in files {
@@ -5305,25 +5296,43 @@ impl StudioVfs {
         namespace_mutations.record_rename(source.0, source.1, target.0, target.1, plan.source);
         self.bump_acl_namespace_epoch();
         drop(sessions);
+        drop(restore_gate);
         if let Some(displaced) = result.displaced {
             self.invalidate_attr_read_cache([displaced.ino]);
-            if displaced.kind == FileType::Directory {
-                self.bump_directory_generation(displaced.ino);
-                self.dentry_cache_invalidate_parent(displaced.ino);
-            } else if displaced.nlink == 0 {
-                if plan.displaced.is_some_and(|(_, keep_open)| keep_open) {
-                    self.handle_table.mark_orphan(displaced.ino);
-                } else {
-                    self.cleanup_scratch_inode_runtime_and_payloads(
-                        displaced.ino,
-                        result.removed_object_ids,
-                    )
-                    .await;
-                }
-            }
+            self.finish_scratch_displacement(
+                &displaced,
+                plan.displaced.is_some_and(|(_, keep_open)| keep_open),
+                result.removed_object_ids,
+            )
+            .await;
         }
         meta.request_eager_flush();
         Ok(())
+    }
+
+    /// Settles runtime state for a scratch entry replaced by a scratch rename or demote.
+    async fn finish_scratch_displacement(
+        &self,
+        displaced: &InodeAttr,
+        keep_open: bool,
+        removed_object_ids: Vec<u64>,
+    ) {
+        if displaced.kind == FileType::Directory {
+            self.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .remove(&displaced.ino);
+            self.bump_directory_generation(displaced.ino);
+            self.dentry_cache_invalidate_parent(displaced.ino);
+        } else if displaced.nlink > 0 {
+            // Another scratch hard link still names the inode.
+        } else if keep_open {
+            self.handle_table.mark_orphan(displaced.ino);
+        } else {
+            self.cleanup_scratch_inode_runtime_and_payloads(displaced.ino, removed_object_ids)
+                .await;
+        }
     }
 
     async fn promote_scratch_rename(
@@ -5381,6 +5390,8 @@ impl StudioVfs {
             self.wait_for_deferred_release_inflight(ino).await;
             self.wait_for_deferred_materialization_inflight(ino).await;
         }
+        // Outermost lock: serializes these multi-permit sessions with retained restore.
+        let restore_gate = self.retained_restore_gate.lock().await;
         let mut sessions = Vec::with_capacity(files.len());
         // Hold the write gates through the namespace commit and upload handoff.
         for ino in files {
@@ -5427,6 +5438,7 @@ impl StudioVfs {
             }
         }
         drop(sessions);
+        drop(restore_gate);
         self.finish_rename_displacement(&meta, result.displaced.as_ref())
             .await?;
         meta.request_eager_flush();

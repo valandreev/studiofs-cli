@@ -1068,6 +1068,14 @@ mod tests {
                     meta.lookup_scratch_entry(dir.ino, b"moved").unwrap(),
                     Some(file.ino)
                 );
+                let events = meta.read_events_range(0, u64::MAX).unwrap();
+                assert!(events[events_before..].iter().any(|event| matches!(
+                    event,
+                    studiofs_meta::MetaEvent::RemoveEntry { parent, name }
+                        if *parent == ROOT_INO && name.as_slice() == b"published"
+                )));
+                // The scratch copy must not depend on the tracked objects.
+                vfs.local_payload_backend.remove_batch(&ids).unwrap();
                 assert_eq!(
                     runtime.block_on(vfs.read(file.ino, 0, 2)).unwrap().as_ref(),
                     b"ab"
