@@ -78,6 +78,7 @@ jobs:
               --scenario mounted-recoverable-trash-janitor-gc
               --scenario mounted-logical-quota
               --scenario mounted-cache-scrub
+              --scenario mounted-scratch-demote-two-client
             )
           fi
 

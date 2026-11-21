@@ -74,7 +74,12 @@
 //! path may await this gate while holding another lock. It is outside
 //! `LockTier` and `LockOrderGuard`. Under it, restore takes one `Restore` file
 //! session permit per source inode, in staged traversal order over unique
-//! inodes; it is the only path that holds several session permits at once.
+//! inodes. Scratch promote and demote renames are the other paths that hold
+//! several session permits at once; they await the same gate first, then take
+//! one `Restore` permit per file in ascending inode order. Demote then holds
+//! the deferred-namespace `inner` mutex across its local metadata commit, so
+//! a deferred enqueue cannot race the tracked-to-scratch move; nothing else is
+//! awaited while that mutex is held.
 //!
 //! With `LocalPayloadBackendRuntime`, cached-store first/final pin transitions
 //! acquire locks in this order:

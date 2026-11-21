@@ -9,11 +9,12 @@ use super::{
     PendingIncarnation, ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange,
     SliceRecord, StudioVfs, UnlinkTarget, VfsError, VfsForegroundWriteOp, VfsForegroundWriteTimer,
     VfsMeta, VfsResult, VfsUploadState, block_index_from_offset, chunk_start_offset, debug, error,
-    info, offset_within_block, validate_name, warn,
+    info, offset_within_block, run_local_cache_io_blocking, validate_name, warn,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use studiofs_cache::local::LocalPayloadPut;
 use studiofs_meta::TimeSpec;
 use studiofs_meta::engine::NamespaceMutation;
 use studiofs_meta::schema::PayloadRefState;
@@ -405,6 +406,10 @@ impl StudioVfs {
                 | DeferredNamespaceOp::CreateDir { parent, .. } => *parent,
                 DeferredNamespaceOp::SetAttr { attr, .. } => attr.ino,
             };
+            // A demotion can commit after the caller classified this as tracked.
+            if self.is_scratch_inode(error_ino)? {
+                return Err(MetaError::TargetChanged.into());
+            }
             if let Some(error) = inner.errors.get(&error_ino) {
                 return Err(VfsError::Other(format!(
                     "deferred namespace metadata commit failed for inode {error_ino}: {error}"
@@ -4764,23 +4769,12 @@ impl StudioVfs {
                 );
                 self.bump_acl_namespace_epoch();
                 if let Some(displaced) = &rename_result.displaced {
-                    if displaced.kind == FileType::Directory {
-                        self.state
-                            .namespace
-                            .dirty_attrs
-                            .lock()
-                            .remove(&displaced.ino);
-                        self.bump_directory_generation(displaced.ino);
-                        self.dentry_cache_invalidate_parent(displaced.ino);
-                    } else if keep_displaced_open {
-                        self.handle_table.mark_orphan(displaced.ino);
-                    } else {
-                        self.cleanup_scratch_inode_runtime_and_payloads(
-                            displaced.ino,
-                            rename_result.removed_object_ids,
-                        )
-                        .await;
-                    }
+                    self.finish_scratch_displacement(
+                        displaced,
+                        keep_displaced_open,
+                        rename_result.removed_object_ids,
+                    )
+                    .await;
                 }
             }
             return Ok(());
@@ -4949,8 +4943,14 @@ impl StudioVfs {
         self.enforce_no_known_foreign_hard_lock(source_entry.ino)?;
         let source_attr = meta.get_attr(source_entry.ino)?;
         if self.is_scratch_inode(new_parent)? {
-            // Demote (tracked -> scratch directory) lands in SFS-1079.
-            return Err(VfsError::CrossDevice);
+            return self
+                .demote_tracked_rename(
+                    (parent, name),
+                    (new_parent, new_name),
+                    source_attr,
+                    replace_if_exists,
+                )
+                .await;
         }
         if meta.lookup_scratch_entry(new_parent, new_name)?.is_some() {
             if !replace_if_exists {
@@ -5134,6 +5134,207 @@ impl StudioVfs {
         Ok(())
     }
 
+    async fn demote_tracked_rename(
+        &self,
+        source: (Ino, &[u8]),
+        target: (Ino, &[u8]),
+        source_attr: InodeAttr,
+        replace: bool,
+    ) -> VfsResult<()> {
+        let meta = self.sync_meta();
+        let existing = meta.lookup_scratch_entry(target.0, target.1)?;
+        if existing.is_some() && !replace {
+            return Err(MetaError::EntryExists {
+                parent: target.0,
+                name: String::from_utf8_lossy(target.1).into_owned(),
+            }
+            .into());
+        }
+        let mut plan = studiofs_meta::engine::ScratchDemotion {
+            source: source_attr.ino,
+            displaced: existing.map(|ino| (ino, self.handle_table.open_count(ino) > 0)),
+            ..Default::default()
+        };
+        let mut pending = vec![source_attr];
+        let mut files = Vec::new();
+        let mut count = 0;
+        while let Some(attr) = pending.pop() {
+            count += 1;
+            if count + pending.len() > self.scratch_promote_entry_limit {
+                return Err(VfsError::CrossDevice);
+            }
+            if self.is_scratch_inode(attr.ino)? {
+                if attr.kind == FileType::Directory {
+                    pending.extend(
+                        meta.readdir_scratch(attr.ino)?
+                            .into_iter()
+                            .map(|(_, attr)| attr),
+                    );
+                }
+                continue;
+            }
+            if !plan.frozen.insert(attr.ino)
+                || (attr.kind != FileType::Directory && attr.nlink != 1)
+            {
+                return Err(VfsError::CrossDevice);
+            }
+            self.enforce_no_known_foreign_hard_lock(attr.ino)?;
+            match attr.kind {
+                FileType::Directory => {
+                    self.wait_for_deferred_namespace_children(attr.ino).await;
+                    for entry in meta.readdir(attr.ino)? {
+                        pending.push(meta.get_attr(entry.ino)?);
+                    }
+                    pending.extend(
+                        meta.readdir_scratch(attr.ino)?
+                            .into_iter()
+                            .map(|(_, attr)| attr),
+                    );
+                }
+                FileType::RegularFile => files.push(attr.ino),
+                FileType::Symlink => {}
+            }
+        }
+        files.sort_unstable();
+        for &ino in &files {
+            self.wait_for_deferred_release_inflight(ino).await;
+            self.wait_for_deferred_materialization_inflight(ino).await;
+        }
+
+        // Outermost lock: serializes these multi-permit sessions with retained restore.
+        let restore_gate = self.retained_restore_gate.lock().await;
+        let mut sessions = Vec::with_capacity(files.len());
+        let mut objects = BTreeMap::<u64, u64>::new();
+        for ino in files {
+            sessions.push(
+                self.file_session_cleanup(ino).with_permit(
+                    self.state
+                        .file_session
+                        .enter_op(ino, FileSessionOperation::Restore)
+                        .await,
+                ),
+            );
+            self.flush_retained_source_ordered(ino).await?;
+            let attr = meta.get_attr(ino)?;
+            let spans = meta.lookup_regular_file_stored_slices(ino, 0, attr.size)?;
+            for payload in spans.iter().filter_map(|span| span.payload) {
+                let end = u64::from(payload.offset) + u64::from(payload.length);
+                let required = objects.entry(payload.object_id).or_default();
+                *required = (*required).max(end);
+            }
+            plan.files.insert(ino, (attr.size, spans));
+        }
+
+        let mut copied = Vec::new();
+        let namespace_mutations = self.namespace_mutations();
+        let staged: VfsResult<()> = async {
+            if !objects.is_empty() {
+                let count = u32::try_from(objects.len()).map_err(|_| VfsError::CrossDevice)?;
+                let ids = meta.next_object_ids(count)?;
+                meta.sync_local_metadata()?;
+                for ((old, required), new) in objects.into_iter().zip(ids) {
+                    let data = self
+                        .payload_store_get_async(old)
+                        .await?
+                        .or_else(|| self.cached_store.get_staged_for_upload(old))
+                        .filter(|data| data.len() as u64 >= required)
+                        .ok_or(VfsError::CrossDevice)?;
+                    let backend = self.local_payload_backend.clone();
+                    let local_io = self.foreground_local_io_permit(1).await?;
+                    copied.push(new);
+                    run_local_cache_io_blocking(move || {
+                        let _local_io = local_io;
+                        backend
+                            .put_scratch_batch(&[LocalPayloadPut {
+                                object_id: new,
+                                data,
+                                evictable: false,
+                            }])
+                            .map_err(VfsError::LocalPayload)
+                    })
+                    .await?;
+                    plan.objects.insert(old, new);
+                }
+            }
+            Ok(())
+        }
+        .await;
+        let result = staged.and_then(|()| {
+            let deferred = self.state.namespace.deferred.inner.lock();
+            if plan.frozen.iter().any(|ino| {
+                deferred.parent_updates.contains_key(ino)
+                    || deferred.pending_inodes.contains_key(ino)
+            }) {
+                return Err(MetaError::TargetChanged.into());
+            }
+            meta.demote_scratch_entry(source, target, &plan)
+                .map_err(VfsError::from)
+        });
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                // The PG wrapper can report a replication bookkeeping error after redb commits.
+                if !copied.is_empty()
+                    && matches!(
+                        meta.get_scratch_attr(plan.source),
+                        Err(MetaError::InodeNotFound(_))
+                    )
+                    && let Err(cleanup) = self.payload_store_remove_batch_async(&copied).await
+                {
+                    warn!(%cleanup, "failed to remove uncommitted scratch demotion payloads");
+                }
+                return Err(error);
+            }
+        };
+
+        self.cancel_pending_uploads_for_inodes(&plan.frozen);
+        for &ino in plan.files.keys() {
+            self.remove_live_extents_for_inode(ino);
+            self.clear_inode_incarnation(ino);
+        }
+        self.invalidate_attr_read_cache(plan.frozen);
+        namespace_mutations.record_rename(source.0, source.1, target.0, target.1, plan.source);
+        self.bump_acl_namespace_epoch();
+        drop(sessions);
+        drop(restore_gate);
+        if let Some(displaced) = result.displaced {
+            self.invalidate_attr_read_cache([displaced.ino]);
+            self.finish_scratch_displacement(
+                &displaced,
+                plan.displaced.is_some_and(|(_, keep_open)| keep_open),
+                result.removed_object_ids,
+            )
+            .await;
+        }
+        meta.request_eager_flush();
+        Ok(())
+    }
+
+    /// Settles runtime state for a scratch entry replaced by a scratch rename or demote.
+    async fn finish_scratch_displacement(
+        &self,
+        displaced: &InodeAttr,
+        keep_open: bool,
+        removed_object_ids: Vec<u64>,
+    ) {
+        if displaced.kind == FileType::Directory {
+            self.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .remove(&displaced.ino);
+            self.bump_directory_generation(displaced.ino);
+            self.dentry_cache_invalidate_parent(displaced.ino);
+        } else if displaced.nlink > 0 {
+            // Another scratch hard link still names the inode.
+        } else if keep_open {
+            self.handle_table.mark_orphan(displaced.ino);
+        } else {
+            self.cleanup_scratch_inode_runtime_and_payloads(displaced.ino, removed_object_ids)
+                .await;
+        }
+    }
+
     async fn promote_scratch_rename(
         &self,
         source: (Ino, &[u8]),
@@ -5189,6 +5390,8 @@ impl StudioVfs {
             self.wait_for_deferred_release_inflight(ino).await;
             self.wait_for_deferred_materialization_inflight(ino).await;
         }
+        // Outermost lock: serializes these multi-permit sessions with retained restore.
+        let restore_gate = self.retained_restore_gate.lock().await;
         let mut sessions = Vec::with_capacity(files.len());
         // Hold the write gates through the namespace commit and upload handoff.
         for ino in files {
@@ -5235,6 +5438,7 @@ impl StudioVfs {
             }
         }
         drop(sessions);
+        drop(restore_gate);
         self.finish_rename_displacement(&meta, result.displaced.as_ref())
             .await?;
         meta.request_eager_flush();

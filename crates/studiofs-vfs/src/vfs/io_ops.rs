@@ -606,7 +606,8 @@ impl StudioVfs {
     }
 
     /// Exclusive session gates on each source inode, held across the restore
-    /// commit. Gates are taken in fence order; restore is the only multi-gate holder.
+    /// commit. Gates are taken in fence order under `retained_restore_gate`, which
+    /// every multi-gate holder (restore, scratch promote/demote) takes first.
     async fn enter_restore_source_gates(
         &self,
         fences: &[studiofs_meta::trash::RetainedSourceFence],

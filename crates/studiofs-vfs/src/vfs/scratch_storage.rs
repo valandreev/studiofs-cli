@@ -975,6 +975,171 @@ mod tests {
     }
 
     #[test]
+    fn scratch_demote_keeps_pending_file_readable() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-demote-pending-");
+        let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs(&temp, VOLUME);
+        let dir = vfs
+            .store_scratch_entry(b"local", InodeAttr::new_dir(0, ROOT_INO, 0, 0, 0o755))
+            .unwrap();
+        let file = vfs.create(ROOT_INO, b"shot.exr", 0, 0, 0o644).unwrap();
+        runtime.block_on(vfs.write(file.ino, 0, DATA)).unwrap();
+        runtime.block_on(vfs.flush(file.ino)).unwrap();
+        assert_eq!(vfs.cached_store.pending_upload_count(), 1);
+
+        vfs.rename(ROOT_INO, b"shot.exr", dir.ino, b"shot.exr", false)
+            .unwrap();
+
+        assert_eq!(vfs.cached_store.pending_upload_count(), 0);
+        assert!(matches!(
+            meta.lookup(ROOT_INO, b"shot.exr"),
+            Err(MetaError::EntryNotFound { .. })
+        ));
+        assert_eq!(
+            meta.lookup_scratch_entry(dir.ino, b"shot.exr").unwrap(),
+            Some(file.ino)
+        );
+        assert_eq!(
+            &runtime
+                .block_on(vfs.read(file.ino, 0, DATA.len() as u32))
+                .unwrap()[..],
+            DATA
+        );
+    }
+
+    #[test]
+    fn scratch_demote_published_file_requires_every_payload_locally() {
+        use studiofs_meta::schema::{
+            ChunkId, PayloadRef, SliceId, SliceOrder, SliceRange, SliceRecord,
+        };
+        use studiofs_meta::{MetaEngine, MetaPayloadObjects};
+
+        for fully_cached in [false, true] {
+            let temp = studiofs_test_support::workspace_target_tempdir("scratch-demote-published-");
+            let (runtime, vfs, meta) = super::super::tests::make_unstarted_test_vfs(&temp, VOLUME);
+            let dir = vfs
+                .store_scratch_entry(b"local", InodeAttr::new_dir(0, ROOT_INO, 0, 0, 0o755))
+                .unwrap();
+            let mut file = vfs.create(ROOT_INO, b"published", 0, 0, 0o644).unwrap();
+            let ids = meta.next_object_ids(2).unwrap();
+            let slices = ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| {
+                    SliceRecord::new(
+                        SliceId(i as u64 + 1),
+                        SliceOrder(i as u64 + 1),
+                        SliceRange::new(i as u32, i as u32 + 1).unwrap(),
+                        PayloadRef::new_full(id, 1),
+                    )
+                })
+                .collect();
+            file.size = 2;
+            file.content_epoch = 1;
+            meta.flush_regular_file_overlay_slices_with_attr(
+                file.ino,
+                &[(ChunkId(0), slices)],
+                Some(&file),
+            )
+            .unwrap();
+            for &id in &ids {
+                assert!(
+                    meta.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, id)
+                        .unwrap()
+                );
+            }
+            assert!(
+                meta.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                    .unwrap()
+            );
+            runtime
+                .block_on(vfs.payload_store_put_async(ids[0], Bytes::from_static(b"a"), true))
+                .unwrap();
+            if fully_cached {
+                runtime
+                    .block_on(vfs.payload_store_put_async(ids[1], Bytes::from_static(b"b"), true))
+                    .unwrap();
+            }
+            let events_before = meta.read_events_range(0, u64::MAX).unwrap().len();
+            let result = vfs.rename(ROOT_INO, b"published", dir.ino, b"moved", false);
+            if fully_cached {
+                result.unwrap();
+                assert!(meta.lookup(ROOT_INO, b"published").is_err());
+                assert_eq!(
+                    meta.lookup_scratch_entry(dir.ino, b"moved").unwrap(),
+                    Some(file.ino)
+                );
+                let events = meta.read_events_range(0, u64::MAX).unwrap();
+                assert!(events[events_before..].iter().any(|event| matches!(
+                    event,
+                    studiofs_meta::MetaEvent::RemoveEntry { parent, name }
+                        if *parent == ROOT_INO && name.as_slice() == b"published"
+                )));
+                // The scratch copy must not depend on the tracked objects.
+                vfs.local_payload_backend.remove_batch(&ids).unwrap();
+                assert_eq!(
+                    runtime.block_on(vfs.read(file.ino, 0, 2)).unwrap().as_ref(),
+                    b"ab"
+                );
+            } else {
+                assert!(matches!(result, Err(VfsError::CrossDevice)));
+                assert_eq!(meta.lookup(ROOT_INO, b"published").unwrap().ino, file.ino);
+                assert_eq!(meta.lookup_scratch_entry(dir.ino, b"moved").unwrap(), None);
+                assert_eq!(
+                    meta.read_events_range(0, u64::MAX).unwrap().len(),
+                    events_before
+                );
+                assert_eq!(vfs.local_payload_backend.object_ids(), [ids[0]]);
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_demote_directory_preserves_child_and_rejects_over_limit() {
+        for limit in [1, 2] {
+            let temp = studiofs_test_support::workspace_target_tempdir("scratch-demote-tree-");
+            let (runtime, mut vfs, meta) =
+                super::super::tests::make_unstarted_test_vfs(&temp, VOLUME);
+            Arc::get_mut(&mut vfs).unwrap().scratch_promote_entry_limit = limit;
+            let dest = vfs
+                .store_scratch_entry(b"local", InodeAttr::new_dir(0, ROOT_INO, 0, 0, 0o755))
+                .unwrap();
+            let tree = vfs.mkdir(ROOT_INO, b"tree", 0, 0, 0o755).unwrap();
+            let file = vfs.create(tree.ino, b"child", 0, 0, 0o644).unwrap();
+            runtime.block_on(vfs.write(file.ino, 0, DATA)).unwrap();
+            runtime.block_on(vfs.flush(file.ino)).unwrap();
+            vfs.set_xattr(file.ino, b"user.demo", b"value", 0).unwrap();
+            let result = vfs.rename(ROOT_INO, b"tree", dest.ino, b"tree", false);
+            if limit == 1 {
+                assert!(matches!(result, Err(VfsError::CrossDevice)));
+                assert_eq!(meta.lookup(ROOT_INO, b"tree").unwrap().ino, tree.ino);
+                assert_eq!(meta.lookup_scratch_entry(dest.ino, b"tree").unwrap(), None);
+            } else {
+                result.unwrap();
+                assert!(meta.lookup(ROOT_INO, b"tree").is_err());
+                assert_eq!(
+                    meta.lookup_scratch_entry(dest.ino, b"tree").unwrap(),
+                    Some(tree.ino)
+                );
+                assert_eq!(
+                    meta.lookup_scratch_entry(tree.ino, b"child").unwrap(),
+                    Some(file.ino)
+                );
+                assert_eq!(
+                    vfs.get_xattr(file.ino, b"user.demo").unwrap().unwrap(),
+                    b"value"
+                );
+                assert_eq!(
+                    runtime
+                        .block_on(vfs.read(file.ino, 0, DATA.len() as u32))
+                        .unwrap()
+                        .as_ref(),
+                    DATA,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn scratch_promote_preserves_open_writer() {
         let temp = studiofs_test_support::workspace_target_tempdir("scratch-promote-writer-");
         let (runtime, vfs, _) = make_started_test_vfs(&temp, "scratch-promote-writer");
@@ -1199,12 +1364,6 @@ mod tests {
                 scratch_a.ino
             );
 
-            // Demotion lands in SFS-1079.
-            assert!(matches!(
-                vfs.rename(ROOT_INO, b"doc.txt", scratch_dir.ino, b"demoted.txt", true),
-                Err(VfsError::CrossDevice)
-            ));
-
             // Hardlinks: scratch -> any name returns EXDEV; tracked -> into scratch dir returns EXDEV.
             assert!(matches!(
                 vfs.link(scratch_a.ino, ROOT_INO, b"link.tmp"),
@@ -1270,6 +1429,22 @@ mod tests {
             assert_eq!(renamed.ino, tracked_file.ino);
             assert!(!vfs.is_scratch_inode(renamed.ino).unwrap());
             assert!(meta.lookup(tracked_dir.ino, b"renamed.tmp").is_ok());
+
+            // Demoting either tracked alias would leave the other across classes.
+            assert!(matches!(
+                vfs.rename(
+                    tracked_dir.ino,
+                    b"renamed.tmp",
+                    scratch_dir.ino,
+                    b"demoted.txt",
+                    true
+                ),
+                Err(VfsError::CrossDevice)
+            ));
+            assert_eq!(
+                vfs.lookup(tracked_dir.ino, b"hardlink.tmp").unwrap().ino,
+                tracked_file.ino
+            );
         });
     }
 

@@ -112,6 +112,15 @@ impl MetaEngineCore for PgMetaEngine {
         )
     }
 
+    fn demote_scratch_entry(
+        &self,
+        source: (Ino, &[u8]),
+        target: (Ino, &[u8]),
+        plan: &crate::engine::ScratchDemotion,
+    ) -> MetaResult<crate::engine::ScratchRenameResult> {
+        self.mutate(|local| local.demote_scratch_entry(source, target, plan))
+    }
+
     fn promote_scratch_entry(
         &self,
         source: (Ino, &[u8]),
