@@ -31,6 +31,7 @@ pub mod operator_test;
 pub mod perf;
 pub mod quota;
 pub mod runtime_tuning;
+pub mod scratch;
 pub mod settings;
 pub mod smount;
 pub mod snapshot;
@@ -173,6 +174,7 @@ enum Commands {
     Smount(smount::SmountArgs),
     Umount(umount::UmountArgs),
     Perf(perf::PerfArgs),
+    Scratch(scratch::ScratchArgs),
     Status(status::StatusArgs),
     Settings(settings::SettingsArgs),
     Snapshot(snapshot::SnapshotArgs),
@@ -200,6 +202,7 @@ impl Commands {
             Self::Smount(args) => args.dispatch(),
             Self::Umount(args) => args.dispatch(),
             Self::Perf(args) => args.dispatch(),
+            Self::Scratch(args) => args.dispatch(),
             Self::Status(args) => args.dispatch(),
             Self::Settings(args) => args.dispatch(),
             Self::Snapshot(args) => args.dispatch(),
@@ -275,6 +278,18 @@ mod tests {
         ] {
             let cli = parse_for_test(args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
             assert_eq!(cli.log_level(), "trace", "{args:?}");
+        }
+    }
+
+    #[test]
+    fn scratch_promote_parses_path_and_optional_volume() {
+        for args in [
+            &["scratch", "promote", "/mnt/studio/renders/tmp"][..],
+            &["scratch", "promote", "--volume", "myvol", "renders/tmp"],
+            &["scratch", "promote", "renders/tmp", "--volume", "myvol"],
+        ] {
+            let cli = parse_for_test(args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert!(matches!(cli.command, Commands::Scratch(_)), "{args:?}");
         }
     }
 

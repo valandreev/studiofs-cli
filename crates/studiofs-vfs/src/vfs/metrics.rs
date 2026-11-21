@@ -2441,6 +2441,19 @@ pub struct ScratchPromoteOverLimitEntry {
     pub entry_limit: usize,
 }
 
+/// Summary returned by an explicit control-API scratch promotion (`studiofs scratch promote`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchPromotePathOutcome {
+    /// Normalized path relative to the volume root.
+    pub relative_path: String,
+    /// Total number of inodes moved from scratch to tracked tables.
+    pub promoted_inodes: usize,
+    /// Number of scratch directories merged into existing tracked directories.
+    pub merged_directories: usize,
+    /// Number of entries conflict-renamed to avoid overwriting existing tracked files.
+    pub conflict_renames: usize,
+}
+
 /// Observability snapshot for the background scratch-layer automatic promotion worker.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VfsScratchAutoPromoteSnapshot {

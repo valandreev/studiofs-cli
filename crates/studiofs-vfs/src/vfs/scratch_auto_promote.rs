@@ -1,12 +1,15 @@
 use super::file_session::FileSessionOperation;
-use super::metrics::{ScratchPromoteOverLimitEntry, VfsScratchAutoPromoteSnapshot};
+use super::metrics::{
+    ScratchPromoteOverLimitEntry, ScratchPromotePathOutcome, VfsScratchAutoPromoteSnapshot,
+};
 use super::namespace::DentryCacheValue;
 use super::{StudioVfs, VfsError, VfsResult};
 use crate::scratch_rules::{ScratchClass, ScratchRules};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use studiofs_meta::schema::ROOT_INO;
 use studiofs_meta::{
     FileType, Ino, InodeAttr, MetaEngine, MetaEngineCore, MetaError, ScratchAutoPromoteResult,
 };
@@ -165,6 +168,26 @@ fn join_relative_path(parent_rel: &[u8], name: &[u8]) -> Vec<u8> {
 
 fn format_relative_path(rel_path: &[u8]) -> String {
     String::from_utf8_lossy(rel_path).into_owned()
+}
+
+fn parse_volume_relative_components(raw_path: &str) -> VfsResult<(Vec<&str>, String)> {
+    let trimmed = raw_path.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return Err(VfsError::InvalidName(
+            "scratch promote path must name a file or directory inside the volume".to_string(),
+        ));
+    }
+    let mut components = Vec::new();
+    for segment in trimmed.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(VfsError::InvalidName(format!(
+                "invalid scratch promote path `{raw_path}`"
+            )));
+        }
+        components.push(segment);
+    }
+    let normalized = components.join("/");
+    Ok((components, normalized))
 }
 
 fn load_compiled_scratch_rules_from_meta(meta: &dyn MetaEngine) -> VfsResult<ScratchRules> {
@@ -673,7 +696,8 @@ impl StudioVfs {
                     %relative_path,
                     entry_count,
                     entry_limit = self.scratch_promote_entry_limit,
-                    "Scratch directory `{}` exceeds promote limit; run `studiofs scratch promote`",
+                    "Scratch directory `{}` exceeds promote limit; run `studiofs scratch promote {}`",
+                    relative_path,
                     relative_path
                 );
                 return Ok(CandidateOutcome::OverLimit(ScratchPromoteOverLimitEntry {
@@ -715,11 +739,31 @@ impl StudioVfs {
         abort_on_shutdown: bool,
         keep_child_scratch: impl FnMut(&[u8], bool) -> bool,
     ) -> VfsResult<FreezeScratchSubtreeOutcome<'a>> {
+        self.freeze_scratch_promote_subtree_with_limit(
+            meta,
+            root_attr,
+            root_rel_path,
+            abort_on_shutdown,
+            Some(self.scratch_promote_entry_limit),
+            keep_child_scratch,
+        )
+        .await
+    }
+
+    async fn freeze_scratch_promote_subtree_with_limit<'a, M: MetaEngineCore + ?Sized>(
+        &'a self,
+        meta: &M,
+        root_attr: InodeAttr,
+        root_rel_path: &[u8],
+        abort_on_shutdown: bool,
+        entry_limit: Option<usize>,
+        keep_child_scratch: impl FnMut(&[u8], bool) -> bool,
+    ) -> VfsResult<FreezeScratchSubtreeOutcome<'a>> {
         let subtree = match collect_scratch_promote_subtree(
             meta,
             root_attr,
             root_rel_path,
-            self.scratch_promote_entry_limit,
+            entry_limit.unwrap_or(usize::MAX),
             ScratchPromoteRevisit::TargetChanged,
             keep_child_scratch,
         )? {
@@ -895,6 +939,297 @@ impl StudioVfs {
         );
         self.submit_promoted_subtree_uploads(&promoted.attrs);
     }
+
+    /// Explicitly promotes a scratch file or directory at a volume-relative
+    /// path through the control API without enforcing the background entry
+    /// limit, and clears any matching over-limit status entries.
+    pub async fn promote_scratch_path(
+        &self,
+        raw_path: &str,
+    ) -> VfsResult<ScratchPromotePathOutcome> {
+        let (components, relative_path) = parse_volume_relative_components(raw_path)?;
+        let Ok(_op_guard) = self.state.shutdown.mutating_operation_gate.try_read() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "volume is shutting down",
+            )
+            .into());
+        };
+
+        let meta = self.sync_meta();
+        let mut parent = ROOT_INO;
+        for (idx, segment) in components[..components.len() - 1].iter().enumerate() {
+            self.wait_for_deferred_namespace_entry(parent, segment.as_bytes())
+                .await?;
+            match meta.lookup(parent, segment.as_bytes()) {
+                Ok(attr) => {
+                    if attr.kind != FileType::Directory {
+                        return Err(MetaError::NotADirectory(attr.ino).into());
+                    }
+                    parent = attr.ino;
+                }
+                Err(MetaError::EntryNotFound { .. }) => {
+                    if meta
+                        .lookup_scratch_entry(parent, segment.as_bytes())?
+                        .is_some()
+                    {
+                        let prefix = components[..=idx].join("/");
+                        return Err(VfsError::InvalidName(format!(
+                            "parent directory `{prefix}` is still in scratch; promote it first"
+                        )));
+                    }
+                    return Err(MetaError::EntryNotFound {
+                        parent,
+                        name: (*segment).to_string(),
+                    }
+                    .into());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let target_name = components[components.len() - 1].as_bytes();
+        self.wait_for_deferred_namespace_entry(parent, target_name)
+            .await?;
+        if meta.lookup_scratch_entry(parent, target_name)?.is_none() {
+            if meta.lookup(parent, target_name).is_ok() {
+                return Err(VfsError::InvalidName(format!(
+                    "path `{relative_path}` is already tracked, not in scratch"
+                )));
+            }
+            return Err(MetaError::EntryNotFound {
+                parent,
+                name: components[components.len() - 1].to_string(),
+            }
+            .into());
+        }
+
+        let conflict_client = meta
+            .invalidation_sender_id()
+            .unwrap_or_else(|| "local".to_string());
+        let mut queue = VecDeque::from([(
+            parent,
+            target_name.to_vec(),
+            relative_path.as_bytes().to_vec(),
+            true,
+        )]);
+        let mut promoted_inodes = 0usize;
+        let mut merged_directories = 0usize;
+        let mut conflict_renames = 0usize;
+        let mut cleared_dir_inos = HashSet::new();
+
+        while let Some((item_parent, item_name, item_rel_path, force_if_matching)) =
+            queue.pop_front()
+        {
+            let mut attempt = 0usize;
+            loop {
+                match self
+                    .promote_one_explicit_item(
+                        meta.as_ref(),
+                        item_parent,
+                        &item_name,
+                        &item_rel_path,
+                        force_if_matching,
+                        &conflict_client,
+                        &mut cleared_dir_inos,
+                    )
+                    .await
+                {
+                    Ok(ExplicitPromoteItem::Promoted {
+                        inodes,
+                        conflict_renamed,
+                    }) => {
+                        promoted_inodes += inodes;
+                        conflict_renames += usize::from(conflict_renamed);
+                        break;
+                    }
+                    Ok(ExplicitPromoteItem::Merged {
+                        merged_dirs,
+                        conflict_renamed,
+                        children,
+                        force_children,
+                    }) => {
+                        merged_directories += merged_dirs;
+                        conflict_renames += usize::from(conflict_renamed);
+                        for (child_parent, child_name, child_attr) in children {
+                            let Some(child_parent_path) =
+                                self.resolve_tracked_directory_path(child_parent)?
+                            else {
+                                continue;
+                            };
+                            let child_rel_path =
+                                join_relative_path(&child_parent_path, &child_name);
+                            let child_is_dir = child_attr.kind == FileType::Directory;
+                            if force_children
+                                || self.classify_scratch_path(&child_rel_path, child_is_dir)
+                                    == ScratchClass::Tracked
+                            {
+                                queue.push_back((
+                                    child_parent,
+                                    child_name,
+                                    child_rel_path,
+                                    force_children,
+                                ));
+                            }
+                        }
+                        break;
+                    }
+                    Ok(ExplicitPromoteItem::Skipped) => break,
+                    Err(VfsError::Meta(MetaError::TargetChanged))
+                        if attempt + 1 < MAX_CANDIDATE_RETRIES =>
+                    {
+                        attempt += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        let prefix = format!("{relative_path}/");
+        let next_snapshot = {
+            let mut snapshot = self.scratch_auto_promote.snapshot.lock();
+            snapshot.over_limit_directories.retain(|entry| {
+                !cleared_dir_inos.contains(&entry.dir_ino)
+                    && entry.relative_path != relative_path
+                    && !entry.relative_path.starts_with(&prefix)
+            });
+            snapshot.promoted_entries = snapshot
+                .promoted_entries
+                .saturating_add(promoted_inodes as u64);
+            snapshot.conflict_renames = snapshot
+                .conflict_renames
+                .saturating_add(conflict_renames as u64);
+            snapshot.clone()
+        };
+        self.scratch_auto_promote
+            .status_tx
+            .send_replace(next_snapshot);
+
+        Ok(ScratchPromotePathOutcome {
+            relative_path,
+            promoted_inodes,
+            merged_directories,
+            conflict_renames,
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "explicit promote helper passes per-item promotion context"
+    )]
+    async fn promote_one_explicit_item(
+        &self,
+        meta: &dyn super::VfsMeta,
+        parent: Ino,
+        name: &[u8],
+        rel_path: &[u8],
+        force_if_matching: bool,
+        conflict_client: &str,
+        cleared_dir_inos: &mut HashSet<Ino>,
+    ) -> VfsResult<ExplicitPromoteItem> {
+        self.wait_for_deferred_namespace_entry(parent, name).await?;
+
+        let Some(current_ino) = meta.lookup_scratch_entry(parent, name)? else {
+            return Ok(ExplicitPromoteItem::Skipped);
+        };
+        let current_attr = match meta.get_scratch_attr(current_ino) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => return Ok(ExplicitPromoteItem::Skipped),
+            Err(error) => return Err(error.into()),
+        };
+
+        let root_is_dir = current_attr.kind == FileType::Directory;
+        let root_matches_rule =
+            self.classify_scratch_path(rel_path, root_is_dir) != ScratchClass::Tracked;
+        let force_subtree = force_if_matching && root_matches_rule;
+
+        if root_is_dir
+            && let Ok(existing) = meta.lookup(parent, name)
+            && existing.kind == FileType::Directory
+            && existing.ino != current_attr.ino
+        {
+            let merged = meta.promote_scratch_auto(
+                parent,
+                name,
+                current_attr.ino,
+                &HashSet::from([current_attr.ino]),
+                &HashSet::new(),
+                conflict_client,
+            )?;
+            for &(_, _, ino) in &merged.merged_away_dirs {
+                cleared_dir_inos.insert(ino);
+            }
+            cleared_dir_inos.insert(current_attr.ino);
+            self.apply_auto_merge_side_effects(&merged);
+            return Ok(ExplicitPromoteItem::Merged {
+                merged_dirs: merged.merged_away_dirs.len().max(1),
+                conflict_renamed: merged.conflict_renamed,
+                children: merged.merged_children,
+                force_children: force_subtree,
+            });
+        }
+
+        let root_ino = current_attr.ino;
+        let frozen = match self
+            .freeze_scratch_promote_subtree_with_limit(
+                meta,
+                current_attr,
+                rel_path,
+                false,
+                None,
+                |child_path, child_is_dir| {
+                    !force_subtree
+                        && self.classify_scratch_path(child_path, child_is_dir)
+                            != ScratchClass::Tracked
+                },
+            )
+            .await?
+        {
+            FreezeScratchSubtreeOutcome::Ready(frozen) => frozen,
+            FreezeScratchSubtreeOutcome::OverLimit { .. }
+            | FreezeScratchSubtreeOutcome::Cancelled => {
+                return Err(VfsError::CrossDevice);
+            }
+        };
+
+        let started_epoch = self.state.namespace.namespace_epoch.load(Ordering::Acquire);
+        let promoted = meta.promote_scratch_auto(
+            parent,
+            name,
+            root_ino,
+            &frozen.frozen,
+            &frozen.kept_scratch,
+            conflict_client,
+        )?;
+        for attr in &promoted.attrs {
+            if attr.kind == FileType::Directory {
+                cleared_dir_inos.insert(attr.ino);
+            }
+        }
+        let inodes = promoted.attrs.len();
+        let conflict_renamed = promoted.conflict_renamed;
+        self.apply_auto_promote_side_effects(meta, started_epoch, root_is_dir, &promoted);
+        meta.request_eager_flush();
+        drop(frozen);
+        Ok(ExplicitPromoteItem::Promoted {
+            inodes,
+            conflict_renamed,
+        })
+    }
+}
+
+enum ExplicitPromoteItem {
+    Promoted {
+        inodes: usize,
+        conflict_renamed: bool,
+    },
+    Merged {
+        merged_dirs: usize,
+        conflict_renamed: bool,
+        children: Vec<(Ino, Vec<u8>, InodeAttr)>,
+        force_children: bool,
+    },
+    Skipped,
 }
 
 #[cfg(test)]
@@ -1351,6 +1686,75 @@ mod tests {
             // Offline inspection counts the whole scratch subtree and agrees.
             let offline = find_over_limit_scratch_directories(meta.as_ref(), 3).unwrap();
             assert_eq!(offline, snap.over_limit_directories);
+
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn scratch_explicit_promote_path_promotes_over_limit_directory_and_clears_status() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-explicit-promote-");
+        let (rt, vfs, meta) =
+            make_started_vfs_with_limit(&temp, "scratch-explicit-promote", Some(3), None, None);
+        let _guard = rt.enter();
+        rt.block_on(async {
+            install_ignore_rules(&vfs, ROOT_INO, b"big/\n*.tmp\n").await;
+
+            let big = vfs.mkdir(ROOT_INO, b"big", 0, 0, 0o755).unwrap();
+            let f1 = write_and_close_file(&vfs, big.ino, b"a.txt", b"alpha").await;
+            let f2 = write_and_close_file(&vfs, big.ino, b"b.txt", b"beta").await;
+            let kept = write_and_close_file(&vfs, big.ino, b"c.tmp", b"temp").await;
+
+            let mut status_rx = vfs.subscribe_scratch_auto_promote_status();
+            install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n").await;
+            let snap =
+                wait_for_auto_promote_generation(&mut status_rx, vfs.ignore_rule_generation())
+                    .await;
+            assert_eq!(snap.over_limit_directories.len(), 1);
+            assert_eq!(snap.over_limit_directories[0].relative_path, "big");
+            assert_eq!(snap.over_limit_directories[0].dir_ino, big.ino);
+
+            // Explicit control-API promotion is not bound by the background entry limit.
+            let outcome = vfs.promote_scratch_path("big").await.unwrap();
+            assert_eq!(outcome.relative_path, "big");
+            assert_eq!(outcome.promoted_inodes, 3);
+            assert_eq!(outcome.merged_directories, 0);
+            assert_eq!(outcome.conflict_renames, 0);
+
+            assert!(!vfs.is_scratch_inode(big.ino).unwrap());
+            assert!(!vfs.is_scratch_inode(f1.ino).unwrap());
+            assert!(!vfs.is_scratch_inode(f2.ino).unwrap());
+            assert!(
+                vfs.is_scratch_inode(kept.ino).unwrap(),
+                "descendant still matching *.tmp must stay scratch"
+            );
+            assert_eq!(vfs.read(f1.ino, 0, 64).await.unwrap().as_ref(), b"alpha");
+            assert_eq!(vfs.read(f2.ino, 0, 64).await.unwrap().as_ref(), b"beta");
+            assert_eq!(vfs.read(kept.ino, 0, 64).await.unwrap().as_ref(), b"temp");
+
+            // Both mounted snapshot and offline inspection no longer list `big`.
+            assert!(
+                vfs.scratch_auto_promote_snapshot()
+                    .over_limit_directories
+                    .is_empty()
+            );
+            assert!(
+                find_over_limit_scratch_directories(meta.as_ref(), 3)
+                    .unwrap()
+                    .is_empty()
+            );
+
+            // Promoting an already-tracked path, missing path, or invalid path returns an error.
+            let already = vfs.promote_scratch_path("big").await.unwrap_err();
+            assert!(already.to_string().contains("already tracked"));
+            assert!(matches!(
+                vfs.promote_scratch_path("missing").await,
+                Err(VfsError::Meta(MetaError::EntryNotFound { .. }))
+            ));
+            assert!(matches!(
+                vfs.promote_scratch_path("../big").await,
+                Err(VfsError::InvalidName(_))
+            ));
 
             vfs.shutdown(Duration::from_secs(5)).await.unwrap();
         });

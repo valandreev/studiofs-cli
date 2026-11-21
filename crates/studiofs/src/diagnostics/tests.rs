@@ -3241,3 +3241,160 @@ fn payload_limit_updates_require_auth_and_lease_over_ipc() {
     })
     .expect("payload limit IPC updates enforce auth and lease");
 }
+
+#[test]
+fn scratch_promote_ipc_enforces_auth_read_only_and_promotes_scratch_path() {
+    use studiofs_meta::schema::ROOT_INO;
+    use studiofs_vfs::contract_harness::ContractVfsFixture;
+
+    let fixture = ContractVfsFixture::new("sfs-1127-promote-ipc").expect("local VFS fixture");
+    let vfs = fixture.vfs();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(async {
+        // `._*` matches the built-in scratch rule so `._big` and its subtree start in scratch.
+        let big = vfs
+            .mkdir(ROOT_INO, b"._big", 0, 0, 0o755)
+            .expect("mkdir ._big");
+        assert!(vfs.is_scratch_inode(big.ino).expect("._big scratch"));
+        let file = vfs
+            .create(big.ino, b"shot.exr", 0, 0, 0o644)
+            .expect("create shot.exr");
+        vfs.write(file.ino, 0, b"frame-data")
+            .await
+            .expect("write shot.exr");
+        vfs.flush(file.ino).await.expect("flush shot.exr");
+        assert!(vfs.is_scratch_inode(file.ino).expect("file scratch"));
+
+        let source: Arc<dyn DiagnosticsDataSource> = Arc::new(LiveMountDiagnosticsSource::new(
+            fixture.core().format_info(),
+            "/sfs-1127",
+            fixture.cache_dir(),
+            std::process::id(),
+            false,
+            LiveMountRuntimeFingerprint {
+                bridge: "test".to_string(),
+                cache_size: None,
+                endpoint_override: None,
+                snapshot_id: None,
+                vfs_config: serde_json::Value::Null,
+            },
+            vfs.clone(),
+        ));
+        let leases = Arc::new(ControllerLeaseManager::default());
+
+        async fn roundtrip(
+            request: DiagnosticsRequest,
+            source: Arc<dyn DiagnosticsDataSource>,
+            leases: Arc<ControllerLeaseManager>,
+        ) -> Result<DiagnosticsResponse> {
+            let (client_stream, server_stream) = tokio::io::duplex(16 * 1024);
+            let semaphore = Arc::new(Semaphore::new(1));
+            let permit = semaphore.acquire_owned().await?;
+            let server = tokio::spawn(handle_client(
+                server_stream,
+                "secret".to_string(),
+                source,
+                leases,
+                None,
+                None,
+                permit,
+            ));
+            let response = send_request(client_stream, request).await?;
+            server.await??;
+            Ok(response)
+        }
+
+        let unauthorized = roundtrip(
+            DiagnosticsRequest::ScratchPromote {
+                auth_token: "wrong-token".to_string(),
+                path: "._big".to_string(),
+            },
+            source.clone(),
+            leases.clone(),
+        )
+        .await?;
+        assert!(matches!(
+            unauthorized,
+            DiagnosticsResponse::Error { code, .. } if code == "unauthorized"
+        ));
+
+        let promoted = roundtrip(
+            DiagnosticsRequest::ScratchPromote {
+                auth_token: "secret".to_string(),
+                path: "._big".to_string(),
+            },
+            source.clone(),
+            leases.clone(),
+        )
+        .await?;
+        match promoted {
+            DiagnosticsResponse::ScratchPromote { outcome } => {
+                assert_eq!(outcome.relative_path, "._big");
+                assert_eq!(outcome.promoted_inodes, 2);
+                assert_eq!(outcome.merged_directories, 0);
+                assert_eq!(outcome.conflict_renames, 0);
+            }
+            other => anyhow::bail!("expected ScratchPromote response, got {other:?}"),
+        }
+        assert!(!vfs.is_scratch_inode(big.ino)?);
+        assert!(!vfs.is_scratch_inode(file.ino)?);
+
+        let snapshot = roundtrip(
+            DiagnosticsRequest::RuntimeSnapshot {
+                auth_token: "secret".to_string(),
+            },
+            source,
+            leases.clone(),
+        )
+        .await?;
+        match snapshot {
+            DiagnosticsResponse::RuntimeSnapshot { snapshot } => {
+                let auto = snapshot
+                    .scratch_auto_promote
+                    .expect("scratch_auto_promote snapshot");
+                assert!(auto.over_limit_directories.is_empty());
+            }
+            other => anyhow::bail!("expected RuntimeSnapshot response, got {other:?}"),
+        }
+
+        // Read-only mount rejects scratch promotion.
+        let ro_source: Arc<dyn DiagnosticsDataSource> = Arc::new(LiveMountDiagnosticsSource::new(
+            fixture.core().format_info(),
+            "/sfs-1127-ro",
+            fixture.cache_dir(),
+            std::process::id(),
+            true,
+            LiveMountRuntimeFingerprint {
+                bridge: "test".to_string(),
+                cache_size: None,
+                endpoint_override: None,
+                snapshot_id: None,
+                vfs_config: serde_json::Value::Null,
+            },
+            vfs,
+        ));
+        let ro_response = roundtrip(
+            DiagnosticsRequest::ScratchPromote {
+                auth_token: "secret".to_string(),
+                path: "._big".to_string(),
+            },
+            ro_source,
+            leases,
+        )
+        .await?;
+        assert!(matches!(
+            ro_response,
+            DiagnosticsResponse::Error { code, message }
+                if code == "scratch_promote_failed" && message.contains("read-only")
+        ));
+
+        Ok::<(), anyhow::Error>(())
+    })
+    .expect("scratch promote IPC promotes scratch directory and updates snapshot");
+}

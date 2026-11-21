@@ -149,15 +149,30 @@ fn format_cache_scrub(snapshot: &studiofs_vfs::VfsCacheScrubSnapshot, now_ms: u6
     )
 }
 
+fn shell_quote_cli_arg(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b':')
+        })
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn format_scratch_over_limit_directories(
+    volume_name: &str,
     entries: &[studiofs_vfs::ScratchPromoteOverLimitEntry],
 ) -> Vec<String> {
+    let volume_arg = shell_quote_cli_arg(volume_name);
     entries
         .iter()
         .map(|entry| {
+            let path_arg = shell_quote_cli_arg(&entry.relative_path);
             format!(
-                "  Scratch dir `{}` exceeds promote limit; run `studiofs scratch promote` ({} > {} entries)",
-                entry.relative_path, entry.entry_count, entry.entry_limit
+                "  Scratch dir `{}` exceeds promote limit; run `studiofs scratch promote --volume {} {}` ({} > {} entries)",
+                entry.relative_path, volume_arg, path_arg, entry.entry_count, entry.entry_limit
             )
         })
         .collect()
@@ -732,9 +747,10 @@ pub fn run(
                     println!("{}", format_cache_scrub(&scrub, current_unix_ms()));
                 }
                 if let Some(auto_promote) = snapshot.scratch_auto_promote.as_ref() {
-                    for line in
-                        format_scratch_over_limit_directories(&auto_promote.over_limit_directories)
-                    {
+                    for line in format_scratch_over_limit_directories(
+                        name,
+                        &auto_promote.over_limit_directories,
+                    ) {
                         println!("{line}");
                     }
                 }
@@ -945,7 +961,7 @@ pub fn run(
         studiofs_vfs::scratch_promote_entry_limit_from_env(),
     ) {
         Ok(over_limit) => {
-            for line in format_scratch_over_limit_directories(&over_limit) {
+            for line in format_scratch_over_limit_directories(name, &over_limit) {
                 println!("{line}");
             }
         }
@@ -1434,16 +1450,20 @@ mod tests {
 
     #[test]
     fn format_scratch_over_limit_directories_reports_promote_guidance() {
-        let lines =
-            format_scratch_over_limit_directories(&[studiofs_vfs::ScratchPromoteOverLimitEntry {
+        let lines = format_scratch_over_limit_directories(
+            "myvol",
+            &[studiofs_vfs::ScratchPromoteOverLimitEntry {
                 dir_ino: 77,
                 relative_path: "renders/tmp".to_string(),
                 entry_count: 4,
                 entry_limit: 3,
-            }]);
+            }],
+        );
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("renders/tmp"));
-        assert!(lines[0].contains("exceeds promote limit; run `studiofs scratch promote`"));
+        assert!(lines[0].contains(
+            "exceeds promote limit; run `studiofs scratch promote --volume myvol renders/tmp`"
+        ));
         assert!(lines[0].contains("4 > 3"));
     }
 

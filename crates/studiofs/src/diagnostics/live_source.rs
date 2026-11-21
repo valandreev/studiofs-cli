@@ -181,6 +181,18 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
         self.vfs.reset_diagnostics_observability();
         Ok(())
     }
+
+    fn promote_scratch_path(&self, path: &str) -> Result<studiofs_vfs::ScratchPromotePathOutcome> {
+        if self.identity.read_only {
+            anyhow::bail!("cannot promote scratch entries on a read-only mount");
+        }
+        crate::runtime_bridge::block_on(async {
+            self.vfs
+                .promote_scratch_path(path)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    }
 }
 
 pub(super) fn base_environment_fingerprint(
