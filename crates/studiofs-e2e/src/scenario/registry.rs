@@ -60,8 +60,14 @@ pub fn available_scenarios() -> &'static [ScenarioDefinition] {
             RecoverableTrashJanitor.definition(),
             LogicalQuota.definition(),
             MountedCacheScrub.definition(),
-            ScratchDemote.definition(),
+            ScratchIsolation.definition(),
+            ScratchAtomicSave.definition(),
+            ScratchDurability.definition(),
             ScratchAutoPromote.definition(),
+            ScratchConflict.definition(),
+            ScratchOrphanRestore.definition(),
+            ScratchDemote.definition(),
+            ScratchAppleDouble.definition(),
         ]
     })
 }
@@ -72,8 +78,14 @@ pub(crate) fn resolve_scenario(name: &str) -> Option<Box<dyn Scenario>> {
         "mounted-recoverable-trash-two-client" => Some(Box::new(RecoverableTrash)),
         "mounted-logical-quota" => Some(Box::new(LogicalQuota)),
         "mounted-cache-scrub" => Some(Box::new(MountedCacheScrub)),
-        SCRATCH_DEMOTE => Some(Box::new(ScratchDemote)),
+        SCRATCH_ISOLATION => Some(Box::new(ScratchIsolation)),
+        SCRATCH_ATOMIC_SAVE => Some(Box::new(ScratchAtomicSave)),
+        SCRATCH_DURABILITY => Some(Box::new(ScratchDurability)),
         SCRATCH_AUTO_PROMOTE => Some(Box::new(ScratchAutoPromote)),
+        SCRATCH_CONFLICT => Some(Box::new(ScratchConflict)),
+        SCRATCH_ORPHAN_RESTORE => Some(Box::new(ScratchOrphanRestore)),
+        SCRATCH_DEMOTE => Some(Box::new(ScratchDemote)),
+        SCRATCH_APPLEDOUBLE => Some(Box::new(ScratchAppleDouble)),
         "mounted-recoverable-trash-durability" => {
             Some(Box::new(RecoverableTrashDurability::OfflineCrashReplay))
         }
@@ -206,14 +218,28 @@ mod tests {
     use super::{available_scenarios, resolve_scenario};
 
     #[test]
-    fn scratch_demote_is_registered_and_resolvable() {
-        let name = super::SCRATCH_DEMOTE;
-        assert!(
-            available_scenarios()
-                .iter()
-                .any(|scenario| scenario.name == name)
-        );
-        assert!(resolve_scenario(name).is_some());
+    fn scratch_scenarios_are_registered_and_resolvable() {
+        for name in [
+            super::SCRATCH_ISOLATION,
+            super::SCRATCH_ATOMIC_SAVE,
+            super::SCRATCH_DURABILITY,
+            super::SCRATCH_AUTO_PROMOTE,
+            super::SCRATCH_CONFLICT,
+            super::SCRATCH_ORPHAN_RESTORE,
+            super::SCRATCH_DEMOTE,
+            super::SCRATCH_APPLEDOUBLE,
+        ] {
+            assert!(
+                available_scenarios()
+                    .iter()
+                    .any(|scenario| scenario.name == name),
+                "missing registered scratch scenario: {name}"
+            );
+            assert!(
+                resolve_scenario(name).is_some(),
+                "could not resolve scratch scenario: {name}"
+            );
+        }
     }
 
     #[test]

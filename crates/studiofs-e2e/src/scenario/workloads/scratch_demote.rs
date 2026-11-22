@@ -7,13 +7,14 @@ pub(in crate::scenario) struct ScratchDemote;
 const WAIT: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(200);
 const PAYLOAD: &[u8] = b"published bytes kept by scratch demotion\0\n";
+const UNCACHED_PAYLOAD: &[u8] = b"published bytes never cached on peer before demote attempt\0\n";
 const SUMMARY: &str = "scratch-demote.json";
 
 impl Scenario for ScratchDemote {
     fn definition(&self) -> ScenarioDefinition {
         ScenarioDefinition {
             name: SCRATCH_DEMOTE,
-            description: "peer removal and offline local read after tracked-to-scratch rename",
+            description: "cached tracked-to-scratch demote succeeds while uncached demote fails with EXDEV",
             requires_studiofs_bin: true,
         }
     }
@@ -50,10 +51,45 @@ impl Scenario for ScratchDemote {
             expect_bytes(&b.join(".studiofsignore"), rules)?;
             controller.unmount("client-a")?;
             controller.mount("client-a")?;
+            controller.unmount("client-b")?;
+            controller.mount("client-b")?;
 
             let source = a.join("tracked.bin");
             write_mounted_file_with_readback(source.clone(), PAYLOAD, "tracked write", true)?;
             expect_bytes(&b.join("tracked.bin"), PAYLOAD)?;
+
+            // Write a second tracked file on client-a and observe only its metadata on client-b
+            // so its payload stays uncached on client-b.
+            write_mounted_file_with_readback(
+                a.join("uncached.bin"),
+                UNCACHED_PAYLOAD,
+                "uncached tracked write",
+                true,
+            )?;
+            wait_for_path_metadata(&b.join("uncached.bin"), UNCACHED_PAYLOAD.len() as u64)?;
+            let b_scratch_dir = b.join("local-scratch");
+            let b_uncached_src = b.join("uncached.bin");
+            let b_uncached_dst = b_scratch_dir.join("uncached.bin");
+            let exdev_errno = run_bounded_mounted_io("demote uncached file", WAIT, move || {
+                fs::create_dir(&b_scratch_dir)?;
+                match fs::rename(&b_uncached_src, &b_uncached_dst) {
+                    Ok(()) => Err(io::Error::other(
+                        "expected EXDEV when demoting uncached tracked file into scratch",
+                    )),
+                    Err(error) => {
+                        if is_cross_device_error(&error) {
+                            Ok(error.raw_os_error())
+                        } else {
+                            Err(io::Error::other(format!(
+                                "expected EXDEV for uncached demote, got: {error} (raw_os_error={:?})",
+                                error.raw_os_error()
+                            )))
+                        }
+                    }
+                }
+            })?;
+            // Uncached file must remain intact at its original tracked path.
+            expect_bytes(&a.join("uncached.bin"), UNCACHED_PAYLOAD)?;
 
             let dir = a.join("local-scratch");
             let destination = dir.join("tracked.bin");
@@ -64,7 +100,7 @@ impl Scenario for ScratchDemote {
             })?;
             wait_for_mounted_paths_absent_until(
                 std::slice::from_ref(&observer),
-                &["tracked.bin", "local-scratch"],
+                &["tracked.bin"],
                 Instant::now() + WAIT,
                 POLL,
                 "scratch demotion peer removal",
@@ -81,6 +117,8 @@ impl Scenario for ScratchDemote {
                 serde_json::to_vec_pretty(&json!({
                     "peer_removal_observed": true,
                     "offline_payload_bytes": PAYLOAD.len(),
+                    "uncached_demote_exdev": true,
+                    "uncached_demote_errno": exdev_errno,
                 }))?,
             )?;
             Ok(())
@@ -117,6 +155,7 @@ impl Scenario for ScratchDemote {
             serde_json::from_slice(&fs::read(context.scenario_dir.join(SUMMARY))?)?;
         if summary["peer_removal_observed"] != true
             || summary["offline_payload_bytes"] != PAYLOAD.len()
+            || summary["uncached_demote_exdev"] != true
         {
             return Err(io::Error::other("scratch demote acceptance incomplete").into());
         }
@@ -128,6 +167,55 @@ impl Scenario for ScratchDemote {
     fn cleanup(&self, _context: &ScenarioContext) -> Result<(), ScenarioError> {
         Ok(())
     }
+}
+
+fn wait_for_path_metadata(path: &Path, expected_len: u64) -> Result<(), ScenarioError> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let probe_path = path.to_path_buf();
+        let meta =
+            run_bounded_mounted_io("stat peer file", WAIT, move || {
+                match fs::symlink_metadata(&probe_path) {
+                    Ok(meta) => Ok(Some(meta)),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })?;
+        if let Some(meta) = meta
+            && meta.is_file()
+            && meta.len() == expected_len
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::other(format!(
+                "timed out waiting for peer metadata at {} (expected {expected_len} bytes)",
+                path.display()
+            ))
+            .into());
+        }
+        thread::sleep(POLL);
+    }
+}
+
+fn is_cross_device_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::CrossesDevices {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        if error.raw_os_error() == Some(libc::EXDEV) {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_SAME_DEVICE = 17
+        if error.raw_os_error() == Some(17) {
+            return true;
+        }
+    }
+    false
 }
 
 fn expect_bytes(path: &Path, expected: &[u8]) -> Result<(), ScenarioError> {
