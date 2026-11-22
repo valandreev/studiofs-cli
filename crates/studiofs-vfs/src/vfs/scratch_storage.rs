@@ -626,7 +626,17 @@ mod tests {
     ) {
         let (rt, vfs, meta) = super::super::tests::make_unstarted_test_vfs(temp, volume);
         let _guard = rt.enter();
+        let mut status = vfs.subscribe_scratch_auto_promote_status();
         vfs.start().unwrap();
+        // With no rule files the empty set loads successfully and SFS-1128 runs one startup
+        // auto-promote pass; let it finish on the empty volume so it cannot promote scratch
+        // entries the test seeds afterwards.
+        rt.block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            status.wait_for(|snap| snap.passes_completed >= 1),
+        ))
+        .expect("timed out waiting for startup scratch auto-promote pass")
+        .expect("scratch auto-promote watch closed");
         (rt, vfs, meta)
     }
 
