@@ -273,6 +273,10 @@ impl Scenario for ScratchAtomicSave {
 
             // Snapshot object files right before rename (includes pre-rename.marker's object).
             let objects_immediately_before_rename = list_cache_object_files(&client_a)?;
+            let scratch_objects = objects_before_rename
+                .difference(&objects_before_write)
+                .map(|path| Ok((path, cache_object_stamp(path)?)))
+                .collect::<io::Result<Vec<_>>>()?;
 
             let src = tmp_path.clone();
             let dst = final_path.clone();
@@ -303,6 +307,15 @@ impl Scenario for ScratchAtomicSave {
                 ))
                 .into());
             }
+            for (path, before) in &scratch_objects {
+                if cache_object_stamp(path)? != *before {
+                    return Err(io::Error::other(format!(
+                        "atomic-save promotion rewrote writer payload object {}",
+                        path.display()
+                    ))
+                    .into());
+                }
+            }
 
             wait_for_mounted_paths_absent_until(
                 std::slice::from_ref(&observer),
@@ -322,6 +335,7 @@ impl Scenario for ScratchAtomicSave {
                     "objects_before_write": objects_before_write.len(),
                     "objects_before_rename": objects_before_rename.len(),
                     "objects_added_by_rename": added_after_rename.len(),
+                    "scratch_objects_reused": scratch_objects.len(),
                     "rule_probe_attempts": probe_attempts,
                 }),
             )
@@ -333,6 +347,7 @@ impl Scenario for ScratchAtomicSave {
         if summary["peer_payload_verified"] != true
             || summary["inode_preserved"] != true
             || summary["objects_added_by_rename"] != 0
+            || summary["scratch_objects_reused"].as_u64().unwrap_or(0) == 0
         {
             return Err(io::Error::other("scratch atomic-save acceptance incomplete").into());
         }
@@ -995,7 +1010,13 @@ fn wait_for_rules_active(
         write_mounted_file_with_readback(writer.join(&probe), b"p\n", "rule probe", true)?;
         write_mounted_file_with_readback(writer.join(&marker), b"m\n", "rule probe marker", true)?;
         expect_bytes(&observer.join(&marker), b"m\n")?;
-        if !observer.join(&probe).exists() {
+        let probe_path = observer.join(&probe);
+        let probe_exists = run_bounded_mounted_io(
+            format!("check scratch rule probe {}", probe_path.display()),
+            WAIT,
+            move || probe_path.try_exists(),
+        )?;
+        if !probe_exists {
             return Ok(attempt);
         }
         if Instant::now() >= deadline {
@@ -1053,8 +1074,7 @@ fn write_synced_mounted_file(
 }
 
 fn expect_bytes(path: &Path, expected: &[u8]) -> Result<(), ScenarioError> {
-    let readback = wait_for_mounted_payload_readback(path, expected, WAIT, POLL)
-        .map_err(|error| io::Error::other(format!("{}: {error}", path.display())))?;
+    let readback = wait_for_mounted_payload_readback(path, expected, WAIT, POLL)?;
     if readback != expected {
         return Err(io::Error::other(format!("payload mismatch at {}", path.display())).into());
     }
@@ -1089,6 +1109,18 @@ fn collect_files_recursive(dir: &Path, out: &mut BTreeSet<PathBuf>) -> io::Resul
         }
     }
     Ok(())
+}
+
+fn cache_object_stamp(path: &Path) -> io::Result<(Option<u64>, std::time::SystemTime)> {
+    let metadata = fs::metadata(path)?;
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let ino = None;
+    Ok((ino, metadata.modified()?))
 }
 
 fn wait_for_cache_object_growth(
