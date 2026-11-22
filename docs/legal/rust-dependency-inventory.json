@@ -4,7 +4,7 @@
   "inputs": {
     "lockfile": {
       "path": "Cargo.lock",
-      "sha256": "2e08e1140b19866e30b6c9b84d05dddf8a8b16bd6ed7e46e027bca88d7a2bcb8",
+      "sha256": "c5440699a6ad6ea64b03fa99c3c4a941e3b44a6e566718c8780cea98b1eef8b8",
       "sha256_input": "LF-normalized bytes"
     },
     "metadata_snapshot": {
@@ -17075,22 +17075,22 @@
     },
     {
       "name": "form_urlencoded",
-      "version": "1.2.2",
+      "version": "1.2.3",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf",
+      "checksum": "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e",
       "package_kind": "third-party",
       "license_expression": "MIT OR Apache-2.0",
       "license_expression_id": "spdx:db11fec9946737df",
       "repository": "https://github.com/servo/rust-url",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#form_urlencoded@1.2.2/Cargo.toml",
-        "sha256": "118b1d87e862ea329b8bc84b389085a2f8e049d4c0b8b3c38ac2bffbe3501928"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#form_urlencoded@1.2.3/Cargo.toml",
+        "sha256": "47a39fced5fea0239010d6cc5e65bdd6312ef348e029be8389e4be8a14b5ce99"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "118b1d87e862ea329b8bc84b389085a2f8e049d4c0b8b3c38ac2bffbe3501928",
-          "archive_member_sha256": "118b1d87e862ea329b8bc84b389085a2f8e049d4c0b8b3c38ac2bffbe3501928",
+          "sha256": "47a39fced5fea0239010d6cc5e65bdd6312ef348e029be8389e4be8a14b5ce99",
+          "archive_member_sha256": "47a39fced5fea0239010d6cc5e65bdd6312ef348e029be8389e4be8a14b5ce99",
           "archive_member_status": "verified"
         },
         {
@@ -17108,8 +17108,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/form_urlencoded-1.2.2.crate",
-        "sha256": "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+        "path": "registry/cache/crates-io/form_urlencoded-1.2.3.crate",
+        "sha256": "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",
@@ -17160,7 +17160,7 @@
         {
           "from": {
             "name": "url",
-            "version": "2.5.8",
+            "version": "2.5.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -23844,7 +23844,7 @@
         {
           "from": {
             "name": "url",
-            "version": "2.5.8",
+            "version": "2.5.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -37142,7 +37142,7 @@
         {
           "from": {
             "name": "form_urlencoded",
-            "version": "1.2.2",
+            "version": "1.2.3",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -37221,7 +37221,7 @@
         {
           "from": {
             "name": "url",
-            "version": "2.5.8",
+            "version": "2.5.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -46777,7 +46777,7 @@
         {
           "from": {
             "name": "url",
-            "version": "2.5.8",
+            "version": "2.5.9",
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           "dependency_kinds": [
@@ -50306,12 +50306,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-cache/Cargo.toml",
-        "sha256": "f977d4ee0bf71565357b8a32c7723dd9f382d1042c601ab99eb3b28af819fc2f"
+        "sha256": "5ed6d53a742c7267194f67f07f8939b0260d3c87332bdb48939aaa8f2feddacb"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "f977d4ee0bf71565357b8a32c7723dd9f382d1042c601ab99eb3b28af819fc2f"
+          "sha256": "5ed6d53a742c7267194f67f07f8939b0260d3c87332bdb48939aaa8f2feddacb"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -50320,16 +50320,22 @@
       "distribution_obligation_profile": "spdx:ffbc986889d4c74b",
       "distribution_obligation_profile_reference": "docs/legal/rust-dependency-audit.md#distribution-profiles",
       "target_scope_classification": "selected-for-studiofs-target",
-      "nonproduction_scope_hints": [],
+      "nonproduction_scope_hints": [
+        "has-workspace-or-dependency-dev-edge"
+      ],
       "resolved_incoming_dependency_edges": [
         {
           "from": {
-            "name": "studiofs",
+            "name": "studiofs-vfs",
             "version": "0.2.4",
             "source": null,
-            "workspace_path": "crates/studiofs"
+            "workspace_path": "crates/studiofs-vfs"
           },
           "dependency_kinds": [
+            {
+              "kind": "dev",
+              "target": null
+            },
             {
               "kind": "normal",
               "target": null
@@ -50338,10 +50344,10 @@
         },
         {
           "from": {
-            "name": "studiofs-vfs",
+            "name": "studiofs",
             "version": "0.2.4",
             "source": null,
-            "workspace_path": "crates/studiofs-vfs"
+            "workspace_path": "crates/studiofs"
           },
           "dependency_kinds": [
             {
@@ -50999,12 +51005,12 @@
       "repository": null,
       "manifest": {
         "path": "crates/studiofs-vfs/Cargo.toml",
-        "sha256": "88223402cef17a4e8d36a3d8f209b85d8e62a3a492bc4049e8c7dd309d2f0e5e"
+        "sha256": "6e81dc2dd7ddc90ac4e347dd5284e25bf82e50301a635c4b907b4d2b089edec4"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "88223402cef17a4e8d36a3d8f209b85d8e62a3a492bc4049e8c7dd309d2f0e5e"
+          "sha256": "6e81dc2dd7ddc90ac4e347dd5284e25bf82e50301a635c4b907b4d2b089edec4"
         }
       ],
       "cargo_cache_checksum_evidence": null,
@@ -58535,22 +58541,22 @@
     },
     {
       "name": "url",
-      "version": "2.5.8",
+      "version": "2.5.9",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed",
+      "checksum": "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a",
       "package_kind": "third-party",
       "license_expression": "MIT OR Apache-2.0",
       "license_expression_id": "spdx:db11fec9946737df",
       "repository": "https://github.com/servo/rust-url",
       "manifest": {
-        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#url@2.5.8/Cargo.toml",
-        "sha256": "7003e5562b5ab8454b9d78376303151af79011f5dd684c1891e0f46bc9112016"
+        "path": "registry:registry+https://github.com/rust-lang/crates.io-index#url@2.5.9/Cargo.toml",
+        "sha256": "8f084b776440d30dd3c1334d0a35126ecf2d2fa8ef18d3ac6c4318ec747adbbd"
       },
       "license_evidence": [
         {
           "path": "Cargo.toml",
-          "sha256": "7003e5562b5ab8454b9d78376303151af79011f5dd684c1891e0f46bc9112016",
-          "archive_member_sha256": "7003e5562b5ab8454b9d78376303151af79011f5dd684c1891e0f46bc9112016",
+          "sha256": "8f084b776440d30dd3c1334d0a35126ecf2d2fa8ef18d3ac6c4318ec747adbbd",
+          "archive_member_sha256": "8f084b776440d30dd3c1334d0a35126ecf2d2fa8ef18d3ac6c4318ec747adbbd",
           "archive_member_status": "verified"
         },
         {
@@ -58568,8 +58574,8 @@
       ],
       "cargo_cache_checksum_evidence": {
         "kind": "crate-archive",
-        "path": "registry/cache/crates-io/url-2.5.8.crate",
-        "sha256": "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+        "path": "registry/cache/crates-io/url-2.5.9.crate",
+        "sha256": "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
       },
       "source_integrity_status": "verified",
       "license_evidence_status": "present",

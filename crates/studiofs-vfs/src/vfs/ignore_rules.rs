@@ -58,6 +58,17 @@ struct CachedDirRules {
     compiled: Arc<CompiledDirRules>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefreshOutcome {
+    /// Every discovered rule file was loaded (or skipped as oversized) and any
+    /// changes were persisted and published.
+    Loaded,
+    /// Metadata scan, payload read, or cache persistence failed; retry later.
+    Retry,
+    /// Background shutdown interrupted the refresh before it completed.
+    Cancelled,
+}
+
 pub(super) struct IgnoreRules {
     backend: Arc<dyn LocalPayloadBackend>,
     pins: parking_lot::Mutex<RulePins>,
@@ -72,6 +83,7 @@ pub(super) struct IgnoreRules {
     watched: Arc<parking_lot::Mutex<RuleInodes>>,
     changed: broadcast::Sender<Vec<Vec<u8>>>,
     bootstrap: watch::Sender<bool>,
+    rules_loaded: watch::Sender<bool>,
 }
 
 impl IgnoreRules {
@@ -116,6 +128,7 @@ impl IgnoreRules {
             watched: Arc::default(),
             changed: broadcast::channel(32).0,
             bootstrap: watch::channel(restored).0,
+            rules_loaded: watch::channel(false).0,
         };
         'sources: for directory in state.sources.keys() {
             let mut parent = ROOT_INO;
@@ -476,6 +489,17 @@ impl StudioVfs {
         self.ignore_rules.changed.subscribe()
     }
 
+    /// Observe whether the background rule worker has completed a full rule load
+    /// at least once since mount.
+    pub(super) fn subscribe_ignore_rules_loaded(&self) -> watch::Receiver<bool> {
+        self.ignore_rules.rules_loaded.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(super) fn trigger_ignore_rules_refresh_for_test(&self) {
+        self.ignore_rules.refresh.notify_one();
+    }
+
     /// Wait for the initial prefetch pass before exposing the mount.
     pub async fn wait_for_ignore_rules_bootstrap(&self) {
         if !self.read_only_mount {
@@ -494,8 +518,16 @@ impl StudioVfs {
         let mut versions = BTreeMap::new();
         let cancellation = &self.state.shutdown.background_shutdown_token;
         loop {
-            let retry = self.refresh_ignore_rules(&mut sources, &mut versions).await;
+            let outcome = self.refresh_ignore_rules(&mut sources, &mut versions).await;
+            if outcome == RefreshOutcome::Loaded {
+                self.ignore_rules.rules_loaded.send_if_modified(|loaded| {
+                    let changed = !*loaded;
+                    *loaded = true;
+                    changed
+                });
+            }
             self.ignore_rules.bootstrap.send_replace(true);
+            let retry = outcome == RefreshOutcome::Retry;
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 _ = self.ignore_rules.refresh.notified() => {}
@@ -525,7 +557,7 @@ impl StudioVfs {
         &self,
         sources: &mut RuleSources,
         versions: &mut BTreeMap<Vec<u8>, RuleVersion>,
-    ) -> bool {
+    ) -> RefreshOutcome {
         let cancellation = self.state.shutdown.background_shutdown_token.clone();
         let watched = Arc::clone(&self.ignore_rules.watched);
         watched.lock().bound_during_scan.clear();
@@ -612,12 +644,12 @@ impl StudioVfs {
             Ok(result) => result,
             Err(error) => {
                 warn!(%error, "could not discover ignore rule files");
-                return true;
+                return RefreshOutcome::Retry;
             }
         };
         let cancellation = &self.state.shutdown.background_shutdown_token;
         if cancellation.is_cancelled() {
-            return false;
+            return RefreshOutcome::Cancelled;
         }
         self.ignore_rules
             .watched
@@ -664,7 +696,7 @@ impl StudioVfs {
                 continue;
             }
             let read = tokio::select! {
-                _ = cancellation.cancelled() => return false,
+                _ = cancellation.cancelled() => return RefreshOutcome::Cancelled,
                 read = tokio::time::timeout_at(deadline, self.read_ignore_rule_payload(ino, size)) => read,
             };
             let payload = match read {
@@ -693,7 +725,7 @@ impl StudioVfs {
                 Ok(bytes) => bytes,
                 Err(error) => {
                     warn!(%error, "could not encode local ignore rules");
-                    return true;
+                    return RefreshOutcome::Retry;
                 }
             };
             if let Err(error) = self
@@ -702,7 +734,7 @@ impl StudioVfs {
                 .await
             {
                 warn!(%error, "could not persist local ignore rules");
-                return true;
+                return RefreshOutcome::Retry;
             }
             #[cfg(test)]
             {
@@ -713,7 +745,7 @@ impl StudioVfs {
                         tokio::time::timeout(BOOTSTRAP_BUDGET, resume).await,
                         Ok(Ok(()))
                     ) {
-                        return true;
+                        return RefreshOutcome::Retry;
                     }
                 }
             }
@@ -730,7 +762,11 @@ impl StudioVfs {
             }
         }
         *versions = next_versions;
-        !missing.is_empty()
+        if missing.is_empty() {
+            RefreshOutcome::Loaded
+        } else {
+            RefreshOutcome::Retry
+        }
     }
 }
 

@@ -403,43 +403,83 @@ impl StudioVfs {
             .send_modify(|snapshot| snapshot.rate_limit_per_sec = rate_per_sec);
     }
 
+    /// Waits for `RULES_SETTLE_DELAY` of quiet on `rules_rx`; returns `false` on
+    /// shutdown or channel closure.
+    async fn wait_for_rules_to_settle(
+        rules_rx: &mut broadcast::Receiver<Vec<Vec<u8>>>,
+        cancel: &CancellationToken,
+    ) -> bool {
+        // Run on settled rules: restart the quiet period on every change.
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return false,
+                _ = tokio::time::sleep(RULES_SETTLE_DELAY) => return true,
+                recv = rules_rx.recv() => {
+                    if matches!(recv, Err(broadcast::error::RecvError::Closed)) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) async fn background_scratch_auto_promote(
         &self,
         mut rules_rx: broadcast::Receiver<Vec<Vec<u8>>>,
+        mut rules_loaded_rx: watch::Receiver<bool>,
     ) {
         let cancel = self.state.shutdown.background_shutdown_token.clone();
+        // Never run a pass before the initial rule load succeeds: without loaded
+        // rules every path classifies as tracked and all scratch would be promoted.
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            loaded = rules_loaded_rx.wait_for(|loaded| *loaded) => {
+                if loaded.is_err() {
+                    return;
+                }
+            }
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
+
         let (rate_per_sec, burst) = self.scratch_auto_promote.effective_rate();
         let mut limiter = AutoPromoteRateLimiter::new(rate_per_sec, burst);
         // A pass that promoted or failed something gets a backed-off follow-up pass: it picks
         // up entries created as scratch under a directory promoted mid-pass and candidates
         // that kept changing under active writes.
         let mut follow_up: Option<Duration> = None;
+        let mut run_initial_pass = true;
 
         loop {
-            let follow_up_timer = async {
-                match follow_up {
-                    Some(delay) => tokio::time::sleep(delay).await,
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = follow_up_timer => {}
-                _ = self.scratch_auto_promote.replay_merge_wake.notified() => {}
-                recv = rules_rx.recv() => {
-                    if matches!(recv, Err(broadcast::error::RecvError::Closed)) {
-                        return;
+            if run_initial_pass {
+                run_initial_pass = false;
+                match rules_rx.try_recv() {
+                    Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                        if !Self::wait_for_rules_to_settle(&mut rules_rx, &cancel).await {
+                            return;
+                        }
                     }
-                    // Run on settled rules: restart the quiet period on every change.
-                    loop {
-                        tokio::select! {
-                            _ = cancel.cancelled() => return,
-                            _ = tokio::time::sleep(RULES_SETTLE_DELAY) => break,
-                            recv = rules_rx.recv() => {
-                                if matches!(recv, Err(broadcast::error::RecvError::Closed)) {
-                                    return;
-                                }
-                            }
+                    Err(broadcast::error::TryRecvError::Empty) => {}
+                    Err(broadcast::error::TryRecvError::Closed) => return,
+                }
+            } else {
+                let follow_up_timer = async {
+                    match follow_up {
+                        Some(delay) => tokio::time::sleep(delay).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = follow_up_timer => {}
+                    _ = self.scratch_auto_promote.replay_merge_wake.notified() => {}
+                    recv = rules_rx.recv() => {
+                        if matches!(recv, Err(broadcast::error::RecvError::Closed)) {
+                            return;
+                        }
+                        if !Self::wait_for_rules_to_settle(&mut rules_rx, &cancel).await {
+                            return;
                         }
                     }
                 }
@@ -1109,22 +1149,33 @@ mod tests {
             .expect("ignore rule channel closed");
     }
 
+    async fn wait_for_auto_promote_status(
+        rx: &mut watch::Receiver<VfsScratchAutoPromoteSnapshot>,
+        what: &str,
+        done: impl Fn(&VfsScratchAutoPromoteSnapshot) -> bool,
+    ) -> VfsScratchAutoPromoteSnapshot {
+        tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|snap| done(snap)))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for scratch auto-promote {what}"))
+            .expect("scratch auto-promote watch closed")
+            .clone()
+    }
+
     async fn wait_for_auto_promote_generation(
         rx: &mut watch::Receiver<VfsScratchAutoPromoteSnapshot>,
         min_rule_generation: u64,
     ) -> VfsScratchAutoPromoteSnapshot {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if rx.borrow().last_rule_generation >= min_rule_generation {
-                    return rx.borrow().clone();
-                }
-                rx.changed()
-                    .await
-                    .expect("scratch auto-promote watch closed");
-            }
+        wait_for_auto_promote_status(rx, "rule generation", |snap| {
+            snap.last_rule_generation >= min_rule_generation
         })
         .await
-        .expect("timed out waiting for scratch auto-promote rule generation")
+    }
+
+    async fn wait_for_auto_promote_pass(
+        rx: &mut watch::Receiver<VfsScratchAutoPromoteSnapshot>,
+        min_passes: u64,
+    ) -> VfsScratchAutoPromoteSnapshot {
+        wait_for_auto_promote_status(rx, "pass", |snap| snap.passes_completed >= min_passes).await
     }
 
     async fn write_and_close_file(
@@ -1925,5 +1976,246 @@ mod tests {
         drop(meta);
         // If background worker did not join cleanly on shutdown, reopening the redb lock fails.
         RedbMetaEngine::open(temp.path().join("meta.redb")).unwrap();
+    }
+
+    #[test]
+    fn scratch_auto_promote_runs_pass_after_remount_with_unchanged_rules() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-auto-remount-");
+
+        // Mount 1: create scratch entries under `*.tmp` and `*.bak`.
+        let (promote_me, dir_tmp, nested, keep_me) = {
+            let (rt, vfs, meta) =
+                make_started_vfs_with_limit(&temp, "scratch-auto-remount", None, None, None);
+            let _guard = rt.enter();
+            let created = rt.block_on(async {
+                install_ignore_rules(&vfs, ROOT_INO, b"*.tmp\n*.bak\n").await;
+
+                let promote_me =
+                    write_and_close_file(&vfs, ROOT_INO, b"promote_me.tmp", b"after-remount").await;
+                let dir_tmp = vfs.mkdir(ROOT_INO, b"dir.tmp", 0, 0, 0o755).unwrap();
+                let nested =
+                    write_and_close_file(&vfs, dir_tmp.ino, b"nested.txt", b"nested-remount").await;
+                let keep_me =
+                    write_and_close_file(&vfs, ROOT_INO, b"keep_me.bak", b"stay-scratch").await;
+
+                for ino in [promote_me.ino, dir_tmp.ino, nested.ino, keep_me.ino] {
+                    assert!(vfs.is_scratch_inode(ino).unwrap());
+                }
+
+                vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+                (promote_me, dir_tmp, nested, keep_me)
+            });
+            drop(_guard);
+            drop(vfs);
+            drop(meta);
+            drop(rt);
+            created
+        };
+
+        // Remove `*.tmp` (persisting the updated rules cache) while stopping before any
+        // auto-promote pass runs, leaving the candidates in scratch across shutdown.
+        {
+            let (rt, vfs, meta) = make_unstarted_test_vfs_at(
+                temp.path(),
+                "scratch-auto-remount",
+                VfsConfig::default(),
+                None,
+            );
+            rt.block_on(async {
+                let rules_worker = tokio::spawn(Arc::clone(&vfs).background_ignore_rules());
+                vfs.wait_for_ignore_rules_bootstrap().await;
+                install_ignore_rules(&vfs, ROOT_INO, b"*.bak\n").await;
+                vfs.state.shutdown.background_shutdown_token.cancel();
+                tokio::time::timeout(Duration::from_secs(5), rules_worker)
+                    .await
+                    .expect("ignore rules worker joined")
+                    .unwrap();
+                for ino in [promote_me.ino, dir_tmp.ino, nested.ino, keep_me.ino] {
+                    assert!(
+                        vfs.is_scratch_inode(ino).unwrap(),
+                        "candidate inode {ino} must remain scratch before remount"
+                    );
+                }
+            });
+            drop(vfs);
+            drop(meta);
+            drop(rt);
+        }
+
+        // Mount 2: remount with the already-persisted unchanged rule set. No `rules_changed`
+        // notification fires, yet the post-mount pass promotes the remaining candidates.
+        let (rt, vfs, meta) = make_unstarted_test_vfs_at(
+            temp.path(),
+            "scratch-auto-remount",
+            VfsConfig::default(),
+            None,
+        );
+        let _guard = rt.enter();
+        let mut status_rx = vfs.subscribe_scratch_auto_promote_status();
+        let mut rules_changed = vfs.subscribe_ignore_rules_changes();
+        vfs.start().unwrap();
+        rt.block_on(async {
+            let snap = wait_for_auto_promote_pass(&mut status_rx, 1).await;
+            assert!(
+                matches!(
+                    rules_changed.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty)
+                ),
+                "remount with unchanged rules must not depend on a rules-changed notification"
+            );
+            assert!(snap.passes_completed >= 1);
+            assert!(snap.promoted_entries >= 2);
+            assert_eq!(snap.failed_entries, 0);
+
+            for promoted_ino in [promote_me.ino, dir_tmp.ino, nested.ino] {
+                assert!(
+                    !vfs.is_scratch_inode(promoted_ino).unwrap(),
+                    "inode {promoted_ino} should be promoted after remount"
+                );
+            }
+            assert!(
+                vfs.is_scratch_inode(keep_me.ino).unwrap(),
+                "entry still matching `*.bak` must stay scratch"
+            );
+            assert_eq!(
+                vfs.lookup(ROOT_INO, b"promote_me.tmp").unwrap().ino,
+                promote_me.ino
+            );
+            assert_eq!(
+                vfs.read(promote_me.ino, 0, 64).await.unwrap().as_ref(),
+                b"after-remount"
+            );
+            assert_eq!(
+                vfs.lookup(dir_tmp.ino, b"nested.txt").unwrap().ino,
+                nested.ino
+            );
+            assert_eq!(
+                vfs.read(nested.ino, 0, 64).await.unwrap().as_ref(),
+                b"nested-remount"
+            );
+
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+        });
+        drop(_guard);
+        drop(vfs);
+        drop(meta);
+    }
+
+    #[test]
+    fn scratch_auto_promote_does_not_run_before_rules_are_loaded() {
+        let temp = studiofs_test_support::workspace_target_tempdir("scratch-auto-unloaded-");
+        let rule_payload = b"*.tmp\n";
+        let (rt, vfs, meta) = make_unstarted_test_vfs_at(
+            temp.path(),
+            "scratch-auto-unloaded",
+            VfsConfig::default(),
+            None,
+        );
+        let _guard = rt.enter();
+        rt.block_on(async {
+            // Seed a published `.studiofsignore` (as if replicated from a peer) whose payload
+            // object is absent from local storage and unreachable remotely, with no cached
+            // rules in redb.
+            let rule_file = meta.create_file(ROOT_INO, RULE_FILE, 0, 0, 0o644).unwrap();
+            let mut rule_attr = meta.get_attr(rule_file.ino).unwrap();
+            let rule_object_id = meta.next_object_id().unwrap();
+            rule_attr.content_epoch = rule_attr.content_epoch.saturating_add(1);
+            rule_attr.committed_content_epoch = rule_attr.content_epoch;
+            rule_attr.size = rule_payload.len() as u64;
+            rule_attr.committed_size = rule_attr.size;
+            rule_attr.upload_state = UploadState::Ready;
+            let mut rec = SliceRecord::new(
+                SliceId(1),
+                SliceOrder(1),
+                SliceRange::new(0, rule_payload.len() as u32).unwrap(),
+                PayloadRef::new_partial(rule_object_id, rule_payload.len() as u32),
+            );
+            rec.payload_state = PayloadRefState::Published;
+            let events = [
+                MetaEvent::SetAttr { attr: rule_attr },
+                MetaEvent::PublishRegularFileBaseSlices {
+                    ino: rule_file.ino,
+                    chunk_slices: vec![(ChunkId(0), vec![rec])],
+                },
+            ];
+            meta.apply_replica_events_to_base(&events).unwrap();
+            meta.apply_replica_serving_state(&events).unwrap();
+            assert!(!vfs.local_payload_backend.contains(rule_object_id));
+            assert!(meta.load_ignore_rules_cache().unwrap().is_none());
+
+            // Seed scratch entries: `keep.tmp` matches the unloaded rule and must not be
+            // promoted; `promote.txt` does not match and should promote once rules load.
+            let keep_tmp = vfs
+                .store_scratch_entry(b"keep.tmp", InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644))
+                .unwrap();
+            vfs.write_scratch(0, keep_tmp.ino, 0, b"keep-local")
+                .await
+                .unwrap();
+            vfs.flush(keep_tmp.ino).await.unwrap();
+
+            let promote_txt = vfs
+                .store_scratch_entry(
+                    b"promote.txt",
+                    InodeAttr::new_file(0, ROOT_INO, 0, 0, 0o644),
+                )
+                .unwrap();
+            vfs.write_scratch(0, promote_txt.ino, 0, b"promote-me")
+                .await
+                .unwrap();
+            vfs.flush(promote_txt.ino).await.unwrap();
+
+            let mut status_rx = vfs.subscribe_scratch_auto_promote_status();
+            let rules_loaded_rx = vfs.subscribe_ignore_rules_loaded();
+            vfs.start().unwrap();
+
+            // Wait for the first refresh attempt to finish bootstrap with the missing payload.
+            vfs.wait_for_ignore_rules_bootstrap().await;
+            // A replay-merge wake before the load must not bypass the gate. The snapshot check
+            // below is only a sanity check; the proof is that `keep.tmp` (matched solely by the
+            // unloaded rule) is still scratch after the post-load pass, since any pass run
+            // without rules would have promoted it.
+            vfs.scratch_auto_promote.replay_merge_wake.notify_one();
+
+            assert!(
+                !*rules_loaded_rx.borrow(),
+                "rules must not report loaded when a rule payload is missing"
+            );
+            assert_eq!(
+                vfs.scratch_auto_promote_snapshot().passes_completed,
+                0,
+                "auto-promote must not run any pass before rules are loaded"
+            );
+            assert!(vfs.is_scratch_inode(keep_tmp.ino).unwrap());
+            assert!(vfs.is_scratch_inode(promote_txt.ino).unwrap());
+
+            // Once the rule payload becomes available, the first successful load runs one pass
+            // using the loaded rules: `keep.tmp` stays scratch and `promote.txt` promotes.
+            vfs.local_payload_backend
+                .put(rule_object_id, rule_payload, true)
+                .unwrap();
+            vfs.trigger_ignore_rules_refresh_for_test();
+
+            let snap = wait_for_auto_promote_pass(&mut status_rx, 1).await;
+            assert!(*rules_loaded_rx.borrow());
+            assert!(snap.passes_completed >= 1);
+            assert_eq!(snap.failed_entries, 0);
+            assert!(
+                vfs.is_scratch_inode(keep_tmp.ino).unwrap(),
+                "matching entry must stay scratch once rules load"
+            );
+            assert!(
+                !vfs.is_scratch_inode(promote_txt.ino).unwrap(),
+                "non-matching candidate must promote after the first successful rule load"
+            );
+            assert_eq!(
+                vfs.read(promote_txt.ino, 0, 64).await.unwrap().as_ref(),
+                b"promote-me"
+            );
+
+            vfs.shutdown(Duration::from_secs(5)).await.unwrap();
+        });
+        drop(_guard);
+        drop(vfs);
+        drop(meta);
     }
 }

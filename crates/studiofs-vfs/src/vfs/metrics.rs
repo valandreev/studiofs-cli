@@ -2458,7 +2458,7 @@ pub struct ScratchPromotePathOutcome {
 pub struct VfsScratchAutoPromoteSnapshot {
     /// Configured maximum entries per scratch directory subtree during automatic promotion.
     pub entry_limit: usize,
-    /// Number of rule-change promotion passes completed.
+    /// Number of background scratch auto-promotion passes completed.
     pub passes_completed: u64,
     /// Ignore-rule generation observed when the most recent completed pass started.
     #[serde(default)]

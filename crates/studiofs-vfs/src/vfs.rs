@@ -5536,17 +5536,22 @@ impl StudioVfs {
         }: StartupChannels,
     ) -> VfsResult<()> {
         self.run_startup_local_metadata_compaction();
-        let scratch_rules_rx =
-            (!self.read_only_mount).then(|| self.subscribe_ignore_rules_changes());
+        let scratch_auto_promote_rxs = (!self.read_only_mount).then(|| {
+            (
+                self.subscribe_ignore_rules_changes(),
+                self.subscribe_ignore_rules_loaded(),
+            )
+        });
         // After compaction, whose exclusive database lock a rule scan would contend.
         let vfs = self.clone();
         self.spawn_background_cleanup_task_on(&tokio::runtime::Handle::current(), async move {
             vfs.background_ignore_rules().await;
         });
-        if let Some(rules_rx) = scratch_rules_rx {
+        if let Some((rules_rx, rules_loaded_rx)) = scratch_auto_promote_rxs {
             let vfs = self.clone();
             self.spawn_background_cleanup_task_on(&tokio::runtime::Handle::current(), async move {
-                vfs.background_scratch_auto_promote(rules_rx).await;
+                vfs.background_scratch_auto_promote(rules_rx, rules_loaded_rx)
+                    .await;
             });
         }
         self.spawn_landing_zone_recovery_worker();

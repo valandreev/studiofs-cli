@@ -1,5 +1,16 @@
 # Rust dependency license audit for v0.2.0
 
+## RUSTSEC-2026-0592 url renewal, 2026-11-22
+
+The reviewed inventory is renewed for `url 2.5.8 -> 2.5.9` and its
+companion `form_urlencoded 1.2.2 -> 1.2.3`. Both manifests still declare
+`MIT OR Apache-2.0`, and their `LICENSE-APACHE` and `LICENSE-MIT` are
+byte-identical to the previous versions. No policy exception or notice
+supplement is needed. The regeneration also records a workspace-only
+`studiofs-cache` dev-edge scope hint. Counts are unchanged: 653 lock entries
+(641 registry and 12 workspace packages). The LF-normalized lockfile SHA-256
+is `c5440699a6ad6ea64b03fa99c3c4a941e3b44a6e566718c8780cea98b1eef8b8`.
+
 ## SFS-1074 scratch rule matcher renewal, 2026-11-20
 
 The rule matcher adds `globset 0.4.19` and its dependency `bstr 1.14.0`.
