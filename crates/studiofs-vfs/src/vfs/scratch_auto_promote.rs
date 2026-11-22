@@ -1149,40 +1149,33 @@ mod tests {
             .expect("ignore rule channel closed");
     }
 
+    async fn wait_for_auto_promote_status(
+        rx: &mut watch::Receiver<VfsScratchAutoPromoteSnapshot>,
+        what: &str,
+        done: impl Fn(&VfsScratchAutoPromoteSnapshot) -> bool,
+    ) -> VfsScratchAutoPromoteSnapshot {
+        tokio::time::timeout(Duration::from_secs(5), rx.wait_for(|snap| done(snap)))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for scratch auto-promote {what}"))
+            .expect("scratch auto-promote watch closed")
+            .clone()
+    }
+
     async fn wait_for_auto_promote_generation(
         rx: &mut watch::Receiver<VfsScratchAutoPromoteSnapshot>,
         min_rule_generation: u64,
     ) -> VfsScratchAutoPromoteSnapshot {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if rx.borrow().last_rule_generation >= min_rule_generation {
-                    return rx.borrow().clone();
-                }
-                rx.changed()
-                    .await
-                    .expect("scratch auto-promote watch closed");
-            }
+        wait_for_auto_promote_status(rx, "rule generation", |snap| {
+            snap.last_rule_generation >= min_rule_generation
         })
         .await
-        .expect("timed out waiting for scratch auto-promote rule generation")
     }
 
     async fn wait_for_auto_promote_pass(
         rx: &mut watch::Receiver<VfsScratchAutoPromoteSnapshot>,
         min_passes: u64,
     ) -> VfsScratchAutoPromoteSnapshot {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if rx.borrow().passes_completed >= min_passes {
-                    return rx.borrow().clone();
-                }
-                rx.changed()
-                    .await
-                    .expect("scratch auto-promote watch closed");
-            }
-        })
-        .await
-        .expect("timed out waiting for scratch auto-promote pass")
+        wait_for_auto_promote_status(rx, "pass", |snap| snap.passes_completed >= min_passes).await
     }
 
     async fn write_and_close_file(
@@ -2177,9 +2170,11 @@ mod tests {
 
             // Wait for the first refresh attempt to finish bootstrap with the missing payload.
             vfs.wait_for_ignore_rules_bootstrap().await;
-            // Even a replay-merge wake must not run a pass before rules are loaded.
+            // A replay-merge wake before the load must not bypass the gate. The snapshot check
+            // below is only a sanity check; the proof is that `keep.tmp` (matched solely by the
+            // unloaded rule) is still scratch after the post-load pass, since any pass run
+            // without rules would have promoted it.
             vfs.scratch_auto_promote.replay_merge_wake.notify_one();
-            tokio::task::yield_now().await;
 
             assert!(
                 !*rules_loaded_rx.borrow(),
