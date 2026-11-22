@@ -88,6 +88,10 @@
 //! `FileSessionOperation::Restore` permits, `flush_retained_source_ordered`,
 //! local redb metadata commit (`promote_scratch_auto`), `record_live_extents`,
 //! `submit_uploads_batch`, and `scratch_auto_promote` snapshot/watch state.
+//! That watch is a leaf lock: scratch `rmdir`, rename displacement, and
+//! promote renames prune `over_limit_directories` through it after their local
+//! commit while still holding their session permits or frozen subtree, and
+//! status reads clone it before re-checking entries against metadata.
 //!
 //! With `LocalPayloadBackendRuntime`, cached-store first/final pin transitions
 //! acquire locks in this order:

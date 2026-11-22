@@ -379,29 +379,15 @@ impl StudioVfs {
         snapshot
     }
 
-    pub(super) fn prune_over_limit_directory(&self, dir_ino: Ino) {
+    /// Drops over-limit entries whose directory left scratch; call after the local commit.
+    pub(super) fn prune_over_limit_directories(&self, is_removed: impl Fn(Ino) -> bool) {
         self.scratch_auto_promote
             .status_tx
             .send_if_modified(|snapshot| {
                 let before = snapshot.over_limit_directories.len();
                 snapshot
                     .over_limit_directories
-                    .retain(|entry| entry.dir_ino != dir_ino);
-                snapshot.over_limit_directories.len() != before
-            });
-    }
-
-    pub(super) fn prune_over_limit_directories(&self, removed_inos: &HashSet<Ino>) {
-        if removed_inos.is_empty() {
-            return;
-        }
-        self.scratch_auto_promote
-            .status_tx
-            .send_if_modified(|snapshot| {
-                let before = snapshot.over_limit_directories.len();
-                snapshot
-                    .over_limit_directories
-                    .retain(|entry| !removed_inos.contains(&entry.dir_ino));
+                    .retain(|entry| !is_removed(entry.dir_ino));
                 snapshot.over_limit_directories.len() != before
             });
     }
@@ -1216,7 +1202,7 @@ impl StudioVfs {
         )?;
         self.apply_auto_promote_side_effects(meta.as_ref(), started_epoch, root_is_dir, &promoted);
         meta.request_eager_flush();
-        self.prune_over_limit_directories(&frozen.frozen);
+        self.prune_over_limit_directories(|ino| frozen.frozen.contains(&ino));
         Ok(ScratchPromotePathOutcome {
             relative_path: raw_path.to_owned(),
             promoted_inodes: promoted.attrs.len(),
