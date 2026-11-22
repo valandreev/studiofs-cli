@@ -974,6 +974,7 @@ mod tests {
             let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-trash-root-");
             let (_runtime, vfs, meta) =
                 super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-trash-root");
+            vfs.set_native_trash_profile(super::super::NativeTrashProfile::Windows);
             if trash_days != 0 {
                 meta.compare_and_set_trash_days(0, trash_days)
                     .unwrap()
@@ -1038,14 +1039,7 @@ mod tests {
                 "ordinary nested $RECYCLE.BIN child file, retention {trash_days}"
             );
             if trash_days == 0 {
-                let non_native_root_name: &[u8] = if cfg!(windows) {
-                    b".Trash"
-                } else {
-                    b"$RECYCLE.BIN"
-                };
-                let non_native_trash = vfs
-                    .mkdir(ROOT_INO, non_native_root_name, 0, 0, 0o755)
-                    .unwrap();
+                let non_native_trash = vfs.mkdir(ROOT_INO, b".Trash", 0, 0, 0o755).unwrap();
                 let child_dir = vfs
                     .mkdir(non_native_trash.ino, b"child", 0, 0, 0o755)
                     .unwrap();
