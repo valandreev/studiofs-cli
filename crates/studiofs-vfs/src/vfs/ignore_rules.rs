@@ -121,7 +121,7 @@ impl Drop for OpenTruncRuleGuard<'_> {
                 }
             }
         }
-        rules.write_activity_epoch.fetch_add(1, Ordering::AcqRel);
+        rules.bump_write_activity_epoch();
         if self.notify_on_drop {
             rules.note_local_barrier(self.ino);
         }
@@ -236,10 +236,16 @@ impl IgnoreRules {
         }
     }
 
+    fn bump_write_activity_epoch(&self) {
+        // Serialize writer activity with the refresh's final check and swap.
+        let _snapshot = self.snapshot.read();
+        self.write_activity_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Record that a write-capable handle was opened on `ino`.
     pub(super) fn note_write_open(&self, ino: Ino) {
         if self.watched.lock().files.contains(&ino) {
-            self.write_activity_epoch.fetch_add(1, Ordering::AcqRel);
+            self.bump_write_activity_epoch();
         }
     }
 
@@ -247,7 +253,7 @@ impl IgnoreRules {
     /// refresh if `ino` is a watched rule file.
     pub(super) fn note_last_write_close(&self, ino: Ino) {
         if self.watched.lock().files.contains(&ino) {
-            self.write_activity_epoch.fetch_add(1, Ordering::AcqRel);
+            self.bump_write_activity_epoch();
             self.refresh.notify_one();
         }
     }
@@ -262,7 +268,7 @@ impl IgnoreRules {
                 notify_on_drop: false,
             };
         }
-        self.write_activity_epoch.fetch_add(1, Ordering::AcqRel);
+        self.bump_write_activity_epoch();
         *self.opening_trunc_writers.lock().entry(ino).or_default() += 1;
         OpenTruncRuleGuard {
             rules: Some(self),
@@ -287,7 +293,7 @@ impl IgnoreRules {
     ) {
         let relevant = self.watched.lock().note_entry(name, ino, bound);
         if relevant {
-            self.write_activity_epoch.fetch_add(1, Ordering::AcqRel);
+            self.bump_write_activity_epoch();
             if bound
                 && let Some(ino) = ino
                 && studiofs_meta::fold_dentry_name(name).as_ref() == RULE_FILE
@@ -616,9 +622,12 @@ impl StudioVfs {
     pub(super) async fn background_ignore_rules(self: Arc<Self>) {
         let mut sources = self.ignore_rules.sources.clone();
         let mut versions = BTreeMap::new();
+        let mut cache_needs_persist = false;
         let cancellation = &self.state.shutdown.background_shutdown_token;
         loop {
-            let outcome = self.refresh_ignore_rules(&mut sources, &mut versions).await;
+            let outcome = self
+                .refresh_ignore_rules(&mut sources, &mut versions, &mut cache_needs_persist)
+                .await;
             if outcome == RefreshOutcome::Loaded {
                 self.ignore_rules.rules_loaded.send_if_modified(|loaded| {
                     let changed = !*loaded;
@@ -661,6 +670,7 @@ impl StudioVfs {
         &self,
         sources: &mut RuleSources,
         versions: &mut BTreeMap<Vec<u8>, RuleVersion>,
+        cache_needs_persist: &mut bool,
     ) -> RefreshOutcome {
         let cancellation = self.state.shutdown.background_shutdown_token.clone();
         let watched = Arc::clone(&self.ignore_rules.watched);
@@ -859,7 +869,7 @@ impl StudioVfs {
         if !missing.is_empty() {
             warn!(?missing, "ignore rule payloads unavailable during refresh");
         }
-        if !changed.is_empty() || !*self.ignore_rules.bootstrap.borrow() {
+        if !changed.is_empty() || *cache_needs_persist || !*self.ignore_rules.bootstrap.borrow() {
             let bytes = match postcard::to_allocvec(&next_sources) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -867,6 +877,9 @@ impl StudioVfs {
                     return RefreshOutcome::Retry;
                 }
             };
+            // A discarded candidate may already have replaced the persisted
+            // cache. Rewrite it even if the next pass has no live changes.
+            *cache_needs_persist = true;
             if let Err(error) = self
                 .meta
                 .run_maintenance(move |meta| meta.store_ignore_rules_cache(&bytes))
@@ -890,12 +903,25 @@ impl StudioVfs {
             }
             {
                 let mut snapshot_guard = self.ignore_rules.snapshot.write();
+                // A writer can reopen while the cache is being persisted. Keep
+                // the live rules and versions so the next pass can reconsider.
+                if self
+                    .ignore_rules
+                    .write_activity_epoch
+                    .load(Ordering::Acquire)
+                    != write_epoch_before
+                {
+                    drop(snapshot_guard);
+                    self.ignore_rules.refresh.notify_one();
+                    return RefreshOutcome::Retry;
+                }
                 *snapshot_guard = Arc::new(next_rules);
                 self.ignore_rules
                     .rule_generation
                     .fetch_add(1, Ordering::Release);
             }
             *sources = next_sources;
+            *cache_needs_persist = false;
             if !changed.is_empty() {
                 let _ = self.ignore_rules.changed.send(changed);
             }
@@ -1182,6 +1208,68 @@ mod tests {
             reopened.classify_scratch_path(b"file.tmp", false),
             ScratchClass::Scratch
         );
+    }
+
+    #[test]
+    fn ignore_rules_defer_publication_when_writer_reopens() {
+        let tmp = studiofs_test_support::workspace_target_tempdir("ignore-rules-");
+        let (runtime, vfs, meta) =
+            super::super::tests::make_unstarted_test_vfs(&tmp, "ignore-rules-reopen");
+        runtime.block_on(async {
+            let ino = write_rule_file(&vfs, ROOT_INO, b"*.old\n").await;
+            let mut changes = vfs.subscribe_ignore_rules_changes();
+            let worker = tokio::spawn(Arc::clone(&vfs).background_ignore_rules());
+            wait_for_class(&vfs, &mut changes, b"a.old", ScratchClass::Scratch).await;
+
+            let (entered, reached) = tokio::sync::oneshot::channel();
+            let (resume, paused) = tokio::sync::oneshot::channel();
+            *vfs.ignore_rules.before_publish.lock() = Some((entered, paused));
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh(fh, ino, 0, b"*.new\n").await.unwrap();
+            vfs.release_fh(fh).await.unwrap();
+            tokio::time::timeout(BOOTSTRAP_BUDGET, reached)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            let mut passes = vfs.subscribe_ignore_rules_refresh_passes_for_test();
+            let paused_pass = *passes.borrow_and_update();
+            resume.send(()).unwrap();
+            tokio::time::timeout(
+                BOOTSTRAP_BUDGET,
+                passes.wait_for(|count| *count > paused_pass),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                vfs.classify_scratch_path(b"a.old", false),
+                ScratchClass::Scratch
+            );
+            assert_eq!(
+                vfs.classify_scratch_path(b"a.new", false),
+                ScratchClass::Tracked
+            );
+            tokio::time::timeout(
+                BOOTSTRAP_BUDGET,
+                passes.wait_for(|count| *count >= paused_pass + 2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let persisted = meta.load_ignore_rules_cache().unwrap().unwrap();
+            let persisted: RuleSources = postcard::from_bytes(&persisted).unwrap();
+            assert_eq!(persisted[&Vec::new()], b"*.old\n");
+
+            vfs.release_fh(fh).await.unwrap();
+            wait_for_class(&vfs, &mut changes, b"a.new", ScratchClass::Scratch).await;
+            vfs.state.shutdown.background_shutdown_token.cancel();
+            tokio::time::timeout(BOOTSTRAP_BUDGET, worker)
+                .await
+                .unwrap()
+                .unwrap();
+        });
     }
 
     #[test]
