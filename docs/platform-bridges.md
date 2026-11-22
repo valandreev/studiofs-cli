@@ -1066,7 +1066,7 @@ layer:
     `listxattr`)
   - emits zero `event_log` rows and queues zero S3 uploads, keeping shared
     directories clean for peers while remaining locally durable across remounts
-  - can be overridden per directory with `!.studiofsignore` negation rules (for
+  - can be overridden per directory with `.studiofsignore` negation rules (for
     example `!._*`)
 - **Root indexing/event directories (`.Spotlight-V100`, `.fseventsd`) and trash
   components → ephemeral discard layer:**

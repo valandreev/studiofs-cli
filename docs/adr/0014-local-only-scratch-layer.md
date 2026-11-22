@@ -1,6 +1,6 @@
 # Paths Matched By `.studiofsignore` Live In A Local-Only Scratch Layer
 
-Status: proposed (SFS-1068). Implementation is tracked in the Linear project
+Status: accepted (SFS-1068, SFS-1072). Implemented in the Linear project
 "[0.2.4] Scratch layer".
 
 ## Context
@@ -12,12 +12,13 @@ hardcoded macOS and trash set goes through the full local-first pipeline:
 `event_log` publication to PostgreSQL, S3 upload, and peer invalidation. That
 adds churn and object-store cost for data no peer needs.
 
-The only existing exclusion is `IgnoredEntryRegistry`
-(`crates/studiofs-vfs/src/vfs/ignored_entries.rs`). It is an in-memory
-metadata-only blackhole: writes only grow `attr.size`, reads return zeros, and
-entries are detached after the last handle closes. It cannot keep autosave data.
-Its rename handling also loses data silently: normal -> ignored unlinks the
-source, and ignored -> normal unlinks the source without creating the target.
+Before this decision, the only exclusion was `IgnoredEntryRegistry`
+(`crates/studiofs-vfs/src/vfs/ignored_entries.rs`), an in-memory
+metadata-only blackhole: writes only grew `attr.size`, reads returned zeros,
+and entries were detached after the last handle closed. It could not keep
+autosave data. Its rename handling also lost data silently: normal -> ignored
+unlinked the source, and ignored -> normal unlinked the source without
+creating the target.
 
 ## Decision
 
@@ -32,18 +33,21 @@ source, and ignored -> normal unlinks the source without creating the target.
   Matching follows the volume's case policy (the folding used by
   `dentries_by_folded_name`).
 - `._*` is a built-in, lowest-precedence scratch rule; `!._*` overrides it.
-  `.Spotlight-V100`, `.fseventsd`, and trash components stay in the existing
-  discard class.
+  `.Spotlight-V100`, `.fseventsd`, and reserved trash roots (`$RECYCLE.BIN`,
+  `.Trash*`) and their descendants bypass scratch rules and stay on the existing
+  discard or retained-trash routing.
 - `.studiofsignore` files are always tracked. Patterns that would match them do
   not apply to them, and `status` warns about such patterns.
-- Rules load in the background: after a local close or flush of a
-  `.studiofsignore`, and after foreign apply of one. `.studiofsignore` payloads
-  are pinned and limited to 64 KiB. Foreground operations use the last compiled
-  rule set and never wait for S3 or PostgreSQL. Compiled rules persist in a
-  local-only redb table, so a remount classifies immediately. The first mount
-  of a volume on a client prefetches all `.studiofsignore` payloads during
-  bootstrap with a bounded timeout; on timeout the mount proceeds and logs a
-  warning.
+- Rules load in the background: after the last local write-capable handle on a
+  `.studiofsignore` closes (keeping the last compiled rule set while a writer
+  handle or `O_TRUNC` open is active), and after foreign apply of one.
+  `.studiofsignore` payloads are pinned and limited to 64 KiB. Foreground
+  operations use the last compiled rule set and never wait for S3 or
+  PostgreSQL. Rule sources persist in a local-only redb table
+  (`ignore_rules_cache`), so a remount compiles and classifies immediately. The
+  first mount of a volume on a client prefetches all `.studiofsignore` payloads
+  during bootstrap with a bounded timeout; on timeout the mount proceeds and
+  logs a warning.
 
 ### Classification
 
@@ -59,8 +63,9 @@ source, and ignored -> normal unlinks the source without creating the target.
 ### Storage
 
 - Scratch metadata lives in separate redb tables (`scratch_inodes`,
-  `scratch_dentries`, `scratch_overlay`, `scratch_xattrs`). The publication path
-  never reads them, so zero `event_log` rows is a structural guarantee.
+  `scratch_dentries`, `scratch_overlay`, `scratch_xattrs`, `scratch_symlinks`,
+  `scratch_conflicts`, `scratch_orphans`). The publication path never reads
+  them, so zero `event_log` rows is a structural guarantee.
 - Scratch inode IDs come from the normal namespace allocator, so promotion
   keeps the inode number and open handles stay valid.
 - Scratch payload goes through the normal writer stack into the local payload
@@ -118,9 +123,10 @@ source, and ignored -> normal unlinks the source without creating the target.
   file to `<name>.scratch-conflict-<client>`; a tracked directory merges as on
   replay. The remaining race equals the ordinary concurrent-create race that
   ADR 0012 accepts.
-- A pass runs only after the rules stay unchanged for a short quiet period, so
-  an in-place rewrite of `.studiofsignore`, which loads an empty rule set
-  between truncate and write, does not promote every scratch entry.
+- A pass runs only after the rules stay unchanged for a short quiet period,
+  guarding against peer in-place rewrites of `.studiofsignore` whose truncate
+  and write can arrive in separate replay batches (local rewrites already defer
+  rule reload until the last write-capable handle closes).
 - When foreign apply or snapshot restore removes the tracked parent of scratch
   entries, they move to `<cache>/scratch-orphans/<timestamp>/<old path>`
   outside the namespace. `studiofs scratch list --orphaned` shows them and
@@ -134,9 +140,9 @@ source, and ignored -> normal unlinks the source without creating the target.
   Scratch never counts as dirty or pending upload.
 - `fsck` checks scratch table consistency. Local payload GC treats scratch
   objects as live. `janitor` is unaffected. Snapshots exclude scratch.
-- The tooling design covers `studiofs scratch list|clean|promote|restore`
-  through the mounted control API and offline against redb. The design for
-  `clean` skips entries with open handles and supports `--older-than`.
+- `studiofs scratch list|clean|promote|restore` work through the mounted
+  control API and offline against redb. `clean` skips entries with open handles
+  and supports `--older-than`.
 - `studiofs scratch promote --volume <volume> -- <path>` works on a writable
   mount or offline and accepts a UTF-8 path relative to the volume root. It
   bypasses the background entry limit and fails atomically if a tracked entry
@@ -159,5 +165,5 @@ Moving a tracked file whose payload is not cached into a scratch directory
 returns `EXDEV`, so applications copy instead of renaming.
 
 Rename across the discard boundary (`.Spotlight-V100`, `.fseventsd`, trash
-components) is fixed separately; this decision does not cover discard
-semantics. Native WinFSP validation is a separate gate.
+components) was fixed separately (SFS-1073); this decision does not cover
+discard semantics. Native WinFSP validation is a separate gate (SFS-1084).
