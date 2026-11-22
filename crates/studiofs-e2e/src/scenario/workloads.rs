@@ -259,7 +259,7 @@ mod recoverable_trash_durability;
 mod recoverable_trash_gvfs;
 mod recoverable_trash_janitor;
 pub(super) mod scratch_auto_promote;
-mod scratch_demote;
+pub(super) mod scratch_demote;
 pub(super) mod scratch_e2e;
 mod smoke_outage;
 mod snapshot_v2;
@@ -286,12 +286,6 @@ pub(super) use random_write_packing::RandomWritePacking;
 pub(super) use recoverable_trash::RecoverableTrash;
 pub(super) use recoverable_trash_durability::RecoverableTrashDurability;
 pub(super) use recoverable_trash_janitor::RecoverableTrashJanitor;
-pub(super) use scratch_demote::{SCRATCH_DEMOTE, ScratchDemote};
-pub(super) use scratch_e2e::{
-    SCRATCH_APPLEDOUBLE, SCRATCH_ATOMIC_SAVE, SCRATCH_CONFLICT, SCRATCH_DURABILITY,
-    SCRATCH_ISOLATION, SCRATCH_ORPHAN_RESTORE, ScratchAppleDouble, ScratchAtomicSave,
-    ScratchConflict, ScratchDurability, ScratchIsolation, ScratchOrphanRestore,
-};
 pub(super) use smoke_outage::*;
 pub(super) use snapshot_v2::*;
 pub(super) use sync_safety::*;

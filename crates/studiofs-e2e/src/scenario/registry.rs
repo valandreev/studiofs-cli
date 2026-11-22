@@ -4,6 +4,12 @@ use std::sync::OnceLock;
 
 use super::types::{Scenario, ScenarioDefinition};
 use super::workloads::scratch_auto_promote::{SCRATCH_AUTO_PROMOTE, ScratchAutoPromote};
+use super::workloads::scratch_demote::{SCRATCH_DEMOTE, ScratchDemote};
+use super::workloads::scratch_e2e::{
+    SCRATCH_APPLEDOUBLE, SCRATCH_ATOMIC_SAVE, SCRATCH_CONFLICT, SCRATCH_DURABILITY,
+    SCRATCH_ISOLATION, SCRATCH_ORPHAN_RESTORE, ScratchAppleDouble, ScratchAtomicSave,
+    ScratchConflict, ScratchDurability, ScratchIsolation, ScratchOrphanRestore,
+};
 use super::workloads::*;
 
 /// Returns the full registry of available scenario definitions.
